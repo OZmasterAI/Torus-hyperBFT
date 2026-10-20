@@ -93,6 +93,44 @@ pub fn epoch_fast_path_explicit() -> bool {
     std::env::var_os("TORUS_EPOCH_FAST_PATH").is_some()
 }
 
+/// Item 7 option 0 (task 3.1, `docs/plans/item7-option0-impl.md`): the EVM
+/// fast path (`TORUS_EVM_FAST_PATH`, node-local, default OFF until bench Q11
+/// passes, read once at startup by `TorusApp::try_new`): a block with EVM
+/// txs takes the pipelined path like a native block. Its EVM part reads
+/// through the block overlay, its EVM rows ride its pending set, its EVM
+/// trie work and its receipts / indices / CoreWriter links move to W. Same
+/// state, roots, receipts and running hash; only timing changes, so
+/// validators may run mixed flags. No effect without W
+/// (`TORUS_EXEC_PIPELINE=0`).
+pub fn evm_fast_path_enabled() -> bool {
+    parse_evm_fast_path(std::env::var("TORUS_EVM_FAST_PATH").ok())
+}
+
+/// Pure parse of `TORUS_EVM_FAST_PATH` (default OFF): `1` or `true` = on;
+/// unset, empty, `0` or `false` = off; anything else = OFF with a warning,
+/// so a typo never enables a consensus-timing change.
+pub fn parse_evm_fast_path(raw: Option<String>) -> bool {
+    let Some(raw) = raw else {
+        return false;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" => true,
+        "" | "0" | "false" => false,
+        other => {
+            tracing::warn!(
+                value = other,
+                "TORUS_EVM_FAST_PATH: not 0/1/true/false — EVM fast path OFF"
+            );
+            false
+        }
+    }
+}
+
+/// Whether `TORUS_EVM_FAST_PATH` is set at all (the startup log).
+pub fn evm_fast_path_explicit() -> bool {
+    std::env::var_os("TORUS_EVM_FAST_PATH").is_some()
+}
+
 /// Item 6 Phase 3 step 6: the compiled default interval on validators (owner
 /// s109, the gate's 15 s). `--rpc-only` nodes default to 0 (per-block flush).
 pub const VALIDATOR_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
@@ -284,6 +322,42 @@ pub fn check_checkpoint_book_mode(
     }
 }
 
+/// Item 7 option 0 step 0 (task 0.4, R5 / F11): where a height became
+/// complete (its state, marker AND EVM mirror resync written). Test-only.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CompleteSite {
+    /// W: a `Job::Flush` (interval 0).
+    WFlush,
+    /// W: a `Job::Marker` (interval 0).
+    WMarker,
+    /// W: a `Job::Checkpoint` (the window up to its height).
+    WCheckpoint,
+    /// E: the serial flush, after its EVM mirror resync.
+    ESerialFlush,
+    /// E: a successful marker-only flush (no native phase).
+    EMarkerOnly,
+}
+
+/// Test-only completion hook: `(site, completed height, the DB)`, called
+/// where the height is known complete (after the EVM mirror resync, before
+/// W moves its durable height or receives its next job).
+#[cfg(test)]
+pub type CompleteHook = std::sync::Arc<dyn Fn(CompleteSite, u64, &StateDb) + Send + Sync>;
+
+/// Item 7 option 0 (task 3.6, C13): test-only path flags, shared by E
+/// (`ExecutionContext::test_paths`) and W (`WorkerEnv::test_paths`).
+#[cfg(test)]
+pub type TestPaths = Arc<Mutex<std::collections::BTreeMap<&'static str, u64>>>;
+
+/// Count path `name` (W side; no-op without a shared map).
+#[cfg(test)]
+fn w_path(env: &WorkerEnv, name: &'static str) {
+    if let Some(p) = &env.test_paths {
+        *p.lock().unwrap().entry(name).or_default() += 1;
+    }
+}
+
 /// One unit of work for W, in commit order.
 pub enum Job {
     /// A native block: flush its frozen pending set (state + trie + marker in one
@@ -306,6 +380,12 @@ pub enum Job {
         /// it has one. W encodes it into the sidecar (`CF_BLOCK_ACTION_STATUS`,
         /// not hashed, not a root CF) so it joins the block's atomic batch.
         action_status: Option<torus_state::action_status::BlockActionStatus>,
+        /// Item 7 option 0 (task 2.4): a fast-path EVM block's EVM part
+        /// ([`EvmJobRows`]): W runs its EVM trie step (a window of one) into
+        /// the batch's prefix and stages its side rows into the sidecar.
+        /// `None` on every path today (dormant until step 3: the serial path
+        /// never sets it).
+        evm: Option<EvmJobRows>,
     },
     /// An empty / non-native block: advance the applied-height marker, in order
     /// behind the previous block's batch. `pending` is the 1-key marker layer the
@@ -313,6 +393,15 @@ pub enum Job {
     Marker {
         height: u64,
         pending: Arc<FrozenPending>,
+        /// Item 7 option 0 (task 2.4, plan F2): a fast-path EVM block without
+        /// a native phase has a status row (its EVM txs all skipped, or its
+        /// section failed); W writes it in the marker batch, like a Flush.
+        action_status: Option<torus_state::action_status::BlockActionStatus>,
+        /// Item 7 option 0 (task 2.4, decision 11): such a block's EVM part
+        /// when its section returned `Ok` with every tx skipped: an empty
+        /// bundle and the hash -> number side row (a Marker never carries
+        /// absorbed rows). W writes the side rows in the marker batch.
+        evm: Option<EvmJobRows>,
     },
     /// Item 6 Phase 3 (checkpoint interval set): a block whose state rows
     /// are NOT written now. W computes `h_height` from its in-memory
@@ -326,6 +415,10 @@ pub enum Job {
         evm_addrs: Vec<Address>,
         order_nonces: Vec<u64>,
         action_status: Option<torus_state::action_status::BlockActionStatus>,
+        /// Item 7 option 0 (task 2.4): the block's EVM part; W folds its
+        /// bundle into the window's EVM delta and its side rows into the
+        /// window's side rows, both written by the next checkpoint.
+        evm: Option<EvmJobRows>,
     },
     /// Item 6 Phase 3: write the since-checkpoint layer `layer` (blocks
     /// S'+1..=height, last value per key) in ONE atomic batch with the
@@ -339,7 +432,61 @@ pub enum Job {
     },
 }
 
+/// Item 7 option 0 (task 2.4): a fast-path EVM block's EVM part on its job:
+/// the bundle (moved out of the validated block; W hashes its keys and runs
+/// the EVM trie step, `torus_state::incremental::EvmWindowDelta`) and the
+/// node-local side rows (receipts, hash -> number, tx index, CoreWriter
+/// links). The bundle's plain rows are NOT here: they were absorbed into the
+/// block's pending set on E (task 1.2).
+pub struct EvmJobRows {
+    pub bundle: torus_bridge::BundleState,
+    pub side: torus_bridge::EvmSideRows,
+}
+
 impl Job {
+    /// Item 6 Phase 3 / item 7 option 0 (task 2.4): the job E hands W with a
+    /// checkpoint interval. A Flush or a Marker becomes a Digest carrying all
+    /// it carried (the set, EVM accounts, order nonces, action status, EVM
+    /// part); a Digest or a Checkpoint is unchanged. A Flush's deferred book
+    /// save cannot ride a digest: the caller refuses it before (fail-stop).
+    pub fn into_digest(self) -> Job {
+        match self {
+            Job::Flush {
+                height,
+                pending,
+                evm_addrs,
+                books,
+                order_nonces,
+                action_status,
+                evm,
+            } => {
+                debug_assert!(books.is_none(), "a deferred book save never rides a digest");
+                Job::Digest {
+                    height,
+                    pending,
+                    evm_addrs,
+                    order_nonces,
+                    action_status,
+                    evm,
+                }
+            }
+            Job::Marker {
+                height,
+                pending,
+                action_status,
+                evm,
+            } => Job::Digest {
+                height,
+                pending,
+                evm_addrs: Vec::new(),
+                order_nonces: Vec::new(),
+                action_status,
+                evm,
+            },
+            job => job,
+        }
+    }
+
     pub fn height(&self) -> u64 {
         match self {
             Job::Flush { height, .. }
@@ -377,6 +524,17 @@ pub struct WorkerGate {
     /// W is parked at the latch seam.
     #[cfg(test)]
     latch_parked: AtomicBool,
+    /// Item 7 option 0 step 0 (F11): park W between a job's batch and its
+    /// EVM mirror resync, until `release`.
+    #[cfg(test)]
+    hold_resync: AtomicBool,
+    /// W is parked at the resync seam.
+    #[cfg(test)]
+    resync_parked: AtomicBool,
+    /// Item 7 option 0 step 0 (G mode): park W at the gate of this height's
+    /// job and every later one, until `release`.
+    #[cfg(test)]
+    hold_from: Mutex<Option<u64>>,
 }
 
 impl WorkerGate {
@@ -394,6 +552,12 @@ impl WorkerGate {
         self.hold_ckpt.store(false, Ordering::SeqCst);
         #[cfg(test)]
         self.hold_latch.store(false, Ordering::SeqCst);
+        #[cfg(test)]
+        self.hold_resync.store(false, Ordering::SeqCst);
+        #[cfg(test)]
+        {
+            *self.hold_from.lock().unwrap() = None;
+        }
         drop(held);
         self.cv.notify_all();
     }
@@ -429,6 +593,41 @@ impl WorkerGate {
         self.latch_parked.load(Ordering::SeqCst)
     }
 
+    /// Item 7 option 0 step 0 (G mode): park W at the gate of job `height`
+    /// (and every later job) until `release`. Unlike [`Self::hold`] it
+    /// cannot catch the job before `height` whatever W's timing: the G-mode
+    /// controller holds the job E is about to hand off.
+    #[cfg(test)]
+    pub fn hold_from(&self, height: u64) {
+        let _held = self.held.lock().unwrap();
+        *self.hold_from.lock().unwrap() = Some(height);
+    }
+
+    /// Item 7 option 0 step 0 (F11): park W after the next batch it writes
+    /// and before that job's EVM mirror resync, until `release`.
+    #[cfg(test)]
+    pub fn hold_before_resync(&self) {
+        let _held = self.held.lock().unwrap();
+        self.resync_parked.store(false, Ordering::SeqCst);
+        self.hold_resync.store(true, Ordering::SeqCst);
+    }
+
+    /// W is parked at the resync seam (`hold_before_resync`).
+    #[cfg(test)]
+    pub fn resync_parked(&self) -> bool {
+        self.resync_parked.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn resync_seam(&self) {
+        let mut held = self.held.lock().unwrap();
+        while self.hold_resync.load(Ordering::SeqCst) {
+            self.resync_parked.store(true, Ordering::SeqCst);
+            held = self.cv.wait(held).unwrap();
+        }
+        self.resync_parked.store(false, Ordering::SeqCst);
+    }
+
     #[cfg(test)]
     fn latch_seam(&self) {
         let mut held = self.held.lock().unwrap();
@@ -461,7 +660,11 @@ impl WorkerGate {
         let mut held = self.held.lock().unwrap();
         loop {
             let ckpt_held = checkpoint && self.hold_ckpt.load(Ordering::SeqCst);
-            if !*held && !ckpt_held {
+            #[cfg(test)]
+            let from_held = self.hold_from.lock().unwrap().is_some_and(|f| height >= f);
+            #[cfg(not(test))]
+            let from_held = false;
+            if !*held && !ckpt_held && !from_held {
                 break;
             }
             if ckpt_held {
@@ -542,6 +745,21 @@ pub struct WorkerEnv {
     /// The node-wide fail-stop latch (T1.5), shared with E and consensus.
     pub exec_failed: Arc<AtomicBool>,
     pub gate: Option<Arc<WorkerGate>>,
+    /// Item 7 option 0 step 0: the completion hook (test-only).
+    #[cfg(test)]
+    pub test_on_complete: Option<CompleteHook>,
+    /// Item 7 option 0 (task 3.6, C13): W's path flags (test-only).
+    #[cfg(test)]
+    pub test_paths: Option<TestPaths>,
+    /// Item 7 option 0 (task 3.6, C13): set by E right before it hands
+    /// over a barrier's drain checkpoint (`checkpoint_drain`); W takes it
+    /// in that checkpoint (test-only).
+    #[cfg(test)]
+    pub test_drain: Option<Arc<AtomicBool>>,
+    /// Item 7 option 0 (task 3.5): a panic inside W's next EVM trie step,
+    /// before its batch (the crash seam; test-only).
+    #[cfg(test)]
+    pub test_evm_step_panic: Option<Arc<AtomicBool>>,
 }
 
 impl FlushWorker {
@@ -718,6 +936,9 @@ struct Window {
     order_nonces: Vec<u64>,
     /// Last digested height.
     last: Option<u64>,
+    /// Item 7 option 0 (task 2.4): the window's EVM bundles, folded in
+    /// height order; the checkpoint writes their trie step in its batch.
+    evm: torus_state::incremental::EvmWindowDelta,
 }
 
 fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
@@ -762,6 +983,22 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
         {
             m.observe_order_ages(torus_telemetry::OrderStage::Durable, order_nonces.iter().copied());
         }
+        // Item 7 option 0 step 0 (F11): the height is complete (batch AND
+        // EVM mirror resync written); before W publishes it or receives its
+        // next job. Never for a digest or a failed job. A TrieStale Flush or
+        // Checkpoint has landed and resynced (task 2.3, F4b), so it is.
+        #[cfg(test)]
+        let complete = matches!(&result, Ok(Ok(()) | Err(JobError::TrieStale(_))));
+        #[cfg(test)]
+        if let (true, false, Some(hook)) = (complete, digest, &env.test_on_complete) {
+            let site = match &job {
+                Job::Flush { .. } => CompleteSite::WFlush,
+                Job::Marker { .. } => CompleteSite::WMarker,
+                Job::Checkpoint { .. } => CompleteSite::WCheckpoint,
+                Job::Digest { .. } => unreachable!("digests are filtered above"),
+            };
+            hook(site, height, &env.state_db);
+        }
         match result {
             Ok(Ok(())) => {
                 // A digest makes nothing durable.
@@ -776,7 +1013,8 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
             Ok(Err(JobError::TrieStale(e))) => {
                 // Today's semantics: the batch (state + marker) is durable, only
                 // the off-by-default incremental native root is stale for this
-                // block; caches were invalidated inside the flush. Keep going.
+                // block; caches were invalidated inside the flush; the EVM
+                // mirror was resynced (task 2.3, F4b). Keep going.
                 tracing::error!(%e, height, "flush worker: native trie maintenance failed (state + marker durable, root stale)");
                 shared.durable_height.store(height, Ordering::SeqCst);
                 if ckpt {
@@ -824,6 +1062,7 @@ fn latch_failstop(env: &WorkerEnv, shared: &Shared) {
     shared.failed.store(true, Ordering::SeqCst);
 }
 
+#[derive(Debug)]
 enum JobError {
     /// The atomic batch did NOT land (RocksDB write error / missing CF).
     Write(String),
@@ -839,14 +1078,42 @@ fn run_job(
 ) -> Result<(), JobError> {
     let mut chain = shared.chain_for_next(&env.state_db);
     match job {
-        Job::Marker { height, pending } => {
+        Job::Marker {
+            height,
+            pending,
+            action_status,
+            evm,
+        } => {
+            debug_assert!(
+                evm.as_ref().is_none_or(|j| j.bundle.state.is_empty()
+                    && j.side.receipts.is_empty()
+                    && j.side.links.is_empty()),
+                "a Marker never carries absorbed rows (plan F2)"
+            );
+            // Item 7 option 0 (task 2.4): its status and side rows (none
+            // today) join the marker batch through the sidecar.
+            #[cfg(test)]
+            {
+                if action_status.is_some() {
+                    w_path(env, "w.status.marker");
+                }
+                if evm.is_some() {
+                    w_path(env, "w.evm_side.marker");
+                }
+            }
+            let sidecar = side_rows_sidecar(
+                env,
+                *height,
+                action_status.take(),
+                evm.take().map(|j| j.side),
+            )?;
             // Exactly today's `write_native_applied_height` bytes, sequenced
             // behind the previous block's batch by this thread's order. Written
             // through the frozen 1-key set so the bytes are the SAME object the
             // exec thread layered under the next overlay.
             pending
                 .flush_on_worker(
-                    None,
+                    sidecar.as_deref(),
                     &env.state_db,
                     Some(*height),
                     None,
@@ -862,6 +1129,7 @@ fn run_job(
             evm_addrs,
             order_nonces,
             action_status,
+            evm,
         } => {
             // The window is contiguous: E checkpoints before any serial
             // block, so a gap here is a pipeline bug — never chain over it.
@@ -874,19 +1142,25 @@ fn run_job(
             }
             // v2 action status: encoded here as on a Flush job, kept in
             // the window's side rows (and digested as the Flush sidecar).
-            let sidecar = action_status.take().map(|status| {
-                let overlay = torus_state::NativeStateOverlay::new(env.state_db.clone());
-                let bytes = crate::action_results::encode_status(&status, env.metrics.as_deref());
-                if let Err(e) = torus_state::StateBackend::put_cf_raw(
-                    &overlay,
-                    torus_state::cf::CF_BLOCK_ACTION_STATUS,
-                    &height.to_be_bytes(),
-                    &bytes,
-                ) {
-                    tracing::error!(%e, height, "flush worker: failed to stage the action status record");
+            // Item 7 option 0 (task 2.4): so are the EVM side rows; the
+            // bundle is folded into the window's EVM delta (an empty one,
+            // an all-skipped block, has no trie work).
+            let evm = evm.take();
+            let sidecar = side_rows_sidecar(
+                env,
+                *height,
+                action_status.take(),
+                evm.as_ref().map(|j| j.side.clone()),
+            )?;
+            if let Some(j) = &evm {
+                #[cfg(test)]
+                w_path(env, "w.evm_side.digest");
+                if !j.bundle.state.is_empty() {
+                    #[cfg(test)]
+                    w_path(env, "w.evm_fold.digest");
+                    window.evm.fold(&j.bundle);
                 }
-                overlay.freeze(*height)
-            });
+            }
             let (entries, secs) = pending.digest_on_worker(
                 sidecar.as_deref(),
                 &env.state_db,
@@ -913,6 +1187,35 @@ fn run_job(
                     layer.top_height()
                 )));
             }
+            // Item 7 option 0 (task 2.4): the window's EVM trie step (its
+            // mirror and trie nodes) leads the checkpoint's ONE batch; the
+            // final CF_ACCOUNTS rows are L's (the DB below). No EVM bundle in
+            // the window: no step (today's path).
+            #[cfg(test)]
+            let drain = env
+                .test_drain
+                .as_ref()
+                .is_some_and(|d| d.swap(false, Ordering::SeqCst));
+            let prefix = if window.evm.is_empty() {
+                rocksdb::WriteBatch::default()
+            } else {
+                #[cfg(test)]
+                w_path(
+                    env,
+                    if drain {
+                        "w.evm_step.drain"
+                    } else {
+                        "w.evm_step.checkpoint"
+                    },
+                );
+                let mut delta = std::mem::take(&mut window.evm);
+                delta.note_accounts(window.evm_addrs.iter().copied());
+                let side = &window.side;
+                evm_trie_prefix(env, *height, delta, |cf, key| {
+                    side.lookup_row(cf, key)
+                        .or_else(|| layer.lookup_row(cf, key))
+                })?
+            };
             let flush_result = {
                 let mut trie_cache = env.trie_cache.lock().expect("trie-cache mutex poisoned");
                 let cache_opt = if torus_state::native_trie::native_root_cache_enabled() {
@@ -929,7 +1232,8 @@ fn run_job(
                 } else {
                     None
                 };
-                layer.flush_checkpoint(
+                layer.flush_checkpoint_after_batch(
+                    prefix,
                     (!window.side.is_empty()).then_some(&window.side),
                     &window.rows,
                     &env.state_db,
@@ -963,6 +1267,7 @@ fn run_job(
             evm_addrs,
             books,
             action_status,
+            evm,
             ..
         } => {
             // Deferred book save: apply pass 2 (if any) into a sidecar overlay
@@ -977,7 +1282,8 @@ fn run_job(
             // block: E observes it on the serial save, W observes it here.
             // v2 action status: encoded here, off the exec thread, and put in
             // the same sidecar (a non-hashed, non-root CF: no root input).
-            let sidecar = if books.is_some() || action_status.is_some() {
+            let evm = evm.take();
+            let sidecar = if books.is_some() || action_status.is_some() || evm.is_some() {
                 let overlay = torus_state::NativeStateOverlay::new(env.state_db.clone());
                 if let Some(b) = books.take() {
                     let t = std::time::Instant::now();
@@ -1006,9 +1312,36 @@ fn run_job(
                         tracing::error!(%e, height, "flush worker: failed to stage the action status record");
                     }
                 }
+                // Item 7 option 0 (task 2.4): the EVM side rows join it.
+                if let Some(j) = &evm {
+                    stage_evm_side_rows(&overlay, &j.side)?;
+                }
                 Some(overlay.freeze(*height))
             } else {
                 None
+            };
+            // Item 7 option 0 (task 2.4): a fast-path EVM block's trie step
+            // (a window of one) leads the batch; the final CF_ACCOUNTS rows
+            // are the block's set (the DB below). An empty bundle (all txs
+            // skipped) has no trie work: today's path.
+            #[cfg(test)]
+            if evm.is_some() {
+                w_path(env, "w.evm_side.flush");
+            }
+            let prefix = match &evm {
+                Some(j) if !j.bundle.state.is_empty() => {
+                    #[cfg(test)]
+                    w_path(env, "w.evm_step.flush");
+                    let mut delta = torus_state::incremental::EvmWindowDelta::default();
+                    delta.fold(&j.bundle);
+                    delta.note_accounts(evm_addrs.iter().copied());
+                    let side = sidecar.as_deref();
+                    evm_trie_prefix(env, *height, delta, |cf, key| {
+                        side.and_then(|s| s.lookup_row(cf, key))
+                            .or_else(|| pending.lookup_row(cf, key))
+                    })?
+                }
+                _ => rocksdb::WriteBatch::default(),
             };
             let flush_result = {
                 let mut trie_cache = env
@@ -1029,7 +1362,8 @@ fn run_job(
                 } else {
                     None
                 };
-                pending.flush_on_worker(
+                pending.flush_on_worker_after_batch(
+                    prefix,
                     sidecar.as_deref(),
                     &env.state_db,
                     Some(*height),
@@ -1038,21 +1372,24 @@ fn run_job(
                     Some(&mut chain),
                 )
             };
-            match flush_result {
-                Ok(stats) => observe_flush_stats(env, &stats),
-                Err(e) => {
-                    // `flush_with_native_trie_stats` returns Err both when the
-                    // write failed (nothing landed) and when the write landed but
-                    // trie maintenance failed. The durable marker tells them apart.
-                    return Err(if marker_is(env, *height) {
-                        JobError::TrieStale(e.to_string())
-                    } else {
-                        JobError::Write(e.to_string())
-                    });
+            let landed = match flush_result {
+                Ok(stats) => {
+                    observe_flush_stats(env, &stats);
+                    Ok(())
                 }
-            }
+                // `flush_with_native_trie_stats` returns Err both when the
+                // write failed (nothing landed) and when the write landed but
+                // trie maintenance failed. The durable marker tells them apart.
+                Err(e) if marker_is(env, *height) => Err(JobError::TrieStale(e.to_string())),
+                Err(e) => return Err(JobError::Write(e.to_string())),
+            };
+            // Item 7 option 0 task 2.3 (plan F4b): the batch is durable, so
+            // the EVM mirror is resynced even when the native trie
+            // maintenance failed (`TrieStale`), as a Checkpoint does. Before,
+            // a TrieStale Flush returned here and its native-credited EVM
+            // accounts kept a pre-resync mirror for good.
             resync_evm(env, *height, std::mem::take(evm_addrs));
-            Ok(())
+            landed
         }
     }
 }
@@ -1076,6 +1413,10 @@ fn marker_is(env: &WorkerEnv, height: u64) -> bool {
 /// CF_ACCOUNTS; resync the incremental mirror AFTER the batch is durable
 /// (DB->DB, sequenced here — design F2). Best-effort, as today.
 fn resync_evm(env: &WorkerEnv, height: u64, evm_addrs: Vec<Address>) {
+    #[cfg(test)]
+    if let Some(g) = &env.gate {
+        g.resync_seam();
+    }
     let resync_timer = std::time::Instant::now();
     if !evm_addrs.is_empty() {
         if let Err(e) = torus_state::incremental::resync_evm_accounts(&env.state_db, &evm_addrs) {
@@ -1085,6 +1426,109 @@ fn resync_evm(env: &WorkerEnv, height: u64, evm_addrs: Vec<Address>) {
     if let Some(m) = &env.metrics {
         m.exec_evm_resync_seconds
             .observe(resync_timer.elapsed().as_secs_f64());
+    }
+}
+
+/// Item 7 option 0 (task 2.1): stage a fast-path EVM block's side rows
+/// (receipts, hash -> number, tx index, CoreWriter links:
+/// [`torus_bridge::EvmSideRows`]) into W's sidecar overlay, so they join the
+/// block's atomic batch (Flush, Marker) or the window's side rows (Digest,
+/// written by the Checkpoint), like the action status. None of them is hashed
+/// or a root CF. A receipt that does not serialize is deterministic (the same
+/// block and receipts on every node): logged, and no side row is staged, as
+/// `commit_block_metadata` writes none on the serial path. A put error is a
+/// code bug (an unregistered CF): the job fails, so W latches the fail-stop
+/// and nothing of the block lands.
+fn stage_evm_side_rows(
+    overlay: &torus_state::NativeStateOverlay,
+    side: &torus_bridge::EvmSideRows,
+) -> Result<(), JobError> {
+    let rows = match side.rows() {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(%e, height = side.height, "flush worker: the EVM side rows do not encode (deterministic); none written");
+            return Ok(());
+        }
+    };
+    for (cf, key, value) in rows {
+        torus_state::StateBackend::put_cf_raw(overlay, cf, &key, &value)
+            .map_err(|e| JobError::Write(format!("EVM side row ({cf}): {e}")))?;
+    }
+    Ok(())
+}
+
+/// Item 7 option 0 (task 2.4): a sidecar holding a Marker's or a Digest's
+/// W-staged rows (the action status, the EVM side rows); `None` without
+/// either. A status that fails to stage is logged (as before); a side row
+/// fails the job ([`stage_evm_side_rows`]).
+fn side_rows_sidecar(
+    env: &WorkerEnv,
+    height: u64,
+    status: Option<torus_state::action_status::BlockActionStatus>,
+    side: Option<torus_bridge::EvmSideRows>,
+) -> Result<Option<Arc<FrozenPending>>, JobError> {
+    if status.is_none() && side.is_none() {
+        return Ok(None);
+    }
+    let overlay = torus_state::NativeStateOverlay::new(env.state_db.clone());
+    if let Some(status) = status {
+        let bytes = crate::action_results::encode_status(&status, env.metrics.as_deref());
+        if let Err(e) = torus_state::StateBackend::put_cf_raw(
+            &overlay,
+            torus_state::cf::CF_BLOCK_ACTION_STATUS,
+            &height.to_be_bytes(),
+            &bytes,
+        ) {
+            tracing::error!(%e, height, "flush worker: failed to stage the action status record");
+        }
+    }
+    if let Some(side) = &side {
+        stage_evm_side_rows(&overlay, side)?;
+    }
+    Ok(Some(overlay.freeze(height)))
+}
+
+/// Item 7 option 0 (task 2.4): the EVM trie step of a window (a Flush's one
+/// block, or a Checkpoint's window) as the prefix of its batch
+/// ([`torus_state::incremental::evm_window_prefix`]). A failed step is
+/// logged and lands the stale marker instead (task 2.3, F4: the window lands
+/// without its EVM ops, the root routes to the full scan, boot rebuilds); a
+/// stale trie gets no step. Only a failure to read or put the marker fails
+/// the job.
+fn evm_trie_prefix(
+    env: &WorkerEnv,
+    height: u64,
+    delta: torus_state::incremental::EvmWindowDelta,
+    rows: impl FnMut(&str, &[u8]) -> Option<Option<Vec<u8>>>,
+) -> Result<rocksdb::WriteBatch, JobError> {
+    // Item 7 option 0 (task 3.5): the crash seam inside the EVM trie step,
+    // before its batch is built (caught by `worker_loop`: W latches).
+    #[cfg(test)]
+    if env
+        .test_evm_step_panic
+        .as_ref()
+        .is_some_and(|p| p.swap(false, Ordering::SeqCst))
+    {
+        panic!("injected panic inside W's EVM trie step at {height} (test)");
+    }
+    let timer = std::time::Instant::now();
+    let prefix = torus_state::incremental::evm_window_prefix(&env.state_db, delta, rows);
+    // Item 7 option 0 (task 4.2): W's EVM trie step (bench Q11 report).
+    if let Some(m) = &env.metrics {
+        m.flush_worker_evm_trie_seconds
+            .observe(timer.elapsed().as_secs_f64());
+    }
+    match prefix {
+        Ok((batch, None)) => Ok(batch),
+        Ok((batch, Some(e))) => {
+            tracing::error!(
+                %e,
+                height,
+                "flush worker: EVM trie step failed; the window lands without its EVM mirror / trie ops and the EVM trie is marked stale (full-scan root until the boot rebuild)"
+            );
+            Ok(batch)
+        }
+        Err(e) => Err(JobError::Write(format!("EVM trie stale marker: {e}"))),
     }
 }
 
@@ -1133,6 +1577,24 @@ mod tests {
     /// section 84). Unset, empty, `1` / `true` (any case, trimmed) = on;
     /// `0` / `false` = off; anything else = off with a warning, so a typo
     /// never silently enables a consensus-timing change.
+    /// Item 7 option 0 (task 3.1): `TORUS_EVM_FAST_PATH` is OFF by default
+    /// (until Q11). `1` / `true` (any case, trimmed) = on; unset, empty, `0`
+    /// / `false` = off; anything else = off with a warning.
+    #[test]
+    fn parse_evm_fast_path_default_off() {
+        assert!(!parse_evm_fast_path(None), "unset: off");
+        for v in ["1", " 1 ", "true", "TRUE", " True "] {
+            assert!(parse_evm_fast_path(Some(v.to_string())), "{v:?}");
+        }
+        for v in ["", " ", "0", " 0 ", "false", "FALSE", " False "] {
+            assert!(!parse_evm_fast_path(Some(v.to_string())), "{v:?}");
+        }
+        // Garbage: off (warned), never on.
+        for v in ["off", "on", "yes", "2", "ture", "-1"] {
+            assert!(!parse_evm_fast_path(Some(v.to_string())), "{v:?}");
+        }
+    }
+
     #[test]
     fn epoch_fast_path_parse_default_on() {
         assert!(parse_epoch_fast_path(None));
@@ -1273,6 +1735,10 @@ mod tests {
                 metrics: None,
                 exec_failed: Arc::new(AtomicBool::new(false)),
                 gate,
+                test_on_complete: None,
+                test_paths: None,
+                test_drain: None,
+                test_evm_step_panic: None,
             },
             dir,
         )
@@ -1294,6 +1760,8 @@ mod tests {
             .submit(Job::Marker {
                 height: 1,
                 pending: Arc::new(FrozenPending::marker_only(1)),
+                action_status: None,
+                evm: None,
             })
             .unwrap();
         // W received 1 and is parked on the gate.
@@ -1306,6 +1774,8 @@ mod tests {
             w2.submit(Job::Marker {
                 height: 2,
                 pending: Arc::new(FrozenPending::marker_only(2)),
+                action_status: None,
+                evm: None,
             })
             .unwrap();
         });
@@ -1358,6 +1828,8 @@ mod tests {
             .submit(Job::Marker {
                 height: 1,
                 pending: Arc::new(FrozenPending::marker_only(1)),
+                action_status: None,
+                evm: None,
             })
             .unwrap();
         assert!(!worker.wait_idle(), "wait_idle must report the failure");
@@ -1368,6 +1840,8 @@ mod tests {
                 .submit(Job::Marker {
                     height: 2,
                     pending: Arc::new(FrozenPending::marker_only(2)),
+                    action_status: None,
+                    evm: None,
                 })
                 .is_err(),
             "no job may be accepted after the latch"
@@ -1392,6 +1866,8 @@ mod tests {
             .submit(Job::Marker {
                 height: 1,
                 pending: Arc::new(FrozenPending::marker_only(1)),
+                action_status: None,
+                evm: None,
             })
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1435,6 +1911,8 @@ mod tests {
         let _ = worker.submit(Job::Marker {
             height: 1,
             pending: Arc::new(FrozenPending::marker_only(1)),
+            action_status: None,
+            evm: None,
         });
         assert!(!worker.wait_idle(), "wait_idle must report the failure");
         assert!(worker.failed());
@@ -1548,6 +2026,7 @@ mod tests {
                     books: None,
                     order_nonces: Vec::new(),
                     action_status,
+                    evm: None,
                 })
                 .unwrap();
         }
@@ -1574,6 +2053,7 @@ mod tests {
                     evm_addrs: Vec::new(),
                     order_nonces: Vec::new(),
                     action_status,
+                    evm: None,
                 })
                 .unwrap();
         }
@@ -1677,6 +2157,7 @@ mod tests {
                     evm_addrs: Vec::new(),
                     order_nonces: Vec::new(),
                     action_status: None,
+                    evm: None,
                 })
                 .is_err(),
             "no job may be accepted after the latch"
@@ -1739,6 +2220,8 @@ mod tests {
             .submit(Job::Marker {
                 height: 5,
                 pending: Arc::new(FrozenPending::marker_only(5)),
+                action_status: None,
+                evm: None,
             })
             .unwrap();
         drop(worker);
@@ -1749,5 +2232,613 @@ mod tests {
             )
             .unwrap();
         assert_eq!(marker, Some(5u64.to_be_bytes().to_vec()));
+    }
+
+    // ---- Item 7 option 0 step 2 (the W side of the EVM fast path) ----
+
+    /// The four side-row CFs of an EVM block (plan task 2.1).
+    const O0_SIDE_CFS: [&str; 4] = [
+        torus_state::cf::CF_RECEIPTS,
+        torus_state::cf::CF_BLOCK_HASH_TO_NUMBER,
+        torus_state::cf::CF_TX_HASH_TO_LOCATION,
+        torus_state::cf::CF_CORE_WRITER_TX,
+    ];
+
+    /// A test EVM block at `height` with `n` receipts (every other tx
+    /// skipped: the receipts' `tx_index` has holes, D5) and `l` CoreWriter
+    /// links.
+    #[allow(clippy::type_complexity)]
+    fn o0_side_block(
+        height: u64,
+        n: u32,
+        l: u64,
+    ) -> (
+        torus_types::TorusBlock,
+        Vec<torus_types::Receipt>,
+        Vec<(u64, u64, torus_state::corewriter_tx::CoreWriterTxLink)>,
+    ) {
+        let mut header = torus_bridge::genesis_parent_header(30_000_000, 5);
+        header.height = height;
+        header.timestamp = 1_700_000_000_000 + height;
+        let block = torus_types::TorusBlock {
+            header,
+            native_actions: Vec::new(),
+            evm_transactions: (0..2 * n).map(|i| vec![0xEE, i as u8]).collect(),
+            core_writer_actions: Vec::new(),
+        };
+        let block_hash = alloy_primitives::keccak256(block.header.canonical_header_bytes());
+        let receipts = (0..n)
+            .map(|i| torus_types::Receipt {
+                tx_hash: alloy_primitives::B256::repeat_byte(0x10 + i as u8),
+                block_number: height,
+                block_hash,
+                tx_index: 2 * i + 1,
+                cumulative_gas_used: 21_000 * u64::from(i + 1),
+                gas_used: 21_000,
+                contract_address: (i % 2 == 1).then(|| Address::repeat_byte(0xC0 + i as u8)),
+                logs: vec![torus_types::Log {
+                    address: Address::repeat_byte(0xA0 + i as u8),
+                    topics: vec![alloy_primitives::B256::repeat_byte(i as u8)],
+                    data: vec![i as u8; 3],
+                }],
+                logs_bloom: Default::default(),
+                status: i % 3 != 2,
+                effective_gas_price: 7,
+            })
+            .collect();
+        let links = (0..l)
+            .map(|seq| {
+                (
+                    height + 1 + seq % 2,
+                    seq,
+                    torus_state::corewriter_tx::CoreWriterTxLink {
+                        tx_hash: alloy_primitives::B256::repeat_byte(0x10 + seq as u8),
+                        call_index: seq as u32,
+                    },
+                )
+            })
+            .collect();
+        (block, receipts, links)
+    }
+
+    /// Task 2.1: W's encoding of `EvmSideRows` (staged into its sidecar,
+    /// written by its flush) gives byte-equal receipts, hash -> number, tx
+    /// index and CoreWriter-link rows to the serial path's
+    /// `commit_block_metadata` + `append_links`, minus the header and the
+    /// body. Zero receipts (an all-skipped block, plan F2): exactly one row,
+    /// the hash -> number row.
+    #[test]
+    fn evm_side_rows_equal_commit_block_metadata() {
+        for (n, l) in [(0u32, 0u64), (1, 0), (0, 2), (3, 2), (6, 5)] {
+            let height = 40 + u64::from(n);
+            let (block, receipts, links) = o0_side_block(height, n, l);
+            let what = format!("{n} receipts, {l} links");
+
+            // Today's serial path.
+            let (reference, _r) = temp_env(None);
+            let reference = reference.state_db;
+            torus_bridge::BlockCommitter::commit_block_metadata(&reference, &block, &receipts)
+                .unwrap();
+            let mut batch = rocksdb::WriteBatch::default();
+            torus_state::corewriter_tx::append_links(&reference, &mut batch, &links).unwrap();
+            reference.write(batch).unwrap();
+
+            // W: the side rows staged into the sidecar overlay, flushed.
+            let (env, _w) = temp_env(None);
+            let db = env.state_db;
+            let overlay = torus_state::NativeStateOverlay::new(db.clone());
+            let side = torus_bridge::EvmSideRows::of(&block, receipts.clone(), links.clone());
+            stage_evm_side_rows(&overlay, &side).unwrap();
+            overlay
+                .freeze(height)
+                .flush_on_worker(None, &db, None, None, None, None)
+                .unwrap();
+
+            for cf in O0_SIDE_CFS {
+                let want = torus_state::StateBackend::iterate_cf(&reference, cf, None).unwrap();
+                let got = torus_state::StateBackend::iterate_cf(&db, cf, None).unwrap();
+                assert_eq!(got, want, "{what}: {cf}");
+            }
+            for cf in [
+                torus_state::cf::CF_BLOCK_HEADERS,
+                torus_state::cf::CF_BLOCK_BODIES,
+            ] {
+                assert!(
+                    !torus_state::StateBackend::iterate_cf(&reference, cf, None)
+                        .unwrap()
+                        .is_empty(),
+                    "{what}: the serial path writes {cf}"
+                );
+                assert!(
+                    torus_state::StateBackend::iterate_cf(&db, cf, None)
+                        .unwrap()
+                        .is_empty(),
+                    "{what}: W never writes {cf} (a dispatch row)"
+                );
+            }
+            let count = |cf| {
+                torus_state::StateBackend::iterate_cf(&db, cf, None)
+                    .unwrap()
+                    .len()
+            };
+            assert_eq!(count(torus_state::cf::CF_BLOCK_HASH_TO_NUMBER), 1, "{what}");
+            assert_eq!(count(torus_state::cf::CF_RECEIPTS), n as usize, "{what}");
+            assert_eq!(
+                count(torus_state::cf::CF_TX_HASH_TO_LOCATION),
+                n as usize,
+                "{what}"
+            );
+            assert_eq!(
+                count(torus_state::cf::CF_CORE_WRITER_TX),
+                l as usize,
+                "{what}"
+            );
+        }
+    }
+
+    // ---- Item 7 option 0 task 2.4: the job plumbing ----
+
+    /// Every CF but the dispatch rows (header, body): W never writes them.
+    fn dump_no_dispatch(db: &StateDb) -> CfDump {
+        dump_all(db)
+            .into_iter()
+            .filter(|(cf, _)| {
+                *cf != torus_state::cf::CF_BLOCK_HEADERS && *cf != torus_state::cf::CF_BLOCK_BODIES
+            })
+            .collect()
+    }
+
+    /// The all-skipped EVM block's action status (every tx skipped).
+    fn o0_skipped_status() -> torus_state::action_status::BlockActionStatus {
+        torus_state::action_status::BlockActionStatus {
+            evm_skipped: vec![true, true],
+            native_skipped: Vec::new(),
+            native_failed: Vec::new(),
+            core_writer: Vec::new(),
+        }
+    }
+
+    /// The fast path's Marker for an all-skipped EVM block at `height`
+    /// without a native phase (plan F2, decision 11): the 1-key marker set,
+    /// the status row, and an `evm` with an empty bundle whose side rows are
+    /// the hash -> number row only.
+    fn o0_all_skipped_marker(height: u64) -> (Job, torus_types::TorusBlock) {
+        let (block, receipts, links) = o0_side_block(height, 0, 0);
+        let job = Job::Marker {
+            height,
+            pending: Arc::new(FrozenPending::marker_only(height)),
+            action_status: Some(o0_skipped_status()),
+            evm: Some(EvmJobRows {
+                bundle: torus_bridge::BundleState::default(),
+                side: torus_bridge::EvmSideRows::of(&block, receipts, links),
+            }),
+        };
+        (job, block)
+    }
+
+    /// Task 2.4 (F2): a Marker job carries its action status. At interval
+    /// 0 W writes it in the marker batch; with an interval the hand-off's
+    /// Marker -> Digest conversion (`Job::into_digest`, `pipeline_handoff`)
+    /// keeps it for the checkpoint. Both DBs equal, the status row present.
+    #[test]
+    fn marker_job_carries_action_status_to_checkpoint() {
+        let status = |h: u64| {
+            let mut s = o0_skipped_status();
+            s.native_skipped = vec![h.is_multiple_of(2)];
+            s
+        };
+        // Interval 0.
+        let (env, _d0) = temp_env(None);
+        let per_block = env.state_db.clone();
+        torus_state::running_hash::configure_activation(&per_block, Some(1)).unwrap();
+        let worker = FlushWorker::spawn(env, 0);
+        for h in 1..=4 {
+            let (pending, action_status) = ckpt_block(&per_block, h);
+            worker
+                .submit(Job::Flush {
+                    height: h,
+                    pending,
+                    evm_addrs: Vec::new(),
+                    books: None,
+                    order_nonces: Vec::new(),
+                    action_status,
+                    evm: None,
+                })
+                .unwrap();
+        }
+        worker
+            .submit(Job::Marker {
+                height: 5,
+                pending: Arc::new(FrozenPending::marker_only(5)),
+                action_status: Some(status(5)),
+                evm: None,
+            })
+            .unwrap();
+        assert!(worker.wait_idle());
+        drop(worker);
+        let row = per_block
+            .get_cf_raw(torus_state::cf::CF_BLOCK_ACTION_STATUS, &5u64.to_be_bytes())
+            .unwrap();
+        assert!(row.is_some(), "interval 0: the Marker's status row landed");
+
+        // Every5: digests, the Marker converted, the checkpoint.
+        let (env, _d1) = temp_env(None);
+        let db = env.state_db.clone();
+        torus_state::running_hash::configure_activation(&db, Some(1)).unwrap();
+        let worker = FlushWorker::spawn_checkpointing(env, 0);
+        let mut layer = digest_window(&worker, &db, 1..=4);
+        let marker = Arc::new(FrozenPending::marker_only(5));
+        layer.merge(&marker);
+        worker
+            .submit(
+                Job::Marker {
+                    height: 5,
+                    pending: marker,
+                    action_status: Some(status(5)),
+                    evm: None,
+                }
+                .into_digest(),
+            )
+            .unwrap();
+        assert!(worker.wait_idle());
+        assert_eq!(
+            db.get_cf_raw(torus_state::cf::CF_BLOCK_ACTION_STATUS, &5u64.to_be_bytes())
+                .unwrap(),
+            None,
+            "a digest writes nothing"
+        );
+        worker
+            .submit(Job::Checkpoint {
+                height: 5,
+                layer: Arc::new(layer),
+            })
+            .unwrap();
+        assert!(worker.wait_idle());
+        drop(worker);
+        assert_dumps_eq(
+            &dump_all(&db),
+            &dump_all(&per_block),
+            "Marker status at the checkpoint",
+        );
+    }
+
+    /// Task 2.4 (R1, decision 11): an all-skipped EVM block's Marker writes
+    /// its hash -> number side row with the marker at interval 0, and at the
+    /// checkpoint with Every5 (via the Marker -> Digest conversion); byte-
+    /// equal to `commit_block_metadata`'s, no receipt or tx-index row.
+    #[test]
+    fn marker_job_side_rows_land_at_interval_0_and_at_checkpoint() {
+        let (env, _r) = temp_env(None);
+        let reference = env.state_db;
+        let (_, block) = o0_all_skipped_marker(5);
+        torus_bridge::BlockCommitter::commit_block_metadata(&reference, &block, &[]).unwrap();
+        let side_rows = |db: &StateDb| -> Vec<_> {
+            O0_SIDE_CFS
+                .iter()
+                .map(|cf| torus_state::StateBackend::iterate_cf(db, cf, None).unwrap())
+                .collect()
+        };
+        let want = side_rows(&reference);
+        assert_eq!(want[1].len(), 1, "the hash -> number row");
+        assert!(want[0].is_empty() && want[2].is_empty() && want[3].is_empty());
+
+        // Interval 0.
+        let (env, _d0) = temp_env(None);
+        let per_block = env.state_db.clone();
+        torus_state::running_hash::configure_activation(&per_block, Some(1)).unwrap();
+        let worker = FlushWorker::spawn(env, 0);
+        for h in 1..=4 {
+            let (pending, action_status) = ckpt_block(&per_block, h);
+            worker
+                .submit(Job::Flush {
+                    height: h,
+                    pending,
+                    evm_addrs: Vec::new(),
+                    books: None,
+                    order_nonces: Vec::new(),
+                    action_status,
+                    evm: None,
+                })
+                .unwrap();
+        }
+        worker.submit(o0_all_skipped_marker(5).0).unwrap();
+        assert!(worker.wait_idle());
+        drop(worker);
+        assert_eq!(
+            side_rows(&per_block),
+            want,
+            "interval 0: in the marker batch"
+        );
+        assert!(!torus_state::incremental::is_evm_trie_stale(&per_block).unwrap());
+
+        // Every5.
+        let (env, _d1) = temp_env(None);
+        let db = env.state_db.clone();
+        torus_state::running_hash::configure_activation(&db, Some(1)).unwrap();
+        let worker = FlushWorker::spawn_checkpointing(env, 0);
+        let mut layer = digest_window(&worker, &db, 1..=4);
+        let (job, _) = o0_all_skipped_marker(5);
+        if let Job::Marker { pending, .. } = &job {
+            layer.merge(pending);
+        }
+        worker.submit(job.into_digest()).unwrap();
+        assert!(worker.wait_idle());
+        assert!(
+            side_rows(&db).iter().all(Vec::is_empty),
+            "before the checkpoint: no side row"
+        );
+        worker
+            .submit(Job::Checkpoint {
+                height: 5,
+                layer: Arc::new(layer),
+            })
+            .unwrap();
+        assert!(worker.wait_idle());
+        drop(worker);
+        assert_eq!(side_rows(&db), want, "Every5: at the checkpoint");
+        assert_dumps_eq(
+            &dump_all(&db),
+            &dump_all(&per_block),
+            "interval 0 vs Every5",
+        );
+    }
+
+    /// A seeded EVM state (accounts 0..40 of `o0_addr`, storage on 0..10)
+    /// with its trie built, as boot leaves it.
+    fn o0_evm_seed(db: &StateDb) {
+        for i in 0..40u8 {
+            db.put_account(&o0_addr(i), &o0_eoa(1_000 + u64::from(i), u64::from(i) + 1))
+                .unwrap();
+            if i < 10 {
+                for slot in 0..3u64 {
+                    db.put_storage(
+                        &o0_addr(i),
+                        &alloy_primitives::U256::from(slot),
+                        &alloy_primitives::U256::from(u64::from(i) * 100 + slot + 1),
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        torus_state::incremental::ensure_trie_built(db).unwrap();
+    }
+
+    fn o0_addr(i: u8) -> Address {
+        let mut b = [0x40u8; 20];
+        b[19] = i;
+        Address::from(b)
+    }
+
+    fn o0_eoa(balance: u64, nonce: u64) -> revm::state::AccountInfo {
+        revm::state::AccountInfo {
+            balance: alloy_primitives::U256::from(balance),
+            nonce,
+            code_hash: torus_state::db::KECCAK_EMPTY,
+            account_id: None,
+            code: None,
+        }
+    }
+
+    /// One fast-path EVM block at `height`: a random bundle (changes with
+    /// storage churn on 0..10, EIP-161 empties and deletes on 10..40) absorbed
+    /// into the block's overlay, a native credit to an EVM account (every
+    /// other block one the bundle also touched), a native row and the applied
+    /// marker; frozen. Height 3 is all-skipped (empty bundle, no receipt).
+    #[allow(clippy::type_complexity)]
+    fn o0_evm_block(
+        db: &StateDb,
+        height: u64,
+        rng: &mut u64,
+    ) -> (
+        Arc<FrozenPending>,
+        torus_bridge::BundleState,
+        torus_types::TorusBlock,
+        Vec<torus_types::Receipt>,
+        Vec<(u64, u64, torus_state::corewriter_tx::CoreWriterTxLink)>,
+    ) {
+        use torus_state::StateBackend;
+        let mut next = || {
+            *rng ^= *rng << 13;
+            *rng ^= *rng >> 7;
+            *rng ^= *rng << 17;
+            *rng
+        };
+        let skipped = height == 3;
+        let mut builder = torus_bridge::BundleState::builder(0..=0);
+        let mut first = None;
+        if !skipped {
+            let mut touched = std::collections::BTreeSet::new();
+            for _ in 0..(next() % 4) + 1 {
+                let kind = next() % 5;
+                let i = if kind >= 2 {
+                    (next() % 10) as u8
+                } else {
+                    10 + (next() % 30) as u8
+                };
+                if !touched.insert(i) {
+                    continue;
+                }
+                let a = o0_addr(i);
+                first.get_or_insert(a);
+                match kind {
+                    0 => builder = builder.state_original_account_info(a, o0_eoa(1, 1)),
+                    1 => builder = builder.state_present_account_info(a, o0_eoa(0, 0)),
+                    _ => {
+                        builder = builder.state_present_account_info(
+                            a,
+                            o0_eoa(next() % 9_000 + 1, next() % 9 + 1),
+                        );
+                        let mut st = revm::primitives::StorageKeyMap::default();
+                        for _ in 0..(next() % 3) + 1 {
+                            let v = if next() % 3 == 0 { 0 } else { next() % 999 + 1 };
+                            st.insert(
+                                alloy_primitives::U256::from(next() % 6),
+                                (
+                                    alloy_primitives::U256::ZERO,
+                                    alloy_primitives::U256::from(v),
+                                ),
+                            );
+                        }
+                        builder = builder.state_storage(a, st);
+                    }
+                }
+            }
+        }
+        let bundle = builder.build();
+        let overlay = torus_state::NativeStateOverlay::new(db.clone());
+        overlay
+            .absorb_evm(&bundle, torus_state::NativeStateOverlay::new(db.clone()))
+            .unwrap();
+        let credited = match first {
+            Some(a) if height.is_multiple_of(2) => a,
+            _ => o0_addr(10 + (next() % 30) as u8),
+        };
+        overlay
+            .put_cf_raw(
+                torus_state::cf::CF_ACCOUNTS,
+                credited.as_slice(),
+                &torus_state::db::encode_account_info(&o0_eoa(50_000 + height, 7)),
+            )
+            .unwrap();
+        overlay
+            .put_cf_raw(
+                torus_state::cf::CF_NATIVE_ORDERS,
+                &[b'o', height as u8],
+                &[1, 2],
+            )
+            .unwrap();
+        overlay
+            .put_cf_raw(
+                torus_state::cf::CF_CONSENSUS_META,
+                torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
+                &height.to_be_bytes(),
+            )
+            .unwrap();
+        let (block, receipts, links) = if skipped {
+            o0_side_block(height, 0, 0)
+        } else {
+            o0_side_block(height, (height % 3) as u32 + 1, height % 2)
+        };
+        (overlay.freeze(height), bundle, block, receipts, links)
+    }
+
+    /// Task 2.4 (C13): fast-path EVM blocks through W, as `Job::Flush` at
+    /// interval 0 and as `Job::Digest`s closed by `Job::Checkpoint`s with an
+    /// interval, give the DB today's serial path gives (each block's trie
+    /// batch prefix + `append_links`, `commit_block_metadata`, the flush,
+    /// then `resync_evm_accounts`): every CF but the dispatch rows (header,
+    /// body), CF_HASHED_* and CF_TRIE_* included; the EVM root equals the
+    /// full scan. One all-skipped block (empty bundle) rides along.
+    #[test]
+    fn evm_jobs_flush_and_checkpoint_equal_serial() {
+        const N: u64 = 10;
+        let blocks = |db: &StateDb| {
+            let mut rng = 0x00e7_a1b2_c3d4_e5f6u64;
+            (1..=N)
+                .map(|h| o0_evm_block(db, h, &mut rng))
+                .collect::<Vec<_>>()
+        };
+        let job_rows =
+            |bundle: &torus_bridge::BundleState,
+             block: &torus_types::TorusBlock,
+             receipts: &[torus_types::Receipt],
+             links: &[(u64, u64, torus_state::corewriter_tx::CoreWriterTxLink)]| {
+                Some(EvmJobRows {
+                    bundle: bundle.clone(),
+                    side: torus_bridge::EvmSideRows::of(block, receipts.to_vec(), links.to_vec()),
+                })
+            };
+
+        // Today's serial path.
+        let (env, _r) = temp_env(None);
+        let reference = env.state_db;
+        torus_state::running_hash::configure_activation(&reference, Some(1)).unwrap();
+        o0_evm_seed(&reference);
+        for (pending, bundle, block, receipts, links) in blocks(&reference) {
+            let h = pending.height();
+            let (_root, mut prefix) =
+                torus_state::incremental::evm_block_trie_batch(&reference, &bundle, None).unwrap();
+            torus_state::corewriter_tx::append_links(&reference, &mut prefix, &links).unwrap();
+            torus_bridge::BlockCommitter::commit_block_metadata(&reference, &block, &receipts)
+                .unwrap();
+            pending
+                .flush_after_batch_with_native_trie_stats(prefix, &reference, Some(h), None, None)
+                .unwrap();
+            torus_state::incremental::resync_evm_accounts(
+                &reference,
+                &pending.dirty_evm_accounts(),
+            )
+            .unwrap();
+        }
+        let want = dump_no_dispatch(&reference);
+        let empty = torus_bridge::BundleState::default();
+        let root = |db: &StateDb| {
+            let incr = torus_state::incremental::incremental_evm_root(db, &empty)
+                .unwrap()
+                .0;
+            let full = torus_state::incremental::full_post_bundle_evm_root(db, &empty).unwrap();
+            assert_eq!(incr, full, "incremental root == full scan");
+            incr
+        };
+        let want_root = root(&reference);
+
+        // W, interval 0: one Flush per block.
+        let (env, _d0) = temp_env(None);
+        let db = env.state_db.clone();
+        torus_state::running_hash::configure_activation(&db, Some(1)).unwrap();
+        o0_evm_seed(&db);
+        let worker = FlushWorker::spawn(env, 0);
+        for (pending, bundle, block, receipts, links) in blocks(&db) {
+            let evm_addrs = pending.dirty_evm_accounts();
+            worker
+                .submit(Job::Flush {
+                    height: pending.height(),
+                    evm_addrs,
+                    books: None,
+                    order_nonces: Vec::new(),
+                    action_status: None,
+                    evm: job_rows(&bundle, &block, &receipts, &links),
+                    pending,
+                })
+                .unwrap();
+        }
+        assert!(worker.wait_idle());
+        drop(worker);
+        assert_dumps_eq(&dump_no_dispatch(&db), &want, "interval 0");
+        assert_eq!(root(&db), want_root);
+
+        // W, an interval: digests, checkpoints at 5 and 10.
+        let (env, _d1) = temp_env(None);
+        let db = env.state_db.clone();
+        torus_state::running_hash::configure_activation(&db, Some(1)).unwrap();
+        o0_evm_seed(&db);
+        let worker = FlushWorker::spawn_checkpointing(env, 0);
+        let mut layer = torus_state::CheckpointLayer::new();
+        for (pending, bundle, block, receipts, links) in blocks(&db) {
+            let h = pending.height();
+            layer.merge(&pending);
+            worker
+                .submit(Job::Digest {
+                    height: h,
+                    evm_addrs: pending.dirty_evm_accounts(),
+                    order_nonces: Vec::new(),
+                    action_status: None,
+                    evm: job_rows(&bundle, &block, &receipts, &links),
+                    pending,
+                })
+                .unwrap();
+            if h % 5 == 0 {
+                worker
+                    .submit(Job::Checkpoint {
+                        height: h,
+                        layer: Arc::new(std::mem::take(&mut layer)),
+                    })
+                    .unwrap();
+            }
+        }
+        assert!(worker.wait_idle());
+        drop(worker);
+        assert_dumps_eq(&dump_no_dispatch(&db), &want, "Every5");
+        assert_eq!(root(&db), want_root);
     }
 }

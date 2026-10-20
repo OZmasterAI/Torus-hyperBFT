@@ -215,6 +215,14 @@ pub const META_NATIVE_APPLIED_HEIGHT: &[u8] = b"native_applied_height";
 /// Written in the flush's atomic batch; cleared only by a full `build_native_trie_to_cf`.
 pub const META_NATIVE_TRIE_STALE: &[u8] = b"native_trie_stale";
 
+/// Key in CF_CONSENSUS_META (node-local, never hashed: outside `META_CONSENSUS_PREFIXES`):
+/// present (`[1]`) iff the persistent EVM trie and hashed mirror (CF_TRIE_*, CF_HASHED_*) lag
+/// CF_ACCOUNTS / CF_STORAGE because an EVM trie step failed (item 7 option 0, plan F4: the
+/// window landed without its EVM ops). While set, the EVM root routes to the full scan and no
+/// step extends the trie; boot wipes and rebuilds both (`incremental::ensure_trie_built`), then
+/// clears it.
+pub const META_EVM_TRIE_STALE: &[u8] = b"evm_trie_stale";
+
 /// Key in CF_CONSENSUS_META (node-local, never hashed): the running state hash after the last
 /// applied block, `height(8 BE) ‖ hash(32)`. Written in the flush's atomic batch with
 /// `META_NATIVE_APPLIED_HEIGHT` (docs/plans/running-state-hash-impl.md).

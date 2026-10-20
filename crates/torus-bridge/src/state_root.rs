@@ -42,7 +42,13 @@ fn evm_root_routed(
     // Fall back to the full scan when incremental is off OR the persistent trie hasn't been built
     // yet (an unmigrated DB — production builds it at boot, but unit tests may bypass that). This
     // keeps default-on safe: a missing trie yields the correct full-scan root, never a wrong one.
-    if !incremental || !torus_state::incremental::is_trie_built(state_db)? {
+    // Item 7 option 0 (task 2.3, F4): so does a trie marked stale (an EVM trie step failed and its
+    // window landed without the EVM ops): it lags the plain state until the boot rebuild, so it is
+    // neither extended (no `TrieUpdates`) nor checked by the oracle below (which would fail-stop).
+    if !incremental
+        || !torus_state::incremental::is_trie_built(state_db)?
+        || torus_state::incremental::is_evm_trie_stale(state_db)?
+    {
         return Ok((compute_post_bundle_evm_root(state_db, bundle)?, None));
     }
     let (root, updates) = torus_state::incremental::incremental_evm_root(state_db, bundle)?;
@@ -371,5 +377,68 @@ mod tests {
             "trie really lags"
         );
         assert_eq!(native_root_routed(&db, true).unwrap(), full);
+    }
+
+    /// Item 7 option 0 task 2.3 (F4): an EVM trie marked stale (the flush
+    /// worker's EVM trie step failed, the window landed without its EVM
+    /// ops) routes the EVM root to the full scan, with no `TrieUpdates` and
+    /// no incremental-vs-full-scan oracle: a lagging trie must never be
+    /// extended or reach the oracle's fail-stop. Without the marker the same
+    /// lagging trie trips the oracle (debug builds), the failure mode F4
+    /// names.
+    #[test]
+    fn stale_trie_routes_root_to_full_scan() {
+        use torus_state::incremental::{incremental_evm_root, is_evm_trie_stale};
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let eoa = |balance: u64, nonce: u64| AccountInfo {
+            balance: U256::from(balance),
+            nonce,
+            code_hash: KECCAK_EMPTY,
+            account_id: None,
+            code: None,
+        };
+        for i in 1u8..24 {
+            let mut b = [0u8; 20];
+            b[0] = i;
+            b[19] = i;
+            db.put_account(&Address::from(b), &eoa(u64::from(i) * 1000, u64::from(i)))
+                .unwrap();
+        }
+        build_trie_to_cf(&db).unwrap();
+        // The step failed: plain state moved on, the mirror and trie did not.
+        db.put_account(
+            &address!("0b000000000000000000000000000000000000bb"),
+            &eoa(77, 1),
+        )
+        .unwrap();
+        let bundle = BundleState::builder(0..=0)
+            .state_present_account_info(
+                address!("0c000000000000000000000000000000000000cc"),
+                eoa(42, 9),
+            )
+            .build();
+        let full = super::compute_post_bundle_evm_root(&db, &bundle).unwrap();
+        assert_ne!(
+            incremental_evm_root(&db, &bundle).unwrap().0,
+            full,
+            "the trie really lags"
+        );
+        if cfg!(debug_assertions) {
+            assert!(
+                evm_root_routed(&db, &bundle, true).is_err(),
+                "unmarked, the lagging trie trips the oracle (F4)"
+            );
+        }
+        let mut batch = rocksdb::WriteBatch::default();
+        torus_state::incremental::mark_evm_trie_stale(&db, &mut batch).unwrap();
+        db.write(batch).unwrap();
+        assert!(is_evm_trie_stale(&db).unwrap());
+        let (root, updates) = evm_root_routed(&db, &bundle, true).unwrap();
+        assert_eq!(root, full, "stale: the full-scan root");
+        assert!(
+            updates.is_none(),
+            "stale: no TrieUpdates to extend the lagging trie"
+        );
     }
 }

@@ -1,6 +1,9 @@
 # Design: item 7 step 3, isolate trading from EVM
 
-Status: revision 2 (s127), DESIGN ONLY, for the owner. Nothing built. Revision 1 (`3b79a617`) went through two
+Status: revision 2 (s127). **Option 0 (P1 + P2) BUILT** on `feat/item7-option0` (plan `item7-option0-impl.md`,
+steps 0-4, G0-G4, 2026-10-19), behind `TORUS_EVM_FAST_PATH` (default off), NOT merged: it waits on the branch's Codex
+review (plan task 4.4) and bench Q11 (plan section 6); the default flips to on if Q11 passes. RPC freshness as
+question 4 a (`docs/api/eth-head.md`). T (P3), HL order and C0 are not built. Revision 1 (`3b79a617`) went through two
 adversarial reviews: Codex (`reviews/codex-item7-step3-adv.md`, needs-attention: P1 + P2) and Claude
 (`reviews/item7-step3-claude-review.md`, build with changes: 3 high, 5 medium, 2 weak spots, missing tests). Every
 finding is verified in code and handled; section 10 maps each one to the change. Owner direction s127 is in: the RPC
