@@ -144,11 +144,7 @@ A now, on this branch (it is the "item 2" as listed), then B as its own item
    tip is this block; or the block holds this replica's highest phase
    certificate (validator-set-update re-proposal). The TC's `high_tip`
    field is unsigned and never counts on its own, so a byzantine leader
-   still cannot pass a fresh stale block off as a re-proposal. During a
-   validator-set transition (a TC is correct under either set), the signed
-   tips count only under a set the TC is correctly signed under, with that
-   set's own powers and faulty threshold (stop-review WARN: one set's
-   signers must not borrow the other set's positional weights).
+   still cannot pass a fresh stale block off as a re-proposal.
    The analysis below was written before that change. A
    byzantine leader can propose `ts = parent.ts` after a stall, so an old
    aggregate has age 0 in that block. A "reject ts < local − 30 s" rule
