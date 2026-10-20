@@ -1743,6 +1743,23 @@ fn run_matching_engine_on<T: torus_state::StateBackend>(
     println!("Warmup:  {} orders", format_num(warmup as u64));
     println!();
 
+    // Pre-testnet P0: orders on a market without a CF_NATIVE_MARKETS row are
+    // rejected in consensus, so the bench lists its markets (placeholder
+    // rows: tick / lot 1, no margin config, the book an unlisted market used
+    // to get). Genesis-listed markets keep their rows.
+    for m in 0..market_count {
+        let key = m.to_be_bytes();
+        if backend
+            .get_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &key)
+            .expect("market row read")
+            .is_none()
+        {
+            backend
+                .put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &key, b"listed")
+                .expect("list bench market");
+        }
+    }
+
     let mut ctx = NativeExecContext::new(
         backend,
         1,
