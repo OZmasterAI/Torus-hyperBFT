@@ -83,7 +83,7 @@ deletes, so a half-pruned range is never served):
 
 ## What Gets Pruned
 
-### Pruned (3 column families)
+### Pruned (4 column families)
 
 | Data | Key Format | Impact |
 |------|-----------|--------|
@@ -170,6 +170,11 @@ These always work regardless of pruning:
 The `torus_db_size_bytes` Prometheus gauge reports the total size of the
 RocksDB data directory. Updated every 60 seconds.
 
+Pruner metrics: `torus_pruner_blocks_removed` (heights pruned), and in filter
+mode `torus_pruner_files_dropped` (SST files dropped whole),
+`torus_pruner_filter_rows_dropped` (rows the compaction filter dropped) and the
+`torus_pruner_filter_cutoff` gauge (0 = the filter drops nothing).
+
 Alerting rules in `monitoring/alerts/node.yml`:
 - **DatabaseLargeWarning**: > 100 GB
 - **DatabaseLargeCritical**: > 200 GB
@@ -216,5 +221,17 @@ The snapshot must have been created before the data was pruned.
   batches to avoid RocksDB compaction latency spikes
 - **Persistence**: Pruning progress is stored in the database and survives
   node restarts
-- **RocksDB `delete_range`**: Uses efficient range deletion for contiguous
-  key ranges (block bodies and receipts are keyed by height)
+- **Prune mode (`TORUS_PRUNE_MODE`, node-local, read at startup)**:
+  - `filter` (default): no deletes. Each pass persists the new cutoff (synced),
+    then RocksDB drops the old rows: whole SST files that lie below the cutoff
+    go at once (`DeleteFilesInRange`), the rest during compactions RocksDB runs
+    anyway (a compaction filter on the four height-keyed CFs). Rows below the
+    cutoff that are still on disk are never served: every read of these CFs
+    hides them, so RPC, crash replay and the DA GC restore answer exactly as
+    with the eager delete. Perf doc section 103.6: the range tombstones of the
+    `range` mode doubled `cf_block_bodies` compaction on the state DB.
+  - `range`: today's eager `delete_range` per batch of contiguous heights (kept
+    for A/B runs).
+
+  Both modes share the cutoff on disk, so a node can switch between them across
+  restarts. Code: `crates/torus-state/src/prune_filter.rs`.

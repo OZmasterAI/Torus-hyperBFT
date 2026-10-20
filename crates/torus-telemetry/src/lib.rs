@@ -233,6 +233,14 @@ pub struct Metrics {
 
     // Pruner metrics
     pub pruner_blocks_removed: Counter,
+    /// s132 (`TORUS_PRUNE_MODE=filter`): SST files of the height-keyed CFs
+    /// the pruner dropped whole with `DeleteFilesInRange`.
+    pub pruner_files_dropped: Counter,
+    /// s132: rows the compaction filter dropped below the prune cutoff.
+    pub pruner_filter_rows_dropped: Counter,
+    /// s132: the compaction filter's cutoff height (0 = drops nothing:
+    /// range mode, retention off, or not armed yet).
+    pub pruner_filter_cutoff: Gauge,
 
     // RPC metrics
     pub rpc_requests_total: Family<Vec<(String, String)>, Counter>,
@@ -1586,6 +1594,24 @@ impl Metrics {
             "torus_pruner_blocks_removed",
             "Total blocks removed by pruner",
             pruner_blocks_removed.clone(),
+        );
+        let pruner_files_dropped = Counter::default();
+        registry.register(
+            "torus_pruner_files_dropped",
+            "SST files of the pruned height-keyed CFs dropped whole by DeleteFilesInRange (filter mode)",
+            pruner_files_dropped.clone(),
+        );
+        let pruner_filter_rows_dropped = Counter::default();
+        registry.register(
+            "torus_pruner_filter_rows_dropped",
+            "Rows below the prune cutoff dropped by the compaction filter (filter mode)",
+            pruner_filter_rows_dropped.clone(),
+        );
+        let pruner_filter_cutoff = Gauge::default();
+        registry.register(
+            "torus_pruner_filter_cutoff",
+            "Prune compaction filter cutoff height (0 = filter drops nothing)",
+            pruner_filter_cutoff.clone(),
         );
 
         let rpc_requests_total = Family::<Vec<(String, String)>, Counter>::default();
@@ -3073,6 +3099,9 @@ impl Metrics {
             sell_top_ups_partial,
             sell_top_ups_none,
             pruner_blocks_removed,
+            pruner_files_dropped,
+            pruner_filter_rows_dropped,
+            pruner_filter_cutoff,
             rpc_requests_total,
             rpc_request_duration_seconds,
             gossip_messages_received,

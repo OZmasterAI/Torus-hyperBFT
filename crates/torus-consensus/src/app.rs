@@ -12060,6 +12060,54 @@ mod crash_recovery_tests {
         assert_eq!(last.height, 3);
     }
 
+    /// s132: the crash-replay loader (also the RH4 DA GC restore's source) treats a
+    /// pruned height as "no durable body" in both prune modes, though in filter mode the
+    /// row is still on disk until a compaction drops it; at and above the cutoff it loads.
+    #[test]
+    fn load_replay_body_hides_pruned_heights_in_both_prune_modes() {
+        use std::sync::atomic::AtomicU64;
+        use torus_state::prune_filter::PruneMode;
+        use torus_state::{PrunerConfig, StatePruner};
+        for mode in [PruneMode::Range, PruneMode::Filter] {
+            let dir = tempfile::tempdir().unwrap();
+            let state_db = StateDb::open_with_prune_mode(dir.path(), mode).unwrap();
+            for h in 1..=10u64 {
+                persist_committed_block_durably(
+                    &state_db,
+                    &make_block(h, vec![sign_claim_rewards(h)]),
+                );
+            }
+            state_db
+                .put_cf_raw(
+                    CF_CONSENSUS_META,
+                    torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
+                    &10u64.to_be_bytes(),
+                )
+                .unwrap();
+            let cfg = PrunerConfig {
+                retention_blocks: 4,
+                prune_interval_blocks: 1,
+                batch_size: 100,
+                trade_retention_blocks: None,
+            };
+            StatePruner::new(state_db.clone(), cfg, Arc::new(AtomicU64::new(0)))
+                .maybe_prune(10)
+                .unwrap();
+            let raw = state_db
+                .inner()
+                .get_cf(state_db.cf_handle(CF_BLOCK_BODIES).unwrap(), 5u64.to_be_bytes())
+                .unwrap();
+            assert_eq!(raw.is_some(), mode == PruneMode::Filter, "{mode:?}: lazy on disk");
+            for h in 1..=10u64 {
+                assert_eq!(
+                    load_replay_body(&state_db, h).is_some(),
+                    h >= 6,
+                    "{mode:?}: height {h} (cutoff 6)"
+                );
+            }
+        }
+    }
+
     /// FIX 1a: `persist_committed_block_durably` writes BOTH the header (with the committed
     /// block hash in the first 32 bytes, for `detect_conflicting_commit`) and the full body,
     /// so the two crash-replay loaders (`load_replay_header` / `load_replay_body`) both resolve
