@@ -1051,6 +1051,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
     let state_db_for_handler = state_db.clone();
     let mempool_for_handler = mempool.clone();
+    let metrics_for_handler = metrics.clone();
     let latest_height_shared = Arc::new(std::sync::atomic::AtomicU64::new(find_latest_height(
         &state_db,
     )));
@@ -1141,22 +1142,25 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             rec_timeout.view_timeout(ev.timestamp);
         })
         .on_commit_block(move |event: &CommitBlockEvent| {
+            // T5.3 part 0: the whole handler, timed (event-bus thread).
+            let handler_timer = std::time::Instant::now();
+            let handler_metrics = &metrics_for_handler;
+            let _observe_handler = scopeguard_observe(move || {
+                handler_metrics
+                    .on_commit_block_handler_seconds
+                    .observe(handler_timer.elapsed().as_secs_f64());
+            });
             rec_commit.commit_block(event.timestamp);
             let height = find_latest_height(&state_db_for_handler);
             info!(height, "on_commit_block fired");
             if height == 0 {
                 return;
             }
-            // Item 7 step 2 (decision 7): the raw DB's applied marker (absent = 0), read before
-            // the state nonces the prune reads from the same DB. Not `height`: the header row
-            // is written at commit, before execution.
-            let executed = state_db_for_handler
-                .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
-                .ok()
-                .flatten()
-                .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
-                .map_or(0, u64::from_be_bytes);
-            mempool_for_handler.prune_committed_txs(executed);
+            prune_committed_after_commit(
+                &state_db_for_handler,
+                &mempool_for_handler,
+                Some(&metrics_for_handler),
+            );
             latest_height_for_handler.store(height, std::sync::atomic::Ordering::Relaxed);
             match state_db_for_handler.get_cf_raw(CF_BLOCK_HEADERS, &height.to_be_bytes()) {
                 Ok(Some(data)) if data.len() > 32 => {
@@ -1905,6 +1909,44 @@ fn install_fail_stop_panic_hook(exit: fn(i32)) {
     }));
 }
 
+/// T5.3 part 0: the on_commit_block handler's mempool prune, timed
+/// (`torus_commit_handler_prune_seconds`, marker read included).
+///
+/// Item 7 step 2 (decision 7): the raw DB's applied marker (absent = 0), read
+/// before the state nonces the prune reads from the same DB. Not the header
+/// height: the header row is written at commit, before execution.
+fn prune_committed_after_commit(
+    state_db: &StateDb,
+    mempool: &Mempool,
+    metrics: Option<&torus_telemetry::Metrics>,
+) {
+    let timer = std::time::Instant::now();
+    let executed = state_db
+        .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
+        .ok()
+        .flatten()
+        .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+        .map_or(0, u64::from_be_bytes);
+    mempool.prune_committed_txs(executed);
+    if let Some(m) = metrics {
+        m.commit_handler_prune_seconds
+            .observe(timer.elapsed().as_secs_f64());
+    }
+}
+
+/// Runs `f` when dropped (every return path of a handler).
+fn scopeguard_observe<F: FnOnce()>(f: F) -> impl Drop {
+    struct Guard<F: FnOnce()>(Option<F>);
+    impl<F: FnOnce()> Drop for Guard<F> {
+        fn drop(&mut self) {
+            if let Some(f) = self.0.take() {
+                f();
+            }
+        }
+    }
+    Guard(Some(f))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1973,6 +2015,27 @@ mod tests {
         let err = res.unwrap_err();
         assert!(err.contains('f') && err.contains('s'), "{err}");
         assert_eq!(flush_then_sync(|| Ok(()), || Ok(())), Ok(()));
+    }
+
+    /// T5.3 part 0: the on_commit_block handler's mempool prune (with its
+    /// applied-marker read) is timed once per call.
+    #[test]
+    fn commit_handler_prune_is_timed_once_per_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        state
+            .put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &3u64.to_be_bytes())
+            .unwrap();
+        let mempool = Mempool::new(state.clone(), MempoolConfig::default());
+        let metrics = torus_telemetry::Metrics::new();
+        prune_committed_after_commit(&state, &mempool, Some(&metrics));
+        let text = metrics.encode();
+        assert!(
+            text.contains("torus_commit_handler_prune_seconds_count 1"),
+            "one prune observation per handler call:\n{text}"
+        );
+        // Metrics are optional (no panic, nothing to observe).
+        prune_committed_after_commit(&state, &mempool, None);
     }
 
     /// Section 71.8 option A: the graceful stop flushes the consensus DB's

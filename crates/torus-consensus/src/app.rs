@@ -8484,7 +8484,11 @@ impl App<RocksKVStore> for TorusApp {
         // durable (`dispatch_to_exec`). Without this, a SIGKILL in the
         // commit->persist window strands the hole with no way to pull bodies
         // (`missing=0`, t12-r3-full h1165).
-        persist_commit_manifest(&self.state_db, height, datum_bytes);
+        {
+            let _manifest_span =
+                ObserveOnDrop::new(self.metrics.clone(), |m| &m.commit_manifest_seconds);
+            persist_commit_manifest(&self.state_db, height, datum_bytes);
+        }
 
         // Committed: these hashes leave the in-flight window. The mempool prunes
         // them via `remove_committed_native` when the block actually executes.
@@ -18187,6 +18191,35 @@ mod crash_recovery_tests {
         assert!(
             text.contains("torus_order_age_commit_seconds_count 2"),
             "one commit observation per native action:\n{text}"
+        );
+    }
+
+    /// T5.3 part 0: the commit-manifest put is timed on its own, once per
+    /// commit (section 106: the consensus thread's in-window commit-hook stall
+    /// is inferred to be this put, waiting behind the checkpoint batch).
+    #[test]
+    fn commit_manifest_put_is_timed_once_per_commit() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, rx, mempool) = app_with_recording_exec(&config, &state_db);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        app.metrics = Some(metrics.clone());
+
+        let a5 = vec![sign_claim_rewards(5)];
+        let _ = mempool.mirror_native_to_da(&a5);
+        let b5 = make_block(5, a5);
+        app.exec_next_height = Some(5);
+        let c5 = committed_compact_block(&b5);
+        app.on_committed_block(&c5, c5.hash);
+        rx.try_recv().expect("height 5 must reach execution");
+
+        let text = metrics.encode();
+        assert!(
+            text.contains("torus_commit_manifest_seconds_count 1"),
+            "one manifest-put observation per commit:\n{text}"
+        );
+        assert!(
+            text.contains("torus_on_committed_block_seconds_count 1"),
+            "the whole hook is timed once:\n{text}"
         );
     }
 

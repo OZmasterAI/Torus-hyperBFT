@@ -2116,6 +2116,8 @@ fn flush_pending_after_batch(
             write_seconds: 0.0,
             write_build_seconds: write_build_secs,
             write_db_seconds: 0.0,
+            write_db_start_unix_ms: 0,
+            write_db_end_unix_ms: 0,
             batch_bytes: 0,
             dirty_buckets: 0,
             bucket_scans: 0,
@@ -2229,9 +2231,11 @@ fn flush_pending_after_batch(
         // Measured AFTER the trie/mirror puts and the applied-height marker were
         // appended: this is the batch RocksDB actually gets.
         stats.batch_bytes = batch.size_in_bytes();
+        stats.write_db_start_unix_ms = unix_ms_now();
         let write_timer = std::time::Instant::now();
         let write_result = target.write(batch);
         stats.write_db_seconds = write_timer.elapsed().as_secs_f64();
+        stats.write_db_end_unix_ms = unix_ms_now();
         // Legacy total kept intact so `torus_exec_state_write_seconds` stays
         // comparable across the split.
         stats.write_seconds = stats.write_build_seconds + stats.write_db_seconds;
@@ -2304,6 +2308,13 @@ fn flush_pending_after_batch(
     })
 }
 
+/// Wall clock in unix ms (0 if the clock is before the epoch).
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// rank-root: flush-phase breakdown surfaced to the exec metrics
 /// (`exec_root_seconds` / `exec_state_write_seconds` / `exec_root_dirty_buckets`).
 pub struct NativeFlushStats {
@@ -2320,6 +2331,10 @@ pub struct NativeFlushStats {
     /// where a write stall shows up. Includes the trie/mirror puts appended
     /// during the root phase (their *append* cost is in `root_seconds`).
     pub write_db_seconds: f64,
+    /// T5.3: wall clock (unix ms) right before / after that `write`, so a
+    /// checkpoint's DB-write window can be logged and aligned across nodes.
+    pub write_db_start_unix_ms: u64,
+    pub write_db_end_unix_ms: u64,
     /// r7 split: size of the batch handed to RocksDB, measured after the
     /// trie/mirror puts and the applied-height marker were appended.
     pub batch_bytes: usize,
