@@ -905,8 +905,9 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    took the deep book 3.42 -> 15.76 native blocks/s on an older base (option 0 base, L2.2 off, no exec-hash). Section 116
    (9d): merged main without L3.1, deep: 3.54 blk/s, save_order_books 56 ms/blk, exec busy 94%. Does the gain hold with
    every current default on? **One binary** `merge/l31-default-on` `e1106362` (= main 9e206ba4 + L3.1 with
-   `TORUS_BOOK_COALESCE` on by default where its preconditions hold; L3.3, L2.2, option 0, exec-hash on; gated: full
-   nextest + cargo test), Classic, 15 s checkpoints, running state hash off (L3.1's precondition), no byte cap, the 8i
+   `TORUS_BOOK_COALESCE` on by default where its preconditions hold; L3.3, option 0, exec-hash on; gated: full
+   nextest + cargo test). Correction (archy, s131): 9e206ba4 predates L2.2 default-on (89655e95), so set
+   `TORUS_SETTLE_NO_MERGE=1` on BOTH arms (= main's current defaults), Classic, 15 s checkpoints, running state hash off (L3.1's precondition), no byte cap, the 8i
    P1M deep book, no EVM load. Arms: **A** = `TORUS_BOOK_COALESCE=0`; **B** = default (L3.1 on; check the startup log
    says on). Warm-up, then A B B A (n = 2), 300 s cells. Report: matched/s, native blocks/s, fills per block, block
    p50 / p99, timeouts per 1k blocks, exec on-CPU ms per 1k fills, CPU-s per 1M fills, save_order_books ms per block,
