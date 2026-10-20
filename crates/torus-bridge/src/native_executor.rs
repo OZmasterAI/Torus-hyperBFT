@@ -5759,6 +5759,77 @@ impl TradeSink<'_> {
     }
 }
 
+/// 8k L2.1: the trade log as it was before the streamed region, so a match
+/// panic seen after earlier markets' pass B leaves it as flag off's fatal
+/// exit does (flag off runs no pass B before every market matched).
+/// Without a rollover the region only appends (undo: truncate). In inline
+/// mode on a new height the first recorded fill would CLEAR the earlier
+/// height's fills (their rows are written, but the buffer still holds them
+/// for later calls and the caller); those are parked here instead (moved,
+/// no copy) and come back on a panic, or when the region recorded no fill
+/// (nothing cleared them yet: a later fill of the call clears them as flag
+/// off's would).
+struct TradeLogUndo {
+    fills_len: usize,
+    extras_len: usize,
+    trade_index: u32,
+    fills_block: u64,
+    inline_fills_written: usize,
+    parked: Option<(Vec<TradeFill>, Vec<FillExtras>)>,
+}
+
+impl TradeLogUndo {
+    /// On the context's trade fields (`trade_sink!`: a field borrow, so the
+    /// call's reader may still hold others).
+    fn begin(t: TradeSink<'_>) -> Self {
+        let mut undo = Self {
+            fills_len: t.pending_fills.len(),
+            extras_len: t.pending_extras.len(),
+            trade_index: *t.trade_index,
+            fills_block: *t.fills_block,
+            inline_fills_written: *t.inline_fills_written,
+            parked: None,
+        };
+        // `TradeSink::persist`'s rollover condition.
+        if !t.defer_trades && *t.fills_block != t.block_height {
+            undo.parked = Some((
+                std::mem::take(t.pending_fills),
+                std::mem::take(t.pending_extras),
+            ));
+        }
+        undo
+    }
+
+    /// The region's matching succeeded: its fills stand.
+    fn commit(self, t: TradeSink<'_>) {
+        if let Some((fills, extras)) = self.parked {
+            if *t.fills_block == self.fills_block {
+                // No fill recorded: nothing would have cleared them.
+                debug_assert!(t.pending_fills.is_empty() && t.pending_extras.is_empty());
+                *t.pending_fills = fills;
+                *t.pending_extras = extras;
+            }
+        }
+    }
+
+    /// A match panic: the trade log as before the region.
+    fn rollback(self, t: TradeSink<'_>) {
+        match self.parked {
+            Some((fills, extras)) => {
+                *t.pending_fills = fills;
+                *t.pending_extras = extras;
+            }
+            None => {
+                t.pending_fills.truncate(self.fills_len);
+                t.pending_extras.truncate(self.extras_len);
+            }
+        }
+        *t.trade_index = self.trade_index;
+        *t.fills_block = self.fills_block;
+        *t.inline_fills_written = self.inline_fills_written;
+    }
+}
+
 /// 8k L2.1: the context fields settle pass B writes (and its metrics), each
 /// borrowed on its own, so the streamed settle runs pass B on the exec thread
 /// while pool jobs still read the fields it does not hold (positions, oracle,
@@ -5774,6 +5845,10 @@ struct PassBSink<'c> {
     next_global_order_id: &'c mut u128,
     fatal_error: &'c mut Option<String>,
     metrics: Option<&'c torus_telemetry::Metrics>,
+    /// Feed a returned book's logs into the two indexes (always, but in the
+    /// 8k L2.1 streamed region: there the logs wait in the books until the
+    /// call's matching has succeeded, see [`NativeExecutor::match_settle_streamed`]).
+    absorb_indexes: bool,
     trades: TradeSink<'c>,
 }
 
@@ -5788,6 +5863,7 @@ macro_rules! pass_b_sink {
             next_global_order_id: &mut $ctx.next_global_order_id,
             fatal_error: &mut $ctx.fatal_error,
             metrics: $ctx.metrics.as_deref(),
+            absorb_indexes: true,
             trades: trade_sink!($ctx),
         }
     };
@@ -5883,13 +5959,16 @@ struct StreamedOut {
     panic: Option<crate::market_workers::MarketWorkerPanic>,
     /// The settle decision (flag off's `use_parallel`); false on a panic.
     parallel: bool,
-    /// Markets pass B has not applied, ascending, with their plans.
+    /// Markets pass B has not applied, ascending, with their plans (all
+    /// computed when `parallel`; `None`: not computed, the gate said
+    /// sequential or a match panicked).
     rest: Vec<(
         crate::market_workers::MarketBatchResult,
-        Result<MarketSettlePlan, String>,
+        Option<Result<MarketSettlePlan, String>>,
     )>,
-    /// Markets pass B applied in the region.
-    applied: usize,
+    /// Markets pass B applied in the region, ascending, each with whether
+    /// it was in `dirty_books` before (the match-panic undo).
+    applied: Vec<(MarketId, bool)>,
     /// Of those, applied while a later market's job was still running.
     early: u64,
     /// Exec-thread time in pass B and waiting for plans (settle time).
@@ -6773,6 +6852,13 @@ impl<T: StateBackend> NativeExecContext<T> {
         self.trader_markets
             .as_ref()
             .map_or((0, 0), TraderMarkets::size)
+    }
+
+    /// 8k L2.1 (tests): the cloid index's entries, stale ones too; `None`
+    /// while not built. O(1).
+    #[doc(hidden)]
+    pub fn cloid_index_len(&self) -> Option<usize> {
+        self.cloid_markets.as_ref().map(|c| c.map.len())
     }
 
     /// P2-1 (tests): `(carried, rebuilt)` as [`ResidentBooks::trader_index`].
@@ -9177,13 +9263,7 @@ impl NativeExecutor {
             // Undo state for the match-panic exit (see below).
             let gas_before = total_gas;
             let order_id_before = ctx.next_global_order_id;
-            let trades_before = (
-                ctx.pending_fills.len(),
-                ctx.pending_extras.len(),
-                ctx.trade_index,
-                ctx.fills_block,
-                ctx.inline_fills_written,
-            );
+            let trades_undo = TradeLogUndo::begin(trade_sink!(ctx));
             let mut out = PassBOut::new(
                 &mut results,
                 &mut total_gas,
@@ -9218,23 +9298,28 @@ impl NativeExecutor {
                     &mut out,
                 )
             };
-            if let Some(panic) = streamed_out.panic {
+            let mut streamed_out = streamed_out;
+            if let Some(panic) = streamed_out.panic.take() {
                 // T1.5 FAIL-STOP, exactly the flag-off exit below: the block
                 // is never applied. Markets before the panicking one may have
-                // gone through pass B already; their in-memory effects are
-                // undone where the caller can see them (results, gas, the
-                // trade log, which `write_trades_inline` writes, and the
-                // order-id counter). The context's books and caches are
-                // poisoned in both modes (the flag-off exit lost every book
-                // of the call); the committer only takes the fatal.
+                // gone through pass B already; what that did to the context
+                // and the call is undone, so the context is the one flag
+                // off's exit leaves: results, gas, the order-id counter, the
+                // trade log (which `write_trades_inline` writes, also across
+                // an inline height rollover), the books (flag off lost every
+                // book of the call: the applied ones leave again) and the
+                // dirty set. Both indexes were not fed in the region. The
+                // call-local caches are dropped.
                 drop(out);
                 total_gas = gas_before;
                 ctx.next_global_order_id = order_id_before;
-                ctx.pending_fills.truncate(trades_before.0);
-                ctx.pending_extras.truncate(trades_before.1);
-                ctx.trade_index = trades_before.2;
-                ctx.fills_block = trades_before.3;
-                ctx.inline_fills_written = trades_before.4;
+                trades_undo.rollback(trade_sink!(ctx));
+                for &(market, was_dirty) in &streamed_out.applied {
+                    ctx.order_books.remove(&market);
+                    if !was_dirty {
+                        ctx.dirty_books.remove(&market);
+                    }
+                }
                 return Self::match_panic_exit(
                     ctx,
                     panic,
@@ -9252,6 +9337,8 @@ impl NativeExecutor {
             }
             settle_carry = in_region;
             settle_timer = std::time::Instant::now();
+            trades_undo.commit(trade_sink!(ctx));
+            Self::absorb_indexes_after_stream(ctx, &mut streamed_out);
             Self::settle_streamed_rest(ctx, streamed_out, &market_batches, out);
         } else {
             let matched = if setup_in_jobs {
@@ -9321,8 +9408,7 @@ impl NativeExecutor {
             // after settlement, in market-id / order / trigger order.
             for mbr in market_results.iter_mut() {
                 Self::absorb_matched(
-                    &mut ctx.trader_markets,
-                    &mut ctx.cloid_markets,
+                    Some((&mut ctx.trader_markets, &mut ctx.cloid_markets)),
                     ctx.metrics.as_deref(),
                     &market_batches,
                     fast_top_ups,
@@ -9925,27 +10011,30 @@ impl NativeExecutor {
     }
 
     /// Phase 4's per-market prologue on a matched book, in market-id order:
-    /// feed its logs into the cancel-all and cloid indexes, clear the
-    /// batch-scoped policing state, count its charged maker fills and margin
-    /// cuts, and collect the stops it fired. Shared by the flag-off path (all
-    /// markets, then the settle) and the 8k L2.1 streamed path (each market
-    /// as its job finishes, before its pass B). Touches only the book, the
+    /// feed its logs into the cancel-all and cloid indexes (`indexes`), clear
+    /// the batch-scoped policing state, count its charged maker fills and
+    /// margin cuts, and collect the stops it fired. Shared by the flag-off
+    /// path (all markets, then the settle) and the 8k L2.1 streamed path
+    /// (each market as its job finishes, before its pass B; `indexes` `None`:
+    /// the logs stay in the book until the call's matching succeeded, see
+    /// [`Self::absorb_indexes_after_stream`]). Touches only the book, the
     /// two indexes, metrics and `triggered`; pass B of an earlier market
     /// reads none of them, so the two interleavings are the same.
     #[allow(clippy::too_many_arguments)]
     fn absorb_matched(
-        trader_markets: &mut Option<TraderMarkets>,
-        cloid_markets: &mut Option<CloidMarkets>,
+        indexes: Option<(&mut Option<TraderMarkets>, &mut Option<CloidMarkets>)>,
         metrics: Option<&torus_telemetry::Metrics>,
         market_batches: &HashMap<MarketId, Vec<PreparedOrder<'_>>>,
         fast_top_ups: bool,
         mbr: &mut crate::market_workers::MarketBatchResult,
         triggered: &mut VecDeque<TriggeredStop>,
     ) {
-        // P2-1: what rested or was stored in this book feeds the index.
-        TraderMarkets::absorb(trader_markets, &mut mbr.book, mbr.market_id);
-        // s114 follow-up: and the cloid index (adds before any later check).
-        CloidMarkets::absorb(cloid_markets, &mut mbr.book, mbr.market_id);
+        if let Some((trader_markets, cloid_markets)) = indexes {
+            // P2-1: what rested or was stored in this book feeds the index.
+            TraderMarkets::absorb(trader_markets, &mut mbr.book, mbr.market_id);
+            // s114 follow-up: and the cloid index (adds before any later check).
+            CloidMarkets::absorb(cloid_markets, &mut mbr.book, mbr.market_id);
+        }
         mbr.book.clear_reduce_only_positions();
         // Plan 9.11 (telemetry): this book's charged maker fills.
         if let Some(m) = metrics {
@@ -9997,10 +10086,11 @@ impl NativeExecutor {
     ///   Only the exec thread writes those, and only through the prologue
     ///   and pass B of markets 0..k, in that order. No job can still change
     ///   anything pass B of market k reads.
-    /// - The prologue of market k touches its book, the two indexes, metrics
-    ///   and the stop list; pass B of markets < k reads none of them. So
-    ///   prologue(0), B(0), prologue(1), B(1), ... is flag off's prologue(0..n)
-    ///   then B(0..n), write for write.
+    /// - The prologue of market k touches its book, metrics and the stop
+    ///   list (the two indexes are fed after the region, in market order);
+    ///   pass B of markets < k reads none of them. So prologue(0), B(0),
+    ///   prologue(1), B(1), ... is flag off's prologue(0..n) then B(0..n),
+    ///   write for write.
     /// - The decision: flag off settles in parallel iff the gate holds on
     ///   the call's total fills. The gate is monotone, so pass B starts only
     ///   once the fills seen so far pass it (or every market is in and the
@@ -10014,9 +10104,21 @@ impl NativeExecutor {
     ///   of a pure, successful plan equals the sequential loop for that
     ///   market (C3), and the sequential loop of a later market reads no key
     ///   of an earlier market's pure plan.
+    /// - No speculative reads (Codex P2): flag off computes plans only when
+    ///   it settles in parallel. A job computes its market's plan only once
+    ///   the fills of the markets matched so far (any order, an atomic sum)
+    ///   pass the gate, which then holds on the total too; else it leaves the
+    ///   plan to the exec thread, which computes it once the decision is
+    ///   parallel (plans read only call-frozen state, so it is the same
+    ///   plan). Below the gate no plan reads anything, so a read fault hits
+    ///   the sequential loop exactly as with the flag off.
     /// - A match panic: the lowest-id panicking market ends the loop (taken
     ///   in id order, so every lower market matched); the caller takes the
-    ///   flag-off fatal exit.
+    ///   flag-off fatal exit and undoes what pass B of the lower markets did
+    ///   to the context (`applied`, [`TradeLogUndo`]). Until the call's
+    ///   matching succeeded the books' index logs are not fed (the caller
+    ///   does it after the region, in market order, as flag off's prologue),
+    ///   so a panic leaves both indexes untouched, as flag off's exit does.
     #[allow(clippy::too_many_arguments)]
     fn match_settle_streamed<'m, 'x, T: StateBackend>(
         jobs_in: StreamJobs<'_, '_, T>,
@@ -10025,7 +10127,7 @@ impl NativeExecutor {
         accum: &mut ExecPhaseAccum,
         market_batches: &'m HashMap<MarketId, Vec<PreparedOrder<'x>>>,
         fast_top_ups: bool,
-        settle_gate: &dyn Fn(usize) -> bool,
+        settle_gate: &(dyn Fn(usize) -> bool + Sync),
         triggered: &mut VecDeque<TriggeredStop>,
         out: &mut PassBOut<'_, '_>,
     ) -> StreamedOut {
@@ -10045,13 +10147,33 @@ impl NativeExecutor {
         let n = ids.len();
         let items: Vec<(MarketId, OrderBook, &'m [PreparedOrder<'x>])> =
             items.into_iter().map(|(m, b, p, _)| (m, b, p)).collect();
+        type Plan = Option<Result<MarketSettlePlan, String>>;
         type JobOut = Result<
-            (
-                crate::market_workers::MarketBatchResult,
-                Result<MarketSettlePlan, String>,
-            ),
+            (crate::market_workers::MarketBatchResult, Plan),
             crate::market_workers::MarketWorkerPanic,
         >;
+        // One market's contained plan, as flag-off pass A computes it.
+        let plan_of = |mbr: &crate::market_workers::MarketBatchResult| {
+            Self::market_settle_plan_contained(
+                positions,
+                typed,
+                margin_configs.get(&mbr.market_id),
+                mbr,
+                market_batches
+                    .get(&mbr.market_id)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]),
+                record_fills,
+                probe.plan_panic,
+            )
+        };
+        // Fills of the markets matched so far, in any order (a lower bound
+        // of the call's total: the gate passing on it is final). Relaxed: a
+        // stale (smaller) sum only leaves a plan to the exec thread.
+        let fills_matched = std::sync::atomic::AtomicUsize::new(0);
+        // The streamed region feeds no index (see above; `sink` is this
+        // call's, dropped after the region).
+        sink.absorb_indexes = false;
         let work = |_: usize,
                     (market_id, book, prepared): (MarketId, OrderBook, &'m [PreparedOrder<'x>])|
          -> JobOut {
@@ -10080,27 +10202,22 @@ impl NativeExecutor {
                     true,
                 )
             })?;
-            // Plan: contained and recovered like flag-off pass A.
-            let plan = Self::market_settle_plan_contained(
-                positions,
-                typed,
-                margin_configs.get(&market_id),
-                &mbr,
-                prepared,
-                record_fills,
-                probe.plan_panic,
-            );
+            // Plan: contained and recovered like flag-off pass A, and only
+            // once the parallel settle is certain (no speculative reads).
+            let fills: usize = mbr.results.iter().map(|r| r.result.fills.len()).sum();
+            let matched =
+                fills_matched.fetch_add(fills, std::sync::atomic::Ordering::Relaxed) + fills;
+            let plan = settle_gate(matched).then(|| plan_of(&mbr));
             Ok((mbr, plan))
         };
         crate::exec_pool::run_streamed(items, jobs, probe.jitter_seed, &work, |rx| {
-            let mut pending: VecDeque<(
-                crate::market_workers::MarketBatchResult,
-                Result<MarketSettlePlan, String>,
-            )> = VecDeque::with_capacity(n);
+            let mut pending: VecDeque<(crate::market_workers::MarketBatchResult, Plan)> =
+                VecDeque::with_capacity(n);
             let mut decided: Option<bool> = None;
             let mut fills_seen = 0usize;
             let mut streaming = true;
-            let (mut applied, mut early) = (0usize, 0u64);
+            let mut applied: Vec<(MarketId, bool)> = Vec::new();
+            let mut early = 0u64;
             let (mut pass_b, mut plan_wait) =
                 (std::time::Duration::ZERO, std::time::Duration::ZERO);
             let mut panic = None;
@@ -10128,8 +10245,7 @@ impl NativeExecutor {
                     }
                 };
                 Self::absorb_matched(
-                    sink.trader_markets,
-                    sink.cloid_markets,
+                    None,
                     sink.metrics,
                     market_batches,
                     fast_top_ups,
@@ -10148,8 +10264,15 @@ impl NativeExecutor {
                 if decided != Some(true) || !streaming {
                     continue;
                 }
-                while let Some((mbr, plan)) = pending.front() {
-                    let ok = match plan {
+                while let Some((mbr, plan)) = pending.front_mut() {
+                    if plan.is_none() {
+                        // Matched before the gate was certain: its plan now
+                        // (exec-thread pass A time).
+                        let t = std::time::Instant::now();
+                        *plan = Some(plan_of(mbr));
+                        plan_wait += t.elapsed();
+                    }
+                    let ok = match plan.as_ref().expect("computed above") {
                         Ok(p) => {
                             p.orders.iter().all(|o| o.fill_error.is_none())
                                 && p.pos_cache
@@ -10162,15 +10285,19 @@ impl NativeExecutor {
                         streaming = false;
                         break;
                     }
-                    let Some((mbr, Ok(plan))) = pending.pop_front() else {
+                    let Some((mbr, Some(Ok(plan)))) = pending.pop_front() else {
                         unreachable!("checked above");
                     };
                     if probe.jitter_seed != 0 {
                         std::thread::sleep(std::time::Duration::from_micros(
-                            crate::exec_pool::jitter_us(probe.jitter_seed ^ 0xE8EC_7E5A, applied),
+                            crate::exec_pool::jitter_us(
+                                probe.jitter_seed ^ 0xE8EC_7E5A,
+                                applied.len(),
+                            ),
                         ));
                     }
                     let is_early = !rx.all_done();
+                    applied.push((mbr.market_id, sink.dirty_books.contains(&mbr.market_id)));
                     let t = std::time::Instant::now();
                     Self::settle_pass_b_market(
                         sink,
@@ -10182,12 +10309,21 @@ impl NativeExecutor {
                         out,
                     );
                     pass_b += t.elapsed();
-                    applied += 1;
                     early += u64::from(is_early);
                 }
             }
             let parallel = panic.is_none() && decided == Some(true);
             if parallel {
+                // Every remaining plan, as flag off's pass A computes all of
+                // them before its fallback check (its first local fault is
+                // latched from any market's plan).
+                let t = std::time::Instant::now();
+                for (mbr, plan) in pending.iter_mut() {
+                    if plan.is_none() {
+                        *plan = Some(plan_of(mbr));
+                    }
+                }
+                plan_wait += t.elapsed();
                 // Pass A is fused into the jobs; what the exec thread still
                 // waits for is the plans (>= 1 ns, so a streamed call counts
                 // as a parallel settle).
@@ -10206,6 +10342,27 @@ impl NativeExecutor {
         })
     }
 
+    /// 8k L2.1: after a streamed region whose matching succeeded, feed every
+    /// market's book logs into both indexes in market order, as flag off's
+    /// prologue does before its settle: the markets pass B applied (their
+    /// books are back in `order_books`), then the rest (still in `rest`).
+    /// The later book returns find the logs empty, as with the flag off.
+    fn absorb_indexes_after_stream<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        so: &mut StreamedOut,
+    ) {
+        for &(market, _) in &so.applied {
+            if let Some(book) = ctx.order_books.get_mut(&market) {
+                TraderMarkets::absorb(&mut ctx.trader_markets, book, market);
+                CloidMarkets::absorb(&mut ctx.cloid_markets, book, market);
+            }
+        }
+        for (mbr, _) in so.rest.iter_mut() {
+            TraderMarkets::absorb(&mut ctx.trader_markets, &mut mbr.book, mbr.market_id);
+            CloidMarkets::absorb(&mut ctx.cloid_markets, &mut mbr.book, mbr.market_id);
+        }
+    }
+
     /// 8k L2.1: Phase 4 after the streamed region, on the markets pass B has
     /// not applied (ascending): the sequential loop when the gate said
     /// sequential; the C3 fallback when a remaining plan failed (resumed after
@@ -10220,9 +10377,13 @@ impl NativeExecutor {
     ) {
         let (mbrs, plans): (Vec<_>, Vec<_>) = so.rest.into_iter().unzip();
         if !so.parallel {
-            debug_assert_eq!(
-                so.applied, 0,
+            debug_assert!(
+                so.applied.is_empty(),
                 "pass B streams only after a parallel decision"
+            );
+            debug_assert!(
+                plans.iter().all(Option::is_none),
+                "no plan below the gate (no speculative reads)"
             );
             out.finish();
             Self::settle_market_results_sequential(
@@ -10237,10 +10398,15 @@ impl NativeExecutor {
             );
             return;
         }
+        let plans: Vec<Result<MarketSettlePlan, String>> = plans
+            .into_iter()
+            .map(|p| p.expect("L2.1: every plan is computed on a parallel decision"))
+            .collect();
         SETTLE_STREAMED_CALLS.with(|c| c.set(c.get() + 1));
         SETTLE_STREAMED_EARLY.with(|c| c.set(c.get() + so.early));
         if let Some(ref m) = ctx.metrics {
-            m.exec_settle_streamed_markets.inc_by(so.applied as u64);
+            m.exec_settle_streamed_markets
+                .inc_by(so.applied.len() as u64);
             m.exec_settle_streamed_early_markets.inc_by(so.early);
         }
         if let Some((reason, fault)) = Self::plan_fallback(&plans) {
@@ -10250,7 +10416,7 @@ impl NativeExecutor {
                     out.pos_cache.merge_disjoint(run);
                 }
             }
-            if so.applied > 0 {
+            if !so.applied.is_empty() {
                 SETTLE_STREAMED_HYBRID.with(|c| c.set(c.get() + 1));
                 if let Some(ref m) = ctx.metrics {
                     m.exec_settle_streamed_resumed_fallbacks.inc();
@@ -10850,14 +11016,19 @@ impl NativeExecutor {
     ) {
         let market_id = mbr.market_id;
 
-        // Reinsert updated book
-        return_matched_book_in(
-            sink.order_books,
-            sink.trader_markets,
-            sink.cloid_markets,
-            market_id,
-            mbr.book,
-        );
+        // Reinsert updated book (8k L2.1 streamed region: its logs reach
+        // the indexes once the call's matching succeeded).
+        if sink.absorb_indexes {
+            return_matched_book_in(
+                sink.order_books,
+                sink.trader_markets,
+                sink.cloid_markets,
+                market_id,
+                mbr.book,
+            );
+        } else {
+            sink.order_books.insert(market_id, mbr.book);
+        }
         sink.dirty_books.insert(market_id);
 
         // Update global ID high-water mark

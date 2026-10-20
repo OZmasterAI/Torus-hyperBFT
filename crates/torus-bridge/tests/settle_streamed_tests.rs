@@ -38,8 +38,8 @@ use alloy_primitives::{Address, B256};
 use torus_bridge::native_executor::{
     parse_settle_streamed, settle_streamed_calls_on_this_thread,
     settle_streamed_early_on_this_thread, settle_streamed_hybrid_on_this_thread,
-    with_settle_no_merge, with_settle_stream_probe, with_settle_streamed, NativeActionResult,
-    NativeExecContext, NativeExecutor, SettleStreamProbe,
+    with_settle_no_merge, with_settle_stream_probe, with_settle_streamed, BookMode,
+    NativeActionResult, NativeExecContext, NativeExecutor, ResidentBooks, SettleStreamProbe,
 };
 use torus_bridge::state_root::compute_native_state_root;
 use torus_core::position::{position_key, MarginType, NativeBalance, Position};
@@ -377,11 +377,15 @@ struct RunStats {
     position_deletes: usize,
     position_puts: usize,
     hits: usize,
+    /// The fatal error that ended the run, if any (also compared in the
+    /// outcome; kept here so tests can assert the fail-stop happened).
+    fatal: Option<String>,
     /// Position point reads per block (pass A's included). Compared only for
-    /// fault-free forced runs: a plan-failure fallback re-reads fewer rows
-    /// streamed (the sequential loop resumes after the prefix instead of
-    /// restarting), and in Auto mode the streamed jobs compute plans before
-    /// the settle gate is known (discarded below it).
+    /// fault-free runs: a plan-failure fallback re-reads fewer rows streamed
+    /// (the sequential loop resumes after the prefix instead of restarting).
+    /// Auto mode included: the streamed jobs compute a plan only once the
+    /// settle gate is certain to pass, so below it nothing reads positions
+    /// for plans (Codex P2).
     position_reads: Reads,
 }
 
@@ -572,6 +576,9 @@ fn run(blocks: &[Block], r: Run, fault: &LastBlockFault) -> (RunOut, RunStats) {
                 .filter(|w| w.0 == CF_NATIVE_POSITIONS && w.2.is_none())
                 .count();
             let fatal = ctx.fatal_error.clone();
+            if fatal.is_some() {
+                stats.fatal = fatal.clone();
+            }
             calls.push(CallOut {
                 writes,
                 results: res.results.iter().map(row).collect(),
@@ -696,9 +703,9 @@ fn assert_streamed_equivalent(
                 ),
                 "{label}: same settle paths and faults"
             );
-            if matches!(fault, LastBlockFault::None) && !matches!(r.mode, Mode::Auto) {
+            if matches!(fault, LastBlockFault::None) {
                 // Same reads too: the fused jobs' plans read exactly what
-                // pass A read.
+                // pass A read (Auto: nothing below the gate).
                 assert_eq!(
                     clean_stats.position_reads, on_stats.position_reads,
                     "{label}: position reads"
@@ -1081,6 +1088,290 @@ fn settle_streamed_impure_prefix_plan_stops_the_stream() {
                         "{what}, L2.2 {no_merge}: stopped at market 1's impure plan ({on:?})"
                     );
                 }
+            }
+        }
+    }
+}
+
+/// Codex P2 (L2.1 review): production `execute_batch` (Auto) below the
+/// settle gate settles sequentially. A one-shot position read failure at the
+/// row's last read of the clean block must hit that sequential loop as with
+/// the flag off (R02 fail-stop, same writes): the streamed jobs must not read
+/// positions for plans the gate never uses (a speculative plan would consume
+/// the fault, and the sequential retry would run on without it).
+#[test]
+fn settle_streamed_below_gate_read_fault_fail_stops_as_flag_off() {
+    let blocks = stream(0x8C21_B10E_FA11, 6, 4, 40);
+    let r = Run {
+        mode: Mode::Auto,
+        record_fills: true,
+        aliases: false,
+        jitter: 0,
+    };
+    let pick = |clean: &RunOut, stats: &RunStats| {
+        let key = last_block_position_key(clean, |_| 0);
+        let n = stats.position_reads.0.last().unwrap()[&key];
+        LastBlockFault::ReadNth(key, n)
+    };
+    for (_, off, ons) in
+        assert_streamed_equivalent(&blocks, r, &[0, 0xB10E], &pick, "below-gate read fault")
+    {
+        assert_eq!(off.parallel_calls, 0, "every call below the gate: {off:?}");
+        assert_eq!(off.hits, 1, "the fault fired once: {off:?}");
+        assert!(
+            off.fatal
+                .as_deref()
+                .is_some_and(|f| f.contains("injected one-shot read failure")),
+            "R02 fail-stop: {off:?}"
+        );
+        for on in ons {
+            assert_eq!(on.fatal, off.fatal, "{on:?}");
+            assert_eq!(on.streamed_calls, 0, "{on:?}");
+        }
+    }
+}
+
+/// The context after one call, as far as later calls and the book save see
+/// it (the trade buffers are compared through `CallOut` and the final take).
+#[derive(PartialEq, Eq, Debug)]
+struct CtxView {
+    books: Vec<MarketId>,
+    dirty: Vec<MarketId>,
+    cancel_index: (u64, u64),
+    cloid_index: Option<usize>,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+struct ReusedOut {
+    calls: Vec<CallOut>,
+    views: Vec<CtxView>,
+    save_writes: Vec<Write>,
+    fills: Vec<TradeFill>,
+    extras: Vec<FillExtras>,
+    trade_rows: Vec<(String, Vec<u8>, Vec<u8>)>,
+}
+
+/// Every resting GTC placement of `batch` at an index divisible by 3 gets a
+/// cloid (unique per batch salt), so the cloid index is built and fed.
+fn with_cloids(batch: &[(Address, NativeAction)], salt: u128) -> Vec<(Address, NativeAction)> {
+    batch
+        .iter()
+        .enumerate()
+        .map(|(i, (s, a))| match a {
+            NativeAction::PlaceOrder(p) if i % 3 == 0 && p.time_in_force == TimeInForce::GTC => {
+                let mut p = p.clone();
+                p.client_order_id = Some(salt + i as u128);
+                (*s, NativeAction::PlaceOrder(p))
+            }
+            _ => (*s, a.clone()),
+        })
+        .collect()
+}
+
+/// `batch`'s placements in markets `<= max` (cancels kept).
+fn only_markets(batch: &[(Address, NativeAction)], max: MarketId) -> Vec<(Address, NativeAction)> {
+    batch
+        .iter()
+        .filter(|(_, a)| !matches!(a, NativeAction::PlaceOrder(p) if p.market_id > max))
+        .cloned()
+        .collect()
+}
+
+/// One resident context REUSED for heights 1 and 2 (inline trade history: rows are
+/// written after each call, and the first fill of a new height clears the
+/// earlier height's buffered fills). Height 1 runs `blocks[0]` in markets
+/// 1-3 only (so markets 4-6 enter height 2 not dirty); height 2 runs
+/// `blocks[1][0]` with `market`'s match job panicking (the fatal exit), then
+/// `blocks[1][1]` on the same context (the committer runs the post-EVM call
+/// after a fatal pre-EVM one), then the book save.
+fn reused_ctx_run(blocks: &[Block], cap: usize, record_fills: bool, market: MarketId) -> ReusedOut {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = StateDb::open(dir.path()).expect("open db");
+    for n in 1..=TRADERS as u8 {
+        let bal = NativeBalance {
+            available: fp(1_000_000),
+            order_margin: FixedPoint::ZERO,
+        };
+        torus_core::position::PositionManager::new(db.clone())
+            .put_native_balance(&addr(n), &bal)
+            .unwrap();
+    }
+    let rec = Recorder {
+        inner: NativeStateOverlay::new(db.clone()),
+        log: Arc::default(),
+        faults: Arc::default(),
+        position_reads: Arc::default(),
+    };
+    // Resident books: the cancel-all index is built (at the first
+    // cancel-all) only in resident mode.
+    let mut resident = ResidentBooks::default();
+    let mut ctx = NativeExecContext::new_with_mode(
+        rec.clone(),
+        1,
+        1000,
+        0,
+        100,
+        10,
+        addr(99),
+        addr(100),
+        addr(101),
+        BookMode::Classic,
+        Some(&mut resident),
+    );
+    ctx.record_fills = record_fills;
+    assert!(
+        ctx.trade_history && !ctx.defer_trades,
+        "inline trade history"
+    );
+    let view = |ctx: &NativeExecContext<Recorder>| {
+        let mut books: Vec<MarketId> = ctx.order_books().keys().copied().collect();
+        books.sort_unstable();
+        let mut dirty: Vec<MarketId> = ctx.dirty_books.iter().copied().collect();
+        dirty.sort_unstable();
+        CtxView {
+            books,
+            dirty,
+            cancel_index: ctx.cancel_index_size(),
+            cloid_index: ctx.cloid_index_len(),
+        }
+    };
+    let mut calls = Vec::new();
+    let mut views = Vec::new();
+    let mut call = |ctx: &mut NativeExecContext<Recorder>,
+                    batch: &[(Address, NativeAction)],
+                    probe: SettleStreamProbe| {
+        let res = with_settle_stream_probe(probe, || {
+            NativeExecutor::execute_batch_settle_workers(ctx, batch, true, Some(cap))
+        });
+        calls.push(CallOut {
+            writes: std::mem::take(&mut *rec.log.lock().unwrap()),
+            results: res.results.iter().map(row).collect(),
+            total_gas: res.total_gas,
+            // The buffers stay in the context (taken once, at the end).
+            fills: Vec::new(),
+            extras: Vec::new(),
+            fatal: ctx.fatal_error.clone(),
+        });
+    };
+    let none = SettleStreamProbe::default();
+    call(
+        &mut ctx,
+        &with_cloids(&only_markets(&blocks[0][0], 3), 1 << 20),
+        none,
+    );
+    call(
+        &mut ctx,
+        &with_cloids(&only_markets(&blocks[0][1], 3), 2 << 20),
+        none,
+    );
+    assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
+    views.push(view(&ctx));
+    ctx.block_height = 2;
+    ctx.timestamp += 1;
+    let panic = SettleStreamProbe {
+        match_panic: Some(market),
+        ..none
+    };
+    call(&mut ctx, &with_cloids(&blocks[1][0], 3 << 20), panic);
+    views.push(view(&ctx));
+    call(&mut ctx, &with_cloids(&blocks[1][1], 4 << 20), none);
+    views.push(view(&ctx));
+    ctx.save_order_books();
+    let mut save_writes = std::mem::take(&mut *rec.log.lock().unwrap());
+    save_writes.sort();
+    let (fills, extras) = ctx.take_pending_fills_and_extras();
+    let mut trade_rows = Vec::new();
+    for cf in [CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES] {
+        for (k, v) in rec.inner.iterate_cf(cf, None).expect("iterate cf") {
+            trade_rows.push((cf.to_string(), k, v));
+        }
+    }
+    ReusedOut {
+        calls,
+        views,
+        save_writes,
+        fills,
+        extras,
+        trade_rows,
+    }
+}
+
+/// Codex P2 (L2.1 review) and its audit: a match panic seen after lower
+/// markets already went through the streamed pass B (the panicking market is
+/// the highest, so with a forced parallel settle every lower market is
+/// applied before the panic is taken) must leave the context exactly as flag
+/// off's fatal exit leaves it, also when the context is reused for a new
+/// block in inline trade-history mode: the trade log (the earlier height's
+/// buffered fills and extras, the rows written after the call), the books the
+/// context holds (flag off lost every book of the call), the dirty-book set,
+/// the cancel-all and cloid indexes; and the next call on the same context
+/// and the book save see the same state.
+#[test]
+fn settle_streamed_match_panic_restores_context_across_block_rollover() {
+    let blocks = stream(0x8C21_B0B0_0F11, 6, 2, 300);
+    let market = 6;
+    for record_fills in [true, false] {
+        for cap in [1usize, 8] {
+            let what = format!("record_fills {record_fills}, cap {cap}");
+            for no_merge in [false, true] {
+                let off = with_settle_no_merge(no_merge, || {
+                    with_settle_streamed(false, || {
+                        reused_ctx_run(&blocks, cap, record_fills, market)
+                    })
+                });
+                let streamed_before = settle_streamed_calls_on_this_thread();
+                let on = with_settle_no_merge(no_merge, || {
+                    with_settle_streamed(true, || {
+                        reused_ctx_run(&blocks, cap, record_fills, market)
+                    })
+                });
+                assert!(
+                    settle_streamed_calls_on_this_thread() - streamed_before >= 2,
+                    "{what}: the flag-on arm streamed"
+                );
+                assert!(
+                    off.calls[2].fatal.as_deref().is_some_and(
+                        |f| f.starts_with(&format!("market worker panicked (market {market})"))
+                    ),
+                    "{what}: {:?}",
+                    off.calls[2].fatal
+                );
+                assert!(
+                    !off.fills.is_empty()
+                        && off.views[0].cancel_index.0 > 0
+                        && off.views[0].cloid_index.is_some_and(|n| n > 0),
+                    "{what}: fills recorded and both indexes built: {:?}",
+                    off.views[0]
+                );
+                for (c, (x, y)) in off.calls.iter().zip(&on.calls).enumerate().take(3) {
+                    assert!(
+                        x.writes == y.writes,
+                        "{what}, L2.2 {no_merge}: call {c}: write sequence diverged ({} vs {} writes)",
+                        x.writes.len(),
+                        y.writes.len()
+                    );
+                    assert_eq!(x, y, "{what}, L2.2 {no_merge}: call {c}");
+                }
+                // The context the panicked call left, before the next call.
+                assert_eq!(
+                    off.views[1], on.views[1],
+                    "{what}, L2.2 {no_merge}: context after the panic"
+                );
+                let (x, y) = (&off.calls[3], &on.calls[3]);
+                assert!(
+                    x.writes == y.writes,
+                    "{what}, L2.2 {no_merge}: next call: write sequence diverged ({} vs {} writes)",
+                    x.writes.len(),
+                    y.writes.len()
+                );
+                assert_eq!(x, y, "{what}, L2.2 {no_merge}: next call");
+                assert_eq!(off.views, on.views, "{what}, L2.2 {no_merge}: context");
+                assert_eq!(
+                    (off.fills.len(), off.extras.len()),
+                    (on.fills.len(), on.extras.len()),
+                    "{what}, L2.2 {no_merge}: pending fills / extras"
+                );
+                assert_eq!(off, on, "{what}, L2.2 {no_merge}");
             }
         }
     }

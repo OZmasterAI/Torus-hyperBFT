@@ -115,7 +115,8 @@ impl<R> StreamRx<'_, R> {
         )
     }
 
-    /// True once every item's job has stored its result.
+    /// True once every item's job has stored its result (or is about to
+    /// mark it ready: true after the last item was taken).
     pub(crate) fn all_done(&self) -> bool {
         self.done.load(Ordering::SeqCst) == self.slots.len()
     }
@@ -178,8 +179,12 @@ where
         }
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(i, item)));
         *slots[i].value.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
-        slots[i].ready.store(true, Ordering::SeqCst);
+        // `done` first: once the caller has taken every item, `all_done`
+        // holds (was: a taken item could still be uncounted, flaking
+        // `run_streamed_hands_out_results_in_item_order`). `all_done` may
+        // run ahead of `ready` by an item: it only labels a pass B early.
         done.fetch_add(1, Ordering::SeqCst);
+        slots[i].ready.store(true, Ordering::SeqCst);
         if waiting.load(Ordering::SeqCst) == i {
             caller.unpark();
         }
