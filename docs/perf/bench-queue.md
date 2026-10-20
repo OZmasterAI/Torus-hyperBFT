@@ -912,6 +912,22 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    says on). Warm-up, then A B B A (n = 2), 300 s cells. Report: matched/s, native blocks/s, fills per block, block
    p50 / p99, timeouts per 1k blocks, exec on-CPU ms per 1k fills, CPU-s per 1M fills, save_order_books ms per block,
    the window-close spike (`torus_exec_book_coalesce_close_seconds`), RSS; A next to 9d's N as a check (same defaults).
+9f. **b1 Classic gap: qc_to_advance sub-timers + b0 / b1 bisect** (owner s131; after 9e; ~45 min). Sections 111 / 111.8:
+   Classic on b1 runs 0.746x native blocks/s at equal per-fill cost; the gap is consensus-side (`qc_to_advance` 21.1 ->
+   30.6 ms per view, ~+30 ms per view independent of block size); a clean rebuild was byte-identical (not a build
+   artefact). **Three binaries**, one identical timers-only commit each: **O** = `perf/qca-timers-o` `bd09feb7`
+   (f8a45a2d + timers); **B0** = `perf/qca-timers-b0` `cc123463` (f8a45a2d + b0 + timers); **B** = `perf/qca-timers-b`
+   `feebce0f` (ab4ded4e = b0 + b1, + timers). Classic, standard shape, code defaults, NOTHING set (EVM fast path, L3.3
+   and L2.2 are off on all three: they predate those defaults; same as 8z), 15 s checkpoints, no EVM load. Warm-up, then
+   O B0 B B B0 O (n = 2), 300 s cells. Report per arm: native blocks/s, fills per block, block p50 / p99, timeouts,
+   commit-interval buckets, per-view phases incl. `torus_view_qc_to_advance_seconds`; every new
+   `torus_qc_advance_<step>_seconds` per view (sum / count) and per second (steps sum to
+   `torus_qc_advance_total_seconds`: pc_check, highest_pc, tree_update, commit_feed_tree, commit_feed_app, post_commit,
+   advance_send, wait_recv, wait_msg, wait_busy, advance_rx, loop_to_enter, enter_new_view, enter_view_write,
+   enter_start; plus `_own_loopback_seconds`, `_swarm_cmd_seconds`, the advanced-by counters); per block
+   `torus_commit_feed_{decode,evm,manifest,enqueue}_seconds`, `torus_exec_dispatch_send_seconds` (blocked on the exec
+   channel), `torus_commit_event_handler_seconds`. Verdict: which step carries B's extra ~+30 ms per view, and is it
+   B0 (b0) or only B (b1)?
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
