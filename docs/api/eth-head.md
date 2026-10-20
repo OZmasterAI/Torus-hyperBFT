@@ -34,7 +34,7 @@ So:
 - `eth_call`, `eth_estimateGas`, `eth_getBalance`, `eth_getCode` and `eth_getStorageAt` answer at
   the eth head (an older or newer block is `HistoricalStateUnavailable`).
 
-With the flag off (the default until bench Q11 passes), every block with EVM txs first drains
+With the flag off (`TORUS_EVM_FAST_PATH=0`; on by default since s131), every block with EVM txs first drains
 everything to disk and then writes its own state and receipts with its marker. The eth head then
 reaches each EVM block right after it executes. The native-only blocks between EVM heights still lag
 by up to one interval.

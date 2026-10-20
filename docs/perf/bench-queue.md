@@ -53,6 +53,11 @@ main at or after 50d2316c.
   `TORUS_HEADER_RESEND_MS=3000` (`=0` = off). Compare against results from before the merge only with the
   pre-merge arms' env spelled out. Binaries built before it (M `e3d11cb9`, Q9's `e1be6c15` / `b2dd21a4`, step Z's
   `9d770519`) keep the old defaults: their arms set PC + F by env, as in sections 83-87.
+- **Defaults change (s131, item 7 option 0 merge `merge/item7-option0`; binaries built from main after it):** an arm
+  that leaves E (`TORUS_EVM_FAST_PATH`) unset gets the EVM fast path ON. A flag-off arm must set `TORUS_EVM_FAST_PATH=0`
+  (an `absent_env` entry for it now means ON). Without EVM load (`EVM_LOAD_RATE` unset) the flag is inert (section 107).
+  Binaries built before the merge (`f8a45a2d` and branches on it: `perf/mode3-b1`, `perf/l31-coalesced-save`) keep it
+  off when unset.
 - Block rate from cells shorter than about 5 min is indicative only: under sustained load it falls to exec pace
   (5.9 -> 3.0 blocks/s by minute 5) while matched/s stays flat (section 79). matched/s stays the primary metric.
 - Watch `no_proposal` in every replicate (1 in the s58dmt check cell, 1 in the s58safe soak).

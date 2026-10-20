@@ -1407,7 +1407,7 @@ struct ExecutionContext {
     /// No effect without W.
     epoch_fast_path: bool,
     /// Item 7 option 0 (task 3.1): the EVM fast path
-    /// (`TORUS_EVM_FAST_PATH`, node-local, default off until Q11, read once
+    /// (`TORUS_EVM_FAST_PATH`, node-local, default on since s131, read once
     /// at construction; see `exec_pipeline::evm_fast_path_enabled`). With it
     /// a block with EVM txs is not a barrier: it takes the pipelined path
     /// (its other barrier reasons still hold: a buffered slash, a header or
@@ -6850,21 +6850,28 @@ impl TorusApp {
         if exec_ctx.evm_fast_path {
             if exec_ctx.flush_worker.is_some() {
                 tracing::info!(
-                    "EVM fast path ON (TORUS_EVM_FAST_PATH=1): blocks with EVM txs run pipelined \
+                    "EVM fast path ON (TORUS_EVM_FAST_PATH unset or 1): blocks with EVM txs run pipelined \
                      (reads through the block overlay, EVM trie and receipts on the flush worker); \
                      EVM state and receipts become durable with the block's checkpoint (eth head, \
                      receipts and EVM state move together); the mempool commit prune reads the \
                      ingress view; metrics torus_exec_evm_fast_path_blocks, \
                      torus_flush_worker_evm_trie_seconds"
                 );
-            } else {
+            } else if crate::exec_pipeline::evm_fast_path_explicit() {
                 tracing::warn!(
                     "TORUS_EVM_FAST_PATH is set but the exec pipeline is off: no effect, every \
                      block with EVM txs runs serially"
                 );
+            } else {
+                tracing::info!(
+                    "EVM fast path on by default but the exec pipeline is off \
+                     (TORUS_EXEC_PIPELINE=0): no effect, every block with EVM txs runs serially"
+                );
             }
-        } else if crate::exec_pipeline::evm_fast_path_explicit() {
-            tracing::info!("EVM fast path OFF (TORUS_EVM_FAST_PATH): blocks with EVM txs barrier");
+        } else {
+            tracing::info!(
+                "EVM fast path OFF (TORUS_EVM_FAST_PATH=0, false or not valid): blocks with EVM txs barrier"
+            );
         }
 
         // Spawn execution pipeline: bounded channel (64 blocks) for backpressure.
@@ -38727,17 +38734,21 @@ mod crash_recovery_tests {
         );
     }
 
-    /// Item 7 option 0 (task 3.1): without `TORUS_EVM_FAST_PATH` (the
-    /// default: unset, and a test context) every block with EVM txs still
-    /// barriers and runs serially, with the epoch fast path on and W
-    /// attached: only the EVM boundary 8 (and the slash boundary 12) leave
-    /// the pipelined path, as before the flag existed, and the state equals
-    /// the serial run.
+    /// Item 7 option 0 (task 3.1): with `TORUS_EVM_FAST_PATH` off (`0` /
+    /// `false` on a node since the s131 default flip; a test context is off
+    /// unless it sets the field) every block with EVM txs still barriers and
+    /// runs serially, with the epoch fast path on and W attached: only the
+    /// EVM boundary 8 (and the slash boundary 12) leave the pipelined path,
+    /// as before the flag existed, and the state equals the serial run.
     #[test]
-    fn evm_fast_path_flag_absent_evm_heights_stay_serial() {
+    fn evm_fast_path_flag_off_evm_heights_stay_serial() {
         assert!(
-            !crate::exec_pipeline::parse_evm_fast_path(None),
-            "unset: off"
+            crate::exec_pipeline::parse_evm_fast_path(None),
+            "unset: on (s131 default)"
+        );
+        assert!(
+            !crate::exec_pipeline::parse_evm_fast_path(Some("0".to_string())),
+            "0: off"
         );
         let (config, db) = make_test_config_and_db();
         assert!(
@@ -38754,9 +38765,9 @@ mod crash_recovery_tests {
             let off = fast_path_run_evm(true, true, false, policy, Some(8), Some(12));
             assert_eq!(
                 off.pipelined, expected,
-                "{what}: EVM height 8 serial without the flag"
+                "{what}: EVM height 8 serial with the flag off"
             );
-            assert_fast_path_runs_equal(&serial, &off, &format!("{what}: flag absent vs serial"));
+            assert_fast_path_runs_equal(&serial, &off, &format!("{what}: flag off vs serial"));
         }
     }
 
