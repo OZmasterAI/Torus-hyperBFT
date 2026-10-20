@@ -132,7 +132,9 @@ pub(crate) fn feed_committed_blocks_to_app<K: KVStore>(
             }
             None => continue,
         };
+        let app_start = std::time::Instant::now();
         app.on_committed_block(&block, hash);
+        crate::qc_advance_timers::add_app_time(app_start.elapsed());
         anchored = true;
         last_fed = Some(h);
         delivered += 1;

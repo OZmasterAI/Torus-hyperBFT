@@ -143,6 +143,8 @@ pub mod replica;
 
 mod committed_feed;
 
+pub mod qc_advance_timers;
+
 mod event_bus;
 
 pub mod events;

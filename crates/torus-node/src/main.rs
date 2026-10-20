@@ -1036,6 +1036,30 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let rec_pc = view_rec.clone();
     let rec_timeout = view_rec.clone();
     let rec_commit = view_rec.clone();
+    // s131: the collector's qc_to_advance step split, observed on the
+    // consensus thread at each advanced collector view.
+    {
+        use hotstuff_rs::qc_advance_timers::{AdvancedBy, STEP_COUNT, STEP_NAMES};
+        const _: () = assert!(STEP_COUNT == torus_telemetry::QC_ADVANCE_STEPS.len());
+        debug_assert_eq!(STEP_NAMES, torus_telemetry::QC_ADVANCE_STEPS);
+        let qca_metrics = metrics.clone();
+        hotstuff_rs::qc_advance_timers::set_observer(move |s| {
+            let steps: [f64; STEP_COUNT] = std::array::from_fn(|i| s.steps[i].as_secs_f64());
+            qca_metrics.qc_advance.observe_view(
+                &steps,
+                s.total.as_secs_f64(),
+                s.own_loopback.map(|d| d.as_secs_f64()),
+                s.committed_blocks,
+                s.wait_msgs,
+                match s.advanced_by {
+                    AdvancedBy::OwnAdvanceView => torus_telemetry::QcAdvanceBy::OwnAdvanceView,
+                    AdvancedBy::PeerAdvanceView => torus_telemetry::QcAdvanceBy::PeerAdvanceView,
+                    AdvancedBy::Other => torus_telemetry::QcAdvanceBy::Other,
+                },
+            );
+        });
+    }
+    let commit_handler_metrics = metrics.clone();
     // Own headers loop back via broadcast self-delivery; proposal_arrival is a
     // follower metric, so filter them out by origin.
     let own_hotstuff_vk = verifying_key;
@@ -1106,6 +1130,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             rec_timeout.view_timeout(ev.timestamp);
         })
         .on_commit_block(move |event: &CommitBlockEvent| {
+            let _handler_span = CommitHandlerSpan(&commit_handler_metrics, std::time::Instant::now());
             rec_commit.commit_block(event.timestamp);
             let height = find_latest_height(&state_db_for_handler);
             info!(height, "on_commit_block fired");
@@ -1570,6 +1595,19 @@ fn log_with_grace(log: impl FnOnce() + Send + 'static, grace: Duration) -> bool 
             let _ = tx.send(());
         });
     spawned.is_ok() && rx.recv_timeout(grace).is_ok()
+}
+
+/// s131: times the `on_commit_block` event handler (event-bus thread) on
+/// every exit path.
+struct CommitHandlerSpan<'a>(&'a torus_telemetry::Metrics, std::time::Instant);
+
+impl Drop for CommitHandlerSpan<'_> {
+    fn drop(&mut self) {
+        self.0
+            .qc_advance
+            .commit_event_handler_seconds
+            .observe(self.1.elapsed().as_secs_f64());
+    }
 }
 
 /// SIGINT and SIGTERM receivers. Kept for the node's lifetime: a signal

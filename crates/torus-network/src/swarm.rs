@@ -2379,6 +2379,12 @@ fn handle_command(
 ) {
     match cmd {
         NetworkCommand::Broadcast { message } => {
+            // s131: AdvanceView command queue wait (consensus -> this loop).
+            if let Some(queued) = take_advance_view_queued(&message) {
+                if let Some(ref m) = shared.metrics {
+                    m.qc_advance.swarm_cmd_seconds.observe(queued.elapsed().as_secs_f64());
+                }
+            }
             // Self-delivery (hotstuff_rs expects proposer to receive its own broadcast)
             enqueue_inbound(shared, *local_key, message.clone());
             // B2 consensus isolation: fan the broadcast over /torus/direct to
@@ -2850,6 +2856,41 @@ fn dispatch_next_push(
         let id = swarm.behaviour_mut().direct.send_request(&pid, req);
         shared.push_scheduler.lock().unwrap().record(id);
     }
+}
+
+/// s131 qc_to_advance timers: queue times of AdvanceView `Broadcast`
+/// commands, FIFO-matched to the swarm loop's handling (the command channel
+/// is FIFO). Process-wide: with several nodes in one process (tests) the
+/// match is approximate, which only skews the histogram. Bounded.
+static ADVANCE_VIEW_CMD_QUEUED: Mutex<VecDeque<Instant>> = Mutex::new(VecDeque::new());
+const ADVANCE_VIEW_CMD_QUEUED_CAP: usize = 256;
+
+fn is_advance_view(message: &hotstuff_rs::networking::messages::Message) -> bool {
+    use hotstuff_rs::networking::messages::{Message, ProgressMessage};
+    use hotstuff_rs::pacemaker::messages::PacemakerMessage;
+    matches!(
+        message,
+        Message::ProgressMessage(ProgressMessage::PacemakerMessage(PacemakerMessage::AdvanceView(_)))
+    )
+}
+
+/// Called where an AdvanceView `Broadcast` command is queued.
+pub(crate) fn note_advance_view_queued(message: &hotstuff_rs::networking::messages::Message) {
+    if !is_advance_view(message) {
+        return;
+    }
+    let mut q = ADVANCE_VIEW_CMD_QUEUED.lock().unwrap_or_else(|e| e.into_inner());
+    if q.len() >= ADVANCE_VIEW_CMD_QUEUED_CAP {
+        q.pop_front();
+    }
+    q.push_back(Instant::now());
+}
+
+fn take_advance_view_queued(message: &hotstuff_rs::networking::messages::Message) -> Option<Instant> {
+    if !is_advance_view(message) {
+        return None;
+    }
+    ADVANCE_VIEW_CMD_QUEUED.lock().unwrap_or_else(|e| e.into_inner()).pop_front()
 }
 
 /// B2: resolve the direct-fan target set for a consensus broadcast — the

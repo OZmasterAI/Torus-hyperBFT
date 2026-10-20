@@ -17,6 +17,7 @@ use std::{
 
 use ed25519_dalek::VerifyingKey;
 
+use crate::qc_advance_timers as qca;
 use crate::{
     app::{
         App, BlockDataCheck, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest,
@@ -648,6 +649,7 @@ impl<N: Network> HotStuff<N> {
             return Ok(());
         }
 
+        qca::enter_view_begin();
         let validator_set_state = block_tree.validator_set_state()?;
 
         // 1. Send a NewView message for the current view to the next leader(s).
@@ -680,6 +682,7 @@ impl<N: Network> HotStuff<N> {
             new_view,
         })
         .publish(&self.event_publisher);
+        qca::enter_lap(qca::Step::EnterNewView);
 
         // 2. Update the struct's internal view info, proposal status, and vote collectors to collect
         //    votes for the new view.
@@ -701,6 +704,7 @@ impl<N: Network> HotStuff<N> {
 
         // 3. Set `highest_view_entered` in the block tree to the new view, then emit a `StartView` event.
         block_tree.set_highest_view_entered(self.view_info.view)?;
+        qca::enter_lap(qca::Step::EnterViewWrite);
 
         // Leader-hint fix: surface the leader this replica will treat as the
         // proposer of the view — computed with the SAME (reputation-aware when
@@ -719,6 +723,7 @@ impl<N: Network> HotStuff<N> {
         } else {
             -(now - self.view_info.deadline).as_secs_f64()
         };
+        qca::start_view(self.view_info.view.int());
         Event::StartView(StartViewEvent {
             timestamp: SystemTime::now(),
             view: self.view_info.view,
@@ -1684,6 +1689,11 @@ impl<N: Network> HotStuff<N> {
                     phase_certificate: new_pc.clone(),
                 })
                 .publish(&self.event_publisher);
+                // s131: time the collector's qc_to_advance leg (generic PCs,
+                // the ones `torus_view_qc_to_advance_seconds` measures).
+                if new_pc.phase.is_generic() {
+                    qca::begin(new_pc.view.int(), self.config.keypair.public(), Instant::now());
+                }
 
                 // If the newly collected PC is not safe, then ignore it and return.
                 // In the header pipeline, the PC's block may not be in the tree
@@ -1713,6 +1723,7 @@ impl<N: Network> HotStuff<N> {
                         "locally-collected steady-state PC must be correct by construction"
                     );
                 } else if !new_pc.is_correct(block_tree)? {
+                    qca::cancel();
                     return Ok(());
                 }
                 let pc_block_pending = self.pending_headers.contains_key(&new_pc.block)
@@ -1733,14 +1744,17 @@ impl<N: Network> HotStuff<N> {
                     safe_pc(&new_pc, block_tree, self.config.chain_id)?
                 };
                 if !pc_safe {
+                    qca::cancel();
                     return Ok(());
                 }
+                qca::lap(qca::Step::PcCheck);
 
                 // 2. Trigger block tree updates: update highestPC, lock, commit (if new PC collected).
                 //    In the header pipeline the certified block may not be in
                 //    the tree yet (body in flight). Always advance highest_pc
                 //    first, then attempt full update for commits.
                 let _ = block_tree.advance_highest_pc_from_remote(&new_pc, &self.event_publisher);
+                qca::lap(qca::Step::HighestPc);
                 let update_result =
                     block_tree
                         .update(&new_pc, &self.event_publisher)
@@ -1748,7 +1762,9 @@ impl<N: Network> HotStuff<N> {
                             validator_set_updates: None,
                             committed_block_hashes: vec![],
                         });
+                qca::lap(qca::Step::TreeUpdate);
                 self.process_update_result(update_result, block_tree, app);
+                qca::commit_feed_done();
 
                 // MonadBFT B2: Speculative commit — 1-QC for fresh proposals.
                 // A block qualifies for speculative commit if it was a fresh
@@ -1770,6 +1786,7 @@ impl<N: Network> HotStuff<N> {
                 let _ = self
                     .phase_vote_collectors
                     .update_validator_sets(&validator_set_state);
+                qca::lap(qca::Step::PostCommit);
 
                 // Broadcast AdvanceView with the new PC so all validators can
                 // advance. In the header pipeline, non-proposers don't call
@@ -1782,6 +1799,7 @@ impl<N: Network> HotStuff<N> {
                     );
                     self.sender_handle
                         .broadcast::<crate::networking::messages::Message>(advance_msg.into());
+                    qca::handler_done();
                 }
             }
         }
