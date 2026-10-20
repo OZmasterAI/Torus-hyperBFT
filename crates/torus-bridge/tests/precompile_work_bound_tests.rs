@@ -158,6 +158,11 @@ fn run_block<T: StateBackend + Clone>(
 /// market 1 under `mode`, saved with the real `save_order_books` (which writes
 /// the node-local `__book_mode__` marker).
 fn seed_sides(db: &StateDb, mode: BookMode, bids: &[i64], asks: &[i64]) {
+    // Pre-testnet P0: orders need a listed market (a placeholder row where
+    // the test has none; the tests count the market rows they charge for).
+    if db.get_cf_raw(CF_NATIVE_MARKETS, &1u64.to_be_bytes()).unwrap().is_none() {
+        db.put_cf_raw(CF_NATIVE_MARKETS, &1u64.to_be_bytes(), &[1u8]).unwrap();
+    }
     let mut ctx = ctx_on(db.clone(), 1, mode);
     ctx.positions
         .put_native_balance(

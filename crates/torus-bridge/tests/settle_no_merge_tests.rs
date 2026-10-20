@@ -411,6 +411,11 @@ fn run_seeded(
 ) -> (RunOut, RunStats) {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = StateDb::open(dir.path()).expect("open db");
+    // Pre-testnet P0: orders need a listed market (placeholder rows,
+    // tick / lot 1, as the old implicit book).
+    for m in 1..=64u64 {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+    }
     for n in 1..=TRADERS as u8 {
         let bal = NativeBalance {
             available: fp(1_000_000),

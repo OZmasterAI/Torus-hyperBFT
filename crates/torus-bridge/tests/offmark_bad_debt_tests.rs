@@ -66,7 +66,10 @@ fn ctx_at(db: StateDb, height: u64) -> NativeExecContext {
 /// Markets listed with the test-fixture row (undecodable => default 20x config).
 fn liq_db(markets: &[MarketId]) -> (tempfile::TempDir, StateDb) {
     let (dir, db) = open_test_db();
-    for m in markets {
+    // Market 9: the parallel path's filler order (pre-testnet P0: an order on
+    // an unlisted market is rejected before Phase 2, so it would not reach
+    // the sharded prepare).
+    for m in markets.iter().chain(&[9]) {
         db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
     }
     (dir, db)

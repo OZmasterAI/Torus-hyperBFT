@@ -84,6 +84,13 @@ fn gtc(market_id: MarketId, is_buy: bool, price: i64, qty: i64) -> PlaceOrderPar
 /// Market 1 ends with bids 100 (qty 3, after a partial fill) and 99 (qty 7),
 /// ask 105 (qty 4); last trade price 100. Market 2 holds one bid.
 fn seed(db: &StateDb, mode: BookMode) {
+    // Pre-testnet P0: orders need a listed market (a placeholder row
+    // where the test has none).
+    for m in [1u64, 2] {
+        if db.get_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes()).unwrap().is_none() {
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+        }
+    }
     let maker = addr(MAKER);
     let taker = addr(TAKER);
     let mut ctx = NativeExecContext::new_with_mode(

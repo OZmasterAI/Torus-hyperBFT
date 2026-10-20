@@ -1295,6 +1295,10 @@ mod parallel_match_setup_flag_tests {
     fn in_jobs_calls(pin: bool, block: &[(Address, NativeAction)]) -> u64 {
         let dir = tempfile::tempdir().unwrap();
         let db = torus_state::StateDb::open(dir.path()).unwrap();
+        // Pre-testnet P0: orders need a listed market.
+        for m in [1u64, 2] {
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+        }
         let mut ctx = NativeExecContext::new(
             db,
             1,
@@ -1664,6 +1668,7 @@ fn reject_label(reason: FailureReason) -> OrderRejectReason {
         FailureReason::BadTriggerPx => OrderRejectReason::BadTriggerPx,
         FailureReason::Fill => OrderRejectReason::Fill,
         FailureReason::DuplicateCloid => OrderRejectReason::DuplicateCloid,
+        FailureReason::UnknownMarket => OrderRejectReason::UnknownMarket,
         FailureReason::Other | FailureReason::BatchCap => OrderRejectReason::Other,
     }
 }
@@ -7925,10 +7930,18 @@ impl NativeExecutor {
             NativeAction::CancelOrder { order_id } => {
                 Self::exec_cancel_order(ctx, sender, *order_id)
             }
+            // Pre-testnet P0: a named market that is not listed is rejected
+            // (it holds nothing to cancel; was an `ok` that cancelled nothing).
             NativeAction::CancelAllOrders { market_id } => {
+                if let Some(r) = market_id.and_then(|m| Self::reject_unlisted(ctx, "cancel_all", m)) {
+                    return r;
+                }
                 Self::exec_cancel_all(ctx, sender, *market_id)
             }
             NativeAction::CancelByCloid { market_id, cloid } => {
+                if let Some(r) = Self::reject_unlisted(ctx, "cancel_by_cloid", *market_id) {
+                    return r;
+                }
                 Self::exec_cancel_by_cloid(ctx, sender, *market_id, *cloid)
             }
             NativeAction::ModifyOrder {
@@ -8293,11 +8306,21 @@ impl NativeExecutor {
                             match &flat[i].1 {
                                 FlatAction::Place(_) => place_order_indices.push(i),
                                 FlatAction::Other(NativeAction::CancelAllOrders { market_id }) => {
-                                    run.push((i, flat[i].0, *market_id))
+                                    // Pre-testnet P0: an unlisted market is
+                                    // rejected here, as on the single path; it
+                                    // holds nothing, so leaving it out of the
+                                    // run changes no other result.
+                                    match market_id.and_then(|m| Self::reject_unlisted(ctx, "cancel_all", m)) {
+                                        Some(r) => results[i] = r,
+                                        None => run.push((i, flat[i].0, *market_id)),
+                                    }
                                 }
                                 FlatAction::Other(_) => break,
                             }
                             i += 1;
+                        }
+                        if run.is_empty() {
+                            continue;
                         }
                         let run_results = match Self::exec_cancel_all_run(ctx, &run) {
                             Ok(run_results) => run_results,
@@ -8330,6 +8353,41 @@ impl NativeExecutor {
             }
         }
         ctx.phase_accum.phase1_actions_ns += phase1_timer.elapsed().as_nanos();
+
+        // Pre-testnet P0 (consensus rule): a placement on a market that is not
+        // listed is rejected first, before the cloid pass and Phase 2, so it
+        // claims no cloid, slot, margin or order id and Phase 3 never creates
+        // its book. One registry read per market of the call (none for a
+        // market with a book).
+        {
+            let mut listed: HashMap<MarketId, Result<bool, CoreError>> = HashMap::default();
+            let (books, state, metrics) = (&ctx.order_books, &ctx.state, &ctx.metrics);
+            let mut fault: Option<String> = None;
+            place_order_indices.retain(|&i| {
+                let FlatAction::Place(p) = &flat[i].1 else {
+                    return true;
+                };
+                let m = p.market_id;
+                let rejection = match listed.entry(m).or_insert_with(|| Self::market_listed(books, state, m)) {
+                    Ok(true) => return true,
+                    Ok(false) => Self::unknown_market_rejection(m),
+                    Err(e) => {
+                        if e.is_local_fault() && fault.is_none() {
+                            fault = Some(format!("market registry read: {e}"));
+                        }
+                        (FailureReason::Other, e.to_string())
+                    }
+                };
+                if let Some(m) = metrics {
+                    RejectReason::Other.count(m, rejection.0);
+                }
+                results[i] = NativeActionResult::rejected("place_order", rejection);
+                false
+            });
+            if let (Some(f), None) = (fault, &ctx.fatal_error) {
+                ctx.fatal_error = Some(f);
+            }
+        }
 
         // s114: cloid uniqueness, serially in flat order, before Phase 2
         // reserves anything: a placement whose cloid is live for its sender
@@ -11291,6 +11349,49 @@ impl NativeExecutor {
             .unwrap_or((FixedPoint::ONE, FixedPoint::ONE)))
     }
 
+    /// Pre-testnet P0 (consensus rule, genesis-bound): `market_id` is listed
+    /// when it has a `CF_NATIVE_MARKETS` row (genesis or a governance
+    /// listing; the row the RPC intake check reads, decodable or not). A
+    /// market with a book is listed without a read: a book is only ever
+    /// created for a listed market and market rows are never deleted, so
+    /// every node answers the same. R02: a failed read is the `Err`.
+    fn market_listed<T: StateBackend>(
+        books: &HashMap<MarketId, OrderBook>,
+        state: &T,
+        market_id: MarketId,
+    ) -> Result<bool, CoreError> {
+        if books.contains_key(&market_id) {
+            return Ok(true);
+        }
+        Ok(state
+            .get_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &market_id.to_be_bytes())?
+            .is_some())
+    }
+
+    /// Pre-testnet P0: the rejection of an action on a market that is not
+    /// listed: reason `UnknownMarket`, the RPC intake text, no gas.
+    fn unknown_market_rejection(market_id: MarketId) -> Rejection {
+        (FailureReason::UnknownMarket, format!("unknown market_id {market_id}"))
+    }
+
+    /// Pre-testnet P0: `None` when `market_id` is listed, else the action's
+    /// rejection (nothing written, nothing charged). A failed registry read
+    /// fail-stops (R02) and rejects the action meanwhile.
+    fn reject_unlisted<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        action: &'static str,
+        market_id: MarketId,
+    ) -> Option<NativeActionResult> {
+        match Self::market_listed(&ctx.order_books, &ctx.state, market_id) {
+            Ok(true) => None,
+            Ok(false) => Some(NativeActionResult::rejected(action, Self::unknown_market_rejection(market_id))),
+            Err(e) => {
+                Self::latch_core_fault(ctx, "market registry read", &e);
+                Some(NativeActionResult::err(action, e.to_string()))
+            }
+        }
+    }
+
     /// s515 (BUG 2): signed position size (+long / -short / 0 flat).
     fn signed_position<T: StateBackend>(
         positions: &PositionManager<T>,
@@ -11511,6 +11612,14 @@ impl NativeExecutor {
         sender: &Address,
         params: &PlaceOrderParams,
     ) -> NativeActionResult {
+        // Pre-testnet P0: a market that is not listed first (the batch path's
+        // order: before the cloid and open-order checks claim anything).
+        if let Some(r) = Self::reject_unlisted(ctx, "place_order", params.market_id) {
+            if let Some(ref m) = ctx.metrics {
+                RejectReason::Other.count(m, r.reason);
+            }
+            return r;
+        }
         // s114: a cloid live for the sender in any market.
         if let Some(msg) = params.client_order_id.and_then(|c| {
             let books = &mut ctx.order_books;
@@ -11598,6 +11707,12 @@ impl NativeExecutor {
         liquidation: bool,
     ) -> NativeActionResult {
         let market_id = params.market_id;
+        // Pre-testnet P0: never a book for a market that is not listed (a
+        // triggered stop or a liquidation order names a market that has a
+        // book or a position, so this only guards the invariant).
+        if let Some(r) = Self::reject_unlisted(ctx, "place_order", market_id) {
+            return r;
+        }
 
         // s515 (BUG 1): market / stop orders need a positive price cap.
         // Fix A (s92): the book's dust / off-tick rejects, before any
@@ -11801,7 +11916,7 @@ impl NativeExecutor {
             }
         }
 
-        // Get or create order book for this market.
+        // Get or create order book for this market (listed: checked above).
         ctx.dirty_books.insert(market_id);
         let book = ctx
             .order_books
