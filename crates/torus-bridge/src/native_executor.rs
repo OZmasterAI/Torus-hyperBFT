@@ -2287,7 +2287,9 @@ pub(crate) struct BlockMarks {
     /// Changes exactly when the table or `margin_configs` differ from the
     /// previous block's ([`BlockMarksState`], kept in the resident rows slot);
     /// a changed block takes a new process-wide value, never one used before
-    /// (slot absent or rebuilt = changed). Keys the sums cache (C3).
+    /// (slot absent or rebuilt = changed). Keys the sums cache (C3). Also
+    /// renewed mid-block when the block itself changes `margin_configs`
+    /// (a governance params update, `NativeExecutor::renew_mark_version`).
     version: u64,
 }
 
@@ -5323,6 +5325,10 @@ mod block_marks_tests;
 #[cfg(test)]
 #[path = "sums_cache_tests.rs"]
 mod sums_cache_tests;
+
+#[cfg(test)]
+#[path = "market_params_cache_tests.rs"]
+mod market_params_cache_tests;
 
 #[cfg(test)]
 #[path = "typed_loads_tests.rs"]
@@ -14553,7 +14559,9 @@ impl NativeExecutor {
     ///   P1); they close with reduce-only orders and stay liquidatable.
     /// - `MarketParamsUpdate`: the live book (if any) takes the row's tick
     ///   and lot (resting orders keep their prices; the book meta is
-    ///   rewritten), and the margin config follows the row.
+    ///   rewritten), and the margin config follows the row; if the config
+    ///   changed, the block's mark version moves
+    ///   ([`Self::renew_mark_version`], the C2 / C3 invariant).
     ///
     /// A failed read of the proposal or the row is a local fault (fail-stop).
     fn apply_executed_market_proposal<T: StateBackend>(ctx: &mut NativeExecContext<T>, id: u64) {
@@ -14590,6 +14598,8 @@ impl NativeExecutor {
                         return;
                     }
                 };
+                let config = market_margin_config(market_id, &row);
+                let config_changed = ctx.margin_configs.get(&market_id) != config.as_ref();
                 if let (Some((tick, lot)), Some(book)) =
                     (market_row_shape(&row), ctx.order_books.get_mut(&market_id))
                 {
@@ -14597,7 +14607,7 @@ impl NativeExecutor {
                     book.lot_size = lot;
                     ctx.dirty_books.insert(market_id);
                 }
-                match market_margin_config(market_id, &row) {
+                match config {
                     Some(c) => {
                         ctx.margin_configs.insert(market_id, c);
                     }
@@ -14605,8 +14615,34 @@ impl NativeExecutor {
                         ctx.margin_configs.remove(&market_id);
                     }
                 }
+                if config_changed {
+                    Self::renew_mark_version(ctx);
+                }
             }
             _ => {}
+        }
+    }
+}
+
+impl NativeExecutor {
+    /// Codex P1 (item 6 C2 / C3 invariant: the mark version changes whenever
+    /// the table or the margin configs it values with change; a new version
+    /// is never one used before): `margin_configs` changed after the block's
+    /// table was versioned (the governance step). Give the table a new
+    /// version and restart the sums memo at it, so no valuation made under
+    /// the old config is served again — not by this block's memo, not by the
+    /// slot's entries (joined at the old version), and not in the next
+    /// block, whose version check compares against this block's final
+    /// configs at the new version. No table: nothing is cached (every
+    /// valuation is direct). Node-local: the version never reaches state.
+    fn renew_mark_version<T: StateBackend>(ctx: &mut NativeExecContext<T>) {
+        let Some(marks) = ctx.block_marks.as_mut() else {
+            return;
+        };
+        let version = MARK_VERSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        marks.version = version;
+        if let Some(sums) = ctx.sums.as_mut() {
+            sums.start(Some(version));
         }
     }
 }
