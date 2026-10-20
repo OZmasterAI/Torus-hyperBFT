@@ -16913,6 +16913,187 @@ CPU-s per 1M and matched/s flat, timeouts 0 vs 0: all rows pass.
   `contention.tsv`, `analyst/8t-analyse.py` = 8q's script + view-timeout reasons and per-pair timeouts, `8t-std.txt`,
   `8t-deep.txt`). Tools `ozarchy-8t-tools/`, stage `ozarchy-8t-stage/`.
 
+## 109. Step 8x, b1 screen: mode 3 with checkpoints, book write off the exec thread: one binary `perf/mode3-b1` `ab4ded4e`, C = Classic (`TORUS_BOOK_ROWS=0`, 15 s checkpoints) vs F = mode 3 per-block flush (`TORUS_BOOK_ROWS=3` + `TORUS_CHECKPOINT_INTERVAL_MS=0`) vs B1 = mode 3 with 15 s checkpoints (b1), shallow (standard) and deep (8i P1M) shapes, 300 s cells, n = 1 (campaign ozarchy-8x, archy, 2026-10-20)
+
+**b1 fails the screen on one of the four pass rules, CPU per fill, so the C vs B1 A/B was not run; it passes the other three and is the best arm on throughput and latency in both shapes. CPU-s per 1M fills is +13.3% shallow and +11.4% deep over Classic, against the limit of b0's +8.9% (b0 deep +5.7%); F is +16.8% / +20.1%. Deep: B1 / C blocks/s 3.18x (F / C 1.86x), p50 17 ms (F 75, C 210), matched/s 1.129 (F 1.086). Shallow: B1 blocks/s 11.59 vs F 6.38, p50 16 vs 62 ms, matched/s 0.967 x C (F 0.940). E's write share is 0 (exec and W write seconds equal on every node): b1 removes b0's ~20 ms per block exec-thread write, and the exec thread gets cheaper per fill (-0.08 shallow, -0.82 deep). The extra CPU is off the exec thread: about half on W (book write +0.5, per-block digest +0.8 CPU-s per 1M fills, from job wall time), deep RocksDB state compaction +0.78, and ~1.2 in unnamed threads, consistent with per-block fixed costs on 1.5-2.9x smaller blocks. Caveat: shallow Classic on this binary runs 8.10 blocks/s at p50 31 ms vs 12.3-14.2 / 14-18 ms on other recent Classic binaries, which inflates the shallow B1 / C block-rate and p50 ratios (not the CPU verdict); check it before any A/B. Whether the CPU rule gives way to the throughput / latency gain is the owner's call. Deep C and F were rerun after a Telegram overlap.**
+
+Question (bench queue step 8x, owner s131): does b1 (mode 3 with 15 s checkpoints, the book save's write half on the flush worker W in each block's digest) keep mode 3's deep win and close its shallow gap, at a CPU cost per fill no worse than b0's (section 104)? Pass: deep B1 / C blocks/s near F / C; shallow B1 >= F on blocks/s and p50; B1 CPU per fill no worse than b0's +8.9% vs Classic; E's write share ~0. If it passes: C vs B1 full A/B, n = 3 per shape.
+
+### 109.1 Setup
+
+- Binary: ONE build of `origin/perf/mode3-b1` `ab4ded4e` (plain release --locked, clang+mold; wt/8x-ab4ded4e, ~/.cargo-target-8x
+  reflink of 8l-b): node `f19d9385`, bench-throughput `ec15372b`, flood `dd59d50d`; stage ozarchy-8x-stage/m.
+  Node md5 = staged on 3/3 nodes in every cell.
+- Tools frozen from main `05de56ab` (ozarchy-8x-tools/FROZEN.txt); harness wt/8x-h-05de56ab.
+- Arms (all this binary, code defaults, 512 KB from env.sh, custody 0, `TORUS_CHECKPOINT_MAX_BYTES` unset):
+  **C** = `TORUS_BOOK_ROWS=0` (Classic, 15 s checkpoints); **F** = `TORUS_BOOK_ROWS=3` + `TORUS_CHECKPOINT_INTERVAL_MS=0`
+  (mode 3, per-block flush); **B1** = `TORUS_BOOK_ROWS=3` (mode 3, 15 s checkpoints, b1).
+- `TORUS_BOOK_FAST_ENCODE`: absent on every node, and the flag is not compiled into ab4ded4e: 0 flag lines per node. So C
+  is Classic without L3.3 (x8fastchk OK in every cell).
+- Shapes: shallow = standard shape (100k genesis, no pre-load; drivers ozarchy-8xs); deep = 8i P1M (1M genesis,
+  PRELOAD=1000000; ozarchy-8xd). Each: w1 C 120 s (gated), then r1-C, r1-F, r1-B1, 300 s each, n = 1.
+- Pacing: end_pass=1. The cells ran back to back in one unit (bench-ozarchy-8x-screen). Gaps from one cell's END to the
+  next START were 5-6 s. The deep C and F reruns ran in bench-ozarchy-8x-rerun, 3 min 28 s after deep B1 ended.
+  End passes and all checks ran post hoc (8x-posthoc.sh, nice 19).
+
+### 109.2 Validity
+
+- 8/8 main cells plus 2 warm-ups: rc 0, ACCEPT / AGREE / PASS, 0 panic or fail-stop lines (summary), and 0 `book tripwire` /
+  FATAL / fail-stop-latch lines on every node (x8tripchk). No HARD FINDING.
+- Post hoc (posthoc-screen.log): 250 CHECK OK. Every used cell is POSTHOC CELL OK. The only CHECK FAILs are x8loadchk on
+  the two `*-telegram-unused` cells, whose run.log `cell=` line still has the original label (expected after the rename).
+  All their other 48 checks pass.
+- Book mode confirmed per node:
+  - C: interval `Some(15s)`, checkpoints ON, Classic metrics (no rows, levels or drain), W book writes 0.
+  - F: interval `None`, no checkpoints-ON line, 0 checkpoints, W book writes = blocks.
+  - B1: interval `Some(15s)`, the b1 line once per node, 37-40 checkpoints per node, W book writes = blocks, E write share
+    0.0000.
+- Smoke: B1 60 s per shape, all checks OK after one check fix: the level-mode dirty-entries-per-block > 50 heuristic was
+  dropped, because shallow B1 makes ~31 per block. Negative tests FAIL as expected (ozarchy-8x-run/negtest).
+
+### 109.3 Results (n = 1 per arm; node means over the bench window)
+
+| metric | shallow C | shallow F | shallow B1 | deep C | deep F | deep B1 |
+|---|---|---|---|---|---|---|
+| matched/s | 264,754 | 248,761 | 256,028 | 220,300 | 239,222 | 248,653 |
+| x / C matched/s | | 0.940 | 0.967 | | 1.086 | 1.129 |
+| native blocks/s | 8.102 | 6.376 | 11.59 | 3.195 | 5.941 | 10.17 |
+| x / C blocks/s | | 0.79 | 1.43 | | 1.86 | 3.18 |
+| fills per native block | 30,120 | 33,270 | 20,030 | 65,300 | 35,240 | 22,190 |
+| block p50 / p99 ms | 31 / 940 | 62 / 960 | 16 / 922 | 210 / 1,470 | 75 / 1,026 | 17 / 966 |
+| timeouts (3 nodes) / per 1k native blocks | 0 / 0 | 0 / 0 | 6 / 1.71 | 3 / 3.11 | 0 / 0 | 4 / 1.30 |
+| exec busy (block_ms x blk/s) / exec_thread_busy_fraction | 0.908 / 0.994 | 0.838 / 0.982 | 0.888 / 0.978 | 0.932 / 0.996 | 0.859 / 0.981 | 0.883 / 0.975 |
+| W busy (flush_worker_seconds ms/blk x blk/s) | 0.064 | 0.369 | 0.400 | 0.091 | 0.391 | 0.410 |
+| exec-thread on-CPU ms per 1k fills | 2.779 | 2.663 | 2.696 | 3.516 | 2.668 | 2.694 |
+| CPU-s per 1M fills (process) | 22.85 | 26.69 (+16.8 %) | 25.90 (+13.3 %) | 24.59 | 29.54 (+20.1 %) | 27.39 (+11.4 %) |
+| CPU ms per native block | 748 | 1,041 | 572 | 1,694 | 1,203 | 670 |
+| E save_books ms/blk (phase): drain / write | 6.6 (Classic) | 6.8: 6.6 / 16.3 (write on W) | 3.8: 3.6 / 9.6 (write on W) | 69.5 (Classic) | 8.4: 8.2 / 21.1 (W) | 4.8: 4.6 / 11.4 (W) |
+| exec_save_books_write_seconds vs W's flush_worker_save_books_write_seconds (s, node mean) | 0 / 0 | 37.42 / 37.42 | 37.18 / 37.18 | 0 / 0 | 43.97 / 43.97 | 39.10 / 39.10 |
+| E's write share (total minus W) | n/a (Classic does not observe it) | 0.000 | 0.000 | n/a | 0.000 | 0.000 |
+| W book write ms per native block | 0 | 15.5 | 9.3 | 0 | 19.9 | 11.0 |
+| checkpoints per node / W checkpoint job ms | 32 / 700 | 0 / - | 40 / 1,035 | 32 / 1,072 | 0 / - | 37 / 1,207 |
+| E checkpoint upkeep ms/blk / settle wait ms/blk | 0.96 / 2.48 | 0 / 0 | 0.65 / 0.19 | 2.13 / 21.9 | 0 / 0 | 0.71 / 0.23 |
+| RSS mean / max MB | 4,544 / 5,910 | 3,161 / 3,623 | 4,014 / 4,999 | 7,048 / 8,594 | 4,609 / 5,094 | 5,335 / 6,428 |
+| fail-stop / tripwire lines | 0 | 0 | 0 | 0 | 0 | 0 |
+
+The E phases (ms per native block, shallow C / F / B1) are as follows. Engine 84.6 / 100.0 / 59.5, verify 8.0 / 9.2 /
+5.6, end_resident 10.1 / 10.8 / 6.8, residual 7.1 / 12.8 / 4.9. On deep: engine 165.5 / 108.4 / 67.1, save_books 69.5 /
+8.4 / 4.8, and checkpoint settle wait 21.9 / 0 / 0.2. Full per-cell rows: analyst/8x-shallow.tsv, analyst/8x-deep.tsv.
+
+### 109.4 Pass criteria
+
+1. **Deep B1/C blocks/s near F/C: PASS.** B1/C is 3.18x and F/C is 1.86x, so B1 beats F by 1.71x. Deep p50 is 17 ms for
+   B1, 75 ms for F and 210 ms for C.
+2. **Shallow B1 >= F on blocks/s and p50: PASS.** Blocks/s 11.59 vs 6.38 (1.82x); p50 15.6 vs 62.4 ms.
+3. **B1 CPU per fill no worse than b0's +8.9 % vs Classic: FAIL.** B1 is +13.3 % shallow (25.90 vs 22.85) and +11.4 % deep
+   (27.39 vs 24.59). b0 was +8.9 % shallow and +5.7 % deep. B1 is still below F's +16.8 % / +20.1 %.
+4. **E's write share ~0: PASS.** It is 0.0000 on every node in both shapes, and W wrote once per native block.
+
+### 109.5 Comparison with 8s (b0, section 104) and 8p (mode 3 per-block flush)
+
+| | shallow matched/s vs Classic | shallow blk/s | shallow p50 ms | shallow CPU/1M vs Classic | deep matched/s | deep blk/s vs Classic | deep p50 ms | deep CPU/1M |
+|---|---|---|---|---|---|---|---|---|
+| 8p mode 3 (flush) | 0.937 | 8.62 (0.62x) | 47 | +17.3 % | 1.087 | 2.16x | 61 | +18.5 % |
+| 8s b0 | 0.911 | 3.99 (0.29x) | 136 | +8.9 % | 1.061 | 1.28x | 107 | +5.7 % |
+| 8x F (in-campaign 8p shape) | 0.940 | 6.38 (0.79x) | 62 | +16.8 % | 1.086 | 1.86x | 75 | +20.1 % |
+| **8x B1** | **0.967** | **11.59 (1.43x)** | **16** | **+13.3 %** | **1.129** | **3.18x** | **17** | **+11.4 %** |
+
+- b1 fixes what b0 broke. b0's E-side write (21.6 / 19.8 ms per block in 8s) is gone: E's save_books is 3.8 / 4.8 ms per
+  block, and E's write share is 0. E's busy share falls (0.888 / 0.883 vs b0's 0.953 / 0.964), and B1 cuts blocks 1.7x
+  smaller than C (shallow) and 2.9x smaller (deep).
+- F in this campaign matches 8p's mode 3: matched/s ratio 0.940 vs 0.937 shallow and 1.086 vs 1.087 deep, CPU +16.8 % vs
+  +17.3 % shallow. The in-campaign target behaves as before.
+- **Caveat on C, the shallow Classic on this binary.** It runs 8.10 blocks/s with p50 31 ms and 30k fills per block (w1:
+  7.89 blocks/s). Other Classic binaries on the same shape do better:
+
+  | Classic binary | blocks/s | p50 ms |
+  |---|---|---|
+  | 8s b0 A | 13.65 | 14 |
+  | 8t main eabec5e5 A | 14.16 | 14 |
+  | 8l4 N-off, option 0 base f8a45a2d | 12.31 | 18 |
+
+  matched/s (264.8k) and CPU/1M (22.85) match those cells. So ab4ded4e's Classic path makes fewer, larger blocks on the
+  shallow shape. Deep C matches 8s and 8p (3.20 vs 3.44 / 3.22 blocks/s). This inflates the shallow B1/C blocks/s and p50
+  ratios. Against main's Classic, shallow B1 is 0.82x on blocks/s and p50 is 15.6 vs 14.2 ms. It does not change the CPU
+  verdict, because C's CPU per fill is normal. This looks like a b1 change in the Classic cadence (b0's A had none), and
+  it should be checked before any A/B. Not investigated here (no code reading beyond log lines).
+
+### 109.6 Where B1's extra CPU per fill goes
+
+These are CPU-s per 1M fills, node means. The sampler names only the torus-execution, hotstuff-algo and main threads; the
+flush-worker thread is not captured (null). So W is estimated from its job wall time, which is an upper bound on its CPU.
+RocksDB background work comes from its cpu or flush micros.
+
+| | shallow C -> B1 | deep C -> B1 |
+|---|---|---|
+| total process | 22.85 -> 25.90 (+3.05) | 24.59 -> 27.39 (+2.80) |
+| exec thread (sched on-CPU) | 2.78 -> 2.70 (-0.08) | 3.52 -> 2.69 (-0.82) |
+| hotstuff-algo | 0.92 -> 0.97 (+0.05) | 0.89 -> 0.96 (+0.07) |
+| W job wall time, total | 0.28 -> 1.78 (+1.50) | 0.52 -> 1.90 (+1.39) |
+| of which checkpoint jobs | 0.28 -> 0.54 (+0.26) | 0.52 -> 0.59 (+0.08) |
+| of which book write (pass 2) | 0 -> 0.48 (+0.48) | 0 -> 0.52 (+0.52) |
+| of which per-block digest / state write rest | 0.00 -> 0.76 (+0.76) | 0.00 -> 0.79 (+0.79) |
+| RocksDB state CF compaction CPU | 0.26 -> 0.41 (+0.15) | 0.35 -> 1.13 (+0.78) |
+| RocksDB state flush time | 0.27 -> 0.41 (+0.14) | 0.34 -> 0.47 (+0.13) |
+| RocksDB consensus compaction CPU | 0.52 -> 0.55 (+0.03) | 0.50 -> 0.57 (+0.07) |
+| E cache flush (flush_all) | 0.42 -> 0.42 (0) | 0.41 -> 0.42 (0) |
+| unattributed rest (threads not named: tokio net/DA, exec pool, etc.) | ~+1.26 | ~+1.18 |
+
+- The extra CPU sits off the exec thread. E gets cheaper per fill (deep -0.82: no 69.5 ms Classic save, no 21.9 ms settle
+  wait).
+- About half of the extra CPU is W. Mode 3's pass 2 book write costs +0.48 / +0.52. W's per-block digest of side rows
+  (a job per native block instead of only checkpoints) costs +0.76 / +0.79. Checkpoint jobs add +0.26 / +0.08.
+- Deep RocksDB state compaction rises +0.78. Mode 3 writes per-level and per-order rows: compaction writes 0.039 GB per 1M
+  fills vs C's 0.009.
+- The remaining ~1.2 is in unnamed threads, consistent with per-block fixed costs, since B1 runs 1.43x / 3.18x the native
+  blocks/s. CPU per native block is lower for B1 (572 vs 748 shallow, 670 vs 1,694 deep), but the per-fill cost rises
+  because blocks are 1.5-2.9x smaller. Attributing this further needs per-thread sampling of all threads (perf stays off,
+  paranoid 2).
+- B1 is cheaper than F (-0.79 shallow, -2.15 deep). Most of the deep saving is RocksDB compaction (1.13 vs 3.71) and W's
+  per-block state write (12.4 vs 45.5 ms per block).
+
+### 109.7 Contention
+
+- **Telegram desktop** (coordinator, from journalctl `--user` scope "Consumed" lines, scopes app-Hyprland-gtk\x2dlaunch-498a90e5
+  and -9899c3a1) ran twice:
+  - 12:16:42-12:46:10: 15.2 s CPU, avg 0.009 core. It overlapped only the smoke chain, so no action.
+  - 13:22:23-13:40:30: 121.8 s CPU over 18.1 min, avg 0.112 core, above the 0.1-core threshold. It fully overlapped the load
+    windows of the original deep r1-C (13:24:49-13:30:19) and r1-F (13:33:39-13:39:00). It did not overlap 8xd-w1, 8xd-r1-B1
+    or any shallow cell.
+- **Replaced:** deep r1-C and r1-F were rerun at 13:52-14:08, same arm, binary and env, 300 s, fresh data dirs, no
+  warm-up (unit bench-ozarchy-8x-rerun; 8x-chain-rerun.sh / 8x-rerun-stage.sh). `pgrep -i telegram` was logged before each
+  rerun cell: none running. The originals are kept as `ozarchy-8xd-r1-{C,F}-telegram-unused` (cells.tsv rows renamed;
+  the pre-rerun copy is xd/cells.tsv.pre-telegram-rerun). The tables above use the reruns. Run order on deep is therefore
+  w1, B1, C, F.
+- **The reruns barely differ from the -telegram-unused cells.**
+
+  | | -telegram-unused | rerun |
+  |---|---|---|
+  | C matched/s | 219,700 | 220,300 (unused -0.3 %) |
+  | C blocks/s | 3.179 | 3.195 |
+  | C p50 ms | 212.5 | 209.7 |
+  | C CPU/1M | 24.64 | 24.59 (unused +0.2 %) |
+  | C exec on-CPU per 1k fills | 3.521 | 3.516 |
+  | F matched/s | 238,100 | 239,200 (unused -0.5 %) |
+  | F blocks/s | 5.696 | 5.941 (unused -4.1 %) |
+  | F p50 / p99 ms | 72.8 / 987 | 75.0 / 1,026 |
+  | F CPU/1M | 29.54 | 29.54 |
+
+  Only F's blocks/s moved beyond ~1 %. Neither changes any pass criterion: with the originals, deep F/C would be 1.79x
+  instead of 1.86x.
+- contention.sh (nice >= 10 processes plus loadavg every 30 s; contention-{smoke,screen,rerun}.tsv) recorded **no foreign
+  nice-19 process** during any cell: the 8t analysis did not overlap. It does not see nice-0 apps such as Telegram, a gap
+  in the tool. Load1 means during the cells were 20-51. That is the bench's own nodes: B1 and F run more threads than C,
+  and the same pattern shows in both shapes.
+
+### 109.8 Caveats and data
+
+- n = 1 per arm and shape (a screen). The CPU-per-fill gap to the limit (+4.4 and +5.7 points) is far larger than typical
+  CPU/1M noise (~1 %; the C telegram pair differs by 0.2 %).
+- Shallow C on this binary makes slower, larger blocks than every other recent Classic binary (see above).
+- W's CPU is estimated from job wall time. The sched sampler does not capture the torus-flush-worker thread.
+- Data: `~/bench-results-matched/ozarchy-8x{s,d}-{w1,r1-C,r1-F,r1-B1}`, `ozarchy-8xd-r1-{C,F}-telegram-unused`, smokes `ozarchy-8x{s,d}-smoke-s0`; run `ozarchy-8x-run/` (`8x-analysis.md`, `xs/`, `xd/`, `posthoc-screen.log`, `contention-*.tsv`, `analyst/` with `8x-headline.py`, `8x-analyse.py`, `8x-shallow.tsv`, `8x-deep.tsv`); tools `ozarchy-8x-tools/`; stage `ozarchy-8x-stage/`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
