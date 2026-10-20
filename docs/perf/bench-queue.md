@@ -680,6 +680,10 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    **Order (owner s131):** 8u and 8v run before 8l and the RH4 3-arm rerun (8w; filter built and reviewed, `baffa3a5`). Queue (s131): 8s and 8u done; **8v now**, then 8l (from scratch), 8t, then the RH4 rerun (8w). Section 105 (8u)
    must add native blocks/s, block p50 / p99 and CPU-s per 1M fills (B / A) for the L3.3 default-on call (analysis
    only, alongside 8v).
+   **L3.3 default-on (owner s131):** `TORUS_BOOK_FAST_ENCODE` becomes on by default (branch `perf/l33-default-on`,
+   merges on owner call). Classic cells on any binary built after that merge include L3.3 (section 105: blocks/s
+   1.086, p50 0.884 on the deep book), so their baselines shift slightly vs older sections: compare against
+   same-campaign controls only, and log the flag state per cell (`TORUS_BOOK_FAST_ENCODE=0` restores the old encoder).
 8w. **RH4 3-arm rerun: state pruner compaction filter** (owner s131; after 8v; ~1 h 50). 8r (section 103.6): the
    cost both retention arms share is state-DB compaction of `cf_block_bodies` from the state pruner's
    `delete_range_cf` range deletes (compaction CPU x2.0, L0 3.3 vs 1.2). Fix: `perf/rh4-gc-worker` `baffa3a5` (on
