@@ -31246,7 +31246,7 @@ mod crash_recovery_tests {
         }
     }
 
-    /// 8k L3.3 (`TORUS_BOOK_FAST_ENCODE`, node-local, off by default): the
+    /// 8k L3.3 (`TORUS_BOOK_FAST_ENCODE`, node-local, on by default): the
     /// Classic save's exact-size encoder writes the same book blobs as
     /// `borsh::to_vec`. Over the 130 P2 blocks with reduce-only places and
     /// cloids (resting orders with and without a cloid, pending stops,
@@ -31262,8 +31262,8 @@ mod crash_recovery_tests {
             book_fast_encodes_on_this_thread, parse_book_fast_encode, with_book_fast_encode,
             BookMode,
         };
-        assert!(!parse_book_fast_encode(None), "off by default");
-        assert!(parse_book_fast_encode(Some("1")));
+        assert!(parse_book_fast_encode(None), "on by default");
+        assert!(!parse_book_fast_encode(Some("0")));
         let (blocks, _, cloid_places) = p2_blocks_with(true, true);
         assert!(!cloid_places.is_empty(), "the stream places cloids");
         let run = |on: bool| {

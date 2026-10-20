@@ -494,9 +494,9 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
   costs the flush worker (per-block flush, +18% whole-process CPU-s per 1M fills); mode 3 is the candidate. Pending:
   bench 8p (longer Classic vs mode 3 A/B, deep and standard shape) and the owner's decision; design note
   `docs/plans/deep-book-save-options.md` on branch `docs/deep-book-save-options`. **L3.3 (`TORUS_BOOK_FAST_ENCODE`,
-  merged off by default s131) only affects Classic:** if the genesis picks mode 3 it is dead code and should be
-  removed in a cleanup; before any default-on, profile the unexplained +2.8% exec-engine timer on the deep book
-  (section 97.8).
+  default on since s131, section 105: deep book B/A blocks/s 1.086, p50 0.884, p99 0.919, CPU-s per 1M fills 0.989,
+  n = 1; `0` turns it off) only affects Classic:** if the genesis picks mode 3 it is dead code and should be removed
+  in a cleanup.
 
 ---
 

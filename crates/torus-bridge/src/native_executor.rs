@@ -627,9 +627,10 @@ pub fn parse_settle_defer_results(v: Option<&str>) -> bool {
     on_by_default_flag("TORUS_SETTLE_DEFER_RESULTS", v)
 }
 
-/// 8k L3.3 (`TORUS_BOOK_FAST_ENCODE`, node-local, OFF by default): pure
-/// parse. `1` or `true` (trimmed, any case) = on; unset, empty, `0` or
-/// `false` = off; anything else is warned and off.
+/// 8k L3.3 (`TORUS_BOOK_FAST_ENCODE`, node-local, ON by default since s131,
+/// perf doc section 105): pure parse (`on_by_default_flag`). `0` or `false`
+/// (trimmed, any case) = off; unset, empty, `1` or `true` = on; anything
+/// else is warned and on.
 ///
 /// Classic book mode only (`TORUS_BOOK_ROWS` unset or `0`): modes 1, 2 and 3
 /// never call the Classic encoder, so the flag does nothing there. If the
@@ -637,20 +638,7 @@ pub fn parse_settle_defer_results(v: Option<&str>) -> bool {
 /// decision), remove this flag and `encode_classic` in a cleanup.
 #[doc(hidden)]
 pub fn parse_book_fast_encode(v: Option<&str>) -> bool {
-    let Some(v) = v else {
-        return false;
-    };
-    match v.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" => true,
-        "" | "0" | "false" => false,
-        _ => {
-            tracing::warn!(
-                value = v,
-                "TORUS_BOOK_FAST_ENCODE: not empty, 1, true, 0 or false (any case); using the default (off)"
-            );
-            false
-        }
-    }
+    on_by_default_flag("TORUS_BOOK_FAST_ENCODE", v)
 }
 
 thread_local! {
@@ -682,12 +670,13 @@ pub fn book_fast_encodes_on_this_thread() -> u64 {
     BOOK_FAST_ENCODES.with(std::cell::Cell::get)
 }
 
-/// 8k L3.3 (`TORUS_BOOK_FAST_ENCODE=1`, node-local, off by default): the
-/// Classic save encodes each dirty book with `OrderBook::encode_classic`
-/// (one allocation sized from the book's counts, one copy per resting order)
-/// instead of `borsh::to_vec` (1 KiB start, doubling: the blob is copied on
-/// every growth). Same bytes (proptest `classic_encode_tests`). The thread's
-/// pin if set, else the env read once per process.
+/// 8k L3.3 (`TORUS_BOOK_FAST_ENCODE`, node-local, on by default; `0` turns
+/// it off): the Classic save encodes each dirty book with
+/// `OrderBook::encode_classic` (one allocation sized from the book's counts,
+/// one copy per resting order) instead of `borsh::to_vec` (1 KiB start,
+/// doubling: the blob is copied on every growth). Same bytes (proptest
+/// `classic_encode_tests`). The thread's pin if set, else the env read once
+/// per process.
 fn book_fast_encode_enabled() -> bool {
     if let Some(on) = BOOK_FAST_ENCODE_PIN.with(std::cell::Cell::get) {
         return on;
@@ -718,14 +707,18 @@ mod book_fast_encode_flag_tests {
         BOOK_FAST_ENCODE_PIN,
     };
 
-    /// Off by default: only `1` / `true` (trimmed, any case) turn it on.
+    /// On by default (s131, bench 8u section 105): unset, empty, `1` /
+    /// `true` and garbage (warned) are on; only `0` / `false` (trimmed, any
+    /// case) turn it off.
     #[test]
-    fn parse_off_by_default() {
-        assert!(!parse_book_fast_encode(None));
-        for v in ["1", " 1", "1\n", "true", "TRUE", " True "] {
+    fn parse_on_by_default() {
+        assert!(parse_book_fast_encode(None));
+        for v in [
+            "", " ", "1", " 1", "1\n", "true", "TRUE", " True ", "2", "on", "yes", "01",
+        ] {
             assert!(parse_book_fast_encode(Some(v)), "{v:?}");
         }
-        for v in ["", " ", "0", "false", "FALSE", "2", "on", "yes", "01"] {
+        for v in ["0", " 0 ", "false", "FALSE", " False "] {
             assert!(!parse_book_fast_encode(Some(v)), "{v:?}");
         }
     }
