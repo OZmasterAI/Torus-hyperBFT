@@ -17808,6 +17808,113 @@ Section 107 (8l4's binaries, Noff / Eon, indicative only): 13.88 / 13.41 native 
 * Campaign: `~/bench-results-matched/ozarchy-9a-run/campaign/` (`campaign.log`, `cells.tsv`), `contention-main.tsv`;
   spec and driver `ozarchy-9a-tools/{9a-spec.json,ozarchy-9a-campaign.sh}`; build `ozarchy-9a-stage/build/`.
 
+## 114. Step 9b, L2.1 A/B: streamed in-order settle: one binary `perf/l21-streamed-settle` `df9e1d8a`, both arms `TORUS_SETTLE_NO_MERGE=1 TORUS_BOOK_FAST_ENCODE=1`, A = those vs B = A + `TORUS_SETTLE_STREAMED=1`, Classic, 15 s checkpoints, no EVM load, deep (8i P1M) and standard shapes, A B B A, 300 s cells, n = 2 (campaign ozarchy-9b, archy, 2026-10-20)
+
+**L2.1 raises block rate and lowers latency but fails the exec-path merge rule on deep: exec-thread on-CPU per 1k fills
+1.044 [1.009, 1.081] (both rounds 1.04-1.05), standard 1.035 [0.934, 1.146]. Everything else under the rule is better or
+flat: native blocks/s deep 1.206 [0.911, 1.596] (3.68 -> 4.43), standard 1.103 [0.834, 1.460] (15.04 -> 16.60); block
+p50 deep 0.679 (179 -> 122 ms), standard 0.970 [0.930, 1.012]; p99 deep 0.882, standard 0.871; matched/s deep 1.021
+[0.983, 1.061], standard 0.998; CPU-s per 1M fills deep 0.997, standard 0.989; exec wall per 1k fills deep 0.978
+[0.968, 0.989]. Deep timeouts went up, 5 -> 10 (2.25 -> 3.73 per 1k blocks; view-timeout reasons 8 -> 25, mostly
+after_vote); standard 1 -> 0. Fallbacks 0 in every cell. The extra exec-thread work is wake-up cost: runqueue wait per 1k
+fills doubles (deep 2.11x, standard 1.88x), consistent with `StreamRx::take` parking the exec thread per market and the
+pool unparking it; exec-pool CPU per 1k fills falls 5-8%. Verdict: not a default-on candidate under the rule as written;
+default-off merge only as an owner exception. Suggested next step: batch the wake-ups (or spin briefly before parking)
+and rerun deep at n = 3.**
+
+### 114.1 Setup
+
+* Binary: one fresh build of `origin/perf/l21-streamed-settle` `df9e1d8a` (on main `be87c86e`) in worktree
+  `wt/9b-df9e1d8a`, fresh `CARGO_TARGET_DIR` `~/.cargo-target-9b`, 8l4 flags (plain `release --locked`, one package
+  at a time, clang + mold). Node md5 `c7ce653406267d8749b6f5e07a42a392` on 3 / 3 nodes in all 10 cells; bench
+  `7779bff1`, flood `dd59d50d` (`~/bench-results-matched/ozarchy-9b-stage/build/md5s.txt`). The node carries
+  `TORUS_SETTLE_STREAMED`, `TORUS_SETTLE_NO_MERGE` and `TORUS_BOOK_FAST_ENCODE` (checked with `strings`).
+* Tools: 9a's freeze of main `654f047c` (`ozarchy-9a-tools`), checked identical.
+* Both arms: code defaults plus `TORUS_SETTLE_NO_MERGE=1 TORUS_BOOK_FAST_ENCODE=1` (the base predates the s131
+  default flips), Classic (no `TORUS_BOOK_ROWS`; every `cell=` line shows `book_mode=classic` and the arm's flags, also
+  in node-env on all 3 nodes), 15 s checkpoints, 512 KB push threshold, custody 0, no EVM load. **B** adds
+  `TORUS_SETTLE_STREAMED=1`.
+* Shapes: **deep** = 8i P1M on 8y's 1M genesis (`a644d0a7`, PRELOAD and BULK_COUNT 1,000,000); **standard** =
+  hsdb-300m. Per shape: w1 (A, warm-up), then A B B A at 300 s, n = 2 per arm.
+* Cells: `~/bench-results-matched/ozarchy-9b{d,s}-{w1,r1-A,r1-B,r2-B,r2-A}`.
+
+### 114.2 Validity
+
+* 10 / 10 cells rc 0, ACCEPT / AGREE / PASS, right node md5 on every node, 0 panic and 0 fail-stop lines, boundary
+  checkpoints all pipelined.
+* Fallbacks: no-merge and streamed-resumed (`torus_exec_settle_streamed_resumed_fallbacks`) 0 / 0 / 0 in every cell.
+  Streamed markets per native block: A 0; B deep 191-204 (45 early), standard 97-101 (18 early), so the flag was live
+  in B only.
+* Contention: no foreign process averaged over 0.1 core (max 0.10 in deep w1, 0.04 in the measured cells); no rerun.
+* Pool busy: the node has no pool metric, so a /proc sampler of the `torus-exec-pool` threads ran (`b9-pool.py`,
+  `pool-main.tsv`; 32 pool threads).
+
+### 114.3 Per cell (run order; node mean)
+
+| shape | cell | arm | matched/s | native blk/s | fills/blk | exec block ms | block p50 / p99 ms | CPU-s / 1M | timeouts |
+|---|---|---|---|---|---|---|---|---|---|
+| deep | w1 | A | 218,863 | 4.902 | 40,439 | 173.7 | 88 / 1,228 | 25.83 | 1 |
+| deep | r1 | A | 231,349 | 3.689 | 60,272 | 255.6 | 169 / 1,416 | 24.82 | 1 |
+| deep | r1 | B | 235,575 | 4.548 | 50,546 | 209.5 | 110 / 1,197 | 24.63 | 5 |
+| deep | r2 | B | 238,905 | 4.321 | 53,651 | 220.4 | 133 / 1,165 | 24.52 | 5 |
+| deep | r2 | A | 233,219 | 3.663 | 61,221 | 256.9 | 188 / 1,266 | 24.48 | 4 |
+| std | w1 | A | 276,884 | 13.756 | 17,192 | 60.3 | 14 / 762 | 22.11 | 0 |
+| std | r1 | A | 270,897 | 14.778 | 17,166 | 59.5 | 14 / 731 | 22.58 | 0 |
+| std | r1 | B | 269,770 | 16.669 | 15,222 | 50.1 | 14 / 615 | 22.47 | 0 |
+| std | r2 | B | 270,464 | 16.521 | 15,489 | 50.1 | 14 / 615 | 22.12 | 0 |
+| std | r2 | A | 270,448 | 15.307 | 16,646 | 57.7 | 14 / 681 | 22.52 | 1 |
+
+### 114.4 Arm means and B / A (ratio = geomean of the 2 per-round ratios, 95% t CI, 1 df)
+
+| metric | deep A | deep B | deep B / A | std A | std B | std B / A |
+|---|---|---|---|---|---|---|
+| **exec-thread on-CPU ms per 1k fills** | 3.200 | 3.342 | **1.044 [1.009, 1.081]** | 2.541 | 2.629 | 1.035 [0.934, 1.146] |
+| native blocks/s | 3.676 | 4.434 | 1.206 [0.911, 1.596] | 15.04 | 16.60 | 1.103 [0.834, 1.460] |
+| block p50 ms | 179 | 122 | 0.679 [0.409, 1.128] | 14 | 14 | 0.970 [0.930, 1.012] |
+| block p99 ms | 1,341 | 1,181 | 0.882 [0.511, 1.522] | 706 | 615 | 0.871 [0.555, 1.367] |
+| timeouts per 1k native blocks | 2.25 (5 / 2,224) | 3.73 (10 / 2,683) | n/a | 0.11 (1 / 9,101) | 0 (0 / 10,040) | n/a |
+| view-timeout reasons (all / after_vote / leader / no_vote) | 8 / 8 / 0 / 0 | 25 / 20 / 4 / 1 | | 1 / 1 / 0 / 0 | 0 | |
+| matched/s | 232,284 | 237,240 | 1.021 [0.983, 1.061] | 270,672 | 270,117 | 0.998 [0.972, 1.025] |
+| CPU-s per 1M fills | 24.65 | 24.57 | 0.997 [0.941, 1.056] | 22.55 | 22.29 | 0.989 [0.909, 1.076] |
+| exec ms per 1k fills | 4.219 | 4.127 | 0.978 [0.968, 0.989] | 3.468 | 3.262 | 0.941 [0.848, 1.043] |
+| fills per native block | 60,746 | 52,099 | 0.858 | 16,906 | 15,356 | 0.908 |
+| exec-thread on-CPU s per cell | 224.5 | 239.6 | 1.068 | 208.0 | 214.8 | 1.033 |
+| exec-thread runqueue wait ms per 1k fills | 0.123 | 0.260 | 2.115 | 0.123 | 0.231 | 1.880 |
+| exec busy share | 0.942 | 0.953 | 1.011 | 0.882 | 0.831 | 0.943 |
+| settle phase ms / blk (per 1k fills) | 52.15 (0.858) | 46.64 (0.895) | 0.894 (1.043) | 16.80 (0.993) | 14.93 (0.972) | 0.889 (0.979) |
+| settle pass A ms / blk | 8.73 | 2.47 | 0.283 | 3.00 | 0.94 | 0.312 |
+| settle pass B ms / blk (per 1k fills) | 16.44 (0.271) | 16.06 (0.308) | 0.977 (1.139) | 5.09 (0.301) | 4.89 (0.318) | 0.960 (1.057) |
+| exec-pool on-CPU cores | 1.445 | 1.399 | 0.968 [0.888, 1.055] | 1.611 | 1.487 | 0.923 [0.853, 0.999] |
+| exec-pool on-CPU ms per 1k fills | 6.233 | 5.903 | 0.947 [0.883, 1.016] | 5.953 | 5.506 | 0.925 [0.832, 1.029] |
+| RSS mean MB | 6,231 | 6,252 | 1.003 | 3,665 | 3,687 | 1.006 |
+
+### 114.5 Verdict
+
+* **Merge rule (section 91, owner s128):** B adds exec-thread CPU per fill on deep with the CI above 1 (1.044 [1.009,
+  1.081]); standard points the same way (1.035, CI spans 1). Under the rule as written L2.1 does not merge default on.
+  Blocks/s, p50 and p99 move the right way on both shapes and CPU-s per 1M fills is flat, so this is not the failure
+  the rule guards against (bigger blocks, lower block rate): block rate rises because pass A overlaps matching (pass A
+  per block -70%), while the exec thread itself does ~7% (deep) / ~3% (std) more on-CPU work per cell.
+* **Where the extra exec-thread work comes from:** runqueue wait per 1k fills roughly doubles and pass B per 1k fills
+  rises (1.14 deep, 1.06 std), while pool CPU per fill falls. This fits the per-market park / unpark handoff in
+  `StreamRx::take` (`crates/torus-bridge/src/exec_pool.rs`: the exec thread parks on each market not yet ready and a
+  worker unparks it). Not profiled, so not localized beyond that.
+* **Deep timeouts doubled** (5 -> 10, both B cells 5; reasons 8 -> 25, after_vote 20, leader 4). Small counts at n = 2;
+  not resolved, but it is the wrong direction for the rule.
+* **Options for the owner:** (1) do not merge; (2) merge default off as an exception (+21% / +10% blocks/s, lower p50
+  and p99, 0 fallbacks); (3) cut the wake-ups (batch several markets per handoff or spin briefly before parking), then
+  rerun deep at n = 3 for exec on-CPU per fill and timeouts. Not measured here: the flag-off cost against main (both
+  arms ran the same binary).
+
+### 114.6 Limits and data
+
+* n = 2 per arm, 1 df: blocks/s, p50 and p99 CIs span 1 despite both rounds agreeing in direction.
+* Exec-pool busy comes from a 1 Hz /proc sampler of the `torus-exec-pool` threads, not from a node metric.
+* Analysis: `~/bench-results-matched/ozarchy-9b-run/analyst/` (`9b-analyse.py`; `9b-deep.txt`, `9b-std.txt`).
+* Campaign: `~/bench-results-matched/ozarchy-9b-run/{deep,std}/` (`cells.tsv`, `campaign.log`), `chain-main.log`,
+  `contention-main.tsv`, `pool-main.tsv`; tools and specs `ozarchy-9b-tools/` (`9bd-spec.json`, `9bs-spec.json`,
+  drivers, `9b-chain.sh`, `b9-contention.py`, `b9-foreign.py`, `b9-pool.py`); build `ozarchy-9b-stage/build/`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

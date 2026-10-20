@@ -824,6 +824,10 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    `exec_checkpoint_{wait,upkeep,settle_wait,deferred_join}` per checkpoint; note in section 111. (2) Rebuild `ab4ded4e`
    in a FRESH target dir with the 8l4 flags; if its md5 differs from `f19d9385`, run 8z2 = 8z's spec with O vs B-clean
    (ABBA n = 2); if identical, report and 18c bisects b0 (`704a089d`) vs b1 (`244a767c`).
+   **Part 2 done s72: IDENTICAL.** Clean rebuild of `ab4ded4e` (`wt/8x-ab4ded4e`, fresh `~/.cargo-target-8x` at 8x's
+   path, 8x's incremental dir kept as `~/.cargo-target-8x-incr`; 8l4 flags, 537 crates from scratch, no rustc wrapper)
+   gives node md5 `f19d9385`, byte-identical to the binary 8z ran (`ozarchy-8z2-stage/build/md5s.txt`). The build is not
+   the cause of section 111's Classic gap; 8z2 not run. Next: qc_to_advance sub-timers in both binaries (18c).
 9a. **Merged-main baseline: every s131 default on** (owner s131; NEXT, ready now; ~35 min). Main `5013cc79` or later
    carries all agreed defaults: exec-hash quick wins (section 94), L3.3 `TORUS_BOOK_FAST_ENCODE` on (105), L2.2
    `TORUS_SETTLE_NO_MERGE` on (108), item 7 option 0 `TORUS_EVM_FAST_PATH` on (107). Question: the new main baseline,
@@ -852,6 +856,12 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    (n = 2), 300 s cells. Report under the exec-path merge rule: exec-thread on-CPU per 1k fills, native blocks/s, block
    p50 / p99, timeouts per 1k blocks, matched/s, CPU-s per 1M fills, plus settle / pass B ms per block, pool busy and
    fallbacks (must be 0 in clean cells). Verdict: merge candidate (default off or on) or not.
+   **Done s72 (ozarchy-9b, section 114; `df9e1d8a` node `c7ce6534`, tools `654f047c`, 10 / 10 cells valid, Classic,
+   fallbacks 0, no foreign-CPU rerun): fails the exec-path merge rule on deep: exec-thread on-CPU per 1k fills B / A
+   1.044 [1.009, 1.081] (std 1.035 [0.934, 1.146]); deep timeouts 5 -> 10. Rest better or flat: blocks/s deep 1.206
+   (3.68 -> 4.43), std 1.103; p50 deep 0.679, p99 0.88 / 0.87; matched/s 1.021 / 0.998; CPU-s per 1M 0.997 / 0.989.
+   Extra exec-thread work looks like the per-market park / unpark (runqueue wait per fill ~2x). Owner's call: no
+   merge, default-off exception, or batch the wake-ups and rerun deep at n = 3.**
 9c. **T5.3 A/B: commit manifest in the consensus DB + off-thread header/body write** (owner s131; after 9b; ~45 min).
    Section 106: block p99 inside checkpoint DB-write windows 1,071 vs 542 ms (G = 529); 446 ms of it is the consensus
    commit hook waiting behind its own node's checkpoint batch in the state DB (`persist_commit_manifest`). Fix on
