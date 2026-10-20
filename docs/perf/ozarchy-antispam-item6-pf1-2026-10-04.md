@@ -16810,6 +16810,109 @@ blocks/s 3.76, p50 0.080, p99 0.480.
   `8l4-analysis-n4.txt`, `8l4-analysis.txt`, `8l-analysis-n3.md`). Tools `ozarchy-8l4-tools/`; stage
   `ozarchy-8l4-stage/`. Earlier paused attempt kept as `ozarchy-8l-run-paused3-unused/`.
 
+## 108. Step 8t, L2.2 before default-on: one binary main `eabec5e5`, A = `TORUS_SETTLE_NO_MERGE` unset vs B = `=1`; (1) standard shape, 300 s cells, n = 3; (2) deep book (8i P1M), 900 s cells, A B B A, n = 2 (campaign ozarchy-8t, archy, 2026-10-20)
+
+**L2.2 is a default-on candidate, and timeouts do not rise with B. Standard shape: every exec-path merge-rule row
+passes: exec-thread on-CPU per 1k fills 0.957 [0.936, 0.978] (below 1 in 3 / 3 rounds), native blocks/s 1.095 [1.080,
+1.111], p99 0.877 [0.832, 0.924], p50 0.959 [0.862, 1.066] (mean better, CI spans 1), CPU-s per 1M fills 0.997,
+matched/s 0.998 (load-bound at ~269k/s in both arms), timeouts 0 vs 0, fallbacks 0 on every node. Settle -20% per
+block (pass B 9.24 -> 4.76 ms), of which the cache flush takes back +0.9 ms (+12%). Deep book, 900 s: timeouts 27 vs 28
+(5.09 vs 5.19 per 1,000 blocks; pairs 17 -> 16, 10 -> 12), all-node view timeouts 64 vs 63 with the same reason mix
+(~90% `after_vote`); pooled with 8n and 8q, A 46 vs B 48, so 8q's 7 -> 14 was noise. Deep rows same direction, wide at
+n = 2: exec on-CPU 0.977, blocks/s 1.018, matched/s 1.015, p50 / p99 flat. L3.3 was off in both arms.**
+
+Question (bench queue step 8t, owner s131): L2.2 (`TORUS_SETTLE_NO_MERGE`, merged on main flag off, `be65552e`) was
+benched on the 1M deep book only (8n, 8q: exec on-CPU 0.972, matched/s 1.022; timeouts 7 -> 14 unresolved). Is it a
+default-on candidate under the exec-path merge rule on the standard shape, and do timeouts rise with B over longer
+deep-book cells?
+
+### 108.1 Setup
+
+* One binary: origin/main `eabec5e5` (worktree `wt/8t-eabec5e5`), plain release `--locked` (clang + mold), node
+  `32120afc` (bit-identical to 8v's `fd2557c3` build; the range is docs only), bench-throughput `268a6992`, torus-tx-flood
+  `dd59d50d` (stage `ozarchy-8t-stage/m`). Tools frozen from `eabec5e5` (`ozarchy-8t-tools/FROZEN.txt`).
+* A = `TORUS_SETTLE_NO_MERGE` unset (absent_env, checked on every node), B = `=1`. Code defaults otherwise (Classic, 15 s
+  checkpoints, PC + F on), 512 KB push threshold from `env.sh`, custody 0. `TORUS_BOOK_FAST_ENCODE`: L3.3 default-on is
+  not in `eabec5e5` (merged later in `342c88a2`); unset on every node, every node logs `on=false`.
+* Part 1, standard shape (as 8v): 100k genesis (`d694b81b`), no pre-load, standard load (300 markets, 76k/s, 5,000
+  senders, BLOCK_CAP 400, MAX_IN_FLIGHT 4, tail commit, oracle on). w1 A 120 s gated, then 300 s cells r1 A B, r2 B A,
+  r3 A B.
+* Part 2, deep book (8i P1M, as 8u): 1M-account genesis (`4c8b8af8`), `PRELOAD=1000000`, same load. w1 A 120 s gated,
+  then 900 s cells r1 A B, r2 B A.
+* One unit `bench-ozarchy-8t`, cells 10:34-12:36, `end_pass=1` (between cells only stop + collect; end passes and all
+  checks post hoc at nice 19). Gaps END -> next START 5-6 s for all 11 transitions. Smokes (std B, deep B, 60 s): 54
+  CHECK OK. `perf_event_paranoid` 2 (no perf).
+* Contention: 8l's post-hoc analysis was approved to run at nice 19 during the cells; `contention.tsv` (245 samples,
+  30 s) saw no nice >= 10 process in any sample, so no A / B asymmetry. loadavg per cell shows no arm-wise pattern.
+
+### 108.2 Validity
+
+12 / 12 cells (std w1 + 6, deep w1 + 4) rc 0, ACCEPT / AGREE / PASS, 0 panic / fail-stop lines, no CELL-FLAG, no rerun;
+node md5 `32120afc` on 3 / 3 nodes of every cell. Post hoc: end passes 12 / 12 OK, 0 HARD FINDING, 314 CHECK OK, 0
+CHECK FAIL, 0 CHECK WARN (per cell: md5, node env, genesis md5, load, Classic + checkpoints, F on, 512 KB, custody 0,
+the L2.2 boot line `on=false` / `on=true` per arm, fallbacks, fast-encode `on=false`, swap, memory, disk, shape,
+paranoid 2). Fallbacks (`torus_exec_settle_no_merge_fallbacks_total`) 0 on every node of every cell. Swap no growth.
+
+### 108.3 Part 1: standard shape (B / A, paired by round, n = 3, geomean, 95% t CI)
+
+| row | A | B | B / A [95% CI] |
+|---|---|---|---|
+| matched/s | 269,077 | 268,575 | 0.998 [0.980, 1.016] |
+| exec ms per 1k fills | 3.631 | 3.491 | 0.961 [0.932, 0.992] |
+| CPU-s per 1M fills | 22.74 | 22.66 | 0.997 [0.963, 1.031] |
+| **exec-thread on-CPU ms per 1k fills** | 2.672 | 2.557 | **0.957 [0.936, 0.978]** |
+| native blocks/s | 14.23 | 15.58 | **1.095 [1.080, 1.111]** |
+| block p50 ms | 14 | 14 | 0.959 [0.862, 1.066] |
+| block p99 ms | 739 | 649 | **0.877 [0.832, 0.924]** |
+| timeouts per 1,000 blocks | 0 (0 / 12,923) | 0 (0 / 14,166) | 0 vs 0 |
+| settle phase ms / block | 20.04 | 16.08 | 0.803 [0.789, 0.816] |
+| settle pass B ms / block | 9.24 | 4.76 | 0.515 [0.504, 0.526] |
+| settle pass A ms / block | 3.30 | 2.99 | 0.907 [0.852, 0.966] |
+| cache flush (`flush_all`) ms / block | 7.08 | 7.95 | 1.122 [1.106, 1.139] |
+| settle ms per 1k fills | 1.137 | 0.990 | 0.871 [0.844, 0.898] |
+| cache flush ms per 1k fills | 0.402 | 0.489 | 1.218 [1.213, 1.222] |
+| exec block_ms | 64.0 | 56.7 | 0.886 [0.873, 0.899] |
+| fills per native block | 17,626 | 16,247 | 0.922 [0.906, 0.938] |
+
+Per round: matched/s B / A 0.990, 1.003, 1.002; exec on-CPU per 1k fills 0.966, 0.955, 0.950; blocks/s 1.093, 1.090,
+1.102. Pass B loses its merge (-4.5 ms / block); `flush_with_runs` takes +0.9 ms of it back; net settle -4 ms / block.
+The exec thread's saving shows as a faster block rate (smaller blocks, p99 -12%), not as more matched/s: the standard
+shape is load-bound at ~269k/s in both arms (CV 0.3-0.4%). RSS mean 0.952 (CI spans 1). No run-order drift.
+
+Merge rule: exec-thread CPU per fill CI below 1, blocks/s CI above 1, p99 CI below 1, p50 not on the wrong side,
+CPU-s per 1M and matched/s flat, timeouts 0 vs 0: all rows pass.
+
+### 108.4 Part 2: deep book (8i P1M), 900 s, A B B A (n = 2)
+
+| cell | timeouts (val0, whole cell; headline as 8n / 8q) | view timeouts, load window, 3 nodes: all (no_proposal / no_vote / after_vote / leader) | native blocks | per 1k blocks | block p99 ms |
+|---|---|---|---|---|---|
+| r1 A | 17 | 32 (0 / 0 / 30 / 2) | 2,657 | 6.40 | 1,480 |
+| r1 B | 16 | 31 (0 / 1 / 25 / 5) | 2,703 | 5.92 | 1,628 |
+| r2 B | 12 | 32 (0 / 0 / 29 / 3) | 2,696 | 4.45 | 1,445 |
+| r2 A | 10 | 32 (2 / 0 / 27 / 3) | 2,651 | 3.77 | 1,587 |
+| **A total** | **27** | **64 (2 / 0 / 57 / 5)** | 5,308 | **5.09** | mean 1,533 |
+| **B total** | **28** | **63 (0 / 1 / 54 / 8)** | 5,399 | **5.19** | mean 1,537 |
+
+* Timeouts do not rise with B: 5.09 vs 5.19 per 1,000 blocks (27 vs 28 events, ratio 1.02); the reason mix is the
+  same (~90% `after_vote`: the timer fires after the node voted and the QC is not formed in time, the deep book's 1.5 s
+  p99 blocks). Pooled with the earlier deep runs (8n 12 -> 6, 8q 7 -> 14, 8t 27 -> 28): A 46, B 48.
+* Other rows (B / A, n = 2, 1 df, wide): matched/s 1.015 [0.975, 1.057] (pairs 1.012, 1.018); exec-thread on-CPU per
+  1k fills 0.977 [0.926, 1.031] (pairs 0.981, 0.973); exec ms per 1k fills 0.985; CPU-s per 1M 1.001; blocks/s 1.018
+  [1.013, 1.022]; p50 1.002 (pairs 0.977, 1.028); p99 1.001 (pairs 1.100, 0.911; unresolved at n = 2). Settle -11% per
+  block (pass B 36.7 -> 21.0 ms, 0.571; cache flush 26.9 -> 33.7 ms, 1.249; pass A 1.029). Consistent with 8q.
+
+### 108.5 Verdict, limits and data
+
+* L2.2 is a default-on candidate: all standard-shape merge-rule rows pass, the deep book moves the same way, fallbacks
+  are 0 everywhere, and timeouts do not rise with B (8q's 7 -> 14 does not reproduce).
+* Limits: deep n = 2 (CIs wide; p99 unresolved, both pairs split); one binary, flag-only difference (no layout
+  effect); L3.3 off in both arms (now default-on on main since `342c88a2`: a re-check of L2.2 on top needs a
+  same-campaign control); the cache flush per block rises 12% (std) / 25% (deep) because the merge moved into
+  `flush_with_runs`, which the pass B saving more than covers.
+* Data: `~/bench-results-matched/ozarchy-8t*` cells; run `ozarchy-8t-run/` (`8t-analysis.md`, `posthoc.log`,
+  `contention.tsv`, `analyst/8t-analyse.py` = 8q's script + view-timeout reasons and per-pair timeouts, `8t-std.txt`,
+  `8t-deep.txt`). Tools `ozarchy-8t-tools/`, stage `ozarchy-8t-stage/`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
