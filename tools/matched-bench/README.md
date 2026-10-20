@@ -181,7 +181,7 @@ python3 tools/matched-bench/test_harness.py
    `min(height)-5` via `eth_getBlockByNumber` on every node, a sha256 state
    digest per node (every market's `torus_getOrderBook` + `torus_getOpenInterest`
    + `torus_getBalances` of 50 bench senders), matched/placed/resting/actions
-   counters (must be identical), `panicked|FAIL-STOP` and `ERROR` line counts.
+   counters (must be identical), `panicked` + ERROR-level fail-stop line counts and `ERROR` line counts.
    **Liquidation-stress cells only** (`LIQ_THIN>0` or `ORACLE_SHOCK_BP>0`): the
    digest also covers the three protocol accounts of
    `torus_core::liquidation` — `LIQUIDATOR_VAULT` (`0x746f...766c74`,
@@ -486,15 +486,15 @@ break every later cell).
 - `exec_queue_depth_at_kill` — committed-but-unexecuted blocks already queued
   on E when it died (that part of the rewind is inherent, pipeline or not).
 - `rewind_beyond_exec_queue` = the two subtracted — **what the pipeline cost.
-  Must be <= `max_rewind_beyond_exec_queue`**: 2 with the per-block flush
-  (depth-1 hand-off + the in-flight batch); with coalesced checkpoints
-  (`checkpoint_interval_s` I, default 15 s on validators) the durable marker is
-  the last finished checkpoint, so the bound is
-  `2 + 2 x min(ceil(I x R x 1.5), 100)`: the open interval plus at most one
-  checkpoint W is still writing, R = `rewind_block_rate` (a survivor's blk/s
-  over the 2 x I before the kill), and never more than 100 blocks per
-  checkpoint (attest heights always checkpoint). `max_rewind_hard_cap` = 202
-  caps it and is the fallback when R is unknown (summarize.py `rewind_limit`).
+  Must be <= `max_rewind_beyond_exec_queue`**: 2 with checkpoints off
+  (per-block flush: depth-1 hand-off + the in-flight batch); 202 with
+  coalesced checkpoints on (`checkpoint_interval_s` set, default 15 s on
+  validators). The durable marker is then the last checkpoint W finished, so a
+  kill replays the open checkpoint window plus at most one checkpoint W was
+  still writing, and neither spans more than 100 blocks because every 100th
+  height forces a checkpoint: 2 + 2 x 100 (`max_rewind_hard_cap`). No
+  block-rate estimate: a survivor's rate does not bound the killed node's span
+  (summarize.py `rewind_limit`).
 - `panic_or_failstop_lines` (restart scan) counts `panicked` lines and
   fail-stop / FATAL / conflicting-blocks lines **at ERROR level only**; the
   startup `INFO ... running state hash fail-stop (...) on=false` is not one
