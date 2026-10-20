@@ -884,6 +884,15 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    1.20 (16.7 -> 20.1), matched/s 0.997, CPU-s per 1M 1.018 [0.995, 1.040], exec on-CPU per 1k fills 1.026 [0.935,
    1.126]. Watch: timeouts 0 -> 3 in 24k blocks (5 no_vote view timeouts), writer-thread persist write 2.3x per block,
    manifest prune p99 115 ms (off the consensus thread).**
+9d. **Merged-main deep baseline: every s131 default on, deep book** (owner s131; NEXT, ready now; ~45 min). 9a
+   (section 113) covered the standard shape only. Same binary as 9a or newer main (code defaults: exec-hash, L3.3,
+   L2.2, item 7 option 0 all on; L3.1 / T5.3 / RH4 not yet on main), Classic, 15 s checkpoints, the 8i P1M deep book
+   (1M-account genesis, `PRELOAD=1000000`), standard load otherwise. Arms: **N** = no EVM load; **E** = `EVM_LOAD_RATE=10
+   EVM_LOAD_SENDERS=40`. Warm-up, then N E E N (n = 2), 300 s cells. Report per arm: matched/s, native blocks/s, fills
+   per block, block p50 / p99, timeouts per 1k blocks, exec ms and exec on-CPU ms per 1k fills, save_order_books ms per
+   block, CPU-s per 1M fills, RSS; E/N with CIs. Questions: (1) the deep-book reference for the L3.1 / L6.1 / head-to-head
+   comparisons with all current defaults; (2) does the EVM fast path keep EVM load free on the deep book too (8l and 9a
+   were standard shape only)?
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
