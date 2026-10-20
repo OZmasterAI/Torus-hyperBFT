@@ -17480,6 +17480,243 @@ Timeouts add +0.57 ms per commit (3%; O 0.33 / 0.33, B 2.33 / 1.00 per node, mos
   size-independent per-view excess; low on which leg. Report: `~/bench-results-matched/ozarchy-8z-tools/analyst/
   8z-followup.md` (scripts `8z2-extract.py`, `8z2-tables.py`, `8z2-tails.py`, `8z2-regress.py` and outputs alongside).
 
+## 112. Step 8w, RH4 3-arm rerun with the state-pruner compaction filter: one binary `perf/rh4-gc-worker` `baffa3a5`, A = no retention vs B = `TORUS_RETENTION_BLOCKS=1000` (filter, the branch default) vs C = retention 1000 + `TORUS_PRUNE_MODE=range` (8r's path), standard unpaced load, 300 markets, 300 s cells, A B C C B A twice, n = 4 per arm (campaign ozarchy-8w, archy, 2026-10-20)
+
+**The filter removes the part of 8r's cost that reproduces on this binary (CPU per fill and compaction); blocks/s is not resolved at n = 4. B / A: block p50 1.003 [0.925, 1.088], CPU-s per 1M fills 1.003 [0.991, 1.016], exec-thread on-CPU per 1k fills 1.003 [0.983, 1.023], matched/s 0.999, timeouts unchanged; native blocks/s 0.963 [0.906, 1.025] (lower in 4 / 4, CI spans 1), mostly before the filter acts (pre window 0.905, minute 1 0.935, when B and C run the same code). C / A reproduces 8r's CPU / compaction / matched/s cost (CPU-s per 1M +1.6% [1.2, 2.0], exec on-CPU +1.4%, matched/s -1.0% in 4 / 4, state compaction CPU x1.80 post, `cf_block_bodies` compaction 12 jobs / 21.6 s vs A's 6 / 7.3 s per node; 8r 12 / 22.9) but not its blocks/s cost (0.994 [0.84, 1.17], p50 0.979; 8r 0.949 / 0.989). The filter cuts the extra `cf_block_bodies` compaction CPU by 74% (+14.3 -> +3.7 s per node per cell); all of B's pruning was whole-SST drops (6-11 SSTs, 235-364 MB per node per cell), the compaction filter's row path dropped 0 rows in 300 s; the slowest filter pass took 399 ms on the background pruner thread. Under the exec-path merge rule B passes p50, p99 and timeouts; blocks/s -3.7% with a CI spanning 1 is the owner's call; n >= 6 at 900 s would resolve it.**
+
+### 112.1 Setup
+
+* Binary: one build of `origin/perf/rh4-gc-worker` `baffa3a5` (8r's `a0181b8b` + the prune filter). Node md5
+  `afb09e79c70ec2ad59e445b209e4854d` on 3 / 3 nodes in all 13 cells (stage `~/bench-results-matched/ozarchy-8w-stage`,
+  `build/md5s.txt`). Tools frozen from main `651c288b` (`ozarchy-8w-tools/FROZEN.txt`; `tools/matched-bench` identical
+  to 8y's `8a5d4aeb`).
+* Arms (EXTRA_ENV): **A** = no retention. **B** = `TORUS_RETENTION_BLOCKS=1000` (filter, the branch default). **C** =
+  `TORUS_RETENTION_BLOCKS=1000` + `TORUS_PRUNE_MODE=range` (as 8r's B: DA GC on the worker, range deletes). All arms:
+  code defaults, 512 KB push threshold, custody 0, state hash off, Classic book (w8clchk, 13 / 13), and
+  `TORUS_BOOK_FAST_ENCODE` effectively off (env unset on every node; the knob string is not in `baffa3a5`, which
+  predates L3.3; w8fastchk 13 / 13).
+* Load: standard unpaced, 300 markets, 300 s cells. Order w1 (A), then A B C C B A twice, so n = 4 per arm. Gaps
+  between cells were 6 s (8r: 67-70 s).
+* Cells: `~/bench-results-matched/ozarchy-8w-300m-{w1,r1-A,r1-B,r1-C,r2-C,r2-B,r2-A,r3-A,r3-B,r3-C,r4-C,r4-B,r4-A}`.
+  Not used here: `ozarchy-8w-300m-smoke-s0` (B smoke, 180 s), `ozarchy-8wc-300m-smoke-s0` (C smoke, 180 s; campaign
+  files in `ozarchy-8w-run/smokeC/smoke`), and `ozarchy-8w-300m-w1-paused-unused` (warm-up cut off when 8w paused
+  for 8z at 16:08).
+* Windows (as 8r): whole = load +0 to the shortest load end of the replicate's three cells (+302/+303 s). Post = the
+  later of B's and C's first deleting DA GC pass + 5 s, to the same end: r1 +87, r2 +96, r3 +76, r4 +86 s (206-227
+  s). Pre = +0 to the post start. The first deleting GC pass was at B +81 / +90 / +70 / +76 s and C +76 / +69 / +70 /
+  +80 s. State pruner passes were at about +68, +158 and +248 s after load start (a fourth at +308-311 s in r1-C and
+  r2-B; r4-C at +68 / +158 / +218 / +278).
+
+### 112.2 Validity and post-hoc checks
+
+* Post hoc `ozarchy-8w-tools/8w-posthoc.sh main` (run niced at 18:31, done 18:48; output `ozarchy-8w-run/posthoc-main.txt`):
+  end pass over 13 cells with 0 failed and 13 hardscans; **313 CHECK OK, 0 CHECK FAIL, 0 CHECK WARN, 0 HARD FINDING**;
+  13 CHECK SOAK lines; `POSTHOC CELL OK` 13 / 13 (`POSTHOC checks ozarchy-8w: 13 cells, 0 with a CHECK FAIL`). The
+  smoke post hoc (`posthoc-smoke.txt`, earlier) passed: 2 / 2 cells, 0 CHECK FAIL.
+* All 13 cells rc 0, ACCEPT / AGREE / PASS, md5 ok, no rerun, no CELL-FLAG. Margin rejects 0%. Swap stayed at the
+  preflight level (2,963-2,964 MB, limit +512 MB).
+* The arms took effect on every node (w8modechk / w8retchk / startup log):
+
+| arm | startup `prune_mode` (val0 / 1 / 2) | `TORUS_PRUNE_MODE` in environ | `cf_block_bodies` compaction filter factory (LOG) | DA GC | pass lines |
+|---|---|---|---|---|---|
+| A | none (no state pruner) | unset | `torus-prune-below-cutoff` (cutoff 0, no-op) | off | 0 |
+| B | Filter / Filter / Filter, 4 / 4 cells | unset (default) | `torus-prune-below-cutoff` | worker | `pruning complete (filter mode)`, 3-4 per cell |
+| C | Range / Range / Range, 4 / 4 cells | `range` | None | worker | `pruning complete` (range), 3-4 per cell |
+
+* Contention (`foreign-main.txt`, `contention-main.tsv`, 30 s samples): Telegram never ran. Every measured cell passes
+  the foreign-CPU rule: foreign mean 0.08-0.19 cores, single process avg <= 0.049 and max <= 0.100. kthread was
+  0.87-0.88 cores in A and 0.71-0.83 in B / C. Other non-bench CPU was 0.29-0.43 cores. The unmeasured w1 had one
+  0.82-core python3 spike (the 8z analysis) and was not rerun (w1 matched/s 263,539).
+
+### 112.3 Per cell, whole window (run order; node mean)
+
+| cell | native blk/s | fills / blk | p50 ms | p99 ms | matched/s | CPU-s / 1M fills | exec ms / 1k fills | exec on-CPU ms / 1k fills (load) | timeouts / 1k blk | state compaction CPU s/s | `cf_block_bodies` L0 mean | process cores |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| r1-A | 13.934 | 19,145 | 14.2 | 749 | 266,767 | 22.72 | 3.626 | 2.699 | 0.237 | 0.066 | 2.35 | 6.060 |
+| r1-B | 13.839 | 19,205 | 14.1 | 750 | 265,746 | 22.87 | 3.665 | 2.707 | 0.000 | 0.079 | 1.83 | 6.077 |
+| r1-C | 15.535 | 17,047 | 13.6 | 645 | 264,817 | 23.14 | 3.699 | 2.725 | 0.071 | 0.123 | 2.31 | 6.129 |
+| r2-C | 13.919 | 18,976 | 15.2 | 729 | 264,135 | 23.23 | 3.691 | 2.730 | 0.000 | 0.122 | 2.11 | 6.136 |
+| r2-B | 14.450 | 18,365 | 14.0 | 708 | 265,380 | 23.05 | 3.702 | 2.711 | 0.000 | 0.089 | 0.53 | 6.116 |
+| r2-A | 15.755 | 16,901 | 14.2 | 572 | 266,280 | 22.83 | 3.659 | 2.682 | 0.070 | 0.075 | 0.81 | 6.079 |
+| r3-A | 14.388 | 18,486 | 14.8 | 724 | 265,978 | 22.93 | 3.695 | 2.722 | 0.000 | 0.079 | 1.63 | 6.098 |
+| r3-B | 14.307 | 18,601 | 14.2 | 719 | 266,117 | 22.74 | 3.605 | 2.680 | 0.077 | 0.083 | 2.63 | 6.052 |
+| r3-C | 13.622 | 19,227 | 13.8 | 778 | 261,901 | 23.23 | 3.714 | 2.755 | 0.000 | 0.115 | 1.93 | 6.085 |
+| r4-C | 15.182 | 17,449 | 13.5 | 654 | 264,899 | 23.04 | 3.685 | 2.725 | 0.000 | 0.117 | 1.78 | 6.103 |
+| r4-B | 13.812 | 19,401 | 15.2 | 713 | 267,952 | 22.84 | 3.665 | 2.710 | 0.161 | 0.079 | 0.73 | 6.119 |
+| r4-A | 14.531 | 18,391 | 14.1 | 719 | 267,244 | 22.73 | 3.618 | 2.677 | 0.000 | 0.075 | 1.36 | 6.073 |
+
+Run order shows no drift: A ran 13.93 / 15.76 / 14.39 / 14.53 blk/s, B 13.84 / 14.45 / 14.31 / 13.81, C 15.54 /
+13.92 / 13.62 / 15.18. Every cell stayed in one regime: 17-19k fills per block and 262-268k matched/s. Timeouts were
+0-1 per cell (node mean 0.0-1.0), all in the pre window.
+
+Native blocks/s per minute (node mean; * = first deleting DA GC pass):
+
+| cell | m1 | m2 | m3 | m4 | m5 |
+|---|---|---|---|---|---|
+| r1-A | 11.19 | 13.74 | 16.57 | 14.97 | 13.71 |
+| r1-B | 9.96 | 13.78* | 16.64 | 14.27 | 14.44 |
+| r1-C | 10.90 | 13.46* | 16.05 | 17.06 | 19.17 |
+| r2-C | 10.84 | 14.50* | 16.36 | 14.38 | 13.66 |
+| r2-B | 9.72 | 11.41* | 16.47 | 15.36 | 18.59 |
+| r2-A | 10.33 | 15.66 | 15.20 | 17.51 | 18.84 |
+| r3-A | 10.81 | 13.17 | 16.14 | 15.82 | 16.53 |
+| r3-B | 11.54 | 14.86* | 16.47 | 14.10 | 14.99 |
+| r3-C | 11.09 | 13.65* | 14.33 | 15.55 | 14.01 |
+| r4-C | 9.62 | 13.49* | 17.12 | 16.39 | 18.28 |
+| r4-B | 10.14 | 12.68* | 16.64 | 14.09 | 15.26 |
+| r4-A | 11.87 | 15.37 | 15.31 | 16.01 | 14.61 |
+
+Per-minute B / A: m1 0.935, m2 0.908, m3 1.048, **m4 0.900 [0.846, 0.958] (4 / 4 lower)**, m5 0.996. C / A: m1 0.960,
+m2 0.953, m3 1.009, m4 0.985, m5 1.018 (all CIs span 1). Minute 1 comes before any prune or GC deletion, when B and
+C run the same code. Even there C / B is 1.027 [0.90, 1.18], which is the size of the cell-to-cell noise. The B / A
+m4 dip matches 8r's (B / A m4 0.920, 4 / 4). It sits in the minute after the second filter pass (+158 s, 3 SSTs
+dropped). C / A shows no such dip. With 10 per-minute tests, one CI excluding 1 can happen by chance. This is a note
+only, not a result.
+
+### 112.4 Arm means and paired ratios (n = 4 per arm; ratio = geomean of the 4 per-replicate ratios, 95% t CI, 3 df, t = 3.182; timeouts as a mean difference)
+
+| metric | window | A | B | C | B / A [95% CI] | B < A | C / A [95% CI] | C < A |
+|---|---|---|---|---|---|---|---|---|
+| matched/s | whole | 266,567 | 266,299 | 263,938 | 0.9990 [0.9940, 1.0040] | 2/4 | 0.9901 [0.9843, 0.9960] | 4/4 |
+| matched/s | post | 265,691 | 264,852 | 261,899 | 0.9968 [0.9889, 1.0048] | 3/4 | 0.9857 [0.9750, 0.9965] | 4/4 |
+| native blocks/s | whole | 14.652 | 14.102 | 14.564 | 0.9633 [0.9055, 1.0247] | 4/4 | 0.9935 [0.8431, 1.1707] | 2/4 |
+| native blocks/s | post | 15.585 | 15.321 | 15.607 | 0.9844 [0.9261, 1.0463] | 3/4 | 0.9994 [0.7704, 1.2965] | 2/4 |
+| native blocks/s | pre | 12.300 | 11.105 | 11.898 | 0.9045 [0.7442, 1.0994] | 3/4 | 0.9674 [0.7979, 1.1727] | 2/4 |
+| fills per native block | whole | 18,231 | 18,893 | 18,175 | 1.0371 [0.9752, 1.1030] | 0/4 | 0.9966 [0.8475, 1.1720] | 2/4 |
+| fills per native block | post | 17,113 | 17,308 | 16,904 | 1.0127 [0.9507, 1.0788] | 1/4 | 0.9863 [0.7608, 1.2786] | 2/4 |
+| block p50 ms | whole | 14.3 | 14.4 | 14.0 | 1.0029 [0.9246, 1.0878] | 3/4 | 0.9785 [0.8905, 1.0752] | 3/4 |
+| block p50 ms | post | 14.0 | 14.0 | 14.0 | 0.9989 [0.9070, 1.1002] | 3/4 | 0.9914 [0.8341, 1.1782] | 3/4 |
+| block p99 ms | whole | 691 | 722 | 702 | 1.0510 [0.8828, 1.2512] | 2/4 | 1.0181 [0.7680, 1.3497] | 2/4 |
+| block p99 ms | post | 638 | 642 | 626 | 1.0104 [0.8962, 1.1391] | 2/4 | 0.9762 [0.6116, 1.5581] | 2/4 |
+| exec ms per 1k fills | whole | 3.649 | 3.659 | 3.697 | 1.0027 [0.9738, 1.0325] | 1/4 | 1.0132 [1.0014, 1.0251] | 0/4 |
+| exec ms per 1k fills | post | 3.668 | 3.679 | 3.732 | 1.0028 [0.9720, 1.0347] | 1/4 | 1.0173 [1.0030, 1.0319] | 0/4 |
+| exec-thread on-CPU ms per 1k fills | whole load | 2.695 | 2.702 | 2.734 | 1.0026 [0.9825, 1.0232] | 1/4 | 1.0144 [1.0078, 1.0210] | 0/4 |
+| CPU-s per 1M fills | whole | 22.80 | 22.87 | 23.16 | 1.0032 [0.9909, 1.0157] | 1/4 | 1.0159 [1.0116, 1.0202] | 0/4 |
+| CPU-s per 1M fills | post | 23.07 | 23.21 | 23.61 | 1.0061 [0.9956, 1.0168] | 1/4 | 1.0237 [1.0178, 1.0296] | 0/4 |
+| timeouts per 1k native blocks | whole | 0.077 | 0.059 | 0.018 | -0.02 [-0.30, +0.26] | 2/4 | -0.06 [-0.18, +0.07] | 2/4 |
+| timeouts per 1k native blocks | post | 0 | 0 | 0 | 0 | - | 0 | - |
+| state DB compaction CPU s/s (all CFs) | whole | 0.074 | 0.082 | 0.119 | 1.1196 [0.9956, 1.2591] | 0/4 | 1.6227 [1.3796, 1.9086] | 0/4 |
+| state DB compaction CPU s/s (all CFs) | post | 0.082 | 0.094 | 0.147 | 1.1461 [1.0117, 1.2984] | 0/4 | 1.8022 [1.4829, 2.1902] | 0/4 |
+| state compact write MB/s | post | 1.61 | 2.14 | 3.48 | 1.3327 [1.2415, 1.4307] | 0/4 | 2.1663 [1.9604, 2.3938] | 0/4 |
+| consensus DB compaction CPU s/s | post | 0.174 | 0.174 | 0.166 | 0.9970 [0.9436, 1.0534] | 3/4 | 0.9515 [0.9001, 1.0058] | 3/4 |
+| `cf_block_bodies` L0 mean (1 Hz) | post | 2.13 | 1.97 | 2.85 | 0.816 [0.379, 1.756] | 3/4 | 1.414 [0.717, 2.789] | 1/4 |
+| process CPU cores | post | 6.128 | 6.146 | 6.184 | 1.0030 [0.9874, 1.0188] | 1/4 | 1.0091 [0.9952, 1.0231] | 1/4 |
+
+C / B (whole): CPU-s per 1M 1.013 [1.003, 1.023] (0 / 4 lower), matched/s 0.991 (4 / 4 lower), state compaction CPU
+1.449 [1.325, 1.585], blocks/s 1.031 [0.899, 1.183], p50 0.976.
+
+### 112.5 State DB, pruner and disk (per node; mean (sd) of the 4 cells per arm; ratios as section 4)
+
+| metric | A | B | C | B / A | C / A |
+|---|---|---|---|---|---|
+| `cf_block_bodies` compaction jobs per cell (LOG) | 6.0 (0) | 9.0 (0) | 12.0 (0) | 1.50 | 2.00 |
+| `cf_block_bodies` compaction CPU s per cell (LOG) | 7.28 (0.11) | 10.94 (0.09) | 21.55 (0.75) | 1.503 [1.472, 1.534] | 2.960 [2.813, 3.116] |
+| `cf_block_bodies` compaction in / out MB | 453 / 259 | 680 / 389 | 1,226 / 666 | 1.50 / 1.50 | 2.70 / 2.57 |
+| `cf_block_bodies` records in -> out (r1..r4 range) | 2.4-2.6k -> same | 3.7-4.1k -> same (0 dropped) | 9.4-10.4k -> 6.6-7.2k | - | - |
+| `cf_block_bodies` trivial moves (LOG `Moving #`) | 14 | 1 | 1 | 0.07 | 0.07 |
+| state DB compaction CPU s per cell (metrics-after, all CFs) | 20.0-23.9 | 23.7-27.2 | 35.4-37.3 | - | - |
+| SSTs dropped whole (`DeleteFilesInRange`) per node per cell | 0 | 7.8 (2.2): 7 / 11 / 7 / 6 | 0 | - | - |
+| MB dropped whole per node per cell | 0 | 268 (64): 236 / 364 / 237 / 235 | 0 | - | - |
+| compaction-filter rows dropped (`torus_pruner_filter_rows_dropped_total`) | 0 | **0 in every B cell** | 0 (filter not installed) | - | - |
+| blocks pruned (metric) / cutoff | 0 | 3,300 (523) / cutoff = pruned height | 3,527 (665) | - | - |
+| prune pass elapsed ms (B log; C does not log it) | - | mostly 2-36; max 399 (r2-B val0, 3rd pass), 154 (r2-B val2, 1st pass, 0 files), 140 (r4-B) | - | - | - |
+| state SST MB / files at cell end (du after stop) | 739 (62) / 72 | 325 (72) / 48 | 299 (39) / 56 | 0.433 [0.341, 0.550] | 0.403 [0.349, 0.464] |
+| live state SST MB at load end (60 s sidecar) | 682 (62) | 304 (63) | 421 (72) | 0.441 [0.366, 0.531] | 0.611 [0.429, 0.870] |
+| live consensus SST MB at load end | 591 (28) | 166 (14) | 170 (28) | 0.280 | 0.284 |
+| live state + consensus total MB at load end (incl. WAL) | 3,669 (278) | 2,883 (86) | 2,957 (136) | 0.787 [0.721, 0.860] | 0.807 [0.730, 0.893] |
+
+Per node, the three validators agree within 0.1-0.7 s on each compaction-CPU figure in every cell (whole cell,
+state / consensus / bb, s): r1-A 20.0 / 47.5 / 7.2, r1-B 24.1 / 45.3 / 10.9, r1-C 37.3 / 43.4 / 21.7, r2-C 36.9 /
+45.5 / 22.2, r2-B 26.5-27.2 / 47-48 / 10.9-11.3, r2-A 22.5 / 48.2 / 7.4, r3-A 23.7 / 48.2 / 7.4, r3-B 25.8 / 44.6 /
+10.9, r3-C 36.5 / 45.1 / 22.1, r4-C 35.5 / 44.3 / 20.6, r4-B 25.6 / 46.5 / 10.9, r4-A 22.8 / 46.4 / 7.3 (val0 shown
+where the nodes are the same; full table in `w8-extra.txt`). The du WAL figure (0-1.4 GB) depends on when the node
+stopped relative to WAL recycling, so the totals use SST bytes.
+
+Notes:
+* B removes old bodies only by dropping whole SSTs. Over 300 s the compaction filter dropped no row in any B cell.
+  Every B `cf_block_bodies` compaction had records in = records out. So rows below the cutoff in SSTs that straddle
+  it stay on disk until a later compaction (reads hide them). The filter's row-dropping path was not exercised by
+  this load.
+* B's residual cost: 3 more `cf_block_bodies` compactions per cell (9 vs 6), +3.7 s CPU per node per cell (+50%),
+  compact write +33% post. They rewrite rows without dropping any. Both retention arms lose the trivial moves A gets
+  (14 -> 1 per node). The extra jobs fit the trivial moves that become real compactions. Cause not resolved; the
+  prune meta key lives in `cf_block_headers`, not in `cf_block_bodies`.
+* The 1 Hz `cf_block_bodies` L0 mean does not separate the arms in 8w: post A 2.13, B 1.97, C 2.85, with per-pair
+  ratios from 0.53 to 2.6 (8r: A 1.20, B / C 3.3). Treat it as noise here.
+* The longest filter pass (399 ms) ran on the background pruner thread, not on the commit path. Slow DA GC passes
+  (worker, >= 50 ms): B 5 lines (50-72 ms, write share 74%), C 13 lines (51-161 ms, write share 94%).
+
+### 112.6 Comparison with 8r (section 103 / 103.6)
+
+8w C is the same path as 8r B (DA GC on the worker plus range deletes). 8r C (inline GC) has no 8w counterpart.
+
+| metric (whole unless noted) | 8r A | 8r B / A (worker + range) | 8w A | 8w C / A (worker + range) | 8w B / A (worker + filter) |
+|---|---|---|---|---|---|
+| native blocks/s | 13.420 | 0.949 [0.820, 1.099], 3/4 | 14.652 | 0.994 [0.843, 1.171], 2/4 | 0.963 [0.906, 1.025], 4/4 |
+| native blocks/s post | 14.493 | 0.940 [0.854, 1.035] | 15.585 | 0.999 [0.770, 1.297] | 0.984 [0.926, 1.046] |
+| block p50 | 14.9 ms | 0.989 [0.882, 1.110] | 14.3 ms | 0.979 [0.891, 1.075] | 1.003 [0.925, 1.088] |
+| block p99 | 784 ms | 1.031 [0.951, 1.118] | 691 ms | 1.018 [0.768, 1.350] | 1.051 [0.883, 1.251] |
+| matched/s | 269,543 | 0.990 [0.979, 1.000], 4/4 | 266,567 | 0.990 [0.984, 0.996], 4/4 | 0.999 [0.994, 1.004] |
+| CPU-s per 1M fills | 22.59 | 1.020 [1.008, 1.033] | 22.80 | 1.016 [1.012, 1.020] | 1.003 [0.991, 1.016] |
+| CPU-s per 1M fills post | 22.95 | 1.028 [1.012, 1.044] | 23.07 | 1.024 [1.018, 1.030] | 1.006 [0.996, 1.017] |
+| exec on-CPU ms per 1k fills | 2.678 | 1.015 [1.000, 1.029] | 2.695 | 1.014 [1.008, 1.021] | 1.003 [0.983, 1.023] |
+| state compaction CPU s/s post | 0.077 | x1.97 [1.74, 2.24] | 0.082 | x1.80 [1.48, 2.19] | x1.15 [1.01, 1.30] |
+| state compact write MB/s post | 1.51 | x2.37 | 1.61 | x2.17 | x1.33 |
+| `cf_block_bodies` LOG jobs / CPU s per node | 6 / 7.30 | 12 / 22.86 | 6 / 7.28 | 12 / 21.55 | 9 / 10.94 |
+| consensus compaction CPU post | 0.172 | x1.08 | 0.174 | x0.95 | x1.00 |
+| gaps between cells | 67-70 s | | 6 s | | |
+
+8w A matches 8r A on `cf_block_bodies` compaction (6 jobs, 7.3 s, 453 / 259 MB). A's native blocks/s is 9% higher
+(14.65 vs 13.42) and its p99 is 12% lower. One candidate is the 6 s gaps against 8r's ~68 s; this is not tested.
+
+### 112.7 Verdicts
+
+* **B vs A (retention 1000 with the filter): within noise on p50 and CPU per fill. Blocks/s is not resolved.** Block
+  p50 1.003 [0.925, 1.088], post 0.999. CPU-s per 1M fills 1.003 [0.991, 1.016]. Exec-thread on-CPU per 1k fills
+  1.003 [0.983, 1.023]. Exec ms per 1k fills 1.003. Process cores 1.003. Matched/s 0.999 [0.994, 1.004]. Timeouts
+  are unchanged. Native blocks/s is 0.963 [0.906, 1.025] whole (4 / 4 lower) and 0.984 [0.926, 1.046] post (3 / 4).
+  The CIs span 1, and the gap is largest before the filter acts: pre 0.905, minute 1 0.935, when B and C run the same
+  code and C / A is 0.960. So the data do not tie the blocks/s gap to the filter. They do not show B equal to A
+  either.
+* **C vs A (8r's path on this binary): 8r's CPU and compaction cost comes back; its blocks/s cost does not.** CPU-s
+  per 1M fills +1.6% [1.2, 2.0] whole and +2.4% post (8r +2.0% / +2.8%). Exec on-CPU +1.4% (8r +1.5%). Matched/s -1.0%
+  in 4 / 4 (8r -1.0%). State compaction CPU x1.62 whole / x1.80 post (8r x1.97 post). `cf_block_bodies` compaction
+  12 jobs / 21.6 s vs 7.3 (8r 12 / 22.9). Native blocks/s 0.994 [0.843, 1.171] and p50 0.979, so there is no
+  blocks/s or p50 cost this time (8r 0.949 / 0.989).
+* **Does the filter fix 8r's cost? Yes for the cost that reproduces.** It removes about 74% of the extra
+  `cf_block_bodies` compaction CPU (+14.3 -> +3.7 s per node per cell) and about 81% of the extra post state
+  compaction CPU (+0.065 -> +0.012 s/s). It brings CPU per fill, exec-thread CPU and matched/s back inside noise
+  (C / B CPU-s 1.013 [1.003, 1.023], matched/s 0.991 in 4 / 4). It also keeps the state DB at least as small at cell
+  end (325 vs 299 MB du; live 304 vs 421 MB). For blocks/s this rerun cannot say: the old path showed no blocks/s
+  cost here, so there was nothing for the filter to fix.
+* Under the exec-path merge rule (native blocks/s, p50 / p99, timeouts not worse): B passes p50, p99 and timeouts.
+  Blocks/s is -3.7% whole with a CI that spans 1 (0.906-1.025). Calling it a pass or a fail is the owner's decision.
+  A longer or larger-n A / B run (n >= 6, 900 s) would resolve it.
+
+### 112.8 Limits and data
+
+* n = 4 per arm, 3 df. Blocks/s varies between cells by +-0.5-1.0 blk/s (sd A 0.78, C 0.94), so a ~4% blocks/s effect
+  cannot be resolved. C's blocks/s CI (0.84-1.17) is wider than in 8r.
+* Gaps between cells were 6 s, against 8r's 67-70 s. Back-to-back cells mean the next cell starts while the host is
+  still writing back the last one. A's baseline is 9% faster in blocks/s than 8r's.
+* Each replicate is three adjacent cells (A B C / C B A), so B is always the middle cell, between A and C.
+* Over 300 s, the compaction filter's row-dropping path never ran (0 rows), and only whole-SST drops removed data.
+  A longer run would exercise it.
+* Only the state DB LOG is copied. The RocksDB background, GC worker and pruner threads have no per-thread CPU.
+  State compaction CPU s/s counts all state CFs (`cf_native_positions` included; the same in all arms in 8r).
+
+* Data and scripts:
+* Scripts and outputs: `~/bench-results-matched/ozarchy-8w-tools/analyst/`. `w8-analyse.py` is 8r's
+  `r8-analyse.py` with md5 `afb09e79`, plus exec ms / 1k fills, timeouts / 1k blocks, compaction CPU, L0, process
+  cores, and per-cell pruner / LOG / du extras. Its outputs are `w8.txt` and `w8-analyse.json`. `w8-extra.py` writes
+  `w8-extra.txt` and `w8-extra.json` (modes, pruner, LOG `cf_block_bodies`, disk, per node, contention).
+* Post hoc: `~/bench-results-matched/ozarchy-8w-run/posthoc-main.txt` (+ `posthoc-main.done`, exit 0) and
+  `posthoc-smoke.txt`. Per-cell outputs: `w8-prune.txt`, `w8-fastenc.txt`, `w8-slowpass.txt`, `w8-worker.txt`,
+  `w8-disk.txt`, `w8-swap.txt`, `w8-push.txt`.
+* Campaign: `~/bench-results-matched/ozarchy-8w-run/campaign/` (`cells.tsv`, `campaign.log`, `cell-step/`,
+  `endpass-state.txt`), plus `chain-main.log`, `contention-main.tsv`, `foreign-main.txt`, `w8-samples/` and
+  `w8-sampler-main.log`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

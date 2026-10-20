@@ -744,6 +744,13 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    `cf_block_bodies` L0 count, SSTs / bytes dropped whole, on-disk size at cell end. Verdicts: B vs A (retention
    within noise: p50, blocks/s, CPU per fill?) and C vs A (does 8r's cost reproduce on this binary?). Prune-by-default
    and the RH4 merge wait on this.
+   **Done s70 (ozarchy-8w, section 112; `baffa3a5` node `afb09e79`, tools `651c288b`, 13 / 13 cells valid, 313 CHECK OK,
+   0 FAIL; prune mode per node A none / B Filter / C Range; Classic; no foreign-CPU rerun; paused once for 8z during its
+   warm-up): the filter fixes the cost that reproduces. B / A p50 1.003 [0.925, 1.088], CPU-s per 1M 1.003 [0.991, 1.016],
+   exec on-CPU 1.003, matched/s 0.999; blocks/s 0.963 [0.906, 1.025] (4 / 4 lower, mostly before the filter acts),
+   unresolved. C / A: CPU-s per 1M +1.6% [1.2, 2.0], matched/s -1.0%, cf_block_bodies compaction 21.6 vs 7.3 s per node
+   (8r's cost back) but blocks/s 0.994 (not back). Filter: -74% of the extra cf_block_bodies compaction CPU, all pruning
+   by whole-SST drops (row filter 0 rows in 300 s). Blocks/s is the owner's call; n >= 6 at 900 s would resolve it.**
 8x. **b1 screen: mode 3 with checkpoints, book write off the exec thread** (owner s131; after 8t; ~50 min, then ~2 h
    A/B if it passes). 8s (section 104): b0 (pass 2 on E when checkpoints are on) moved the ~20-22 ms/blk write half
    onto the saturated exec thread: deep native blocks/s mode 3 / Classic 2.16x (8p) -> 1.28x, shallow p50 14 -> 136 ms.
