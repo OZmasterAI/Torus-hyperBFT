@@ -728,8 +728,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     );
     // Item 6 Phase 3 step 6: coalesced checkpoints every 15 s on validators,
     // off (per-block flush) on --rpc-only; TORUS_CHECKPOINT_INTERVAL_MS
-    // overrides (0 = per-block). Every book mode (b0: modes 2/3 then save
-    // their books on the exec thread).
+    // overrides (0 = per-block). Every book mode (b1: modes 2/3 then defer
+    // their book save's write half to the flush worker in each digest).
     let checkpoint_interval =
         torus_consensus::exec_pipeline::set_checkpoint_interval_default(cli.rpc_only);
     info!(

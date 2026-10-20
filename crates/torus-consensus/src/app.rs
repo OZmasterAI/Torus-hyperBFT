@@ -1274,11 +1274,16 @@ struct ExecutionContext {
     /// or 1-key Marker), ALWAYS layered under the next fast-path overlay,
     /// durable or not (design F1/F6). `None` after a barrier / at start.
     last_job: std::sync::Mutex<Option<Arc<torus_state::FrozenPending>>>,
-    /// Deferred book save (s63 port of item 6a): whether `last_job` is a
-    /// `Job::Flush` whose book-save pass 2 rides W's sidecar — i.e. its book
-    /// bytes are NOT in the parent layer. A next block that would REBUILD its
-    /// books (resident holder not the predecessor) must then barrier first,
-    /// so the reload reads them from the DB. Cleared by every barrier.
+    /// Deferred book save (s63 port of item 6a): whether book bytes of a
+    /// handed-off block ride W instead of E's layers — i.e. are NOT in the
+    /// parent layer, L or C. Per-block flush: `last_job` is a `Job::Flush`
+    /// whose book-save pass 2 rides W's sidecar. b1 (checkpoint interval):
+    /// the open window has deferred books (a `Job::Digest` carried them; W
+    /// keeps them in its side rows until the window's checkpoint is
+    /// durable), so it stays set across non-barrier checkpoints. A next
+    /// block that would REBUILD its books (resident holder not the
+    /// predecessor) must then barrier first, so the reload reads them from
+    /// the DB. Cleared only by a barrier (or a fresh W).
     last_job_books_deferred: AtomicBool,
     /// Item 6 Phase 3: coalesced state checkpoints. `None` (interval unset
     /// or 0, the default) = today's per-block `Job::Flush`, byte for byte.
@@ -2956,9 +2961,8 @@ impl ExecutionContext {
         }
         // Item 6 Phase 3: with a checkpoint interval a block's rows are not
         // written now: W digests it and keeps its side rows for the next
-        // checkpoint. Deferred book saves never reach here (b0: with an
-        // interval modes 2/3 save their books on E); one would be a code
-        // bug: fail-stop.
+        // checkpoint. b1: a deferred book save rides the Digest (W applies
+        // it over its window side rows); before, it was a fail-stop here.
         // Item 7 option 0 (task 2.4): a Marker becomes a Digest carrying its
         // action status and EVM side rows (`Job::into_digest`); before, its
         // Digest had `action_status: None` and no EVM part.
@@ -2969,17 +2973,6 @@ impl ExecutionContext {
             self.test_path("handoff.marker_to_digest.evm");
         }
         let job = if self.checkpoint.is_some() {
-            if matches!(
-                &job,
-                crate::exec_pipeline::Job::Flush { books: Some(_), .. }
-            ) {
-                tracing::error!(
-                    height,
-                    "FATAL: deferred book save with a checkpoint interval — fail-stop"
-                );
-                self.exec_failed.store(true, Ordering::SeqCst);
-                return false;
-            }
             job.into_digest()
         } else {
             job
@@ -2993,6 +2986,7 @@ impl ExecutionContext {
         let books_deferred = matches!(
             &job,
             crate::exec_pipeline::Job::Flush { books: Some(_), .. }
+                | crate::exec_pipeline::Job::Digest { books: Some(_), .. }
         );
         #[cfg(test)]
         self.test_path(match &job {
@@ -3021,8 +3015,16 @@ impl ExecutionContext {
         };
         self.exec_applied.store(height, Ordering::SeqCst);
         *self.last_job.lock().unwrap() = Some(pending);
-        self.last_job_books_deferred
-            .store(books_deferred, Ordering::SeqCst);
+        if self.checkpoint.is_some() {
+            // b1: the open window has deferred books until a barrier (a
+            // non-barrier checkpoint is not durable when E moves on).
+            if books_deferred {
+                self.last_job_books_deferred.store(true, Ordering::SeqCst);
+            }
+        } else {
+            self.last_job_books_deferred
+                .store(books_deferred, Ordering::SeqCst);
+        }
         true
     }
 
@@ -3149,6 +3151,9 @@ impl ExecutionContext {
         // n-2 once settled) + the folded n-1 + n. Overlapping keys count
         // twice, so this bounds the merged size from above: early, never late.
         // Summed only with a cap set (it walks both blocks' sets on E).
+        // b1: W's window side rows (deferred book saves) are not counted;
+        // a byte cap with book modes 2/3 refuses to start
+        // (`check_checkpoint_byte_cap_book_mode`, owner s131).
         let bytes = || {
             (st.layer_bytes()
                 + fold.as_ref().map_or(0, |p| p.state_bytes())
@@ -3193,7 +3198,9 @@ impl ExecutionContext {
             // b1 mutation (test-only): "the open window has deferred books"
             // cleared at a non-barrier checkpoint (C in flight is not durable).
             #[cfg(test)]
-            if self.test_b1_mutation.load(Ordering::SeqCst) == crate::exec_pipeline::B1_MUT_CLEAR_FLAG {
+            if self.test_b1_mutation.load(Ordering::SeqCst)
+                == crate::exec_pipeline::B1_MUT_CLEAR_FLAG
+            {
                 self.last_job_books_deferred.store(false, Ordering::SeqCst);
             }
             // C (in flight) now holds every block up to `height`. Step 1:
@@ -4544,11 +4551,14 @@ impl ExecutionContext {
             // EVERY resting order into memory — O(total resting depth) per
             // block. Attribute it explicitly (near-zero when resident reuse hits).
             // Deferred book save hazard guard: the parent job's book bytes ride
-            // W's sidecar, NOT the parent layer. If this block would rebuild its
-            // books (holder is not the predecessor's post-state — drained or
-            // skipped; unreachable in the normal sequence), wait for W first so
-            // the reload reads them from the DB. Resident reuse (the normal
-            // case) never reads persisted books, so it never waits here.
+            // W's sidecar, NOT the parent layer (b1, checkpoint interval: the
+            // open window's book bytes are in W's side rows, not in L or C).
+            // If this block would rebuild its books (holder is not the
+            // predecessor's post-state — drained or skipped; unreachable in the
+            // normal sequence), barrier first (with an interval: close the
+            // window into a checkpoint and wait for it) so the reload reads
+            // them from the DB. Resident reuse (the normal case) never reads
+            // persisted books, so it never waits here.
             if pipelined
                 && self.last_job_books_deferred.load(Ordering::SeqCst)
                 && resident_books.height() != height.checked_sub(1)
@@ -4900,13 +4910,12 @@ impl ExecutionContext {
             // which must then already hold the book bytes — those nodes keep the
             // on-thread pass 2. `save_order_books_deferred` returns None (no side
             // effects) for Classic / OrderRows.
-            // b0 (docs/plans/deep-book-save-options.md section 4): with a
-            // checkpoint interval the save runs HERE in full (the serial save:
-            // reads through own -> R -> parent -> L -> C -> DB, writes into
-            // this overlay, then L and the checkpoint). W's deferred pass 2
-            // reads the DB as "every height < N durable", which a
-            // since-checkpoint layer breaks. Same bytes either way.
-            let deferred_books = if pipelined && ctx.resident_mode() && self.checkpoint.is_none() {
+            // b1 (docs/plans/deep-book-save-options.md section 4): with a
+            // checkpoint interval pass 2 rides the block's Job::Digest; W
+            // applies it reading through its window side rows, then the DB
+            // (the book-CF view E's serial save reads through L / C), and the
+            // rows land with the window's checkpoint. Same bytes either way.
+            let deferred_books = if pipelined && ctx.resident_mode() {
                 ctx.save_order_books_deferred()
             } else {
                 None
@@ -6832,14 +6841,15 @@ impl TorusApp {
         // height before `exec_next_height` / manifest parking read it (design
         // §2.1 W.6, F4). Default ON; `TORUS_EXEC_PIPELINE=0` ⇒ None ⇒ serial chain.
         // Item 6 Phase 3: the interval (step 6 role default: 15 s on
-        // validators) for every book mode; b0: with an interval, book modes
-        // 2/3 save their books on E instead of deferring to W.
-        let checkpoint_interval = crate::exec_pipeline::effective_checkpoint_interval(
-            torus_bridge::native_executor::configured_book_mode(),
-        );
+        // validators) for every book mode; b1: with an interval, book modes
+        // 2/3 defer pass 2 of their book save to W in the Digest.
+        let book_mode = torus_bridge::native_executor::configured_book_mode();
+        let checkpoint_interval = crate::exec_pipeline::effective_checkpoint_interval(book_mode);
         if crate::exec_pipeline::exec_pipeline_enabled() {
-            exec_ctx.checkpoint =
-                crate::exec_pipeline::CheckpointPolicy::for_interval(checkpoint_interval);
+            let policy = crate::exec_pipeline::CheckpointPolicy::for_interval(checkpoint_interval);
+            // b1 (owner s131): no byte cap with book modes 2/3.
+            crate::exec_pipeline::check_checkpoint_byte_cap_book_mode(policy, book_mode)?;
+            exec_ctx.checkpoint = policy;
             exec_ctx.attach_flush_worker(None);
         } else if checkpoint_interval.is_some()
             && crate::exec_pipeline::checkpoint_interval_explicit()
@@ -20291,28 +20301,29 @@ mod crash_recovery_tests {
             fund_evm_balance(db, b, deposit);
             build_native_trie_to_cf(db).unwrap();
         };
-        let spawn_worker = |db: &StateDb,
-                            gate: Arc<crate::exec_pipeline::WorkerGate>,
-                            exec_failed: Arc<std::sync::atomic::AtomicBool>| {
-            crate::exec_pipeline::FlushWorker::spawn(
-                crate::exec_pipeline::WorkerEnv {
-                    state_db: db.clone(),
-                    trie_cache: Arc::new(std::sync::Mutex::new(Default::default())),
-                    member_cache: Arc::new(std::sync::Mutex::new(
-                        NativeMemberCache::with_budget(0),
-                    )),
-                    metrics: None,
-                    exec_failed,
-                    gate: Some(gate),
-                    test_on_complete: None,
-                    test_paths: None,
-                    test_drain: None,
-                    test_evm_step_panic: None,
-                    test_b1_mutation: None,
-                },
-                0,
-            )
-        };
+        let spawn_worker =
+            |db: &StateDb,
+             gate: Arc<crate::exec_pipeline::WorkerGate>,
+             exec_failed: Arc<std::sync::atomic::AtomicBool>| {
+                crate::exec_pipeline::FlushWorker::spawn(
+                    crate::exec_pipeline::WorkerEnv {
+                        state_db: db.clone(),
+                        trie_cache: Arc::new(std::sync::Mutex::new(Default::default())),
+                        member_cache: Arc::new(std::sync::Mutex::new(
+                            NativeMemberCache::with_budget(0),
+                        )),
+                        metrics: None,
+                        exec_failed,
+                        gate: Some(gate),
+                        test_on_complete: None,
+                        test_paths: None,
+                        test_drain: None,
+                        test_evm_step_panic: None,
+                        test_b1_mutation: None,
+                    },
+                    0,
+                )
+            };
 
         // ---- Serial reference (save + flush on "E"). ----
         let (_c0, db_ref) = make_test_config_and_db();
@@ -20615,14 +20626,14 @@ mod crash_recovery_tests {
         }
     }
 
-    /// b0: with a checkpoint interval, modes 2 AND 3 do NOT defer the book
-    /// save: every pipelined native block that dirtied a book hands W a
-    /// frozen set that already holds its book bytes (the save ran on E), W
-    /// only digests (no `Flush`, so no sidecar), nothing fail-stops, and the
-    /// final state equals the serial run in every CF, with the same native
-    /// root.
+    /// b1: with a checkpoint interval, modes 2 AND 3 defer the book save's
+    /// pass 2 to W in the Digest: no pipelined native block's frozen set
+    /// holds a book-CF row (W applies them over its window side rows), the
+    /// open window's deferred-books flag stays set (a non-barrier checkpoint
+    /// does not clear it), nothing fail-stops, and the final state equals
+    /// the serial run in every CF, with the same native root.
     #[test]
-    fn exec_pipeline_books_saved_on_exec_thread_with_checkpoints() {
+    fn exec_pipeline_books_deferred_to_worker_with_checkpoints() {
         use torus_bridge::native_executor::BookMode;
         for mode in [BookMode::LevelAuthority, BookMode::LevelAuthorityChunked] {
             let (_db_off, off, root_off, _) = run_book_fixture(false, mode);
@@ -20632,7 +20643,7 @@ mod crash_recovery_tests {
             let mut ctx = book_pipeline_ctx(&state_db, false, None, mode);
             ctx.checkpoint = Some(ckpt_every(5));
             ctx.attach_flush_worker(None);
-            let mut with_books = 0;
+            let mut deferred = 0;
             for b in &book_fixture_blocks() {
                 dispatch_and_execute(&ctx, &state_db, b);
                 assert!(
@@ -20644,24 +20655,26 @@ mod crash_recovery_tests {
                 if h > 1 && !b.native_actions.is_empty() && !EpochManager::is_epoch_boundary(h, 4) {
                     let last = ctx.last_job.lock().unwrap().clone().expect("fast path");
                     assert_eq!(last.height(), h);
-                    // Blocks whose actions dirtied a book carry its bytes
-                    // (a cancel-all of a sender without orders dirties none).
-                    if frozen_book_rows(&last) > 0 {
-                        with_books += 1;
-                    }
+                    assert_eq!(frozen_book_rows(&last), 0, "{mode:?} h{h}: books ride W");
                     assert!(
-                        !ctx.last_job_books_deferred.load(Ordering::SeqCst),
+                        ctx.last_job_books_deferred.load(Ordering::SeqCst),
                         "{mode:?} h{h}"
                     );
+                    deferred += 1;
                 }
             }
-            assert!(with_books >= 6, "{mode:?}: {with_books}");
+            assert!(deferred >= 6, "{mode:?}: {deferred}");
+            let paths = ctx.test_paths.lock().unwrap().clone();
+            assert!(
+                paths.get("w.books.digest").copied().unwrap_or(0) >= 6,
+                "{mode:?}: {paths:?}"
+            );
             drop(ctx);
             assert_eq!(read_native_applied_height(&state_db), Some(13));
             assert_dumps_equal(
                 &off,
                 &dump_all_cfs(&state_db),
-                &format!("{mode:?}: b0 vs serial"),
+                &format!("{mode:?}: b1 vs serial"),
             );
             assert_eq!(
                 root_off,
@@ -36991,9 +37004,12 @@ mod crash_recovery_tests {
             P2_BLOCKS,
             ro,
             cloid,
-            deep.then_some(p2_deep_actions as fn(u64) -> Vec<(u8, NativeAction)>),
+            deep.then_some(p2_deep_actions as P2DeepFn),
         )
     }
+
+    /// A deep-traffic generator: the `(signer seed, action)`s of a height.
+    type P2DeepFn = fn(u64) -> Vec<(u8, NativeAction)>;
 
     /// [`p2_blocks_full`] over heights `1..=n` with the deep traffic of
     /// `deep` (b1: a 300-block stream; the draws per height are the same,
@@ -37002,7 +37018,7 @@ mod crash_recovery_tests {
         n: u64,
         ro: bool,
         cloid: bool,
-        deep: Option<fn(u64) -> Vec<(u8, NativeAction)>>,
+        deep: Option<P2DeepFn>,
     ) -> (Vec<TorusBlock>, P2Fed, Vec<P2CloidPlace>) {
         let mut rng = C5Rng(0x9e21_0008);
         let mut fed = P2Fed::default();
@@ -39705,8 +39721,11 @@ mod crash_recovery_tests {
         })
     }
 
+    /// A node's final dump (every CF's short hash) and running hash.
+    type B1Final = (BTreeMap<&'static str, String>, Option<(u64, [u8; 32])>);
+
     /// A finished node's final dump (every CF's hash) and running hash.
-    fn b1_final(node: &O0Node) -> (BTreeMap<&'static str, String>, Option<(u64, [u8; 32])>) {
+    fn b1_final(node: &O0Node) -> B1Final {
         let dump = o0_snapshot(&node.db, u64::MAX)
             .iter()
             .filter(|(_, rows)| !rows.is_empty())
@@ -39744,7 +39763,10 @@ mod crash_recovery_tests {
         assert_eq!(node.failed_at, None, "{what}: fail-stop");
         node.ledger().assert_complete(B1_BLOCKS, &what);
         let c = o0_compare(&golden.ledger(), &node.ledger()).unwrap_or_else(|d| {
-            panic!("FINDING: {what} diverged from the golden at {}: {}", d.height, d.what)
+            panic!(
+                "FINDING: {what} diverged from the golden at {}: {}",
+                d.height, d.what
+            )
         });
         assert!(c.hn >= B1_BLOCKS, "{what}: {c:?}");
         assert_eq!(b1_final(golden), b1_final(node), "{what}: final state");
@@ -39815,7 +39837,11 @@ mod crash_recovery_tests {
         b1_assert_golden_node(&nodes[0]);
         for node in &nodes[1..] {
             let holds = node.ctl.as_ref().unwrap().st.lock().unwrap().holds;
-            assert!(holds >= 10, "{:?}: the controller parked W {holds} times", node.cfg);
+            assert!(
+                holds >= 10,
+                "{:?}: the controller parked W {holds} times",
+                node.cfg
+            );
             let dumps = b1_assert_matches_golden(&nodes[0], node);
             println!("b1 {:?}: holds {holds}, dumps compared {dumps}", node.cfg);
             b1_assert_w_saved_books(node);
@@ -39909,7 +39935,11 @@ mod crash_recovery_tests {
     /// equals the golden; with the flag cleared at that checkpoint
     /// (mutation), the rebuild reads books older than the window and the
     /// run must fail the harness.
-    fn b1_stale_rebuild_after_checkpoint(golden: &O0Node, blocks: &[O0Block], mutation: u8) -> Option<String> {
+    fn b1_stale_rebuild_after_checkpoint(
+        golden: &O0Node,
+        blocks: &[O0Block],
+        mutation: u8,
+    ) -> Option<String> {
         let a: u64 = 15;
         let mut node = O0Node::with_fixture(b1_cfg(Some(P5Ckpt::Every5), O0Run::D), b1_fixture());
         node.tolerate_failstop = true;
@@ -39922,7 +39952,9 @@ mod crash_recovery_tests {
         let gate = node.gate.clone().unwrap();
         gate.hold_checkpoints();
         o0_step(&node, &blocks[a as usize - 1]);
-        o0_wait("checkpoint a parked", || gate.parked_checkpoint() == Some(a));
+        o0_wait("checkpoint a parked", || {
+            gate.parked_checkpoint() == Some(a)
+        });
         assert!(read_native_applied_height(&node.db).unwrap_or(0) < a);
         {
             let ctx = node.ctx.as_mut().unwrap();
@@ -39933,7 +39965,11 @@ mod crash_recovery_tests {
         }
         o0_step(&node, &blocks[a as usize]);
         gate.release();
-        if node.ctx.as_ref().is_some_and(|c| c.exec_failed.load(Ordering::SeqCst)) {
+        if node
+            .ctx
+            .as_ref()
+            .is_some_and(|c| c.exec_failed.load(Ordering::SeqCst))
+        {
             node.failed_at = Some(a + 1);
         } else {
             node.run(&blocks[a as usize + 1..]);
@@ -39947,14 +39983,20 @@ mod crash_recovery_tests {
         let blocks = b1_blocks();
         let golden = b1_run(&blocks, &[b1_cfg(None, O0Run::D)], 0).remove(0);
         let control = b1_stale_rebuild_after_checkpoint(&golden, &blocks, 0);
-        assert_eq!(control, None, "b1 (flag until a barrier): stale rebuild after a checkpoint");
+        assert_eq!(
+            control, None,
+            "b1 (flag until a barrier): stale rebuild after a checkpoint"
+        );
         let mutant = b1_stale_rebuild_after_checkpoint(
             &golden,
             &blocks,
             crate::exec_pipeline::B1_MUT_CLEAR_FLAG,
         );
         println!("b1 mutation flag cleared at checkpoint: {mutant:?}");
-        assert!(mutant.is_some(), "clearing the window flag at a checkpoint passed the harness");
+        assert!(
+            mutant.is_some(),
+            "clearing the window flag at a checkpoint passed the harness"
+        );
     }
 
     /// Three replicas of the reduce-only P2 sequence (OrderRows) with

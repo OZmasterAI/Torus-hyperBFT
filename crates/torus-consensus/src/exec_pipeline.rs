@@ -179,13 +179,13 @@ fn checkpoint_interval_env_set(v: Option<&str>) -> bool {
 }
 
 /// The interval the node runs, from the env value and the role default, for
-/// every book mode. b0 (`docs/plans/deep-book-save-options.md` section 4):
-/// with an interval, book modes 2 / 3 run their book save on E (the serial
-/// save, into the block overlay and then L) instead of deferring its write
-/// half to W, so they take the same interval as Classic / OrderRows (before
-/// b0 an explicit interval refused to start and the role default yielded to
-/// them, owner s109). Without an interval (per-block flush) they keep the
-/// deferred save on W.
+/// every book mode. b1 (`docs/plans/deep-book-save-options.md` section 4):
+/// with an interval, book modes 2 / 3 defer pass 2 of their book save to W
+/// in the block's `Job::Digest` (W reads through its window side rows, then
+/// the DB; the rows land with the window's checkpoint), as they defer it in
+/// the `Job::Flush` without one, so they take the same interval as Classic /
+/// OrderRows (before b0 an explicit interval refused to start and the role
+/// default yielded to them, owner s109; b0 ran the save on E).
 pub fn resolve_checkpoint_interval(
     raw: Option<String>,
     default: Option<std::time::Duration>,
@@ -202,11 +202,34 @@ pub fn resolve_checkpoint_interval(
         tracing::info!(
             ?mode,
             ?interval,
-            "checkpoints with a level-authority book mode: the book save runs on the exec \
-             thread (b0), not on the flush worker"
+            "checkpoints with a level-authority book mode: the book save's write half runs \
+             on the flush worker in each block's digest (b1)"
         );
     }
     interval
+}
+
+/// b1 (owner s131, design open question 7, option C): a checkpoint byte
+/// cap (`TORUS_CHECKPOINT_MAX_BYTES` > 0 with checkpoints on) needs a
+/// non-deferred book mode. The cap counts E's since-checkpoint layer only;
+/// in book modes 2 / 3 the book rows of the open window sit on W (its side
+/// rows) until the checkpoint, so the cap would not see them. The node
+/// refuses to start; the error names both settings. No cap, no checkpoints
+/// (`policy` `None`), or Classic / OrderRows: `Ok`.
+pub fn check_checkpoint_byte_cap_book_mode(
+    policy: Option<CheckpointPolicy>,
+    mode: torus_bridge::native_executor::BookMode,
+) -> Result<(), String> {
+    use torus_bridge::native_executor::BookMode;
+    match (policy.and_then(|p| p.max_bytes), mode) {
+        (Some(cap), BookMode::LevelAuthority | BookMode::LevelAuthorityChunked) => Err(format!(
+            "TORUS_CHECKPOINT_MAX_BYTES={cap} is not supported with TORUS_BOOK_ROWS selecting \
+             {mode:?} (the book save's rows wait on the flush worker, outside the byte cap's \
+             count); unset TORUS_CHECKPOINT_MAX_BYTES (or 0), or use TORUS_BOOK_ROWS unset/0 \
+             (Classic) or 1 (OrderRows)"
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// [`resolve_checkpoint_interval`] from the environment and the role default.
@@ -347,9 +370,8 @@ pub enum Job {
     /// into a sidecar pending set whose entries join the SAME atomic batch and
     /// the SAME native-root inputs as `pending` — byte-identical durable state
     /// to the serial on-E save, with the write half of save_books off E's
-    /// critical path. `None` = exactly the pre-port job. Only on the per-block
-    /// flush: with a checkpoint interval E runs the whole save (b0), since W's
-    /// pass 2 reads the DB as "every height < N durable".
+    /// critical path. `None` = exactly the pre-port job. With a checkpoint
+    /// interval the payload rides the block's [`Job::Digest`] instead (b1).
     Flush {
         height: u64,
         pending: Arc<FrozenPending>,
@@ -401,6 +423,14 @@ pub enum Job {
         /// bundle into the window's EVM delta and its side rows into the
         /// window's side rows, both written by the next checkpoint.
         evm: Option<EvmJobRows>,
+        /// b1 (`docs/plans/deep-book-save-options.md` section 4): the
+        /// block's DEFERRED mode-2/3 book-save pass 2 (as on a `Flush`). W
+        /// applies it into a sidecar over the window's side rows, then the
+        /// DB (every book-CF row since the last checkpoint is W's: E writes
+        /// none while its blocks defer, [`books_tripwire`]), digests the
+        /// sidecar with the block and merges it into the side rows, which
+        /// the next checkpoint writes in its one batch.
+        books: Option<torus_bridge::native_executor::DeferredBookSave>,
     },
     /// Item 6 Phase 3: write the since-checkpoint layer `layer` (blocks
     /// S'+1..=height, last value per key) in ONE atomic batch with the
@@ -429,8 +459,8 @@ impl Job {
     /// Item 6 Phase 3 / item 7 option 0 (task 2.4): the job E hands W with a
     /// checkpoint interval. A Flush or a Marker becomes a Digest carrying all
     /// it carried (the set, EVM accounts, order nonces, action status, EVM
-    /// part); a Digest or a Checkpoint is unchanged. A Flush's deferred book
-    /// save cannot ride a digest: the caller refuses it before (fail-stop).
+    /// part, and b1: the deferred book save); a Digest or a Checkpoint is
+    /// unchanged.
     pub fn into_digest(self) -> Job {
         match self {
             Job::Flush {
@@ -441,17 +471,15 @@ impl Job {
                 order_nonces,
                 action_status,
                 evm,
-            } => {
-                debug_assert!(books.is_none(), "a deferred book save never rides a digest");
-                Job::Digest {
-                    height,
-                    pending,
-                    evm_addrs,
-                    order_nonces,
-                    action_status,
-                    evm,
-                }
-            }
+            } => Job::Digest {
+                height,
+                pending,
+                evm_addrs,
+                order_nonces,
+                action_status,
+                evm,
+                books,
+            },
             Job::Marker {
                 height,
                 pending,
@@ -464,6 +492,7 @@ impl Job {
                 order_nonces: Vec::new(),
                 action_status,
                 evm,
+                books: None,
             },
             job => job,
         }
@@ -946,6 +975,13 @@ struct Window {
     /// Item 7 option 0 (task 2.4): the window's EVM bundles, folded in
     /// height order; the checkpoint writes their trie step in its batch.
     evm: torus_state::incremental::EvmWindowDelta,
+    /// b1: a digest of the window carried a deferred book save (its rows
+    /// are in `side`).
+    books_deferred: bool,
+    /// b1: a digest of the window had a book-CF row in its own set (E-side:
+    /// then in L, not `side`). Never together with `books_deferred`
+    /// ([`books_tripwire`]).
+    e_books: bool,
 }
 
 fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
@@ -1137,6 +1173,7 @@ fn run_job(
             order_nonces,
             action_status,
             evm,
+            books,
         } => {
             // The window is contiguous: E checkpoints before any serial
             // block, so a gap here is a pipeline bug — never chain over it.
@@ -1147,18 +1184,34 @@ fn run_job(
                     )));
                 }
             }
+            // b1: W's view of the book CFs (side rows, then DB) is complete
+            // only if E wrote none of their keys in this window.
+            let books = books.take();
+            books_tripwire(env, Some(window), pending, books.is_some(), *height)?;
             // v2 action status: encoded here as on a Flush job, kept in
             // the window's side rows (and digested as the Flush sidecar).
             // Item 7 option 0 (task 2.4): so are the EVM side rows; the
             // bundle is folded into the window's EVM delta (an empty one,
             // an all-skipped block, has no trie work).
+            // b1: a deferred book save is applied first, into the same
+            // sidecar, reading through the window's side rows.
             let evm = evm.take();
-            let sidecar = side_rows_sidecar(
-                env,
-                *height,
-                action_status.take(),
-                evm.as_ref().map(|j| j.side.clone()),
-            )?;
+            let sidecar = match books {
+                Some(b) => Some(digest_books_sidecar(
+                    env,
+                    window,
+                    *height,
+                    b,
+                    action_status.take(),
+                    evm.as_ref().map(|j| &j.side),
+                )?),
+                None => side_rows_sidecar(
+                    env,
+                    *height,
+                    action_status.take(),
+                    evm.as_ref().map(|j| j.side.clone()),
+                )?,
+            };
             if let Some(j) = &evm {
                 #[cfg(test)]
                 w_path(env, "w.evm_side.digest");
@@ -1290,22 +1343,16 @@ fn run_job(
             // v2 action status: encoded here, off the exec thread, and put in
             // the same sidecar (a non-hashed, non-root CF: no root input).
             let evm = evm.take();
+            // b1: the same tripwire as a digest's (a window of one block).
+            books_tripwire(env, None, pending, books.is_some(), *height)?;
             let sidecar = if books.is_some() || action_status.is_some() || evm.is_some() {
                 let overlay = torus_state::NativeStateOverlay::new(env.state_db.clone());
                 if let Some(b) = books.take() {
-                    let t = std::time::Instant::now();
+                    #[cfg(test)]
+                    w_path(env, "w.books.flush");
                     // R02 branch 7: a failed book write fails the job (W
                     // latches the fail-stop; nothing of the block lands).
-                    torus_bridge::native_executor::apply_deferred_book_save(
-                        &overlay,
-                        env.metrics.as_deref(),
-                        b,
-                    )
-                    .map_err(|e| JobError::Write(format!("deferred book save: {e}")))?;
-                    if let Some(m) = &env.metrics {
-                        m.exec_save_books_write_seconds
-                            .observe(t.elapsed().as_secs_f64());
-                    }
+                    apply_books_on_worker(env, &overlay, b)?;
                 }
                 if let Some(status) = action_status.take() {
                     let bytes =
@@ -1462,6 +1509,119 @@ fn stage_evm_side_rows(
             .map_err(|e| JobError::Write(format!("EVM side row ({cf}): {e}")))?;
     }
     Ok(())
+}
+
+/// Deferred book save on W: pass 2 into `overlay`, timed as the block's
+/// `exec_save_books_write_seconds` (one observation per native block: E
+/// observes the serial save, W this) and `flush_worker_save_books_write_seconds`
+/// (W only, b1). R02 branch 7: a failed book write or stop-row scan is the
+/// job's `Err` (W latches the fail-stop; nothing of the block lands).
+fn apply_books_on_worker(
+    env: &WorkerEnv,
+    overlay: &torus_state::NativeStateOverlay,
+    books: torus_bridge::native_executor::DeferredBookSave,
+) -> Result<(), JobError> {
+    let t = std::time::Instant::now();
+    torus_bridge::native_executor::apply_deferred_book_save(overlay, env.metrics.as_deref(), books)
+        .map_err(|e| JobError::Write(format!("deferred book save: {e}")))?;
+    if let Some(m) = &env.metrics {
+        let secs = t.elapsed().as_secs_f64();
+        m.exec_save_books_write_seconds.observe(secs);
+        m.flush_worker_save_books_write_seconds.observe(secs);
+    }
+    Ok(())
+}
+
+/// b1 tripwire (`docs/plans/deep-book-save-options.md` section 4): W's
+/// pass 2 reads the book CFs (`CF_NATIVE_ORDER_BOOKS`, `CF_BOOK_ORDER_ROWS`)
+/// from its own side rows and the DB only, and a checkpoint appends the
+/// side rows after L (last wins). Both are right only because E writes no
+/// book-CF key while its blocks defer their book save (only the save paths
+/// write those CFs, and the deferred one writes into W's sidecar). A
+/// deferred job whose own set holds a book-CF key, or a window (`Some`:
+/// since the last checkpoint; `None`: a per-block `Flush`, a window of one)
+/// that mixes deferred blocks with E-side book writes, fails the job: W
+/// latches the fail-stop and nothing of it lands. O(1) per job.
+fn books_tripwire(
+    env: &WorkerEnv,
+    window: Option<&mut Window>,
+    pending: &FrozenPending,
+    deferred: bool,
+    height: u64,
+) -> Result<(), JobError> {
+    use torus_state::cf::{CF_BOOK_ORDER_ROWS, CF_NATIVE_ORDER_BOOKS};
+    let e_books = pending.touches_any(&[CF_NATIVE_ORDER_BOOKS, CF_BOOK_ORDER_ROWS]);
+    let mixed = match window {
+        Some(w) => {
+            w.books_deferred |= deferred;
+            w.e_books |= e_books;
+            w.books_deferred && w.e_books
+        }
+        None => deferred && e_books,
+    };
+    if !mixed {
+        return Ok(());
+    }
+    #[cfg(test)]
+    w_path(env, "w.books.tripwire");
+    let _ = env;
+    Err(JobError::Write(format!(
+        "book tripwire at {height}: an E-side book-CF write in a window whose book saves \
+         ride the flush worker (its view of the book CFs would be incomplete)"
+    )))
+}
+
+/// b1: the sidecar of a `Digest` whose block's book save rides W. Pass 2
+/// runs into an overlay whose lower layer is the window's side rows (every
+/// book-CF row written since the last checkpoint: W's own,
+/// [`books_tripwire`]), then the DB (the last checkpoint, which W wrote
+/// itself before this job): the view E's serial save reads through its
+/// layers. Then the action status and EVM side rows, as on a `Flush`.
+/// `window.side` is lent to the overlay (moved, not copied) and back.
+fn digest_books_sidecar(
+    env: &WorkerEnv,
+    window: &mut Window,
+    height: u64,
+    books: torus_bridge::native_executor::DeferredBookSave,
+    status: Option<torus_state::action_status::BlockActionStatus>,
+    side: Option<&torus_bridge::EvmSideRows>,
+) -> Result<Arc<FrozenPending>, JobError> {
+    #[cfg(test)]
+    w_path(env, "w.books.digest");
+    #[cfg(test)]
+    let skip_side = b1_mutation(env) == B1_MUT_SKIP_SIDE;
+    #[cfg(not(test))]
+    let skip_side = false;
+    let lower = (!skip_side).then(|| Arc::new(std::mem::take(&mut window.side)));
+    let overlay = torus_state::NativeStateOverlay::with_layers(
+        env.state_db.clone(),
+        None,
+        lower.clone(),
+        None,
+    );
+    let applied = apply_books_on_worker(env, &overlay, books).and_then(|()| {
+        if let Some(status) = status {
+            let bytes = crate::action_results::encode_status(&status, env.metrics.as_deref());
+            if let Err(e) = torus_state::StateBackend::put_cf_raw(
+                &overlay,
+                torus_state::cf::CF_BLOCK_ACTION_STATUS,
+                &height.to_be_bytes(),
+                &bytes,
+            ) {
+                tracing::error!(%e, height, "flush worker: failed to stage the action status record");
+            }
+        }
+        match side {
+            Some(side) => stage_evm_side_rows(&overlay, side),
+            None => Ok(()),
+        }
+    });
+    let frozen = overlay.freeze(height);
+    drop(overlay);
+    if let Some(lower) = lower {
+        window.side = Arc::try_unwrap(lower).unwrap_or_else(|l| l.duplicate());
+    }
+    applied.map(|()| frozen)
 }
 
 /// Item 7 option 0 (task 2.4): a sidecar holding a Marker's or a Digest's
@@ -1668,11 +1828,55 @@ mod tests {
         }
     }
 
-    /// b0 (deep-book-save-options.md section 4): the interval applies to
-    /// every book mode. Modes 2 / 3 then save their books on E (the serial
-    /// save) instead of deferring pass 2 to W, so the role default (15 s on
+    /// b0 / b1 (deep-book-save-options.md section 4): the interval applies
+    /// to every book mode. Modes 2 / 3 then defer pass 2 of the book save to
+    /// W in the block's digest (b1; b0 ran it on E), so the role default (15 s on
     /// validators) no longer yields to them and an explicit interval starts;
     /// `0` and no role default stay the per-block flush.
+    #[test]
+    fn checkpoint_byte_cap_refuses_deferred_book_modes() {
+        use std::time::Duration;
+        use torus_bridge::native_executor::BookMode;
+        let capped_policy = CheckpointPolicy {
+            interval: Some(Duration::from_secs(15)),
+            max_bytes: Some(64 << 20),
+            every_blocks: None,
+        };
+        let capped = Some(capped_policy);
+        let uncapped = Some(CheckpointPolicy {
+            max_bytes: None,
+            ..capped_policy
+        });
+        for mode in [BookMode::LevelAuthority, BookMode::LevelAuthorityChunked] {
+            let err = check_checkpoint_byte_cap_book_mode(capped, mode)
+                .expect_err("a byte cap with a deferred book mode must refuse to start");
+            assert!(err.contains("TORUS_CHECKPOINT_MAX_BYTES"), "{err}");
+            assert!(err.contains("TORUS_BOOK_ROWS"), "{err}");
+            assert_eq!(
+                check_checkpoint_byte_cap_book_mode(uncapped, mode),
+                Ok(()),
+                "{mode:?}"
+            );
+            assert_eq!(
+                check_checkpoint_byte_cap_book_mode(None, mode),
+                Ok(()),
+                "{mode:?}"
+            );
+        }
+        for mode in [BookMode::Classic, BookMode::OrderRows] {
+            assert_eq!(
+                check_checkpoint_byte_cap_book_mode(capped, mode),
+                Ok(()),
+                "{mode:?}"
+            );
+            assert_eq!(
+                check_checkpoint_byte_cap_book_mode(uncapped, mode),
+                Ok(()),
+                "{mode:?}"
+            );
+        }
+    }
+
     #[test]
     fn checkpoint_interval_applies_to_every_book_mode() {
         use std::time::Duration;
@@ -2050,6 +2254,7 @@ mod tests {
                     order_nonces: Vec::new(),
                     action_status,
                     evm: None,
+                    books: None,
                 })
                 .unwrap();
         }
@@ -2154,6 +2359,7 @@ mod tests {
                     order_nonces: Vec::new(),
                     action_status: None,
                     evm: None,
+                    books: None,
                 })
                 .is_err(),
             "no job may be accepted after the latch"
@@ -2821,6 +3027,7 @@ mod tests {
                     action_status: None,
                     evm: job_rows(&bundle, &block, &receipts, &links),
                     pending,
+                    books: None,
                 })
                 .unwrap();
             if h % 5 == 0 {

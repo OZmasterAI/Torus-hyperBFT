@@ -1086,6 +1086,15 @@ impl FrozenPending {
             .all(|(i, c)| c.is_empty() || keep.contains(&CfId(i as u8)))
     }
 
+    /// b1 (`docs/plans/deep-book-save-options.md` section 4): whether this
+    /// set writes or deletes any key of one of `cfs` (hash extras excluded).
+    /// O(number of `cfs`): no walk of the set.
+    pub fn touches_any(&self, cfs: &[&str]) -> bool {
+        cfs.iter()
+            .filter_map(|cf| intern_cf(cf))
+            .any(|id| !self.state.cf(id).is_empty())
+    }
+
     /// Item 6 cut 5: the frozen block's own writes and tombstones of R's
     /// CFs — exactly [`NativeStateOverlay::own_pending_delta`] taken just
     /// before [`NativeStateOverlay::freeze`] (freeze moves the pending set
