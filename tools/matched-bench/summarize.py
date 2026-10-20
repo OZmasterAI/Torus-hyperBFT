@@ -1095,6 +1095,38 @@ def rust_parse_u64(v):
     return n if n <= U64_MAX else None
 
 
+# s131: per-cell audit of the book mode and the default-changed flags (same
+# list, order and wording as run-cell.sh NODE_FLAGS_AUDIT / node_flags_line).
+NODE_FLAGS_AUDIT = (
+    "TORUS_BOOK_ROWS",
+    "TORUS_BOOK_FAST_ENCODE",
+    "TORUS_SETTLE_NO_MERGE",
+    "TORUS_EVM_FAST_PATH",
+    "TORUS_BOOK_COALESCE",
+    "TORUS_CHECKPOINT_INTERVAL_MS",
+)
+
+
+def book_mode(node_env):
+    """torus_bridge::native_executor::parse_book_rows_mode: trimmed "1"/"2"/"3"
+    -> mode1/mode2/mode3, anything else (incl. unset/empty) -> classic. None
+    when the cell recorded no node env (legacy): unknown, not guessed."""
+    if not isinstance(node_env, dict):
+        return None
+    v = rust_trim(node_env.get("TORUS_BOOK_ROWS"))
+    return "mode" + v if v in ("1", "2", "3") else "classic"
+
+
+def node_flags(node_env):
+    if not isinstance(node_env, dict):
+        return None
+    out = {}
+    for k in NODE_FLAGS_AUDIT:
+        v = node_env.get(k)
+        out[k] = "unset (default)" if v is None else "empty (default)" if v == "" else v
+    return out
+
+
 def checkpoint_interval_s(node_env):
     """The checkpoint interval (s) the cell's validators ran, None = per-block
     flush. Mirrors the node's resolution (see the block comment above):
@@ -1378,6 +1410,9 @@ summary = {
              # Row 76 liquidation stress: load senders 0..liq_thin-1 seeded thin (0 = off).
              "liq_thin": int(A.liq_thin or 0),
              "liq_thin_avail": A.liq_thin_avail if int(A.liq_thin or 0) > 0 else None,
+             # s131: the effective book mode and default-changed flags (None = no node env recorded).
+             "book_mode": book_mode(NODE_ENV if A.node_env else None),
+             "node_flags": node_flags(NODE_ENV if A.node_env else None),
              "extra_env": A.extra_env, "node_env": NODE_ENV,
              "env_digests_per_node": A.env_digests.split(), "bench_cmd": A.bench_cmd, "node_pids": A.pids.split()},
     "timing": {"t_bench0": t0, "t_bench1": t1, "t_drain": td, "bench_wall_s": t1 - t0, "drain_s": td - t1,
