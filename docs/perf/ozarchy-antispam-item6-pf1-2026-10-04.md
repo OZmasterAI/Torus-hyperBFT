@@ -16315,6 +16315,155 @@ logs), the same as 8p's 68-72 s, and still above the ~60 s target.
   `ozarchy-8s-stage/`. Analysis in `ozarchy-8s-run/analyst/` (`8s-analyse.py`, `8s-shallow-analysis.md`,
   `8s-deep-analysis.md`, `8s-ckpt.py`, `8s-ckpt.txt`).
 
+## 105. Step 8u, L3.3 engine-timer profile: one binary main `0e514a5c` (= `51037f22` + bench-queue.md), A = `TORUS_BOOK_FAST_ENCODE` unset vs B = `=1`, 1M-resting deep book (8i P1M), standard load, 300 markets, Classic, 300 s cells, n = 1 per arm, Q8 perf recipe on val1's exec thread with `perf_event_paranoid=1` (campaign ozarchy-8u, archy, 2026-10-20)
+
+**Not a scheduling artefact, and with one binary the rise is smaller and not uniform; n = 1, so not resolved.
+Exec-thread runqueue wait per 1k fills is +1.3% (0.129 -> 0.131; 8kd +5.5%). Engine ms per 1k fills is +2.0%
+node-consistent (2.891 -> 2.948; +3.1% in 97.8's definition, which mixes val0's headline fills per block with the 3-node
+engine mean). 44% of the rise is the post-engine tail (+13.4%), which the profile places in the liquidation step's
+on-CPU work (+20% per 1k fills); margin +2.0% and settle +1.0% make most of the rest. In the profiled 60 s window the
+engine is flat (on-CPU 1.002, wall 1.001). Allocation, jemalloc, memmove and page faults inside the engine do not rise;
+L3.3's allocator / page-fault change is confined to save_books (memmove 0.124 -> 0.001 ms per 1k fills, page faults
++20%). The headline repeats 97.8: matched/s 1.020, save_books per 1k fills 0.869, exec on-CPU per 1k fills 0.973.
+8kd's rise re-checks as real (node-consistent 1.025 [1.009, 1.041]) but was uniform across every sub-phase, with A and
+B on different binaries (main vs the exp branch): a code-layout difference is the likely cause (hypothesis, not tested
+here). Confidence low-medium.**
+
+Question (bench queue step 8u, owner s131; the owner moved it ahead of 8l and 8t on 2026-10-20): 97.8 (8kd, n = 3)
+found L3.3 raised exec engine ms per 1k fills by +2.8% [1.020, 1.037] and exec runqueue wait by +5.5%, though L3.3 only
+touches the Classic book save. Is the engine rise real on-CPU work or a scheduling artefact?
+
+### 105.1 Setup
+
+* Binary: origin/main `0e514a5c`, Q8 profiling build (release `--locked`, mold, frame pointers, line tables), worktree
+  `wt/8u-0e514a5c`, staged in `ozarchy-8u-stage/m`: node `bbc03997d9f15882aab2e5aecfaba328`, bench `dd37b78a`,
+  tx-flood `b5370223`. Tools frozen from `0e514a5c` (`ozarchy-8u-tools`, `FROZEN.txt`; `tools/matched-bench` equal to
+  8s's `be87c86e` copy).
+* Shape: the 8i P1M / 8kd deep book: 1M-account genesis (base `a644d0a7`, cell genesis `4c8b8af8`), `PRELOAD=1000000`.
+  Standard load: 300 markets, rate 76,000, BLOCK_CAP 400, MAX_IN_FLIGHT 4, commit tail, oracle on. Classic
+  (`TORUS_BOOK_ROWS` empty, as in 8kd), custody 0, code defaults (15 s checkpoints, F on).
+* Arms: A = `TORUS_BOOK_FAST_ENCODE` unset (in `absent_env`), B = `TORUS_BOOK_FAST_ENCODE=1`. Warm-up w1 (A, 120 s,
+  gated, no perf), then r1-A, r1-B, 300 s each. Smoke: B 240 s with perf (all CHECK OK, 220k matched/s).
+* Perf sidecar on val1 (offsets after the harness `bench:` line): W3 40-55 s off-CPU, whole process (`cycles` +
+  `context-switches/period=1`, kernel + user fp stacks, `--switch-events`); W1 60-120 s `cycles:u` 499 Hz whole process
+  (the Q8 W1 recipe); W2 125-185 s exec thread only, kernel + user, `cycles` 999 Hz, `page-faults/period=8/`,
+  `context-switches/period=1/`, `--switch-events`; PS 60-185 s `perf stat` on the exec thread at 5 s; snapshots of
+  /metrics, per-task schedstat, ctx switches and minflt at 5 s, each window edge and 290 s.
+* `kernel.perf_event_paranoid = 1`, set by the owner for this run only (restored to 2 after); logged 1 at every cell
+  start and end and 5 times per perf cell.
+* Contention log `contention.sh` (foreign zcat / gzip -cd and loadavg every 30 s): the 8s analysis was still running
+  at launch. No foreign process overlapped either cell; node CPU 16.4 (A) vs 16.6 (B) cores.
+* Unit `bench-ozarchy-8u`, 02:47 -> 03:16.
+
+### 105.2 Validity
+
+w1, r1-A, r1-B: rc 0, ACCEPT / AGREE / PASS, 0 panic / error lines, node exe md5 `bbc03997` on 3 / 3 nodes per cell.
+The flag is absent on 3 / 3 nodes in w1 and r1-A (node log `on=false`) and `=1` on 3 / 3 in r1-B (`on=true`).
+campaign.log: 73 CHECK OK, 0 CHECK FAIL, 0 CELL-FLAG. Perf data captured for the val1 exec thread in both arms (A tid
+2418803, B 2470541), 0 lost samples in W2 / W3, 98.6% of W2 samples unwind to `execution_loop`. matched/s: w1 212,830,
+r1-A 218,358, r1-B 222,638; timeouts 1 / 7 / 4.
+
+### 105.3 Headline (load window, 3-node means, 97.8's definitions; `ozarchy-8u-run/analyst/8u.txt`)
+
+| metric | A | B | B/A | 97.8 (8kd, n = 3) |
+|---|---|---|---|---|
+| matched/s | 218,358 | 222,638 | 1.020 | |
+| native blocks/s | 3.554 | 3.861 | 1.086 | |
+| fills per native block (headline, val0) | 59,334 | 55,724 | 0.939 | |
+| exec ms per 1k fills | 4.499 | 4.423 | 0.983 | -1.8% |
+| exec-thread on-CPU ms per 1k fills | 3.475 | 3.380 | 0.973 | -3.2% |
+| save_order_books ms per 1k fills | 1.014 | 0.881 | 0.869 | -14.7% |
+| exec engine ms per 1k fills (97.8 definition) | 2.464 | 2.541 | **1.031** | +2.8% [1.020, 1.037] |
+| exec-thread runqueue wait ms per 1k fills | 0.129 | 0.131 | **1.013** | +5.5% |
+| block p50 / p99 ms | 188 / 1,539 | 167 / 1,414 | 0.884 / 0.919 | |
+| CPU-s per 1M fills | 25.33 | 25.06 | 0.989 | |
+
+### 105.4 Engine per 1k fills: definition, sub-phases, block size
+
+97.8's row divides the 3-node mean engine ms per native block by val0's headline fills per block. Each node's own
+`torus_exec_engine_seconds` sum delta over its own load-window fills gives a smaller rise:
+
+| engine ms per 1k fills | A | B | B/A |
+|---|---|---|---|
+| 97.8 definition | 2.464 | 2.541 | 1.031 |
+| node-consistent, 3-node mean (per node 1.025 / 1.022 / 1.011) | 2.891 | 2.948 | **1.020** |
+| val1, 5-290 s (sidecar snapshots) | 2.748 | 2.837 | 1.032 |
+| val1, W1 60-120 s | 2.957 | 2.969 | 1.004 |
+| val1, W2 125-185 s (profiled exec thread) | 2.883 | 2.886 | **1.001** |
+
+Sub-phase timers (load window, node-consistent, ms per 1k fills; `8u-phases.txt`):
+
+| sub-phase | A | B | B-A | B/A | 8kd B/A |
+|---|---|---|---|---|---|
+| phase1 actions | 0.196 | 0.194 | -0.001 | 0.993 | 1.034 |
+| margin | 0.856 | 0.874 | +0.017 | 1.020 | 1.024 [1.005, 1.044] |
+| match | 0.304 | 0.305 | +0.001 | 1.004 | 1.024 |
+| settle (pass A / pass B) | 1.192 (0.169 / 0.588) | 1.204 (0.171 / 0.599) | +0.012 | 1.010 | 1.023 [1.009, 1.038] |
+| cache flush | 0.412 | 0.410 | -0.002 | 0.995 | 1.010 |
+| post-engine tail (CoreWriter drain, liquidation step, governance, fees, epoch) | 0.189 | 0.214 | **+0.025** | **1.134** | 1.038 |
+| engine untimed | 0.154 | 0.157 | +0.002 | 1.014 | |
+| **engine** | 2.891 | 2.948 | +0.057 | 1.020 | 1.025 [1.009, 1.041] |
+
+* The tail is 44% of the +0.057 ms rise; without it the engine is +1.2% (2.702 -> 2.734). It is higher in B in almost
+  every 10 s bin (after 180 s: A ~0.15, B ~0.19 ms per 1k fills; ~12.5 vs ~15.5 ms per block; `8u-timeline.txt`).
+* Cancel-all count per 1k fills 1.022; books visited per 1k fills 0.996.
+* Block size: B's native blocks are 5% smaller (node-consistent 50.6k -> 48.0k fills) because its faster save_books
+  shortens the block. A per-node fit on 10 s bins (`engine_ms = F x blocks + v x fills`, F ~16 ms per block, v = 2.47
+  ms per 1k fills) predicts only +0.3% from that (2.738 -> 2.746); B measured / predicted = 1.022 (`8u-blocksize.txt`).
+* The 10 s bins of engine B/A scatter 0.885-1.174 (+-7%), so a +2% step is not resolved by one pair.
+* 8kd re-check (`8u-8kd-recheck.txt`): node-consistent engine per 1k fills 1.0248 [1.0093, 1.0405] (97.8 definition
+  1.0281 [1.0199, 1.0365]), so 8kd's rise was real, not a denominator artefact, and uniform across the sub-phases. In
+  8kd A was main `0f5bef38` and B the `exp/8k-book-fast-encode` branch `4b916ecf`: two binaries.
+
+### 105.5 Profiled window W2 (val1 exec thread, 125-185 s, kernel + user; `8u-w2report.txt`)
+
+Engine on-CPU + off-CPU = 2.82 / 2.83 ms per 1k fills, 97.8% of the engine timer (2.883 / 2.886).
+
+| engine, ms per 1k fills | A | B | B-A | B/A |
+|---|---|---|---|---|
+| on-CPU, total | 2.151 | 2.156 | +0.005 | 1.002 |
+| margin / prepare | 0.669 | 0.671 | +0.002 | 1.003 |
+| settle (exec thread) | 0.575 | 0.567 | -0.007 | 0.987 |
+| cache flush (`flush_all`) | 0.372 | 0.375 | +0.002 | 1.006 |
+| liquidation step | 0.166 | 0.199 | **+0.033** | **1.200** |
+| cancel-all | 0.033 | 0.032 | -0.002 | 0.948 |
+| match (exec thread side; the match runs in the exec pool) | 0.004 | 0.003 | -0.001 | 0.836 |
+| oracle + other engine | 0.331 | 0.309 | -0.022 | 0.932 |
+| leaf: jemalloc (`_rjem_*`) | 0.019 | 0.018 | -0.001 | 0.938 |
+| leaf: alloc wrappers (`__rust_alloc`, RawVec growth) | 0.017 | 0.016 | -0.001 | 0.956 |
+| leaf: unresolved libc (memmove / memcpy) | 0.235 | 0.250 | +0.015 | 1.064 |
+| leaf: page faults (kernel) | 0.082 | 0.080 | -0.002 | 0.975 |
+| leaf: other kernel | 0.063 | 0.070 | +0.008 | 1.120 |
+| off-CPU, voluntary (pool waits: match 0.278 / 0.283, settle 0.151 / 0.158, cancel-all 0.145 / 0.139) | 0.574 | 0.580 | +0.006 | 1.011 |
+| off-CPU, preempted (runqueue) | 0.091 | 0.093 | +0.003 | 1.029 |
+
+* Page faults per 1k fills (W2, samples x 8): engine 31.6 -> 30.1 (settle 19.8 -> 21.4, other engine 11.0 -> 8.6);
+  save_books 28.5 -> 34.1 (+20%: B faults in `copy_nonoverlapping` into fresh exact-size buffers, A in jemalloc
+  `rallocx` growth); exec thread total +6.8% (W2), +10.4% (perf stat).
+* save_books on-CPU per 1k fills 1.058 -> 0.934; its libc memmove share 0.124 -> 0.001 (the borsh growth copies are
+  gone, as intended).
+* perf stat, exec thread, 60-185 s, per 1k fills B/A: cycles 0.987, instructions 0.948, IPC 1.227 -> 1.179, L1d misses
+  0.856, DRAM fills 0.913, page faults 1.104, context switches 1.041; kernel share of cycles 7.1% -> 7.6%.
+* Exec-pool threads (val1 schedstat, 5-290 s): on-CPU per 1k fills 0.979, runqueue wait 228 -> 254 s (1.114); over
+  60-185 s flat (0.998), exec-thread runqueue there 0.987.
+
+### 105.6 Verdict, limits and next
+
+* Not a scheduling artefact: exec runqueue per 1k fills +1.3% with one binary (8kd +5.5%); inside the engine off-CPU
+  rises 0.009 ms per 1k fills in W2 (pool waits +1.1%, preemption +3%). Neither can carry a 2-3% engine rise.
+* With one binary the rise is +2.0% and not uniform: 44% is the post-engine tail, on-CPU in the liquidation step (+20%
+  per 1k fills, +12% per block, at a fixed 2,048 accounts valued per block; not explained here); margin +2.0% and
+  settle +1.0% make most of the rest. The profiled window is flat.
+* 8kd's uniform +2.5-2.8% came from two binaries; a code-layout difference is the likely cause (hypothesis, untested).
+* n = 1 per arm, 10 s bins scatter +-7%: confidence low-medium. To settle it: 2 more one-binary deep pairs (300 s,
+  without perf), and / or a liquidation-step timer or a perf window after 190 s, where B's tail gap is largest. Only
+  matters if Classic stays (it does for testnet genesis, section 104).
+* Data: `~/bench-results-matched/ozarchy-8u-300m-{w1,r1-A,r1-B}`; campaign `ozarchy-8u-run/campaign/` (campaign.log),
+  `ozarchy-8u-run/contention.tsv`, analysis `ozarchy-8u-run/8u-analysis.md` and `ozarchy-8u-run/analyst/`
+  (`8u-analyse.py` = 97.8's script with this run's md5s, `8u-phases.py`, `8u-blocksize.py`, `8u-timeline.py`,
+  `8u-8kd-recheck.py`, `8u-w2fold.py` + `8u-w2report.py`, W2 dumps in `analysis/`). Tools `ozarchy-8u-tools/`, stage
+  `ozarchy-8u-stage/`. Left on disk: `~/.cargo-target-8u`, `wt/8u-0e514a5c`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

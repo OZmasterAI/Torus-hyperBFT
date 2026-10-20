@@ -660,6 +660,14 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    8u and restores 2 after; kernel sampling is needed for page faults, kernel time and off-CPU stacks, which the
    scheduling-artefact question depends on; log the value at every cell start and end). Report the engine phase split A vs B (match, settle, cancel-all, allocation, memmove,
    jemalloc, page faults) and whether the rise is real or a scheduling artefact. Only matters if Classic stays.
+   **Done s70 (ozarchy-8u, section 105; main `0e514a5c` node `bbc03997`, 3 / 3 cells valid, 73 CHECK OK, 0 FAIL;
+   paranoid 1 throughout, restored to 2 after; no contention overlap): not a scheduling artefact (exec runqueue per 1k
+   fills +1.3%, 8kd +5.5%). With one binary, engine per 1k fills is +2.0% node-consistent (+3.1% in 97.8's definition),
+   n = 1, not resolved: 44% of it is the post-engine tail (liquidation step on-CPU +20%), margin +2.0%, settle +1.0%;
+   the profiled 60 s window is flat (1.002). Allocation / jemalloc / memmove / page faults inside the engine are flat;
+   L3.3's change is confined to save_books (memmove 0.124 -> 0.001, page faults +20%). matched/s 1.020, save_books per
+   1k fills 0.869. 8kd's uniform rise was two binaries (likely code layout, untested). Next if wanted: 2 more
+   one-binary deep pairs without perf, or a liquidation-step timer.**
 8v. **T5.3 attribution: block p99 inside checkpoint windows** (owner s131; after 8u; ~1 h incl. analysis; no code).
    Roadmap T5.3: during a checkpoint DB write, block p99 sits ~500-650 ms above the out-of-window p99 (sections 87,
    89); A1 (checkpoint slicing) is parked because its target (manifest put, ~6-12 ms) can't explain it. One main
