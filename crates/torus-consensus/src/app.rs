@@ -498,7 +498,7 @@ struct CommittedBlockMsg {
 /// [`CommitPersistWriter`] the header lands after the commit event, so the
 /// commit handler alone would publish one height behind and never catch up
 /// once commits stop. Called on the writer thread (after the row's write
-/// returned, before the height's ticket fills), in height order, at most once
+/// returned and the height's ticket filled, so exec never waits on it), in height order, at most once
 /// per height there; or on the exec thread for a height whose writer write
 /// failed (exec wrote the row). Must be quick and must not panic. Never called
 /// with the manifest in the state DB (the dispatch writes the row before the
@@ -536,6 +536,14 @@ impl PersistTicket {
             }
             slot = cv.wait(slot).unwrap_or_else(|e| e.into_inner());
         }
+    }
+}
+
+#[cfg(test)]
+impl PersistTicket {
+    /// The filled rows, without waiting (`None` while the write is pending).
+    fn peek(&self) -> Option<DurableRows> {
+        *self.0 .0.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -606,16 +614,18 @@ impl CommitPersistWriter {
                         metrics.as_deref(),
                         false,
                     );
-                    // The header row is readable now: publish the height (RPC
-                    // height + WS head) before the ticket settles, so the
-                    // commit handler's stale read (it may have run before this
-                    // write) is repaired even if no commit follows.
+                    // Settle the ticket first: exec unblocks without waiting
+                    // on the publish below.
+                    job.ticket.set(durable);
+                    // The header row is readable now (the write returned Ok):
+                    // publish the height (RPC height + WS head), so the commit
+                    // handler's stale read (it may have run before this write)
+                    // is repaired even if no commit follows.
                     if durable.header {
                         if let Some(hook) = header_hook.get() {
                             hook(height);
                         }
                     }
-                    job.ticket.set(durable);
                     if durable.body {
                         pruner.note(height);
                     }
@@ -19203,9 +19213,10 @@ mod crash_recovery_tests {
     /// consensus thread, the commit handler can run before the height's header
     /// exists, so the node needs a signal once it does: the header-persisted
     /// hook fires for each dispatched height, in order, exactly once, after its
-    /// row is readable and before its ticket settles (so waiting on the ticket
-    /// is enough to see it; no sleeps). RED on 173f9a12: nothing tells the node,
-    /// and the last committed height stays unpublished once commits stop.
+    /// row is readable. RED on 173f9a12: nothing tells the node, and the last
+    /// committed height stays unpublished once commits stop. The hook runs
+    /// after the ticket settles (see the test below), so the test waits for
+    /// the hook's call itself (a channel; no sleeps).
     #[test]
     fn header_persisted_hook_fires_once_per_height_after_its_off_thread_write() {
         let (config, state_db) = make_test_config_and_db();
@@ -19218,7 +19229,13 @@ mod crash_recovery_tests {
             TorusApp::try_new_with_manifest_db(state_db.clone(), cdb, &config, None, None, None)
                 .unwrap();
         assert!(app.commit_persist.is_some(), "the off-thread writer");
-        let (hook, calls) = recording_header_hook(&state_db);
+        let (record, calls) = recording_header_hook(&state_db);
+        let (fired_tx, fired_rx) = std::sync::mpsc::channel::<u64>();
+        let fired_tx = std::sync::Mutex::new(fired_tx);
+        let hook: HeaderPersistedHook = Arc::new(move |h: u64| {
+            record(h);
+            let _ = fired_tx.lock().unwrap().send(h);
+        });
         app.set_header_persisted_hook(hook);
         let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(8);
         app.replace_exec_tx(tx);
@@ -19230,10 +19247,11 @@ mod crash_recovery_tests {
             assert_eq!(msg.torus_block.header.height, h);
             assert!(msg.persist.is_some(), "queued on the writer");
             assert!(msg.settled_durable().header, "the write landed");
+            assert_eq!(fired_rx.recv().unwrap(), h, "the hook fired for h");
             assert_eq!(
                 calls.lock().unwrap().last().copied(),
                 Some((h, true)),
-                "published once its row was readable, before the ticket settled"
+                "published once its row was readable"
             );
         }
         assert_eq!(
@@ -19241,6 +19259,60 @@ mod crash_recovery_tests {
             vec![(5, true), (6, true), (7, true)],
             "in order, each height once"
         );
+    }
+
+    /// T5.3 (review P3) RED-first: the writer settles a height's ticket (exec
+    /// unblocks) BEFORE it runs the header-persisted hook, so the publish work
+    /// (lock, row read, header parse, broadcast) is not added to exec's wait.
+    /// Deterministic: the hook reports its entry and then blocks until the test
+    /// releases it; while it is blocked, the ticket is already filled. RED on
+    /// 0036f1f3: the hook ran first, so the ticket was still empty.
+    #[test]
+    fn writer_settles_the_ticket_before_the_header_persisted_hook() {
+        let (config, state_db) = make_test_config_and_db();
+        let cdb = make_test_consensus_db();
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 4);
+        let mut app =
+            TorusApp::try_new_with_manifest_db(state_db.clone(), cdb, &config, None, None, None)
+                .unwrap();
+        assert!(app.commit_persist.is_some(), "the off-thread writer");
+        let (record, calls) = recording_header_hook(&state_db);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<u64>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new((entered_tx, release_rx));
+        let hook: HeaderPersistedHook = Arc::new(move |h: u64| {
+            record(h);
+            let gate = gate.lock().unwrap();
+            let _ = gate.0.send(h);
+            // Held until the test releases it (or drops `release_tx`).
+            let _ = gate.1.recv();
+        });
+        app.set_header_persisted_hook(hook);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(8);
+        app.replace_exec_tx(tx);
+        app.exec_next_height = Some(5);
+        // Declared after `app`: dropped first on a failed assert, which frees
+        // a held hook so the writer's join in `app`'s drop cannot hang.
+        let release_tx = release_tx;
+        for h in 5..=6u64 {
+            let c = committed_full_block(&make_block(h, vec![]));
+            app.on_committed_block(&c, c.hash);
+            let msg = rx.try_recv().expect("dispatched");
+            assert_eq!(msg.torus_block.header.height, h);
+            let ticket = msg.persist.as_ref().expect("queued on the writer");
+            assert_eq!(entered_rx.recv().unwrap(), h, "the hook is running");
+            let settled = ticket.peek();
+            assert!(
+                settled.is_some_and(|rows| rows.header),
+                "the ticket settled before the hook ran (exec is not held by it)"
+            );
+            release_tx.send(()).unwrap();
+        }
+        drop(release_tx);
+        assert_eq!(*calls.lock().unwrap(), vec![(5, true), (6, true)]);
     }
 
     /// T5.3: `TORUS_MANIFEST_IN_STATE_DB=1` (pre-T5.3 layout) is unchanged: the

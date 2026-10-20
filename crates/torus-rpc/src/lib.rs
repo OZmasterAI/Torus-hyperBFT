@@ -871,58 +871,80 @@ pub const MAX_HEAD_BACKFILL: u64 = 256;
 /// visible even when its header lands after the commit event and no commit
 /// follows.
 ///
-/// Guarantees: a height is published only once its header row is readable;
-/// heights go out in increasing order, each at most once; the RPC height never
-/// regresses and is stored before the height's head is notified.
+/// Guarantees: a height is published only once its header row is readable,
+/// and only after every height below it (down to the backfill bound) was: a
+/// missing row stops the fill, and the heights above it wait (a later call,
+/// e.g. the exec fallback's after it wrote the row, publishes them); heights go
+/// out in increasing order, each at most once; the RPC height never regresses
+/// and is stored before the height's head is notified.
 pub struct HeadPublisher {
     state_db: StateDb,
     notifier: BlockNotifier,
     latest_height: Arc<AtomicU64>,
-    /// Highest height published (or the boot height): the lock serializes
-    /// the publishing callers.
-    published: Mutex<u64>,
+    /// The lock serializes the publishing callers.
+    progress: Mutex<HeadProgress>,
+}
+
+/// [`HeadPublisher`]'s position.
+struct HeadProgress {
+    /// Highest height published (or the boot height).
+    published: u64,
+    /// Highest height any caller asked for: heights above a missing row are
+    /// published once it is readable, with no further call for them.
+    wanted: u64,
 }
 
 impl HeadPublisher {
     /// Heights up to `latest_height`'s current value count as published.
     pub fn new(state_db: StateDb, notifier: BlockNotifier, latest_height: Arc<AtomicU64>) -> Self {
-        let published = Mutex::new(latest_height.load(Ordering::Relaxed));
+        let boot = latest_height.load(Ordering::Relaxed);
         Self {
             state_db,
             notifier,
             latest_height,
-            published,
+            progress: Mutex::new(HeadProgress {
+                published: boot,
+                wanted: boot,
+            }),
         }
     }
 
     /// The highest height published so far.
     pub fn published(&self) -> u64 {
-        *self.published.lock().unwrap_or_else(|e| e.into_inner())
+        self.progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .published
     }
 
-    /// Publish every height in `(published, height]`, in order: store it as
-    /// the RPC height, then notify its head (a row that is missing or does
-    /// not parse is not notified). Nothing happens, and `false` is returned,
-    /// when `height` is already published or its header row is not readable
-    /// yet (a later call publishes it).
+    /// Ask for every height up to `height` (and any asked for earlier), then
+    /// publish the readable run above the published height, in order: store
+    /// each as the RPC height, then notify its head (a row that does not parse
+    /// is not notified). The run stops at the first missing row. A gap wider
+    /// than [`MAX_HEAD_BACKFILL`] starts at its top heights. Returns whether
+    /// anything was published (`false`: `height` was already published, or
+    /// the next height's row is not readable yet).
     pub fn publish_up_to(&self, height: u64) -> bool {
-        let mut published = self.published.lock().unwrap_or_else(|e| e.into_inner());
-        if height <= *published {
+        let mut progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        progress.wanted = progress.wanted.max(height);
+        let wanted = progress.wanted;
+        if wanted <= progress.published {
             return false;
         }
-        let Some(top) = self.header_row(height) else {
-            return false;
-        };
-        let from = published
+        let from = progress
+            .published
             .saturating_add(1)
-            .max(height.saturating_sub(MAX_HEAD_BACKFILL - 1));
-        for h in from..height {
-            let row = self.header_row(h);
-            self.publish_one(h, row.as_deref());
+            .max(wanted.saturating_sub(MAX_HEAD_BACKFILL - 1));
+        let mut advanced = false;
+        for h in from..=wanted {
+            let Some(row) = self.header_row(h) else {
+                break;
+            };
+            self.publish_one(h, &row);
+            progress.published = h;
+            advanced = true;
         }
-        self.publish_one(height, Some(&top));
-        *published = height;
-        true
+        advanced
     }
 
     fn header_row(&self, height: u64) -> Option<Vec<u8>> {
@@ -932,9 +954,9 @@ impl HeadPublisher {
             .flatten()
     }
 
-    fn publish_one(&self, height: u64, row: Option<&[u8]>) {
+    fn publish_one(&self, height: u64, row: &[u8]) {
         self.latest_height.fetch_max(height, Ordering::Relaxed);
-        let head = row
+        let head = Some(row)
             .filter(|data| data.len() > 32)
             .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data[32..]).ok());
         if let Some(head) = head {
@@ -1270,8 +1292,43 @@ mod tests {
         assert_eq!(drain_heads(&mut rx), Vec::<u64>::new());
     }
 
+    /// T5.3 (review P3) RED-first: the writer's write for 5 failed but 6's
+    /// landed. 6 must wait for 5 (a gap fill that skipped 5 would publish 6 and
+    /// 5 would never get a head: the exec fallback's later call for 5 would be
+    /// a no-op). Once exec writes 5, its call publishes 5 then 6, in order,
+    /// each once, with no further call for 6.
+    #[test]
+    fn head_publisher_waits_for_a_missing_row_below_the_top() {
+        let dir = TempDir::new().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        for h in 1..=4 {
+            put_header_row(&state, h);
+        }
+        let latest = Arc::new(AtomicU64::new(4));
+        let notifier = BlockNotifier::new();
+        let mut rx = notifier.new_heads.subscribe();
+        let publisher = HeadPublisher::new(state.clone(), notifier, latest.clone());
+
+        put_header_row(&state, 6); // the writer: 5 failed, 6 landed
+        assert!(!publisher.publish_up_to(6), "6 waits for 5");
+        assert!(!publisher.publish_up_to(find_latest_height(&state)));
+        assert_eq!(latest.load(Ordering::Relaxed), 4);
+        assert_eq!(publisher.published(), 4);
+        assert_eq!(drain_heads(&mut rx), Vec::<u64>::new());
+
+        put_header_row(&state, 5); // the exec fallback writes 5
+        assert!(publisher.publish_up_to(5));
+        assert_eq!(drain_heads(&mut rx), vec![5, 6], "5 then 6, no call for 6");
+        assert_eq!(latest.load(Ordering::Relaxed), 6);
+        assert_eq!(publisher.published(), 6);
+        for again in [5, 6] {
+            assert!(!publisher.publish_up_to(again));
+        }
+        assert_eq!(drain_heads(&mut rx), Vec::<u64>::new(), "each once");
+    }
+
     /// Heights go out in order, never regress, each once; a gap is filled in
-    /// order (a missing row in it is skipped), and an older call is a no-op.
+    /// order and stops at a missing row, and an older call is a no-op.
     #[test]
     fn head_publisher_is_ordered_monotonic_and_exactly_once() {
         let dir = TempDir::new().unwrap();
@@ -1286,8 +1343,12 @@ mod tests {
         }
         assert!(publisher.publish_up_to(3));
         assert_eq!(drain_heads(&mut rx), vec![2, 3]);
-        assert!(publisher.publish_up_to(6));
-        assert_eq!(drain_heads(&mut rx), vec![5, 6], "4 has no row");
+        assert!(!publisher.publish_up_to(6), "4 has no row: 5 and 6 wait");
+        assert_eq!(drain_heads(&mut rx), Vec::<u64>::new());
+        assert_eq!(latest.load(Ordering::Relaxed), 3);
+        put_header_row(&state, 4);
+        assert!(publisher.publish_up_to(4));
+        assert_eq!(drain_heads(&mut rx), vec![4, 5, 6]);
         assert_eq!(latest.load(Ordering::Relaxed), 6);
         for stale in [0, 2, 4, 6] {
             assert!(!publisher.publish_up_to(stale));
