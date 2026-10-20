@@ -39111,12 +39111,13 @@ mod crash_recovery_tests {
                 .count()
         };
         // (checkpoint, hash activation, book blocker, reason fragment)
-        let blocked: Vec<(
+        type Case = (
             Option<crate::exec_pipeline::CheckpointPolicy>,
             Option<u64>,
             Option<&'static str>,
-            &str,
-        )> = vec![
+            &'static str,
+        );
+        let blocked: Vec<Case> = vec![
             (None, None, classic, "no checkpoint interval"),
             (Some(capped), None, classic, "byte cap"),
             (Some(ckpt_every(5)), Some(1), classic, "running state hash"),
