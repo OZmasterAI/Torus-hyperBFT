@@ -715,7 +715,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    stall / flush activity and per-thread CPU if sampled. Name the dominant phase of the in-window gap with numbers.
    This decides whether A1 or something else gets built.
    **Order (owner s131):** 8u and 8v run before 8l and the RH4 3-arm rerun (8w; filter built and reviewed, `baffa3a5`). **Queue (owner s131, latest):** 8s, 8u, 8v, 8l, 8t, 8x done; **8y running** (L3.1 A/B), then **8z** (Classic
-   cadence check, clears b1), then 8w (RH4 rerun). Run them back to back. A merged-main baseline follows once L2.2
+   cadence check, clears b1), then 8w (RH4 rerun), then 8z2 (conditional, clean b1 build). Run them back to back. A merged-main baseline follows once L2.2
    default-on lands.
    **L3.3 default-on (owner s131):** `TORUS_BOOK_FAST_ENCODE` becomes on by default (branch `perf/l33-default-on`,
    merges on owner call). Classic cells on any binary built after that merge include L3.3 (section 105: blocks/s
@@ -804,6 +804,18 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    equal (exec on-CPU 0.999, CPU-s per 1M 0.998, matched/s 1.005); fills per block 1.32x, p50 1.20x, p99 1.24x,
    timeouts 0.11 -> 0.77 per 1k blocks. No level flip per minute (O 13.2-16.7, B 10.0-12.6): a steady binary effect,
    not a cadence swing. Next per spec: 18c bisects b0 `704a089d` vs b1 `244a767c` with this shallow Classic ABBA.**
+8z2. **8z rerun with a clean b1 build (conditional)** (owner s131; after 8w; ~35 min + rebuild). Section 111: Classic
+   native blocks/s on b1 `ab4ded4e` (node `f19d9385`) vs `f8a45a2d` (`74598d33`) = 0.746 [0.712, 0.780] with equal
+   per-fill CPU, steady (no cadence flip), the loss in the tail (p99 +171 ms, timeouts 0.11 -> 0.77 per 1k). Code study
+   (s131): no Classic-path wait in b0 / b1 (W tripwire O(1) on W, handoff wait 0.02 ms, deferred-books flag never set);
+   `wall_ms_per_committed_block` is span / ncommit (= 1 / blocks/s), not a measured wait. Top suspect: the build (B was
+   an incremental rebuild in a reflink copy of 8l's target dir; O a fresh build). (1) Analysis only, alongside 8w, from
+   8z's data, O vs B: `torus_commit_interval_seconds` buckets (share of the gap from intervals > 100 ms), view timeout
+   reasons and `view_entered_past_deadline`, per-view propose_delay / proposal_arrival / vote_gather / qc_collect /
+   qc_to_advance / entry_slack, `block_build_*` and `validate_block_*` per 1k txs, exec_queue_depth, flush_worker_seconds,
+   `exec_checkpoint_{wait,upkeep,settle_wait,deferred_join}` per checkpoint; note in section 111. (2) Rebuild `ab4ded4e`
+   in a FRESH target dir with the 8l4 flags; if its md5 differs from `f19d9385`, run 8z2 = 8z's spec with O vs B-clean
+   (ABBA n = 2); if identical, report and 18c bisects b0 (`704a089d`) vs b1 (`244a767c`).
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
