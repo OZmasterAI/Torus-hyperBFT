@@ -247,6 +247,8 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
 
 ## Tier 5 — Latency: block cadence and tail *(after item 6 and item 7; added s121)*
 
+> **Status s131:** item 7 steps 1-2 merged (s123, s127); step 3 option 0, the EVM fast path, merged s131 and on by default (`TORUS_EVM_FAST_PATH`, perf doc section 107: EVM blocks no longer barrier the exec pipeline). T, HL order and C0 not built.
+>
 > **Order (owner s121):** item 7 steps 1-2 (EVM lanes, `plans/item7-evm-lanes.md`; overdue, see there) -> item 6 Phase 5 build steps (after archy's step 0 re-profile) -> Tier 5. Tier 5 comes after item 7 because item 7 changes the block cadence itself (EVM only every Nth block, then HL-style small and big blocks). The measurement-only first steps of T5.1 and T5.2 need no code and can run on archy's rig whenever it is free.
 >
 > **Why after item 6:** item 6 (Phases 1-5) targets matched/s on the exec-bound axis. Block time is where Hyperliquid is furthest ahead: HL publishes a 0.2 s median and 0.9 s p99 end-to-end latency (co-located client, request to committed response; HL docs, HyperCore overview) and runs ~70 ms blocks (unofficial figure). Our bench (300 markets, Phase 4 node, section 71 of `perf/ozarchy-antispam-item6-pf1-2026-10-04.md`) runs ~310 ms per block with a block-time p99 of 1.29-1.43 s. The numbers are not like for like (HL: end-to-end latency at normal load; ours: block interval under a saturating bench, 3 validators on one host), so step 1 of each item is measuring them the same way.

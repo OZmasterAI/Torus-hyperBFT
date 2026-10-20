@@ -631,6 +631,21 @@ pub fn capture_take(db: &StateDb) -> Vec<(u64, Vec<WriteEntry>)> {
     out
 }
 
+/// Item 7 option 0 step 0 (`test-probes`): take what was captured for `db`
+/// so far and KEEP recording (no gap between a take and the next begin, as
+/// `capture_take` + `capture_begin` would leave while the flush worker hashes
+/// on its own thread). Test hook.
+#[cfg(feature = "test-probes")]
+#[doc(hidden)]
+pub fn capture_drain(db: &StateDb) -> Vec<(u64, Vec<WriteEntry>)> {
+    let mut c = CAPTURE.lock().unwrap();
+    let id = db_id(db);
+    c.iter_mut()
+        .find(|(d, _)| *d == id)
+        .map(|(_, v)| std::mem::take(v))
+        .unwrap_or_default()
+}
+
 pub(crate) fn capture_active() -> bool {
     CAPTURE_ACTIVE.load(Ordering::Relaxed)
 }

@@ -14,7 +14,7 @@ pub mod proposer;
 pub mod state_root;
 pub mod validator;
 
-pub use committer::BlockCommitter;
+pub use committer::{metadata_side_rows, BlockCommitter, EvmSideRows, SideRow};
 pub use decode::{declared_gas_limit, decode_all_txs, decode_rlp_tx, decode_txs_lossy, DecodedTx};
 pub use error::BridgeError;
 pub use native_executor::{
@@ -26,4 +26,4 @@ pub use proposer::{
     genesis_parent_header, genesis_parent_header_for, BlockProposer, ProposedBlock,
 };
 pub use revm::database::BundleState;
-pub use validator::{merge_bundle_into, BlockValidator, ValidatedBlock};
+pub use validator::{merge_bundle_into, BlockValidator, EvmReads, RootMode, ValidatedBlock};

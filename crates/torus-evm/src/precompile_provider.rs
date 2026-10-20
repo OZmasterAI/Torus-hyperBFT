@@ -131,6 +131,12 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles {
             U256::ZERO
         };
 
+        // Item 7 option 0 (task 3.6): the precompile's reads (its journal, an
+        // overlay over the block's layers on the fast path) are labelled
+        // `Journal` for the test-only overlay probes (`test-probes`).
+        #[cfg(feature = "test-probes")]
+        let _probe_scope = torus_state::probes::scope(torus_state::probes::Reader::Journal);
+
         // Resolve calldata (same SharedBuffer / Bytes pattern as EthPrecompiles).
         let result = {
             let r;

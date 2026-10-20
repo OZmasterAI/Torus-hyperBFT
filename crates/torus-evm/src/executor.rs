@@ -314,6 +314,7 @@ impl EvmExecutor {
     ) -> Result<BlockExecResult, EvmError> {
         self.execute_block_lanes(
             state_db,
+            NativeStateOverlay::new(state_db.clone()),
             block_cfg,
             transactions,
             skip_invalid,
@@ -323,16 +324,26 @@ impl EvmExecutor {
 
     /// [`Self::execute_block`] with a big lane (item 7 step 2): a tx from `big.senders` runs at
     /// `big.base_fee`, every other tx at `block_cfg.base_fee`.
-    pub fn execute_block_lanes(
+    ///
+    /// Item 7 option 0 (task 1.5): revm reads `db` (a `&StateDb`, or a
+    /// `torus_state::LayeredEvmDb` over the block overlay) and the writer
+    /// precompiles read and write `journal` (an overlay over the same reads:
+    /// `NativeStateOverlay::new(state_db)` on the DB, the block's layers through a
+    /// `torus_state::EvmBlockState`). The journal comes back as `native_writes`.
+    pub fn execute_block_lanes<D>(
         &self,
-        state_db: &StateDb,
+        db: D,
+        journal: NativeStateOverlay,
         block_cfg: &BlockEnvCfg,
         transactions: Vec<TxEnv>,
         skip_invalid: bool,
         big: &BigLane,
-    ) -> Result<BlockExecResult, EvmError> {
+    ) -> Result<BlockExecResult, EvmError>
+    where
+        D: revm::DatabaseRef<Error = torus_state::StateError>,
+    {
         let state = State::builder()
-            .with_database_ref(state_db)
+            .with_database_ref(db)
             .with_bundle_update()
             .build();
 
@@ -352,7 +363,6 @@ impl EvmExecutor {
         // committer to persist atomically with the bundle. Nothing touches the DB
         // here, so a block that errors part-way (or a crash before the bundle
         // commit) leaves no queued action behind.
-        let journal = NativeStateOverlay::new(state_db.clone());
         let precompiles =
             TorusPrecompiles::new(EVM_SPEC, journal.clone(), block_cfg.number, block_cfg.timestamp);
         // R02 branch 5: the provider's local-fault cell (see `local_fault_or`).

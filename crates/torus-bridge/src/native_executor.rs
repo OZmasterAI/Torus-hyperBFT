@@ -13946,14 +13946,16 @@ impl NativeExecutor {
     /// pipeline must then run the native path (and so [`Self::drain_core_writer`]) even
     /// for a block with no native actions and no fees. Queue entries for `height` are
     /// buffered by an earlier block's EVM execution (`height - 1`, or `height - K` and
-    /// earlier for order kinds and rows a full block moved on, item 7 step 2) and
-    /// committed in the SAME atomic batch as that block's EVM bundle (s515 F1), which
-    /// lands before this block runs; no later block rewrites them before their drain
-    /// (EVM blocks are serial barriers) — so a DB read is authoritative here. R02 (C4): a
-    /// read error is a local fault and propagates; the caller fail-stops the block (never
-    /// "assume due").
-    pub fn core_writer_due(state_db: &StateDb, height: u64) -> Result<bool, CoreError> {
-        Ok(CoreWriterQueue::pending_count(state_db, height)? > 0)
+    /// earlier for order kinds and rows a full block moved on, item 7 step 2) and ride
+    /// that block's consensus writes (s515 F1). Item 7 option 0 (task 1.3): `state` is
+    /// the block overlay (DB + the in-flight layers: parent, L, C), read after the
+    /// block's own EVM rows were absorbed into it. Those target `height + 1` or later,
+    /// so they never answer for `height`; an earlier block's row may still sit in a
+    /// layer (not durable yet), and a drained row may be a layer tombstone over a DB
+    /// row. The answer equals `pending_count > 0`. R02 (C4): a read error is a local
+    /// fault and propagates; the caller fail-stops the block (never "assume due").
+    pub fn core_writer_due<T: StateBackend>(state: &T, height: u64) -> Result<bool, CoreError> {
+        Ok(state.prefix_exists(torus_state::cf::CF_CORE_WRITER_QUEUE, &height.to_be_bytes())?)
     }
 
     /// Item 2: whether this block must run the native phase for the oracle —

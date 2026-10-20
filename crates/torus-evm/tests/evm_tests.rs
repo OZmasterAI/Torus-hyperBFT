@@ -391,7 +391,14 @@ fn big_lane_sender_pays_the_big_base_fee() {
         transfer_1559(BOB, CAROL, 0, 5_000_000_000),
     ];
     let r = EvmExecutor::new(TORUS_CHAIN_ID)
-        .execute_block_lanes(&db, &cfg, txs, false, &big)
+        .execute_block_lanes(
+            &db,
+            torus_state::NativeStateOverlay::new(db.clone()),
+            &cfg,
+            txs,
+            false,
+            &big,
+        )
         .unwrap();
     assert_eq!(r.receipts[0].effective_gas_price, 1_000_000_001);
     assert_eq!(r.receipts[1].effective_gas_price, 3_000_000_001);
@@ -445,7 +452,14 @@ fn big_lane_tx_below_the_big_base_fee_is_skipped() {
         transfer_1559(ALICE, CAROL, 0, 2_000_000_000),
     ];
     let r = EvmExecutor::new(TORUS_CHAIN_ID)
-        .execute_block_lanes(&db, &cfg, txs, true, &big)
+        .execute_block_lanes(
+            &db,
+            torus_state::NativeStateOverlay::new(db.clone()),
+            &cfg,
+            txs,
+            true,
+            &big,
+        )
         .unwrap();
     assert_eq!(r.included_indices, vec![1]);
     assert_eq!(r.receipts.len(), 1);
@@ -2162,4 +2176,198 @@ mod hex {
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
             .collect()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Item 7 option 0 task 1.5: the block's EVM part over the block overlay's layers
+// ---------------------------------------------------------------------------
+
+/// Task 1.5 (RED: `execute_block_lanes` read only a `&StateDb` and built its journal over
+/// the DB): the same block over a DB holding every row, and over an `EvmBlockState` whose
+/// overlay holds those rows only in its layers (parent: the sender and a queued row; L: the
+/// contract, its code, the order delay, a tombstone over a stale DB account; C: a storage
+/// slot and the header BLOCKHASH reads; the DB under them has stale or no rows), gives the
+/// same receipts, bundle, journal rows and CoreWriter origins. The contract copies slot 1 to
+/// slot 2, stores BLOCKHASH(0) in slot 3 and forwards a cancelOrder to CoreWriter, whose
+/// `next_sequence` must see the parent's queued row (seq 1).
+#[test]
+fn execute_block_lanes_over_layers_equals_db() {
+    use std::sync::Arc;
+    use torus_state::cf::{
+        CF_ACCOUNTS, CF_BLOCK_HEADERS, CF_CODE, CF_CORE_WRITER_QUEUE, CF_FEE_CONFIG, CF_STORAGE,
+    };
+    use torus_state::checkpoint_layer::CheckpointLayer;
+    use torus_state::db::{encode_account_info, storage_key};
+    use torus_state::{EvmBlockState, NativeStateOverlay, StateBackend};
+
+    let contract = Address::repeat_byte(0xC7);
+    let mut code = vec![
+        0x60, 0x01, 0x54, 0x60, 0x02, 0x55, 0x60, 0x00, 0x40, 0x60, 0x03, 0x55,
+    ];
+    code.extend(core_writer_proxy_code(&[0x00]));
+    let code_hash = alloy_primitives::keccak256(&code);
+    let header_hash = B256::repeat_byte(0x5A);
+    let ten_eth = U256::from(10_000_000_000_000_000_000u128);
+    let acct = |balance: U256, nonce: u64, code_hash: B256| {
+        encode_account_info(&AccountInfo {
+            balance,
+            nonce,
+            code_hash,
+            code: None,
+            account_id: None,
+        })
+        .to_vec()
+    };
+    let queued = [2u64.to_be_bytes(), 0u64.to_be_bytes()].concat();
+    let parent_rows: Vec<(&str, Vec<u8>, Vec<u8>)> = vec![
+        (CF_ACCOUNTS, ALICE.to_vec(), acct(ten_eth, 0, KECCAK_EMPTY)),
+        (
+            CF_CORE_WRITER_QUEUE,
+            queued.clone(),
+            b"an earlier row".to_vec(),
+        ),
+    ];
+    let l_rows: Vec<(&str, Vec<u8>, Vec<u8>)> = vec![
+        (
+            CF_ACCOUNTS,
+            contract.to_vec(),
+            acct(U256::ZERO, 1, code_hash),
+        ),
+        (CF_CODE, code_hash.to_vec(), code.clone()),
+        (
+            CF_FEE_CONFIG,
+            b"core_writer_order_delay".to_vec(),
+            b"1".to_vec(),
+        ),
+    ];
+    let c_rows: Vec<(&str, Vec<u8>, Vec<u8>)> = vec![
+        (
+            CF_STORAGE,
+            storage_key(&contract, &U256::from(1)).to_vec(),
+            U256::from(0x77).to_be_bytes::<32>().to_vec(),
+        ),
+        (
+            CF_BLOCK_HEADERS,
+            0u64.to_be_bytes().to_vec(),
+            [header_hash.as_slice(), b"rest"].concat(),
+        ),
+    ];
+
+    let cfg = BlockEnvCfg {
+        number: 1,
+        ..default_block_cfg()
+    };
+    let txs = || {
+        vec![
+            TxEnv {
+                caller: ALICE,
+                gas_limit: 300_000,
+                gas_price: 2_000_000_000,
+                kind: TxKind::Call(contract),
+                data: Bytes::from(cancel_order_calldata(7)),
+                nonce: 0,
+                chain_id: Some(TORUS_CHAIN_ID),
+                ..Default::default()
+            },
+            transfer_tx(ALICE, CAROL, U256::from(1u64), 1, 2_000_000_000),
+        ]
+    };
+    let exec = EvmExecutor::new(TORUS_CHAIN_ID);
+    let journal_bytes = |db: &StateDb, j: &NativeStateOverlay| {
+        let mut b = rocksdb::WriteBatch::default();
+        j.append_pending_to_batch(db, &mut b).unwrap();
+        b.data().to_vec()
+    };
+
+    // Every row in the DB.
+    let (_da, db_a) = open_test_db();
+    for (cf, k, v) in parent_rows.iter().chain(&l_rows).chain(&c_rows) {
+        db_a.put_cf_raw(cf, k, v).unwrap();
+    }
+    let a = exec
+        .execute_block_lanes(
+            &db_a,
+            NativeStateOverlay::new(db_a.clone()),
+            &cfg,
+            txs(),
+            false,
+            &BigLane::default(),
+        )
+        .unwrap();
+
+    // The rows only in the layers; the DB under them is stale.
+    let (_db_dir, db_b) = open_test_db();
+    db_b.put_cf_raw(
+        CF_ACCOUNTS,
+        ALICE.as_slice(),
+        &acct(U256::from(5u64), 9, KECCAK_EMPTY),
+    )
+    .unwrap();
+    db_b.put_cf_raw(
+        CF_ACCOUNTS,
+        CAROL.as_slice(),
+        &acct(U256::from(3u64), 0, KECCAK_EMPTY),
+    )
+    .unwrap();
+    let frozen = |h: u64, rows: &[(&str, Vec<u8>, Vec<u8>)], tombstones: &[(&str, Vec<u8>)]| {
+        let ov = NativeStateOverlay::new(db_b.clone());
+        for (cf, k, v) in rows {
+            ov.put_cf_raw(cf, k, v).unwrap();
+        }
+        for (cf, k) in tombstones {
+            ov.delete_cf_raw(cf, k).unwrap();
+        }
+        ov.freeze(h)
+    };
+    let mut l = CheckpointLayer::new();
+    l.merge(&frozen(0, &l_rows, &[(CF_ACCOUNTS, CAROL.to_vec())]));
+    let mut c = CheckpointLayer::new();
+    c.merge(&frozen(0, &c_rows, &[]));
+    let overlay = NativeStateOverlay::with_layers(
+        db_b.clone(),
+        Some(frozen(0, &parent_rows, &[])),
+        Some(Arc::new(l)),
+        Some(Arc::new(c)),
+    );
+    let EvmBlockState { db, journal } = EvmBlockState::new(&overlay);
+    let b = exec
+        .execute_block_lanes(db, journal, &cfg, txs(), false, &BigLane::default())
+        .unwrap();
+
+    assert_eq!(format!("{:?}", a.receipts), format!("{:?}", b.receipts));
+    assert!(a.receipts.iter().all(|r| r.status), "{:?}", a.receipts);
+    assert_eq!(a.bundle, b.bundle);
+    assert_eq!(a.core_writer_origins, b.core_writer_origins);
+    assert_eq!(a.core_writer_origins.len(), 1);
+    assert_eq!(
+        a.core_writer_origins[0].seq, 1,
+        "next_sequence saw the parent's row"
+    );
+    assert_eq!(
+        journal_bytes(&db_a, &a.native_writes),
+        journal_bytes(&db_b, &b.native_writes)
+    );
+    assert_eq!(
+        a.native_writes.pending_write_count(),
+        2,
+        "one queue row and the last-order cursor row"
+    );
+    let slot = |i: u64| b.bundle.state[&contract].storage[&U256::from(i)].present_value;
+    assert_eq!(slot(2), U256::from(0x77), "the C slot");
+    assert_eq!(
+        slot(3),
+        U256::from_be_bytes(header_hash.0),
+        "BLOCKHASH from C"
+    );
+    assert_eq!(
+        b.bundle.state[&CAROL].original_info, None,
+        "L's tombstone hides the stale DB account"
+    );
+    // Nothing read through the overlay was written to it.
+    assert_eq!(overlay.pending_write_count(), 0);
+    assert!(
+        StateBackend::get_cf_raw(&db_b, CF_CORE_WRITER_QUEUE, &queued)
+            .unwrap()
+            .is_none()
+    );
 }
