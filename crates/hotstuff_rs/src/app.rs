@@ -220,6 +220,26 @@ pub trait App<K: KVStore>: Send {
         BlockDataCheck::Held
     }
 
+    /// [`Self::check_block_data`] for an authenticated re-proposal: the vote
+    /// for a block that consensus forces the leader to propose again (a
+    /// timeout certificate's winning high tip, vouched for by its signers or
+    /// by this replica's own earlier vote; or a block that already holds this
+    /// replica's highest phase certificate). Such a block cannot be refreshed
+    /// (its timestamp and contents are fixed by its hash), and its fresh-time
+    /// rules were already met when it was first voted, so the app may skip
+    /// vote-time freshness rules here (pre-testnet P1: the block-timestamp
+    /// lower bound, which would otherwise refuse the re-proposal forever after
+    /// a long stall). Every other rule must still apply.
+    ///
+    /// The default is [`Self::check_block_data`].
+    fn check_reproposal_data(
+        &mut self,
+        block: &Block,
+        block_tree: &AppBlockTreeView<'_, K>,
+    ) -> BlockDataCheck {
+        self.check_block_data(block, block_tree)
+    }
+
     /// Called after a block is irrevocably committed by consensus (finalized via
     /// the commit rule -- 2-chain in MonadBFT pipelined mode).
     ///
