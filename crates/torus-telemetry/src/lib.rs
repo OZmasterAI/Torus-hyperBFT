@@ -549,6 +549,15 @@ pub struct Metrics {
     /// the in-window commit-hook stall, waiting behind the checkpoint batch
     /// while the manifest lived in the state DB).
     pub commit_manifest_seconds: Histogram,
+    /// T5.3: one background manifest prune pass (pruner thread, at most 1/s):
+    /// state-DB WAL fsync, then the delete of the dispatched heights' manifests
+    /// in the consensus DB. Not observed with the manifest in the state DB (its
+    /// prune rides the commit-persist batch).
+    pub commit_manifest_prune_seconds: Histogram,
+    /// T5.3: how long the exec thread waits, before executing a block, for its
+    /// header + body write on the commit-persist writer thread (that write keeps
+    /// the `torus_commit_persist_*` timers, now observed on the writer).
+    pub exec_commit_persist_wait_seconds: Histogram,
     /// T5.3: the whole `on_commit_block` event handler (event-bus thread:
     /// height lookup, mempool prune, header read, WS notify).
     pub on_commit_block_handler_seconds: Histogram,
@@ -2280,6 +2289,18 @@ impl Metrics {
             "Consensus thread: commit-manifest put inside on_committed_block (T5.3)",
             commit_manifest_seconds.clone(),
         );
+        let commit_manifest_prune_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_commit_manifest_prune_seconds",
+            "Pruner thread: state-WAL fsync + commit-manifest delete in the consensus DB, per pass (T5.3)",
+            commit_manifest_prune_seconds.clone(),
+        );
+        let exec_commit_persist_wait_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 16));
+        registry.register(
+            "torus_exec_commit_persist_wait_seconds",
+            "Exec thread: wait for the block's off-thread header + body write before executing it (T5.3)",
+            exec_commit_persist_wait_seconds.clone(),
+        );
         let on_commit_block_handler_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
         registry.register(
             "torus_on_commit_block_handler_seconds",
@@ -3162,6 +3183,8 @@ impl Metrics {
             validate_block_attest_lookup_seconds,
             on_committed_block_seconds,
             commit_manifest_seconds,
+            commit_manifest_prune_seconds,
+            exec_commit_persist_wait_seconds,
             on_commit_block_handler_seconds,
             commit_handler_prune_seconds,
             mempool_remove_committed_seconds,
@@ -3844,6 +3867,8 @@ mod tests {
             "torus_validate_block_attest_lookup_seconds",
             "torus_on_committed_block_seconds",
             "torus_commit_manifest_seconds",
+            "torus_commit_manifest_prune_seconds",
+            "torus_exec_commit_persist_wait_seconds",
             "torus_on_commit_block_handler_seconds",
             "torus_commit_handler_prune_seconds",
             "torus_mempool_remove_committed_seconds",
