@@ -13,7 +13,7 @@ OFF-CHAIN line and left out of that per-block sum: `block_ms` is the EXEC
 thread's own timer, so counting worker ms into it drives residual_untimed
 negative and the percentages past 100 %.
 """
-import argparse, csv, json, os, re, statistics, sys, time
+import argparse, csv, json, math, os, re, statistics, sys, time
 from health import assess_liveness, acceptance, DEFAULT_STALL_S
 
 ap = argparse.ArgumentParser()
@@ -1028,19 +1028,99 @@ else:
 # What the gate proves for TORUS_EXEC_PIPELINE: the applied-height marker is the
 # crash fence, so the restarted node must replay from it, converge to the SAME
 # state as the two survivors, and rewind no further than the work that was
-# already committed-but-unexecuted at the kill.
+# already committed-but-unexecuted at the kill plus what was executed but not
+# yet durable (the hand-off; with coalesced checkpoints, since the last
+# checkpoint W finished).
 #
 #   rewind_blocks             committed - applied at the crash (the replay gap)
 #   exec_queue_depth_at_kill  committed-but-unexecuted blocks already queued on E
-#   rewind_beyond_exec_queue  what the PIPELINE cost on top: depth-1 hand-off
-#                             plus the in-flight batch => <= 2
+#   rewind_beyond_exec_queue  what the PIPELINE cost on top of that queue
+#
+# The bound on rewind_beyond_exec_queue (max_rewind_beyond_exec_queue, per kill):
+#
+#   per-block flush (checkpoint interval off):   PER_BLOCK_REWIND_SLACK = 2
+#       the depth-1 hand-off plus the in-flight batch; W writes every block.
+#   coalesced checkpoints (item 6 Phase 3, interval I > 0):
+#       2 + CHECKPOINTS_IN_REWIND x min(ceil(I x R x CHECKPOINT_RATE_MARGIN),
+#                                       CHECKPOINT_FORCED_STRIDE)
+#     The durable applied height is the LAST checkpoint W finished, so a kill
+#     also replays every block E executed since then: the open interval, plus
+#     the previous checkpoint if W was still writing it (checkpoints are
+#     depth-1 on W, `second_checkpoint_waits_for_first`, so at most one more):
+#     CHECKPOINTS_IN_REWIND = 2. One checkpoint spans I seconds of E time at
+#     the chain's block rate R (blocks/s on a survivor over the 2 x I before
+#     the kill), x1.5 for rate jitter, and never more than 100 blocks because
+#     attest heights (h % 100 == 0) always checkpoint (exec_pipeline.rs
+#     `CheckpointPolicy`).
+#   MAX_REWIND_HARD_CAP = 2 + 2 x 100 = 202 is the most any checkpoint config
+#     can legitimately rewind; the bound never exceeds it, and an unknown block
+#     rate (no sampler rows around the kill) falls back to it. A rewind past
+#     the bound is a broken fence or a runaway replay: FAIL.
+#   I resolves exactly as the node does (exec_pipeline.rs
+#     `effective_checkpoint_interval` + app.rs): TORUS_EXEC_PIPELINE=0 -> off
+#     (checkpoints need W); TORUS_CHECKPOINT_INTERVAL_MS set -> that value
+#     (0 or garbage -> off); unset -> the validator default 15 s, unless
+#     TORUS_BOOK_ROWS=2/3 (a deferred book save turns the default off).
+#
+# Bench 8l (perf doc 107.6): 15 s checkpoints, a 27-block replay (23 beyond the
+# queue) with agreeing digests was REJECTed by the old constant bound of 2.
 #
 # Absent crash.json => `crash` is null and the headline gate is null (NOT "FAIL"):
 # an ordinary cell simply did not run the gate.
-MAX_REWIND_BEYOND_EXEC_QUEUE = 2
+PER_BLOCK_REWIND_SLACK = 2
+CHECKPOINT_FORCED_STRIDE = 100
+CHECKPOINTS_IN_REWIND = 2
+CHECKPOINT_RATE_MARGIN = 1.5
+VALIDATOR_CHECKPOINT_INTERVAL_S = 15.0
+MAX_REWIND_HARD_CAP = PER_BLOCK_REWIND_SLACK + CHECKPOINTS_IN_REWIND * CHECKPOINT_FORCED_STRIDE
 
 
-def kill_checks(raw, out):
+def checkpoint_interval_s(node_env):
+    """The checkpoint interval (s) the cell's validators ran, None = per-block
+    flush. Mirrors the node's resolution (see the block comment above)."""
+    if (node_env.get("TORUS_EXEC_PIPELINE") or "").strip() == "0":
+        return None
+    raw = (node_env.get("TORUS_CHECKPOINT_INTERVAL_MS") or "").strip()
+    if raw:
+        return int(raw) / 1000.0 if raw.isdigit() and int(raw) > 0 else None
+    if (node_env.get("TORUS_BOOK_ROWS") or "").strip() in ("2", "3"):
+        return None
+    return VALIDATOR_CHECKPOINT_INTERVAL_S
+
+
+def block_rate_before(kill_ts, window_s, killed):
+    """Blocks/s on a SURVIVOR over [kill_ts - window_s, kill_ts] from the 1 Hz
+    sampler (None if fewer than two samples there)."""
+    if kill_ts is None:
+        return None
+    for node in ("val0", "val1", "val2"):
+        if node == killed:
+            continue
+        sel = [r for r in rows.get(node, []) if kill_ts - window_s <= r["ts"] <= kill_ts]
+        if len(sel) >= 2 and sel[-1]["ts"] > sel[0]["ts"]:
+            return ((m(sel[-1], "block_height") - m(sel[0], "block_height"))
+                    / (sel[-1]["ts"] - sel[0]["ts"]))
+    return None
+
+
+def rewind_limit(raw, node_env):
+    """(max rewind beyond the exec queue, interval s, block rate) for one kill."""
+    iv = checkpoint_interval_s(node_env)
+    if iv is None:
+        return PER_BLOCK_REWIND_SLACK, None, None
+    kill_ts = raw.get("kill_ts")
+    if kill_ts is None and raw.get("kill_at_s") is not None:
+        kill_ts = t0 + float(raw["kill_at_s"])
+    rate = block_rate_before(kill_ts, CHECKPOINTS_IN_REWIND * iv, raw.get("kill_node"))
+    if rate is None:
+        per_ckpt = CHECKPOINT_FORCED_STRIDE
+    else:
+        per_ckpt = min(math.ceil(iv * rate * CHECKPOINT_RATE_MARGIN), CHECKPOINT_FORCED_STRIDE)
+    limit = min(PER_BLOCK_REWIND_SLACK + CHECKPOINTS_IN_REWIND * per_ckpt, MAX_REWIND_HARD_CAP)
+    return limit, iv, (round(rate, 3) if rate is not None else None)
+
+
+def kill_checks(raw, out, node_env):
     """The part of the gate that ONE kill's record + log scan decides on its
     own (shared by crash.json and every s75 multi-crash crash-<k>.json):
     fills the rewind fields into `out`, returns the failures."""
@@ -1049,17 +1129,23 @@ def kill_checks(raw, out):
     gap = int(r.get("gap") or 0)
     q = pre.get("exec_queue_depth")
     q = int(q) if q is not None else None
+    limit, iv, rate = rewind_limit(raw, node_env)
     out["rewind_blocks"] = gap
     out["exec_queue_depth_at_kill"] = q
     out["rewind_beyond_exec_queue"] = (gap - q) if q is not None else None
+    out["checkpoint_interval_s"] = iv
+    out["rewind_block_rate"] = rate
+    out["max_rewind_beyond_exec_queue"] = limit
+    out["max_rewind_hard_cap"] = MAX_REWIND_HARD_CAP
     fail = []
     if not raw.get("restarted_pid"):
         fail.append("killed node did not restart")
     if out["rewind_beyond_exec_queue"] is None:
         fail.append("no exec_queue_depth sampled at the kill — rewind unbounded")
-    elif out["rewind_beyond_exec_queue"] > MAX_REWIND_BEYOND_EXEC_QUEUE:
-        fail.append("rewind %d blocks beyond the exec queue (max %d)"
-                    % (out["rewind_beyond_exec_queue"], MAX_REWIND_BEYOND_EXEC_QUEUE))
+    elif out["rewind_beyond_exec_queue"] > limit:
+        fail.append("rewind %d blocks beyond the exec queue (max %d: checkpoint interval %s s, "
+                    "block rate %s blk/s, hard cap %d)"
+                    % (out["rewind_beyond_exec_queue"], limit, iv, rate, MAX_REWIND_HARD_CAP))
     if int(r.get("panic_or_failstop_lines") or 0) > 0:
         fail.append("panic/fail-stop after the restart")
     if int(r.get("hole_lines") or 0) > 0:
@@ -1072,8 +1158,7 @@ def crash_gate(raw, agreement, node_env):
         return None
     r = raw.get("restart") or {}
     out = dict(raw)
-    fail = kill_checks(raw, out)
-    out["max_rewind_beyond_exec_queue"] = MAX_REWIND_BEYOND_EXEC_QUEUE
+    fail = kill_checks(raw, out, node_env)
     # The gate exists to unblock the FLAG: if the restarted node came back
     # without the flush worker, it crash-tested the serial path and proves
     # nothing. (A flag-off crash cell is a legitimate serial control.)
@@ -1141,7 +1226,7 @@ def crash_kill_list(out_dir, first, node_env):
             raw = crash_record(os.path.join(out_dir, "crash-kill-%d.json" % k)) or {}
         e = {f: raw.get(f) for f in KILL_FIELDS}
         e["kill_seq"] = e["kill_seq"] or k
-        fail = kill_checks(raw, e)
+        fail = kill_checks(raw, e, node_env)
         r = raw.get("restart") or {}
         e.update({f: r.get(f) for f in SCAN_FIELDS})
         if not scanned:
