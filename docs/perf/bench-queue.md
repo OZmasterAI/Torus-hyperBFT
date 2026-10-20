@@ -901,6 +901,16 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    free on deep: E / N matched/s 1.009 [1.001, 1.017], CPU-s per 1M 0.997, exec on-CPU 0.996 [0.974, 1.020], blocks/s
    0.990, save_order_books / blk 1.000. Watch: block p99 E / N 1.12 [0.84, 1.49] (both rounds up), flush worker per 1k
    fills 1.065.**
+9e. **L3.1 on top of every s131 default, deep book** (owner s131; NEXT, ready now; ~40 min). Section 110 (8y): L3.1
+   took the deep book 3.42 -> 15.76 native blocks/s on an older base (option 0 base, L2.2 off, no exec-hash). Section 116
+   (9d): merged main without L3.1, deep: 3.54 blk/s, save_order_books 56 ms/blk, exec busy 94%. Does the gain hold with
+   every current default on? **One binary** `merge/l31-default-on` `e1106362` (= main 9e206ba4 + L3.1 with
+   `TORUS_BOOK_COALESCE` on by default where its preconditions hold; L3.3, L2.2, option 0, exec-hash on; gated: full
+   nextest + cargo test), Classic, 15 s checkpoints, running state hash off (L3.1's precondition), no byte cap, the 8i
+   P1M deep book, no EVM load. Arms: **A** = `TORUS_BOOK_COALESCE=0`; **B** = default (L3.1 on; check the startup log
+   says on). Warm-up, then A B B A (n = 2), 300 s cells. Report: matched/s, native blocks/s, fills per block, block
+   p50 / p99, timeouts per 1k blocks, exec on-CPU ms per 1k fills, CPU-s per 1M fills, save_order_books ms per block,
+   the window-close spike (`torus_exec_book_coalesce_close_seconds`), RSS; A next to 9d's N as a check (same defaults).
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
