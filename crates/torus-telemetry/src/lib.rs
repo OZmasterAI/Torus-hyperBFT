@@ -2,6 +2,8 @@
 
 pub mod view_metrics;
 pub use view_metrics::ViewMetricsRecorder;
+pub mod qc_advance;
+pub use qc_advance::{QcAdvanceBy, QcAdvanceMetrics, QC_ADVANCE_STEPS};
 
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
@@ -787,6 +789,8 @@ pub struct Metrics {
     pub view_vote_gather_seconds: Histogram,
     /// ...and that PC to our next StartView (update/commit feed + AdvanceView).
     pub view_qc_to_advance_seconds: Histogram,
+    /// s131: step split of `view_qc_to_advance_seconds` and the commit path in it.
+    pub qc_advance: QcAdvanceMetrics,
     pub view_entry_slack_seconds: Histogram,
     pub view_timeout_after_seconds: Histogram,
     pub view_entered_past_deadline: Counter,
@@ -2699,6 +2703,7 @@ impl Metrics {
             "Collector: PC collected to our next StartView (update/commit feed + AdvanceView) (s70)",
             view_qc_to_advance_seconds.clone(),
         );
+        let qc_advance = QcAdvanceMetrics::register(&mut registry);
         let view_entry_slack_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 15));
         registry.register(
             "torus_view_entry_slack_seconds",
@@ -3128,6 +3133,7 @@ impl Metrics {
             view_vote_delay_seconds,
             view_vote_gather_seconds,
             view_qc_to_advance_seconds,
+            qc_advance,
             view_entry_slack_seconds,
             view_timeout_after_seconds,
             view_entered_past_deadline,
