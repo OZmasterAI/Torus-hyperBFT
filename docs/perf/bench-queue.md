@@ -624,8 +624,8 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    per node, x 2.0, 4 / 4), not the DA GC; with the GC it accounts for CPU per fill; exec us / fill +14-16% in
    state-compaction seconds (23% vs 13% of seconds); blocks/s link medium-low (bigger blocks, saturated exec); no
    RocksDB stalls. Next: retention-on arm with block-body pruning off. Raw 8r data: branch `data/ozarchy-8r` 7c8323ac.**
-8s. **b0 screen: Classic vs mode 3 + b0 (mode 3 with checkpoints)** (owner s131; NOW: pause 8l, run 8s, then 8l
-   restarts from scratch; ~40 min). 8p
+8s. **b0 screen: Classic vs mode 3 + b0 (mode 3 with checkpoints)** (owner s131; DONE s131, section 104 pending on
+   `docs/perf-section-104-8s`; ~40 min). 8p
    (section 102): mode 3 wins deep (blocks/s 2.16x) but loses shallow (blocks/s 0.62x, p50 3.3x, CPU per fill +17%)
    because modes 2/3 flushed every block. b0 (`perf/mode3-checkpoints-b0` `c2fbfbc0`, Codex torus-adversarial approve,
    137 targeted tests): with a checkpoint interval set, modes 2/3 use checkpoints; the write half of the book save runs
@@ -645,14 +645,15 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    settle / pass B / cache flush ms per block, fallbacks (must be 0). (2) **Timeouts**, deep book (8i P1M), **900 s**
    cells, A B B A (n = 2): timeouts per 1,000 blocks and per pair, view-timeout reasons (`torus_view_timeout_*`),
    p99. Verdict: default-on candidate or not; say plainly whether timeouts rise with B.
-8u. **L3.3 engine-timer profile** (owner s131; NOW: right after 8s, before 8l; ~40 min). L3.3 (`TORUS_BOOK_FAST_ENCODE`, merged flag off)
+8u. **L3.3 engine-timer profile** (owner s131; DONE s131, section 105 pending; ~40 min). L3.3 (`TORUS_BOOK_FAST_ENCODE`, merged flag off)
    showed exec engine ms per 1k fills +2.8% [1.020, 1.037] and runqueue wait +5.5% on the deep book (section 97.8),
    unexplained. One main binary, 1M deep book (8i P1M), A = flag unset, B = `TORUS_BOOK_FAST_ENCODE=1`, one 300 s cell
    each with the Q8 perf recipe on the exec thread, **`perf_event_paranoid=1` for this run only** (owner sets it before
    8u and restores 2 after; kernel sampling is needed for page faults, kernel time and off-CPU stacks, which the
    scheduling-artefact question depends on; log the value at every cell start and end). Report the engine phase split A vs B (match, settle, cancel-all, allocation, memmove,
    jemalloc, page faults) and whether the rise is real or a scheduling artefact. Only matters if Classic stays.
-8v. **T5.3 attribution: block p99 inside checkpoint windows** (owner s131; after 8u; ~1 h incl. analysis; no code).
+8v. **T5.3 attribution: block p99 inside checkpoint windows** (owner s131; NOW: right after 8u, before 8l; ~1 h incl.
+   analysis; no code; `perf_event_paranoid` back at 2, no perf needed).
    Roadmap T5.3: during a checkpoint DB write, block p99 sits ~500-650 ms above the out-of-window p99 (sections 87,
    89); A1 (checkpoint slicing) is parked because its target (manifest put, ~6-12 ms) can't explain it. One main
    binary, code defaults (15 s checkpoints), standard shape, 3 cells of 600 s. Align every view / block with the
@@ -661,7 +662,9 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    body persist) and the exec thread's (checkpoint upkeep, freeze, flush handoff, settle wait), plus RocksDB write /
    stall / flush activity and per-thread CPU if sampled. Name the dominant phase of the in-window gap with numbers.
    This decides whether A1 or something else gets built.
-   **Order (owner s131):** 8u and 8v run **before** the RH4 3-arm rerun (8w; filter built and reviewed, `baffa3a5`). Queue after 8s (8s finished, analysis running): 8u now, then 8l, 8t, 8v, then the RH4 rerun (8w).
+   **Order (owner s131):** 8u and 8v run before 8l and the RH4 3-arm rerun (8w; filter built and reviewed, `baffa3a5`). Queue (s131): 8s and 8u done; **8v now**, then 8l (from scratch), 8t, then the RH4 rerun (8w). Section 105 (8u)
+   must add native blocks/s, block p50 / p99 and CPU-s per 1M fills (B / A) for the L3.3 default-on call (analysis
+   only, alongside 8v).
 8w. **RH4 3-arm rerun: state pruner compaction filter** (owner s131; after 8v; ~1 h 50). 8r (section 103.6): the
    cost both retention arms share is state-DB compaction of `cf_block_bodies` from the state pruner's
    `delete_range_cf` range deletes (compaction CPU x2.0, L0 3.3 vs 1.2). Fix: `perf/rh4-gc-worker` `baffa3a5` (on
