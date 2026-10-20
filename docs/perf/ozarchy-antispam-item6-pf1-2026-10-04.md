@@ -16653,6 +16653,163 @@ r1-M; `validate_block_seconds` and `view_insert_persist_seconds` none.
   `ozarchy-8v-tools/` (`8v-spec.json`, `8v-checks.sh`, `ozarchy-8v-campaign.sh`, `run-with-t53.sh`, `t53watch.sh`,
   `t53-sampler.py`, `t53-analyze.py`, `t53-hook.py`, `FROZEN.txt`).
 
+## 107. Step 8l (Q11), item 7 option 0, the EVM fast path, A/B: one branch binary `feat/item7-option0` `f8a45a2d` for N-off / E-off / N-on / E-on (`TORUS_EVM_FAST_PATH=0` / `=1`), arm M = main `fd94818d` (the branch base), standard load hsdb-300m, N = 11, 300 markets, 600 s cells, n = 4 (r4 by the spec's n = 4 trigger), plus E-heavy, crash and mixed-flag cells (campaign ozarchy-8l4, archy, 2026-10-20)
+
+**Option 0 passes the exec-path merge rule on E-on / E-off with every CI resolved, passes all six option 0 passes,
+and the branch with the flag off is not worse than main. Under EVM load (10 tx/s) E-on runs at N-on's pace: matched/s
+1.079 x E-off [1.074, 1.084], native blocks/s 3.53 x [3.20, 3.89], block p50 0.090 [0.082, 0.099], p99 0.496 [0.437,
+0.563], exec-thread on-CPU per 1k fills 0.981 [0.972, 0.991] (lower in 4 / 4 rounds; at n = 3 it was [0.963, 1.0006],
+which triggered r4), CPU-s per 1M fills 1.000, timeouts 22 -> 3. E-off / M: exec-thread CPU 0.998 [0.988, 1.008],
+blocks/s 1.066 [1.014, 1.122], p50 0.897 [0.817, 0.984], p99 0.966 [0.905, 1.032], CPU-s per 1M 1.005 [0.999, 1.010].
+N-on / N-off is within noise (the flag is inert without EVM). All 25 cells valid (the crash cell's REJECT is harness-
+made, digests agree after a 27-block replay); the mixed-flag cell agrees at all 35 checkpoints. The default flip is
+the owner's call.**
+
+Question (bench queue step 8l, owner s128 decisions 7a / 8a, unpaused s131, run from scratch): does option 0 (EVM
+blocks run pipelined, the EVM trie step moves to the flush worker W) remove the EVM-height cost (sections 80 / 85:
+E-off ~0.91 x N-off matched/s, ~0.5 s exec idle before each EVM block, serial EVM blocks) without adding exec-thread
+CPU per fill, and is the branch with the flag off no worse than its base main? Spec: bench-queue.md 8l and
+`docs/plans/item7-option0-impl.md` section 6 (`origin/feat/item7-option0`).
+
+### 107.1 Setup
+
+* Binaries (fresh worktrees, plain release `--locked`, clang + mold; stage `ozarchy-8l4-stage`): B =
+  `origin/feat/item7-option0` `f8a45a2d`, torus-node `74598d33b5711263ed141faf960d9c22` (all arms but M); M = main
+  `fd94818d`, torus-node `602e1a5acd0054632cd51a06bb28842b`; bench-throughput `32fc7b69`, torus-tx-flood `dd59d50d`
+  (both from `f8a45a2d`) in every arm; a MIX wrapper execs B with per-node env by `--data-dir`. md5s equal attempt 3's
+  build of the same commits. Tools frozen from main `eabec5e5` (`ozarchy-8l4-tools/FROZEN.txt`).
+* Shape: standard load hsdb-300m (300 markets, rate 76,000, 5,000 senders, `BLOCK_CAP=400 RETRY_BUSY=1 MAX_IN_FLIGHT=4
+  OPEN_ORDER_BUDGET=900 ORACLE_FEED=1 IN_FLIGHT_TAIL=commit CLOID_SHARE=0`, Classic, 15 s coalesced checkpoints,
+  oracle on), N = 11 bench genesis (100k accounts, `d694b81b`; EVM heights mod 11 = 0), 3 validators, code defaults,
+  512 KB push threshold from `env.sh`, custody 0.
+* Arms (the flag set explicitly in every B arm): Noff / Non (native only, `=0` / `=1`), Eoff / Eon (+ `EVM_LOAD_RATE=10
+  EVM_LOAD_SENDERS=40`), M (main, flag unset, EVM 10 / 40). Extra (n = 1): EHoff / EHon (`EVM_LOAD_RATE=40`), Con
+  (crash: flag on, EVM 10 / 40, SIGKILL val1 at bench + 300 s, restart from its data dir), MIX (val0 `=1`, val1 `=0`,
+  val2 `=1` + `TORUS_CHECKPOINT_INTERVAL_MS=0`, EVM 10 / 40, running state hash polled at every 100-block checkpoint).
+* `TORUS_BOOK_FAST_ENCODE` not set in any arm (L3.3 default-on not merged; both binaries predate it): unset on every
+  node of every cell (absent_env).
+* Order: smokes (60 s per arm; crash 120 s with the kill at 45 s; MIX 60 s), warm-up w1 Eon 300 s (gated), r1 Noff Eoff
+  M Eon Non, r2 Non Eon M Eoff Noff, r3 as r1, then EHoff EHon, Con, MIX: one unit `bench-ozarchy-8l4`, 05:29-09:10.
+  r4 (the spec's n = 4 trigger: the E-on / E-off exec-thread CPU CI straddled 1 by 0.06 points) Noff Eoff M Eon Non,
+  no warm-up, same binaries / env / tools, from its own driver (`8l4r4-spec.json`: the generator refuses arms without
+  a cell, so the EH arms are dropped) and unit `bench-ozarchy-8l4r4`, 09:20-10:16; cells `ozarchy-8l4-300m-r4-*`.
+* Pacing (owner `end_pass=1`): between cells only stop + collect files; all run.log expectations, campaign checks,
+  end passes and analysis after the last cell (nice 19). Gaps END -> next START 5-6 s for all 19 transitions of the
+  main chain and all 4 of r4. 8t's build and cells started after r4's last cell; only 8l's post-hoc work (nice 19,
+  sequential) overlapped them.
+
+### 107.2 Validity
+
+* 25 cells: w1, 20 matrix (r1-r4), EHoff, EHon, Con, MIX. All rc 0 ACCEPT / AGREE / PASS except Con (REJECT, harness-made,
+  107.6). 625 CHECK OK, 0 CHECK FAIL, 0 HARD FINDING, 0 panic / fail-stop lines; no reruns. Smokes: 9 cells, 225 CHECK
+  OK. The first crash smoke stopped at its warm-up gate (the crash gate fails by design there); tooling fix
+  `GATE_TAGS=` for the crash stage, rerun OK, failed copy kept as `ozarchy-8l4c-300m-smoke-s0-unused`.
+* exe md5 on all 3 nodes: B `74598d33` in the 21 B cells (63 / 63 nodes), M `602e1a5a` in the 4 M cells (12 / 12).
+  Flag in node env matches the arm on every node of every cell; the ON / OFF startup line once per start on every B
+  node, none on M.
+* Host: swap growth <= +36 kB, MemAvailable >= 30.8 GB, paranoid 2 (no perf), no cargo / rustc / indexer during cells.
+* CHECK WARN only: EVM landed < accepted in serial-path cells (r1-Eoff 111, r3-Eoff 413, r1-M 128, r2-M 325, r4-M 67,
+  EHoff 1,752, MIX 325 accepted-not-landed, no rejects): txs still pending when the scan ended (the serial path makes
+  ~200 EVM blocks per cell vs ~620-710). Every E-on cell has landed = accepted.
+
+### 107.3 Per-arm means (r1-r4, node means, bench window; `ozarchy-8l4-run/analyst/8l4-analysis-n4.txt`)
+
+| metric | Noff | Eoff | M | Eon | Non |
+|---|---|---|---|---|---|
+| matched/s | 258,241 | 239,290 | 239,424 | 258,150 | 257,388 |
+| exec ms per 1k fills | 3.828 | 4.139 | 4.139 | 3.837 | 3.839 |
+| exec-thread on-CPU ms per 1k fills | 2.838 | 2.899 | 2.905 | 2.845 | 2.843 |
+| CPU-s per 1M fills | 23.57 | 23.61 | 23.50 | 23.60 | 23.61 |
+| native blocks/s | 13.88 | 3.80 | 3.56 | 13.41 | 14.89 |
+| block p50 / p99 ms | 15 / 730 | 169 / 1,547 | 188 / 1,601 | 15 / 768 | 14 / 676 |
+| fills per native block | 18,088 | 61,914 | 65,776 | 18,529 | 16,781 |
+| timeouts per 1,000 native blocks | 0.06 | 2.43 | 1.74 | 0.10 | 0.03 |
+| W busy (flush worker s / s) | 0.085 | 0.106 | 0.107 | 0.086 | 0.084 |
+| checkpoints / min, layer MB / min | 8.9, 1,062 | 23.2, 1,821 | 21.9, 1,882 | 8.6, 1,047 | 9.4, 1,060 |
+| RSS mean MB | 3,824 | 4,968 | 5,095 | 3,880 | 3,801 |
+
+### 107.4 Paired ratios (per round, geomean, 95% t CI, n = 4)
+
+| metric | Eon / Eoff | Eoff / M | Non / Noff | Eon / Non | Eoff / Noff |
+|---|---|---|---|---|---|
+| matched/s | 1.079 [1.074, 1.084] | 0.999 [0.994, 1.005] | 0.997 [0.993, 1.001] | 1.003 [0.995, 1.011] | 0.927 [0.918, 0.935] |
+| exec ms per 1k fills | 0.927 [0.921, 0.933] | 1.000 [0.994, 1.006] | 1.003 [0.997, 1.009] | 0.999 [0.992, 1.006] | 1.081 [1.072, 1.091] |
+| CPU-s per 1M fills | 1.000 [0.994, 1.005] | 1.005 [0.999, 1.010] | 1.001 [0.993, 1.010] | 1.000 [0.993, 1.007] | 1.002 [0.997, 1.007] |
+| exec-thread on-CPU ms / 1k fills | **0.981 [0.972, 0.991]** | 0.998 [0.988, 1.008] | 1.002 [0.997, 1.006] | 1.001 [0.998, 1.003] | 1.021 [1.013, 1.030] |
+| native blocks/s | 3.53 [3.20, 3.89] | 1.066 [1.014, 1.122] | 1.08 [0.83, 1.40] | 0.90 [0.76, 1.07] | 0.275 [0.228, 0.332] |
+| block p50 | 0.090 [0.082, 0.099] | 0.897 [0.817, 0.984] | 0.91 [0.74, 1.11] | 1.09 [0.95, 1.25] | 11.0 [8.8, 13.8] |
+| block p99 | 0.496 [0.437, 0.563] | 0.966 [0.905, 1.032] | 0.93 [0.65, 1.31] | 1.14 [0.96, 1.36] | 2.13 [1.83, 2.49] |
+| timeouts / 1k blocks (pooled) | 0.040 (3 vs 22) | 1.27 [0.22, 7.44] | 0.51 (1 vs 2) | 3.0 (3 vs 1) | 39 |
+
+n = 3 (r1-r3) for reference: Eon / Eoff matched/s 1.078 [1.070, 1.087], exec-thread CPU 0.981 [0.963, 1.0006],
+blocks/s 3.61; Eoff / M CPU-s per 1M 1.0065 [1.0049, 1.0080] (r4 0.9994 brought it back to a CI spanning 1). Native-only
+blocks/s and p50 / p99 swing between rounds in both N arms (12.3-16.0 blk/s), so N-on / N-off and E-on / N-on are wide
+on those rows. E-on vs main (Eon / M): matched/s 1.078 [1.076, 1.081], exec-thread on-CPU 0.979 [0.977, 0.981],
+blocks/s 3.76, p50 0.080, p99 0.480.
+
+### 107.5 Judgement per spec
+
+* **Exec-path merge rule, E-on / E-off: pass, all CIs resolved.** Exec-thread CPU per fill 0.981 [0.972, 0.991];
+  blocks/s 3.53 x, p50 0.090, p99 0.496; timeouts 2.43 -> 0.10 per 1,000 blocks; matched/s +7.9%, exec ms per 1k fills
+  -7.3%, CPU-s per 1M 1.000.
+* **E-off / M (flag-off cost): not worse.** Exec-thread CPU 0.998 [0.988, 1.008]; blocks/s 1.066 and p50 0.897 better;
+  p99 0.966 spans 1; CPU-s per 1M 1.005 [0.999, 1.010]: at most a ~1% whole-process cost, not on the exec thread.
+* **N-on / N-off: within noise** (matched/s 0.997 [0.993, 1.001], exec-thread CPU 1.002 [0.997, 1.006]).
+* **Six option 0 passes (section 6):**
+  1. E-on / N-on matched/s 1.003 [0.995, 1.011] >= 0.97; E-off / N-off 0.927 [0.918, 0.935] vs section 85's 0.913: pass.
+  2. Pipelined share at EVM heights (E-on): `torus_exec_evm_fast_path_blocks` / `torus_exec_evm_blocks` = 1.0000 on
+     every node (685 / 685, 686 / 686, 708 / 708, 622 / 622; logs: `pipelined=true` at 100%). Exec idle before an EVM
+     block (logs): p50 0.05-0.06 ms, mean 0.8-1.4 ms, p99 5-12.5 ms (E-off p50 408-436 ms, M 372-400 ms): pass.
+  3. `torus_exec_checkpoint_deferred_read_waits` delta 0 in every cell, every node: pass.
+  4. `torus_exec_resident_rows_rebuilds` 0 and `torus_exec_checkpoint_layer_shared` 0 in every arm: pass.
+  5. Checkpoints / min E-on 8.57 vs N-on 9.44 (N-off 8.86), layer MB / min 1,047 vs 1,060: no forced checkpoints.
+     E-off shows the forced ones (23.2 / min, 1,821 MB / min; M 21.9, 1,882): pass.
+  6. EVM landed = accepted in every E-on cell (6,000 / 6,000 x 4; w1 3,000; EHon 24,000), `off_cadence_blocks` 0, eth
+     head at the load's last height 1-4 s after the load, attestations / digests agree in every cell: pass.
+* **W:** `torus_flush_worker_evm_trie_seconds` (E-on, per node): 76-86 jobs per 600 s cell (one per checkpoint with
+  EVM writes, not per EVM block), 5.9-7.1 ms per job (mean 6.58), 0.49-0.61 s per cell (~0.1% of wall); off arms 0
+  jobs. W busy E-on 0.086 vs N-on 0.084 vs E-off 0.106 vs M 0.107 (E-off's W does the forced checkpoints); W ms per job
+  E-on 5.7-6.3 vs E-off 21.5-22.4. W on-CPU per fill not available (no flush-worker thread in the summary schedstat).
+* EVM heights (all nodes, bench window): E-on exec ms at EVM heights mean 75-91 / p50 15-28 ms vs other heights 69-78
+  / 11-13 ms; E-off 326-365 / 384-416 ms (serial). Exec idle before EVM blocks: E-on 0.10-0.14% of the window, E-off
+  11.9-12.4%, M 12.0-12.3%. Commit -> exec lag p50: E-on 2.0-2.6 s, E-off 14.3-17.0 s, M 17.7-20.1 s.
+  `torus_exec_evm_block_seconds` E-on 75-91 ms vs E-off 673-733 ms.
+
+### 107.6 Extra cells (n = 1 each)
+
+* **E-heavy (EVM 40 tx/s):** EHon / EHoff matched/s 254,446 / 236,344 (1.077), native blocks/s 16.35 / 3.65, p50 13 /
+  176 ms, p99 588 / 1,595 ms, exec-thread on-CPU 2.872 / 2.938 ms per 1k fills, CPU-s per 1M 23.72 / 23.91. EHon: 890
+  EVM blocks all on the fast path, landed 24,000 / 24,000, W evm_trie 6.7 ms per job (99 jobs). EHoff: 19,276 accepted,
+  1,752 not landed. Both hit the 142-tx EVM block cap (the 3M gas lane fills at rate 40): this sizes C0's trigger.
+* **Crash (Con, flag on, SIGKILL val1 at bench + 300 s):** val1 down 1.01 s, restarted from its data dir, replayed 27
+  blocks (`execution gap detected, replaying committed_height=4327 applied_height=4300 gap=27`). End: all 3 nodes same
+  block hash and state digest (`dae816fd...`), AGREE, 0 panic / fail-stop lines, 0 HARD FINDING. After the restart
+  val1 ran 288 / 290 EVM blocks on the fast path (2 not: likely the replayed range; not checked further). 252,446
+  matched/s, p50 / p99 16 / 831 ms, 7 timeouts; liveness UNKNOWN (val1's metrics reset). The crash gate FAIL / REJECT
+  are harness-made, two issues for 18c: (a) `summarize.py` `MAX_REWIND_BEYOND_EXEC_QUEUE = 2` dates from per-block
+  flush; with 15 s coalesced checkpoints the durable applied height is the last checkpoint, so a rewind up to one
+  checkpoint interval is expected (here 23 beyond the exec queue); (b) `crash-kill.sh` `crash_scan_restart_tail` greps
+  `panicked|FAIL-STOP|fail-stop|conflicting blocks` without a level filter, so the startup line `INFO
+  torus_consensus::state_hash: running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false` counts as a
+  fail-stop (run-cell.sh's own scan excludes INFO). Both also hit both crash smokes. EVM: 1,105 accepted-not-landed +
+  185 rejected (nonce too far / http): val1-pinned senders lost their mempool txs at the kill.
+* **Mixed flags (MIX: val0 on, val1 off, val2 on + per-block flush):** running state hash equal on all 3 nodes at all
+  35 checkpoints (heights 100..3500), 0 disagreements, 0 error answers; ACCEPT / AGREE / PASS. val1 (off) sets the
+  pace: 3.59 blk/s, p50 190 ms, 239,340 matched/s, 10 timeouts. val2's EVM trie runs per block (196 jobs vs val0 50).
+
+### 107.7 Limits and data
+
+* r4 ran from a separate driver and unit ~10 min after the main chain (same binaries, env, tools; no warm-up after
+  cells until 09:10). r4-Eon had the lowest E-on block rate (12.31 blk/s); r4's paired exec-CPU ratio (0.981) equals
+  r1-r3's mean.
+* Extra cells n = 1; the crash cell's gate verdict is harness-made (107.6).
+* Data: `~/bench-results-matched/ozarchy-8l4-300m-{w1,r1-*,r2-*,r3-*,r4-*,x1-EHoff,x1-EHon}`, `ozarchy-8l4c-300m-x1-Con`,
+  `ozarchy-8l4m-300m-x1-MIX` (+ `state-hashes.txt`); smokes `ozarchy-8l4s-300m-s1-*`, `ozarchy-8l4c-300m-smoke-s0`,
+  `ozarchy-8l4m-300m-smoke-s0`. Run `ozarchy-8l4-run/` (`chain.log`, `chain-r4.log`, `posthoc*.log`,
+  `{campaign,campaign-r4,crash,mixed}/{campaign.log,cells.tsv}`, `8l-analysis.md`, `analyst/` with `8l4-analyse.py`,
+  `8l4-analysis-n4.txt`, `8l4-analysis.txt`, `8l-analysis-n3.md`). Tools `ozarchy-8l4-tools/`; stage
+  `ozarchy-8l4-stage/`. Earlier paused attempt kept as `ozarchy-8l-run-paused3-unused/`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
