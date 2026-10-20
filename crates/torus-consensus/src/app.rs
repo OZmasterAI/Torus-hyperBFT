@@ -39997,8 +39997,9 @@ mod crash_recovery_tests {
     /// Every L6.1 node agrees, at every height it made durable (full dump,
     /// native root, running hash): serial with and without resident books,
     /// pipelined with L3.1 on (checkpoints every 7, epoch fast path) and off
-    /// (no time closes, barriers), a restart just before 100 (W fails 98
-    /// after E ran 99, the replay re-runs both), and a node whose META rows
+    /// (no time closes, barriers), restarts (a new context at 33, 66 and 99,
+    /// just before the attest height), a crash at 97 under L3.1 (the lost
+    /// blocks replayed from the last checkpoint), and a node whose META rows
     /// are stale (no configured activation, no L6.1 row) while its genesis
     /// chain config has L6.1 on: the execution rule comes from the chain
     /// config, so it runs the same state transition (its hash rows differ,
@@ -40071,13 +40072,22 @@ mod crash_recovery_tests {
                 P2Fault::None,
             ),
             (
-                "restart before 100",
+                "restarts at 33, 66, 99",
                 true,
                 classic,
                 None,
                 false,
                 None,
-                P2Fault::CrashAfter(vec![97]),
+                P2Fault::RestartEvery(33),
+            ),
+            (
+                "L3.1 every 5, crash at 97 (replayed)",
+                true,
+                classic,
+                Some(ckpt_every(5)),
+                true,
+                Some(true),
+                P2Fault::CkptCrash(vec![(97, false)]),
             ),
         ] {
             let run = l61_forced_run(
@@ -40092,8 +40102,17 @@ mod crash_recovery_tests {
             );
             assert_eq!(l31_divergence(&golden, &run), None, "{what}");
             assert_eq!(golden.hash, run.hash, "{what}: running hash");
-            if let P2Fault::CrashAfter(_) = fault {
-                assert_eq!(run.faults, 1, "{what}: crashed once");
+            match fault {
+                P2Fault::CkptCrash(_) => {
+                    assert_eq!(run.faults, 1, "{what}: crashed once");
+                    assert!(
+                        run.crash_windows.iter().all(|(s, last)| *s < 97 && *last < 100),
+                        "{what}: lost and replayed blocks before 100: {:?}",
+                        run.crash_windows
+                    );
+                }
+                P2Fault::RestartEvery(_) => assert_eq!(run.restarts, 3, "{what}: restarts"),
+                _ => {}
             }
         }
         let stale = l61_forced_run(
