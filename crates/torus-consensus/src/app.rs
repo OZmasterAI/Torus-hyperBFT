@@ -72,6 +72,31 @@ fn refused_proposal() -> ProduceBlockResponse {
 /// `inflight` (C) -> DB, where S = `base` is the last checkpoint handed to
 /// W.
 ///
+/// 8k L3.1: what closed a window into a checkpoint (every
+/// [`ExecutionContext::checkpoint_submit`] names one; the coalesced book
+/// encode runs for all of them, and the test seam `test_coalesce_skip` can
+/// skip it for one to prove the golden catches a missed close).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseKind {
+    /// `h % 100 == 0` (attest height).
+    Attest,
+    /// An epoch boundary under the epoch fast path.
+    Epoch,
+    /// The policy's block count (`every_blocks`).
+    Every,
+    /// The policy's interval (`TORUS_CHECKPOINT_INTERVAL_MS`).
+    Interval,
+    /// The policy's byte cap (`TORUS_CHECKPOINT_MAX_BYTES`).
+    Bytes,
+    /// A barrier's drain (`pipeline_barrier`).
+    Barrier,
+    /// The final drain at shutdown (`Drop`).
+    Shutdown,
+    /// Test seam `test_ckpt_due` (a seeded random policy).
+    #[cfg(test)]
+    TestDue,
+}
+
 /// p3 merge wait: between blocks L is in two parts. `layer` holds every CF
 /// but [`torus_state::DEFERRED_CFS`] (positions, balances: ~92% of a
 /// block's keys, read by a native block from R only); `deferred` holds
@@ -120,6 +145,14 @@ struct CkptState {
     /// the `torus_exec_checkpoint_live_*`, `_read_views_live` and
     /// `_oldest_live_age_blocks` gauges (set once per pipelined block).
     retention: Arc<torus_state::RetentionStats>,
+    /// 8k L3.1 (`TORUS_BOOK_COALESCE`): the markets whose Classic blob the
+    /// open window owes: the per-block encode of a book dirtied above `base`
+    /// was skipped, so the resident holder holds the only copy of its bytes.
+    /// Every window close encodes them into the closing layer and clears the
+    /// set ([`ExecutionContext::checkpoint_submit`]). Kept with the window
+    /// (not in the holder): a fresh context starts a fresh window, so a holder
+    /// moved into it carries no debt (crash replay restarts from S).
+    unsaved: std::collections::BTreeSet<torus_types::MarketId>,
     /// p3 merge wait test seam: holds each merge's deferred half (see
     /// [`DeferredGate`]).
     #[cfg(test)]
@@ -1288,6 +1321,21 @@ struct ExecutionContext {
     /// flight C and the window bookkeeping (E-only; the mutex is
     /// uncontended). Unused while `checkpoint` is `None`.
     ckpt: std::sync::Mutex<CkptState>,
+    /// 8k L3.1 (`TORUS_BOOK_COALESCE`, node-local, default off): pipelined
+    /// blocks with resident Classic books skip the per-block whole-book
+    /// encode; each window close encodes the window's dirty books once
+    /// (`CkptState::unsaved`). Set by [`Self::configure_book_coalesce`]
+    /// (needs a checkpoint interval, Classic + resident books and the running
+    /// hash not configured), after `checkpoint`.
+    book_coalesce: bool,
+    /// 8k L3.1 test seam (mutation): a close of this kind skips the
+    /// coalesced encode (the books stay owed to a later close).
+    #[cfg(test)]
+    test_coalesce_skip: Option<CloseKind>,
+    /// 8k L3.1 test seam: an extra checkpoint trigger (`h` -> due), e.g. a
+    /// seeded random policy.
+    #[cfg(test)]
+    test_ckpt_due: Option<Arc<dyn Fn(u64) -> bool + Send + Sync>>,
     /// Test-only stand-in for the process-global `TORUS_BOOK_ROWS` +
     /// `TORUS_RESIDENT_BOOKS=1` (`OnceLock`s in production): `Some(mode)` builds
     /// every native context in `mode` with the resident holder attached.
@@ -2680,7 +2728,7 @@ impl Drop for ExecutionContext {
         if self.checkpoint.is_some()
             && self.flush_worker.is_some()
             && !self.exec_failed.load(Ordering::SeqCst)
-            && !self.pipeline_barrier()
+            && !self.pipeline_barrier_with(CloseKind::Shutdown)
         {
             tracing::error!("item 6 Phase 3: final checkpoint at shutdown failed (restart replays from the durable marker)");
         }
@@ -2852,6 +2900,12 @@ impl ExecutionContext {
             }
             None => crate::exec_pipeline::FlushWorker::spawn(env, applied),
         });
+        // 8k L3.1: a window's book debt dies with its window only through a
+        // close; dropping it here would lose the bytes (code bug).
+        if !self.ckpt.lock().unwrap().unsaved.is_empty() {
+            tracing::error!("FATAL: L3.1 unsaved books at a flush worker attach — fail-stop");
+            self.exec_failed.store(true, Ordering::SeqCst);
+        }
         *self.ckpt.lock().unwrap() = CkptState {
             base: applied,
             dropper: self
@@ -2879,6 +2933,12 @@ impl ExecutionContext {
     /// non-durable rows, replay) first waits for W to drain. Returns `false`
     /// (after latching the fail-stop) if W failed.
     fn pipeline_barrier(&self) -> bool {
+        self.pipeline_barrier_with(CloseKind::Barrier)
+    }
+
+    /// [`Self::pipeline_barrier`]; `kind` names its drain (8k L3.1: a
+    /// barrier, or the final one at shutdown).
+    fn pipeline_barrier_with(&self, kind: CloseKind) -> bool {
         let Some(worker) = &self.flush_worker else {
             return true;
         };
@@ -2892,7 +2952,7 @@ impl ExecutionContext {
         // Item 6 Phase 3: a barrier first closes the window (L + the last
         // digested block) into a checkpoint, so after it everything handed
         // to W is durable and the serial path runs on the DB as today.
-        if self.checkpoint.is_some() && !self.checkpoint_drain() {
+        if self.checkpoint.is_some() && !self.checkpoint_drain(kind) {
             self.exec_failed.store(true, Ordering::SeqCst);
             return false;
         }
@@ -3150,14 +3210,34 @@ impl ExecutionContext {
         // consensus refuses `height + L` and execution idles, for good.
         // Checkpoint the boundary at its own height (for L % 100 == 0 the
         // attest term already does).
-        let due = height.is_multiple_of(torus_state::running_hash::STATE_HASH_CHECKPOINT_INTERVAL)
-            || (self.epoch_fast_path && EpochManager::is_epoch_boundary(height, self.epoch_length))
-            || policy
-                .every_blocks
-                .is_some_and(|n| height.saturating_sub(st.base) >= n)
-            || policy.interval.is_some_and(|iv| since.elapsed() >= iv)
-            || policy.max_bytes.is_some_and(|cap| bytes() >= cap);
-        if due {
+        // 8k L3.1: the first term that fires names the close (`CloseKind`).
+        let due = if height
+            .is_multiple_of(torus_state::running_hash::STATE_HASH_CHECKPOINT_INTERVAL)
+        {
+            Some(CloseKind::Attest)
+        } else if self.epoch_fast_path && EpochManager::is_epoch_boundary(height, self.epoch_length)
+        {
+            Some(CloseKind::Epoch)
+        } else if policy
+            .every_blocks
+            .is_some_and(|n| height.saturating_sub(st.base) >= n)
+        {
+            Some(CloseKind::Every)
+        } else if policy.interval.is_some_and(|iv| since.elapsed() >= iv) {
+            Some(CloseKind::Interval)
+        } else if policy.max_bytes.is_some_and(|cap| bytes() >= cap) {
+            Some(CloseKind::Bytes)
+        } else {
+            None
+        };
+        #[cfg(test)]
+        let due = due.or_else(|| {
+            self.test_ckpt_due
+                .as_ref()
+                .is_some_and(|f| f(height))
+                .then_some(CloseKind::TestDue)
+        });
+        if let Some(kind) = due {
             let mut layer = st.take_layer();
             if let Some(p) = &fold {
                 layer.merge(p);
@@ -3172,7 +3252,7 @@ impl ExecutionContext {
             if let Some(f) = &self.test_before_wait {
                 f(Some(height));
             }
-            if !self.checkpoint_submit(&mut st, height, layer) {
+            if !self.checkpoint_submit(&mut st, height, layer, kind) {
                 return false;
             }
             // C (in flight) now holds every block up to `height`. Step 1:
@@ -3245,8 +3325,9 @@ impl ExecutionContext {
 
     /// Item 6 Phase 3: close the open window at a barrier / shutdown: L +
     /// the last digested block (`last_job`, if above S) into a checkpoint.
-    /// Nothing open: nothing to do. `false`: fail-stop.
-    fn checkpoint_drain(&self) -> bool {
+    /// Nothing open: nothing to do. `false`: fail-stop. `kind`: a barrier's
+    /// or the shutdown's drain.
+    fn checkpoint_drain(&self, kind: CloseKind) -> bool {
         let top = self.last_job.lock().unwrap().clone();
         let mut st = self.ckpt.lock().unwrap();
         #[cfg(test)]
@@ -3267,6 +3348,15 @@ impl ExecutionContext {
                         .is_none_or(|l| l.is_empty()),
                 "L open without a digested top"
             );
+            // 8k L3.1: books are owed only by blocks above S, so an open
+            // debt here is a code bug; closing nothing would lose it.
+            if !st.unsaved.is_empty() {
+                tracing::error!(
+                    unsaved = st.unsaved.len(),
+                    "FATAL: L3.1 unsaved books with no open window — fail-stop"
+                );
+                return false;
+            }
             return true;
         };
         let mut layer = st.take_layer();
@@ -3276,20 +3366,27 @@ impl ExecutionContext {
             self.test_path("checkpoint.drain");
             self.test_drain.store(true, Ordering::SeqCst);
         }
-        self.checkpoint_submit(&mut st, top.height(), layer)
+        self.checkpoint_submit(&mut st, top.height(), layer, kind)
     }
 
     /// Hand checkpoint `height` to W (waits while the previous one is in
-    /// flight) and make it C. `false`: W failed (fail-stop latched).
+    /// flight) and make it C. `false`: W failed (fail-stop latched). 8k
+    /// L3.1: first the window's unsaved books go into `layer`
+    /// ([`Self::coalesce_unsaved_books`]); every close passes here, so none
+    /// can skip that encode.
     fn checkpoint_submit(
         &self,
         st: &mut CkptState,
         height: u64,
-        layer: torus_state::CheckpointLayer,
+        mut layer: torus_state::CheckpointLayer,
+        kind: CloseKind,
     ) -> bool {
         let Some(worker) = &self.flush_worker else {
             return false;
         };
+        if !self.coalesce_unsaved_books(st, &mut layer, height, kind) {
+            return false;
+        }
         #[cfg(test)]
         {
             self.test_path("checkpoint.submit");
@@ -3325,6 +3422,121 @@ impl ExecutionContext {
         st.base = height;
         st.since = Some(std::time::Instant::now());
         true
+    }
+
+    /// 8k L3.1 (`TORUS_BOOK_COALESCE`): the window close's half of the
+    /// coalesced Classic save. Encodes every book the window owes
+    /// (`st.unsaved`) from the resident holder, with the per-block save's
+    /// encoder, and puts the blobs into the closing `layer` on top of
+    /// everything merged, then clears the debt. The layer then holds what
+    /// the per-block path's layer would: the last blob of every book dirtied
+    /// in the window. Nothing owed: nothing to do (the holder is not
+    /// touched, so modes 2/3 and the flag off never lock it here). `false`
+    /// (fail-stop latched): the holder is gone or busy, so the owed bytes
+    /// exist nowhere (restart replays from S).
+    fn coalesce_unsaved_books(
+        &self,
+        st: &mut CkptState,
+        layer: &mut torus_state::CheckpointLayer,
+        height: u64,
+        kind: CloseKind,
+    ) -> bool {
+        if st.unsaved.is_empty() {
+            return true;
+        }
+        #[cfg(test)]
+        if self.test_coalesce_skip == Some(kind) {
+            return true;
+        }
+        let timer = std::time::Instant::now();
+        // E is the holder's only user and never holds it across a close (a
+        // close with books owed runs at the end of a block or at a barrier
+        // before the next block takes the holder), so a busy lock is a code
+        // bug: fail-stop, never wait on ourselves.
+        let blobs = match self.resident_books.try_lock() {
+            Ok(holder) => holder.encode_classic_books(&st.unsaved),
+            Err(e) => Err(format!("resident holder not available: {e}")),
+        };
+        let blobs = match blobs {
+            Ok(b) => b,
+            Err(reason) => {
+                tracing::error!(
+                    height,
+                    ?kind,
+                    unsaved = st.unsaved.len(),
+                    %reason,
+                    "FATAL: L3.1 window close cannot encode the unsaved books — fail-stop (restart replays from the durable marker)"
+                );
+                self.exec_failed.store(true, Ordering::SeqCst);
+                return false;
+            }
+        };
+        let books = st.unsaved.len();
+        for (market, blob) in blobs {
+            if let Err(e) = layer.put_raw(
+                torus_state::cf::CF_NATIVE_ORDER_BOOKS,
+                market.to_be_bytes().to_vec(),
+                blob,
+            ) {
+                tracing::error!(height, %e, "FATAL: L3.1 coalesced book put — fail-stop");
+                self.exec_failed.store(true, Ordering::SeqCst);
+                return false;
+            }
+        }
+        st.unsaved.clear();
+        let secs = timer.elapsed().as_secs_f64();
+        if let Some(m) = &self.metrics {
+            m.exec_book_coalesce_close_seconds.observe(secs);
+            m.exec_book_coalesce_close_books.observe(books as f64);
+        }
+        tracing::debug!(
+            height,
+            ?kind,
+            books,
+            ms = secs * 1e3,
+            "L3.1 coalesced book encode at window close"
+        );
+        true
+    }
+
+    /// 8k L3.1: turn `TORUS_BOOK_COALESCE` (`requested`) on iff it can run:
+    /// a checkpoint interval (`self.checkpoint`, set before this) without a
+    /// byte cap (`TORUS_CHECKPOINT_MAX_BYTES`: the cap's estimate never sees
+    /// the coalesced blobs; owner option C, as b1), the running state hash
+    /// not configured (`hash_activation`: the genesis
+    /// `consensus.state_hash_activation_height`; with the hash on, h_n needs
+    /// every block's book bytes, so this needs L6.1 first) and the process's
+    /// book settings ([`torus_bridge::native_executor::book_coalesce_blocker`]).
+    /// Otherwise warns once with the reason and stays off.
+    fn configure_book_coalesce(&mut self, requested: bool, hash_activation: Option<u64>) {
+        self.book_coalesce = false;
+        if !requested {
+            return;
+        }
+        let blocker = if self.checkpoint.is_none() {
+            Some("no checkpoint interval (TORUS_CHECKPOINT_INTERVAL_MS 0 or the exec pipeline off)")
+        } else if self.checkpoint.is_some_and(|p| p.max_bytes.is_some()) {
+            // Owner decision (design open question 7, option C, as b1): the
+            // byte cap sums L + the folded blocks, which never hold the
+            // coalesced blobs (added only at the close; ~155 MB at P1M), so
+            // the cap would be silently blind to them.
+            Some("a checkpoint byte cap is set (TORUS_CHECKPOINT_MAX_BYTES): it cannot count the coalesced book blobs")
+        } else if hash_activation.is_some() {
+            Some("the running state hash is configured (genesis state_hash_activation_height)")
+        } else {
+            torus_bridge::native_executor::book_coalesce_blocker()
+        };
+        match blocker {
+            Some(reason) => tracing::warn!(
+                reason,
+                ?hash_activation,
+                "TORUS_BOOK_COALESCE=1 ignored: L3.1 coalesced Classic book save stays OFF"
+            ),
+            None => {
+                tracing::info!("TORUS_BOOK_COALESCE: L3.1 coalesced Classic book save ON (one encode per dirty book per checkpoint window)");
+                self.book_coalesce = true;
+            }
+        }
     }
 
     /// Running state hash: block's consensus writes NOT in its overlay (Task 0),
@@ -4592,6 +4804,22 @@ impl ExecutionContext {
                     m.exec_resident_rebuilds.inc();
                 }
             }
+            // 8k L3.1: books rebuilt while the open window owes blobs: the
+            // load read them through L / C / the DB, which hold OLDER blobs
+            // of those books (their per-block encode was skipped) next to
+            // newer rows of every other CF. The holder was the only copy:
+            // fail-stop, the restart replays from S with a fresh window.
+            if ctx.resident_rebuilt() && !self.ckpt.lock().unwrap().unsaved.is_empty() {
+                tracing::error!(
+                    height,
+                    "FATAL: L3.1 resident books rebuilt from state while the checkpoint window owes unsaved books — fail-stop (restart replays from the durable marker)"
+                );
+                self.exec_failed.store(true, Ordering::SeqCst);
+                if fold_header {
+                    persist_block_header(&self.state_db, torus_block);
+                }
+                return;
+            }
             ctx.metrics = self.metrics.clone();
             ctx.evm_fee_window = fee_window;
             ctx.evm_gas = evm_gas;
@@ -4884,9 +5112,18 @@ impl ExecutionContext {
             } else {
                 None
             };
+            // 8k L3.1 (`TORUS_BOOK_COALESCE`): a pipelined block with resident
+            // Classic books skips the whole-book encodes; the books join the
+            // window's debt below and are encoded at its close. Serial blocks
+            // (after a barrier: the window is closed) encode per block.
+            ctx.coalesce_books = self.book_coalesce
+                && pipelined
+                && ctx.resident_mode()
+                && ctx.book_mode() == torus_bridge::native_executor::BookMode::Classic;
             if deferred_books.is_none() {
                 ctx.save_order_books();
             }
+            let coalesced = ctx.take_coalesced_books();
             #[cfg(test)]
             if self.test_replay_fault == Some(ReplayFault::BookSave) {
                 ctx.fatal_error
@@ -4910,6 +5147,7 @@ impl ExecutionContext {
             if let Some(ref m) = self.metrics {
                 m.exec_save_books_seconds
                     .observe(save_books_timer.elapsed().as_secs_f64());
+                m.exec_book_coalesce_skipped.inc_by(coalesced.len() as u64);
                 // bl1 exec-chain ruler: split save_books into pass 1 (journal
                 // DRAIN — reads the LIVE book levels the next block's engine
                 // mutates, so it can never leave this thread) and pass 2
@@ -5083,11 +5321,17 @@ impl ExecutionContext {
                 }) {
                     return;
                 }
+                // 8k L3.1: this block's skipped books join the window's debt
+                // before the upkeep, which may close the window right here.
+                if !coalesced.is_empty() {
+                    self.ckpt.lock().unwrap().unsaved.extend(coalesced);
+                }
                 if !self.checkpoint_upkeep(&mut overlay, height) {
                     return;
                 }
                 resident_ok = true;
             } else {
+            debug_assert!(coalesced.is_empty(), "L3.1: a serial block encodes its books");
             if let Some(status) = &action_status {
                 let bytes =
                     crate::action_results::encode_status(status, self.metrics.as_deref());
@@ -6669,6 +6913,11 @@ impl TorusApp {
             last_job_books_deferred: AtomicBool::new(false),
             checkpoint: None,
             ckpt: Default::default(),
+            book_coalesce: false,
+            #[cfg(test)]
+            test_coalesce_skip: None,
+            #[cfg(test)]
+            test_ckpt_due: None,
             #[cfg(test)]
             test_book_mode: None,
             #[cfg(test)]
@@ -6806,6 +7055,11 @@ impl TorusApp {
                  the flush worker; every block is written as today"
             );
         }
+        // 8k L3.1: after `checkpoint` (it needs one), before any block runs.
+        exec_ctx.configure_book_coalesce(
+            crate::exec_pipeline::book_coalesce_requested(),
+            config.state_hash_activation_height,
+        );
         // s124: the epoch fast path only changes which blocks take the
         // pipelined path, so it needs W.
         if exec_ctx.epoch_fast_path {
@@ -15322,6 +15576,11 @@ mod crash_recovery_tests {
             last_job_books_deferred: AtomicBool::new(false),
             checkpoint: None,
             ckpt: Default::default(),
+            book_coalesce: false,
+            #[cfg(test)]
+            test_coalesce_skip: None,
+            #[cfg(test)]
+            test_ckpt_due: None,
             #[cfg(test)]
             test_book_mode: None,
             #[cfg(test)]
@@ -36861,6 +37120,31 @@ mod crash_recovery_tests {
     /// placed again. The extra draws happen only with `cloid`. Returns the
     /// single places with a cloid.
     fn p2_blocks_with(ro: bool, cloid: bool) -> (Vec<TorusBlock>, P2Fed, Vec<P2CloidPlace>) {
+        p2_blocks_full(ro, cloid, false)
+    }
+
+    /// [`p2_blocks_with`], and with `deep` (b0): the deep-level traffic of
+    /// [`p2_deep_actions`] in front of each block's other actions (no extra
+    /// draws: the rest of the sequence is the original one). Needs
+    /// [`p2_deep_seed`] on the fixture.
+    fn p2_blocks_full(
+        ro: bool,
+        cloid: bool,
+        deep: bool,
+    ) -> (Vec<TorusBlock>, P2Fed, Vec<P2CloidPlace>) {
+        p2_blocks_len(P2_BLOCKS, ro, cloid, deep)
+    }
+
+    /// 8k L3.1: [`p2_blocks_full`] over heights `1..=len`: the first
+    /// `P2_BLOCKS` are that sequence; past them the same generator runs on
+    /// (mark walk, maker requotes, trader actions; no more shocks or V4) and
+    /// the deep traffic repeats with period `P2_BLOCKS`.
+    fn p2_blocks_len(
+        len: u64,
+        ro: bool,
+        cloid: bool,
+        deep: bool,
+    ) -> (Vec<TorusBlock>, P2Fed, Vec<P2CloidPlace>) {
         let mut rng = C5Rng(0x9e21_0008);
         let mut fed = P2Fed::default();
         let mut cloid_places: Vec<P2CloidPlace> = Vec::new();
@@ -36890,9 +37174,14 @@ mod crash_recovery_tests {
             order(m, is_buy, price, qty, torus_types::OrderType::Limit)
         };
         let mut blocks = Vec::new();
-        for h in 1..=P2_BLOCKS {
+        for h in 1..=len {
             cur_h.set(h);
             let mut actions = Vec::new();
+            if deep {
+                for (seed, action) in p2_deep_actions((h - 1) % P2_BLOCKS + 1) {
+                    actions.push(sign(seed, action));
+                }
+            }
             let shock = h == 60 || h == 120;
             let mark_round = h == 1 || h % 5 == 1 || shock || rng.below(4) == 0;
             if mark_round {
@@ -37173,6 +37462,21 @@ mod crash_recovery_tests {
         /// (the DB at the block) and the holder's R (positions and balances
         /// read through `Users`) was checked equal to the DB scan of its CFs.
         r_db_checked: u64,
+        /// b0: `(S, full CF dump)` each time the durable marker moved (as
+        /// `roots`), recorded only while [`P2_DUMP_DURABLE`] is set.
+        dumps: Vec<(u64, Vec<CfDump>)>,
+    }
+
+    thread_local! {
+        /// b0: record a full CF dump in `P2Run::dumps` at every durable height.
+        static P2_DUMP_DURABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// 8k L3.1: every `p2_run_full` context requests `TORUS_BOOK_COALESCE`
+        /// (through `configure_book_coalesce`, with the DB's configured hash
+        /// activation), skips the coalesced encode at closes of this kind
+        /// (mutation seam), and adds a seeded random checkpoint trigger.
+        static P2_BOOK_COALESCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static P2_COALESCE_SKIP: std::cell::Cell<Option<CloseKind>> = const { std::cell::Cell::new(None) };
+        static P2_CKPT_RANDOM: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     }
 
     /// P2-1 review (GPT-6.1-sol, gap 1): what `p2_run` does to the node
@@ -37421,6 +37725,16 @@ mod crash_recovery_tests {
             if let Some(fast) = fast {
                 ctx.epoch_fast_path = fast;
             }
+            ctx.configure_book_coalesce(
+                P2_BOOK_COALESCE.get(),
+                torus_state::running_hash::read_configured_activation(&db),
+            );
+            ctx.test_coalesce_skip = P2_COALESCE_SKIP.get();
+            if let Some(seed) = P2_CKPT_RANDOM.get() {
+                ctx.test_ckpt_due = Some(Arc::new(move |h| {
+                    C5Rng(seed ^ h.wrapping_mul(0x9e37_79b9_7f4a_7c15)).below(4) == 0
+                }));
+            }
             if pipelined && attach {
                 ctx.attach_flush_worker(Some(gate.clone()));
                 if let P2Fault::DeferredGate(g) = fault {
@@ -37434,6 +37748,7 @@ mod crash_recovery_tests {
         let mut crash_windows: Vec<(u64, u64)> = Vec::new();
         let mut cloid_checked = 0;
         let mut r_db_checked = 0;
+        let mut dumps: Vec<(u64, Vec<CfDump>)> = Vec::new();
         let mut ctx = new_ctx(true);
         let (mut v4_max, mut v4_last, mut index_checked, mut restarts, mut faults) =
             (0, 0, 0, 0, 0);
@@ -37607,6 +37922,12 @@ mod crash_recovery_tests {
                         durable,
                         torus_state::native_trie::persisted_native_root(&db).unwrap(),
                     ));
+                    // 8k L3.1: only a height made durable by its own block
+                    // (after a crash replay the marker first moves at a later
+                    // block, whose dispatched header is in the DB too).
+                    if P2_DUMP_DURABLE.get() && durable == h {
+                        dumps.push((durable, dump_all_cfs(&db)));
+                    }
                 }
             }
             let h = h.max(skip_to);
@@ -37680,6 +38001,7 @@ mod crash_recovery_tests {
             crash_windows,
             cloid_checked,
             r_db_checked,
+            dumps,
         }
     }
 
@@ -37874,6 +38196,545 @@ mod crash_recovery_tests {
                 all,
                 "{name}: every height hashed once"
             );
+        }
+    }
+
+    // ---- 8k L3.1 (`TORUS_BOOK_COALESCE`): checkpoint-coalesced Classic book
+    // save (docs/plans/deep-book-save-options.md section 3). The deep-level
+    // traffic below is b0's (perf/mode3-checkpoints-b0), unchanged. ----
+
+    /// b0 deep-level traffic: a maker resting many orders on single price
+    /// levels (150 bids at 80 per market: 3 chunks of `LEVEL_CHUNK_SEQS` =
+    /// 64; asks at 125, more bids at 79), a stop far from the mark, takers
+    /// sweeping across chunk boundaries, and cancel-alls deleting whole deep
+    /// levels (market 2 at 96, re-placed after) and a stop (market 3 at 104).
+    const P2_DEEP_MAKER: u8 = 96;
+    const P2_DEEP_TAKER: u8 = 97;
+
+    fn p2_deep_seed(db: &StateDb) {
+        use torus_core::position::{NativeBalance, PositionManager};
+        let pm = PositionManager::new(db.clone());
+        for seed in [P2_DEEP_MAKER, P2_DEEP_TAKER] {
+            pm.put_native_balance(
+                &oracle_addr(seed),
+                &NativeBalance {
+                    available: px(10_000_000),
+                    order_margin: FixedPoint::ZERO,
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    /// The deep actions of height `h` (`(signer seed, action)`), a pure
+    /// function of `h`.
+    fn p2_deep_actions(h: u64) -> Vec<(u8, NativeAction)> {
+        let limit = |m: u64, is_buy: bool, price: i64, qty: i64| torus_types::PlaceOrderParams {
+            market_id: m,
+            is_buy,
+            price: px(price),
+            quantity: px(qty),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let m = C5_MARKETS[(h % 3) as usize];
+        let mut out = Vec::new();
+        let mut maker = Vec::new();
+        if (2..=19).contains(&h) {
+            maker.extend((0..25).map(|_| limit(m, true, 80, 1)));
+            maker.extend((0..10).map(|_| limit(m, false, 125, 1)));
+            if h % 5 == 4 {
+                maker.extend((0..20).map(|_| limit(m, true, 79, 1)));
+            }
+        }
+        if h == 99 || h == 101 {
+            maker.extend((0..25).map(|_| limit(2, true, 80, 1)));
+        }
+        if !maker.is_empty() {
+            out.push((P2_DEEP_MAKER, NativeAction::PlaceOrderBatch(maker)));
+        }
+        match h {
+            20 => out.push((
+                P2_DEEP_MAKER,
+                NativeAction::PlaceOrder(torus_types::PlaceOrderParams {
+                    order_type: torus_types::OrderType::StopMarket { trigger: px(30) },
+                    ..limit(3, false, 20, 1)
+                }),
+            )),
+            60 => out.push((
+                P2_DEEP_MAKER,
+                NativeAction::PlaceOrder(torus_types::PlaceOrderParams {
+                    order_type: torus_types::OrderType::StopLimit {
+                        trigger: px(300),
+                        limit: px(301),
+                    },
+                    ..limit(1, true, 301, 1)
+                }),
+            )),
+            96 => out.push((
+                P2_DEEP_MAKER,
+                NativeAction::CancelAllOrders { market_id: Some(2) },
+            )),
+            104 => out.push((
+                P2_DEEP_MAKER,
+                NativeAction::CancelAllOrders { market_id: Some(3) },
+            )),
+            25 | 41 | 66 | 88 | 111 => out.push((
+                P2_DEEP_TAKER,
+                NativeAction::PlaceOrder(limit(m, false, 79, 70)),
+            )),
+            33 | 77 => out.push((
+                P2_DEEP_TAKER,
+                NativeAction::PlaceOrder(limit(m, true, 125, 15)),
+            )),
+            _ => {}
+        }
+        out
+    }
+
+    /// 8k L3.1 stream length: multi-hundred blocks, the last neither an
+    /// attest height nor an epoch boundary (`C5_EPOCH` 50), so a window
+    /// never closed by time is still open at shutdown.
+    const L31_BLOCKS: u64 = 260;
+
+    /// The deep P2 stream (reduce-only places on) over `L31_BLOCKS` heights.
+    fn l31_blocks() -> Vec<TorusBlock> {
+        p2_blocks_len(L31_BLOCKS, true, false, true).0
+    }
+
+    /// The deep traders, and the running state hash NOT configured (L3.1
+    /// runs only with the hash off).
+    fn l31_seed(db: &StateDb) {
+        p2_deep_seed(db);
+        torus_state::running_hash::configure_activation(db, None).unwrap();
+    }
+
+    /// One pipelined Classic resident run of `blocks` on the L3.1 seed, with
+    /// a full CF dump at every durable height. `ckpt`: the checkpoint policy
+    /// (`None`: the per-block flush, the golden); `coalesce`:
+    /// `TORUS_BOOK_COALESCE` requested; `fast`: the epoch fast path (`None`:
+    /// off, epoch boundaries are barriers); `random`: a seeded extra
+    /// trigger; `skip`: the mutation seam.
+    fn l31_run(
+        blocks: &[TorusBlock],
+        ckpt: Option<crate::exec_pipeline::CheckpointPolicy>,
+        coalesce: bool,
+        fast: Option<bool>,
+        fault: &P2Fault,
+        random: Option<u64>,
+        skip: Option<CloseKind>,
+    ) -> P2Run {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                P2_DUMP_DURABLE.set(false);
+                P2_BOOK_COALESCE.set(false);
+                P2_COALESCE_SKIP.set(None);
+                P2_CKPT_RANDOM.set(None);
+            }
+        }
+        let _reset = Reset;
+        P2_DUMP_DURABLE.set(true);
+        P2_BOOK_COALESCE.set(coalesce);
+        P2_COALESCE_SKIP.set(skip);
+        P2_CKPT_RANDOM.set(random);
+        p2_run_full(
+            blocks,
+            true,
+            Some(torus_bridge::native_executor::BookMode::Classic),
+            false,
+            fault,
+            ckpt,
+            &l31_seed,
+            false,
+            None,
+            fast,
+        )
+    }
+
+    /// The first place `run` differs from the per-block `golden`: the full CF
+    /// dump and the persisted native root at each height `run` made durable
+    /// (the golden has both at every height), then the final dump.
+    fn l31_divergence(golden: &P2Run, run: &P2Run) -> Option<String> {
+        let differ = |a: &[CfDump], b: &[CfDump]| {
+            a.iter()
+                .zip(b)
+                .find(|((_, x), (_, y))| x != y)
+                .map(|((cf, _), _)| *cf)
+        };
+        for (s, dump) in &run.dumps {
+            let Some((_, want)) = golden.dumps.iter().find(|(h, _)| h == s) else {
+                return Some(format!("no golden dump at {s}"));
+            };
+            if let Some(cf) = differ(want, dump) {
+                return Some(format!("CF {cf} at checkpoint {s}"));
+            }
+        }
+        for (s, root) in &run.roots {
+            let want = golden.roots.iter().find(|(h, _)| h == s).map(|(_, r)| *r);
+            if want != Some(*root) {
+                return Some(format!("native root at checkpoint {s}"));
+            }
+        }
+        differ(&golden.dump, &run.dump).map(|cf| format!("CF {cf} in the final dump"))
+    }
+
+    /// `(closes with owed books, books they encoded)` from a run's metrics.
+    fn l31_closes(run: &P2Run) -> (u64, u64) {
+        let text = run.metrics.encode();
+        (
+            metric_value(&text, "torus_exec_book_coalesce_close_books_count") as u64,
+            metric_value(&text, "torus_exec_book_coalesce_close_books_sum") as u64,
+        )
+    }
+
+    /// 8k L3.1 golden (a): the deep stream with `TORUS_BOOK_COALESCE` on (no
+    /// per-block whole-book encode; each window close encodes the window's
+    /// dirty books once) under every close kind: a block count (every 1 / 5
+    /// / 7), never by time (attest heights 100 / 200, the epoch boundaries
+    /// 50 / 100 / ... as barriers, the shutdown drain), the same with the
+    /// epoch fast path (epoch closes instead of barriers), a 1 ms interval
+    /// and a seeded random trigger (a byte cap keeps L3.1 off, see (d)). At every height a run made
+    /// durable, its full CF dump (every book blob included) and native root
+    /// equal the per-block Classic run's at that height, and so do the final
+    /// dumps. Non-vacuous: the runs skipped per-block encodes, closes encoded
+    /// the owed books (every 1: exactly the skipped ones), windows spanned
+    /// blocks.
+    #[test]
+    fn l31_coalesced_book_save_matches_per_block_at_every_checkpoint() {
+        let blocks = l31_blocks();
+        let golden = l31_run(&blocks, None, false, None, &P2Fault::None, None, None);
+        assert_eq!(golden.max_lag, 0, "golden: per-block flush");
+        assert_eq!(
+            golden.dumps.len() as u64,
+            L31_BLOCKS,
+            "golden: a dump per height"
+        );
+        assert_eq!(
+            golden.metrics.exec_book_coalesce_skipped.get(),
+            0,
+            "golden: L3.1 off"
+        );
+        let fills = golden.metrics.orders_matched.get();
+        let resting: usize = golden
+            .dumps
+            .iter()
+            .map(|(_, d)| {
+                d.iter()
+                    .find(|(cf, _)| *cf == torus_state::cf::CF_NATIVE_ORDER_BOOKS)
+                    .map_or(0, |(_, rows)| rows.iter().map(|(_, v)| v.len()).sum())
+            })
+            .max()
+            .unwrap_or(0);
+        println!(
+            "L3.1 golden: {L31_BLOCKS} blocks, fills {fills}, liquidations {}, largest book CF {resting} bytes",
+            golden.metrics.liquidations_triggered.get()
+        );
+        assert!(fills >= 300, "fills {fills}");
+        assert!(resting >= 50_000, "deep books: {resting} bytes");
+        let interval = crate::exec_pipeline::CheckpointPolicy {
+            interval: Some(std::time::Duration::from_millis(1)),
+            ..Default::default()
+        };
+        for (name, policy, fast, random, min_lag) in [
+            ("every 1", ckpt_every(1), None, None, 0),
+            ("every 5", ckpt_every(5), None, None, 4),
+            ("every 7", ckpt_every(7), None, None, 6),
+            ("never, barriers", ckpt_never(), None, None, 40),
+            ("never, epoch fast path", ckpt_never(), Some(true), None, 40),
+            ("interval 1 ms", interval, None, None, 0),
+            ("random", ckpt_never(), Some(true), Some(0x1a31), 2),
+        ] {
+            let what = format!("L3.1 {name}");
+            let run = l31_run(
+                &blocks,
+                Some(policy),
+                true,
+                fast,
+                &P2Fault::None,
+                random,
+                None,
+            );
+            assert_eq!(l31_divergence(&golden, &run), None, "{what}");
+            let skipped = run.metrics.exec_book_coalesce_skipped.get();
+            let (closes, encoded) = l31_closes(&run);
+            println!(
+                "{what}: max lag {}, checkpoints {}, skipped {skipped}, closes {closes} encoding {encoded}",
+                run.max_lag,
+                run.metrics.exec_checkpoints.get()
+            );
+            assert!(
+                run.max_lag >= min_lag,
+                "{what}: max lag {} < {min_lag}",
+                run.max_lag
+            );
+            assert!(skipped >= 300, "{what}: skipped {skipped}");
+            assert!(closes >= 3 && encoded > 0 && encoded <= skipped, "{what}");
+            if name == "every 1" {
+                assert_eq!(encoded, skipped, "{what}: each block's own books");
+            } else {
+                assert!(encoded < skipped, "{what}: windows coalesced");
+            }
+        }
+    }
+
+    /// 8k L3.1 (b): crash mid-window. A checkpoint every 5 blocks, L3.1 on,
+    /// six crashes at non-checkpoint heights: three lose the open window
+    /// before its close encoded anything (W fails its next job), three after
+    /// the close encoded and handed off (W fails the checkpoint in flight).
+    /// Each restart replays (S, last] from the DB with a fresh window: the
+    /// holder carried over is ahead of the DB, the guard rebuilds the books,
+    /// and nothing is owed, so no fail-stop. The run equals the uncrashed
+    /// per-block golden at every checkpoint and at the end.
+    #[test]
+    fn l31_crash_mid_window_replays_from_s_to_the_golden() {
+        let blocks = l31_blocks();
+        let golden = l31_run(&blocks, None, false, None, &P2Fault::None, None, None);
+        let crashes = [
+            (12, false),
+            (23, true),
+            (58, false),
+            (91, true),
+            (144, false),
+            (203, true),
+        ];
+        let fault = P2Fault::CkptCrash(crashes.to_vec());
+        let run = l31_run(&blocks, Some(ckpt_every(5)), true, None, &fault, None, None);
+        assert_eq!(run.faults, crashes.len() as u64);
+        for (durable, last) in &run.crash_windows {
+            assert!(durable < last, "crash window ({durable}, {last}]");
+        }
+        assert_eq!(l31_divergence(&golden, &run), None, "L3.1 crashes");
+        assert!(run.metrics.exec_book_coalesce_skipped.get() >= 300);
+        assert_eq!(
+            run.metrics.exec_resident_rebuilds.get(),
+            1 + crashes.len() as u64,
+            "one guard rebuild per crash"
+        );
+    }
+
+    /// 8k L3.1 (c): a resident-book rebuild while the window owes books
+    /// fail-stops. Checkpoints never by time, L3.1 on: the holder drops its
+    /// books mid-window (as a stale guard trip does); the next native block
+    /// would rebuild them through L / C / the DB, which hold older blobs, so
+    /// it fail-stops and nothing lands past S; a restart replays from S and
+    /// reaches the per-block golden. Right after a close the window owes
+    /// nothing: the same drop is a plain rebuild (C / DB hold every blob)
+    /// and the run equals the golden.
+    #[test]
+    fn l31_stale_holder_rebuild_with_unsaved_books_fail_stops() {
+        let blocks = l31_blocks();
+        let n = 40usize;
+        let golden = l31_run(&blocks[..n], None, false, None, &P2Fault::None, None, None);
+        let ctx_for = |config: &ChainConfig, db: &StateDb, policy| {
+            let mut ctx = make_exec_ctx(config, db);
+            ctx.test_book_mode = Some(torus_bridge::native_executor::BookMode::Classic);
+            ctx.checkpoint = Some(policy);
+            ctx.configure_book_coalesce(
+                true,
+                torus_state::running_hash::read_configured_activation(db),
+            );
+            assert!(ctx.book_coalesce, "L3.1 on");
+            ctx
+        };
+        let run = |ctx: &ExecutionContext, db: &StateDb, range: std::ops::Range<usize>| {
+            for b in &blocks[range] {
+                dispatch_and_execute(ctx, db, b);
+                assert!(
+                    !ctx.exec_failed.load(Ordering::SeqCst),
+                    "fail-stop at {}",
+                    b.header.height
+                );
+            }
+        };
+
+        // Mid-window: the rebuild fail-stops.
+        let (config, db) = p2_fixture();
+        l31_seed(&db);
+        let mut ctx = ctx_for(&config, &db, ckpt_never());
+        ctx.attach_flush_worker(None);
+        let k = 30usize;
+        run(&ctx, &db, 0..k);
+        assert!(
+            !ctx.ckpt.lock().unwrap().unsaved.is_empty(),
+            "the window owes books"
+        );
+        assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+        let durable = read_native_applied_height(&db);
+        assert!(durable.unwrap_or(0) < k as u64, "window open: {durable:?}");
+        ctx.resident_books.lock().unwrap().invalidate();
+        dispatch_and_execute(&ctx, &db, &blocks[k]);
+        assert!(
+            ctx.exec_failed.load(Ordering::SeqCst),
+            "a rebuild with unsaved books must fail-stop"
+        );
+        drop(ctx);
+        assert_eq!(
+            read_native_applied_height(&db),
+            durable,
+            "nothing past S landed"
+        );
+        let replay = ctx_for(&config, &db, ckpt_never());
+        let (_last, parked) = TorusApp::replay_committed(&db, &replay);
+        assert_eq!(parked, None);
+        assert!(!replay.exec_failed.load(Ordering::SeqCst), "replay");
+        assert_eq!(
+            read_native_applied_height(&db),
+            Some(k as u64 + 1),
+            "replayed to k + 1"
+        );
+        run(&replay, &db, k + 1..n);
+        drop(replay);
+        assert_dumps_equal(
+            &golden.dump,
+            &dump_all_cfs(&db),
+            "restart after the fail-stop",
+        );
+
+        // Right after a close: nothing owed, a plain rebuild.
+        let (config, db) = p2_fixture();
+        l31_seed(&db);
+        let mut ctx = ctx_for(&config, &db, ckpt_every(5));
+        ctx.attach_flush_worker(None);
+        run(&ctx, &db, 0..10);
+        {
+            let st = ctx.ckpt.lock().unwrap();
+            assert_eq!(st.base, 10, "closed at 10");
+            assert!(st.unsaved.is_empty(), "nothing owed after a close");
+        }
+        ctx.resident_books.lock().unwrap().invalidate();
+        run(&ctx, &db, 10..n);
+        drop(ctx);
+        assert_dumps_equal(
+            &golden.dump,
+            &dump_all_cfs(&db),
+            "rebuild right after a close",
+        );
+    }
+
+    /// 8k L3.1 (d): with the running state hash configured L3.1 stays off.
+    /// `configure_book_coalesce` refuses it (as without a checkpoint
+    /// interval, or with a checkpoint byte cap: owner option C, as b1), and
+    /// a run that requests it on the hash-on fixture encodes
+    /// every book per block: per-block write sets (every `h_n`), running hash
+    /// and full CF dump equal the run that does not request it.
+    #[test]
+    fn l31_hash_configured_keeps_the_per_block_encode() {
+        let (config, db) = p2_fixture();
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.checkpoint = Some(ckpt_every(5));
+        for (requested, hash, on) in [
+            (true, Some(1), false),
+            (true, Some(500), false),
+            (false, None, false),
+            (true, None, true),
+        ] {
+            ctx.configure_book_coalesce(requested, hash);
+            assert_eq!(
+                ctx.book_coalesce, on,
+                "requested {requested}, hash {hash:?}"
+            );
+        }
+        ctx.checkpoint = None;
+        ctx.configure_book_coalesce(true, None);
+        assert!(!ctx.book_coalesce, "no checkpoint interval");
+        // A byte cap cannot count the coalesced blobs: it keeps L3.1 off.
+        for cap in [1, 256 << 20] {
+            for base in [ckpt_every(5), ckpt_never()] {
+                ctx.checkpoint = Some(crate::exec_pipeline::CheckpointPolicy {
+                    max_bytes: Some(cap),
+                    ..base
+                });
+                ctx.configure_book_coalesce(true, None);
+                assert!(!ctx.book_coalesce, "byte cap {cap}");
+            }
+        }
+        drop(ctx);
+
+        let blocks = p2_blocks_full(false, false, true).0;
+        let run = |coalesce: bool| {
+            P2_BOOK_COALESCE.set(coalesce);
+            let r = p2_run_full(
+                &blocks,
+                true,
+                Some(torus_bridge::native_executor::BookMode::Classic),
+                false,
+                &P2Fault::None,
+                Some(ckpt_every(5)),
+                &p2_deep_seed,
+                false,
+                None,
+                None,
+            );
+            P2_BOOK_COALESCE.set(false);
+            r
+        };
+        let (off, on) = (run(false), run(true));
+        assert!(on.hash.is_some(), "the hash is on");
+        assert_eq!(
+            on.metrics.exec_book_coalesce_skipped.get(),
+            0,
+            "per-block encode"
+        );
+        assert_write_sets_equal(&off.captured, &on.captured, "L3.1 requested, hash on");
+        assert_eq!(off.hash, on.hash, "running hash");
+        assert_dumps_equal(&off.dump, &on.dump, "L3.1 requested, hash on");
+    }
+
+    /// 8k L3.1 (e), mutation: a close that skips its coalesced encode (the
+    /// books stay owed to a later close) fails the golden for every close
+    /// kind L3.1 runs under (not the byte cap, which keeps it off), so the harness catches a missed trigger (the design's main risk:
+    /// a checkpoint S silently holding old blobs). A skip whose debt then
+    /// meets no open window fail-stops, which the harness also catches.
+    #[test]
+    fn l31_golden_catches_a_close_that_skips_its_encode() {
+        let blocks = l31_blocks();
+        let golden = l31_run(&blocks, None, false, None, &P2Fault::None, None, None);
+        let interval = crate::exec_pipeline::CheckpointPolicy {
+            interval: Some(std::time::Duration::from_millis(1)),
+            ..Default::default()
+        };
+        for (kind, policy, fast, random) in [
+            (CloseKind::Every, ckpt_every(5), None, None),
+            (CloseKind::Attest, ckpt_never(), Some(true), None),
+            (CloseKind::Epoch, ckpt_never(), Some(true), None),
+            (CloseKind::Interval, interval, None, None),
+            (CloseKind::TestDue, ckpt_never(), Some(true), Some(0x1a31)),
+            (CloseKind::Barrier, ckpt_never(), None, None),
+            (CloseKind::Shutdown, ckpt_never(), Some(true), None),
+        ] {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                l31_run(
+                    &blocks,
+                    Some(policy),
+                    true,
+                    fast,
+                    &P2Fault::None,
+                    random,
+                    Some(kind),
+                )
+            }));
+            match outcome {
+                Ok(run) => {
+                    let found = l31_divergence(&golden, &run);
+                    println!("L3.1 mutant, {kind:?} close skips its encode: {found:?}");
+                    assert!(
+                        found.is_some(),
+                        "{kind:?}: a close that skips its encode passed the golden"
+                    );
+                }
+                Err(panic) => {
+                    let msg = panic
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    println!("L3.1 mutant, {kind:?} close skips its encode: run failed ({msg})");
+                    assert!(msg.contains("fail-stop"), "{kind:?}: {msg}");
+                }
+            }
         }
     }
 

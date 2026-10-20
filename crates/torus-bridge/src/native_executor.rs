@@ -3139,6 +3139,24 @@ pub fn configured_book_mode() -> BookMode {
     book_mode()
 }
 
+/// 8k L3.1 (`TORUS_BOOK_COALESCE`): why this process's book settings cannot
+/// coalesce the Classic save (`None`: they can). It needs Classic books
+/// (`TORUS_BOOK_ROWS` unset / 0), resident books (`TORUS_RESIDENT_BOOKS` not
+/// 0: the holder is where the unsaved books live) and the untouched-block
+/// advance (`TORUS_RESIDENT_ADVANCE_UNTOUCHED` not 0: without it every empty
+/// block makes the next one rebuild, which fail-stops with unsaved books).
+pub fn book_coalesce_blocker() -> Option<&'static str> {
+    if book_mode() != BookMode::Classic {
+        Some("book mode is not Classic (TORUS_BOOK_ROWS)")
+    } else if !resident_books_enabled() {
+        Some("resident books are off (TORUS_RESIDENT_BOOKS=0)")
+    } else if !advance_untouched_enabled() {
+        Some("the untouched-block advance is off (TORUS_RESIDENT_ADVANCE_UNTOUCHED=0)")
+    } else {
+        None
+    }
+}
+
 /// Pure parse of the `TORUS_BOOK_ROWS` value (same trim/strictness as C4).
 fn parse_book_rows_mode(v: Option<String>) -> BookMode {
     match v.as_deref().map(str::trim) {
@@ -4335,6 +4353,35 @@ impl ResidentBooks {
         self.inner.as_ref().map(|i| i.height)
     }
 
+    /// 8k L3.1 (`TORUS_BOOK_COALESCE`): the Classic whole-book blob of each
+    /// of `markets` from the resident books, with the encoder the per-block
+    /// save uses (`encode_classic_book`, L3.3 when on), as `(market, blob)`
+    /// in market order. Like the per-block save, a market with no book is
+    /// skipped and a book that fails to encode is logged and skipped. `Err`:
+    /// the holder carries no books (drained or taken), so the blobs owed to
+    /// the window exist nowhere; the caller fail-stops.
+    pub fn encode_classic_books<'a>(
+        &self,
+        markets: impl IntoIterator<Item = &'a MarketId>,
+    ) -> Result<Vec<(MarketId, Vec<u8>)>, String> {
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| "resident holder carries no books".to_string())?;
+        let mut out = Vec::new();
+        for &market_id in markets {
+            let Some(book) = inner.books.get(&market_id) else {
+                continue;
+            };
+            match encode_classic_book(book) {
+                Ok(blob) => out.push((market_id, blob)),
+                Err(e) => tracing::error!(market_id, %e, "failed to serialize order book"),
+            }
+        }
+        out.sort_unstable_by_key(|(m, _)| *m);
+        Ok(out)
+    }
+
     /// r2 resident-books-stale-rebuild: a committed block that skipped the
     /// native path entirely (no native actions, no fee revenue — the pipeline
     /// never builds a context for it) leaves every book untouched, so the
@@ -5475,6 +5522,16 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// rank8: whether resident state was actually reused this block (vs a
     /// rebuild from persisted state — first block, restart, or stale guard).
     resident_reused: bool,
+    /// 8k L3.1 (`TORUS_BOOK_COALESCE`, set by the committer per block):
+    /// the Classic save skips the whole-book encode of each dirty book and
+    /// records its market in `coalesced_books` instead; the window close
+    /// encodes it from the resident holder ([`ResidentBooks::encode_classic_books`]).
+    /// Only on pipelined blocks with resident Classic books, a checkpoint
+    /// interval and the running hash off. Default `false`: the per-block save.
+    pub coalesce_books: bool,
+    /// 8k L3.1: the markets whose encode this block's save skipped
+    /// ([`Self::take_coalesced_books`]).
+    coalesced_books: Vec<MarketId>,
     /// L3: level-hash sponge cache budget in BYTES for mode-2 saves
     /// (`TORUS_LEVEL_HASH_CACHE` env, MB; default
     /// [`DEFAULT_LEVEL_HASH_CACHE_MB`] = ON). 0 = disabled (exact-today),
@@ -6048,6 +6105,8 @@ impl<T: StateBackend> NativeExecContext<T> {
             book_mode_marker_present,
             resident: resident_mode,
             resident_reused,
+            coalesce_books: false,
+            coalesced_books: Vec::new(),
             level_hash_cache_bytes: level_hash_cache_env_bytes(),
             save_books_workers: save_books_workers_env(),
             save_books_min_ops: save_books_min_ops_env(),
@@ -6137,6 +6196,18 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// full O(resting depth) reload on the exec thread.
     pub fn resident_rebuilt(&self) -> bool {
         self.resident && !self.resident_reused
+    }
+
+    /// The book persistence mode this context runs.
+    pub fn book_mode(&self) -> BookMode {
+        self.book_mode
+    }
+
+    /// 8k L3.1: the markets whose whole-book encode this block's Classic
+    /// save skipped (`coalesce_books`), taken. Their blobs are owed to the
+    /// window close.
+    pub fn take_coalesced_books(&mut self) -> Vec<MarketId> {
+        std::mem::take(&mut self.coalesced_books)
     }
 
     /// The block's fail-stop reason, taken: `fatal_error`, else the first
@@ -7074,6 +7145,12 @@ impl<T: StateBackend> NativeExecContext<T> {
                 continue;
             };
             match self.book_mode {
+                // 8k L3.1: the window close encodes it (`coalesce_books`).
+                BookMode::Classic if self.coalesce_books => {
+                    self.coalesced_books.push(market_id);
+                    book.discard_row_ops();
+                    book.discard_level_ops();
+                }
                 BookMode::Classic => {
                     let key = market_id.to_be_bytes();
                     match encode_classic_book(book) {

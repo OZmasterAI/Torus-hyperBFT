@@ -865,3 +865,73 @@ fn resident_guard_without_parent_layer_rebuilds_control() {
         "control: with the lagging DB marker and no layer the guard trips (rebuild)"
     );
 }
+
+// ============================================================================
+// 8k L3.1 (`TORUS_BOOK_COALESCE`): the coalesced Classic save
+// ============================================================================
+
+/// 8k L3.1: with `coalesce_books` the Classic save skips every dirty book's
+/// whole-book put and lists its market instead; at the end the holder
+/// encodes exactly the blobs the per-block save wrote (the window close's
+/// half), and every other CF (bbo rows included) is the per-block save's.
+/// A holder without books cannot encode (`Err`).
+#[test]
+fn coalesced_save_skips_book_puts_and_holder_encodes_the_same_bytes() {
+    let (_d1, per_block) = open_test_db();
+    let (_d2, coalesced) = open_test_db();
+    let (mut h1, mut h2) = (ResidentBooks::default(), ResidentBooks::default());
+    let mut owed = std::collections::BTreeSet::new();
+    for (i, batch) in script_batches(1).iter().enumerate() {
+        let height = (i + 1) as u64;
+        for (db, holder, coalesce) in [(&per_block, &mut h1, false), (&coalesced, &mut h2, true)] {
+            let mut ctx = make_ctx(db.clone(), height, false, Some(&mut *holder));
+            assert!(ctx.fatal_error.is_none());
+            if height == 1 {
+                for t in [addr(1), addr(2), addr(3), addr(4)] {
+                    fund_native(&ctx, &t, fp(1_000_000));
+                }
+            }
+            let _ = NativeExecutor::execute_batch(&mut ctx, batch);
+            ctx.coalesce_books = coalesce;
+            let writes = ctx.save_order_books();
+            let skipped = ctx.take_coalesced_books();
+            if coalesce {
+                assert_eq!(writes, 0, "block {height}: no book put");
+                assert!(!skipped.is_empty(), "block {height}: dirty books listed");
+                owed.extend(skipped);
+            } else {
+                assert!(writes > 0 && skipped.is_empty(), "block {height}");
+            }
+            ctx.stash_resident(holder);
+        }
+        assert_eq!(
+            non_book_dump(&per_block),
+            non_book_dump(&coalesced),
+            "block {height}"
+        );
+        assert_eq!(
+            dump_cf(&per_block, torus_state::cf::CF_NATIVE_BBO),
+            dump_cf(&coalesced, torus_state::cf::CF_NATIVE_BBO),
+            "block {height}: bbo rows"
+        );
+    }
+    assert!(
+        dump_cf(&coalesced, CF_NATIVE_ORDER_BOOKS).is_empty(),
+        "no blob written"
+    );
+    let encoded: Vec<(Vec<u8>, Vec<u8>)> = h2
+        .encode_classic_books(&owed)
+        .expect("books held")
+        .into_iter()
+        .map(|(m, blob)| (m.to_be_bytes().to_vec(), blob))
+        .collect();
+    assert_eq!(owed.len(), 3, "markets 1-3 owed");
+    assert_eq!(
+        encoded,
+        dump_cf(&per_block, CF_NATIVE_ORDER_BOOKS),
+        "same blobs"
+    );
+    assert!(ResidentBooks::default()
+        .encode_classic_books(&owed)
+        .is_err());
+}
