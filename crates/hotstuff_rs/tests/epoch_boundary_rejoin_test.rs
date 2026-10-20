@@ -23,7 +23,8 @@
 //!
 //! Each case stops one validator C around E and restarts it on its own store. C keeps its inbox
 //! (`NetworkStub` clone): whatever the filter let through while it was down is still delivered.
-//! Commits must resume within a bound, and every validator must end past E.
+//! Certificates and commits must resume (never `RECOVERY_BOUND` without one), every validator
+//! must commit again and end past E.
 //! 1. C's vote for E never leaves (the drill). With the fix C re-enters E.
 //! 2. C's vote for E leaves and the others certify E, but C never learns QC(E). With the fix C
 //!    re-enters E while the others are in E + 1 and wait for its vote there.
@@ -48,7 +49,7 @@ use common::{
     network::{mock_network_with_filter, FilterHandle, NetworkStub},
     node::Node,
     number_app::{NumberApp, NumberAppTransaction},
-    poll::wait_until,
+    poll::{wait_for_scenario, Scenario},
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -63,8 +64,41 @@ const EPOCH_CHANGE_VIEW: u64 = 2 * EPOCH_LENGTH as u64;
 /// Blocks every validator must commit after the restart.
 const COMMITS_AFTER_RESTART: u64 = 2;
 
-/// How long commits may take to resume after the restart.
+/// How long the cluster may go without a new certificate or commit after the restart. The s85
+/// wedge forms neither (the replicas still in E cannot certify it; the restarted one runs alone on
+/// local timeouts), so it fails here as it did under the old fixed 90 s bound.
 const RECOVERY_BOUND: Duration = Duration::from_secs(90);
+
+/// Total time recovery may take while certificates keep forming (a loaded host).
+const RECOVERY_CEILING: Duration = Duration::from_secs(240);
+
+/// Setup waits (running the cluster up to the state a case needs) fail when the cluster stops
+/// moving, not at a fixed deadline: idle they take ~20 s, on a loaded host (load ~270 on 18 cores)
+/// past 120 s while still progressing. `SETUP_STALL` bounds a view at deep backoff with margin.
+const SETUP_STALL: Duration = Duration::from_secs(180);
+const SETUP_CEILING: Duration = Duration::from_secs(300);
+
+/// Fresh clusters a case may start when a run misses its scenario (see case 2).
+/// At 4x CPU oversubscription about half the runs miss case 2's scenario.
+const SETUP_ATTEMPTS: usize = 5;
+
+/// Grows whenever any validator enters a view, certifies or commits.
+fn progress(nodes: &[Node]) -> u64 {
+    nodes
+        .iter()
+        .map(|n| n.highest_view_entered().int())
+        .sum::<u64>()
+        + certified(nodes)
+}
+
+/// Grows whenever any validator certifies or commits (not on bare view changes, which the s85
+/// wedge keeps making).
+fn certified(nodes: &[Node]) -> u64 {
+    nodes
+        .iter()
+        .map(|n| n.highest_pc_view() + n.committed_height().unwrap_or(0))
+        .sum()
+}
 
 /// Three equal-stake validators on a filtered mock network.
 struct Cluster {
@@ -127,15 +161,18 @@ impl Cluster {
         }
     }
 
-    fn wait(&self, timeout: Duration, context: &str, condition: impl FnMut(&[Node]) -> bool) {
-        let mut condition = condition;
-        wait_until(
-            timeout,
+    /// Run the cluster until `observe` reports the scenario reached (`true`) or missed (`false`);
+    /// panics if it stops progressing (see [`SETUP_STALL`]).
+    fn wait_for_setup(&self, context: &str, mut observe: impl FnMut(&Self) -> Scenario) -> bool {
+        wait_for_scenario(
+            SETUP_CEILING,
+            SETUP_STALL,
             POLL_INTERVAL,
             context,
-            || condition(&self.nodes),
+            || observe(self),
+            || progress(&self.nodes),
             || describe(&self.nodes),
-        );
+        )
     }
 
     /// Stop node `c` (dropping it shuts its replica down), heal the network, restart `c` on its
@@ -155,18 +192,27 @@ impl Cluster {
 
         let e = ViewNumber::new(EPOCH_CHANGE_VIEW);
         let target = committed_before + COMMITS_AFTER_RESTART;
-        self.wait(
+        let recovered = wait_for_scenario(
+            RECOVERY_CEILING,
             RECOVERY_BOUND,
+            POLL_INTERVAL,
             &format!(
                 "every validator to leave view {EPOCH_CHANGE_VIEW} and commit height >= {target} \
                  (committed {committed_before} at the restart of n{c})"
             ),
-            |nodes| {
-                nodes.iter().all(|n| {
+            || {
+                let done = self.nodes.iter().all(|n| {
                     n.highest_view_entered() > e && n.committed_height().unwrap_or(0) >= target
-                })
+                });
+                match done {
+                    true => Scenario::Reached,
+                    false => Scenario::Pending,
+                }
             },
+            || certified(&self.nodes),
+            || describe(&self.nodes),
         );
+        assert!(recovered);
     }
 }
 
@@ -198,11 +244,15 @@ fn restart_inside_an_epoch_change_view_does_not_wedge_equal_stake_validators() {
         .silence_from_view(cluster.keypairs[c].verifying_key(), e);
     cluster.start();
 
-    cluster.wait(
-        Duration::from_secs(120),
+    // Every validator must enter E (an epoch-change view is never skipped) and none can leave it
+    // (C is silent), so this cannot be missed.
+    assert!(cluster.wait_for_setup(
         &format!("all three validators to enter the epoch-change view {EPOCH_CHANGE_VIEW}"),
-        |nodes| nodes.iter().all(|n| n.highest_view_entered() == e),
-    );
+        |cl| match cl.nodes.iter().all(|n| n.highest_view_entered() == e) {
+            true => Scenario::Reached,
+            false => Scenario::Pending,
+        },
+    ));
     cluster.restart_and_expect_recovery(c);
 }
 
@@ -210,36 +260,82 @@ fn restart_inside_an_epoch_change_view_does_not_wedge_equal_stake_validators() {
 /// collector, so the others certify E and enter E + 1; from that vote on nothing reaches C, so it
 /// stays in E without QC(E). Before the fix C restarted at E + 1, in the others' epoch; with the
 /// fix it re-enters E and must catch up while the others wait in E + 1 for its vote.
+///
+/// The scenario needs C's phase vote for E to certify E on the others. On a loaded host E can
+/// time out first and the three leave it on TC(E); the run is then past the state for good (seen:
+/// every node at view 94 when the old 120 s setup wait expired; at 7x CPU oversubscription, every
+/// node at view 26 with PC 18). Such a run is discarded and a fresh cluster started,
+/// up to `SETUP_ATTEMPTS` times; the recovery assertion only ever runs on a run that hit the case.
 #[test]
 fn restart_after_the_vote_for_an_epoch_change_view_left() {
-    let mut cluster = Cluster::new();
-    // leader(E + 2) is the backup collector of E's votes: its own vote to itself is dropped by the
-    // isolation, so only the primary collector leader(E + 1) certifies E. Not leader(E): the others
-    // may still need to fetch E's body from its proposer.
-    let c = cluster.leader(EPOCH_CHANGE_VIEW + 2);
-    assert_ne!(c, cluster.leader(EPOCH_CHANGE_VIEW + 1));
-    assert_ne!(c, cluster.leader(EPOCH_CHANGE_VIEW));
-    let e = ViewNumber::new(EPOCH_CHANGE_VIEW);
-    cluster
-        .filter
-        .isolate_after_vote(cluster.keypairs[c].verifying_key(), e);
-    cluster.start();
+    for attempt in 1..=SETUP_ATTEMPTS {
+        let mut cluster = Cluster::new();
+        // leader(E + 2) is the backup collector of E's votes: its own vote to itself is dropped by
+        // the isolation, so only the primary collector leader(E + 1) certifies E. Not leader(E):
+        // the others may still need to fetch E's body from its proposer.
+        let c = cluster.leader(EPOCH_CHANGE_VIEW + 2);
+        assert_ne!(c, cluster.leader(EPOCH_CHANGE_VIEW + 1));
+        assert_ne!(c, cluster.leader(EPOCH_CHANGE_VIEW));
+        let e = ViewNumber::new(EPOCH_CHANGE_VIEW);
+        cluster
+            .filter
+            .isolate_after_vote(cluster.keypairs[c].verifying_key(), e);
+        cluster.start();
 
-    cluster.wait(
-        Duration::from_secs(120),
-        &format!("n{c}'s vote for {EPOCH_CHANGE_VIEW} to certify it on the others only"),
-        |nodes| {
-            nodes.iter().enumerate().all(|(i, n)| {
+        let context =
+            format!("n{c}'s vote for {EPOCH_CHANGE_VIEW} to certify it on the others only");
+        let reached = cluster.wait_for_setup(&context, |cl| {
+            let certified_on_others_only = cl.nodes.iter().enumerate().all(|(i, n)| {
                 if i == c {
                     n.highest_view_entered() == e && n.highest_pc_view() < e.int()
                 } else {
                     n.highest_view_entered() > e && n.highest_pc_view() >= e.int()
                 }
-            })
-        },
+            });
+            if certified_on_others_only {
+                return Scenario::Reached;
+            }
+            // Views never go back, so the run is past the scenario for good when
+            // - C left E: whether it never voted for E (E ended first), or it voted but a
+            //   TC(E) already in its inbox took it out; or
+            // - C is isolated in E but the others left E without QC(E) (on TC(E): E timed out
+            //   before C's vote reached the collector), so nobody can ever certify E.
+            //   Each node's view is read before its PC (the PC is written before the view it
+            //   opens, e.g. `on_receive_advance_view`), so a node entering E + 1 on QC(E) is
+            //   not taken for this; were it, the cost is one fresh attempt, not a pass.
+            let c_left_e = cl.nodes[c].highest_view_entered() > e;
+            let others_left_e_without_qc = cl.filter.is_isolated()
+                && cl
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != c)
+                    .any(|(_, n)| n.highest_view_entered() > e && n.highest_pc_view() < e.int());
+            if c_left_e || others_left_e_without_qc {
+                Scenario::Missed
+            } else {
+                Scenario::Pending
+            }
+        });
+        if !reached {
+            eprintln!(
+                "attempt {attempt}/{SETUP_ATTEMPTS}: view {EPOCH_CHANGE_VIEW} ended without n{c}'s \
+                 vote certifying it (host load?); starting a fresh cluster. State: {}",
+                describe(&cluster.nodes)
+            );
+            continue;
+        }
+        assert!(
+            cluster.filter.is_isolated(),
+            "n{c} sent its vote for {EPOCH_CHANGE_VIEW}"
+        );
+        cluster.restart_and_expect_recovery(c);
+        return;
+    }
+    panic!(
+        "{SETUP_ATTEMPTS} runs in a row left view {EPOCH_CHANGE_VIEW} without the isolated node's \
+         vote certifying it: the scenario was never set up"
     );
-    assert!(cluster.filter.is_isolated(), "n{c} sent its vote for {EPOCH_CHANGE_VIEW}");
-    cluster.restart_and_expect_recovery(c);
 }
 
 /// Case 3, C collected QC(E): C is leader(E + 1), and what it sends to others that could carry a
@@ -256,18 +352,21 @@ fn restart_after_collecting_the_qc_for_an_epoch_change_view_alone() {
         .certify_alone(cluster.keypairs[c].verifying_key(), e);
     cluster.start();
 
-    cluster.wait(
-        Duration::from_secs(120),
+    assert!(cluster.wait_for_setup(
         &format!("n{c} alone to certify {EPOCH_CHANGE_VIEW} while the others stay in it"),
-        |nodes| {
-            nodes.iter().enumerate().all(|(i, n)| {
+        |cl| {
+            let alone = cl.nodes.iter().enumerate().all(|(i, n)| {
                 if i == c {
                     n.highest_pc_view() >= e.int() && n.highest_view_entered() > e
                 } else {
                     n.highest_view_entered() == e && n.highest_pc_view() < e.int()
                 }
-            })
+            });
+            match alone {
+                true => Scenario::Reached,
+                false => Scenario::Pending,
+            }
         },
-    );
+    ));
     cluster.restart_and_expect_recovery(c);
 }
