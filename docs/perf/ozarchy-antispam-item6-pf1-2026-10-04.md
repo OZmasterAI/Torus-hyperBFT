@@ -16464,6 +16464,195 @@ Engine on-CPU + off-CPU = 2.82 / 2.83 ms per 1k fills, 97.8% of the engine timer
   `8u-8kd-recheck.py`, `8u-w2fold.py` + `8u-w2report.py`, W2 dumps in `analysis/`). Tools `ozarchy-8u-tools/`, stage
   `ozarchy-8u-stage/`. Left on disk: `~/.cargo-target-8u`, `wt/8u-0e514a5c`.
 
+## 106. Step 8v, T5.3 attribution: block p99 inside checkpoint DB-write windows: one binary main `fd2557c3`, code defaults (15 s checkpoints, Classic), standard shape, standard load, 300 markets, 3 cells of 600 s, one arm, no perf, a 50 Hz /proc thread sampler as sidecar (campaign ozarchy-8v, archy, 2026-10-20)
+
+**The gap reproduces and one phase carries most of it: the consensus thread blocks in the commit hook until its own
+node's checkpoint DB write ends. Block p99 is 1,071 ms inside the DB-write windows vs 542 ms outside (G = 529 ms;
+520 / 643 / 424 per cell). Per node, `on_commit_block fired` -> `on_committed_block: sending to execution pipeline`
+takes 0.07-0.11 ms (p50) out of windows; in windows 517 hook stalls >= 50 ms (3 cells, 3 nodes) overlap the node's
+own DB write, ~320-400 ms each, and 98% of them end within 100 ms of that DB write's end (median 11 ms before it).
+The stall covers 78% of the in-window tail excess (~600 ms per tail interval); taking it out moves in-window p99
+1,071 -> 625 ms, i.e. 446 of G's 529 ms (84%). Validate, vote, commit persist, the exec thread and RocksDB write
+stalls are ruled out (none grows per call in windows; 0 write stalls; the consensus DB is unaffected). The likely
+call is `persist_commit_manifest` (`state_db.put_cf_raw(CF_COMMIT_MANIFEST, ..)`, app.rs:1875, called at :8487),
+the first state-DB write in the hook, waiting in the state DB's write queue behind the ~128 MB checkpoint batch
+(inferred from the bracket and the timing; main has no timer on the put). So A1 aims at the right mechanism: section
+87 judged the manifest put by its per-call mean (6-12 ms), but the gap is its tail, one put per checkpoint waiting
+for the whole batch. Cheaper than slicing: write the commit manifest outside the state DB's write queue, or move the
+put off the consensus thread. ~83 ms of in-window p99 is not attributed. n = 3 cells, one arm.**
+
+Question (bench queue step 8v, owner s131; 18c moved it ahead of 8l in main `6248ba59`): roadmap T5.3: during a
+checkpoint DB write, block p99 sits ~500-650 ms above the out-of-window p99 (sections 87, 89), and A1 (checkpoint
+slicing) is parked because its target, the manifest put (~6-12 ms per call), can't explain that. Which phase carries
+the in-window gap, and does A1 target it?
+
+### 106.1 Setup
+
+* Binary: one build of origin/main `fd2557c3` (crates identical to 8u's `0e514a5c`), plain release `--locked` (clang
+  + mold), worktree `wt/8v-fd2557c3`, `CARGO_TARGET_DIR ~/.cargo-target-8v`: node `32120afc76fa3b010c509f60425a1e8f`,
+  bench-throughput `268a6992`, tx-flood `dd59d50d` (stage `ozarchy-8v-stage/m`). Tools frozen from `fd2557c3`
+  (`ozarchy-8v-tools/FROZEN.txt`; `tools/matched-bench` identical to the 8s tools).
+* Code defaults: 15 s checkpoints, Classic, F and PC on, `TORUS_BOOK_FAST_ENCODE` absent (built before L3.3
+  default-on), 512 KB push threshold (`env.sh`), custody 0.
+* Standard shape (100k genesis, cell genesis `d694b81b`, no pre-load), standard load (300 markets, rate 76,000,
+  `BLOCK_CAP=400 RETRY_BUSY=1 MAX_IN_FLIGHT=4 OPEN_ORDER_BUDGET=900 ORACLE_FEED=1 IN_FLIGHT_TAIL=commit
+  CLOID_SHARE=0`, oracle on, native only).
+* Cells: smoke 60 s, warm-up w1 120 s (gated), then r1-M, r2-M, r3-M, 600 s each, one detached unit
+  `bench-ozarchy-8v` (driver `ozarchy-8v-campaign.sh` from `8v-spec.json`, wrapped by `run-with-t53.sh`).
+* `kernel.perf_event_paranoid` 2 at the start and end of the unit and of every cell. No perf.
+* Instrumentation: main has no checkpoint DB-write log line or start / end gauge (only the step-0 branch
+  `perf/q6-ckpt-slicing` has them), so the windows come from a sidecar, no node code: `t53-sampler.py` reads
+  `/proc/<pid>/task/<tid>/{schedstat,io}` at 50 Hz for `hotstuff-algo`, `torus-execution`, the flush worker W
+  (`torus-flush-wor`, which runs every checkpoint job), body serve and DA recovery, and at 5 Hz for the RocksDB high /
+  low pools, merge threads and tokio. A checkpoint = a WAL burst on W (wchar >= 256 KB per 20 ms tick) inside a W busy
+  run: `job0` (batch build) .. `w0` (WAL start) .. `wal1` (WAL end) .. `w1` (memtable insert end). DB-write window
+  = `[w0, w1]` (the analogue of section 87's `checkpoint db write` span); job window = `[job0, w1]`. Block
+  intervals = consecutive `on_commit_block fired` lines per node in the load window (`t_bench0 + 20 s` to
+  `t_bench1`); in-window = overlaps the union of the 3 nodes' DB-write windows (section 87's G definition). The
+  sampler costs ~41 s CPU per cell (~7% of one of 32 cores), the same in every cell.
+
+### 106.2 Validity and pacing
+
+| cell | rc | validity / agreement / liveness | panic / fail-stop | node md5 (3 nodes) | timeouts | matched/s | native blk/s | CHECK |
+|---|---|---|---|---|---|---|---|---|
+| smoke-s0 (60 s, re-run) | 0 | ACCEPT / AGREE / PASS | 0 | 32120afc | 0 | 270,667 | | 25 OK |
+| w1 (120 s) | 0 | ACCEPT / AGREE / PASS | 0 | 32120afc | 0 | 265,873 | | 26 OK |
+| r1-M | 0 | ACCEPT / AGREE / PASS | 0 | 32120afc | 2 | 263,186 | 14.25 | 25 OK |
+| r2-M | 0 | ACCEPT / AGREE / PASS | 0 | 32120afc | 1 | 263,557 | 13.60 | 25 OK |
+| r3-M | 0 | ACCEPT / AGREE / PASS | 0 | 32120afc | 0 | 264,942 | 14.48 | 25 OK |
+
+101 CHECK OK, 0 CHECK FAIL, 0 CELL-FLAG, no reruns. Swap +0 (baseline 2.78 GB), min MemAvailable > 37 GB, free
+disk >= 96 GB. Sampler: 32,646-32,768 ticks per 600 s cell, 0.4-0.5% late. The first smoke failed its CHECKs from a
+driver bug (`8v-checks.sh` lost its `K8_*` block); fixed, self-tested on a scratch copy, smoke re-run clean (the
+first kept as `ozarchy-8v-300m-smoke-s0-try1-unused`).
+
+Pacing: the owner's `end_pass=1` instruction arrived after launch and switching needed a restart, so the chain ran
+with `end_pass=0` (in-line checks + shallow report scans, 9-13 s). Gaps END -> next START: w1 -> r1 14 s, r1 -> r2
+19 s, r2 -> r3 19 s. No deferred work ran during cells; the whole analysis ran after the chain (`nice -n 19`).
+
+### 106.3 Checkpoint windows (per node, mean of 3 nodes, load window)
+
+| cell | checkpoints / node | 1 Hz jobs >= 50 ms | job ms (build / WAL / memtable) | DB-write ms mean (p50; max) | WAL MB | median gap s | load share in any node's DB write |
+|---|---|---|---|---|---|---|---|
+| r1-M | 84.0 | 84.0 | 643 (164 / 212 / 267) | 479 (463; 1,300) | 128 | 5.75 | 10.4% |
+| r2-M | 83.0 | 79.0 | 659 (162 / 216 / 281) | 497 (553; 980) | 128 | 8.09 | 10.1% |
+| r3-M | 87.3 | 85.3 | 599 (141 / 206 / 251) | 457 (420; 940) | 124 | 5.86 | 10.7% |
+
+The sidecar's jobs match the 1 Hz `torus_flush_worker_checkpoint_seconds` steps (count 84 / 84, 83 / 79, 87 / 85; job
+ms 643 vs 633, 659 vs 678, 599 vs 603). The 3 nodes checkpoint the same height at nearly the same time (~1 per 100
+blocks), so the union and own-node windows nearly coincide. The DB write (~480 ms) is above section 87's 407 ms
+(batches 128 vs 108 MB).
+
+### 106.4 Block p50 / p99, in vs out of the DB-write windows (commit intervals, mean of 3 nodes)
+
+| cell | all p50 / p99 | in p50 / p99 | out p50 / p99 | **G = p99 in - out** | intervals in / out (3 nodes) | > 1 s in / out |
+|---|---|---|---|---|---|---|
+| r1-M | 12.5 / 606 | 132 / 1,053 | 11.7 / 534 | **520** | 912 / 22,403 | 12 / 5 |
+| r2-M | 12.5 / 623 | 153 / 1,189 | 11.7 / 546 | **643** | 787 / 21,680 | 24 / 4 |
+| r3-M | 11.8 / 626 | 155 / 970 | 11.0 / 546 | **424** | 905 / 22,865 | 8 / 1 |
+| mean | 12.3 / 618 | 147 / 1,071 | 11.5 / 542 | **529** | | |
+
+The gap reproduces (G 424-643 ms, mean 529; it drifts between same-arm cells, as in 87 / 89). With the job window
+(batch build + DB write) G is 363 / 472 / 358 (the build part dilutes it); with each node's own window 594 / 679 / 461.
+
+### 106.5 Where the in-window time goes
+
+The commit hook = `on_commit_block fired` -> `on_committed_block: sending to execution pipeline` (per node, from the
+log). Out of windows it takes 0.07-0.11 ms (p50). Hook stalls >= 50 ms (sums of the 3 nodes):
+
+| cell | stalls overlapping the node's own DB write | ms per stall | >= 250 ms in / out of windows | end within 100 ms of the DB-write end | end - DB-write end, p50 (p10, p90) |
+|---|---|---|---|---|---|
+| r1-M | 181 | 322 | 76 / 15 | 181 / 181 | -11 ms (-24..-34, +2..+3) |
+| r2-M | 156 | 398 | 85 / 9 | 152 / 156 | -11..-14 ms (-25..-38, +9..+28) |
+| r3-M | 180 | 333 | 88 / 21 | 175 / 180 | -7..-11 ms (-22..-24, +7..+23) |
+
+* During a stall the consensus thread is off-CPU and not runnable (in-window CPU 8.4% vs 28.5% out, runqueue 1.4% vs
+  3.3%), and messages queue behind it. The other nodes get no proposal / vote from it, so the whole cluster's commit
+  interval stretches: the slow view's leader was itself inside its own DB write in 35-45 of 43-55 tail intervals per
+  node.
+* Example (r1-M, 01:56:13.13 UTC, height 1067, interval 1,566 ms): all 3 nodes checkpoint the same height (val0 DB
+  write -0.008 .. +1.251 s). val0 logs `on_commit_block fired height=1064` at 0.000 and the matching
+  `on_committed_block: sending ... height=1065` at +1.198, with nothing else on its consensus thread in between
+  (algo CPU 0), then 4 queued `type=Other` messages in 2 ms (the proposer's header re-sends at +0.22 .. +0.97). val1
+  does the same; the view times out and val1 proposes 1068 on parent 1066 at +1.15.
+
+Attribution (`t53-hook.py`; for every commit interval, the time covered by any node's hook stall >= 50 ms):
+
+| cell | tail-in intervals (> out p99), 3 nodes | with a hook stall | excess over out p50, s | of it hook stall, s | **share** | validate stall share | p99 in -> without the stall (out p99) |
+|---|---|---|---|---|---|---|---|
+| r1-M | 130 | 125 | 98.7 | 81.5 | **82.6%** | 0.05% | 1,053 -> 521 (534) |
+| r2-M | 157 | 152 | 126.6 | 95.9 | **75.8%** | 0.56% | 1,189 -> 736 (546) |
+| r3-M | 142 | 131 | 106.5 | 80.1 | **75.2%** | 0.71% | 970 -> 618 (546) |
+| all | 429 | 408 | 331.8 | 257.6 | **77.6%** | | 1,071 -> 625 (542) |
+
+Out of windows the same stall covers 4-5% of the tail excess.
+
+What inside the hook: the first state-DB write of `on_committed_block` is `persist_commit_manifest`
+(`state_db.put_cf_raw(CF_COMMIT_MANIFEST, ..)`, `crates/torus-consensus/src/app.rs:1875`, called at :8487), section
+87's "manifest put", which 87 measured waiting in the state DB's write queue behind the checkpoint batch (mutex /
+cond-wait 0). The handler before it (`find_latest_height`, a `get_cf_raw`, `mempool.prune_committed_txs`) writes
+nothing to the state DB (whether the untimed mempool prune can wait on a lock is not measured). The next state-DB
+write, the timed commit persist (`torus_commit_persist_seconds`), is not slow in windows (2.1 ms per call in vs 5.5
+out). A stall that ends when the batch's memtable insert ends is a RocksDB write-queue wait; on main the put has no
+timer, so the location is inferred, not measured.
+
+Other phases, in vs out (1 Hz scrape seconds touching a DB write vs seconds >= 2 s away; mean of 9 node-cells):
+
+| phase | ms per call in / out | ms per second in / out |
+|---|---|---|
+| view qc_collect (leader) | 46.0 / 49.5 | 251 / 224 |
+| view vote_gather (collector) | 30.4 / 26.8 | 326 / 241 |
+| view proposal_arrival (follower) | 22.9 / 30.2 | 250 / 274 |
+| view insert_persist (validate + block-tree write) | 8.9 / 10.7 | 97 / 97 |
+| view vote_delay | 8.8 / 8.7 | 96 / 79 |
+| view propose_delay (block build + readiness) | 9.4 / 21.6 | 51 / 98 |
+| block_build (mirror / select) | 8.9 (3.5 / 4.6) / 20.9 (9.0 / 9.7) | |
+| validate_block (DA reconstruct; DA wait) | 2.2 (5.2; 21.1) / 3.7 (6.6; 20.5) | |
+| on_committed_block (whole hook) | 16.2 / 19.1 | 265 / 260 |
+| commit persist (write alone) | 2.07 (1.18) / 5.48 (2.96) | |
+| vote-state write | 0.05 / 0.06 | |
+| exec checkpoint upkeep | 0.91 / 0.16 | 27 / 0.6 |
+| exec settle wait | 0.93 / 5.42 | |
+| exec deferred join | 0.33 / 0.03 | |
+| exec checkpoint hand-off wait / flush hand-off wait | 0.05 / - ; 0.01 / 0.02 | |
+| state-DB write, RocksDB stats (incl. the checkpoint batch) | 8.4 / 1.7 | 287 / 43 |
+| consensus-DB write, RocksDB stats | 0.23 / 0.38 | |
+| write stalls, state and consensus DB | 0 / 0 | |
+
+The 1 Hz means are diluted (the stall hits a few views per window), so they do not localise the tail, but they rule
+out the other candidates: no validate / vote / persist phase grows per call in windows, no RocksDB write stall, the
+consensus DB is unaffected, and the exec thread's checkpoint work stays ~1 ms per block (exec CPU 69% in vs 72% out,
+runqueue 3.6% both). Per-thread CPU in / out: flush worker 66% / 1.5%, RocksDB high pool 14% / 8%, low pool 27% /
+27%, tokio 40% / 53%. Memtable flushes starting inside the node's own DB write: 19-37 of ~270 per node per cell
+(~10%, the time share); compactions 0-2 of ~58. `on_committed_block_seconds` has 14-20 calls > 0.5 s per node in
+r1-M; `validate_block_seconds` and `view_insert_persist_seconds` none.
+
+### 106.6 Verdict, limits and next
+
+* The in-window p99 gap reproduces: G 529 ms (424-643), in-window p99 1,071 vs 542 ms out.
+* Dominant phase: the consensus thread's commit hook (`on_committed_block`, before dispatch), blocked on the state
+  DB's write queue until its own checkpoint WriteBatch (~128 MB, ~480 ms WAL + memtable) completes; most likely the
+  commit-manifest put. 78% of the in-window tail excess, 446 of G's 529 ms (84%), ~600 ms per tail interval; 98% of
+  the stalls end with the DB write.
+* A1 (checkpoint slicing) aims at the right mechanism: section 87 judged the manifest put by its per-call mean
+  (~6-12 ms), but the gap is its tail, one put per checkpoint waiting for the whole batch (>= 250 ms in ~1 of 3
+  checkpoints). Slicing caps the wait at one slice's write time, if the consensus write can enter the queue between
+  slices. Two cheaper fixes take the wait off the consensus thread entirely: write the commit manifest outside the
+  state DB's write queue (the consensus DB showed no in-window slowdown), or move the put off the consensus thread (it
+  must only be durable before dispatch). Section 89's ZC (50 MB cap) did not shrink G, but it also changed the
+  cadence (checkpoints every ~3.7 blocks, DB writing 44% of the time), so it was not a clean test of slicing.
+* Missing instrumentation on main: a timer around `persist_commit_manifest` (the step-0 branch's
+  `commit_db_split`) and around the node's `on_commit_block` handler (`prune_committed_txs`), to measure the stall on
+  the put itself; a checkpoint DB-write start / end log line or gauges (this run derived the windows from /proc).
+* Limits: n = 3 cells, one arm, G drifts 424-643 between cells; windows at 20 ms resolution from /proc, not node
+  timestamps; the stall's location inside the hook is inferred; the residual ~83 ms of in-window p99 is not
+  attributed; the sidecar adds ~7% of one core (same in every cell).
+* Data: `~/bench-results-matched/ozarchy-8v-300m-{smoke-s0,w1,r1-M,r2-M,r3-M}`; campaign `ozarchy-8v-run/`
+  (`campaign.log`, `campaign/cells.tsv`), analysis `ozarchy-8v-run/8v-analysis.md` and `ozarchy-8v-run/analysis/`
+  (`{r1-M,r2-M,r3-M}.json` from `t53-analyze.py`, `hook-*.json` from `t53-hook.py`, `show.py`, `spanshow.py`). Tools
+  `ozarchy-8v-tools/` (`8v-spec.json`, `8v-checks.sh`, `ozarchy-8v-campaign.sh`, `run-with-t53.sh`, `t53watch.sh`,
+  `t53-sampler.py`, `t53-analyze.py`, `t53-hook.py`, `FROZEN.txt`).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

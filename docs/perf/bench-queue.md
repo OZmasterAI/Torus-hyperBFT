@@ -684,6 +684,15 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    merges on owner call). Classic cells on any binary built after that merge include L3.3 (section 105: blocks/s
    1.086, p50 0.884 on the deep book), so their baselines shift slightly vs older sections: compare against
    same-campaign controls only, and log the flag state per cell (`TORUS_BOOK_FAST_ENCODE=0` restores the old encoder).
+   **Done s70 (ozarchy-8v, section 106; main `fd2557c3` node `32120afc`, 3 / 3 cells of 600 s valid, 101 CHECK OK,
+   0 FAIL; no perf, paranoid 2; windows from a 50 Hz /proc sampler on the flush worker): the gap reproduces, in-window
+   p99 1,071 vs 542 ms out (G 529, 424-643). Dominant phase: the consensus thread's commit hook
+   (`on_commit_block fired` -> `on_committed_block: sending`) blocks until its own node's checkpoint DB write
+   (~128 MB, ~480 ms) ends: 98% of the stalls end with it, 78% of the in-window tail excess, 446 of G's 529 ms (84%).
+   Likely the commit-manifest put (`persist_commit_manifest`) waiting in the state DB's write queue (inferred; no
+   timer on main). A1 aims at the right mechanism (87 judged the put by its mean, the gap is its tail); cheaper:
+   write the manifest outside the state DB's write queue or off the consensus thread. Missing: timers on the put and
+   the commit handler, a checkpoint DB-write start / end line. Gaps 14-19 s (`end_pass=0`, switched too late).**
 8w. **RH4 3-arm rerun: state pruner compaction filter** (owner s131; after 8v; ~1 h 50). 8r (section 103.6): the
    cost both retention arms share is state-DB compaction of `cf_block_bodies` from the state pruner's
    `delete_range_cf` range deletes (compaction CPU x2.0, L0 3.3 vs 1.2). Fix: `perf/rh4-gc-worker` `baffa3a5` (on
