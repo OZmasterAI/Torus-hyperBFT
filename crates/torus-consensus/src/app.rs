@@ -1345,6 +1345,14 @@ struct ExecutionContext {
     /// (needs a checkpoint interval, Classic + resident books and the running
     /// hash not configured), after `checkpoint`.
     book_coalesce: bool,
+    /// L6.1 (CONSENSUS, genesis `consensus.book_window_commit`): the chain
+    /// config's L6.1 activation height (`ChainConfig::book_window_activation`,
+    /// `None` = off). The execution rule (an attest height runs the native
+    /// phase and saves every book, `running_hash::book_window_full_save_at`)
+    /// reads only this, never node-local META: a forced native phase changes
+    /// state (governance, the liquidation pass), so every node must take it
+    /// from the same chain config.
+    book_window: Option<u64>,
     /// 8k L3.1 test seam (mutation): a close of this kind skips the
     /// coalesced encode (the books stay owed to a later close).
     #[cfg(test)]
@@ -4438,9 +4446,13 @@ impl ExecutionContext {
         // Bug (b): every boundary block runs it too (validator-set plans).
         // L6.1 (consensus, genesis `book_window_commit`): so does every attest
         // height, whose Classic save writes (and the running hash commits to)
-        // every book, even in an otherwise empty block.
+        // every book, even in an otherwise empty block. A STATE-TRANSITION
+        // rule, not only a hash rule: the forced native phase runs every
+        // block-level step (governance finalizes / executes due proposals,
+        // the liquidation pass walks from its cursor). So it is decided from
+        // the chain config (`self.book_window`), never from node-local META.
         let book_window_full =
-            torus_state::running_hash::book_window_full_save_at(&self.state_db, height);
+            torus_state::running_hash::book_window_full_save_at(self.book_window, height);
         #[cfg(test)]
         let book_window_full = book_window_full && self.test_l61_skip_full_save != Some(height);
         let run_native = if has_native
@@ -6984,6 +6996,7 @@ impl TorusApp {
             checkpoint: None,
             ckpt: Default::default(),
             book_coalesce: false,
+            book_window: config.book_window_activation(),
             #[cfg(test)]
             test_coalesce_skip: None,
             #[cfg(test)]
@@ -7073,20 +7086,32 @@ impl TorusApp {
         // `exec_hole_since` wiring in the struct literal below).
         // Running state hash: the CHAIN-WIDE activation height (genesis) must
         // be in place before the replay flushes any block.
+        // L6.1 review: with window-committed books on, the digest's book
+        // filter reads these META rows, so a node that cannot write them
+        // would hash a different preimage: refuse to start. (Execution never
+        // reads them: `ExecutionContext::book_window` is the chain config.)
+        // Without L6.1 a failure stays logged only, as before.
         if let Err(e) =
             torus_state::running_hash::configure_activation(&state_db, config.state_hash_activation_height)
         {
+            if config.book_window_commit {
+                return Err(format!(
+                    "running state hash: failed to apply the activation config (genesis \
+                     book_window_commit needs it): {e}"
+                ));
+            }
             tracing::error!(%e, "running state hash: failed to apply the activation config");
         }
         // L6.1 (genesis `book_window_commit`): Classic books only; then the
-        // chain config row both the digest and execution read.
+        // node-local copy of the L6.1 activation the digest reads.
         check_book_window_mode(
             config.book_window_commit,
             torus_bridge::native_executor::configured_book_mode(),
         )?;
-        if let Err(e) =
-            torus_state::running_hash::configure_book_window(&state_db, config.book_window_commit)
-        {
+        if let Err(e) = torus_state::running_hash::configure_book_window(
+            &state_db,
+            config.book_window_activation(),
+        ) {
             return Err(format!(
                 "running state hash: failed to apply book_window_commit: {e}"
             ));
@@ -16021,6 +16046,7 @@ mod crash_recovery_tests {
             checkpoint: None,
             ckpt: Default::default(),
             book_coalesce: false,
+            book_window: config.book_window_activation(),
             #[cfg(test)]
             test_coalesce_skip: None,
             #[cfg(test)]
@@ -37927,6 +37953,11 @@ mod crash_recovery_tests {
         /// L6.1: every `p2_run_full` context skips the full book save at
         /// this attest height (mutation seam `test_l61_skip_full_save`).
         static P2_L61_SKIP_FULL: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+        /// L6.1 review: an edit of the chain config `p2_run_full` builds its
+        /// contexts from, applied after the seed (which writes the META rows
+        /// the config is otherwise derived from), e.g. a node whose META rows
+        /// are stale while its genesis chain config has L6.1 on.
+        static P2_CONFIG_EDIT: std::cell::Cell<Option<fn(&mut ChainConfig)>> = const { std::cell::Cell::new(None) };
     }
 
     /// P2-1 review (GPT-6.1-sol, gap 1): what `p2_run` does to the node
@@ -38150,8 +38181,16 @@ mod crash_recovery_tests {
         probe: Option<&BlockProbe>,
         fast: Option<bool>,
     ) -> P2Run {
-        let (config, db) = p2_fixture();
+        let (mut config, db) = p2_fixture();
         seed(&db);
+        // The chain config the seeded running-hash rows stand for (a node
+        // applies both from its genesis at boot), then the test's edit.
+        config.state_hash_activation_height =
+            torus_state::running_hash::read_configured_activation(&db);
+        config.book_window_commit = torus_state::running_hash::read_book_window(&db).is_some();
+        if let Some(edit) = P2_CONFIG_EDIT.get() {
+            edit(&mut config);
+        }
         torus_state::running_hash::capture_begin(&db);
         let metrics = Arc::new(torus_telemetry::Metrics::new());
         let what = format!("pipelined={pipelined} {mode:?} reference={reference} {fault:?}");
@@ -38180,8 +38219,8 @@ mod crash_recovery_tests {
             }
             ctx.configure_book_coalesce(
                 P2_BOOK_COALESCE.get(),
-                torus_state::running_hash::read_configured_activation(&db),
-                torus_state::running_hash::read_book_window(&db),
+                config.state_hash_activation_height,
+                config.book_window_commit,
             );
             ctx.test_l61_skip_full_save = P2_L61_SKIP_FULL.get();
             ctx.test_coalesce_skip = P2_COALESCE_SKIP.get();
@@ -38990,7 +39029,7 @@ mod crash_recovery_tests {
             ctx.configure_book_coalesce(
                 true,
                 torus_state::running_hash::read_configured_activation(db),
-                torus_state::running_hash::read_book_window(db),
+                torus_state::running_hash::read_book_window(db).is_some(),
             );
             assert!(ctx.book_coalesce, "L3.1 on");
             ctx
@@ -39203,7 +39242,7 @@ mod crash_recovery_tests {
     fn l61_seed(db: &StateDb, on: bool) {
         p2_deep_seed(db);
         torus_state::running_hash::configure_activation(db, Some(1)).unwrap();
-        torus_state::running_hash::configure_book_window(db, on).unwrap();
+        torus_state::running_hash::configure_book_window(db, on.then_some(1)).unwrap();
     }
 
     /// A deliberately wrong L6.1 rule (the goldens must catch each).
@@ -39567,6 +39606,8 @@ mod crash_recovery_tests {
         let run = |on: bool, skip: Option<u64>| {
             let (mut config, db) = p2_fixture();
             config.epoch_length = 1_000;
+            config.state_hash_activation_height = Some(1);
+            config.book_window_commit = on;
             l61_seed(&db, on);
             db.put_cf_raw(
                 torus_state::cf::CF_NATIVE_ORDER_BOOKS,
@@ -39735,6 +39776,374 @@ mod crash_recovery_tests {
                 "{mode:?}, L6.1 on"
             );
         }
+    }
+
+    // ---- L6.1 review (s131): a forced attest block is a state transition,
+    // not only a hash change. Every block-level step of the native phase runs
+    // at an attest height even when nothing else is due: the governance step
+    // (proposals whose vote ended finalize, passed ones past their timelock
+    // execute) and the liquidation pass (a walk longer than its scan budget
+    // writes the round-robin cursor, which makes the next blocks due). The
+    // rule must therefore come from the chain config, identically on every
+    // node. ----
+
+    /// Proposal 1 (text, Active): voting ends at this height, so it
+    /// finalizes at the first native block above it.
+    const L61_GOV_END: u64 = 40;
+    /// Proposal 2 (Passed, parameter change `quorum_bps` -> 4000): executes
+    /// at the first native block at or above this height.
+    const L61_GOV_EXEC: u64 = 60;
+    /// Traders with a one-lot position beyond the liquidation scan budget,
+    /// so a pass that starts at the beginning stops early and writes the
+    /// cursor.
+    const L61_LIQ_TRADERS: usize = torus_core::liquidation::LIQ_SCAN_PER_BLOCK + 40;
+
+    /// Governance and liquidation work that a native block does on its own:
+    /// the two proposals above (governance initialized) and
+    /// `L61_LIQ_TRADERS` positioned traders. No row makes any block due.
+    fn l61_forced_seed(db: &StateDb) {
+        use torus_core::position::{MarginType, PositionManager};
+        use torus_economics::governance::{
+            ExecutionPayload, Proposal, ProposalStatus, ProposalType,
+        };
+        torus_economics::GovernanceManager::new(db.clone())
+            .set_governance_params(&torus_economics::GovernanceParams::defaults(
+                Address::ZERO,
+            ))
+            .unwrap();
+        let proposal = |id: u64, status, end_block, executable_after, payload| Proposal {
+            id,
+            proposer: Address::repeat_byte(0x61),
+            title: format!("l61 {id}"),
+            description: String::new(),
+            proposal_type: match payload {
+                Some(_) => ProposalType::ParameterChange,
+                None => ProposalType::TextProposal,
+            },
+            status,
+            votes_for: U256::ZERO,
+            votes_against: U256::ZERO,
+            start_block: 0,
+            end_block,
+            executable_after,
+            snapshot_block: 0,
+            execution_payload: payload,
+        };
+        for p in [
+            proposal(1, ProposalStatus::Active, L61_GOV_END, 0, None),
+            proposal(
+                2,
+                ProposalStatus::Passed,
+                0,
+                L61_GOV_EXEC,
+                Some(ExecutionPayload::ParameterChange {
+                    param_key: "quorum_bps".into(),
+                    new_value: "4000".into(),
+                }),
+            ),
+        ] {
+            db.put_cf_raw(
+                torus_state::cf::CF_GOVERNANCE_PROPOSALS,
+                &p.id.to_be_bytes(),
+                &borsh::to_vec(&p).unwrap(),
+            )
+            .unwrap();
+        }
+        db.put_cf_raw(torus_state::cf::CF_FEE_CONFIG, b"gov_next_id", &3u64.to_be_bytes())
+            .unwrap();
+        let pm = PositionManager::new(db.clone());
+        for i in 0..L61_LIQ_TRADERS as u32 {
+            let mut a = [0xa6u8; 20];
+            a[16..].copy_from_slice(&i.to_be_bytes());
+            pm.apply_fill(&Address::from(a), 2, true, px(1), px(100), MarginType::Cross)
+                .unwrap();
+        }
+    }
+
+    /// Which running-hash rows a node's META holds (its chain config is
+    /// separate: [`L61Node::config`]).
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum L61Node {
+        /// Genesis L6.1 on (hash from 1); META applied from it.
+        On,
+        /// Genesis L6.1 off (hash from 1); META applied from it.
+        Off,
+        /// Genesis L6.1 on (hash from 1), but META stale: no configured
+        /// activation and no L6.1 row (a failed boot write, an edited row).
+        StaleMeta,
+    }
+
+    /// One `p2_run_full` of `blocks` on [`l61_forced_seed`] for `node`, epoch
+    /// length 1000 (no attest height is an epoch boundary), a full CF dump
+    /// at every durable height.
+    #[allow(clippy::too_many_arguments)]
+    fn l61_forced_run(
+        blocks: &[TorusBlock],
+        node: L61Node,
+        pipelined: bool,
+        mode: Option<torus_bridge::native_executor::BookMode>,
+        ckpt: Option<crate::exec_pipeline::CheckpointPolicy>,
+        coalesce: bool,
+        fast: Option<bool>,
+        fault: &P2Fault,
+    ) -> P2Run {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                P2_DUMP_DURABLE.set(false);
+                P2_BOOK_COALESCE.set(false);
+                P2_CONFIG_EDIT.set(None);
+            }
+        }
+        fn long_epoch(c: &mut ChainConfig) {
+            c.epoch_length = 1_000;
+        }
+        fn stale(c: &mut ChainConfig) {
+            long_epoch(c);
+            c.state_hash_activation_height = Some(1);
+            c.book_window_commit = true;
+        }
+        let _reset = Reset;
+        P2_DUMP_DURABLE.set(true);
+        P2_BOOK_COALESCE.set(coalesce);
+        P2_CONFIG_EDIT.set(Some(match node {
+            L61Node::StaleMeta => stale,
+            _ => long_epoch,
+        }));
+        let seed = move |db: &StateDb| {
+            match node {
+                L61Node::On => l61_seed(db, true),
+                L61Node::Off => l61_seed(db, false),
+                L61Node::StaleMeta => {
+                    p2_deep_seed(db);
+                    torus_state::running_hash::configure_activation(db, None).unwrap();
+                }
+            }
+            l61_forced_seed(db);
+        };
+        p2_run_full(
+            blocks, pipelined, mode, false, fault, ckpt, &seed, false, None, fast,
+        )
+    }
+
+    /// A dump without the running-hash rows (the state proper).
+    fn l61_state(dump: &[CfDump]) -> Vec<CfDump> {
+        use torus_state::cf::*;
+        dump.iter()
+            .map(|(cf, rows)| {
+                let rows = rows
+                    .iter()
+                    .filter(|(k, _)| {
+                        *cf != CF_CONSENSUS_META
+                            || !(k.as_slice() == META_RUNNING_STATE_HASH
+                                || k.as_slice() == META_RUNNING_STATE_HASH_ACTIVATION
+                                || k.as_slice() == META_STATE_HASH_CONFIGURED_ACTIVATION
+                                || k.as_slice() == META_STATE_HASH_BOOK_WINDOW
+                                || k.starts_with(META_STATE_HASH_CHECKPOINT_PREFIX))
+                    })
+                    .cloned()
+                    .collect();
+                (*cf, rows)
+            })
+            .collect()
+    }
+
+    /// `run`'s dump at durable height `h`.
+    fn l61_dump_at(run: &P2Run, h: u64) -> &[CfDump] {
+        &run
+            .dumps
+            .iter()
+            .find(|(s, _)| *s == h)
+            .unwrap_or_else(|| panic!("no dump at {h}"))
+            .1
+    }
+
+    /// Proposal `id`'s status in `dump`.
+    fn l61_proposal_status(
+        dump: &[CfDump],
+        id: u64,
+    ) -> torus_economics::governance::ProposalStatus {
+        let rows = &dump
+            .iter()
+            .find(|(cf, _)| *cf == torus_state::cf::CF_GOVERNANCE_PROPOSALS)
+            .expect("proposals CF dumped")
+            .1;
+        let (_, v) = rows
+            .iter()
+            .find(|(k, _)| k.as_slice() == id.to_be_bytes())
+            .expect("proposal row");
+        borsh::from_slice::<torus_economics::governance::Proposal>(v)
+            .unwrap()
+            .status
+    }
+
+    /// Whether `dump` holds the liquidation walk's cursor row.
+    fn l61_liq_cursor(dump: &[CfDump]) -> bool {
+        dump.iter()
+            .find(|(cf, _)| *cf == torus_state::cf::CF_NATIVE_LIQUIDATION)
+            .is_some_and(|(_, rows)| {
+                rows.iter()
+                    .any(|(k, _)| k.as_slice() == torus_core::liquidation::CURSOR_KEY)
+            })
+    }
+
+    /// L6.1 review P1/P2: an EMPTY attest height (100, not an epoch boundary
+    /// here) runs the native phase on an L6.1 chain, and that changes state:
+    /// proposal 1 (vote ended at 40) finalizes and proposal 2 (timelock 60)
+    /// executes AT 100, and the liquidation pass walks the traders and writes
+    /// its cursor (more traders than one pass scans), which makes 101 due
+    /// (the walk ends there and clears it). On an L6.1-off chain nothing in
+    /// 1..=130 runs the native phase (so the transition really differs).
+    /// Every L6.1 node agrees, at every height it made durable (full dump,
+    /// native root, running hash): serial with and without resident books,
+    /// pipelined with L3.1 on (checkpoints every 7, epoch fast path) and off
+    /// (no time closes, barriers), a restart just before 100 (W fails 98
+    /// after E ran 99, the replay re-runs both), and a node whose META rows
+    /// are stale (no configured activation, no L6.1 row) while its genesis
+    /// chain config has L6.1 on: the execution rule comes from the chain
+    /// config, so it runs the same state transition (its hash rows differ,
+    /// it has no chain; compared without them).
+    #[test]
+    fn l61_forced_attest_block_runs_the_same_transition_on_every_node() {
+        use torus_bridge::native_executor::BookMode;
+        use torus_economics::governance::ProposalStatus as S;
+        let mut blocks: Vec<TorusBlock> = (1..=130).map(|h| make_block(h, vec![])).collect();
+        link_blocks(&mut blocks);
+        let classic = Some(BookMode::Classic);
+        let golden = l61_forced_run(
+            &blocks,
+            L61Node::On,
+            true,
+            classic,
+            None,
+            false,
+            None,
+            &P2Fault::None,
+        );
+        assert_eq!(golden.max_lag, 0, "golden: per-block flush");
+        let at = |h| l61_dump_at(&golden, h);
+        for h in [L61_GOV_END + 1, L61_GOV_EXEC, 99] {
+            assert_eq!(l61_proposal_status(at(h), 1), S::Active, "1 at {h}");
+            assert_eq!(l61_proposal_status(at(h), 2), S::Passed, "2 at {h}");
+            assert!(!l61_liq_cursor(at(h)), "no cursor at {h}");
+        }
+        assert_eq!(l61_proposal_status(at(100), 1), S::Rejected, "1 finalizes at 100");
+        assert_eq!(l61_proposal_status(at(100), 2), S::Executed, "2 executes at 100");
+        assert!(l61_liq_cursor(at(100)), "the pass at 100 stops at the scan budget");
+        assert!(!l61_liq_cursor(at(101)), "101 is due and ends the walk");
+        let off = l61_forced_run(
+            &blocks,
+            L61Node::Off,
+            true,
+            classic,
+            None,
+            false,
+            None,
+            &P2Fault::None,
+        );
+        assert_eq!(l61_proposal_status(&off.dump, 1), S::Active, "off: never finalized");
+        assert_eq!(l61_proposal_status(&off.dump, 2), S::Passed, "off: never executed");
+        assert!(!l61_liq_cursor(&off.dump), "off: no pass ran");
+        assert_ne!(
+            l61_state(l61_dump_at(&off, 100)),
+            l61_state(at(100)),
+            "L6.1 changes the state transition at 100"
+        );
+        for (what, pipelined, mode, ckpt, coalesce, fast, fault) in [
+            ("serial", false, classic, None, false, None, P2Fault::None),
+            ("serial, no resident books", false, None, None, false, None, P2Fault::None),
+            (
+                "L3.1 every 7, epoch fast path",
+                true,
+                classic,
+                Some(ckpt_every(7)),
+                true,
+                Some(true),
+                P2Fault::None,
+            ),
+            (
+                "L3.1 off, never (barriers)",
+                true,
+                classic,
+                Some(ckpt_never()),
+                false,
+                None,
+                P2Fault::None,
+            ),
+            (
+                "restart before 100",
+                true,
+                classic,
+                None,
+                false,
+                None,
+                P2Fault::CrashAfter(vec![97]),
+            ),
+        ] {
+            let run = l61_forced_run(
+                &blocks,
+                L61Node::On,
+                pipelined,
+                mode,
+                ckpt,
+                coalesce,
+                fast,
+                &fault,
+            );
+            assert_eq!(l31_divergence(&golden, &run), None, "{what}");
+            assert_eq!(golden.hash, run.hash, "{what}: running hash");
+            if let P2Fault::CrashAfter(_) = fault {
+                assert_eq!(run.faults, 1, "{what}: crashed once");
+            }
+        }
+        let stale = l61_forced_run(
+            &blocks,
+            L61Node::StaleMeta,
+            true,
+            classic,
+            None,
+            false,
+            None,
+            &P2Fault::None,
+        );
+        for h in 1..=130 {
+            assert_dumps_equal(
+                &l61_state(at(h)),
+                &l61_state(l61_dump_at(&stale, h)),
+                &format!("stale META: state at {h}"),
+            );
+        }
+    }
+
+    /// L6.1 review P1: with genesis L6.1 on, a boot that cannot apply the
+    /// running-hash activation config to META refuses to start (the digest
+    /// reads those rows; before, the error was only logged). The node's DB
+    /// holds L6.1's row as the genesis wants it but no configured activation,
+    /// and is read-only, so the write fails. With L6.1 off the same failure
+    /// is still only logged and the node starts (unchanged).
+    #[test]
+    fn l61_boot_refuses_when_the_activation_config_cannot_be_applied() {
+        let (mut config, _scratch) = make_test_config_and_db();
+        config.state_hash_activation_height = Some(1);
+        config.book_window_commit = true;
+        let dir = scratch_db_dir("torus-l61-boot-ro");
+        {
+            let db = StateDb::open(&dir).unwrap();
+            torus_state::running_hash::configure_book_window(&db, Some(1)).unwrap();
+        }
+        let ro = StateDb::open_read_only(&dir).unwrap();
+        match TorusApp::try_new(ro, &config, None, None, None) {
+            Ok(_) => panic!("L6.1 on: boot must refuse a failed activation config"),
+            Err(e) => assert!(e.contains("activation"), "{e}"),
+        }
+        let off_dir = scratch_db_dir("torus-l61-boot-ro-off");
+        drop(StateDb::open(&off_dir).unwrap());
+        config.book_window_commit = false;
+        let ro = StateDb::open_read_only(&off_dir).unwrap();
+        assert!(
+            TorusApp::try_new(ro, &config, None, None, None).is_ok(),
+            "L6.1 off: logged only"
+        );
     }
 
     /// Item 6 Phase 3: the barrier fixture. `pipeline_fixture_blocks` (13

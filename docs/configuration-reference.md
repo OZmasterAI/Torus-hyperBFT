@@ -92,6 +92,7 @@ which governance can change (see the two "EVM blocks" sections below).
 | `fee_validator_bps` | u16 | 0 | Fee to block proposer (basis points) |
 | `fee_treasury_bps` | u16 | 4500 | Fee to treasury (basis points) |
 | `fee_dev_pool_bps` | u16 | 4500 | Fee to dev pool (basis points) |
+| `book_window_commit` | bool | false | L6.1 window-committed Classic order books, **consensus-changing** (state transition and running state hash), chain-wide. Genesis key `consensus.book_window_commit` (absent = off). Needs `consensus.state_hash_activation_height` (refused otherwise) and the Classic book mode (a node with `TORUS_BOOK_ROWS` 1 / 2 / 3 refuses to start). From the activation height, the running hash skips `cf_native_order_books` except at every 100th height, where the block always runs the native phase (even when empty: governance finalizes / executes due proposals and the liquidation pass runs there), writes the blob of every book and hashes them. Allows `TORUS_BOOK_COALESCE` with the hash on. Design: `docs/plans/l61-window-committed-books.md`. |
 
 ## EVM blocks (item 7 step 1)
 

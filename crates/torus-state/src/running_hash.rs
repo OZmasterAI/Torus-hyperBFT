@@ -320,27 +320,32 @@ fn discard_stored_chain(
 /// Hash `cf_id` of `cf_native_order_books` (frozen, [`HASHED_CFS`]).
 pub const ID_NATIVE_ORDER_BOOKS: u8 = 3;
 
-/// L6.1: whether this node's chain config has window-committed books
-/// (`META_STATE_HASH_BOOK_WINDOW`, written at boot by
-/// [`configure_book_window`]).
-pub fn read_book_window(db: &StateDb) -> bool {
-    matches!(
-        db.get_cf_raw(CF_CONSENSUS_META, META_STATE_HASH_BOOK_WINDOW)
-            .ok()
-            .flatten()
-            .as_deref(),
-        Some([1])
-    )
+/// L6.1: the node-local copy of the chain config's L6.1 activation height
+/// (`ChainConfig::book_window_activation`; `META_STATE_HASH_BOOK_WINDOW`,
+/// written at boot by [`configure_book_window`]), `None` = off. Read by the
+/// digest only; the execution rule takes the chain config itself.
+pub fn read_book_window(db: &StateDb) -> Option<u64> {
+    db.get_cf_raw(CF_CONSENSUS_META, META_STATE_HASH_BOOK_WINDOW)
+        .ok()
+        .flatten()
+        .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+        .map(u64::from_be_bytes)
 }
 
-/// L6.1: apply the chain config's `book_window_commit` at boot, after
+/// L6.1: apply the chain config's L6.1 activation
+/// (`ChainConfig::book_window_activation`) at boot, after
 /// [`configure_activation`] and before any block is flushed. It is part of
 /// the chain's definition (it changes the hash preimage), so a change with a
 /// stored chain discards that chain, as an activation change does. Returns
 /// whether a stored chain was discarded.
-pub fn configure_book_window(db: &StateDb, on: bool) -> Result<bool, crate::StateError> {
-    let previous = read_book_window(db);
-    if previous == on {
+pub fn configure_book_window(db: &StateDb, on: Option<u64>) -> Result<bool, crate::StateError> {
+    let stored = db.get_cf_raw(CF_CONSENSUS_META, META_STATE_HASH_BOOK_WINDOW)?;
+    let previous = stored
+        .as_deref()
+        .and_then(|v| <[u8; 8]>::try_from(v).ok())
+        .map(u64::from_be_bytes);
+    // An undecodable row (not 8 bytes) counts as a change: rewritten.
+    if previous == on && (on.is_some() || stored.is_none()) {
         // Unchanged: no write (a read-only DB opens with the same config).
         return Ok(false);
     }
@@ -351,49 +356,63 @@ pub fn configure_book_window(db: &StateDb, on: bool) -> Result<bool, crate::Stat
     if reset {
         discard_stored_chain(&mut batch, cf, &checkpoints);
         tracing::warn!(
-            previous,
-            on,
+            ?previous,
+            ?on,
             "running state hash: book_window_commit config changed, stored chain discarded"
         );
     }
-    if on {
-        batch.put_cf(cf, META_STATE_HASH_BOOK_WINDOW, [1u8]);
+    if let Some(a) = on {
+        batch.put_cf(cf, META_STATE_HASH_BOOK_WINDOW, a.to_be_bytes());
     } else {
         batch.delete_cf(cf, META_STATE_HASH_BOOK_WINDOW);
     }
     db.write(batch)?;
     tracing::info!(
-        on,
+        ?on,
         "running state hash: L6.1 window-committed books (chain config)"
     );
     Ok(reset)
 }
 
-/// L6.1 rule, digest side: whether block `height`'s digest hashes its
-/// `cf_native_order_books` (hash id 3) entries. Off (`book_window` false):
-/// always, as before L6.1. On: only at attest heights
-/// (`height % STATE_HASH_CHECKPOINT_INTERVAL == 0`), where the block's
-/// Classic save wrote every book ([`book_window_full_save_at`]).
+/// L6.1: whether window-committed books apply at `height`: `book_window`
+/// (the L6.1 activation height, `ChainConfig::book_window_activation`) is
+/// set and `height` >= it. Both rules below require it explicitly, so a
+/// later L6.1 activation above the hash activation (P0.0) keeps today's
+/// preimage and execution below it.
 #[inline]
-pub fn books_hashed_at(book_window: bool, height: u64) -> bool {
-    !book_window || height.is_multiple_of(STATE_HASH_CHECKPOINT_INTERVAL)
+pub fn book_window_active(book_window: Option<u64>, height: u64) -> bool {
+    book_window.is_some_and(|a| height >= a)
 }
 
-/// L6.1 rule, execution side: whether block `height`'s Classic save writes
-/// the blob of every book (and its native path runs even if the block has
-/// nothing else to do): L6.1 on, the running hash configured and
-/// `height` >= its activation, and `height` an attest height. Reads META
-/// only at attest heights.
-pub fn book_window_full_save_at(db: &StateDb, height: u64) -> bool {
-    height.is_multiple_of(STATE_HASH_CHECKPOINT_INTERVAL)
-        && read_configured_activation(db).is_some_and(|a| height >= a)
-        && read_book_window(db)
+/// L6.1 rule, digest side: whether block `height`'s digest hashes its
+/// `cf_native_order_books` (hash id 3) entries. Inactive at `height`
+/// ([`book_window_active`]): always, as before L6.1. Active: only at attest
+/// heights (`height % STATE_HASH_CHECKPOINT_INTERVAL == 0`), where the
+/// block's Classic save wrote every book ([`book_window_full_save_at`]).
+#[inline]
+pub fn books_hashed_at(book_window: Option<u64>, height: u64) -> bool {
+    !book_window_active(book_window, height)
+        || height.is_multiple_of(STATE_HASH_CHECKPOINT_INTERVAL)
+}
+
+/// L6.1 rule, execution side (CONSENSUS: it changes the state transition,
+/// not only the hash): whether block `height` runs the native phase even
+/// with nothing else due, and its Classic save writes the blob of every
+/// book: L6.1 active at `height` ([`book_window_active`]) and `height` an
+/// attest height. The forced native phase runs every block-level step
+/// (governance finalization and execution, the liquidation pass, ...), so
+/// the caller passes its CHAIN CONFIG's activation
+/// (`ChainConfig::book_window_activation`), never a node-local META row.
+#[inline]
+pub fn book_window_full_save_at(book_window: Option<u64>, height: u64) -> bool {
+    book_window_active(book_window, height)
+        && height.is_multiple_of(STATE_HASH_CHECKPOINT_INTERVAL)
 }
 
 /// [`books_hashed_at`] for a digest flushing into `db`, with the test-only
 /// mutation seam ([`set_book_window_mutant`]) applied.
 #[inline]
-pub(crate) fn books_hashed_for(db: &StateDb, book_window: bool, height: u64) -> bool {
+pub(crate) fn books_hashed_for(db: &StateDb, book_window: Option<u64>, height: u64) -> bool {
     let rule = books_hashed_at(book_window, height);
     #[cfg(feature = "test-probes")]
     {
@@ -543,7 +562,7 @@ pub struct ChainMemo {
     unverified: Option<u64>,
     prev: Option<(u64, [u8; 32])>,
     /// L6.1: [`read_book_window`] (chain config, fixed after boot).
-    book_window: bool,
+    book_window: Option<u64>,
 }
 
 impl ChainMemo {
@@ -558,8 +577,8 @@ impl ChainMemo {
         }
     }
 
-    /// L6.1: the chain config's window-committed books flag, as loaded.
-    pub fn book_window(&self) -> bool {
+    /// L6.1: the chain config's L6.1 activation height, as loaded.
+    pub fn book_window(&self) -> Option<u64> {
         self.book_window
     }
 

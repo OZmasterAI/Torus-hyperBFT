@@ -24,12 +24,39 @@ With L6.1 on, for every hashed height n (hash step Start / Continue, i.e. n >= a
    The native path is forced at these heights (like epoch boundaries, `run_native`), so an empty block still commits.
 
 Hence `h_n` is a function of block contents only: the book bytes enter at a height fixed by the chain, never by a
-node-local window. A clean book's rewrite is the stored value, so the state (every CF, native root) is unchanged by L6.1;
-only the hash preimage changes. The set "every book in the context" is the set of decodable stored blobs (the load
-reads them all; the resident holder carries the same set, which the resident goldens already rely on).
+node-local window. The set "every book in the context" is the set of decodable stored blobs (the load reads them all;
+the resident holder carries the same set, which the resident goldens already rely on).
 
-**Versus L6.1 off (same blocks):** `W_on(n) = W_off(n) \ {id 3}` for n % 100 != 0; `W_on(n) = W_off(n) \ {id 3} ∪
-{(3, market, blob) for every book after n}` for n % 100 == 0. Below activation nothing is hashed, as today.
+**L6.1 changes the state transition, not only the preimage (review correction, s131).** A clean book's rewrite is the
+stored value, so the book save itself leaves every CF as it was. But forcing the native phase at an attest height that
+would otherwise skip it (an empty block with nothing due) runs every block-level step of that phase at n. The steps
+that can then change state at n (instead of at the next native block, which may be much later):
+
+* **Governance** (`process_governance(n)`): a proposal whose vote ended before n finalizes at n; a passed proposal
+  whose timelock expired executes at n (its payload's rows, e.g. a parameter change).
+* **Liquidation pass** (`run_liquidations`): it walks the positioned traders from its cursor. With more traders than
+  one pass scans (`LIQ_SCAN_PER_BLOCK`) the pass at n writes the cursor, which makes n + 1, ... due until the walk
+  ends; it also rewrites the ADL mark-base rows and acts on any account that a pass would classify differently now
+  (e.g. a mark that aged out since the last native block).
+* No change from the others when they are not due: the oracle step aggregates only with submission rows (which make the
+  block due anyway), the CoreWriter drain only due rows, fees only with revenue, the epoch step only at boundaries, the
+  EVM gas counter only with gas; the nonce-window prune runs on both paths.
+
+So the execution rule is consensus in its own right. Every node takes it from its genesis chain config
+(`ChainConfig::book_window_activation`, carried on `ExecutionContext`), never from node-local META, and with L6.1 on a
+node that cannot apply the running-hash META rows at boot refuses to start (the digest reads them). Test:
+`l61_forced_attest_block_runs_the_same_transition_on_every_node` (an empty attest height, not an epoch boundary, with a
+proposal expiring before it and more traders than one pass scans: every node variant, including stale META, runs the
+same transition at 100).
+
+**Activation.** Both rules require `n >= H_l61` explicitly (`running_hash::book_window_active`); today `H_l61` is the
+hash activation height, so below it nothing is hashed. With P0.0 `H_l61` may be later: below it the digest hashes books
+as without L6.1 and no height is forced.
+
+**Versus L6.1 off (same blocks):** where the attest block runs the native phase in both (it has work, or a step is due),
+`W_on(n) = W_off(n) \ {id 3}` for n % 100 != 0 and `W_on(n) = W_off(n) \ {id 3} ∪ {(3, market, blob) for every book
+after n}` for n % 100 == 0. Where only L6.1 forces it, the state can differ from n on (above). Below activation nothing
+is hashed, as today.
 
 ## 3. L3.1 with the hash on
 
@@ -52,10 +79,12 @@ the debt into the closing layer exactly as L3.1 does (those bytes are never hash
 
 * Genesis `consensus.book_window_commit: bool`, default false (absent = off = today's hash preimage). Copied into
   `ChainConfig.book_window_commit`. `validate`: requires `state_hash_activation_height` (inert otherwise).
-* Boot: `running_hash::configure_book_window(db, on)` right after `configure_activation`, before the replay; stored in
-  META `state_hash_book_window` (node-local key, never hashed). A change with a stored chain discards it, as an
-  activation change does. The digest reads it (serial: META; flush worker: `ChainMemo`), E reads the same row
-  (`book_window_full_save_at`), so both sides apply one rule.
+* Boot: `running_hash::configure_book_window(db, ChainConfig::book_window_activation())` right after
+  `configure_activation`, before the replay; stored in META `state_hash_book_window` (the L6.1 activation height, 8 BE;
+  node-local key, never hashed). A change with a stored chain discards it, as an activation change does. With L6.1 on,
+  a failure of either write refuses the boot. The digest reads the row (serial: META; flush worker: `ChainMemo`). E
+  does NOT: `ExecutionContext::book_window` is set from the chain config, and `book_window_full_save_at(activation, n)`
+  is a pure function of it and n, because the forced native phase is a state transition (section 2).
 * Refuse to start if L6.1 is on and the book mode is not Classic (`TORUS_BOOK_ROWS`): row modes write per-order rows to
   the same CF, which this rule would drop.
 * All nodes agree because it is in genesis, like the activation height. When P0.0 lands it becomes

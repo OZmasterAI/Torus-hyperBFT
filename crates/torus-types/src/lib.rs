@@ -1742,6 +1742,21 @@ fn default_backoff_cap() -> u32 {
 }
 
 impl ChainConfig {
+    /// L6.1: the first height of window-committed books, `None` = off.
+    /// Today `book_window_commit` starts with the running hash
+    /// (`state_hash_activation_height`); with P0.0 it becomes its own
+    /// activation height. Every L6.1 rule (the digest's book filter and the
+    /// execution's forced full save at attest heights) is a function of this
+    /// value and the height only, so every node applies the same rule from
+    /// its chain config.
+    pub fn book_window_activation(&self) -> Option<u64> {
+        if self.book_window_commit {
+            self.state_hash_activation_height
+        } else {
+            None
+        }
+    }
+
     /// FIX CONS-PF-04: Validate chain configuration parameters.
     pub fn validate(&self) -> Result<(), String> {
         if self.epoch_length == 0 {

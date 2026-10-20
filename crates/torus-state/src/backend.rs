@@ -6299,42 +6299,46 @@ mod tests {
         assert_eq!(read_running_hash(&db), None, "disabled: nothing hashed");
     }
 
-    /// L6.1 digest rule: book entries are hashed at every height with the
-    /// flag off, and only at attest heights with it on.
+    /// L6.1 digest rule: book entries are hashed at every height with L6.1
+    /// off, and with it on only at attest heights AT OR ABOVE its activation
+    /// (below it, as before L6.1: review P2, an L6.1 activation above the
+    /// hash activation keeps today's preimage below it).
     #[test]
     fn running_hash_book_window_rule() {
         use crate::running_hash::books_hashed_at;
-        for h in [1, 37, 99, 100, 101, 199, 200, 5_000] {
-            assert!(books_hashed_at(false, h), "off: {h}");
+        for h in [1, 37, 99, 100, 101, 149, 150, 199, 200, 201, 5_000] {
+            assert!(books_hashed_at(None, h), "off: {h}");
             assert_eq!(
-                books_hashed_at(true, h),
+                books_hashed_at(Some(1), h),
                 h % STATE_HASH_CHECKPOINT_INTERVAL == 0,
-                "on: {h}"
+                "on from 1: {h}"
+            );
+            assert_eq!(
+                books_hashed_at(Some(150), h),
+                h < 150 || h % STATE_HASH_CHECKPOINT_INTERVAL == 0,
+                "on from 150: {h}"
             );
         }
     }
 
-    /// L6.1 execution rule: the full book save runs at attest heights at or
-    /// above the hash activation, only with the flag and the hash configured.
+    /// L6.1 execution rule: the full book save (and the forced native
+    /// phase) runs at attest heights at or above the L6.1 activation, and
+    /// only from the activation it is given (the chain config's), whatever
+    /// the DB's META holds.
     #[test]
     fn running_hash_book_window_full_save_at() {
-        use crate::running_hash::{
-            book_window_full_save_at, configure_activation, configure_book_window,
-        };
-        let (db, _d) = rsh_db();
-        let at = |db: &StateDb| -> Vec<u64> {
-            [0, 1, 99, 100, 101, 150, 200, 300]
+        use crate::running_hash::book_window_full_save_at;
+        let at = |l61: Option<u64>| -> Vec<u64> {
+            [0, 1, 99, 100, 101, 150, 199, 200, 300]
                 .into_iter()
-                .filter(|h| book_window_full_save_at(db, *h))
+                .filter(|h| book_window_full_save_at(l61, *h))
                 .collect()
         };
-        assert!(at(&db).is_empty(), "flag off");
-        configure_book_window(&db, true).unwrap();
-        assert_eq!(at(&db), vec![100, 200, 300]);
-        configure_activation(&db, Some(150)).unwrap();
-        assert_eq!(at(&db), vec![200, 300], "not below the activation");
-        configure_activation(&db, None).unwrap();
-        assert!(at(&db).is_empty(), "the hash is off");
+        assert!(at(None).is_empty(), "off");
+        assert_eq!(at(Some(1)), vec![100, 200, 300]);
+        assert_eq!(at(Some(100)), vec![100, 200, 300], "at the activation");
+        assert_eq!(at(Some(150)), vec![200, 300], "not below the activation");
+        assert_eq!(at(Some(301)), Vec::<u64>::new());
     }
 
     /// L6.1: `book_window_commit` is part of the chain's definition. An
@@ -6349,19 +6353,37 @@ mod tests {
         }
         let before = read_running_hash(&db);
         assert!(before.is_some());
-        assert!(!configure_book_window(&db, false).unwrap(), "same config");
+        assert!(!configure_book_window(&db, None).unwrap(), "same config");
         assert_eq!(read_running_hash(&db), before, "same config: chain kept");
-        assert!(!read_book_window(&db) && !ChainMemo::load(&db).book_window());
-        assert!(configure_book_window(&db, true).unwrap(), "changed");
-        assert!(read_book_window(&db) && ChainMemo::load(&db).book_window());
+        assert_eq!(read_book_window(&db), None);
+        assert_eq!(ChainMemo::load(&db).book_window(), None);
+        assert!(configure_book_window(&db, Some(1)).unwrap(), "changed");
+        assert_eq!(read_book_window(&db), Some(1));
+        assert_eq!(ChainMemo::load(&db).book_window(), Some(1));
         assert_eq!(read_running_hash(&db), None, "changed: chain discarded");
         assert!(checkpoint_heights(&db).is_empty());
         assert!(
-            !configure_book_window(&db, true).unwrap(),
+            !configure_book_window(&db, Some(1)).unwrap(),
             "same config again"
         );
-        assert!(configure_book_window(&db, false).is_ok());
-        assert!(!read_book_window(&db));
+        // Another L6.1 activation is another chain definition too.
+        for h in 1..=3 {
+            flush_block(&db, h);
+        }
+        assert!(read_running_hash(&db).is_some());
+        assert!(configure_book_window(&db, Some(7)).unwrap(), "activation moved");
+        assert_eq!(read_running_hash(&db), None);
+        assert_eq!(read_book_window(&db), Some(7));
+        // An undecodable row (the pre-review `[1]`) is rewritten.
+        db.put_cf_raw(CF_CONSENSUS_META, crate::cf::META_STATE_HASH_BOOK_WINDOW, &[1])
+            .unwrap();
+        assert_eq!(read_book_window(&db), None);
+        assert!(configure_book_window(&db, None).is_ok());
+        assert_eq!(
+            db.get_cf_raw(CF_CONSENSUS_META, crate::cf::META_STATE_HASH_BOOK_WINDOW)
+                .unwrap(),
+            None
+        );
     }
 
     /// L6.1 digest on the serial flush: with the flag on, a block's book
@@ -6387,7 +6409,7 @@ mod tests {
         for on in [false, true] {
             let (db, _d) = temp_db();
             configure_activation(&db, Some(98)).unwrap();
-            configure_book_window(&db, on).unwrap();
+            configure_book_window(&db, on.then_some(98)).unwrap();
             let mut expect = [0u8; 32];
             for h in 98..=201 {
                 let w = writes(h);
@@ -6403,6 +6425,46 @@ mod tests {
             }
             assert_eq!(checkpoint_heights(&db), vec![100, 200], "on {on}");
         }
+    }
+
+    /// L6.1 review P2: the digest rule requires `h >= activation` itself.
+    /// The hash from 98 and L6.1 from 150 (a later activation, as P0.0 would
+    /// allow): books are hashed at every height 98..=149 (100 included) as
+    /// without L6.1, and from 150 only at attest heights (200).
+    #[test]
+    fn running_hash_book_window_digest_waits_for_its_activation() {
+        use crate::cf::CF_NATIVE_ORDER_BOOKS;
+        use crate::running_hash::{
+            configure_activation, configure_book_window, ID_NATIVE_ORDER_BOOKS,
+        };
+        let (db, _d) = temp_db();
+        configure_activation(&db, Some(98)).unwrap();
+        configure_book_window(&db, Some(150)).unwrap();
+        let mut expect = [0u8; 32];
+        let mut hashed_books = Vec::new();
+        for h in 98..=201u64 {
+            let w = vec![
+                (CF_NATIVE_BALANCES, vec![7], Some(h.to_be_bytes().to_vec())),
+                (
+                    CF_NATIVE_ORDER_BOOKS,
+                    2u64.to_be_bytes().to_vec(),
+                    Some(vec![h as u8; 40]),
+                ),
+            ];
+            rsh_overlay(&db, &w)
+                .flush_with_native_trie_stats(&db, Some(h), None, None)
+                .unwrap();
+            let mut hashed = rsh_expected(&w);
+            if h >= 150 && h % STATE_HASH_CHECKPOINT_INTERVAL != 0 {
+                hashed.retain(|e| e.0 != ID_NATIVE_ORDER_BOOKS);
+            } else {
+                hashed_books.push(h);
+            }
+            expect = next_running_hash(&expect, h, &hashed);
+            assert_eq!(read_running_hash(&db), Some((h, expect)), "h_{h}");
+        }
+        assert_eq!(hashed_books.len(), 52 + 1, "98..=149 and 200");
+        assert_eq!(hashed_books.last(), Some(&200));
     }
 
     /// Review finding 7: the multi-layer merge is a streaming k-way merge;
