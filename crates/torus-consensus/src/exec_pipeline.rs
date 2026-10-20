@@ -742,6 +742,31 @@ pub struct WorkerEnv {
     /// before its batch (the crash seam; test-only).
     #[cfg(test)]
     pub test_evm_step_panic: Option<Arc<AtomicBool>>,
+    /// b1 (`docs/plans/deep-book-save-options.md` section 4): the planted
+    /// fault of the b1 harness's mutation checks (`B1_MUT_*`; test-only).
+    #[cfg(test)]
+    pub test_b1_mutation: Option<Arc<std::sync::atomic::AtomicU8>>,
+}
+
+/// b1 mutation (test-only): W applies a deferred book save in a `Digest`
+/// over the DB only, skipping the window's side rows.
+#[cfg(test)]
+pub const B1_MUT_SKIP_SIDE: u8 = 1;
+/// b1 mutation (test-only): E plants a book-CF write into a deferred
+/// block's own set (the tripwire must fail-stop it).
+#[cfg(test)]
+pub const B1_MUT_PLANT_E_BOOK: u8 = 2;
+/// b1 mutation (test-only): E clears "the open window has deferred books"
+/// at a non-barrier checkpoint.
+#[cfg(test)]
+pub const B1_MUT_CLEAR_FLAG: u8 = 3;
+
+/// The b1 mutation armed in `env` (0: none; test-only).
+#[cfg(test)]
+fn b1_mutation(env: &WorkerEnv) -> u8 {
+    env.test_b1_mutation
+        .as_ref()
+        .map_or(0, |m| m.load(Ordering::SeqCst))
 }
 
 impl FlushWorker {
@@ -1709,6 +1734,7 @@ mod tests {
                 test_paths: None,
                 test_drain: None,
                 test_evm_step_panic: None,
+                test_b1_mutation: None,
             },
             dir,
         )

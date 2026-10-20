@@ -1388,6 +1388,15 @@ struct ExecutionContext {
     /// EVM trie step (the crash seam).
     #[cfg(test)]
     test_evm_step_panic: Arc<AtomicBool>,
+    /// b1 (`docs/plans/deep-book-save-options.md` section 4): shared with
+    /// W; the b1 harness's planted fault (`exec_pipeline::B1_MUT_*`, 0 =
+    /// none).
+    #[cfg(test)]
+    test_b1_mutation: Arc<std::sync::atomic::AtomicU8>,
+    /// b1: an extra checkpoint trigger, asked with the height at every
+    /// end-of-block upkeep (the harness's random checkpoint policy).
+    #[cfg(test)]
+    test_ckpt_due: Option<Arc<dyn Fn(u64) -> bool + Send + Sync>>,
     /// Item 7 option 0 (task 3.6, C9): the EVM bundle accounts of the
     /// pipelined blocks since the last checkpoint / barrier (test-only).
     #[cfg(test)]
@@ -2840,6 +2849,8 @@ impl ExecutionContext {
             test_drain: Some(self.test_drain.clone()),
             #[cfg(test)]
             test_evm_step_panic: Some(self.test_evm_step_panic.clone()),
+            #[cfg(test)]
+            test_b1_mutation: Some(self.test_b1_mutation.clone()),
         };
         self.flush_worker = Some(match self.checkpoint {
             Some(policy) => {
@@ -3158,6 +3169,9 @@ impl ExecutionContext {
                 .is_some_and(|n| height.saturating_sub(st.base) >= n)
             || policy.interval.is_some_and(|iv| since.elapsed() >= iv)
             || policy.max_bytes.is_some_and(|cap| bytes() >= cap);
+        // b1 harness: the random checkpoint policy (test-only trigger).
+        #[cfg(test)]
+        let due = due || self.test_ckpt_due.as_ref().is_some_and(|f| f(height));
         if due {
             let mut layer = st.take_layer();
             if let Some(p) = &fold {
@@ -3175,6 +3189,12 @@ impl ExecutionContext {
             }
             if !self.checkpoint_submit(&mut st, height, layer) {
                 return false;
+            }
+            // b1 mutation (test-only): "the open window has deferred books"
+            // cleared at a non-barrier checkpoint (C in flight is not durable).
+            #[cfg(test)]
+            if self.test_b1_mutation.load(Ordering::SeqCst) == crate::exec_pipeline::B1_MUT_CLEAR_FLAG {
+                self.last_job_books_deferred.store(false, Ordering::SeqCst);
             }
             // C (in flight) now holds every block up to `height`. Step 1:
             // `fold` is usually the last handle on block n-1.
@@ -4893,6 +4913,19 @@ impl ExecutionContext {
             };
             if deferred_books.is_none() {
                 ctx.save_order_books();
+            }
+            // b1 mutation (test-only): an E-side book-CF write on a block
+            // whose book save rides W (the tripwire must fail-stop it).
+            #[cfg(test)]
+            if deferred_books.is_some()
+                && self.test_b1_mutation.load(Ordering::SeqCst)
+                    == crate::exec_pipeline::B1_MUT_PLANT_E_BOOK
+            {
+                let _ = overlay.put_cf_raw(
+                    torus_state::cf::CF_NATIVE_ORDER_BOOKS,
+                    b"b1-planted-e-side-book-row",
+                    &height.to_be_bytes(),
+                );
             }
             #[cfg(test)]
             if self.test_replay_fault == Some(ReplayFault::BookSave) {
@@ -6716,6 +6749,10 @@ impl TorusApp {
             test_drain: Default::default(),
             #[cfg(test)]
             test_evm_step_panic: Default::default(),
+            #[cfg(test)]
+            test_b1_mutation: Default::default(),
+            #[cfg(test)]
+            test_ckpt_due: None,
             #[cfg(test)]
             test_window_evm: Default::default(),
             liq_value_sum: liq_value_sum_enabled(),
@@ -15369,6 +15406,10 @@ mod crash_recovery_tests {
             #[cfg(test)]
             test_evm_step_panic: Default::default(),
             #[cfg(test)]
+            test_b1_mutation: Default::default(),
+            #[cfg(test)]
+            test_ckpt_due: None,
+            #[cfg(test)]
             test_window_evm: Default::default(),
             liq_value_sum: liq_value_sum_enabled(),
             // s124: the epoch fast path is off unless a test sets it.
@@ -20267,6 +20308,7 @@ mod crash_recovery_tests {
                     test_paths: None,
                     test_drain: None,
                     test_evm_step_panic: None,
+                    test_b1_mutation: None,
                 },
                 0,
             )
@@ -29412,6 +29454,24 @@ mod crash_recovery_tests {
         Every5,
         /// Never by time: attest heights, barriers and shutdown only.
         Never,
+        /// b1: attest heights, barriers and shutdown plus a seeded 1 in 4
+        /// chance at every block (windows of random length,
+        /// [`p5_checkpoint`]).
+        Random,
+    }
+
+    /// The checkpoint policy of `ckpt` on `ctx` (`seed`: the random
+    /// policy's draws).
+    fn p5_checkpoint(ctx: &mut ExecutionContext, ckpt: P5Ckpt, seed: u64) {
+        ctx.checkpoint = match ckpt {
+            P5Ckpt::PerBlock => None,
+            P5Ckpt::Every5 => Some(ckpt_every(5)),
+            P5Ckpt::Never | P5Ckpt::Random => Some(ckpt_never()),
+        };
+        if ckpt == P5Ckpt::Random {
+            let rng = std::sync::Mutex::new(C5Rng(0xb1c4_0000 ^ seed));
+            ctx.test_ckpt_due = Some(Arc::new(move |_| rng.lock().unwrap().below(4) == 0));
+        }
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -29828,11 +29888,7 @@ mod crash_recovery_tests {
             let mut ctx = make_exec_ctx(&self.config, &self.db);
             ctx.test_book_mode = Some(self.cfg.mode);
             ctx.metrics = Some(self.metrics.clone());
-            ctx.checkpoint = match self.cfg.ckpt {
-                P5Ckpt::PerBlock => None,
-                P5Ckpt::Every5 => Some(ckpt_every(5)),
-                P5Ckpt::Never => Some(ckpt_never()),
-            };
+            p5_checkpoint(&mut ctx, self.cfg.ckpt, 0);
             ctx.test_block_probe = self.probe.clone();
             p5_configure(&mut ctx, self.path);
             if self.cfg.pipelined && attach {
@@ -32297,11 +32353,7 @@ mod crash_recovery_tests {
             // Production default since s128 (task 3.6: off in one cell).
             ctx.epoch_fast_path = self.cfg.epoch_fast;
             ctx.evm_fast_path = self.cfg.evm_fast;
-            ctx.checkpoint = match self.cfg.ckpt {
-                P5Ckpt::PerBlock => None,
-                P5Ckpt::Every5 => Some(ckpt_every(5)),
-                P5Ckpt::Never => Some(ckpt_never()),
-            };
+            p5_checkpoint(&mut ctx, self.cfg.ckpt, self.cfg.ctl_seed);
             ctx.test_on_complete = Some(o0_hook(self.ledger.clone()));
             if let Some(ctl) = &self.ctl {
                 let c = ctl.clone();
@@ -36935,6 +36987,23 @@ mod crash_recovery_tests {
         cloid: bool,
         deep: bool,
     ) -> (Vec<TorusBlock>, P2Fed, Vec<P2CloidPlace>) {
+        p2_blocks_gen(
+            P2_BLOCKS,
+            ro,
+            cloid,
+            deep.then_some(p2_deep_actions as fn(u64) -> Vec<(u8, NativeAction)>),
+        )
+    }
+
+    /// [`p2_blocks_full`] over heights `1..=n` with the deep traffic of
+    /// `deep` (b1: a 300-block stream; the draws per height are the same,
+    /// so `n = P2_BLOCKS` with [`p2_deep_actions`] is the b0 stream).
+    fn p2_blocks_gen(
+        n: u64,
+        ro: bool,
+        cloid: bool,
+        deep: Option<fn(u64) -> Vec<(u8, NativeAction)>>,
+    ) -> (Vec<TorusBlock>, P2Fed, Vec<P2CloidPlace>) {
         let mut rng = C5Rng(0x9e21_0008);
         let mut fed = P2Fed::default();
         let mut cloid_places: Vec<P2CloidPlace> = Vec::new();
@@ -36964,7 +37033,7 @@ mod crash_recovery_tests {
             order(m, is_buy, price, qty, torus_types::OrderType::Limit)
         };
         let mut blocks = Vec::new();
-        for h in 1..=P2_BLOCKS {
+        for h in 1..=n {
             cur_h.set(h);
             let mut actions = Vec::new();
             let shock = h == 60 || h == 120;
@@ -36996,8 +37065,8 @@ mod crash_recovery_tests {
                     ));
                 }
             }
-            if deep {
-                for (seed, action) in p2_deep_actions(h) {
+            if let Some(deep) = deep {
+                for (seed, action) in deep(h) {
                     actions.push(sign(seed, action));
                 }
             }
@@ -39554,6 +39623,338 @@ mod crash_recovery_tests {
         assert_write_sets_equal(&reference.captured, &ck.captured, "b0 stale holder");
         assert_eq!(reference.hash, ck.hash, "b0 stale holder: running hash");
         assert_dumps_equal(&reference.dump, &ck.dump, "b0 stale holder");
+    }
+
+    // ---- b1 (docs/plans/deep-book-save-options.md section 4, "(b1)"):
+    // book modes 2 / 3 with checkpoints, the book save's pass 2 on W in the
+    // `Digest`, reading through the window's side rows, then the DB. The
+    // golden is the serial mode-3 run of a 300-block deep stream with the
+    // state hash active: every height's `h_n` write set and every CF dump at
+    // every height (incl. `cf_book_order_rows`), through the option 0
+    // ledger (`O0Ledger`). ----
+
+    const B1_BLOCKS: u64 = 300;
+
+    /// The b1 deep traffic: [`p2_deep_actions`] cycled every 120 heights
+    /// (deep levels rest, sweep across chunk boundaries, whole levels and
+    /// stops cancelled, three times over), in front of the P2 sequence's
+    /// own actions (stops near the touch, cancel-alls, crossing places).
+    fn b1_deep_actions(h: u64) -> Vec<(u8, NativeAction)> {
+        p2_deep_actions((h - 1) % 120 + 1)
+    }
+
+    fn b1_blocks() -> Vec<O0Block> {
+        p2_blocks_gen(B1_BLOCKS, false, false, Some(b1_deep_actions))
+            .0
+            .into_iter()
+            .map(|block| O0Block {
+                block,
+                slashes: Vec::new(),
+                fatal: false,
+                section_error: false,
+            })
+            .collect()
+    }
+
+    /// `p2_fixture` with the deep maker and taker funded.
+    fn b1_fixture() -> (ChainConfig, StateDb) {
+        let (config, db) = p2_fixture();
+        p2_deep_seed(&db);
+        (config, db)
+    }
+
+    /// A b1 node in mode 3 (serial when `ckpt` is `None`).
+    fn b1_cfg(ckpt: Option<P5Ckpt>, run: O0Run) -> O0Cfg {
+        let base = match ckpt {
+            None => O0Cfg::serial(),
+            Some(c) => O0Cfg::piped(c, run),
+        };
+        O0Cfg {
+            mode: torus_bridge::native_executor::BookMode::LevelAuthorityChunked,
+            ctl_seed: 0xb1,
+            ..base
+        }
+    }
+
+    /// Run `blocks` through one node per config (own thread and DB), with
+    /// the b1 mutation `mutation` armed on every pipelined node (a planted
+    /// fault may fail-stop it: recorded, not a panic). The nodes come back
+    /// finished.
+    fn b1_run(blocks: &[O0Block], cfgs: &[O0Cfg], mutation: u8) -> Vec<O0Node> {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = cfgs
+                .iter()
+                .map(|cfg| {
+                    s.spawn(move || {
+                        let mut node = O0Node::with_fixture(*cfg, b1_fixture());
+                        if mutation != 0 && cfg.pipelined {
+                            let ctx = node.ctx.as_ref().unwrap();
+                            ctx.test_b1_mutation.store(mutation, Ordering::SeqCst);
+                            node.tolerate_failstop = true;
+                        }
+                        node.run(blocks);
+                        node.finish();
+                        node
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
+        })
+    }
+
+    /// A finished node's final dump (every CF's hash) and running hash.
+    fn b1_final(node: &O0Node) -> (BTreeMap<&'static str, String>, Option<(u64, [u8; 32])>) {
+        let dump = o0_snapshot(&node.db, u64::MAX)
+            .iter()
+            .filter(|(_, rows)| !rows.is_empty())
+            .map(|(cf, rows)| (*cf, o0_short(&o0_cf_hash(rows))))
+            .collect();
+        (dump, torus_state::running_hash::read_running_hash(&node.db))
+    }
+
+    /// The golden (`nodes[0]`, serial) is non-vacuous and complete: a dump
+    /// at every height, deep books rested, filled and cancelled.
+    fn b1_assert_golden_node(golden: &O0Node) {
+        let what = format!("b1 golden {:?}", golden.cfg);
+        assert!(!golden.cfg.pipelined, "{what}: the golden is serial");
+        golden.ledger().assert_complete(B1_BLOCKS, &what);
+        assert_eq!(
+            golden.ledger().dumps.len() as u64,
+            B1_BLOCKS,
+            "{what}: a CF dump at every height"
+        );
+        let trades = StateBackend::iterate_cf(&golden.db, torus_state::cf::CF_NATIVE_TRADES, None)
+            .unwrap()
+            .len();
+        let rows = book_order_rows(&golden.db);
+        println!("{what}: trade rows {trades}, final order rows {rows}");
+        assert!(trades >= 300, "{what}: trade rows {trades}");
+        assert!(rows >= 150, "{what}: order rows {rows}");
+    }
+
+    /// `node` equals the golden: every height's `h_n` write set, action
+    /// status and side rows, the CF dump at every height both hold (all
+    /// CFs, incl. `cf_book_order_rows`), the final dump and running hash;
+    /// its final DB passes boot verify. Returns the dumps compared.
+    fn b1_assert_matches_golden(golden: &O0Node, node: &O0Node) -> u64 {
+        let what = format!("b1 {:?}", node.cfg);
+        assert_eq!(node.failed_at, None, "{what}: fail-stop");
+        node.ledger().assert_complete(B1_BLOCKS, &what);
+        let c = o0_compare(&golden.ledger(), &node.ledger()).unwrap_or_else(|d| {
+            panic!("FINDING: {what} diverged from the golden at {}: {}", d.height, d.what)
+        });
+        assert!(c.hn >= B1_BLOCKS, "{what}: {c:?}");
+        assert_eq!(b1_final(golden), b1_final(node), "{what}: final state");
+        assert!(
+            b0_boot_verify(&node.db, node.cfg.mode, &what) > 0,
+            "{what}: resting orders loaded"
+        );
+        c.dumps
+    }
+
+    /// The pipelined node ran b1: with an interval W applied the deferred
+    /// book saves in its digests (and never through a Flush); at interval
+    /// 0 through Flushes.
+    fn b1_assert_w_saved_books(node: &O0Node) {
+        let what = format!("b1 {:?}", node.cfg);
+        let get = |k: &str| node.paths.get(k).copied().unwrap_or(0);
+        if node.cfg.interval() {
+            assert!(
+                get("w.books.digest") >= B1_BLOCKS / 2,
+                "{what}: deferred book saves on W in digests: {:?}",
+                node.paths
+            );
+            assert_eq!(get("w.books.flush"), 0, "{what}: {:?}", node.paths);
+        } else {
+            assert!(
+                get("w.books.flush") >= B1_BLOCKS / 2,
+                "{what}: deferred book saves on W in flushes: {:?}",
+                node.paths
+            );
+        }
+    }
+
+    /// b1 golden, drained (D): pipelined at interval 0, every 5 blocks and
+    /// a random policy equal the serial mode-3 run at every height.
+    #[test]
+    fn b1_golden_mode3_drained() {
+        let blocks = b1_blocks();
+        let cfgs = [
+            b1_cfg(None, O0Run::D),
+            b1_cfg(Some(P5Ckpt::PerBlock), O0Run::D),
+            b1_cfg(Some(P5Ckpt::Every5), O0Run::D),
+            b1_cfg(Some(P5Ckpt::Random), O0Run::D),
+        ];
+        let nodes = b1_run(&blocks, &cfgs, 0);
+        b1_assert_golden_node(&nodes[0]);
+        for node in &nodes[1..] {
+            let dumps = b1_assert_matches_golden(&nodes[0], node);
+            println!("b1 {:?}: dumps compared {dumps}", node.cfg);
+            assert!(dumps >= 40, "{:?}: dumps compared {dumps}", node.cfg);
+            b1_assert_w_saved_books(node);
+        }
+    }
+
+    /// b1 golden, W-gated (G): the controller parks W (interval 0: each
+    /// block's Flush until the next hand-off; with an interval: each
+    /// checkpoint and the digests queued behind it across 1-4 more
+    /// hand-offs), so windows span stop and meta changes with W behind E.
+    #[test]
+    fn b1_golden_mode3_gated() {
+        let blocks = b1_blocks();
+        let cfgs = [
+            b1_cfg(None, O0Run::D),
+            b1_cfg(Some(P5Ckpt::PerBlock), O0Run::G),
+            b1_cfg(Some(P5Ckpt::Every5), O0Run::G),
+            b1_cfg(Some(P5Ckpt::Random), O0Run::G),
+        ];
+        let nodes = b1_run(&blocks, &cfgs, 0);
+        b1_assert_golden_node(&nodes[0]);
+        for node in &nodes[1..] {
+            let holds = node.ctl.as_ref().unwrap().st.lock().unwrap().holds;
+            assert!(holds >= 10, "{:?}: the controller parked W {holds} times", node.cfg);
+            let dumps = b1_assert_matches_golden(&nodes[0], node);
+            println!("b1 {:?}: holds {holds}, dumps compared {dumps}", node.cfg);
+            b1_assert_w_saved_books(node);
+        }
+    }
+
+    /// Mode 2 (LevelAuthority) on the same stream: every 5 blocks and the
+    /// random policy, D and G, equal its serial run.
+    #[test]
+    fn b1_golden_mode2() {
+        let blocks = b1_blocks();
+        let mode2 = |c: O0Cfg| O0Cfg {
+            mode: torus_bridge::native_executor::BookMode::LevelAuthority,
+            ..c
+        };
+        let cfgs = [
+            mode2(b1_cfg(None, O0Run::D)),
+            mode2(b1_cfg(Some(P5Ckpt::Every5), O0Run::D)),
+            mode2(b1_cfg(Some(P5Ckpt::Random), O0Run::G)),
+        ];
+        let nodes = b1_run(&blocks, &cfgs, 0);
+        b1_assert_golden_node(&nodes[0]);
+        for node in &nodes[1..] {
+            b1_assert_matches_golden(&nodes[0], node);
+            b1_assert_w_saved_books(node);
+        }
+    }
+
+    /// Whether `node` failed the harness against `golden`: a divergence
+    /// (the lowest height) or a fail-stop.
+    fn b1_harness_failure(golden: &O0Node, node: &O0Node) -> Option<String> {
+        if let Some(h) = node.failed_at {
+            return Some(format!("fail-stop at {h}"));
+        }
+        if let Err(d) = o0_compare(&golden.ledger(), &node.ledger()) {
+            return Some(format!("diverged at {}: {}", d.height, d.what));
+        }
+        (b1_final(golden) != b1_final(node)).then(|| "final state differs".to_string())
+    }
+
+    /// Mutation 1: W's pass 2 in a digest reads the DB only (skips the
+    /// window's side rows). It must fail the harness at an in-window stop
+    /// or meta change (a stale diff: a duplicate put, a missed delete or a
+    /// meta rewrite changes the write set), D and G.
+    #[test]
+    fn b1_mutation_w_skips_side_rows_fails() {
+        let blocks = b1_blocks();
+        let cfgs = [
+            b1_cfg(None, O0Run::D),
+            b1_cfg(Some(P5Ckpt::Every5), O0Run::D),
+            b1_cfg(Some(P5Ckpt::Random), O0Run::G),
+        ];
+        let nodes = b1_run(&blocks, &cfgs, crate::exec_pipeline::B1_MUT_SKIP_SIDE);
+        for node in &nodes[1..] {
+            let failure = b1_harness_failure(&nodes[0], node);
+            println!("b1 mutation skip-side {:?}: {failure:?}", node.cfg);
+            assert!(
+                failure.is_some(),
+                "{:?}: W reading the DB only passed the harness",
+                node.cfg
+            );
+        }
+    }
+
+    /// Mutation 2: E writes a book-CF row into a block whose book save
+    /// rides W. The tripwire must fail-stop the node (with an interval and
+    /// at interval 0).
+    #[test]
+    fn b1_mutation_e_side_book_write_trips_tripwire() {
+        let blocks = b1_blocks();
+        let cfgs = [
+            b1_cfg(Some(P5Ckpt::Every5), O0Run::D),
+            b1_cfg(Some(P5Ckpt::PerBlock), O0Run::D),
+        ];
+        let nodes = b1_run(&blocks, &cfgs, crate::exec_pipeline::B1_MUT_PLANT_E_BOOK);
+        for node in &nodes {
+            let tripped = node.paths.get("w.books.tripwire").copied().unwrap_or(0);
+            println!(
+                "b1 mutation e-side book write {:?}: failed at {:?}, tripwire {tripped}",
+                node.cfg, node.failed_at
+            );
+            assert!(node.failed_at.is_some(), "{:?}: no fail-stop", node.cfg);
+            assert_eq!(tripped, 1, "{:?}: tripwire {:?}", node.cfg, node.paths);
+        }
+    }
+
+    /// Mutation 3 (and its control): a stale resident holder right after a
+    /// non-barrier checkpoint `a` whose batch W still holds (C in flight
+    /// carries the window's side rows only in W's memory). With the window
+    /// flag kept until a barrier (b1), the rebuild barriers first and the run
+    /// equals the golden; with the flag cleared at that checkpoint
+    /// (mutation), the rebuild reads books older than the window and the
+    /// run must fail the harness.
+    fn b1_stale_rebuild_after_checkpoint(golden: &O0Node, blocks: &[O0Block], mutation: u8) -> Option<String> {
+        let a: u64 = 15;
+        let mut node = O0Node::with_fixture(b1_cfg(Some(P5Ckpt::Every5), O0Run::D), b1_fixture());
+        node.tolerate_failstop = true;
+        node.ctx
+            .as_ref()
+            .unwrap()
+            .test_b1_mutation
+            .store(mutation, Ordering::SeqCst);
+        node.run(&blocks[..a as usize - 1]);
+        let gate = node.gate.clone().unwrap();
+        gate.hold_checkpoints();
+        o0_step(&node, &blocks[a as usize - 1]);
+        o0_wait("checkpoint a parked", || gate.parked_checkpoint() == Some(a));
+        assert!(read_native_applied_height(&node.db).unwrap_or(0) < a);
+        {
+            let ctx = node.ctx.as_mut().unwrap();
+            let g = gate.clone();
+            ctx.test_before_wait = Some(Arc::new(move |_| g.release()));
+            let holder = std::mem::take(&mut *ctx.resident_books.lock().unwrap());
+            assert_eq!(holder.height(), Some(a), "the holder is at a");
+        }
+        o0_step(&node, &blocks[a as usize]);
+        gate.release();
+        if node.ctx.as_ref().is_some_and(|c| c.exec_failed.load(Ordering::SeqCst)) {
+            node.failed_at = Some(a + 1);
+        } else {
+            node.run(&blocks[a as usize + 1..]);
+        }
+        node.finish();
+        b1_harness_failure(golden, &node)
+    }
+
+    #[test]
+    fn b1_mutation_window_flag_cleared_at_checkpoint_diverges() {
+        let blocks = b1_blocks();
+        let golden = b1_run(&blocks, &[b1_cfg(None, O0Run::D)], 0).remove(0);
+        let control = b1_stale_rebuild_after_checkpoint(&golden, &blocks, 0);
+        assert_eq!(control, None, "b1 (flag until a barrier): stale rebuild after a checkpoint");
+        let mutant = b1_stale_rebuild_after_checkpoint(
+            &golden,
+            &blocks,
+            crate::exec_pipeline::B1_MUT_CLEAR_FLAG,
+        );
+        println!("b1 mutation flag cleared at checkpoint: {mutant:?}");
+        assert!(mutant.is_some(), "clearing the window flag at a checkpoint passed the harness");
     }
 
     /// Three replicas of the reduce-only P2 sequence (OrderRows) with
