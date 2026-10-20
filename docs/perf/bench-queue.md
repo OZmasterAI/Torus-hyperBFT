@@ -878,6 +878,12 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    `torus_commit_manifest_seconds`, `torus_commit_persist_write_seconds` (writer thread),
    `torus_exec_commit_persist_wait_seconds`, `torus_commit_manifest_prune_seconds`. Verdict: does G fall toward 0, at
    no cost to blocks/s or CPU?
+   **Done s72 (ozarchy-9c, section 115; `f72eda52` node `af6b207d`, tools `654f047c`, 5 / 5 cells valid, r2-A rerun for
+   foreign load 0.128 core): G falls ~78%, not to 0: union G A 452 -> B 100 ms (0.22, rounds 0.20 / 0.25), own-window G
+   511 -> 245; in-window p99 917 -> 485 (0.53 [0.42, 0.67]); commit hook in-window p99 815 -> 93 ms. No cost: blocks/s
+   1.20 (16.7 -> 20.1), matched/s 0.997, CPU-s per 1M 1.018 [0.995, 1.040], exec on-CPU per 1k fills 1.026 [0.935,
+   1.126]. Watch: timeouts 0 -> 3 in 24k blocks (5 no_vote view timeouts), writer-thread persist write 2.3x per block,
+   manifest prune p99 115 ms (off the consensus thread).**
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
