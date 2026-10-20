@@ -3,7 +3,22 @@
 Design note, s131 follow-up to perf doc sections 96, 97 and 99. Doc only, no code. Every claim cites code (path:line,
 on origin/main `bcc95fab`) or a results section. Numbers not measured are marked "(estimate)".
 
-**Status (s131): b0 built** on branch `perf/mode3-checkpoints-b0` (not merged). With a checkpoint interval, book modes
+**Status (s131): b1 built** on branch `perf/mode3-b1` (on top of `origin/feat/item7-option0` f8a45a2d plus b0; not
+merged). With a checkpoint interval, book modes 2 / 3 defer pass 2 again: it rides the block's `Job::Digest`; W applies
+it into a sidecar over `window.side`, then the DB (`digest_books_sidecar`, `exec_pipeline.rs`), digests the sidecar with
+the block and merges it into `window.side`, which the checkpoint writes with L and the marker in one batch. Tripwire
+(`books_tripwire`): a deferred job whose own set holds a book-CF key, or a window mixing deferred blocks with E-side
+book writes, fail-stops. `last_job_books_deferred` = "the open window has deferred books" with an interval, cleared only
+by a barrier. Byte cap (open question 7, owner s131: option C): a cap (`TORUS_CHECKPOINT_MAX_BYTES` > 0) with modes 2 / 3
+refuses to start (`check_checkpoint_byte_cap_book_mode`); the cap's estimate is unchanged. W's write half is in
+`torus_flush_worker_save_books_write_seconds` (W only; `exec_save_books_write_seconds` keeps one observation per native
+block wherever it ran). Tests: the golden (serial mode 3, 300-block deep stream, hash on, every `h_n` and every CF dump
+at every height through the option 0 ledger) equals interval 0 / every 5 / random policies in D and G runs, mode 3 and
+mode 2; the three mutations fail the harness (skip side rows: diverges at height 2; planted E-side book write: tripwire
+fail-stop; flag cleared at a non-barrier checkpoint with a stale rebuild while it is held: diverges at a + 1). b0's
+equivalence and crash-replay tests now run the b1 path.
+
+**Earlier status (s131): b0 built** on branch `perf/mode3-checkpoints-b0` (not merged). With a checkpoint interval, book modes
 2 / 3 run the whole `save_order_books` on E (gate at the save in `app.rs`: defer only when `self.checkpoint.is_none()`);
 with no interval (per-block flush) the deferred save on W is unchanged. `check_checkpoint_book_mode` is gone: the
 interval and the 15 s validator default apply to every book mode. Tests: equivalence on a deep-level P2 stream (serial,
