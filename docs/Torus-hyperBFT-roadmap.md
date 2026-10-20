@@ -37,7 +37,7 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
 - **P0.0 activation-height gating:** not started; only `state_hash_activation_height` exists. Tracked in P0.0.
 - **Liquidator-vault deficit (P5):** monitoring is done. Owner s131 (as decided s99): for the testnet, seed the liquidator vault with capital in the genesis, with ADL as the backstop once the vault runs dry; an HLP-style deposit vault before mainnet. Still open: the seed amount. Tracked in P5.
 - **Aliased opaque position rows in the parallel settle:** answer "can they exist?" first, then fix before the testnet genesis. Tracked in Pre-testnet decisions.
-- **EVM proposer concentration (Q12):** pick N coprime to the validator count or rotate by EVM height; genesis-bound. Tracked in Pre-testnet decisions.
+- **EVM proposer concentration (Q12):** decided s131: keep N = 11 for the testnet (coprime to 3 / 4 validators); revisit before mainnet. Tracked in Pre-testnet decisions.
 - **Retention default (prune by default or not):** GC-pass logging, from-block-1 check and an 8h rerun first; perf doc sections 95 and 103.6. Tracked in Pre-testnet decisions.
 - **Book storage mode for the genesis (Classic vs mode 3):** bench 8p / 8s and owner decision. Tracked in Pre-testnet decisions and `docs/perf/bench-queue.md`.
 - **Running state hash in the genesis:** whether the testnet genesis sets `consensus.state_hash_activation_height` (absent = running hash off; `docs/plans/running-state-hash-impl.md`). Owner decision before the genesis.
@@ -455,6 +455,8 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
   rotation. Not a throughput issue, but all EVM ordering (and its MEV) sits with one validator. Option 0 does not
   change it. Decide before the testnet genesis: pick N coprime to the validator count, or rotate the EVM proposer by
   EVM height instead of view (consensus change, genesis-bound).
+  **Decision (owner s131): keep N = 11 for the testnet** (coprime to the planned 3 or 4 validators, so no
+  concentration). Revisit before mainnet (rotate by EVM height, own design) once the validator set grows or changes.
 - **Validator history retention.** Prune by default (`--retention-blocks`) only if Q9 (main vs main + RH4 DA body GC
   with `TORUS_RETENTION_BLOCKS=1000`) proves it works; the production N is decided after Q9 (starting point about
   100,000 blocks, about 5-9 h a validator can be offline and still catch up without state sync). Owner s126.
