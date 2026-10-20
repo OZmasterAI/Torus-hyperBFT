@@ -33,11 +33,12 @@ explicitly for mode-3 arms. Each cell logs `cell=<label> book_mode=... <flag>='.
 `cell.node_flags` in summary.json. Pull tools from main before the next campaign.
 
 **Run the queue back to back (owner s131):** archy runs every ready item in queue order without stopping between
-them and without asking. When a campaign's cells finish, launch the next ready item right away; write, commit and
-push the finished item's doc section (perf doc section + its Done line here, on a `docs/perf-section-*` branch;
-18c merges) while the next campaign's warm-up and cells run. Doc work never holds the bench idle. Stop only when the
-queue has no ready item, a cell fails validity, an item needs an owner action (e.g. `perf_event_paranoid`), or 18c
-or the owner says stop; then say why in one line.
+them and without asking. **Nothing runs on archy during measured cells** (owner s131, after a build overlapped 8w's
+cells): no cargo builds, no analysis scripts, no doc work beyond trivial git. Builds, analysis and the previous item's
+doc section (perf doc section + its Done line, on a `docs/perf-section-*` branch; 18c merges) happen in the gap
+between campaigns, then the next ready item launches right away. Stop only when the queue has no ready item, a cell
+fails validity, an item needs an owner action (e.g. `perf_event_paranoid`), or 18c or the owner says stop; then say
+why in one line. Any cell that overlapped a build or other foreign load (check `contention.tsv`) is rerun.
 
 **Exec-path A/B merge rule (owner s128, after section 91):** any A/B that decides a merge of an exec-path change
 judges, besides matched/s, exec ms per 1k fills and CPU-s per 1M fills: **exec-thread on-CPU ms per 1k fills**, native
