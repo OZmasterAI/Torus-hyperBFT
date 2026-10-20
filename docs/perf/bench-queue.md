@@ -646,6 +646,43 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    flush worker is busy 0.11 / 0.12 (8p 0.42 / 0.41). The cost moved to the saturated exec thread: the write half is
    ~20-22 ms per block (save_books 29.8 / 28.3 ms per block). b0 is not enough; if mode 3 is still wanted, build b1
    (the write half off the exec thread, with checkpoints) and re-test both shapes. Gaps 15-17 s shallow, 69 s deep.**
+8t. **L2.2 before default-on: standard-shape A/B + longer timeout check** (owner s131; after 8l; ~2 h 20). L2.2
+   (`TORUS_SETTLE_NO_MERGE`, merged on main flag off, `be65552e`) was benched on the 1M deep book only (8n, 8q: exec
+   on-CPU 0.972, matched/s 1.022; timeouts 7 -> 14 unresolved). One main binary (current), A = flag unset, B =
+   `TORUS_SETTLE_NO_MERGE=1`. (1) **Standard** shape, 300 s, warm-up then A B B A A B (n = 3): exec-path merge rule +
+   settle / pass B / cache flush ms per block, fallbacks (must be 0). (2) **Timeouts**, deep book (8i P1M), **900 s**
+   cells, A B B A (n = 2): timeouts per 1,000 blocks and per pair, view-timeout reasons (`torus_view_timeout_*`),
+   p99. Verdict: default-on candidate or not; say plainly whether timeouts rise with B.
+8u. **L3.3 engine-timer profile** (owner s131; NOW: right after 8s, before 8l; ~40 min). L3.3 (`TORUS_BOOK_FAST_ENCODE`, merged flag off)
+   showed exec engine ms per 1k fills +2.8% [1.020, 1.037] and runqueue wait +5.5% on the deep book (section 97.8),
+   unexplained. One main binary, 1M deep book (8i P1M), A = flag unset, B = `TORUS_BOOK_FAST_ENCODE=1`, one 300 s cell
+   each with the Q8 perf recipe on the exec thread, **`perf_event_paranoid=1` for this run only** (owner sets it before
+   8u and restores 2 after; kernel sampling is needed for page faults, kernel time and off-CPU stacks, which the
+   scheduling-artefact question depends on; log the value at every cell start and end). Report the engine phase split A vs B (match, settle, cancel-all, allocation, memmove,
+   jemalloc, page faults) and whether the rise is real or a scheduling artefact. Only matters if Classic stays.
+8v. **T5.3 attribution: block p99 inside checkpoint windows** (owner s131; after 8u; ~1 h incl. analysis; no code).
+   Roadmap T5.3: during a checkpoint DB write, block p99 sits ~500-650 ms above the out-of-window p99 (sections 87,
+   89); A1 (checkpoint slicing) is parked because its target (manifest put, ~6-12 ms) can't explain it. One main
+   binary, code defaults (15 s checkpoints), standard shape, 3 cells of 600 s. Align every view / block with the
+   checkpoint windows (start / end of each checkpoint write from the checkpoint metrics / log) and split, inside vs
+   outside the windows, the consensus thread's phases (proposal wait, validate, vote, QC collect, commit, manifest /
+   body persist) and the exec thread's (checkpoint upkeep, freeze, flush handoff, settle wait), plus RocksDB write /
+   stall / flush activity and per-thread CPU if sampled. Name the dominant phase of the in-window gap with numbers.
+   This decides whether A1 or something else gets built.
+   **Order (owner s131):** 8u and 8v run **before** the RH4 3-arm rerun (8w; filter built and reviewed, `baffa3a5`). Queue after 8s (8s finished, analysis running): 8u now, then 8l, 8t, 8v, then the RH4 rerun (8w).
+8w. **RH4 3-arm rerun: state pruner compaction filter** (owner s131; after 8v; ~1 h 50). 8r (section 103.6): the
+   cost both retention arms share is state-DB compaction of `cf_block_bodies` from the state pruner's
+   `delete_range_cf` range deletes (compaction CPU x2.0, L0 3.3 vs 1.2). Fix: `perf/rh4-gc-worker` `baffa3a5` (on
+   `a0181b8b`, pushed, not merged; Codex torus review: no findings): `TORUS_PRUNE_MODE=filter` (default) saves the
+   cutoff durably, drops whole SSTs below it (`DeleteFilesInRange`) and lets a compaction filter drop the rest;
+   `TORUS_PRUNE_MODE=range` keeps the old path (microbench: compaction CPU 23.2 -> 7.6 s, write 408 -> 124 MiB).
+   **One binary** from `baffa3a5` (code defaults; 512 KB from `env.sh`; custody 0). Arms: **A** = no retention;
+   **B** = `TORUS_RETENTION_BLOCKS=1000` (filter, the branch default); **C** = `TORUS_RETENTION_BLOCKS=1000` +
+   `TORUS_PRUNE_MODE=range` (as 8r's B), all via `EXTRA_ENV`. Standard unpaced load, 300 markets, 300 s cells,
+   warm-up then A B C C B A twice (n = 4 per arm). Report as 8r plus state-DB compaction CPU per node,
+   `cf_block_bodies` L0 count, SSTs / bytes dropped whole, on-disk size at cell end. Verdicts: B vs A (retention
+   within noise: p50, blocks/s, CPU per fill?) and C vs A (does 8r's cost reproduce on this binary?). Prune-by-default
+   and the RH4 merge wait on this.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 

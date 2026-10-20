@@ -227,7 +227,7 @@ Minimal unsafe usage — only in `hotstuff_rs`:
 
 #### hotstuff_rs/src/block_tree/invariants.rs — Block Tree Safety Invariants
 
-- **CONS-CHK-14**: Commit rule — verify a block is only committed when it has a chain of 3 certified blocks (prepare, precommit, commit QCs per HotStuff).
+- **CONS-CHK-14**: Commit rule and lock depth — Torus commits on a 2-chain (`block_to_commit`: two certified blocks in consecutive views) and locks on the parent (`pc_to_lock` = `justify`; T1.2, `4a94e8bc`). Verify the lock depth matches the commit depth (lock-on-parent for a 2-chain commit; the old grandparent lock is unsafe, `specs/consensus/stateright_2chain_safety.md`). *(s131: was "a chain of 3 certified blocks (prepare, precommit, commit QCs per HotStuff)", stale since the 2-chain fork.)*
 - **CONS-CHK-15**: Locked value — verify the locked block cannot regress (monotonicity of the locked QC view).
 - **CONS-CHK-16** (line 273): Comment mentions "unsafe to commit" — verify the actual invariant check is correct.
 
