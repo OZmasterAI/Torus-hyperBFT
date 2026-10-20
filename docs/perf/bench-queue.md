@@ -747,6 +747,14 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    share = total minus W's), checkpoints per node, any fail-stop / tripwire line (must be 0). **Pass:** deep B1/C
    blocks/s near F/C; shallow B1 >= F on blocks/s and p50; B1 CPU per fill no worse than b0's +8.9% vs Classic
    (section 104); E's write share ~0. If it passes: C vs B1 full A/B, n = 3 per shape (~2 h), right after.
+   **Done s70 (ozarchy-8x, section 109; `ab4ded4e` node `f19d9385`, 8 / 8 cells valid, 250 CHECK OK, 0 tripwire /
+   fail-stop lines; deep C and F rerun after a Telegram overlap, originals kept as *-telegram-unused): FAIL on the CPU
+   rule, A/B not run. CPU-s per 1M fills B1 +13.3% shallow / +11.4% deep vs Classic (limit b0's +8.9%; F +16.8% /
+   +20.1%). Passes the other three: deep B1 / C blocks/s 3.18x (F 1.86x), p50 17 ms (F 75, C 210), matched/s 1.129;
+   shallow B1 11.59 vs F 6.38 blk/s, p50 16 vs 62 ms, matched/s 0.967; E's write share 0. Extra CPU is off the exec
+   thread (exec on-CPU per fill -0.08 / -0.82): W ~+1.4-1.5 (book write + per-block digest), deep state compaction
+   +0.78, unnamed threads ~+1.2. Caveat: shallow Classic on this binary is slow (8.10 blk/s, p50 31 ms vs 12-14 /
+   14-18 elsewhere): check before any A/B. CPU rule vs throughput gain: owner's call.**
 8y. **L3.1 A/B: Classic book save once per checkpoint window** (owner s131; after 8x; ~1 h 30). Classic encodes every
    dirty book's whole blob each block (`save_order_books` 78.9 ms per block at P1M). L3.1 skips the per-block encode and
    encodes each owed book once at every window close. **One binary** `perf/l31-coalesced-save` `b7bb3666` (on option 0
