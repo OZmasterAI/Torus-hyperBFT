@@ -3400,11 +3400,13 @@ pub enum OrderRejectReason {
     DuplicateCloid,
     /// Pre-testnet P0: the order names a market that is not listed.
     UnknownMarket,
+    /// Pre-testnet P1: a non-reduce-only order on a delisted market.
+    MarketDelisted,
 }
 
 impl OrderRejectReason {
     /// Number of reasons (labels).
-    pub const COUNT: usize = 18;
+    pub const COUNT: usize = 19;
 
     /// Every reason in discriminant order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -3426,6 +3428,7 @@ impl OrderRejectReason {
         Self::Other,
         Self::DuplicateCloid,
         Self::UnknownMarket,
+        Self::MarketDelisted,
     ];
 
     /// The label value (the `FailureReason` names of torus-state where one
@@ -3450,6 +3453,7 @@ impl OrderRejectReason {
             Self::Other => "other",
             Self::DuplicateCloid => "duplicate_cloid",
             Self::UnknownMarket => "unknown_market",
+            Self::MarketDelisted => "market_delisted",
         }
     }
 }
