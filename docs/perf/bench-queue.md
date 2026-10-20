@@ -22,6 +22,11 @@ Why: Q7 run 1 (s66) ran the bare defaults (MAX_IN_FLIGHT, IN_FLIGHT_TAIL, OPEN_O
 unset): ~140-156k matched/s instead of ~240-250k, deeper books, ~76k fills per block vs ~50k, ~4.9 vs ~2.9 ms exec per
 1k fills. The A/B stayed fair but not at the load every other bench uses.
 
+**Harness fix (s131, main after `c3c8b142`):** crash cells: rewind bound 2 without checkpoints, 202 with
+checkpoints (section 107's false REJECT fixed); `crash-kill.sh` and `run-cell.sh` count only `panicked` and ERROR-level
+fail-stop / FATAL / conflicting-blocks lines (the INFO "running state hash fail-stop ... on=false" no longer counts).
+Pull tools from main before the next campaign that has crash cells.
+
 **Run the queue back to back (owner s131):** archy runs every ready item in queue order without stopping between
 them and without asking. When a campaign's cells finish, launch the next ready item right away; write, commit and
 push the finished item's doc section (perf doc section + its Done line here, on a `docs/perf-section-*` branch;
