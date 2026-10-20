@@ -1074,15 +1074,40 @@ VALIDATOR_CHECKPOINT_INTERVAL_S = 15.0
 MAX_REWIND_HARD_CAP = PER_BLOCK_REWIND_SLACK + CHECKPOINTS_IN_REWIND * CHECKPOINT_FORCED_STRIDE
 
 
+# Rust `char::is_whitespace` (Unicode White_Space), what `str::trim` strips.
+# Python's str.strip() differs (it also strips U+001C..U+001F).
+RUST_WHITESPACE = ("\t\n\x0b\x0c\r \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004"
+                   "\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000")
+U64_MAX = 2 ** 64 - 1
+
+
+def rust_trim(v):
+    return (v or "").strip(RUST_WHITESPACE)
+
+
+def rust_parse_u64(v):
+    """Rust `v.parse::<u64>()` (v already trimmed): an optional single leading
+    '+', then one or more ASCII digits, value <= u64::MAX; else None (Err)."""
+    body = v[1:] if v.startswith("+") else v
+    if not body or not all("0" <= ch <= "9" for ch in body):
+        return None
+    n = int(body)
+    return n if n <= U64_MAX else None
+
+
 def checkpoint_interval_s(node_env):
     """The checkpoint interval (s) the cell's validators ran, None = per-block
-    flush. Mirrors the node's resolution (see the block comment above)."""
-    if (node_env.get("TORUS_EXEC_PIPELINE") or "").strip() == "0":
+    flush. Mirrors the node's resolution (see the block comment above):
+    exec_pipeline::parse_checkpoint_interval treats a value that is blank
+    after trim as unset (role default); otherwise `trim().parse::<u64>()`,
+    where Ok(0) and every Err (sign '-', non-digits, overflow) mean OFF."""
+    if rust_trim(node_env.get("TORUS_EXEC_PIPELINE")) == "0":
         return None
-    raw = (node_env.get("TORUS_CHECKPOINT_INTERVAL_MS") or "").strip()
+    raw = rust_trim(node_env.get("TORUS_CHECKPOINT_INTERVAL_MS"))
     if raw:
-        return int(raw) / 1000.0 if raw.isdigit() and int(raw) > 0 else None
-    if (node_env.get("TORUS_BOOK_ROWS") or "").strip() in ("2", "3"):
+        ms = rust_parse_u64(raw)
+        return ms / 1000.0 if ms else None
+    if rust_trim(node_env.get("TORUS_BOOK_ROWS")) in ("2", "3"):
         return None
     return VALIDATOR_CHECKPOINT_INTERVAL_S
 

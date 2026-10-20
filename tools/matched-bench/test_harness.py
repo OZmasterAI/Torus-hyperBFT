@@ -1885,6 +1885,38 @@ class CheckpointRewindBoundTest(unittest.TestCase):
             self.assertEqual(c["max_rewind_beyond_exec_queue"], 2, env)
             self.assertEqual(c["verdict"], "FAIL", env)
 
+    def test_interval_parse_matches_the_node(self):
+        """TORUS_CHECKPOINT_INTERVAL_MS parses like the node's
+        exec_pipeline::parse_checkpoint_interval: blank after trim -> the 15 s
+        default; else Rust `trim().parse::<u64>()` (optional leading '+',
+        ASCII digits, <= u64::MAX); 0 or any Err (incl. overflow) -> OFF."""
+        self.crash(gap=4 + 3, queue=4)
+        cases = (
+            ("+15000", 15.0),
+            (" 15000 ", 15.0),
+            ("\t15000\n", 15.0),
+            ("   ", 15.0),            # blank = unset = role default
+            ("18446744073709551615", 18446744073709551615 / 1000.0),  # u64::MAX
+            ("18446744073709551616", None),  # overflow -> Err -> off
+            ("0", None),
+            ("+0", None),
+            ("+", None),
+            ("-15000", None),
+            ("++15000", None),
+            ("15_000", None),
+            ("15000ms", None),
+            ("\u0661\u0665", None),  # non-ASCII digits: Rust rejects
+        )
+        for raw, want in cases:
+            s, _ = run_summarize(
+                self.d, extra=self.env(TORUS_CHECKPOINT_INTERVAL_MS=raw)
+            )
+            c = s["crash"]
+            self.assertEqual(c["checkpoint_interval_s"], want, repr(raw))
+            self.assertEqual(
+                c["max_rewind_beyond_exec_queue"], 2 if want is None else 202, repr(raw)
+            )
+
     def test_each_kill_of_a_multi_crash_cell_gets_the_checkpoint_bound(self):
         self.crash(gap=27, queue=4, seq=1)
         write_crash(
