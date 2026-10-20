@@ -716,7 +716,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    stall / flush activity and per-thread CPU if sampled. Name the dominant phase of the in-window gap with numbers.
    This decides whether A1 or something else gets built.
    **Order (owner s131):** 8u and 8v run before 8l and the RH4 3-arm rerun (8w; filter built and reviewed, `baffa3a5`). **Queue (owner s131, latest):** 8s, 8u, 8v, 8l, 8t, 8x done; **8y running** (L3.1 A/B), then **8z** (Classic
-   cadence check, clears b1), then 8w (RH4 rerun), then 8z2 (conditional, clean b1 build; part 2 paused by the owner). **9a (merged-main baseline) is next.** Run them back to back. A merged-main baseline follows once L2.2
+   cadence check, clears b1), then 8w (RH4 rerun), then 8z2 (conditional, clean b1 build; part 2 paused by the owner). **9a (merged-main baseline) is next**, then 8z2 (resumed), then 9b (L2.1 A/B). Run them back to back. A merged-main baseline follows once L2.2
    default-on lands.
    **L3.3 default-on (owner s131):** `TORUS_BOOK_FAST_ENCODE` becomes on by default (branch `perf/l33-default-on`,
    merges on owner call). Classic cells on any binary built after that merge include L3.3 (section 105: blocks/s
@@ -835,6 +835,17 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    per 1M fills, RSS; and place them next to section 108 B (L2.2 on: 268.6k, 15.58 blk/s) and section 107 Noff / Eon
    (13.88 / 13.41 blk/s) as references (different binaries, so indicative only). No verdict needed beyond "no
    regression visible"; flag anything clearly worse.
+9b. **L2.1 A/B: streamed in-order settle** (owner s131; after 9a and 8z2; ~1 h 30). L2.1 (`TORUS_SETTLE_STREAMED`,
+   default off) starts each market's pass B as soon as that market is matched (in market order) instead of after all
+   markets; on any fallback it undoes the streamed prefix and replays the call on the flag-off path. Branch
+   `perf/l21-streamed-settle` `df9e1d8a` (on main `be87c86e`; 3 Codex/Claude review rounds, last [claude-review]: no
+   findings; nextest 4207/4207; microbench exec wall per call on/off 0.870-0.939 on a busy host). **One binary**
+   `df9e1d8a`, code defaults, Classic, 15 s checkpoints. That base predates L2.2 / L3.3 default-on and option 0, so set
+   explicitly in BOTH arms: `TORUS_SETTLE_NO_MERGE=1 TORUS_BOOK_FAST_ENCODE=1` (production defaults). Arms: **A** =
+   those; **B** = A + `TORUS_SETTLE_STREAMED=1`. Shapes: standard and deep (8i P1M), warm-up then A B B A per shape
+   (n = 2), 300 s cells. Report under the exec-path merge rule: exec-thread on-CPU per 1k fills, native blocks/s, block
+   p50 / p99, timeouts per 1k blocks, matched/s, CPU-s per 1M fills, plus settle / pass B ms per block, pool busy and
+   fallbacks (must be 0 in clean cells). Verdict: merge candidate (default off or on) or not.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
