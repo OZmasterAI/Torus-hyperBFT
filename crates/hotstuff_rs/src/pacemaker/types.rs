@@ -147,6 +147,13 @@ impl TimeoutCertificate {
     /// that block (its local tip is set only by a vote). The `high_tip`
     /// field itself is not signed, so it never counts. Precondition: the TC
     /// [is correct](Certificate::is_correct).
+    ///
+    /// During a validator-set transition the TC is correct under EITHER set,
+    /// so tip power is counted per set only when the TC is
+    /// [correctly signed](Certificate::is_correctly_signed) under that same
+    /// set (signatures authenticated, quorum reached), against that set's own
+    /// faulty threshold: one set's signers never borrow the other set's
+    /// positional weights.
     pub fn tip_vouched<K: KVStore>(
         &self,
         block_hash: &CryptoHash,
@@ -188,7 +195,9 @@ impl TimeoutCertificate {
         }
         let total = validator_set.total_power().int();
         let faulty = total - validator_set.quorum().int();
-        power > faulty
+        // Verify last (ed25519 per signer): count only signers authenticated
+        // under this same set.
+        power > faulty && self.is_correctly_signed(validator_set)
     }
 }
 
@@ -303,5 +312,135 @@ impl Collector for TimeoutVoteCollector {
         }
 
         None
+    }
+}
+
+/// Pre-testnet P1 (stop-review WARN): during a validator-set transition a TC
+/// is correct under EITHER set, so [`TimeoutCertificate::tip_vouched`] must
+/// count tip power only under a set that authenticates the signatures (and
+/// reaches its quorum), with that set's own faulty threshold. Otherwise a TC
+/// signed by the previous set could borrow the committed set's positional
+/// weights (same size, different members and powers) and vouch falsely.
+#[cfg(test)]
+mod tip_vouched_tests {
+    use super::*;
+    use crate::hotstuff::header_fast_path_regression_test::{signing_keys, MemKV};
+    use crate::types::crypto_primitives::{Keypair, SigningKey};
+    use crate::types::update_sets::AppStateUpdates;
+
+    const VIEW: u64 = 1;
+    const BLOCK: CryptoHash = CryptoHash::new([51; 32]);
+
+    /// `powers[i]` goes to the validator at POSITION `i` (sorted by key).
+    fn set_with(keys: &[SigningKey], powers: &[u64]) -> ValidatorSet {
+        let mut sorted: Vec<_> = keys.iter().map(|k| k.verifying_key()).collect();
+        sorted.sort_by_key(|vk| vk.to_bytes());
+        let mut vs = ValidatorSet::new();
+        for (vk, p) in sorted.iter().zip(powers) {
+            vs.put(vk, Power::new(*p));
+        }
+        vs
+    }
+
+    /// A TC signed by the validators at `positions` of `set`; signed tip
+    /// `BLOCK` for the first `tips` of them, none for the rest.
+    fn tc(
+        set: &ValidatorSet,
+        keys: &[SigningKey],
+        positions: &[usize],
+        tips: usize,
+    ) -> TimeoutCertificate {
+        let view = ViewNumber::new(VIEW);
+        let mut signatures = SignatureSet::new(set.len());
+        let mut voter_metadata = vec![(None, None); set.len()];
+        for (i, &pos) in positions.iter().enumerate() {
+            let vk = set.validators().nth(pos).copied().unwrap();
+            let sk = keys.iter().find(|k| k.verifying_key() == vk).unwrap();
+            let tip = (i < tips).then_some(BLOCK);
+            let mut msg = (ChainID::new(0), view).try_to_vec().unwrap();
+            if let Some(hash) = tip {
+                msg.extend_from_slice(&hash.bytes());
+            }
+            signatures.set(pos, Some(Keypair::new(sk.clone()).sign(&msg)));
+            voter_metadata[pos] = (tip, None);
+        }
+        TimeoutCertificate {
+            chain_id: ChainID::new(0),
+            view,
+            signatures,
+            high_tip: None,
+            high_qc: None,
+            high_tip_is_winner: true,
+            voter_metadata,
+        }
+    }
+
+    fn tree(committed: &ValidatorSet, previous: &ValidatorSet) -> BlockTreeSingleton<MemKV> {
+        let vss = ValidatorSetState::new(
+            committed.clone(),
+            previous.clone(),
+            Some(BlockHeight::new(0)),
+            false,
+        );
+        let mut tree = BlockTreeSingleton::new(MemKV::default());
+        tree.initialize(&AppStateUpdates::new(), &vss).unwrap();
+        tree
+    }
+
+    /// Previous set: 4 x power 1. Committed set: 4 OTHER validators, power
+    /// 100 at position 0. A previous-set TC (3 signers, one signed tip at
+    /// position 0, not > f = 1) must not vouch via the committed set's
+    /// weights, whose signatures it never authenticated.
+    #[test]
+    fn tc_of_one_set_does_not_borrow_the_other_sets_weights() {
+        let prev_keys = signing_keys(&[1, 2, 3, 4]);
+        let comm_keys = signing_keys(&[5, 6, 7, 8]);
+        let previous = set_with(&prev_keys, &[1, 1, 1, 1]);
+        let committed = set_with(&comm_keys, &[100, 1, 1, 1]);
+        let tree = tree(&committed, &previous);
+        let tc = tc(&previous, &prev_keys, &[0, 1, 2], 1);
+        assert!(
+            tc.is_correct(&tree).unwrap(),
+            "correct under the previous set"
+        );
+        assert!(!tc.is_correctly_signed(&committed));
+        assert!(
+            !tc.tip_vouched(&BLOCK, &tree).unwrap(),
+            "1 of 4 previous-set power is not > f; committed weights must not count"
+        );
+    }
+
+    /// Same, reversed: a committed-set TC must not vouch via the previous
+    /// set's weights.
+    #[test]
+    fn committed_tc_does_not_borrow_previous_weights() {
+        let prev_keys = signing_keys(&[1, 2, 3, 4]);
+        let comm_keys = signing_keys(&[5, 6, 7, 8]);
+        let previous = set_with(&prev_keys, &[100, 1, 1, 1]);
+        let committed = set_with(&comm_keys, &[1, 1, 1, 1]);
+        let tree = tree(&committed, &previous);
+        let tc = tc(&committed, &comm_keys, &[0, 1, 2], 1);
+        assert!(tc.is_correct(&tree).unwrap());
+        assert!(!tc.tip_vouched(&BLOCK, &tree).unwrap());
+    }
+
+    /// Control: under the authenticating set, > f signed tips still vouch,
+    /// in either direction of the transition.
+    #[test]
+    fn authenticated_tips_over_f_still_vouch_during_transition() {
+        let prev_keys = signing_keys(&[1, 2, 3, 4]);
+        let comm_keys = signing_keys(&[5, 6, 7, 8]);
+        let previous = set_with(&prev_keys, &[1, 1, 1, 1]);
+        let committed = set_with(&comm_keys, &[100, 1, 1, 1]);
+        let tree = tree(&committed, &previous);
+        let prev_tc = tc(&previous, &prev_keys, &[0, 1, 2], 2);
+        assert!(prev_tc.tip_vouched(&BLOCK, &tree).unwrap());
+        // Committed-set TC: power 100 (position 0) + 1 signs, tip only at
+        // position 1 (power 1): not > f; tip at position 0 (100): > f.
+        let low = tc(&committed, &comm_keys, &[1, 0], 1);
+        assert!(low.is_correct(&tree).unwrap());
+        assert!(!low.tip_vouched(&BLOCK, &tree).unwrap());
+        let high = tc(&committed, &comm_keys, &[0, 1], 1);
+        assert!(high.tip_vouched(&BLOCK, &tree).unwrap());
     }
 }
