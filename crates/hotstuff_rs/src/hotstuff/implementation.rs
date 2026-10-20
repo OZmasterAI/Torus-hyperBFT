@@ -1467,18 +1467,7 @@ impl<N: Network> HotStuff<N> {
                 &proposal.block.justify,
             ) && (block_tree.highest_view_voted()?.is_none()
                 || block_tree.highest_view_voted()?.unwrap() < self.view_info.view)
-                && Self::vote_check(
-                    &proposal.block,
-                    block_tree,
-                    app,
-                    Self::authenticated_reproposal(
-                        self.view_info.view,
-                        &proposal.block.hash,
-                        proposal.tc.as_ref(),
-                        has_valid_nec,
-                        block_tree,
-                    )?,
-                )? == BlockDataCheck::Held
+                && Self::vote_check(&proposal.block, block_tree, app)? == BlockDataCheck::Held
             {
                 let vote_phase = if validator_set_updates.is_some() {
                     Phase::Prepare
@@ -2674,15 +2663,8 @@ impl<N: Network> HotStuff<N> {
         } else if block_tree.contains(&hash) {
             // Rebase s87 (T0b): validated on insertion, but vote-time-only rules
             // (the local-clock bound) are in the data check alone.
-            let reproposal = Self::authenticated_reproposal(
-                header.view,
-                &hash,
-                header.tc.as_ref(),
-                header.nec.is_some(),
-                block_tree,
-            )?;
             let check = match block_tree.block(&hash)? {
-                Some(block) => Self::vote_check(&block, block_tree, app, reproposal)?,
+                Some(block) => Self::vote_check(&block, block_tree, app)?,
                 None => BlockDataCheck::Missing,
             };
             match check {
@@ -2701,19 +2683,7 @@ impl<N: Network> HotStuff<N> {
                 }
             }
         } else if let Some(block) = body.filter(|block| block.hash == hash) {
-            let reproposal = Self::authenticated_reproposal(
-                header.view,
-                &hash,
-                header.tc.as_ref(),
-                header.nec.is_some(),
-                block_tree,
-            )?;
-            let view = block_tree.app_view(None)?;
-            let check = if reproposal {
-                app.check_reproposal_data(block, &view)
-            } else {
-                app.check_block_data(block, &view)
-            };
+            let check = app.check_block_data(block, &block_tree.app_view(None)?);
             match check {
                 BlockDataCheck::Held => true,
                 BlockDataCheck::Missing => {
@@ -2744,22 +2714,12 @@ impl<N: Network> HotStuff<N> {
     /// inserted): it may vote only on `Held`. Vote-time-only rules (the
     /// local-clock bound on the block timestamp) live there, never in
     /// `validate_block`, so insertion of a certified block never applies them.
-    ///
-    /// Pre-testnet P1: `reproposal` ([`Self::authenticated_reproposal`])
-    /// asks [`App::check_reproposal_data`] instead, which may skip vote-time
-    /// freshness rules for a block consensus forces to be proposed again.
     fn vote_check<K: KVStore>(
         block: &Block,
         block_tree: &BlockTreeSingleton<K>,
         app: &mut impl App<K>,
-        reproposal: bool,
     ) -> Result<BlockDataCheck, HotStuffError> {
-        let view = block_tree.app_view(None)?;
-        let check = if reproposal {
-            app.check_reproposal_data(block, &view)
-        } else {
-            app.check_block_data(block, &view)
-        };
+        let check = app.check_block_data(block, &block_tree.app_view(None)?);
         if check != BlockDataCheck::Held {
             log::warn!(
                 "not voting (yet): {} fails the pre-vote data check ({check:?})",
@@ -2767,53 +2727,6 @@ impl<N: Network> HotStuff<N> {
             );
         }
         Ok(check)
-    }
-
-    /// Pre-testnet P1 (Codex review): whether the proposal of `block_hash` in
-    /// `view` is an AUTHENTICATED re-proposal — a block consensus forces the
-    /// leader to propose again, whose vote-time freshness rules
-    /// ([`App::check_reproposal_data`]) were already met when it was first
-    /// voted, so a long stall cannot make it unvotable forever:
-    ///
-    /// 1. the block holds this replica's highest phase certificate (the
-    ///    re-proposal of an interrupted validator-set-updating block,
-    ///    [`repropose_block`]): a quorum already voted for it; or
-    /// 2. `tc` (no NEC: a NEC makes the proposal fresh) is a correct timeout
-    ///    certificate of `view - 1` whose winning high tip is this block,
-    ///    AND either its signers whose signed local tip is this block hold
-    ///    more than the faulty power ([`TimeoutCertificate::tip_vouched`]:
-    ///    an honest replica voted for it) or this replica's own local tip is
-    ///    this block (it voted for it itself).
-    ///
-    /// The TC's `high_tip` field is not signed, so a TC alone never vouches:
-    /// a leader cannot dress a fresh stale block up as a re-proposal.
-    fn authenticated_reproposal<K: KVStore>(
-        view: ViewNumber,
-        block_hash: &CryptoHash,
-        tc: Option<&crate::pacemaker::types::TimeoutCertificate>,
-        has_nec: bool,
-        block_tree: &BlockTreeSingleton<K>,
-    ) -> Result<bool, HotStuffError> {
-        if block_tree.highest_pc()?.block == *block_hash {
-            return Ok(true);
-        }
-        let Some(tc) = tc.filter(|_| !has_nec) else {
-            return Ok(false);
-        };
-        if !tc.high_tip_is_winner
-            || tc
-                .high_tip
-                .as_ref()
-                .is_none_or(|tip| tip.block_hash != *block_hash)
-            || tc.view.int().checked_add(1) != Some(view.int())
-            || !tc.is_correct(block_tree)?
-        {
-            return Ok(false);
-        }
-        Ok(tc.tip_vouched(block_hash, block_tree)?
-            || block_tree
-                .local_tip()?
-                .is_some_and(|tip| tip.block_hash == *block_hash))
     }
 
     /// Phase-vote for `header`, the current view's checked proposal header
@@ -5440,310 +5353,6 @@ mod vote_after_body_tests {
         f.body();
         assert_eq!(f.tree.highest_view_voted().unwrap(), None);
         assert!(f.hotstuff.awaiting_body_vote.is_none());
-    }
-}
-
-/// Pre-testnet P1 (Codex review): a replica whose app refuses a block on a
-/// vote-time freshness rule (Torus: the block-timestamp lower bound) still
-/// votes for its AUTHENTICATED re-proposal — the winning high tip of a
-/// correct timeout certificate of the previous view, vouched for by more
-/// than the faulty power of its signers' signed tips or by the replica's own
-/// local tip — so a stall longer than the bound cannot wedge consensus. A
-/// fresh proposal of the same block, or one whose TC does not vouch for it,
-/// is still refused.
-#[cfg(test)]
-mod reproposal_vote_tests {
-    use super::*;
-    use crate::hotstuff::header_fast_path_regression_test::{
-        hotstuff_at, proposer_for, signing_keys, steady_block_tree, validator_set, MemKV,
-        NullNetwork,
-    };
-    use crate::hotstuff::types::PhaseCertificate;
-    use crate::pacemaker::types::{TimeoutCertificate, TipInfo};
-    use crate::types::crypto_primitives::{Keypair, SigningKey};
-    use crate::types::data_types::{Data, SignatureSet};
-    use crate::types::validator_set::ValidatorSet;
-    use borsh::BorshSerialize;
-
-    /// Refuses every block on the fresh path ("too old"); the re-proposal
-    /// path passes. Counts both.
-    #[derive(Default)]
-    struct StaleApp {
-        fresh_checks: usize,
-        reproposal_checks: usize,
-    }
-    impl App<MemKV> for StaleApp {
-        fn produce_block(&mut self, _: ProduceBlockRequest<MemKV>) -> ProduceBlockResponse {
-            unreachable!()
-        }
-        fn validate_block(&mut self, _: ValidateBlockRequest<MemKV>) -> ValidateBlockResponse {
-            ValidateBlockResponse::Valid {
-                app_state_updates: None,
-                validator_set_updates: None,
-            }
-        }
-        fn validate_block_for_sync(
-            &mut self,
-            _: ValidateBlockRequest<MemKV>,
-        ) -> ValidateBlockResponse {
-            unreachable!()
-        }
-        fn check_block_data(
-            &mut self,
-            _: &Block,
-            _: &crate::block_tree::accessors::app::AppBlockTreeView<'_, MemKV>,
-        ) -> BlockDataCheck {
-            self.fresh_checks += 1;
-            BlockDataCheck::Invalid
-        }
-        fn check_reproposal_data(
-            &mut self,
-            _: &Block,
-            _: &crate::block_tree::accessors::app::AppBlockTreeView<'_, MemKV>,
-        ) -> BlockDataCheck {
-            self.reproposal_checks += 1;
-            BlockDataCheck::Held
-        }
-    }
-
-    const VIEW: u64 = 2;
-
-    /// A TC for view `VIEW - 1` signed by `signers`, each with signed local
-    /// tip `tips[i]`; `high_tip` (unsigned) names `block`.
-    fn tc_for(
-        block: &Block,
-        signers: &[&SigningKey],
-        tips: &[Option<CryptoHash>],
-        set: &ValidatorSet,
-    ) -> TimeoutCertificate {
-        let view = ViewNumber::new(VIEW - 1);
-        let mut signatures = SignatureSet::new(set.len());
-        let mut voter_metadata = vec![(None, None); set.len()];
-        for (sk, tip) in signers.iter().zip(tips) {
-            let mut msg = (ChainID::new(0), view).try_to_vec().unwrap();
-            if let Some(hash) = tip {
-                msg.extend_from_slice(&hash.bytes());
-            }
-            let pos = set.position(&sk.verifying_key()).unwrap();
-            signatures.set(pos, Some(Keypair::new((*sk).clone()).sign(&msg)));
-            voter_metadata[pos] = (*tip, None);
-        }
-        TimeoutCertificate {
-            chain_id: ChainID::new(0),
-            view,
-            signatures,
-            high_tip: Some(TipInfo {
-                block_hash: block.hash,
-                block_height: block.height,
-                block_justify: block.justify.clone(),
-                block_data_hash: block.data_hash,
-                view,
-            }),
-            high_qc: None,
-            high_tip_is_winner: true,
-            voter_metadata,
-        }
-    }
-
-    struct Replica {
-        hotstuff: HotStuff<NullNetwork>,
-        tree: BlockTreeSingleton<MemKV>,
-        app: StaleApp,
-        block: Block,
-        origin: VerifyingKey,
-        keys: Vec<SigningKey>,
-        set: ValidatorSet,
-    }
-
-    impl Replica {
-        /// A follower (not the view-`VIEW` leader) of 4 validators at view `VIEW`.
-        fn new() -> Self {
-            let keys = signing_keys(&[1, 2, 3, 4]);
-            let set = validator_set(&keys);
-            let (tree, vss) = steady_block_tree(&set);
-            let view = ViewNumber::new(VIEW);
-            let origin = proposer_for(view, &keys, &vss, &tree);
-            let local = keys
-                .iter()
-                .find(|k| k.verifying_key() != origin)
-                .unwrap()
-                .clone();
-            let hotstuff = hotstuff_at(view, local, vss);
-            let block = Block::new(
-                BlockHeight::new(0),
-                PhaseCertificate::genesis_pc(),
-                CryptoHash::new([51; 32]),
-                Data::new(vec![]),
-            );
-            Replica {
-                hotstuff,
-                tree,
-                app: StaleApp::default(),
-                block,
-                origin,
-                keys,
-                set,
-            }
-        }
-        fn others(&self) -> Vec<&SigningKey> {
-            let me = self.hotstuff.config.keypair.public();
-            self.keys
-                .iter()
-                .filter(|k| k.verifying_key() != me)
-                .collect()
-        }
-        fn header(&self, tc: Option<TimeoutCertificate>) -> ProposalHeader {
-            ProposalHeader {
-                chain_id: ChainID::new(0),
-                view: ViewNumber::new(VIEW),
-                block_hash: self.block.hash,
-                height: self.block.height,
-                data_hash: self.block.data_hash,
-                justify: self.block.justify.clone(),
-                tc,
-                nec: None,
-                has_validator_set_updates: false,
-            }
-        }
-        fn receive(&mut self, msg: HotStuffMessage) {
-            self.hotstuff
-                .on_receive_msg(msg, &self.origin, &mut self.tree, &mut self.app)
-                .unwrap();
-        }
-        /// Header-first (the production path), then the body.
-        fn header_then_body(&mut self, tc: Option<TimeoutCertificate>) {
-            self.receive(self.header(tc).into());
-            let body = BlockDataResponse {
-                view: ViewNumber::new(VIEW),
-                block: self.block.clone(),
-            };
-            self.receive(body.into());
-        }
-        fn voted(&self) -> bool {
-            self.tree.highest_view_voted().unwrap() == Some(ViewNumber::new(VIEW))
-        }
-    }
-
-    #[test]
-    fn tc_reproposal_of_a_stale_block_is_voted_header_first() {
-        let mut r = Replica::new();
-        let tip = Some(r.block.hash);
-        let tc = tc_for(&r.block, &r.others(), &[tip, tip, tip], &r.set);
-        r.header_then_body(Some(tc));
-        assert!(r.voted(), "the vouched re-proposal is voted");
-        assert_eq!((r.app.reproposal_checks, r.app.fresh_checks), (1, 0));
-    }
-
-    #[test]
-    fn tc_reproposal_of_a_stale_block_is_voted_full_proposal() {
-        let mut r = Replica::new();
-        let tip = Some(r.block.hash);
-        let tc = tc_for(&r.block, &r.others(), &[tip, tip, None], &r.set);
-        let msg = HotStuffMessage::Proposal(Proposal {
-            chain_id: ChainID::new(0),
-            view: ViewNumber::new(VIEW),
-            block: r.block.clone(),
-            tc: Some(tc),
-            nec: None,
-        });
-        r.receive(msg);
-        assert!(r.voted(), "2 of 4 signed tips (> f = 1) vouch");
-        assert_eq!((r.app.reproposal_checks, r.app.fresh_checks), (1, 0));
-    }
-
-    /// The replica's own local tip vouches when the TC's signed tips do not.
-    #[test]
-    fn own_local_tip_vouches_for_the_reproposal() {
-        let mut r = Replica::new();
-        let tip = Some(r.block.hash);
-        let tc = tc_for(&r.block, &r.others(), &[tip, None, None], &r.set);
-        let local_tip = tc.high_tip.clone().unwrap();
-        r.tree.set_local_tip(&local_tip).unwrap();
-        r.header_then_body(Some(tc));
-        assert!(r.voted());
-        assert_eq!(r.app.reproposal_checks, 1);
-    }
-
-    /// A fresh proposal of the stale block (no TC) is refused: the bound holds.
-    #[test]
-    fn fresh_proposal_of_a_stale_block_is_still_refused() {
-        let mut r = Replica::new();
-        r.header_then_body(None);
-        assert!(!r.voted());
-        assert_eq!((r.app.reproposal_checks, r.app.fresh_checks), (0, 1));
-    }
-
-    /// A TC that does not vouch for the block: the unsigned `high_tip`
-    /// alone (signed tips name another block, or only one signer, f = 1,
-    /// names it), a TC of the wrong view, or a bad signature. All take the
-    /// fresh path and are refused.
-    #[test]
-    fn unvouched_or_invalid_tc_takes_the_fresh_path() {
-        let other = Some(CryptoHash::new([7; 32]));
-        type MakeTc = Box<dyn Fn(&Replica) -> TimeoutCertificate>;
-        let cases: Vec<(&str, MakeTc)> = vec![
-            (
-                "signed tips name another block",
-                Box::new(move |r: &Replica| {
-                    tc_for(&r.block, &r.others(), &[other, other, other], &r.set)
-                }),
-            ),
-            (
-                "one signed tip (not > f)",
-                Box::new(|r: &Replica| {
-                    let tip = Some(r.block.hash);
-                    tc_for(&r.block, &r.others(), &[tip, None, None], &r.set)
-                }),
-            ),
-            (
-                "wrong view",
-                Box::new(|r: &Replica| {
-                    let tip = Some(r.block.hash);
-                    let mut tc = tc_for(&r.block, &r.others(), &[tip, tip, tip], &r.set);
-                    tc.view = ViewNumber::new(VIEW - 1 + 5);
-                    tc
-                }),
-            ),
-            (
-                "signed tip substituted (bad signature)",
-                Box::new(move |r: &Replica| {
-                    let tip = Some(r.block.hash);
-                    let mut tc = tc_for(&r.block, &r.others(), &[other, other, other], &r.set);
-                    for m in tc.voter_metadata.iter_mut().filter(|m| m.0.is_some()) {
-                        m.0 = tip;
-                    }
-                    tc
-                }),
-            ),
-        ];
-        for (name, make) in cases {
-            let mut r = Replica::new();
-            let tc = make(&r);
-            r.header_then_body(Some(tc));
-            assert!(!r.voted(), "{name}: not voted");
-            assert_eq!(
-                (r.app.reproposal_checks, r.app.fresh_checks),
-                (0, 1),
-                "{name}"
-            );
-        }
-    }
-
-    /// The validator-set-updating re-proposal (no TC) of a block that holds
-    /// this replica's highest PC: a quorum already voted for it.
-    #[test]
-    fn reproposal_of_the_highest_pc_block_is_voted() {
-        use crate::block_tree::accessors::internal::BlockTreeWriteBatch;
-        use crate::hotstuff::header_fast_path_regression_test::{generic_pc, MemWb};
-        let mut r = Replica::new();
-        let signers: Vec<SigningKey> = r.keys[..3].to_vec();
-        let pc = generic_pc(ViewNumber::new(1), r.block.hash, &signers, &r.set);
-        let mut wb: BlockTreeWriteBatch<MemWb> = BlockTreeWriteBatch::new();
-        wb.set_highest_pc(&pc).unwrap();
-        r.tree.write(wb);
-        r.header_then_body(None);
-        assert!(r.voted());
-        assert_eq!((r.app.reproposal_checks, r.app.fresh_checks), (1, 0));
     }
 }
 

@@ -138,60 +138,6 @@ impl Certificate for TimeoutCertificate {
     }
 }
 
-impl TimeoutCertificate {
-    /// Pre-testnet P1 (re-proposal vote): whether the signers whose SIGNED
-    /// local tip (`voter_metadata`, bound by their signature, see
-    /// [`Certificate::is_correctly_signed`]) is `block_hash` hold more than
-    /// the faulty power (`total - quorum + 1`, "f + 1") of the validator set
-    /// this TC verifies under — so at least one honest replica voted for
-    /// that block (its local tip is set only by a vote). The `high_tip`
-    /// field itself is not signed, so it never counts. Precondition: the TC
-    /// [is correct](Certificate::is_correct).
-    pub fn tip_vouched<K: KVStore>(
-        &self,
-        block_hash: &CryptoHash,
-        block_tree: &BlockTreeSingleton<K>,
-    ) -> Result<bool, BlockTreeError> {
-        let validator_set_state = block_tree.validator_set_state()?;
-        let committed = self
-            .tip_power_exceeds_faulty(block_hash, validator_set_state.committed_validator_set());
-        Ok(committed
-            || (!validator_set_state.update_decided()
-                && self.tip_power_exceeds_faulty(
-                    block_hash,
-                    validator_set_state.previous_validator_set(),
-                )))
-    }
-
-    fn tip_power_exceeds_faulty(
-        &self,
-        block_hash: &CryptoHash,
-        validator_set: &ValidatorSet,
-    ) -> bool {
-        if self.signatures.len() != validator_set.len() {
-            return false;
-        }
-        let mut power: u128 = 0;
-        for (idx, (signature, (_, p))) in self
-            .signatures
-            .iter()
-            .zip(validator_set.validators_and_powers())
-            .enumerate()
-        {
-            let signed_tip = self
-                .voter_metadata
-                .get(idx)
-                .and_then(|(tip, _)| tip.as_ref());
-            if signature.is_some() && signed_tip == Some(block_hash) {
-                power += u128::from(p.int());
-            }
-        }
-        let total = validator_set.total_power().int();
-        let faulty = total - validator_set.quorum().int();
-        power > faulty
-    }
-}
-
 /// Struct that incrementally forms [`TimeoutCertificate`]s by combining [`TimeoutVote`]s with the
 /// same specific `chain_id` and `view` and from the same `validator_set` into a [`SignatureSet`].
 #[derive(Clone, PartialEq)]

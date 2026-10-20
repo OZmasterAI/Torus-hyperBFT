@@ -131,20 +131,6 @@ A now, on this branch (it is the "item 2" as listed), then B as its own item
    crash replay however old it is (catch-up never reads the clock), so it
    cannot wedge. A proposal delivered more than 30 s late gets no vote; the
    view times out and the next leader proposes with `max(now, parent.ts)`.
-   Exception (Codex P1 follow-up, same branch): an AUTHENTICATED
-   re-proposal skips the 30 s bound (hotstuff `check_reproposal_data`,
-   Torus `check_reproposal_proposal_data`; the ahead bound and every other
-   rule still apply). After a timeout certificate whose winning high tip is
-   an uncertified block, the next leader MUST re-propose that exact block
-   and cannot refresh its timestamp, so after a stall over 30 s the bound
-   refused it forever. Authenticated = the TC is correct, of the previous
-   view, its high tip is this block, and either the signers whose SIGNED
-   local tip is this block hold more than the faulty power (an honest
-   replica voted it fresh, within the bound) or this replica's own local
-   tip is this block; or the block holds this replica's highest phase
-   certificate (validator-set-update re-proposal). The TC's `high_tip`
-   field is unsigned and never counts on its own, so a byzantine leader
-   still cannot pass a fresh stale block off as a re-proposal.
    The analysis below was written before that change. A
    byzantine leader can propose `ts = parent.ts` after a stall, so an old
    aggregate has age 0 in that block. A "reject ts < local − 30 s" rule
