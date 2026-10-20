@@ -17451,6 +17451,35 @@ bisects b0 (`704a089d`) vs b1 (`244a767c`) with this same shallow Classic ABBA.
 * Limits: n = 2 (t(0.975, 1) = 12.7, so CIs are wide even though the two pairs agree to 0.005 on blocks/s); one bench / flood pair (`ec15372b` / `dd59d50d`, from `ab4ded4e`; tools/ unchanged between the commits) for both arms.
 * Data: `~/bench-results-matched/ozarchy-8zs-{w1,r1-O,r1-B,r2-B,r2-O}`; smokes `ozarchy-8zs-smoke-s0`, `ozarchy-8zso-smoke-s0`; run `ozarchy-8z-run/` (`8z-analysis.md`, `zs/campaign.log`, `chain-main.log`, `contention-main.tsv`, `posthoc-main.log`, `negtest/`, `analyst/` with `8z-analyse.py`, `8z-cells.tsv`, `8z-series.tsv`, `8z-ref-cells.tsv`, `8z-ref-series.tsv`); tools `ozarchy-8z-tools/` (8z-stage.sh also fixes 8y's lost contention path in the pre-cell log line); stage `ozarchy-8z-stage/{o,b}`.
 
+### 111.8 Follow-up (18c s131, bench queue 8z2 part 1): where B's fewer, bigger blocks come from (analysis of the 8z cells, no new cells)
+
+**The gap is consensus-side, in the long commit intervals; no single phase holds a new fixed wait, and exec cost per
+second is equal.** Mean commit interval O 69.8 vs B 91.2 ms (+21.4 ms per commit). Intervals > 128 ms carry +22.3 ms
+(104% of the gap; the buckets have no 100 ms edge), > 256 ms alone +21.0 ms (98%): 92 vs 144 per 1k commits.
+Timeouts add +0.57 ms per commit (3%; O 0.33 / 0.33, B 2.33 / 1.00 per node, mostly `after_vote`);
+`view_entered_past_deadline` is 0 everywhere; views per commit 1.000.
+
+* Per-view phases scale 1.13-1.45x per view with the same per-second totals (block-size ratio 1.30). Only
+  `qc_to_advance` (collector: PC to the next StartView) is clearly above it in both pairs: 21.1 -> 30.6 ms per view
+  (1.45x; r1 1.38, r2 1.53), its > 256 ms tail 5.0 -> 11.7 per 1k commits. Then `qc_collect` 48.6 -> 60.9 ms (1.25x),
+  `proposal_arrival` 1.31x. The phases nest across roles, so none can be read as the cause.
+* Build / validate: block_build per 1k txs 1.065x (mostly select 1.097x; ~+0.4 ms per commit), validate_block 0.935x.
+* Exec side saturated and equal per second: exec_block 982 vs 986 ms/s; every exec sub-timer within +-6 ms/s and
+  1.22-1.40x per block. Checkpoint upkeep / settle_wait / deferred_join / wait together add < 1 ms per block.
+  exec_queue_depth mean 35.5 vs 34.0, near the 64 cap 25-33% of the time in both arms, with no consensus stall on it.
+  flush_worker 1.31x per call, 1.00x per second.
+* Within cells (10 s bins), wall ms per commit = a + b x txs: O a = 48-50 ms, B a = 75-84 ms (B fits weak, r <= 0.3):
+  B carries ~+30 ms per view independent of block size, so its bigger blocks (1.30x txs per commit, mempool 2.1k vs
+  1.4k) follow from the slower cadence. hotstuff-algo is ~25% on-CPU in both arms (not CPU-bound).
+* `mempool_remove_committed` is the one commit-feed timer above size scaling: 1.32 -> 2.22 ms per block (1.69x), still
+  only ~+0.9 ms per commit.
+* Missing to name the leg: sub-timers inside `qc_to_advance` (commit-chain update, commit persist, mempool
+  remove_committed, the exec send, AdvanceView), hotstuff-algo's off-CPU wait reason, and proposer-selection stats.
+  Next per 8z2 part 2: the fresh-target rebuild of `ab4ded4e` (md5 vs `f19d9385`) tests the top suspect, the build.
+* Confidence: high that the gap lives in the long intervals with equal exec cost per second; medium that B has a
+  size-independent per-view excess; low on which leg. Report: `~/bench-results-matched/ozarchy-8z-tools/analyst/
+  8z-followup.md` (scripts `8z2-extract.py`, `8z2-tables.py`, `8z2-tails.py`, `8z2-regress.py` and outputs alongside).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
