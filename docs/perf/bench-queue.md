@@ -624,8 +624,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    per node, x 2.0, 4 / 4), not the DA GC; with the GC it accounts for CPU per fill; exec us / fill +14-16% in
    state-compaction seconds (23% vs 13% of seconds); blocks/s link medium-low (bigger blocks, saturated exec); no
    RocksDB stalls. Next: retention-on arm with block-body pruning off. Raw 8r data: branch `data/ozarchy-8r` 7c8323ac.**
-8s. **b0 screen: Classic vs mode 3 + b0 (mode 3 with checkpoints)** (owner s131; DONE s131, section 104 pending on
-   `docs/perf-section-104-8s`; ~40 min). 8p
+8s. **b0 screen: Classic vs mode 3 + b0 (mode 3 with checkpoints)** (owner s131; DONE s131, section 104; ~40 min). 8p
    (section 102): mode 3 wins deep (blocks/s 2.16x) but loses shallow (blocks/s 0.62x, p50 3.3x, CPU per fill +17%)
    because modes 2/3 flushed every block. b0 (`perf/mode3-checkpoints-b0` `c2fbfbc0`, Codex torus-adversarial approve,
    137 targeted tests): with a checkpoint interval set, modes 2/3 use checkpoints; the write half of the book save runs
@@ -638,6 +637,14 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    on-CPU per 1k fills, `save_books` ms per block and per 1k fills, flush-worker ms per 1k fills and busy share,
    CPU-s per 1M fills, RSS; and compare with 8p's mode 3 (per-block flush) cells. Question: does b0 close mode 3's
    shallow gap while keeping most of its deep win? It decides whether b1 gets built. Tools: main `3aaaa046` or later.
+   **Done s68 (ozarchy-8s = 8ss shallow + 8sd deep, section 104; b0 `c2fbfbc0` node `fde31231`, tools `be87c86e`, 6 / 6
+   cells valid, md5 18 / 18, 0 CHECK FAIL; every B node ran 15 s checkpoints with the b0 exec-thread save, no per-block
+   flush): no, b0 widens the shallow gap: matched/s B / A 0.911 (8p 0.937), blocks/s 13.65 -> 3.99 (3.2x fills per
+   block), p50 14 -> 136 ms, timeouts 1 -> 9. It keeps a smaller deep win: matched/s 1.061 (8p 1.087), blocks/s 1.28x
+   (8p 2.16x), p50 189 -> 107 ms. CPU per 1M fills falls to +8.9% / +5.7% over Classic (8p +17.3% / +18.5%) and the
+   flush worker is busy 0.11 / 0.12 (8p 0.42 / 0.41). The cost moved to the saturated exec thread: the write half is
+   ~20-22 ms per block (save_books 29.8 / 28.3 ms per block). b0 is not enough; if mode 3 is still wanted, build b1
+   (the write half off the exec thread, with checkpoints) and re-test both shapes. Gaps 15-17 s shallow, 69 s deep.**
 8t. **L2.2 before default-on: standard-shape A/B + longer timeout check** (owner s131; after 8l; ~2 h 20). L2.2
    (`TORUS_SETTLE_NO_MERGE`, merged on main flag off, `be65552e`) was benched on the 1M deep book only (8n, 8q: exec
    on-CPU 0.972, matched/s 1.022; timeouts 7 -> 14 unresolved). One main binary (current), A = flag unset, B =
@@ -645,13 +652,21 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    settle / pass B / cache flush ms per block, fallbacks (must be 0). (2) **Timeouts**, deep book (8i P1M), **900 s**
    cells, A B B A (n = 2): timeouts per 1,000 blocks and per pair, view-timeout reasons (`torus_view_timeout_*`),
    p99. Verdict: default-on candidate or not; say plainly whether timeouts rise with B.
-8u. **L3.3 engine-timer profile** (owner s131; DONE s131, section 105 pending; ~40 min). L3.3 (`TORUS_BOOK_FAST_ENCODE`, merged flag off)
+8u. **L3.3 engine-timer profile** (owner s131; DONE s131, section 105; ~40 min). L3.3 (`TORUS_BOOK_FAST_ENCODE`, merged flag off)
    showed exec engine ms per 1k fills +2.8% [1.020, 1.037] and runqueue wait +5.5% on the deep book (section 97.8),
    unexplained. One main binary, 1M deep book (8i P1M), A = flag unset, B = `TORUS_BOOK_FAST_ENCODE=1`, one 300 s cell
    each with the Q8 perf recipe on the exec thread, **`perf_event_paranoid=1` for this run only** (owner sets it before
    8u and restores 2 after; kernel sampling is needed for page faults, kernel time and off-CPU stacks, which the
    scheduling-artefact question depends on; log the value at every cell start and end). Report the engine phase split A vs B (match, settle, cancel-all, allocation, memmove,
    jemalloc, page faults) and whether the rise is real or a scheduling artefact. Only matters if Classic stays.
+   **Done s70 (ozarchy-8u, section 105; main `0e514a5c` node `bbc03997`, 3 / 3 cells valid, 73 CHECK OK, 0 FAIL;
+   paranoid 1 throughout, restored to 2 after; no contention overlap): not a scheduling artefact (exec runqueue per 1k
+   fills +1.3%, 8kd +5.5%). With one binary, engine per 1k fills is +2.0% node-consistent (+3.1% in 97.8's definition),
+   n = 1, not resolved: 44% of it is the post-engine tail (liquidation step on-CPU +20%), margin +2.0%, settle +1.0%;
+   the profiled 60 s window is flat (1.002). Allocation / jemalloc / memmove / page faults inside the engine are flat;
+   L3.3's change is confined to save_books (memmove 0.124 -> 0.001, page faults +20%). matched/s 1.020, save_books per
+   1k fills 0.869. 8kd's uniform rise was two binaries (likely code layout, untested). Next if wanted: 2 more
+   one-binary deep pairs without perf, or a liquidation-step timer.**
 8v. **T5.3 attribution: block p99 inside checkpoint windows** (owner s131; NOW: right after 8u, before 8l; ~1 h incl.
    analysis; no code; `perf_event_paranoid` back at 2, no perf needed).
    Roadmap T5.3: during a checkpoint DB write, block p99 sits ~500-650 ms above the out-of-window p99 (sections 87,
