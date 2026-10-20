@@ -90,7 +90,8 @@ QUEUE = "rerun-queue.tsv"
 TSV = "cells.tsv"
 V = ("val0", "val1", "val2")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
-# crash-kill.sh crash_scan_restart_tail: panics=$(cnt 'panicked|FAIL-STOP|fail-stop|conflicting blocks')
+# Pre-s131 crash-kill.sh crash_scan_restart_tail pattern (no level filter; it counted the INFO
+# `on=false` line). Kept to classify cells summarized before the ERROR-level rule.
 PANIC_RE = re.compile(r"panicked|FAIL-STOP|fail-stop|conflicting blocks")
 BENIGN_FAILSTOP_RE = re.compile(
     r" INFO \S+: running state hash fail-stop \(TORUS_STATE_HASH_FAILSTOP\) on=false\s*$"

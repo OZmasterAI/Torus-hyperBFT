@@ -1,8 +1,9 @@
-//! 8k L2.2 settle-no-merge (`TORUS_SETTLE_NO_MERGE=1`, node-local, off by
-//! default): the parallel settle's pass B keeps each market's plan cache as a
-//! run instead of `merge_disjoint`-ing it into the batch cache, and the
-//! end-of-call flush writes the batch cache and the runs together
-//! (`PositionCache::flush_with_runs`) in the same global key order.
+//! 8k L2.2 settle-no-merge (`TORUS_SETTLE_NO_MERGE`, node-local, on by
+//! default since s131; `0` turns it off): the parallel settle's pass B keeps
+//! each market's plan cache as a run instead of `merge_disjoint`-ing it into
+//! the batch cache, and the end-of-call flush writes the batch cache and the
+//! runs together (`PositionCache::flush_with_runs`) in the same global key
+//! order.
 //!
 //! THE contract under test: the flag changes where pass B's position entries
 //! sit until the flush, never what is written or in which order. Over a

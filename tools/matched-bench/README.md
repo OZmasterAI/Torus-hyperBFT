@@ -82,17 +82,28 @@ python3 tools/matched-bench/test_harness.py
    `bulk-test` rows than `SENDERS` (s17: a stub-bench test run left 61 rows with
    address `oracle-feed`); move it away or set `FORCE=1` to rebuild it.
 4. `CLEAN=1 launch-3val.sh` with the RE-PROOF5 record-cell env
-   (`TORUS_BOOK_ROWS=3 TORUS_RESIDENT_BOOKS=1 TORUS_NATIVE_ROOT_CACHE=1
-   TORUS_PARALLEL_SETTLE=1 TORUS_PARALLEL_BUCKET_HASH=8
-   TORUS_BUCKET_MEMBER_CACHE_MB=256 TORUS_COMMIT_LAG_BACKOFF_CAP=8`; R190 ran
-   `TORUS_BOOK_ROWS=2` — the harness moved to mode 3 with the r2 merge, pass
-   `EXTRA_ENV='TORUS_BOOK_ROWS=2'` for a mode-2 control) — ambient
+   (`TORUS_ROCKSDB_PIPELINED_WRITE=1 TORUS_RESIDENT_BOOKS=1
+   TORUS_NATIVE_ROOT_CACHE=1 TORUS_PARALLEL_SETTLE=1 TORUS_PARALLEL_BUCKET_HASH=8
+   TORUS_BUCKET_MEMBER_CACHE_MB=256 TORUS_COMMIT_LAG_BACKOFF_CAP=8`) — ambient
    `TORUS_*` vars are unset first, `EXTRA_ENV` is applied last (so it overrides).
    Since plan 9.13 (`feat/compiled-defaults`) the node's compiled defaults equal
-   these values except `TORUS_BOOK_ROWS` (consensus-visible, stays Classic until
-   the book mode is in genesis; the cell needs the explicit `=3`) and
-   `TORUS_COMMIT_LAG_BACKOFF_CAP` (genesis-sourced, default 0); the other
-   exports are kept so older binaries run the same configuration.
+   these values except `TORUS_COMMIT_LAG_BACKOFF_CAP` (genesis-sourced, default
+   0); the other exports are kept so older binaries run the same configuration.
+   **Book mode is NOT pinned (s131).** From the r2 merge to s131 this env
+   carried `TORUS_BOOK_ROWS=3`, so a cell was mode 3 unless the campaign
+   overrode it (one bench-8y Classic smoke silently ran mode 3). A cell now runs
+   the node default, Classic (the testnet genesis mode); a mode-3 arm must set
+   `EXTRA_ENV='TORUS_BOOK_ROWS=3'` (or the arm's `env` in a driver spec), `=2`
+   for mode 2, `=1` for OrderRows.
+   After the env is final, run.log gets one audit line per cell:
+   `cell=<label> book_mode=classic|mode1|mode2|mode3 TORUS_BOOK_ROWS='...'
+   TORUS_BOOK_FAST_ENCODE='...' TORUS_SETTLE_NO_MERGE='...'
+   TORUS_EVM_FAST_PATH='...' TORUS_BOOK_COALESCE='...'
+   TORUS_CHECKPOINT_INTERVAL_MS='...'`, each value `unset (default)`,
+   `empty (default)` or the value (book mode parsed like the node:
+   trimmed `1`/`2`/`3`, anything else Classic). summary.json records the same
+   as `cell.book_mode` and `cell.node_flags` (both `null` when the cell has no
+   recorded node env). Check A/B arms against this line before analysis.
    Verifies via `/proc/<pid>/environ` that all 3 nodes got the same env.
    `BLOCK_CAP=N` (block-cap-raise sweep) exports the coherent proposer-local
    bundle between the two: `TORUS_NATIVE_TOTAL_BLOCK_CAP=N`,
@@ -181,7 +192,7 @@ python3 tools/matched-bench/test_harness.py
    `min(height)-5` via `eth_getBlockByNumber` on every node, a sha256 state
    digest per node (every market's `torus_getOrderBook` + `torus_getOpenInterest`
    + `torus_getBalances` of 50 bench senders), matched/placed/resting/actions
-   counters (must be identical), `panicked|FAIL-STOP` and `ERROR` line counts.
+   counters (must be identical), `panicked` + ERROR-level fail-stop line counts and `ERROR` line counts.
    **Liquidation-stress cells only** (`LIQ_THIN>0` or `ORACLE_SHOCK_BP>0`): the
    digest also covers the three protocol accounts of
    `torus_core::liquidation` — `LIQUIDATOR_VAULT` (`0x746f...766c74`,
@@ -486,7 +497,19 @@ break every later cell).
 - `exec_queue_depth_at_kill` — committed-but-unexecuted blocks already queued
   on E when it died (that part of the rewind is inherent, pipeline or not).
 - `rewind_beyond_exec_queue` = the two subtracted — **what the pipeline cost.
-  Must be <= 2** (depth-1 hand-off + the in-flight batch).
+  Must be <= `max_rewind_beyond_exec_queue`**: 2 with checkpoints off
+  (per-block flush: depth-1 hand-off + the in-flight batch); 202 with
+  coalesced checkpoints on (`checkpoint_interval_s` set, default 15 s on
+  validators). The durable marker is then the last checkpoint W finished, so a
+  kill replays the open checkpoint window plus at most one checkpoint W was
+  still writing, and neither spans more than 100 blocks because every 100th
+  height forces a checkpoint: 2 + 2 x 100 (`max_rewind_hard_cap`). No
+  block-rate estimate: a survivor's rate does not bound the killed node's span
+  (summarize.py `rewind_limit`).
+- `panic_or_failstop_lines` (restart scan) counts `panicked` lines and
+  fail-stop / FATAL / conflicting-blocks lines **at ERROR level only**; the
+  startup `INFO ... running state hash fail-stop (...) on=false` is not one
+  (crash-kill.sh `crash_failstop_count`).
 - `pipeline_flag_confirmed` — the restarted node logged
   `bl2 exec pipeline ENABLED`. Required when the cell env has
   `TORUS_EXEC_PIPELINE=1`, otherwise the gate crash-tested the serial path and

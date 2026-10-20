@@ -47,6 +47,53 @@ pub struct ValidatedBlock {
     pub fee_revenue: u128,
 }
 
+/// Item 7 option 0 (task 1.5): where a block's EVM part reads.
+pub enum EvmReads<'a> {
+    /// The DB: revm reads it, the writer-precompile journal is an overlay over
+    /// it (the serial path, the vote-side validation, RPC).
+    Db(&'a StateDb),
+    /// The block overlay's layers: revm through `torus_state::LayeredEvmDb`,
+    /// the journal over the same layers (`torus_state::EvmBlockState`, moved
+    /// into the executor and returned as `native_writes`).
+    Layered(torus_state::EvmBlockState<'a>),
+}
+
+impl<'a> EvmReads<'a> {
+    /// Item 7 option 0 (task 1.4): a point read before the execution (the
+    /// lane read): the DB, or the block overlay with its layers.
+    pub fn get_cf_raw(
+        &self,
+        cf: &str,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, torus_state::StateError> {
+        match self {
+            EvmReads::Db(db) => db.get_cf_raw(cf, key),
+            EvmReads::Layered(state) => state.lane_read(cf, key),
+        }
+    }
+
+    /// The DB under the reads (the EVM root compute reads it).
+    pub fn state_db(&self) -> &'a StateDb {
+        match self {
+            EvmReads::Db(db) => db,
+            EvmReads::Layered(state) => state.state_db(),
+        }
+    }
+}
+
+/// Item 7 option 0 (task 1.5): whether the catch-up validation computes the
+/// post-bundle EVM root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootMode {
+    /// On the executing thread, over the DB (today's serial path); its
+    /// `(root, TrieUpdates)` pair is reused by the block's trie batch.
+    OnE,
+    /// No root and no full-scan oracle (the fast path, step 3: the EVM trie
+    /// moves to the flush worker): `state_root` is zero and
+    /// `evm_root_updates` `None`.
+    Skip,
+}
+
 /// Validates proposed blocks by re-executing EVM transactions and verifying the state root.
 pub struct BlockValidator {
     #[allow(dead_code)]
@@ -90,7 +137,14 @@ impl BlockValidator {
         state_db: &StateDb,
         evm_executor: &EvmExecutor,
     ) -> Result<ValidatedBlock, BridgeError> {
-        self.validate_block_inner(block, state_db, evm_executor, None, false)
+        self.validate_block_inner(
+            block,
+            EvmReads::Db(state_db),
+            evm_executor,
+            None,
+            false,
+            RootMode::OnE,
+        )
     }
 
     /// Validate with parent header for base_fee verification.
@@ -101,28 +155,44 @@ impl BlockValidator {
         evm_executor: &EvmExecutor,
         parent_header: &torus_types::TorusBlockHeader,
     ) -> Result<ValidatedBlock, BridgeError> {
-        self.validate_block_inner(block, state_db, evm_executor, Some(parent_header), false)
+        self.validate_block_inner(
+            block,
+            EvmReads::Db(state_db),
+            evm_executor,
+            Some(parent_header),
+            false,
+            RootMode::OnE,
+        )
     }
 
     /// Validate during catch-up replay — skips state root check since blocks
-    /// are already consensus-committed.
+    /// are already consensus-committed. Item 7 option 0 (task 1.5): the EVM
+    /// part reads `reads` (the DB, or the block overlay's layers), and `root`
+    /// says whether the post-bundle EVM root is computed.
     pub fn validate_block_for_catchup(
         &self,
         block: &TorusBlock,
-        state_db: &StateDb,
+        reads: EvmReads<'_>,
         evm_executor: &EvmExecutor,
+        root: RootMode,
     ) -> Result<ValidatedBlock, BridgeError> {
-        self.validate_block_inner(block, state_db, evm_executor, None, true)
+        self.validate_block_inner(block, reads, evm_executor, None, true, root)
     }
 
     fn validate_block_inner(
         &self,
         block: &TorusBlock,
-        state_db: &StateDb,
+        reads: EvmReads<'_>,
         evm_executor: &EvmExecutor,
         parent_header: Option<&torus_types::TorusBlockHeader>,
         skip_state_root_check: bool,
+        root: RootMode,
     ) -> Result<ValidatedBlock, BridgeError> {
+        debug_assert!(
+            skip_state_root_check || root == RootMode::OnE,
+            "the strict validation always checks the root"
+        );
+        let state_db = reads.state_db();
         // FIX CONS-PF-14: Verify base_fee using EIP-1559 if parent is available.
         if let Some(parent) = parent_header {
             let expected_base_fee = torus_evm::calc_next_block_base_fee(
@@ -152,9 +222,10 @@ impl BlockValidator {
         let tx_envs: Vec<_> = decoded_txs.iter().map(|(_, d)| d.tx_env.clone()).collect();
 
         // Item 7 step 2: while big blocks are on (M > 0) a sender whose `EvmUserModify` row says big
-        // pays the big base fee (owner answer 7: the row when the block executes). An EVM block
-        // runs after a barrier, so the DB is current. A read fault is a local fault (fail-stop),
-        // never "small".
+        // pays the big base fee (owner answer 7: the row when the block executes). Item 7 option 0
+        // (task 1.4): the row is read through `reads`, i.e. through the block overlay when the
+        // block runs over its layers, so a row an earlier block wrote and W has not made durable
+        // yet counts. A read fault is a local fault (fail-stop), never "small".
         let mut big_lane = torus_evm::BigLane {
             base_fee: block.header.big_base_fee_per_gas,
             ..Default::default()
@@ -163,7 +234,7 @@ impl BlockValidator {
             let callers: std::collections::HashSet<Address> =
                 decoded_txs.iter().map(|(_, d)| d.tx_env.caller).collect();
             for caller in callers {
-                let row = state_db
+                let row = reads
                     .get_cf_raw(
                         torus_state::cf::CF_NATIVE_ORACLE,
                         &torus_state::cf::evm_lane_key(&caller),
@@ -186,13 +257,25 @@ impl BlockValidator {
             base_fee: block.header.base_fee_per_gas,
         };
 
-        let mut exec_result = evm_executor.execute_block_lanes(
-            state_db,
-            &block_cfg,
-            tx_envs,
-            skip_state_root_check,
-            &big_lane,
-        )?;
+        let mut exec_result = match reads {
+            EvmReads::Db(db) => evm_executor.execute_block_lanes(
+                db,
+                torus_state::NativeStateOverlay::new(db.clone()),
+                &block_cfg,
+                tx_envs,
+                skip_state_root_check,
+                &big_lane,
+            )?,
+            EvmReads::Layered(torus_state::EvmBlockState { db, journal }) => evm_executor
+                .execute_block_lanes(
+                    db,
+                    journal,
+                    &block_cfg,
+                    tx_envs,
+                    skip_state_root_check,
+                    &big_lane,
+                )?,
+        };
 
         align_receipts(&mut exec_result, &decoded_txs, block.header.height);
 
@@ -230,13 +313,19 @@ impl BlockValidator {
             }
         }
 
-        let root_timer = std::time::Instant::now();
-        let (computed_root, evm_root_updates) =
-            compute_post_bundle_state_root_with_updates(state_db, &exec_result.bundle)?;
-        if let Some(ref m) = self.metrics {
-            m.state_root_compute_seconds
-                .observe(root_timer.elapsed().as_secs_f64());
-        }
+        let (computed_root, evm_root_updates) = match root {
+            RootMode::OnE => {
+                let root_timer = std::time::Instant::now();
+                let out =
+                    compute_post_bundle_state_root_with_updates(state_db, &exec_result.bundle)?;
+                if let Some(ref m) = self.metrics {
+                    m.state_root_compute_seconds
+                        .observe(root_timer.elapsed().as_secs_f64());
+                }
+                out
+            }
+            RootMode::Skip => (B256::ZERO, None),
+        };
 
         if !skip_state_root_check && computed_root != block.header.state_root {
             return Err(BridgeError::StateRootMismatch {

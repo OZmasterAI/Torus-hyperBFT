@@ -129,7 +129,12 @@ fn catchup_validation_charges_each_sender_its_lane_while_big_blocks_are_on() {
             signed_transfer(&kb, 0, 21_000),
         ];
         let v = validator()
-            .validate_block_for_catchup(&block(100, m, txs), &db, &EvmExecutor::new(TORUS_CHAIN_ID))
+            .validate_block_for_catchup(
+                &block(100, m, txs),
+                torus_bridge::EvmReads::Db(&db),
+                &EvmExecutor::new(TORUS_CHAIN_ID),
+                torus_bridge::RootMode::OnE,
+            )
             .unwrap();
         assert_eq!(v.receipts.len(), 2);
         (
@@ -158,8 +163,9 @@ fn a_tx_above_the_small_limit_runs_only_at_a_big_height() {
         let v = validator()
             .validate_block_for_catchup(
                 &block(height, 50, vec![signed_transfer(&k, 0, 5_000_000)]),
-                &db,
+                torus_bridge::EvmReads::Db(&db),
                 &EvmExecutor::new(TORUS_CHAIN_ID),
+                torus_bridge::RootMode::OnE,
             )
             .unwrap();
         v.receipts.len()
@@ -168,4 +174,135 @@ fn a_tx_above_the_small_limit_runs_only_at_a_big_height() {
     assert_eq!(run(100), 1);
     // Height 105 (small cadence only): cap 3M, revm refuses it (above the block gas limit).
     assert_eq!(run(105), 0);
+}
+
+/// Item 7 option 0 (task 1.5): the catch-up validation over `EvmReads::Layered` on a
+/// layer-less block overlay (the serial path's reads) equals `EvmReads::Db`: receipts,
+/// bundle, fees, root and trie updates. `RootMode::Skip` gives the same execution with no
+/// root (zero) and no trie updates.
+#[test]
+fn catchup_validation_reads_layered_equals_db_and_skip_computes_no_root() {
+    use torus_bridge::{EvmReads, RootMode};
+    use torus_state::{EvmBlockState, NativeStateOverlay};
+    let (ka, kb) = (key(0x44), key(0x55));
+    let (a, b) = (address_from_key(&ka), address_from_key(&kb));
+    let (_dir, db) = open_test_db();
+    fund(&db, &a);
+    fund(&db, &b);
+    db.put_cf_raw(CF_NATIVE_ORACLE, &evm_lane_key(&b), &[1])
+        .unwrap();
+    let blk = block(
+        100,
+        50,
+        vec![
+            signed_transfer(&ka, 0, 21_000),
+            signed_transfer(&kb, 0, 21_000),
+        ],
+    );
+    let exec = EvmExecutor::new(TORUS_CHAIN_ID);
+    let summary = |v: &torus_bridge::ValidatedBlock| {
+        (
+            format!("{:?}", v.receipts),
+            v.bundle.clone(),
+            v.fee_revenue,
+            v.gas_used,
+            v.big_gas_used,
+        )
+    };
+    let on_db = validator()
+        .validate_block_for_catchup(&blk, EvmReads::Db(&db), &exec, RootMode::OnE)
+        .unwrap();
+    let overlay = NativeStateOverlay::new(db.clone());
+    let layered = validator()
+        .validate_block_for_catchup(
+            &blk,
+            EvmReads::Layered(EvmBlockState::new(&overlay)),
+            &exec,
+            RootMode::OnE,
+        )
+        .unwrap();
+    assert_eq!(summary(&on_db), summary(&layered));
+    assert_eq!(on_db.state_root, layered.state_root);
+    assert_ne!(on_db.state_root, B256::ZERO);
+    assert_eq!(
+        on_db.evm_root_updates.as_ref().map(|(r, _)| *r),
+        layered.evm_root_updates.as_ref().map(|(r, _)| *r)
+    );
+    assert_eq!(
+        overlay.pending_write_count(),
+        0,
+        "the block overlay is only read"
+    );
+    let skip = validator()
+        .validate_block_for_catchup(&blk, EvmReads::Db(&db), &exec, RootMode::Skip)
+        .unwrap();
+    assert_eq!(summary(&on_db), summary(&skip));
+    assert_eq!(skip.state_root, B256::ZERO);
+    assert!(skip.evm_root_updates.is_none());
+}
+
+/// Item 7 option 0 task 1.4 (RED: the lane read went to the raw DB): a sender's
+/// `EvmUserModify` row held only in the block overlay's parent layer (written by the
+/// previous block, not durable yet) makes it pay the big base fee when the block runs over
+/// its layers; the raw DB (no row) charges the small fee. A tombstone in L over a DB row
+/// makes the sender small.
+#[test]
+fn lane_row_in_parent_layer_sets_big_fee() {
+    use std::sync::Arc;
+    use torus_bridge::{EvmReads, RootMode};
+    use torus_state::checkpoint_layer::CheckpointLayer;
+    use torus_state::{EvmBlockState, NativeStateOverlay, StateBackend};
+    let k = key(0x66);
+    let sender = address_from_key(&k);
+    let exec = EvmExecutor::new(TORUS_CHAIN_ID);
+    let blk = || block(100, 50, vec![signed_transfer(&k, 0, 21_000)]);
+    let fee = |v: torus_bridge::ValidatedBlock| (v.receipts[0].effective_gas_price, v.big_gas_used);
+
+    // Row only in the parent layer.
+    let (_d1, db) = open_test_db();
+    fund(&db, &sender);
+    let parent = {
+        let ov = NativeStateOverlay::new(db.clone());
+        ov.put_cf_raw(CF_NATIVE_ORACLE, &evm_lane_key(&sender), &[1])
+            .unwrap();
+        ov.freeze(99)
+    };
+    let overlay = NativeStateOverlay::with_parent(db.clone(), Some(parent));
+    let layered = validator()
+        .validate_block_for_catchup(
+            &blk(),
+            EvmReads::Layered(EvmBlockState::new(&overlay)),
+            &exec,
+            RootMode::OnE,
+        )
+        .unwrap();
+    assert_eq!(fee(layered), (3 * GWEI, 21_000), "big: the parent's row");
+    let raw = validator()
+        .validate_block_for_catchup(&blk(), EvmReads::Db(&db), &exec, RootMode::OnE)
+        .unwrap();
+    assert_eq!(fee(raw), (GWEI, 0), "the raw DB has no row");
+
+    // Row in the DB, tombstoned in L (the sender went small, not durable yet).
+    let (_d2, db) = open_test_db();
+    fund(&db, &sender);
+    db.put_cf_raw(CF_NATIVE_ORACLE, &evm_lane_key(&sender), &[1])
+        .unwrap();
+    let small = {
+        let ov = NativeStateOverlay::new(db.clone());
+        ov.delete_cf_raw(CF_NATIVE_ORACLE, &evm_lane_key(&sender))
+            .unwrap();
+        ov.freeze(98)
+    };
+    let mut l = CheckpointLayer::new();
+    l.merge(&small);
+    let overlay = NativeStateOverlay::with_layers(db.clone(), None, Some(Arc::new(l)), None);
+    let layered = validator()
+        .validate_block_for_catchup(
+            &blk(),
+            EvmReads::Layered(EvmBlockState::new(&overlay)),
+            &exec,
+            RootMode::OnE,
+        )
+        .unwrap();
+    assert_eq!(fee(layered), (GWEI, 0), "small: L's tombstone");
 }

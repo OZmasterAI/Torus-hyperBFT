@@ -1925,3 +1925,162 @@ fn bbo_is_a_reader_at_0x080e() {
     assert_eq!(meter.used(), 2 * GAS_PRECOMPILE_READ_PER_WORD);
     assert_eq!(reader_gas(meter.used()), 16_440);
 }
+
+/// Item 7 option 0 task 1.3 (guard on the new body): `pending_count` takes any
+/// backend and `pending_count > 0` is exactly the due-check's
+/// `prefix_exists(CF_CORE_WRITER_QUEUE, target)`, over the DB and over an
+/// overlay whose own pending set drains one target and queues another.
+#[test]
+fn pending_count_matches_prefix_exists() {
+    use torus_state::cf::CF_CORE_WRITER_QUEUE;
+    use torus_state::StateBackend;
+    let (_dir, db) = setup();
+    let key = |t: u64, s: u64| {
+        let mut k = t.to_be_bytes().to_vec();
+        k.extend_from_slice(&s.to_be_bytes());
+        k
+    };
+    for (t, n) in [(3u64, 1u64), (4, 3), (6, 2), (u64::MAX, 1)] {
+        for s in 0..n {
+            db.put_cf_raw(CF_CORE_WRITER_QUEUE, &key(t, s), b"row")
+                .unwrap();
+        }
+    }
+    let ov = NativeStateOverlay::new(db.clone());
+    ov.delete_cf_raw(CF_CORE_WRITER_QUEUE, &key(3, 0)).unwrap();
+    ov.delete_cf_raw(CF_CORE_WRITER_QUEUE, &key(4, 1)).unwrap();
+    ov.put_cf_raw(CF_CORE_WRITER_QUEUE, &key(5, 0), b"row")
+        .unwrap();
+    let expect_db = [
+        (2u64, 0usize),
+        (3, 1),
+        (4, 3),
+        (5, 0),
+        (6, 2),
+        (7, 0),
+        (u64::MAX, 1),
+    ];
+    let expect_ov = [
+        (2u64, 0usize),
+        (3, 0),
+        (4, 2),
+        (5, 1),
+        (6, 2),
+        (7, 0),
+        (u64::MAX, 1),
+    ];
+    for (t, n) in expect_db {
+        assert_eq!(
+            CoreWriterQueue::pending_count(&db, t).unwrap(),
+            n,
+            "db target {t}"
+        );
+        assert_eq!(
+            db.prefix_exists(CF_CORE_WRITER_QUEUE, &t.to_be_bytes())
+                .unwrap(),
+            n > 0,
+            "db target {t}"
+        );
+    }
+    for (t, n) in expect_ov {
+        assert_eq!(
+            CoreWriterQueue::pending_count(&ov, t).unwrap(),
+            n,
+            "overlay target {t}"
+        );
+        assert_eq!(
+            ov.prefix_exists(CF_CORE_WRITER_QUEUE, &t.to_be_bytes())
+                .unwrap(),
+            n > 0,
+            "overlay target {t}"
+        );
+    }
+}
+
+/// Item 7 option 0 task 1.4: `enqueue` reads every row it decides on (the order delay, the
+/// last-order target, the first-open cursor, the full-order run, the full-target probes,
+/// `next_sequence`) through its backend, so with those rows held only in a layer of the
+/// block overlay (the parent, L, or C, over an empty DB) it places the same rows at the same
+/// targets and seqs, and writes the same cursor rows, as with them in the DB.
+#[test]
+fn enqueue_reads_cursor_rows_from_layers() {
+    use std::sync::Arc;
+    use torus_state::cf::{CF_CORE_WRITER_QUEUE, CF_FEE_CONFIG};
+    use torus_state::checkpoint_layer::CheckpointLayer;
+    use torus_state::StateBackend;
+    const CAP: u64 = torus_types::CORE_WRITER_DRAIN_CAP;
+    let order = |block: u64, id: u128| QueuedAction {
+        trader: addr(1),
+        kind: QueuedActionKind::CancelOrder { order_id: id },
+        block_queued: block,
+    };
+    let other = |block: u64| QueuedAction {
+        trader: addr(2),
+        kind: QueuedActionKind::ClaimRewards,
+        block_queued: block,
+    };
+    // The DB state: target 101 full of orders (cursor rows written), one more order and a
+    // non-order row placed past it.
+    let (_dir, db) = setup_k1();
+    for i in 0..CAP {
+        CoreWriterQueue::enqueue(&db, &order(100, i.into())).unwrap();
+    }
+    CoreWriterQueue::enqueue(&db, &order(100, 9_999)).unwrap();
+    CoreWriterQueue::enqueue(&db, &other(100)).unwrap();
+    let rows: Vec<(&str, Vec<u8>, Vec<u8>)> = [CF_CORE_WRITER_QUEUE, CF_FEE_CONFIG]
+        .into_iter()
+        .flat_map(|cf| {
+            StateBackend::iterate_cf(&db, cf, None)
+                .unwrap()
+                .into_iter()
+                .map(move |(k, v)| (cf, k, v))
+        })
+        .collect();
+    assert!(rows
+        .iter()
+        .any(|(_, k, _)| k.as_slice() == CORE_WRITER_FIRST_OPEN_TARGET_KEY));
+    assert!(rows
+        .iter()
+        .any(|(_, k, _)| k.as_slice() == CORE_WRITER_LAST_ORDER_TARGET_KEY));
+    let next = |state: &NativeStateOverlay| {
+        let seqs = vec![
+            CoreWriterQueue::enqueue(state, &order(100, 1)).unwrap(),
+            CoreWriterQueue::enqueue(state, &other(100)).unwrap(),
+            CoreWriterQueue::enqueue(state, &order(105, 2)).unwrap(),
+            CoreWriterQueue::enqueue(state, &other(101)).unwrap(),
+        ];
+        let view: Vec<_> = [CF_CORE_WRITER_QUEUE, CF_FEE_CONFIG]
+            .into_iter()
+            .map(|cf| StateBackend::iterate_cf(state, cf, None).unwrap())
+            .collect();
+        (seqs, view)
+    };
+    let want = next(&NativeStateOverlay::new(db.clone()));
+    assert_eq!(
+        want.0,
+        vec![2, 3, 0, 4],
+        "past the full target, then K = 1 at 106"
+    );
+
+    let frozen = |empty: &StateDb| {
+        let ov = NativeStateOverlay::new(empty.clone());
+        for (cf, k, v) in &rows {
+            ov.put_cf_raw(cf, k, v).unwrap();
+        }
+        ov.freeze(99)
+    };
+    let layer = |empty: &StateDb| {
+        let mut l = CheckpointLayer::new();
+        l.merge(&frozen(empty));
+        Arc::new(l)
+    };
+    for place in ["parent", "L", "C"] {
+        let (_d, empty) = setup();
+        let state = match place {
+            "parent" => NativeStateOverlay::with_parent(empty.clone(), Some(frozen(&empty))),
+            "L" => NativeStateOverlay::with_layers(empty.clone(), None, Some(layer(&empty)), None),
+            _ => NativeStateOverlay::with_layers(empty.clone(), None, None, Some(layer(&empty))),
+        };
+        assert_eq!(next(&state), want, "rows in {place}");
+    }
+}
