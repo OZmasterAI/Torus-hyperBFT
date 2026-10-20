@@ -477,6 +477,15 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    (digests agree, replay length); one mixed-flag cell (val0 on, val1 off, val2 on with
    `TORUS_CHECKPOINT_INTERVAL_MS=0`): attestations agree for the whole cell. The default flip is the owner's call
    after this.
+   **Done s70 (ozarchy-8l4, section 107; B `f8a45a2d` node `74598d33`, M `fd94818d` node `602e1a5a`, tools `eabec5e5`;
+   25 / 25 cells valid (crash REJECT harness-made), 625 CHECK OK, 0 FAIL; n = 4 via the spec's trigger; end_pass=1,
+   gaps 5-6 s): option 0 passes the exec-path merge rule on E-on / E-off with every CI resolved: matched/s 1.079
+   [1.074, 1.084], exec-thread CPU per 1k fills 0.981 [0.972, 0.991], blocks/s 3.53 x, p50 0.090, p99 0.496, timeouts
+   22 -> 3. E-off / M not worse (exec CPU 0.998 [0.988, 1.008], blocks/s 1.066, p50 0.897, CPU-s per 1M 1.005 [0.999,
+   1.010]); N-on / N-off within noise; all six option 0 passes (pipelined 100%, idle before EVM p50 0.05 ms, 0 deferred
+   waits / rebuilds / shared layers, no forced checkpoints, all EVM landed). E-heavy 1.077; crash: digests agree after
+   a 27-block replay; mixed flags agree at 35 / 35 checkpoints. Harness fixes for 18c: crash rewind limit 2 predates
+   coalesced checkpoints; `crash-kill.sh` counts an INFO fail-stop line. Default flip: owner's call.**
 8m. **Book storage mode at depth, + L3.1's zero-build flag** (owner s131; NEXT, 8l is paused; ~1 h 15: 7 cells of
    300 s, ~10 min each incl. genesis / boot / pre-load / post checks, ~1 min between cells). 8i: at 1M resting orders
    Classic's `save_books` is 73% whole-book encode, linear in depth. The other modes save only what changed but were
