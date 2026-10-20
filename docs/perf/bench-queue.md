@@ -893,6 +893,14 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    block, CPU-s per 1M fills, RSS; E/N with CIs. Questions: (1) the deep-book reference for the L3.1 / L6.1 / head-to-head
    comparisons with all current defaults; (2) does the EVM fast path keep EVM load free on the deep book too (8l and 9a
    were standard shape only)?
+   **Done s73 (ozarchy-9d, section 116; main `50cdd395` node `ce0f110c` (= 9a's node), tools `ozarchy-9d-tools/standard`,
+   5 / 5 cells valid, Classic, flags unset, deep genesis `a644d0a7`, EVM 3000 / 3000 landed and every EVM block on the
+   fast path in both E cells, no foreign-CPU rerun): deep reference N 232.7k matched/s, 3.54 blk/s, 63.3k fills / blk,
+   p50 / p99 191 / 1,344 ms, 3.26 timeouts per 1k blocks, exec 4.196 and exec on-CPU 3.170 ms per 1k fills,
+   save_order_books 56.3 ms / blk, 24.72 CPU-s per 1M, RSS 6.5 / 8.0 GB; within ~1% of 114 deep A per fill. EVM load
+   free on deep: E / N matched/s 1.009 [1.001, 1.017], CPU-s per 1M 0.997, exec on-CPU 0.996 [0.974, 1.020], blocks/s
+   0.990, save_order_books / blk 1.000. Watch: block p99 E / N 1.12 [0.84, 1.49] (both rounds up), flush worker per 1k
+   fills 1.065.**
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 

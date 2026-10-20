@@ -18035,6 +18035,117 @@ Timers (3 nodes, mean / bucket p99, ms):
 * Campaign: `~/bench-results-matched/ozarchy-9c-run/` (`std/`, `rerun/`, `combined/cells.tsv`, `chain-main.log`,
   `contention-main.tsv`, `rerun-chain/`); tools `ozarchy-9c-tools/`; build `ozarchy-9c-stage/build/`.
 
+## 116. Step 9d, merged-main deep baseline with every s131 default on: one binary main `50cdd395` (non-doc tree = 9a's `654f047c`), code defaults, N = no EVM load vs E = `EVM_LOAD_RATE=10 EVM_LOAD_SENDERS=40`, Classic, 15 s checkpoints, deep (8i P1M) shape, N E E N, 300 s cells, n = 2 (campaign ozarchy-9d, archy, 2026-10-21)
+
+**Deep-book reference with all current defaults: N runs 232.7k matched/s, 3.537 native blocks/s, 63.3k fills per
+block, block p50 / p99 191 / 1,344 ms, 3.26 timeouts per 1k blocks (mostly after_vote), exec 4.196 ms and exec-thread
+on-CPU 3.170 ms per 1k fills, save_order_books 56.3 ms per block (0.889 ms per 1k fills), 24.72 CPU-s per 1M fills,
+RSS 6.5 / 8.0 GB (mean / max). That is within ~1% of section 114's deep A arm on matched/s, exec per fill and CPU-s
+per 1M (same genesis, other binary), with blocks/s 4% lower. Against 9a's standard shape (same binary) the deep book
+costs 13% of matched/s, 27% more exec on-CPU per fill and 4.8x the save_order_books time per fill. The EVM fast path
+keeps EVM load free on the deep book too: E / N matched/s 1.009 [1.001, 1.017], CPU-s per 1M 0.997 [0.982, 1.012],
+exec on-CPU per 1k fills 0.996 [0.974, 1.020], blocks/s 0.990, p50 1.002, save_order_books per block 1.000; every EVM
+block ran on the fast path (99 / 101 of 99 / 101). Watch: block p99 E / N 1.12 [0.84, 1.49] (both rounds higher,
+1.10 / 1.15; 9a standard 0.997) and flush worker per 1k fills 1.065 (9a 1.081), both unresolved at n = 2.**
+
+### 116.1 Setup
+
+* Binary: one fresh build of main `50cdd395` (`git diff --stat 654f047c 50cdd395 -- ':!docs'` is empty) in worktree
+  `wt/9d-50cdd395`, fresh `CARGO_TARGET_DIR` `~/.cargo-target-9d`, 8l4 flags (plain `release --locked`, one package at
+  a time, clang + mold). Node md5 `ce0f110ce3501c55018754bba685caa9` on 3 / 3 nodes in all 5 cells, byte-identical to
+  9a's node (section 113); bench `eaf9f007`, flood `dd59d50d` (`~/bench-results-matched/ozarchy-9d-stage/build/md5s.txt`).
+* Tools frozen in `ozarchy-9d-tools/standard`; genesis the 1M-account deep genesis of section 114
+  (`genesis-weighted-full.json` md5 `a644d0a7`, same as `ozarchy-9b-tools/deep`; bulk_count 1,000,000, 300 markets).
+  Preload 1,000,000 resting orders per cell (r1-N: 23 s).
+* Both arms: code defaults, nothing set (L2.2, L3.3, option 0 E, PC, F, D / M / T on; every `cell=` line shows
+  `book_mode=classic` and the flags unset; node-env checked on 3 nodes), 512 KB push threshold from `env.sh`, custody 0,
+  15 s checkpoints, standard load (rate 76,000, 5,000 senders). **N** = no EVM load; **E** = `EVM_LOAD_RATE=10
+  EVM_LOAD_SENDERS=40`.
+* Order: w1 (N, 120 s, warm-up gate), then N E E N at 300 s, n = 2 per arm. Campaign 00:08-00:57.
+* Cells: `~/bench-results-matched/ozarchy-9d-{w1,r1-N,r1-E,r2-E,r2-N}`.
+
+### 116.2 Validity
+
+* 5 / 5 cells rc 0, ACCEPT / AGREE / PASS, right node md5 on every node, 0 panic and 0 fail-stop lines, no CELL-FLAG,
+  rerun pass empty, end pass 0 failed. No-merge fallbacks 0 on every node; boundary checkpoints all pipelined
+  (true:false 32-39:0 per node).
+* Both E cells landed 3000 / 3000 EVM transactions (0 rejected, 0 off-cadence; 99 and 101 EVM blocks), and
+  `torus_exec_evm_fast_path_blocks_total` equals the EVM block count on all 3 nodes (99 / 101; 0 in N cells). EVM
+  execution 9.0-10.1 ms per EVM block (r1-E, per node).
+* Contention (30 s sampler, FOREIGN CPU rule): no foreign process averaged over 0.1 core in any cell (largest: claude
+  0.064 avg in r2-N, max sample 0.115 in r2-E; Hyprland ~0.03), no Telegram samples, no n19 load; no rerun.
+
+### 116.3 Per cell (run order; node mean)
+
+| cell | arm | matched/s | native blk/s | fills/blk | exec block ms | block p50 / p99 ms | CPU-s / 1M | exec on-CPU ms / 1k fills | save_order_books ms / blk | timeouts | RSS mean / max MB |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 | N | 226,726 | 4.320 | 49,278 | 207.0 | 115 / 1,252 | 25.87 | 3.249 | 41.37 | 1 | 5,991 / 7,246 |
+| r1 | N | 233,448 | 3.515 | 63,829 | 266.9 | 195 / 1,318 | 24.64 | 3.156 | 56.68 | 3 | 6,318 / 7,734 |
+| r1 | E | 235,745 | 3.480 | 64,758 | 269.7 | 196 / 1,446 | 24.54 | 3.139 | 56.62 | 3 | 6,506 / 8,148 |
+| r2 | E | 233,935 | 3.526 | 63,453 | 266.0 | 187 / 1,572 | 24.76 | 3.178 | 55.88 | 3 | 6,375 / 7,695 |
+| r2 | N | 231,943 | 3.558 | 62,773 | 264.3 | 187 / 1,370 | 24.80 | 3.184 | 55.84 | 4 | 6,629 / 8,224 |
+
+Replicate spread: N matched/s CV 0.46%, CPU-s per 1M CV 0.46%; E 0.54% and 0.62%. Drift: N falls 0.6% from r1 to r2
+(RSS mean +5%); the N E E N order cancels a linear trend, and the per-round E / N ratios agree (1.0098 / 1.0086).
+
+### 116.4 Arm means, E / N, and the references (ratio = geomean of the 2 per-round ratios, 95% t CI, 1 df)
+
+| metric | N | E | E / N [95% CI] | step / pooled sd | 114 deep A (`df9e1d8a`) | N / 114 A | 113 std N (same binary) | N / 113 N |
+|---|---|---|---|---|---|---|---|---|
+| matched/s | 232,695 | 234,840 | 1.009 [1.001, 1.017] | 1.8 | 232,284 | 1.002 | 268,762 | 0.866 |
+| native blocks/s | 3.537 | 3.503 | 0.990 [0.984, 0.997] | 1.1 | 3.676 | 0.962 | 15.47 | 0.229 |
+| fills per native block | 63,301 | 64,106 | 1.013 [0.989, 1.037] | 1.0 | 60,746 | 1.042 | 16,314 | 3.88 |
+| block p50 ms | 191 | 191 | 1.002 [0.992, 1.011] | 0.1 | 179 | 1.067 | 14 | |
+| block p99 ms | 1,344 | 1,509 | 1.122 [0.844, 1.492] | 2.4 | 1,341 | 1.002 | 659 | 2.04 |
+| timeouts per 1k native blocks | 3.26 (7 / 2,143) | 2.84 (6 / 2,116) | n/a | | 2.25 (5 / 2,224) | | 0 | |
+| view-timeout reasons (all / no_proposal / after_vote / leader) | 18 / 1 / 15 / 2 | 18 / 0 / 17 / 1 | | | 8 / 0 / 8 / 0 | | | |
+| exec ms per 1k fills | 4.196 | 4.179 | 0.996 [0.995, 0.996] | | 4.219 | 0.995 | 3.473 | 1.208 |
+| **exec-thread on-CPU ms per 1k fills** | 3.170 | 3.159 | 0.996 [0.974, 1.020] | 0.5 | 3.200 | 0.991 | 2.503 | 1.266 |
+| CPU-s per 1M fills | 24.72 | 24.65 | 0.997 [0.982, 1.012] | 0.5 | 24.65 | 1.003 | 22.77 | 1.086 |
+| save_order_books ms per native block | 56.26 | 56.25 | 1.000 [0.988, 1.011] | 0.0 | | | | |
+| save_order_books ms per 1k fills | 0.889 | 0.877 | 0.987 [0.953, 1.022] | | | | 0.187 | 4.75 |
+| RSS mean / max MB | 6,473 / 7,979 | 6,440 / 7,922 | 0.995 / 0.993 | | 6,231 (mean) | 1.039 | 3,623 / 4,402 | 1.79 / 1.81 |
+| settle phase ms per native block | 53.63 | 53.08 | 0.990 [0.936, 1.046] | | 52.15 | 1.028 | | |
+| flush_all ms per 1k fills | 0.399 | 0.388 | 0.972 [0.931, 1.014] | | | | 0.442 | |
+| flush worker ms per 1k fills | 0.345 | 0.367 | 1.065 [0.739, 1.537] | | | | 0.314 | |
+| exec runqueue wait ms per 1k fills | 0.130 | 0.126 | 0.969 [0.653, 1.437] | | 0.123 | | | |
+| exec busy share | 0.939 | 0.938 | 0.999 | | 0.942 | | 0.876 | |
+
+Section 114's deep A set `TORUS_SETTLE_NO_MERGE=1 TORUS_BOOK_FAST_ENCODE=1` by env on a base without option 0 (now
+defaults); same genesis, other binary and campaign, so the N / 114 A column is indicative only.
+
+### 116.5 Verdict
+
+* **(1) Deep-book reference** for L3.1 / L6.1 / head-to-head, all current defaults: use N above (232.7k matched/s,
+  3.54 blocks/s, p50 / p99 191 / 1,344 ms, exec on-CPU 3.170 ms per 1k fills, 24.72 CPU-s per 1M, save_order_books
+  56.3 ms per block). It matches section 114 deep A on per-fill rows (exec on-CPU 0.991, CPU-s 1.003, matched/s 1.002),
+  so merged main lost nothing on deep against the per-feature build. Blocks/s 0.962 and fills per block 1.042 are the
+  usual block-size trade between campaigns, not resolved here. The exec thread is busy 94% of wall time on deep (88%
+  on standard), and save_order_books is 21% of the exec block (56.3 of 265.6 ms) at 4.75x the standard cost per fill:
+  deep is exec-bound and the book write is the largest timed phase after the engine.
+* **(2) EVM load on deep: free.** Every per-fill row is E / N 0.97-1.01 with CIs around 1 (exec on-CPU, CPU-s, save
+  books, settle). matched/s 1.009 [1.001, 1.017] has a CI just above 1 at 1 df but is 1.8 pooled sd, so "no cost", not
+  a gain. Blocks/s 0.990 [0.984, 0.997] (1.1 pooled sd, -1%) with fills per block +1.3%: a block-size wobble, not
+  a throughput cost. All EVM blocks ran pipelined (fast-path counter = EVM block count). EVM execution is ~9.5 ms per
+  EVM block, ~0.9 s per 300 s cell, under 0.5% of exec-thread on-CPU time (223 s per cell).
+* **Watch: block p99 E / N 1.12** (1,344 -> 1,509 ms; rounds 1.10 / 1.15; 2.4 pooled sd; CI [0.84, 1.49]). Sized:
+  ~9.5 ms of EVM execution per EVM block explains at most ~6% of the +165 ms step. p99 rests on ~10 blocks per node per
+  cell, the timeouts did not move (18 / 18 view timeouts), and 9a standard showed 0.997, so this is not resolved. Also
+  flush worker per 1k fills 1.065 under E, the same direction as 9a (1.081), off the exec thread, CI spans 1 in both.
+
+### 116.6 Limits and data
+
+* n = 2 per arm, 1 df: the p99, RSS and flush-worker CIs are wide; the narrow per-fill CIs come from two agreeing
+  rounds, not many samples. Timeout counts are small (6-7 per arm).
+* The section 113 / 114 references are other campaigns (113 another shape; 114 another binary); indicative only.
+* Next cells if the p99 watch matters: N E E N E N N E at 300 s on the same binary (~1 h 20 with boot and preload)
+  gives n = 4 per arm for block p99 and the flush worker row.
+* Analysis: `~/bench-results-matched/ozarchy-9d-tools/analyst/9d.txt` (`9d-analyse.py`, a copy of 9a's) and
+  `9d-foreign.txt` (`d9-foreign.py`, a copy of `a9-foreign.py`).
+* Campaign: `~/bench-results-matched/ozarchy-9d-run/campaign/` (`campaign.log`, `cells.tsv`, `handoff.json`),
+  `contention-main.tsv`; spec and driver `ozarchy-9d-tools/{9d-spec.json,ozarchy-9d-campaign.sh,9d-chain.sh}`; build
+  `ozarchy-9d-stage/build/`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
