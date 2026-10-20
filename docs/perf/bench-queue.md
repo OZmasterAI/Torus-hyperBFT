@@ -661,8 +661,20 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    body persist) and the exec thread's (checkpoint upkeep, freeze, flush handoff, settle wait), plus RocksDB write /
    stall / flush activity and per-thread CPU if sampled. Name the dominant phase of the in-window gap with numbers.
    This decides whether A1 or something else gets built.
-   **Order (owner s131):** 8u and 8v run **before** the RH4 3-arm rerun, which still waits on 18c's compaction-filter
-   build and its review. Queue after 8s (8s finished, analysis running): 8u now, then 8l, 8t, 8v, then the RH4 rerun.
+   **Order (owner s131):** 8u and 8v run **before** the RH4 3-arm rerun (8w; filter built and reviewed, `baffa3a5`). Queue after 8s (8s finished, analysis running): 8u now, then 8l, 8t, 8v, then the RH4 rerun (8w).
+8w. **RH4 3-arm rerun: state pruner compaction filter** (owner s131; after 8v; ~1 h 50). 8r (section 103.6): the
+   cost both retention arms share is state-DB compaction of `cf_block_bodies` from the state pruner's
+   `delete_range_cf` range deletes (compaction CPU x2.0, L0 3.3 vs 1.2). Fix: `perf/rh4-gc-worker` `baffa3a5` (on
+   `a0181b8b`, pushed, not merged; Codex torus review: no findings): `TORUS_PRUNE_MODE=filter` (default) saves the
+   cutoff durably, drops whole SSTs below it (`DeleteFilesInRange`) and lets a compaction filter drop the rest;
+   `TORUS_PRUNE_MODE=range` keeps the old path (microbench: compaction CPU 23.2 -> 7.6 s, write 408 -> 124 MiB).
+   **One binary** from `baffa3a5` (code defaults; 512 KB from `env.sh`; custody 0). Arms: **A** = no retention;
+   **B** = `TORUS_RETENTION_BLOCKS=1000` (filter, the branch default); **C** = `TORUS_RETENTION_BLOCKS=1000` +
+   `TORUS_PRUNE_MODE=range` (as 8r's B), all via `EXTRA_ENV`. Standard unpaced load, 300 markets, 300 s cells,
+   warm-up then A B C C B A twice (n = 4 per arm). Report as 8r plus state-DB compaction CPU per node,
+   `cf_block_bodies` L0 count, SSTs / bytes dropped whole, on-disk size at cell end. Verdicts: B vs A (retention
+   within noise: p50, blocks/s, CPU per fill?) and C vs A (does 8r's cost reproduce on this binary?). Prune-by-default
+   and the RH4 merge wait on this.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
