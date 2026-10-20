@@ -735,10 +735,35 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         ?checkpoint_interval,
         "checkpoint interval (TORUS_CHECKPOINT_INTERVAL_MS; default 15 s on validators, 0 on --rpc-only)"
     );
+    // T5.3: the commit manifest's home (the consensus DB by default; the A/B
+    // switch keeps the pre-T5.3 state-DB layout). Rows left in the other DB
+    // move at boot, so a hole they guard is never ignored.
+    let manifest_in_state_db = torus_consensus::app::parse_manifest_in_state_db(
+        std::env::var(torus_consensus::app::ENV_MANIFEST_IN_STATE_DB)
+            .ok()
+            .as_deref(),
+    );
+    let manifest_db = if manifest_in_state_db {
+        let moved = torus_consensus::app::migrate_commit_manifests(&dbs.consensus, &state_db)?;
+        if moved > 0 {
+            warn!(
+                moved,
+                "moved leftover commit-manifest rows from the consensus DB into the state DB"
+            );
+        }
+        state_db.clone()
+    } else {
+        dbs.consensus.clone()
+    };
+    info!(
+        manifest_in_state_db,
+        "commit manifest home (TORUS_MANIFEST_IN_STATE_DB=1: state DB, pre-T5.3; default: consensus DB)"
+    );
     // R02 branch 8 (D1): a startup storage fault (e.g. the validator rows
     // cannot be read to resolve the proposer address) stops the node here.
-    let mut app = TorusApp::try_new(
+    let mut app = TorusApp::try_new_with_manifest_db(
         state_db.clone(),
+        manifest_db,
         &chain_config,
         Some(metrics.clone()),
         Some(mempool.clone()),
