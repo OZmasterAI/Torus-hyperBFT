@@ -14557,10 +14557,15 @@ impl NativeExecutor {
     ///   trader's reservation released (the user cancel-all path). Positions
     ///   are left open: how they settle is an open owner question (roadmap
     ///   P1); they close with reduce-only orders and stay liquidatable.
-    /// - `MarketParamsUpdate`: the live book (if any) takes the row's tick
-    ///   and lot (resting orders keep their prices; the book meta is
-    ///   rewritten), and the margin config follows the row; if the config
-    ///   changed, the block's mark version moves
+    /// - `MarketParamsUpdate`: when the row's tick, lot or margin config
+    ///   differs from the live one, every resting order and pending stop in
+    ///   the book is first cancelled the same way, each reservation released
+    ///   under the OLD config (Codex P1: a reservation is never re-priced
+    ///   under a config it was not placed with — lowering the leverage
+    ///   released other orders' collateral on cancel, raising it stranded
+    ///   collateral). Then the live book (if any) takes the row's tick and
+    ///   lot (the book meta is rewritten), the margin config follows the
+    ///   row, and, if the config changed, the block's mark version moves
     ///   ([`Self::renew_mark_version`], the C2 / C3 invariant).
     ///
     /// A failed read of the proposal or the row is a local fault (fail-stop).
@@ -14577,14 +14582,7 @@ impl NativeExecutor {
         match payload {
             Some(ExecutionPayload::MarketDelist { market_id }) => {
                 ctx.delisted_markets.insert(market_id);
-                let Some(book) = ctx.order_books.get(&market_id) else { return };
-                let mut traders: Vec<Address> = book.traders_present().copied().collect();
-                traders.sort_unstable();
-                traders.dedup();
-                for trader in traders {
-                    let total = Self::cancel_orders_and_stops(ctx, &trader, Some(market_id));
-                    Self::release_order_margin(ctx, &trader, total);
-                }
+                Self::cancel_market_orders_and_stops(ctx, market_id);
             }
             Some(ExecutionPayload::MarketParamsUpdate { market_id, .. }) => {
                 let row = match ctx
@@ -14594,14 +14592,27 @@ impl NativeExecutor {
                     Ok(Some(row)) => row,
                     Ok(None) => return, // cannot happen: execution checked it
                     Err(e) => {
-                        Self::latch_core_fault(ctx, "governance market row read", &CoreError::from(e));
+                        Self::latch_core_fault(
+                            ctx,
+                            "governance market row read",
+                            &CoreError::from(e),
+                        );
                         return;
                     }
                 };
+                let shape = market_row_shape(&row);
                 let config = market_margin_config(market_id, &row);
                 let config_changed = ctx.margin_configs.get(&market_id) != config.as_ref();
+                let shape_changed = ctx.order_books.get(&market_id).is_some_and(|book| {
+                    shape.is_some_and(|s| s != (book.tick_size, book.lot_size))
+                });
+                if config_changed || shape_changed {
+                    // Codex P1: released under the old config (still in
+                    // `margin_configs`), before anything changes.
+                    Self::cancel_market_orders_and_stops(ctx, market_id);
+                }
                 if let (Some((tick, lot)), Some(book)) =
-                    (market_row_shape(&row), ctx.order_books.get_mut(&market_id))
+                    (shape, ctx.order_books.get_mut(&market_id))
                 {
                     book.tick_size = tick;
                     book.lot_size = lot;
@@ -14625,6 +14636,26 @@ impl NativeExecutor {
 }
 
 impl NativeExecutor {
+    /// Pre-testnet P1: cancel every resting order and pending stop in
+    /// `market_id`'s book, trader by trader in ascending address order, each
+    /// trader's reservation released at the market's CURRENT margin config
+    /// (the user cancel-all path). No book: nothing to do.
+    fn cancel_market_orders_and_stops<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        market_id: MarketId,
+    ) {
+        let Some(book) = ctx.order_books.get(&market_id) else {
+            return;
+        };
+        let mut traders: Vec<Address> = book.traders_present().copied().collect();
+        traders.sort_unstable();
+        traders.dedup();
+        for trader in traders {
+            let total = Self::cancel_orders_and_stops(ctx, &trader, Some(market_id));
+            Self::release_order_margin(ctx, &trader, total);
+        }
+    }
+
     /// Codex P1 (item 6 C2 / C3 invariant: the mark version changes whenever
     /// the table or the margin configs it values with change; a new version
     /// is never one used before): `margin_configs` changed after the block's

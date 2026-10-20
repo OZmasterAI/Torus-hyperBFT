@@ -12,9 +12,12 @@
 //!
 //! UpdateMarketParams: tick, lot and max leverage (initial margin = 1 / max
 //! leverage, as for listings) are validated and written to the market row in
-//! the proposal's atomic write at its execution height; the live book takes
-//! the new tick / lot (resting orders keep their prices) and the margin
-//! config follows the row.
+//! the proposal's atomic write at its execution height. When tick, lot or
+//! max leverage changes, every resting order and pending stop in the market
+//! is first cancelled and refunded under the old config (Codex P1: a
+//! reservation is never re-priced under a config it was not placed with);
+//! then the live book takes the new tick / lot and the margin config follows
+//! the row.
 //!
 //! The direct (non-governance) actions stay rejected.
 
@@ -472,7 +475,16 @@ fn governance_update_market_params_applies_at_execution() {
         (fp(2), fp(2)),
         "the live book took them (persisted)"
     );
-    assert_eq!(book.order_count(), 3, "resting orders keep their prices");
+    // Codex P1: the tick / lot / leverage change cancelled the resting
+    // orders and refunded them under the old config.
+    assert_eq!(book.order_count(), 0, "resting orders cancelled");
+    for t in [10, 11, 12] {
+        assert_eq!(
+            bal(&db, t).order_margin,
+            FixedPoint::ZERO,
+            "trader {t} refunded"
+        );
+    }
     assert_eq!(ctx.margin_configs[&M].max_leverage, 10);
     assert_eq!(
         ctx.margin_configs[&OTHER].max_leverage, 20,
@@ -623,4 +635,195 @@ fn direct_delist_and_update_actions_stay_rejected() {
     }
     drop(ctx);
     assert_eq!(dump(&db), before);
+}
+
+// ---------------------------------------------------------------------------
+// Codex P1 (pre-testnet review): a params update that changes tick, lot or
+// max leverage first cancels every resting order and pending stop in the
+// market and refunds each reservation under the OLD config (the delist
+// cancel / refund path), then applies the new params. Before, resting
+// orders kept their reservations while later cancels refunded at the new
+// leverage: lowering it released other orders' collateral, raising it
+// stranded collateral.
+// ---------------------------------------------------------------------------
+
+fn fp_ratio(num: i128, den: i128) -> FixedPoint {
+    FixedPoint::from_raw(num * FixedPoint::SCALE / den)
+}
+
+fn params(tick: i64, lot: i64, max_leverage: u32) -> MarketParams {
+    MarketParams {
+        tick_size: fp(tick),
+        lot_size: fp(lot),
+        max_leverage,
+        maintenance_margin_bps: 500,
+        max_funding_rate_bps: 100,
+    }
+}
+
+/// Submits and executes an update of M (proposal 1 on a fresh setup).
+fn update_m(db: &StateDb, p: MarketParams) {
+    let r = submit(
+        db,
+        3,
+        "BTC params",
+        ProposalAction::UpdateMarketParams {
+            market_id: M,
+            params: p,
+        },
+    );
+    assert!(r.success, "{r:?}");
+    let results = pass_and_execute(db, 1);
+    assert!(results.iter().all(|r| r.success), "{results:?}");
+    assert_eq!(status(db, 1), ProposalStatus::Executed);
+}
+
+/// Resting orders in M (two traders), a pending stop in M and a resting
+/// order of trader 10 in the other market, all at 20x and unfilled.
+fn seed_resting(db: &StateDb) {
+    let stop = PlaceOrderParams {
+        order_type: OrderType::StopLimit {
+            trigger: fp(120),
+            limit: fp(121),
+        },
+        ..limit(M, true, 121, 1)
+    };
+    let r = block(
+        db,
+        2,
+        1,
+        &[
+            place(10, limit(M, true, 100, 2)),    // 200 / 20 = 10
+            place(10, limit(OTHER, true, 50, 1)), // 50 / 20 = 2.5
+            place(11, limit(M, false, 110, 3)),   // 330 / 20 = 16.5
+            place(12, stop),
+        ],
+    );
+    assert!(r.iter().all(|r| r.success), "{r:?}");
+    assert_eq!(bal(db, 10).order_margin, fp_ratio(25, 2));
+    assert_eq!(bal(db, 11).order_margin, fp_ratio(33, 2));
+    assert!(bal(db, 12).order_margin > FixedPoint::ZERO);
+}
+
+/// No fill happened: every trader's collateral is where it started.
+fn assert_collateral_conserved(db: &StateDb) {
+    for t in TRADERS {
+        let b = bal(db, t);
+        assert_eq!(
+            b.available + b.order_margin,
+            fp(1_000_000),
+            "trader {t}: collateral conserved ({b:?})"
+        );
+    }
+}
+
+fn leverage_update_refunds_exactly(new_leverage: u32) {
+    let (_d, db) = setup();
+    seed_resting(&db);
+    update_m(&db, params(1, 1, new_leverage));
+
+    let ctx = ctx_at(&db, 201);
+    assert_eq!(ctx.margin_configs[&M].max_leverage, new_leverage);
+    let book = &ctx.order_books()[&M];
+    assert_eq!(book.order_count(), 0, "resting orders cancelled");
+    assert!(book.pending_stops().is_empty(), "pending stops cancelled");
+    assert_eq!(
+        ctx.order_books()[&OTHER].order_count(),
+        1,
+        "other market untouched"
+    );
+    drop(ctx);
+    // Refunded at the reservation they were placed with (20x), exactly.
+    assert_eq!(
+        bal(&db, 10).order_margin,
+        fp_ratio(5, 2),
+        "only the other market's 2.5"
+    );
+    for t in [11, 12] {
+        assert_eq!(bal(&db, t).order_margin, FixedPoint::ZERO, "trader {t}");
+    }
+    assert_collateral_conserved(&db);
+
+    // Later cancels release exactly what is still reserved.
+    let r = block(
+        &db,
+        201,
+        1,
+        &[(addr(10), NativeAction::CancelAllOrders { market_id: None })],
+    );
+    assert!(r[0].success, "{r:?}");
+    assert_eq!(bal(&db, 10).order_margin, FixedPoint::ZERO);
+    assert_eq!(bal(&db, 10).available, fp(1_000_000));
+
+    // New orders reserve at the new leverage and release the same on cancel.
+    let r = block(&db, 202, 1, &[place(11, limit(M, false, 110, 1))]);
+    assert!(r[0].success, "{r:?}");
+    assert_eq!(
+        bal(&db, 11).order_margin,
+        fp_ratio(110, new_leverage as i128)
+    );
+    let r = block(
+        &db,
+        203,
+        1,
+        &[(
+            addr(11),
+            NativeAction::CancelAllOrders { market_id: Some(M) },
+        )],
+    );
+    assert!(r[0].success, "{r:?}");
+    assert_eq!(bal(&db, 11).order_margin, FixedPoint::ZERO);
+    assert_collateral_conserved(&db);
+}
+
+#[test]
+fn leverage_20_to_10_cancels_and_refunds_under_the_old_config() {
+    leverage_update_refunds_exactly(10);
+}
+
+#[test]
+fn leverage_20_to_40_cancels_and_refunds_under_the_old_config() {
+    leverage_update_refunds_exactly(40);
+}
+
+/// A tick change with resting orders: cancelled and refunded; the emptied
+/// book takes the new tick.
+#[test]
+fn tick_change_cancels_resting_orders_and_refunds() {
+    let (_d, db) = setup();
+    seed_resting(&db);
+    update_m(&db, params(2, 1, 20));
+    let ctx = ctx_at(&db, 201);
+    let book = &ctx.order_books()[&M];
+    assert_eq!((book.tick_size, book.order_count()), (fp(2), 0));
+    assert!(book.pending_stops().is_empty());
+    drop(ctx);
+    assert_eq!(bal(&db, 10).order_margin, fp_ratio(5, 2));
+    assert_collateral_conserved(&db);
+    let r = block(
+        &db,
+        201,
+        1,
+        &[
+            place(13, limit(M, true, 99, 1)),
+            place(13, limit(M, true, 98, 1)),
+        ],
+    );
+    assert_eq!(r[0].reason, FailureReason::Tick, "{r:?}");
+    assert!(r[1].success, "{r:?}");
+}
+
+/// An update that changes none of tick, lot and max leverage leaves the
+/// resting orders and their reservations alone.
+#[test]
+fn unchanged_params_keep_resting_orders() {
+    let (_d, db) = setup();
+    seed_resting(&db);
+    update_m(&db, params(1, 1, 20));
+    let ctx = ctx_at(&db, 201);
+    assert_eq!(ctx.order_books()[&M].order_count(), 2);
+    assert_eq!(ctx.order_books()[&M].pending_stops().len(), 1);
+    drop(ctx);
+    assert_eq!(bal(&db, 10).order_margin, fp_ratio(25, 2));
+    assert_eq!(bal(&db, 11).order_margin, fp_ratio(33, 2));
 }
