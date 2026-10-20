@@ -27,6 +27,11 @@ checkpoints (section 107's false REJECT fixed); `crash-kill.sh` and `run-cell.sh
 fail-stop / FATAL / conflicting-blocks lines (the INFO "running state hash fail-stop ... on=false" no longer counts).
 Pull tools from main before the next campaign that has crash cells.
 
+**Harness fix (s131, branch `tools/harness-book-mode`):** `run-cell.sh` no longer pins book mode 3 (its RECORD_ENV set
+`TORUS_BOOK_ROWS=3`; an 8y Classic smoke ran mode 3 that way): no override = Classic. Set `TORUS_BOOK_ROWS=3`
+explicitly for mode-3 arms. Each cell logs `cell=<label> book_mode=... <flag>='...'` and records `cell.book_mode` /
+`cell.node_flags` in summary.json. Pull tools from main before the next campaign.
+
 **Run the queue back to back (owner s131):** archy runs every ready item in queue order without stopping between
 them and without asking. When a campaign's cells finish, launch the next ready item right away; write, commit and
 push the finished item's doc section (perf doc section + its Done line here, on a `docs/perf-section-*` branch;
