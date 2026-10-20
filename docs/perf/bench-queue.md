@@ -798,6 +798,12 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    blocks/s time series per minute (a cadence flip shows as a level shift within or between cells). **Verdict:** B/A
    blocks/s within noise (or both arms swinging alike) -> b1 cleared to merge; B consistently ~0.6x with equal
    per-fill cost -> report it (18c then bisects b0 vs b1).
+   **Done s70 (ozarchy-8z, section 111; O `f8a45a2d` node `74598d33`, B `ab4ded4e` node `f19d9385`, one bench pair
+   `ec15372b`; 5 / 5 cells valid, 111 CHECK OK, 0 FAIL; Classic, EVM fast path and L3.3 off on every node; no foreign-
+   CPU rerun): b1 NOT cleared: Classic native blocks/s B / O 0.746 [0.712, 0.780] (pairs 0.743, 0.748), per-fill cost
+   equal (exec on-CPU 0.999, CPU-s per 1M 0.998, matched/s 1.005); fills per block 1.32x, p50 1.20x, p99 1.24x,
+   timeouts 0.11 -> 0.77 per 1k blocks. No level flip per minute (O 13.2-16.7, B 10.0-12.6): a steady binary effect,
+   not a cadence swing. Next per spec: 18c bisects b0 `704a089d` vs b1 `244a767c` with this shallow Classic ABBA.**
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
