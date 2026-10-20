@@ -1710,6 +1710,15 @@ pub struct ChainConfig {
     /// upgrade. `None` (any genesis without the field) = running hash disabled.
     #[serde(default)]
     pub state_hash_activation_height: Option<u64>,
+    /// L6.1 window-committed Classic order books
+    /// (docs/plans/l61-window-committed-books.md): the running hash skips
+    /// `cf_native_order_books` except at attest heights (`h % 100 == 0`),
+    /// where the block writes and hashes every book. CHAIN-WIDE, consensus-
+    /// changing (genesis `consensus.book_window_commit`); needs
+    /// `state_hash_activation_height` and the Classic book mode. `false` (any
+    /// genesis without the field) = today's hash preimage.
+    #[serde(default)]
+    pub book_window_commit: bool,
 }
 
 fn default_timeout_base_ms() -> u64 {
@@ -1743,6 +1752,12 @@ impl ChainConfig {
         }
         if self.state_hash_activation_height == Some(0) {
             return Err("state_hash_activation_height must be >= 1".to_string());
+        }
+        if self.book_window_commit && self.state_hash_activation_height.is_none() {
+            return Err(
+                "book_window_commit needs state_hash_activation_height (it only changes the running hash)"
+                    .to_string(),
+            );
         }
         Ok(())
     }

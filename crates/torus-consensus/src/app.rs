@@ -97,6 +97,23 @@ enum CloseKind {
     TestDue,
 }
 
+/// L6.1 (genesis `consensus.book_window_commit`): window-committed books
+/// need the Classic book mode. Row modes (`TORUS_BOOK_ROWS` 1 / 2 / 3) write
+/// per-order and level rows to the same CF every block, which the L6.1 digest
+/// would drop off attest heights, so such a node refuses to start.
+fn check_book_window_mode(
+    book_window: bool,
+    mode: torus_bridge::native_executor::BookMode,
+) -> Result<(), String> {
+    if book_window && mode != torus_bridge::native_executor::BookMode::Classic {
+        return Err(format!(
+            "genesis consensus.book_window_commit (L6.1) needs the Classic book mode, but \
+             TORUS_BOOK_ROWS selects {mode:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// p3 merge wait: between blocks L is in two parts. `layer` holds every CF
 /// but [`torus_state::DEFERRED_CFS`] (positions, balances: ~92% of a
 /// block's keys, read by a native block from R only); `deferred` holds
@@ -1332,6 +1349,10 @@ struct ExecutionContext {
     /// coalesced encode (the books stay owed to a later close).
     #[cfg(test)]
     test_coalesce_skip: Option<CloseKind>,
+    /// L6.1 test seam (mutation): this attest height skips its full book
+    /// save (and the forced native path), as a broken committer would.
+    #[cfg(test)]
+    test_l61_skip_full_save: Option<u64>,
     /// 8k L3.1 test seam: an extra checkpoint trigger (`h` -> due), e.g. a
     /// seeded random policy.
     #[cfg(test)]
@@ -3508,7 +3529,12 @@ impl ExecutionContext {
     /// every block's book bytes, so this needs L6.1 first) and the process's
     /// book settings ([`torus_bridge::native_executor::book_coalesce_blocker`]).
     /// Otherwise warns once with the reason and stays off.
-    fn configure_book_coalesce(&mut self, requested: bool, hash_activation: Option<u64>) {
+    fn configure_book_coalesce(
+        &mut self,
+        requested: bool,
+        hash_activation: Option<u64>,
+        book_window: bool,
+    ) {
         self.book_coalesce = false;
         if !requested {
             return;
@@ -3521,8 +3547,10 @@ impl ExecutionContext {
             // coalesced blobs (added only at the close; ~155 MB at P1M), so
             // the cap would be silently blind to them.
             Some("a checkpoint byte cap is set (TORUS_CHECKPOINT_MAX_BYTES): it cannot count the coalesced book blobs")
-        } else if hash_activation.is_some() {
-            Some("the running state hash is configured (genesis state_hash_activation_height)")
+        } else if hash_activation.is_some() && !book_window {
+            // L6.1 (`book_window`) takes the book bytes out of every
+            // non-attest h_n, so node-local windows cannot fork it.
+            Some("the running state hash is configured (genesis state_hash_activation_height) without L6.1 (book_window_commit)")
         } else {
             torus_bridge::native_executor::book_coalesce_blocker()
         };
@@ -4408,7 +4436,14 @@ impl ExecutionContext {
         // not wait for activity).
         // A read error is a node fault: fail-stop (C4), never "assume".
         // Bug (b): every boundary block runs it too (validator-set plans).
+        // L6.1 (consensus, genesis `book_window_commit`): so does every attest
+        // height, whose Classic save writes (and the running hash commits to)
+        // every book, even in an otherwise empty block.
+        let book_window_full = torus_state::running_hash::book_window_full_save_at(&self.state_db, height);
+        #[cfg(test)]
+        let book_window_full = book_window_full && self.test_l61_skip_full_save != Some(height);
         let run_native = if has_native
+            || book_window_full
             || computed_fee_revenue > 0
             || evm_gas != (0, 0)
             || core_writer_due
@@ -5129,8 +5164,12 @@ impl ExecutionContext {
             // Classic books skips the whole-book encodes; the books join the
             // window's debt below and are encoded at its close. Serial blocks
             // (after a barrier: the window is closed) encode per block.
+            // L6.1: an attest height never coalesces; its save writes every
+            // book into this block (`book_window_full_save`).
+            ctx.book_window_full_save = book_window_full;
             ctx.coalesce_books = self.book_coalesce
                 && pipelined
+                && !book_window_full
                 && ctx.resident_mode()
                 && ctx.book_mode() == torus_bridge::native_executor::BookMode::Classic;
             if deferred_books.is_none() {
@@ -5338,6 +5377,12 @@ impl ExecutionContext {
                 // before the upkeep, which may close the window right here.
                 if !coalesced.is_empty() {
                     self.ckpt.lock().unwrap().unsaved.extend(coalesced);
+                }
+                // L6.1: an attest height wrote the newest blob of every book
+                // into this block (the Attest close folds it into the
+                // checkpoint), so the window owes nothing.
+                if book_window_full {
+                    self.ckpt.lock().unwrap().unsaved.clear();
                 }
                 if !self.checkpoint_upkeep(&mut overlay, height) {
                     return;
@@ -6941,6 +6986,8 @@ impl TorusApp {
             #[cfg(test)]
             test_coalesce_skip: None,
             #[cfg(test)]
+            test_l61_skip_full_save: None,
+            #[cfg(test)]
             test_ckpt_due: None,
             #[cfg(test)]
             test_book_mode: None,
@@ -7030,6 +7077,17 @@ impl TorusApp {
         {
             tracing::error!(%e, "running state hash: failed to apply the activation config");
         }
+        // L6.1 (genesis `book_window_commit`): Classic books only; then the
+        // chain config row both the digest and execution read.
+        check_book_window_mode(
+            config.book_window_commit,
+            torus_bridge::native_executor::configured_book_mode(),
+        )?;
+        if let Err(e) =
+            torus_state::running_hash::configure_book_window(&state_db, config.book_window_commit)
+        {
+            return Err(format!("running state hash: failed to apply book_window_commit: {e}"));
+        }
         let (last_header, parked_hole) = Self::replay_committed(&state_db, &exec_ctx);
         // Running state hash: a fail-stop latched before the restart stays
         // latched (persisted record; `TORUS_STATE_HASH_FAILSTOP=1`).
@@ -7083,6 +7141,7 @@ impl TorusApp {
         exec_ctx.configure_book_coalesce(
             crate::exec_pipeline::book_coalesce_requested(),
             config.state_hash_activation_height,
+            config.book_window_commit,
         );
         // s124: the epoch fast path only changes which blocks take the
         // pipelined path, so it needs W.
@@ -7845,6 +7904,7 @@ impl TorusApp {
             reputation_leader_selection: false,
             exec_trust_cache: false,
             state_hash_activation_height: None,
+            book_window_commit: false,
         };
         let mut seed = [0u8; 32];
         seed[..8].copy_from_slice(&id.to_le_bytes());
@@ -10724,6 +10784,7 @@ mod exec_throttle_tests {
                 reputation_leader_selection: false,
                 exec_trust_cache: false,
                 state_hash_activation_height: None,
+                book_window_commit: false,
             };
             (config, state_db)
         };
@@ -12214,6 +12275,7 @@ mod crash_recovery_tests {
             // Running state hash on from height 1 (chain config), as a
             // genesis-synced node of a chain with activation 1.
             state_hash_activation_height: Some(1),
+            book_window_commit: false,
         };
         torus_state::running_hash::configure_activation(&state_db, config.state_hash_activation_height)
             .expect("configure running hash activation");
@@ -15958,6 +16020,8 @@ mod crash_recovery_tests {
             book_coalesce: false,
             #[cfg(test)]
             test_coalesce_skip: None,
+            #[cfg(test)]
+            test_l61_skip_full_save: None,
             #[cfg(test)]
             test_ckpt_due: None,
             #[cfg(test)]
@@ -37857,6 +37921,9 @@ mod crash_recovery_tests {
         static P2_BOOK_COALESCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         static P2_COALESCE_SKIP: std::cell::Cell<Option<CloseKind>> = const { std::cell::Cell::new(None) };
         static P2_CKPT_RANDOM: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+        /// L6.1: every `p2_run_full` context skips the full book save at
+        /// this attest height (mutation seam `test_l61_skip_full_save`).
+        static P2_L61_SKIP_FULL: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     }
 
     /// P2-1 review (GPT-6.1-sol, gap 1): what `p2_run` does to the node
@@ -38111,7 +38178,9 @@ mod crash_recovery_tests {
             ctx.configure_book_coalesce(
                 P2_BOOK_COALESCE.get(),
                 torus_state::running_hash::read_configured_activation(&db),
+                torus_state::running_hash::read_book_window(&db),
             );
+            ctx.test_l61_skip_full_save = P2_L61_SKIP_FULL.get();
             ctx.test_coalesce_skip = P2_COALESCE_SKIP.get();
             if let Some(seed) = P2_CKPT_RANDOM.get() {
                 ctx.test_ckpt_due = Some(Arc::new(move |h| {
@@ -38918,6 +38987,7 @@ mod crash_recovery_tests {
             ctx.configure_book_coalesce(
                 true,
                 torus_state::running_hash::read_configured_activation(db),
+                torus_state::running_hash::read_book_window(db),
             );
             assert!(ctx.book_coalesce, "L3.1 on");
             ctx
@@ -39014,14 +39084,14 @@ mod crash_recovery_tests {
             (false, None, false),
             (true, None, true),
         ] {
-            ctx.configure_book_coalesce(requested, hash);
+            ctx.configure_book_coalesce(requested, hash, false);
             assert_eq!(
                 ctx.book_coalesce, on,
                 "requested {requested}, hash {hash:?}"
             );
         }
         ctx.checkpoint = None;
-        ctx.configure_book_coalesce(true, None);
+        ctx.configure_book_coalesce(true, None, false);
         assert!(!ctx.book_coalesce, "no checkpoint interval");
         // A byte cap cannot count the coalesced blobs: it keeps L3.1 off.
         for cap in [1, 256 << 20] {
@@ -39030,7 +39100,7 @@ mod crash_recovery_tests {
                     max_bytes: Some(cap),
                     ..base
                 });
-                ctx.configure_book_coalesce(true, None);
+                ctx.configure_book_coalesce(true, None, false);
                 assert!(!ctx.book_coalesce, "byte cap {cap}");
             }
         }
@@ -39118,6 +39188,379 @@ mod crash_recovery_tests {
                     assert!(msg.contains("fail-stop"), "{kind:?}: {msg}");
                 }
             }
+        }
+    }
+
+    // ---- L6.1 (genesis `consensus.book_window_commit`): window-committed
+    // Classic books (docs/plans/l61-window-committed-books.md). The running
+    // hash skips `cf_native_order_books` off attest heights; at attest heights
+    // the block writes and hashes every book. Fixture: L3.1's deep stream. ----
+
+    /// The deep traders, the running hash from height 1, and L6.1 `on`.
+    fn l61_seed(db: &StateDb, on: bool) {
+        p2_deep_seed(db);
+        torus_state::running_hash::configure_activation(db, Some(1)).unwrap();
+        torus_state::running_hash::configure_book_window(db, on).unwrap();
+    }
+
+    /// A deliberately wrong L6.1 rule (the goldens must catch each).
+    #[derive(Clone, Copy, Debug)]
+    enum L61Mutant {
+        /// A digest-side rule change on the run's DB.
+        Digest(torus_state::running_hash::BookWindowMutant),
+        /// The committer skips the full book save at this attest height.
+        SkipFullSave(u64),
+    }
+
+    /// One run of `blocks` on the L6.1 seed (`on`: the flag), with a full CF
+    /// dump at every durable height. `pipelined` / `mode` / `ckpt` / `fast`
+    /// / `fault` / `random`: as [`l31_run`]; `coalesce`: L3.1 requested;
+    /// `mutant`: see [`L61Mutant`].
+    #[allow(clippy::too_many_arguments)]
+    fn l61_run(
+        blocks: &[TorusBlock],
+        on: bool,
+        pipelined: bool,
+        mode: Option<torus_bridge::native_executor::BookMode>,
+        ckpt: Option<crate::exec_pipeline::CheckpointPolicy>,
+        coalesce: bool,
+        fast: Option<bool>,
+        fault: &P2Fault,
+        random: Option<u64>,
+        mutant: Option<L61Mutant>,
+    ) -> P2Run {
+        // Clears the seams, the digest mutant included (it is keyed by the DB,
+        // held here so its address is never reused while armed).
+        struct Reset(std::cell::RefCell<Option<StateDb>>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                P2_DUMP_DURABLE.set(false);
+                P2_BOOK_COALESCE.set(false);
+                P2_CKPT_RANDOM.set(None);
+                P2_L61_SKIP_FULL.set(None);
+                if let Some(db) = self.0.borrow_mut().take() {
+                    torus_state::running_hash::set_book_window_mutant(&db, None);
+                }
+            }
+        }
+        let reset = Reset(std::cell::RefCell::new(None));
+        P2_DUMP_DURABLE.set(true);
+        P2_BOOK_COALESCE.set(coalesce);
+        P2_CKPT_RANDOM.set(random);
+        P2_L61_SKIP_FULL.set(match mutant {
+            Some(L61Mutant::SkipFullSave(h)) => Some(h),
+            _ => None,
+        });
+        let seed = |db: &StateDb| {
+            l61_seed(db, on);
+            if let Some(L61Mutant::Digest(m)) = mutant {
+                torus_state::running_hash::set_book_window_mutant(db, Some(m));
+            }
+            *reset.0.borrow_mut() = Some(db.clone());
+        };
+        p2_run_full(blocks, pipelined, mode, false, fault, ckpt, &seed, false, None, fast)
+    }
+
+    /// The `cf_native_order_books` entries of a captured write set.
+    fn l61_book_entries(ws: &[torus_state::running_hash::WriteEntry]) -> usize {
+        ws.iter()
+            .filter(|e| e.0 == torus_state::running_hash::ID_NATIVE_ORDER_BOOKS)
+            .count()
+    }
+
+    /// `run`'s `cf_native_order_books` rows at durable height `h`.
+    fn l61_books_at(run: &P2Run, h: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let (_, dump) = run
+            .dumps
+            .iter()
+            .find(|(s, _)| *s == h)
+            .unwrap_or_else(|| panic!("no dump at {h}"));
+        dump.iter()
+            .find(|(cf, _)| *cf == torus_state::cf::CF_NATIVE_ORDER_BOOKS)
+            .map(|(_, rows)| rows.clone())
+            .unwrap_or_default()
+    }
+
+    fn l61_golden(blocks: &[TorusBlock]) -> P2Run {
+        let classic = Some(torus_bridge::native_executor::BookMode::Classic);
+        l61_run(blocks, true, true, classic, None, false, None, &P2Fault::None, None, None)
+    }
+
+    /// L6.1 golden: with the hash ON and L6.1 on, h_n and the state agree on
+    /// every node whatever its node-local checkpoint windows. The golden is
+    /// the pipelined per-block run (no L3.1): it hashes book bytes only at
+    /// the attest heights 100 / 200, and there exactly every stored book. The
+    /// serial run, the serial run without resident books, and L3.1 under
+    /// every close kind (every 1 / 5 / 7, never with barriers, never with the
+    /// epoch fast path, a 1 ms interval, a seeded random trigger) give the
+    /// same per-height write sets (so every h_n), final hash and retained
+    /// checkpoint hashes, and the same full CF dump and native root at every
+    /// height they made durable. Non-vacuous: the L3.1 runs coalesced.
+    #[test]
+    fn l61_hash_and_state_agree_across_checkpoint_windows() {
+        use torus_bridge::native_executor::BookMode;
+        let blocks = l31_blocks();
+        let classic = Some(BookMode::Classic);
+        let golden = l61_golden(&blocks);
+        assert_eq!(golden.max_lag, 0, "golden: per-block flush");
+        assert!(golden.hash.is_some(), "the running hash is on");
+        assert_eq!(golden.captured.len() as u64, L31_BLOCKS, "every height hashed");
+        for (h, ws) in &golden.captured {
+            let books = l61_book_entries(ws);
+            if h % 100 == 0 {
+                let stored = l61_books_at(&golden, *h).len();
+                assert!(stored >= 2, "books exist at {h}");
+                assert_eq!(books, stored, "attest height {h}: every book hashed");
+            } else {
+                assert_eq!(books, 0, "height {h}: no book bytes hashed");
+            }
+        }
+        let checkpoints = |run: &P2Run| {
+            [100u64, 200].map(|h| torus_state::running_hash::read_checkpoint(&run.db, h))
+        };
+        assert!(checkpoints(&golden).iter().all(Option::is_some));
+        let check = |run: &P2Run, what: &str| {
+            assert_write_sets_equal(&golden.captured, &run.captured, what);
+            assert_eq!(golden.hash, run.hash, "{what}: running hash");
+            assert_eq!(checkpoints(&golden), checkpoints(run), "{what}: checkpoint hashes");
+            assert_eq!(l31_divergence(&golden, run), None, "{what}");
+        };
+        for (what, mode) in [("serial", classic), ("serial, no resident books", None)] {
+            let run = l61_run(&blocks, true, false, mode, None, false, None, &P2Fault::None, None, None);
+            check(&run, what);
+        }
+        let interval = crate::exec_pipeline::CheckpointPolicy {
+            interval: Some(std::time::Duration::from_millis(1)),
+            ..Default::default()
+        };
+        for (name, policy, fast, random, min_lag) in [
+            ("every 1", ckpt_every(1), None, None, 0),
+            ("every 5", ckpt_every(5), None, None, 4),
+            ("every 7", ckpt_every(7), None, None, 6),
+            ("never, barriers", ckpt_never(), None, None, 40),
+            ("never, epoch fast path", ckpt_never(), Some(true), None, 40),
+            ("interval 1 ms", interval, None, None, 0),
+            ("random", ckpt_never(), Some(true), Some(0x1a61), 2),
+        ] {
+            let what = format!("L6.1 + L3.1 {name}");
+            let run = l61_run(&blocks, true, true, classic, Some(policy), true, fast, &P2Fault::None, random, None);
+            let skipped = run.metrics.exec_book_coalesce_skipped.get();
+            println!(
+                "{what}: max lag {}, checkpoints {}, skipped {skipped}, closes {:?}",
+                run.max_lag,
+                run.metrics.exec_checkpoints.get(),
+                l31_closes(&run)
+            );
+            assert!(skipped >= 300, "{what}: L3.1 coalesced ({skipped})");
+            assert!(run.max_lag >= min_lag, "{what}: max lag {} < {min_lag}", run.max_lag);
+            check(&run, &what);
+        }
+    }
+
+    /// L6.1 vs L6.1 off (hash on, same blocks): the per-height write sets
+    /// differ exactly as the design says. Off attest heights the L6.1 set is
+    /// the off set without its book entries; at attest heights it is that
+    /// plus every stored book after the block. The state (every CF but the
+    /// running hash rows) is identical at 100, 200 and at the end.
+    #[test]
+    fn l61_write_sets_differ_from_off_only_in_book_entries() {
+        use torus_bridge::native_executor::BookMode;
+        use torus_state::running_hash::{WriteEntry, ID_NATIVE_ORDER_BOOKS};
+        let blocks = l31_blocks();
+        let classic = Some(BookMode::Classic);
+        let off = l61_run(&blocks, false, true, classic, None, false, None, &P2Fault::None, None, None);
+        let on = l61_golden(&blocks);
+        assert_eq!(
+            off.captured.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
+            on.captured.iter().map(|(h, _)| *h).collect::<Vec<_>>()
+        );
+        let sorted = |mut v: Vec<WriteEntry>| {
+            v.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+            v
+        };
+        let mut off_books = 0;
+        for ((h, w_off), (_, w_on)) in off.captured.iter().zip(&on.captured) {
+            off_books += l61_book_entries(w_off);
+            let mut want: Vec<WriteEntry> =
+                w_off.iter().filter(|e| e.0 != ID_NATIVE_ORDER_BOOKS).cloned().collect();
+            if h % 100 == 0 {
+                want.extend(
+                    l61_books_at(&off, *h)
+                        .into_iter()
+                        .map(|(k, v)| (ID_NATIVE_ORDER_BOOKS, k, Some(v))),
+                );
+            }
+            assert_eq!(sorted(want), sorted(w_on.clone()), "write set of height {h}");
+        }
+        assert!(off_books >= 300, "off hashes book blobs every block ({off_books})");
+        assert_ne!(off.hash, on.hash, "the preimage changed");
+        let state = |dump: &[CfDump]| -> Vec<CfDump> {
+            use torus_state::cf::*;
+            dump.iter()
+                .map(|(cf, rows)| {
+                    let rows = rows
+                        .iter()
+                        .filter(|(k, _)| {
+                            *cf != CF_CONSENSUS_META
+                                || !(k.as_slice() == META_RUNNING_STATE_HASH
+                                    || k.as_slice() == META_STATE_HASH_BOOK_WINDOW
+                                    || k.starts_with(META_STATE_HASH_CHECKPOINT_PREFIX))
+                        })
+                        .cloned()
+                        .collect();
+                    (*cf, rows)
+                })
+                .collect()
+        };
+        for h in [100u64, 200] {
+            let at = |run: &P2Run| run.dumps.iter().find(|(s, _)| *s == h).unwrap().1.clone();
+            assert_dumps_equal(&state(&at(&off)), &state(&at(&on)), &format!("state at {h}"));
+        }
+        assert_dumps_equal(&state(&off.dump), &state(&on.dump), "final state");
+    }
+
+    /// L6.1 crash mid-window: L3.1 on with a checkpoint every 5 blocks and
+    /// the epoch fast path (so the attest height 100 is a plain close, not a
+    /// barrier), six crashes (three with the checkpoint in flight; the one at
+    /// 98 loses the window across the attest height 100, its checkpoint in
+    /// flight). Each restart replays (S, last] serially under the
+    /// same rule; the run equals the golden at every durable height (dump,
+    /// native root, running hash row) and in the final hash and checkpoints.
+    #[test]
+    fn l61_crash_mid_window_replays_to_the_same_hash() {
+        use torus_bridge::native_executor::BookMode;
+        let blocks = l31_blocks();
+        let golden = l61_golden(&blocks);
+        let crashes = [(12, false), (23, true), (58, false), (98, true), (144, false), (203, true)];
+        let fault = P2Fault::CkptCrash(crashes.to_vec());
+        let run = l61_run(
+            &blocks,
+            true,
+            true,
+            Some(BookMode::Classic),
+            Some(ckpt_every(5)),
+            true,
+            Some(true),
+            &fault,
+            None,
+            None,
+        );
+        assert_eq!(run.faults, crashes.len() as u64);
+        println!("L6.1 crash windows: {:?}", run.crash_windows);
+        assert!(
+            run.crash_windows.iter().any(|(s, last)| *s < 100 && *last >= 100),
+            "a lost window spans the attest height 100: {:?}",
+            run.crash_windows
+        );
+        assert_eq!(l31_divergence(&golden, &run), None, "L6.1 crashes");
+        assert_eq!(golden.hash, run.hash, "running hash");
+        for h in [100, 200] {
+            assert_eq!(
+                torus_state::running_hash::read_checkpoint(&golden.db, h),
+                torus_state::running_hash::read_checkpoint(&run.db, h),
+                "checkpoint {h}"
+            );
+        }
+        assert!(run.metrics.exec_book_coalesce_skipped.get() >= 300);
+    }
+
+    /// L6.1 forces the attest commit: an empty block at height 100 (not an
+    /// epoch boundary here) runs the native path and hashes every book (one
+    /// seeded book, never touched). L6.1 off: nothing of the book is hashed
+    /// at 100. The committer skipping the full save (mutation) hashes none.
+    /// Heights 1..=99 are identical in all three.
+    #[test]
+    fn l61_empty_attest_block_commits_every_book() {
+        let mut blocks: Vec<TorusBlock> = (1..=101).map(|h| make_block(h, vec![])).collect();
+        link_blocks(&mut blocks);
+        let book = torus_core::order_book::OrderBook::new(2, FixedPoint::ONE, FixedPoint::ONE);
+        let blob = borsh::to_vec(&book).unwrap();
+        let run = |on: bool, skip: Option<u64>| {
+            let (mut config, db) = p2_fixture();
+            config.epoch_length = 1_000;
+            l61_seed(&db, on);
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_ORDER_BOOKS, &2u64.to_be_bytes(), &blob)
+                .unwrap();
+            torus_state::running_hash::capture_begin(&db);
+            let mut ctx = make_exec_ctx(&config, &db);
+            ctx.test_book_mode = Some(torus_bridge::native_executor::BookMode::Classic);
+            ctx.test_l61_skip_full_save = skip;
+            for b in &blocks {
+                dispatch_and_execute(&ctx, &db, b);
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fail-stop at {}", b.header.height);
+            }
+            drop(ctx);
+            torus_state::running_hash::capture_take(&db)
+        };
+        let (on, off, skipped) = (run(true, None), run(false, None), run(true, Some(100)));
+        let at = |c: &CapturedWrites, h: u64| c.iter().find(|(x, _)| *x == h).map(|(_, w)| w.clone());
+        let want = (torus_state::running_hash::ID_NATIVE_ORDER_BOOKS, 2u64.to_be_bytes().to_vec(), Some(blob.clone()));
+        let on100 = at(&on, 100).expect("height 100 hashed");
+        assert!(on100.contains(&want), "L6.1: the untouched book is committed at 100");
+        assert_eq!(l61_book_entries(&on100), 1);
+        assert_eq!(at(&off, 100).map(|w| l61_book_entries(&w)), Some(0), "off: no book at 100");
+        assert_eq!(at(&skipped, 100).map(|w| l61_book_entries(&w)), Some(0), "mutant: no book at 100");
+        for h in (1..=99).chain([101]) {
+            assert_eq!(at(&on, h), at(&off, h), "height {h}");
+        }
+    }
+
+    /// L6.1 mutations: each wrong rule fails the golden (per-height write
+    /// sets or the final hash): the digest hashing books at one non-attest
+    /// height; the digest never filtering (L3.1 with barriers: serial blocks
+    /// write blobs); an attest height not hashing books; an attest height
+    /// coalescing instead of saving every book (L3.1).
+    #[test]
+    fn l61_golden_catches_book_window_mutants() {
+        use torus_bridge::native_executor::BookMode;
+        use torus_state::running_hash::BookWindowMutant as M;
+        let blocks = l31_blocks();
+        let classic = Some(BookMode::Classic);
+        let golden = l61_golden(&blocks);
+        for (name, mutant, ckpt, coalesce) in [
+            ("books hashed at 37", L61Mutant::Digest(M::HashBooksAt(37)), None, false),
+            ("never filtered, L3.1 with barriers", L61Mutant::Digest(M::NeverFilter), Some(ckpt_never()), true),
+            ("attest 100 not hashed", L61Mutant::Digest(M::SkipAttest(100)), None, false),
+            ("attest 200 not hashed, L3.1", L61Mutant::Digest(M::SkipAttest(200)), Some(ckpt_every(5)), true),
+            ("attest 100 coalesces, L3.1", L61Mutant::SkipFullSave(100), Some(ckpt_every(5)), true),
+        ] {
+            let run = l61_run(&blocks, true, true, classic, ckpt, coalesce, None, &P2Fault::None, None, Some(mutant));
+            let first = golden
+                .captured
+                .iter()
+                .zip(&run.captured)
+                .find(|((_, a), (_, b))| a != b)
+                .map(|((h, _), _)| *h);
+            println!("L6.1 mutant {name}: first differing write set at {first:?}");
+            assert!(
+                first.is_some() || golden.hash != run.hash,
+                "L6.1 mutant passed the golden: {name}"
+            );
+        }
+    }
+
+    /// L6.1 switch: L3.1 may run with the running hash iff L6.1 is on, and
+    /// L6.1 refuses the row book modes.
+    #[test]
+    fn l61_gates_l31_and_the_book_mode() {
+        use torus_bridge::native_executor::BookMode;
+        let (config, db) = p2_fixture();
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.checkpoint = Some(ckpt_every(5));
+        for (hash, window, on) in [
+            (Some(1), false, false),
+            (Some(1), true, true),
+            (Some(500), true, true),
+            (None, true, true),
+            (None, false, true),
+        ] {
+            ctx.configure_book_coalesce(true, hash, window);
+            assert_eq!(ctx.book_coalesce, on, "hash {hash:?}, L6.1 {window}");
+        }
+        assert!(check_book_window_mode(true, BookMode::Classic).is_ok());
+        for mode in [BookMode::OrderRows, BookMode::LevelAuthority, BookMode::LevelAuthorityChunked] {
+            assert!(check_book_window_mode(false, mode).is_ok(), "{mode:?}, L6.1 off");
+            assert!(check_book_window_mode(true, mode).is_err(), "{mode:?}, L6.1 on");
         }
     }
 

@@ -124,6 +124,10 @@ pub struct ConsensusConfig {
     /// every node hashes). Absent = running hash disabled.
     #[serde(default)]
     pub state_hash_activation_height: Option<u64>,
+    /// L6.1 window-committed Classic order books (CHAIN-WIDE, consensus-
+    /// changing; docs/plans/l61-window-committed-books.md). Absent = off.
+    #[serde(default)]
+    pub book_window_commit: bool,
 }
 
 fn default_chain_id() -> u64 {
@@ -741,6 +745,7 @@ impl Genesis {
             // via the `--exec-trust-cache` CLI flag.
             exec_trust_cache: false,
             state_hash_activation_height: self.consensus.state_hash_activation_height,
+            book_window_commit: self.consensus.book_window_commit,
         }
     }
 
@@ -1066,6 +1071,23 @@ mod tests {
         assert!(config.validate().is_ok());
         config.state_hash_activation_height = Some(0);
         assert!(config.validate().is_err(), "height 0 is never executed");
+    }
+
+    /// L6.1: `consensus.book_window_commit` is a CHAIN-WIDE genesis field,
+    /// absent (every existing genesis) = off; on needs the running hash.
+    #[test]
+    fn genesis_book_window_commit_is_chain_config() {
+        let genesis = Genesis::from_json(&sample_genesis_json()).unwrap();
+        assert!(!genesis.consensus.book_window_commit);
+        assert!(!genesis.chain_config().book_window_commit, "off by default");
+        let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        json["consensus"]["book_window_commit"] = serde_json::json!(true);
+        json["consensus"]["state_hash_activation_height"] = serde_json::json!(1);
+        let mut config = Genesis::from_json(&json.to_string()).unwrap().chain_config();
+        assert!(config.book_window_commit);
+        assert!(config.validate().is_ok());
+        config.state_hash_activation_height = None;
+        assert!(config.validate().is_err(), "L6.1 without the running hash");
     }
 
     /// Consensus bug (b): genesis records the hotstuff genesis set as the
