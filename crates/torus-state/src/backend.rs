@@ -6306,7 +6306,11 @@ mod tests {
         use crate::running_hash::books_hashed_at;
         for h in [1, 37, 99, 100, 101, 199, 200, 5_000] {
             assert!(books_hashed_at(false, h), "off: {h}");
-            assert_eq!(books_hashed_at(true, h), h % STATE_HASH_CHECKPOINT_INTERVAL == 0, "on: {h}");
+            assert_eq!(
+                books_hashed_at(true, h),
+                h % STATE_HASH_CHECKPOINT_INTERVAL == 0,
+                "on: {h}"
+            );
         }
     }
 
@@ -6314,7 +6318,9 @@ mod tests {
     /// above the hash activation, only with the flag and the hash configured.
     #[test]
     fn running_hash_book_window_full_save_at() {
-        use crate::running_hash::{book_window_full_save_at, configure_activation, configure_book_window};
+        use crate::running_hash::{
+            book_window_full_save_at, configure_activation, configure_book_window,
+        };
         let (db, _d) = rsh_db();
         let at = |db: &StateDb| -> Vec<u64> {
             [0, 1, 99, 100, 101, 150, 200, 300]
@@ -6350,7 +6356,10 @@ mod tests {
         assert!(read_book_window(&db) && ChainMemo::load(&db).book_window());
         assert_eq!(read_running_hash(&db), None, "changed: chain discarded");
         assert!(checkpoint_heights(&db).is_empty());
-        assert!(!configure_book_window(&db, true).unwrap(), "same config again");
+        assert!(
+            !configure_book_window(&db, true).unwrap(),
+            "same config again"
+        );
         assert!(configure_book_window(&db, false).is_ok());
         assert!(!read_book_window(&db));
     }
@@ -6362,11 +6371,17 @@ mod tests {
     #[test]
     fn running_hash_book_window_digest_skips_books_off_attest_heights() {
         use crate::cf::CF_NATIVE_ORDER_BOOKS;
-        use crate::running_hash::{configure_activation, configure_book_window, ID_NATIVE_ORDER_BOOKS};
+        use crate::running_hash::{
+            configure_activation, configure_book_window, ID_NATIVE_ORDER_BOOKS,
+        };
         let writes = |h: u64| {
             vec![
                 (CF_NATIVE_BALANCES, vec![7], Some(h.to_be_bytes().to_vec())),
-                (CF_NATIVE_ORDER_BOOKS, 2u64.to_be_bytes().to_vec(), Some(vec![h as u8; 40])),
+                (
+                    CF_NATIVE_ORDER_BOOKS,
+                    2u64.to_be_bytes().to_vec(),
+                    Some(vec![h as u8; 40]),
+                ),
             ]
         };
         for on in [false, true] {
@@ -6376,7 +6391,9 @@ mod tests {
             let mut expect = [0u8; 32];
             for h in 98..=201 {
                 let w = writes(h);
-                rsh_overlay(&db, &w).flush_with_native_trie_stats(&db, Some(h), None, None).unwrap();
+                rsh_overlay(&db, &w)
+                    .flush_with_native_trie_stats(&db, Some(h), None, None)
+                    .unwrap();
                 let mut hashed = rsh_expected(&w);
                 if on && h % STATE_HASH_CHECKPOINT_INTERVAL != 0 {
                     hashed.retain(|e| e.0 != ID_NATIVE_ORDER_BOOKS);

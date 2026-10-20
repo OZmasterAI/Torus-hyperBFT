@@ -1083,7 +1083,9 @@ mod tests {
         let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
         json["consensus"]["book_window_commit"] = serde_json::json!(true);
         json["consensus"]["state_hash_activation_height"] = serde_json::json!(1);
-        let mut config = Genesis::from_json(&json.to_string()).unwrap().chain_config();
+        let mut config = Genesis::from_json(&json.to_string())
+            .unwrap()
+            .chain_config();
         assert!(config.book_window_commit);
         assert!(config.validate().is_ok());
         config.state_hash_activation_height = None;

@@ -4439,7 +4439,8 @@ impl ExecutionContext {
         // L6.1 (consensus, genesis `book_window_commit`): so does every attest
         // height, whose Classic save writes (and the running hash commits to)
         // every book, even in an otherwise empty block.
-        let book_window_full = torus_state::running_hash::book_window_full_save_at(&self.state_db, height);
+        let book_window_full =
+            torus_state::running_hash::book_window_full_save_at(&self.state_db, height);
         #[cfg(test)]
         let book_window_full = book_window_full && self.test_l61_skip_full_save != Some(height);
         let run_native = if has_native
@@ -7086,7 +7087,9 @@ impl TorusApp {
         if let Err(e) =
             torus_state::running_hash::configure_book_window(&state_db, config.book_window_commit)
         {
-            return Err(format!("running state hash: failed to apply book_window_commit: {e}"));
+            return Err(format!(
+                "running state hash: failed to apply book_window_commit: {e}"
+            ));
         }
         let (last_header, parked_hole) = Self::replay_committed(&state_db, &exec_ctx);
         // Running state hash: a fail-stop latched before the restart stays
@@ -39258,7 +39261,9 @@ mod crash_recovery_tests {
             }
             *reset.0.borrow_mut() = Some(db.clone());
         };
-        p2_run_full(blocks, pipelined, mode, false, fault, ckpt, &seed, false, None, fast)
+        p2_run_full(
+            blocks, pipelined, mode, false, fault, ckpt, &seed, false, None, fast,
+        )
     }
 
     /// The `cf_native_order_books` entries of a captured write set.
@@ -39283,7 +39288,18 @@ mod crash_recovery_tests {
 
     fn l61_golden(blocks: &[TorusBlock]) -> P2Run {
         let classic = Some(torus_bridge::native_executor::BookMode::Classic);
-        l61_run(blocks, true, true, classic, None, false, None, &P2Fault::None, None, None)
+        l61_run(
+            blocks,
+            true,
+            true,
+            classic,
+            None,
+            false,
+            None,
+            &P2Fault::None,
+            None,
+            None,
+        )
     }
 
     /// L6.1 golden: with the hash ON and L6.1 on, h_n and the state agree on
@@ -39304,7 +39320,11 @@ mod crash_recovery_tests {
         let golden = l61_golden(&blocks);
         assert_eq!(golden.max_lag, 0, "golden: per-block flush");
         assert!(golden.hash.is_some(), "the running hash is on");
-        assert_eq!(golden.captured.len() as u64, L31_BLOCKS, "every height hashed");
+        assert_eq!(
+            golden.captured.len() as u64,
+            L31_BLOCKS,
+            "every height hashed"
+        );
         for (h, ws) in &golden.captured {
             let books = l61_book_entries(ws);
             if h % 100 == 0 {
@@ -39322,11 +39342,26 @@ mod crash_recovery_tests {
         let check = |run: &P2Run, what: &str| {
             assert_write_sets_equal(&golden.captured, &run.captured, what);
             assert_eq!(golden.hash, run.hash, "{what}: running hash");
-            assert_eq!(checkpoints(&golden), checkpoints(run), "{what}: checkpoint hashes");
+            assert_eq!(
+                checkpoints(&golden),
+                checkpoints(run),
+                "{what}: checkpoint hashes"
+            );
             assert_eq!(l31_divergence(&golden, run), None, "{what}");
         };
         for (what, mode) in [("serial", classic), ("serial, no resident books", None)] {
-            let run = l61_run(&blocks, true, false, mode, None, false, None, &P2Fault::None, None, None);
+            let run = l61_run(
+                &blocks,
+                true,
+                false,
+                mode,
+                None,
+                false,
+                None,
+                &P2Fault::None,
+                None,
+                None,
+            );
             check(&run, what);
         }
         let interval = crate::exec_pipeline::CheckpointPolicy {
@@ -39343,7 +39378,18 @@ mod crash_recovery_tests {
             ("random", ckpt_never(), Some(true), Some(0x1a61), 2),
         ] {
             let what = format!("L6.1 + L3.1 {name}");
-            let run = l61_run(&blocks, true, true, classic, Some(policy), true, fast, &P2Fault::None, random, None);
+            let run = l61_run(
+                &blocks,
+                true,
+                true,
+                classic,
+                Some(policy),
+                true,
+                fast,
+                &P2Fault::None,
+                random,
+                None,
+            );
             let skipped = run.metrics.exec_book_coalesce_skipped.get();
             println!(
                 "{what}: max lag {}, checkpoints {}, skipped {skipped}, closes {:?}",
@@ -39352,7 +39398,11 @@ mod crash_recovery_tests {
                 l31_closes(&run)
             );
             assert!(skipped >= 300, "{what}: L3.1 coalesced ({skipped})");
-            assert!(run.max_lag >= min_lag, "{what}: max lag {} < {min_lag}", run.max_lag);
+            assert!(
+                run.max_lag >= min_lag,
+                "{what}: max lag {} < {min_lag}",
+                run.max_lag
+            );
             check(&run, &what);
         }
     }
@@ -39368,7 +39418,18 @@ mod crash_recovery_tests {
         use torus_state::running_hash::{WriteEntry, ID_NATIVE_ORDER_BOOKS};
         let blocks = l31_blocks();
         let classic = Some(BookMode::Classic);
-        let off = l61_run(&blocks, false, true, classic, None, false, None, &P2Fault::None, None, None);
+        let off = l61_run(
+            &blocks,
+            false,
+            true,
+            classic,
+            None,
+            false,
+            None,
+            &P2Fault::None,
+            None,
+            None,
+        );
         let on = l61_golden(&blocks);
         assert_eq!(
             off.captured.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
@@ -39381,8 +39442,11 @@ mod crash_recovery_tests {
         let mut off_books = 0;
         for ((h, w_off), (_, w_on)) in off.captured.iter().zip(&on.captured) {
             off_books += l61_book_entries(w_off);
-            let mut want: Vec<WriteEntry> =
-                w_off.iter().filter(|e| e.0 != ID_NATIVE_ORDER_BOOKS).cloned().collect();
+            let mut want: Vec<WriteEntry> = w_off
+                .iter()
+                .filter(|e| e.0 != ID_NATIVE_ORDER_BOOKS)
+                .cloned()
+                .collect();
             if h % 100 == 0 {
                 want.extend(
                     l61_books_at(&off, *h)
@@ -39390,9 +39454,16 @@ mod crash_recovery_tests {
                         .map(|(k, v)| (ID_NATIVE_ORDER_BOOKS, k, Some(v))),
                 );
             }
-            assert_eq!(sorted(want), sorted(w_on.clone()), "write set of height {h}");
+            assert_eq!(
+                sorted(want),
+                sorted(w_on.clone()),
+                "write set of height {h}"
+            );
         }
-        assert!(off_books >= 300, "off hashes book blobs every block ({off_books})");
+        assert!(
+            off_books >= 300,
+            "off hashes book blobs every block ({off_books})"
+        );
         assert_ne!(off.hash, on.hash, "the preimage changed");
         let state = |dump: &[CfDump]| -> Vec<CfDump> {
             use torus_state::cf::*;
@@ -39414,16 +39485,21 @@ mod crash_recovery_tests {
         };
         for h in [100u64, 200] {
             let at = |run: &P2Run| run.dumps.iter().find(|(s, _)| *s == h).unwrap().1.clone();
-            assert_dumps_equal(&state(&at(&off)), &state(&at(&on)), &format!("state at {h}"));
+            assert_dumps_equal(
+                &state(&at(&off)),
+                &state(&at(&on)),
+                &format!("state at {h}"),
+            );
         }
         assert_dumps_equal(&state(&off.dump), &state(&on.dump), "final state");
     }
 
     /// L6.1 crash mid-window: L3.1 on with a checkpoint every 5 blocks and
     /// the epoch fast path (so the attest height 100 is a plain close, not a
-    /// barrier), six crashes (three with the checkpoint in flight; the one at
-    /// 98 loses the window across the attest height 100, its checkpoint in
-    /// flight). Each restart replays (S, last] serially under the
+    /// barrier), six crashes (two with the checkpoint in flight; the one at
+    /// 99 loses 99 and the attest height 100 with its full save: W fails
+    /// 99's job after E ran 99 and 100). Each restart replays (S, last]
+    /// serially under the
     /// same rule; the run equals the golden at every durable height (dump,
     /// native root, running hash row) and in the final hash and checkpoints.
     #[test]
@@ -39431,7 +39507,18 @@ mod crash_recovery_tests {
         use torus_bridge::native_executor::BookMode;
         let blocks = l31_blocks();
         let golden = l61_golden(&blocks);
-        let crashes = [(12, false), (23, true), (58, false), (98, true), (144, false), (203, true)];
+        // A checkpoint in flight cannot span 100 here (an epoch boundary, so
+        // the harness's E waits on it), and 99 must not close a window itself
+        // (the 100 close would wait on that checkpoint behind the parked W):
+        // the replay after 57 rebases the every-5 closes to 63, ..., 98.
+        let crashes = [
+            (12, false),
+            (23, true),
+            (57, false),
+            (99, false),
+            (144, false),
+            (203, true),
+        ];
         let fault = P2Fault::CkptCrash(crashes.to_vec());
         let run = l61_run(
             &blocks,
@@ -39448,7 +39535,9 @@ mod crash_recovery_tests {
         assert_eq!(run.faults, crashes.len() as u64);
         println!("L6.1 crash windows: {:?}", run.crash_windows);
         assert!(
-            run.crash_windows.iter().any(|(s, last)| *s < 100 && *last >= 100),
+            run.crash_windows
+                .iter()
+                .any(|(s, last)| *s < 100 && *last >= 100),
             "a lost window spans the attest height 100: {:?}",
             run.crash_windows
         );
@@ -39479,27 +39568,51 @@ mod crash_recovery_tests {
             let (mut config, db) = p2_fixture();
             config.epoch_length = 1_000;
             l61_seed(&db, on);
-            db.put_cf_raw(torus_state::cf::CF_NATIVE_ORDER_BOOKS, &2u64.to_be_bytes(), &blob)
-                .unwrap();
+            db.put_cf_raw(
+                torus_state::cf::CF_NATIVE_ORDER_BOOKS,
+                &2u64.to_be_bytes(),
+                &blob,
+            )
+            .unwrap();
             torus_state::running_hash::capture_begin(&db);
             let mut ctx = make_exec_ctx(&config, &db);
             ctx.test_book_mode = Some(torus_bridge::native_executor::BookMode::Classic);
             ctx.test_l61_skip_full_save = skip;
             for b in &blocks {
                 dispatch_and_execute(&ctx, &db, b);
-                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fail-stop at {}", b.header.height);
+                assert!(
+                    !ctx.exec_failed.load(Ordering::SeqCst),
+                    "fail-stop at {}",
+                    b.header.height
+                );
             }
             drop(ctx);
             torus_state::running_hash::capture_take(&db)
         };
         let (on, off, skipped) = (run(true, None), run(false, None), run(true, Some(100)));
-        let at = |c: &CapturedWrites, h: u64| c.iter().find(|(x, _)| *x == h).map(|(_, w)| w.clone());
-        let want = (torus_state::running_hash::ID_NATIVE_ORDER_BOOKS, 2u64.to_be_bytes().to_vec(), Some(blob.clone()));
+        let at =
+            |c: &CapturedWrites, h: u64| c.iter().find(|(x, _)| *x == h).map(|(_, w)| w.clone());
+        let want = (
+            torus_state::running_hash::ID_NATIVE_ORDER_BOOKS,
+            2u64.to_be_bytes().to_vec(),
+            Some(blob.clone()),
+        );
         let on100 = at(&on, 100).expect("height 100 hashed");
-        assert!(on100.contains(&want), "L6.1: the untouched book is committed at 100");
+        assert!(
+            on100.contains(&want),
+            "L6.1: the untouched book is committed at 100"
+        );
         assert_eq!(l61_book_entries(&on100), 1);
-        assert_eq!(at(&off, 100).map(|w| l61_book_entries(&w)), Some(0), "off: no book at 100");
-        assert_eq!(at(&skipped, 100).map(|w| l61_book_entries(&w)), Some(0), "mutant: no book at 100");
+        assert_eq!(
+            at(&off, 100).map(|w| l61_book_entries(&w)),
+            Some(0),
+            "off: no book at 100"
+        );
+        assert_eq!(
+            at(&skipped, 100).map(|w| l61_book_entries(&w)),
+            Some(0),
+            "mutant: no book at 100"
+        );
         for h in (1..=99).chain([101]) {
             assert_eq!(at(&on, h), at(&off, h), "height {h}");
         }
@@ -39517,14 +39630,64 @@ mod crash_recovery_tests {
         let blocks = l31_blocks();
         let classic = Some(BookMode::Classic);
         let golden = l61_golden(&blocks);
-        for (name, mutant, ckpt, coalesce) in [
-            ("books hashed at 37", L61Mutant::Digest(M::HashBooksAt(37)), None, false),
-            ("never filtered, L3.1 with barriers", L61Mutant::Digest(M::NeverFilter), Some(ckpt_never()), true),
-            ("attest 100 not hashed", L61Mutant::Digest(M::SkipAttest(100)), None, false),
-            ("attest 200 not hashed, L3.1", L61Mutant::Digest(M::SkipAttest(200)), Some(ckpt_every(5)), true),
-            ("attest 100 coalesces, L3.1", L61Mutant::SkipFullSave(100), Some(ckpt_every(5)), true),
+        // `fast`: the epoch fast path, so the attest heights (also epoch
+        // boundaries here) run pipelined and L3.1 would coalesce them.
+        for (name, mutant, ckpt, coalesce, fast) in [
+            (
+                "books hashed at 37",
+                L61Mutant::Digest(M::HashBooksAt(37)),
+                None,
+                false,
+                None,
+            ),
+            (
+                "never filtered, L3.1 with barriers",
+                L61Mutant::Digest(M::NeverFilter),
+                Some(ckpt_never()),
+                true,
+                None,
+            ),
+            (
+                "attest 100 not hashed",
+                L61Mutant::Digest(M::SkipAttest(100)),
+                None,
+                false,
+                None,
+            ),
+            (
+                "attest 200 not hashed, L3.1",
+                L61Mutant::Digest(M::SkipAttest(200)),
+                Some(ckpt_every(5)),
+                true,
+                Some(true),
+            ),
+            (
+                "attest 100 coalesces, L3.1",
+                L61Mutant::SkipFullSave(100),
+                Some(ckpt_every(5)),
+                true,
+                Some(true),
+            ),
+            (
+                "attest 200 coalesces, L3.1",
+                L61Mutant::SkipFullSave(200),
+                Some(ckpt_never()),
+                true,
+                Some(true),
+            ),
         ] {
-            let run = l61_run(&blocks, true, true, classic, ckpt, coalesce, None, &P2Fault::None, None, Some(mutant));
+            let run = l61_run(
+                &blocks,
+                true,
+                true,
+                classic,
+                ckpt,
+                coalesce,
+                fast,
+                &P2Fault::None,
+                None,
+                Some(mutant),
+            );
             let first = golden
                 .captured
                 .iter()
@@ -39558,9 +39721,19 @@ mod crash_recovery_tests {
             assert_eq!(ctx.book_coalesce, on, "hash {hash:?}, L6.1 {window}");
         }
         assert!(check_book_window_mode(true, BookMode::Classic).is_ok());
-        for mode in [BookMode::OrderRows, BookMode::LevelAuthority, BookMode::LevelAuthorityChunked] {
-            assert!(check_book_window_mode(false, mode).is_ok(), "{mode:?}, L6.1 off");
-            assert!(check_book_window_mode(true, mode).is_err(), "{mode:?}, L6.1 on");
+        for mode in [
+            BookMode::OrderRows,
+            BookMode::LevelAuthority,
+            BookMode::LevelAuthorityChunked,
+        ] {
+            assert!(
+                check_book_window_mode(false, mode).is_ok(),
+                "{mode:?}, L6.1 off"
+            );
+            assert!(
+                check_book_window_mode(true, mode).is_err(),
+                "{mode:?}, L6.1 on"
+            );
         }
     }
 

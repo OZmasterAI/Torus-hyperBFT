@@ -294,7 +294,11 @@ fn has_stored_chain(db: &StateDb, checkpoints: &[u64]) -> bool {
 
 /// Delete the stored chain (hash, activation record, unverified marker and
 /// `checkpoints`) in `batch`: it belongs to another chain definition.
-fn discard_stored_chain(batch: &mut rocksdb::WriteBatch, cf: &rocksdb::ColumnFamily, checkpoints: &[u64]) {
+fn discard_stored_chain(
+    batch: &mut rocksdb::WriteBatch,
+    cf: &rocksdb::ColumnFamily,
+    checkpoints: &[u64],
+) {
     for key in [
         META_RUNNING_STATE_HASH,
         META_RUNNING_STATE_HASH_ACTIVATION,
@@ -321,7 +325,10 @@ pub const ID_NATIVE_ORDER_BOOKS: u8 = 3;
 /// [`configure_book_window`]).
 pub fn read_book_window(db: &StateDb) -> bool {
     matches!(
-        db.get_cf_raw(CF_CONSENSUS_META, META_STATE_HASH_BOOK_WINDOW).ok().flatten().as_deref(),
+        db.get_cf_raw(CF_CONSENSUS_META, META_STATE_HASH_BOOK_WINDOW)
+            .ok()
+            .flatten()
+            .as_deref(),
         Some([1])
     )
 }
@@ -333,8 +340,12 @@ pub fn read_book_window(db: &StateDb) -> bool {
 /// whether a stored chain was discarded.
 pub fn configure_book_window(db: &StateDb, on: bool) -> Result<bool, crate::StateError> {
     let previous = read_book_window(db);
+    if previous == on {
+        // Unchanged: no write (a read-only DB opens with the same config).
+        return Ok(false);
+    }
     let checkpoints = checkpoint_heights(db);
-    let reset = previous != on && has_stored_chain(db, &checkpoints);
+    let reset = has_stored_chain(db, &checkpoints);
     let cf = db.cf_handle(CF_CONSENSUS_META)?;
     let mut batch = rocksdb::WriteBatch::default();
     if reset {
@@ -351,7 +362,10 @@ pub fn configure_book_window(db: &StateDb, on: bool) -> Result<bool, crate::Stat
         batch.delete_cf(cf, META_STATE_HASH_BOOK_WINDOW);
     }
     db.write(batch)?;
-    tracing::info!(on, "running state hash: L6.1 window-committed books (chain config)");
+    tracing::info!(
+        on,
+        "running state hash: L6.1 window-committed books (chain config)"
+    );
     Ok(reset)
 }
 
@@ -362,9 +376,7 @@ pub fn configure_book_window(db: &StateDb, on: bool) -> Result<bool, crate::Stat
 /// Classic save wrote every book ([`book_window_full_save_at`]).
 #[inline]
 pub fn books_hashed_at(book_window: bool, height: u64) -> bool {
-    let _ = book_window;
-    let _ = height;
-    true
+    !book_window || height.is_multiple_of(STATE_HASH_CHECKPOINT_INTERVAL)
 }
 
 /// L6.1 rule, execution side: whether block `height`'s Classic save writes
@@ -373,8 +385,9 @@ pub fn books_hashed_at(book_window: bool, height: u64) -> bool {
 /// `height` >= its activation, and `height` an attest height. Reads META
 /// only at attest heights.
 pub fn book_window_full_save_at(db: &StateDb, height: u64) -> bool {
-    let _ = (db, height);
-    false
+    height.is_multiple_of(STATE_HASH_CHECKPOINT_INTERVAL)
+        && read_configured_activation(db).is_some_and(|a| height >= a)
+        && read_book_window(db)
 }
 
 /// [`books_hashed_at`] for a digest flushing into `db`, with the test-only
