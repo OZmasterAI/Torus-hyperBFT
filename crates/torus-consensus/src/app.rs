@@ -663,7 +663,24 @@ impl CommitPersistWriter {
         header_hook: HeaderHookSlot,
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<PersistJob>();
-        let worker = std::thread::Builder::new()
+        let worker = Self::spawn_on(rx, state_db, pruner, metrics, header_hook);
+        Self {
+            tx: Some(tx),
+            worker: Some(worker),
+            #[cfg(test)]
+            _held: None,
+        }
+    }
+
+    /// The writer thread over `rx` (see [`Self::spawn`]).
+    fn spawn_on(
+        rx: std::sync::mpsc::Receiver<PersistJob>,
+        state_db: StateDb,
+        pruner: ManifestPruner,
+        metrics: Option<Arc<torus_telemetry::Metrics>>,
+        header_hook: HeaderHookSlot,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::Builder::new()
             .name("torus-commit-persist".into())
             .spawn(move || {
                 for job in rx {
@@ -692,13 +709,7 @@ impl CommitPersistWriter {
                 }
                 // `pruner` drops here: its last pass, then its thread joins.
             })
-            .expect("spawn the commit-persist writer");
-        Self {
-            tx: Some(tx),
-            worker: Some(worker),
-            #[cfg(test)]
-            _held: None,
-        }
+            .expect("spawn the commit-persist writer")
     }
 
     /// Test seam: a writer that queues jobs and never writes them (a crash
@@ -711,6 +722,48 @@ impl CommitPersistWriter {
             worker: None,
             _held: Some(rx),
         }
+    }
+
+    /// Test seam: the real writer, each write landing `delay` after its
+    /// submit (a write queued behind a state checkpoint batch).
+    #[cfg(test)]
+    fn delayed(state_db: StateDb, pruner: ManifestPruner, delay: std::time::Duration) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<PersistJob>();
+        let (fwd_tx, fwd_rx) = std::sync::mpsc::channel::<PersistJob>();
+        std::thread::spawn(move || {
+            for job in rx {
+                std::thread::sleep(delay);
+                if fwd_tx.send(job).is_err() {
+                    return;
+                }
+            }
+        });
+        Self {
+            tx: Some(tx),
+            worker: Some(Self::spawn_on(
+                fwd_rx,
+                state_db,
+                pruner,
+                None,
+                HeaderHookSlot::default(),
+            )),
+            _held: None,
+        }
+    }
+
+    /// Test seam: let a [`Self::held`] writer go: the real writer thread
+    /// starts on the held queue and writes what it holds, in order, then
+    /// what follows (a slow write that lands late).
+    #[cfg(test)]
+    fn release(&mut self, state_db: StateDb, pruner: ManifestPruner) {
+        let rx = self._held.take().expect("a held writer");
+        self.worker = Some(Self::spawn_on(
+            rx,
+            state_db,
+            pruner,
+            None,
+            HeaderHookSlot::default(),
+        ));
     }
 
     /// Queue `block`'s header + body write; the ticket fills once it returned.
@@ -45473,19 +45526,38 @@ mod crash_recovery_tests {
     /// Its record must not be "no actions": the cursor stays at 1228 and
     /// nothing goes; the next pass back-fills 1228 from the tree, pin
     /// included.
+    ///
+    /// RH4 x T5.3: the same when the T5.3 `CommitPersistWriter` makes the
+    /// failed write (`writer`): the GC learns of the failure from the
+    /// writer's ticket, not at dispatch. And x, lost from the DA store
+    /// before 1228 dispatched, is restored from the block's actions either
+    /// way (the body row it would otherwise reload never landed).
     #[test]
     fn da_gc_failed_body_write_leaves_the_cursor_behind() {
+        for writer in [false, true] {
+            da_gc_failed_body_write(writer);
+        }
+    }
+
+    fn da_gc_failed_body_write(writer: bool) {
         use hotstuff_rs::hotstuff::types::PhaseCertificate;
         use hotstuff_rs::types::data_types::BlockHeight;
         const W: u64 = 1128;
+        let what = format!("writer {writer}");
         let (config, scratch) = make_test_config_and_db();
         let x = sign_claim_rewards(1);
         let hx = torus_types::compute_action_hash(&x);
-        let (consensus, store, _) =
-            da_gc_store_with_row(&scratch, "torus-da-gc-ro", &x, 99, 1227, W);
+        let (consensus, store, _) = da_gc_store_with_row(
+            &scratch,
+            &format!("torus-da-gc-ro-{writer}"),
+            &x,
+            99,
+            1227,
+            W,
+        );
         let mut blocks = vec![high_block(1227, vec![]), high_block(1228, vec![x.clone()])];
         link_blocks(&mut blocks);
-        let state_dir = scratch_db_dir("torus-da-gc-ro-state");
+        let state_dir = scratch_db_dir(&format!("torus-da-gc-ro-state-{writer}"));
         {
             let state = StateDb::open(&state_dir).unwrap();
             persist_committed_block_durably(&state, &blocks[0]);
@@ -45496,7 +45568,7 @@ mod crash_recovery_tests {
         let state_db = StateDb::open_read_only(&state_dir).unwrap();
         assert!(
             !persist_committed_block_durably(&state_db, &blocks[1]).body,
-            "the state DB rejects the body write"
+            "{what}: the state DB rejects the body write"
         );
         let mempool = Arc::new(torus_mempool::Mempool::with_da_store(
             state_db.clone(),
@@ -45511,10 +45583,20 @@ mod crash_recovery_tests {
             Some(mempool.clone()),
             None,
         );
+        if writer {
+            let (pruned_tx, _pruned_rx) = std::sync::mpsc::channel();
+            app.commit_persist = Some(CommitPersistWriter::spawn(
+                state_db.clone(),
+                ManifestPruner::detached(pruned_tx),
+                None,
+                app.header_hook.clone(),
+            ));
+        }
         app.set_da_body_gc(Some(crate::da_gc::DaBodyGc {
             retention: W,
             block_tree_db: consensus.clone(),
         }));
+        store.remove(&[hx]).unwrap();
         // A full datum (a proposal this node validated): the body is in hand.
         let datum = encode_proposal_datum(&blocks[1], false);
         let committed = hotstuff_rs::types::block::Block::new(
@@ -45525,23 +45607,24 @@ mod crash_recovery_tests {
         );
         app.on_committed_block(&committed, committed.hash);
         da_gc_settle(&app);
-        assert_eq!(app.exec_next_height, Some(1229), "1228 dispatched");
-        assert!(tree_serves(&consensus, 1228));
+        assert_eq!(app.exec_next_height, Some(1229), "{what}: 1228 dispatched");
+        assert!(tree_serves(&consensus, 1228), "{what}");
         assert!(
             store.contains(&hx.0).unwrap(),
-            "1228's record is unknown (its body write failed): nothing goes"
+            "{what}: restored from the block's actions; 1228's record is unknown (its body \
+             write failed): nothing goes"
         );
         assert_eq!(
             (held_passes(&metrics, "unrecorded"), held_total(&metrics)),
             (1, 1),
-            "the held pass is counted, by its reason"
+            "{what}: the held pass is counted, by its reason"
         );
         // The next pass back-fills 1228 from the tree: x moves to row 1228.
         app.gc_da_bodies_after_dispatch(1229, &[], vec![], true);
         da_gc_settle(&app);
-        assert!(store.contains(&hx.0).unwrap(), "pinned by 1228");
-        assert_eq!(metrics.da_bodies_gc_deleted.get(), 0);
-        assert_eq!(held_total(&metrics), 1);
+        assert!(store.contains(&hx.0).unwrap(), "{what}: pinned by 1228");
+        assert_eq!(metrics.da_bodies_gc_deleted.get(), 0, "{what}");
+        assert_eq!(held_total(&metrics), 1, "{what}");
     }
 
     /// The tree's uncommitted tail, as the GC reads it: every block above
@@ -46193,6 +46276,244 @@ mod crash_recovery_tests {
                 held_total(&metrics),
                 held_before,
                 "{what}: back-filled, the restarted pass held nothing"
+            );
+        }
+    }
+
+    /// The cursor of the durable DA body GC state in `db`.
+    fn da_gc_cursor(db: &StateDb) -> Option<u64> {
+        da_gc_state(db).map(|s| s.1)
+    }
+
+    /// `app`'s off-thread commit-persist writer, as the T5.3 node runs it.
+    fn spawn_commit_persist_writer(app: &mut TorusApp) {
+        let (pruned_tx, _pruned_rx) = std::sync::mpsc::channel();
+        app.commit_persist = Some(CommitPersistWriter::spawn(
+            app.state_db.clone(),
+            ManifestPruner::detached(pruned_tx),
+            None,
+            app.header_hook.clone(),
+        ));
+    }
+
+    /// RH4 x T5.3 (the GC worker): a dispatched height reaches the GC only
+    /// once the `CommitPersistWriter` wrote its body row. Height 6
+    /// re-includes x, whose body aged out at tip 5; the restore reloads it
+    /// from 6's body row. The writer holds 6's write: the worker records
+    /// nothing for 6 (the cursor stays at 6), however long it waits. Once the
+    /// write lands the pass restores x from the row and records 6, and x
+    /// stays for 6's whole window. Run on the handoff alone the pass would
+    /// record 6 with its row still unwritten and its restore failing: x
+    /// would be gone for good.
+    #[test]
+    fn da_gc_worker_records_a_height_only_once_its_commit_persist_write_landed() {
+        let (config, state_db) = make_test_config_and_db();
+        set_tree_frontier(&state_db, u64::MAX);
+        let (mut app, mempool, _metrics, _rx) = da_gc_app_mode(&state_db, &config, 4, false);
+        spawn_commit_persist_writer(&mut app);
+        let x = sign_claim_rewards(1);
+        mempool
+            .mirror_native_to_da(std::slice::from_ref(&x))
+            .unwrap();
+        da_gc_commit(&mut app, 1, vec![x.clone()]);
+        for tip in 2..=5u64 {
+            da_gc_commit(&mut app, tip, vec![]);
+        }
+        assert!(!da_has(&mempool, &x), "row 1 aged out at tip 5");
+        assert_eq!(da_gc_cursor(&state_db), Some(6));
+        // 6's write is slow (queued behind a checkpoint batch): held.
+        app.commit_persist = Some(CommitPersistWriter::held());
+        let committed = committed_full_block(&make_block(6, vec![x.clone()]));
+        app.on_committed_block(&committed, committed.hash);
+        assert_eq!(app.exec_next_height, Some(7), "height 6 dispatched");
+        let t = std::time::Instant::now();
+        while t.elapsed() < std::time::Duration::from_millis(500) {
+            assert_eq!(
+                da_gc_cursor(&state_db),
+                Some(6),
+                "height 6 recorded before its body row was written"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(load_replay_body(&state_db, 6).is_none(), "6's write is held");
+        let (pruned_tx, _pruned_rx) = std::sync::mpsc::channel();
+        app.commit_persist
+            .as_mut()
+            .unwrap()
+            .release(state_db.clone(), ManifestPruner::detached(pruned_tx));
+        da_gc_settle(&app);
+        assert!(load_replay_body(&state_db, 6).is_some(), "6's write landed");
+        assert_eq!(da_gc_cursor(&state_db), Some(7), "6 recorded");
+        for tip in 7..=10u64 {
+            assert!(
+                da_has(&mempool, &x),
+                "tip {}: restored from 6's row, block 6 still needs it",
+                tip - 1
+            );
+            da_gc_commit(&mut app, tip, vec![]);
+        }
+        assert!(!da_has(&mempool, &x), "block 6's window ended at tip 10");
+    }
+
+    /// RH4 x T5.3 (`TORUS_DA_GC_INLINE=1`): the inline pass also runs only
+    /// once the writer wrote the height's rows (each write lands 300 ms after
+    /// its submit here): when the commit returns, the height is recorded and
+    /// its body row is on disk, never the record alone.
+    #[test]
+    fn da_gc_inline_pass_waits_for_the_commit_persist_write() {
+        let (config, state_db) = make_test_config_and_db();
+        set_tree_frontier(&state_db, u64::MAX);
+        let (mut app, mempool, _metrics, _rx) = da_gc_app_mode(&state_db, &config, 4, true);
+        let (pruned_tx, _pruned_rx) = std::sync::mpsc::channel();
+        app.commit_persist = Some(CommitPersistWriter::delayed(
+            state_db.clone(),
+            ManifestPruner::detached(pruned_tx),
+            std::time::Duration::from_millis(300),
+        ));
+        let x = sign_claim_rewards(1);
+        mempool
+            .mirror_native_to_da(std::slice::from_ref(&x))
+            .unwrap();
+        for (h, actions) in [(1u64, vec![x.clone()]), (2, vec![])] {
+            let committed = committed_compact_block(&make_block(h, actions));
+            app.on_committed_block(&committed, committed.hash);
+            assert_eq!(da_gc_cursor(&state_db), Some(h + 1), "height {h} recorded");
+            assert!(
+                load_replay_body(&state_db, h).is_some(),
+                "height {h} recorded before its body row was written"
+            );
+        }
+    }
+
+    /// RH4 x T5.3, the two crash windows around the off-thread write, in the
+    /// production layout (manifest, block tree and DA store in the consensus
+    /// DB; the `CommitPersistWriter` writes 1226's rows; x, re-included by
+    /// 1226, has its old row at 100, due at 1228):
+    ///
+    /// - `write_landed` false: the crash comes before the writer wrote 1226.
+    ///   The GC (waiting on the write) recorded nothing for 1226. The restart
+    ///   parks 1226 from its manifest, heals it from the DA store, and its
+    ///   pass (after the healed write) records the pin.
+    /// - `write_landed` true: the write landed, the crash came before the GC
+    ///   recorded 1226. The restart replays 1226 from its rows and the next
+    ///   pass back-fills 1226's record (the pin) from the tree.
+    ///
+    /// Either way x survives 1228's pass (row 100 due), the cursor reaches
+    /// 1229, and no pass holds for a gap or an unknown record.
+    #[test]
+    fn da_gc_with_the_commit_persist_writer_survives_a_crash_in_either_window() {
+        for write_landed in [false, true] {
+            const W: u64 = 1128;
+            let what = format!("write landed before the crash: {write_landed}");
+            let (config, state_db) = make_test_config_and_db();
+            let x = sign_claim_rewards(1);
+            let hx = torus_types::compute_action_hash(&x);
+            let prefix = format!("torus-da-gc-writer-crash-{write_landed}");
+            let (consensus, store, mempool) =
+                da_gc_store_with_row(&state_db, &prefix, &x, 100, 1225, W);
+            let mut blocks = vec![
+                high_block(1225, vec![]),
+                high_block(1226, vec![x.clone()]),
+                high_block(1227, vec![]),
+                high_block(1228, vec![]),
+            ];
+            link_blocks(&mut blocks);
+            persist_committed_block_durably(&state_db, &blocks[0]);
+            write_native_applied_height(&state_db, 1225);
+            tree_commit_chain(&consensus, &blocks[1..]);
+            set_tree_frontier(&consensus, 228);
+            let metrics = Arc::new(torus_telemetry::Metrics::new());
+            let boot = |mempool: Arc<torus_mempool::Mempool>| {
+                let mut app = TorusApp::try_new_with_manifest_db(
+                    state_db.clone(),
+                    consensus.clone(),
+                    &config,
+                    Some(metrics.clone()),
+                    Some(mempool),
+                    None,
+                )
+                .unwrap();
+                assert!(app.commit_persist.is_some(), "the off-thread writer");
+                app.set_da_body_gc_mode(
+                    Some(crate::da_gc::DaBodyGc {
+                        retention: W,
+                        block_tree_db: consensus.clone(),
+                    }),
+                    false,
+                );
+                app
+            };
+            let mut app = boot(mempool);
+            if write_landed {
+                app.da_gc_hooks().pause();
+            } else {
+                app.commit_persist = Some(CommitPersistWriter::held());
+            }
+            let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+            app.replace_exec_tx(tx);
+            let committed = committed_compact_block(&blocks[1]);
+            app.on_committed_block(&committed, committed.hash);
+            let msg = rx.try_recv().expect("1226 dispatched");
+            if write_landed {
+                assert!(msg.settled_durable().body, "{what}: 1226's rows landed");
+            } else {
+                let t = std::time::Instant::now();
+                while t.elapsed() < std::time::Duration::from_millis(500) {
+                    assert_eq!(
+                        da_gc_cursor(&consensus),
+                        Some(1226),
+                        "{what}: 1226 recorded before its body row was written"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            app.da_gc_kill_worker();
+            assert_eq!(da_gc_cursor(&consensus), Some(1226), "{what}: no record");
+            drop(app); // the crash: a held write is dropped unwritten
+            drop(msg);
+            assert_eq!(
+                load_replay_body(&state_db, 1226).is_some(),
+                write_landed,
+                "{what}"
+            );
+
+            let mempool = Arc::new(torus_mempool::Mempool::with_da_store(
+                state_db.clone(),
+                store.clone(),
+                torus_mempool::MempoolConfig::default(),
+            ));
+            let mut app = boot(mempool);
+            assert!(!app.is_exec_failed(), "{what}");
+            if write_landed {
+                assert_eq!(app.exec_next_height, Some(1227), "{what}: 1226 replayed");
+            } else {
+                assert_eq!(
+                    app.exec_next_height,
+                    Some(1226),
+                    "{what}: 1226 parked from its manifest"
+                );
+                app.drain_exec_queue();
+            }
+            for block in &blocks[2..] {
+                let committed = committed_compact_block(block);
+                app.on_committed_block(&committed, committed.hash);
+            }
+            da_gc_settle(&app);
+            assert!(!app.is_exec_failed(), "{what}");
+            assert_eq!(app.exec_next_height, Some(1229), "{what}: 1228 dispatched");
+            assert!(load_replay_body(&state_db, 1226).is_some(), "{what}");
+            assert!(
+                store.contains(&hx.0).unwrap(),
+                "{what}: the tree serves 1226, its re-included body must stay"
+            );
+            assert_eq!(da_gc_cursor(&consensus), Some(1229), "{what}");
+            assert_eq!(
+                (
+                    held_passes(&metrics, "gap"),
+                    held_passes(&metrics, "unrecorded")
+                ),
+                (0, 0),
+                "{what}"
             );
         }
     }
