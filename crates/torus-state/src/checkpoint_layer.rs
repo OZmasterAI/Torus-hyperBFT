@@ -287,6 +287,39 @@ impl CheckpointLayer {
         }
     }
 
+    /// 8k L3.1 (`TORUS_BOOK_COALESCE`): write `(cf, key) = value` on top, as
+    /// the newest block would (replaces an earlier write or tombstone of the
+    /// key). The window close puts the coalesced Classic book blobs into the
+    /// closing layer with it, just before the checkpoint hand-off. `Err`: an
+    /// unregistered CF (code bug).
+    pub fn put_raw(&mut self, cf: &str, key: Vec<u8>, value: Vec<u8>) -> Result<(), StateError> {
+        // A CF's slot is its position in `ALL_CF_NAMES` (as `books_deferred`).
+        let i = crate::cf::ALL_CF_NAMES
+            .iter()
+            .position(|n| *n == cf)
+            .ok_or_else(|| {
+                StateError::Io(std::io::Error::other(format!("unregistered CF {cf}")))
+            })?;
+        let (dst, bytes) = (&mut self.state.cfs[i], &mut self.bytes[i]);
+        if dst.deletes.remove(&key) {
+            *bytes -= key.len();
+        }
+        match dst.writes.get_mut(&key) {
+            Some(old) => {
+                *bytes = *bytes - old.len() + value.len();
+                *old = value;
+            }
+            None => {
+                *bytes += key.len() + value.len();
+                dst.writes.insert(key, value);
+            }
+        }
+        if let Some(t) = &self.tracked {
+            t.set_bytes(self.bytes());
+        }
+        Ok(())
+    }
+
     /// A deep copy (the fallback when another handle on a shared layer is
     /// still alive where the exec thread takes it back to merge into it).
     pub fn duplicate(&self) -> Self {
@@ -850,6 +883,54 @@ mod tests {
         assert_eq!(l.bytes(), 3 + 4 + 2 + 2);
         assert_eq!(l.entry_count(), 3);
         assert_eq!(l.top_height(), Some(6));
+    }
+
+    /// 8k L3.1: `put_raw` equals merging a block that puts the same row: it
+    /// replaces an earlier write or tombstone, keeps `bytes()` exact, leaves
+    /// the top alone and rejects an unregistered CF.
+    #[test]
+    fn put_raw_equals_merging_the_put() {
+        let (db, _dir) = temp_db();
+        let cf = crate::cf::CF_NATIVE_ORDER_BOOKS;
+        let block = |f: &dyn Fn(&NativeStateOverlay), h: u64| {
+            let o = NativeStateOverlay::new(db.clone());
+            f(&o);
+            o.freeze(h)
+        };
+        let base = |l: &mut CheckpointLayer| {
+            l.merge(&block(
+                &|o| {
+                    o.put_cf_raw(cf, b"m1", b"old-blob").unwrap();
+                    o.delete_cf_raw(cf, b"m2").unwrap();
+                    o.put_cf_raw(crate::cf::CF_SESSIONS, b"k", b"v").unwrap();
+                },
+                7,
+            ))
+        };
+        let (mut put, mut merged) = (CheckpointLayer::new(), CheckpointLayer::new());
+        base(&mut put);
+        base(&mut merged);
+        for (k, v) in [(&b"m1"[..], &b"new"[..]), (b"m2", b"blob-2"), (b"m3", b"x")] {
+            put.put_raw(cf, k.to_vec(), v.to_vec()).unwrap();
+        }
+        merged.merge(&block(
+            &|o| {
+                o.put_cf_raw(cf, b"m1", b"new").unwrap();
+                o.put_cf_raw(cf, b"m2", b"blob-2").unwrap();
+                o.put_cf_raw(cf, b"m3", b"x").unwrap();
+            },
+            7,
+        ));
+        assert_eq!(put.bytes(), merged.bytes());
+        assert_eq!(put.bytes(), 2 + 3 + 2 + 6 + 2 + 1 + 1 + 1);
+        assert_eq!(put.entry_count(), merged.entry_count());
+        for k in [&b"m1"[..], b"m2", b"m3"] {
+            assert_eq!(put.lookup_row(cf, k), merged.lookup_row(cf, k));
+        }
+        assert_eq!(put.top_height(), Some(7));
+        assert!(put
+            .put_raw("no-such-cf", b"k".to_vec(), b"v".to_vec())
+            .is_err());
     }
 
     /// `FrozenPending::state_bytes()` uses the layer's measure (an empty

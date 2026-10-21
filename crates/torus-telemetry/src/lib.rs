@@ -403,6 +403,11 @@ pub struct Metrics {
     /// Post-engine tail on the exec thread: core-writer drain, governance,
     /// fee distribution and the epoch boundary.
     pub exec_post_engine_tail_seconds: Histogram,
+    /// The liquidation step inside the post-engine tail, on the exec thread:
+    /// the whole `run_liquidations` call (the pass, its node-local telemetry
+    /// reads and the optional value-sum walk), one observation per native
+    /// block. `torus_liquidation_step_seconds` times the pass alone.
+    pub exec_liquidation_step_seconds: Histogram,
     /// The residual: engine wall clock minus (phase1 + margin + match +
     /// settle + tail). Whatever this holds is the next thing to instrument.
     pub exec_engine_untimed_seconds: Histogram,
@@ -754,6 +759,18 @@ pub struct Metrics {
     /// Item 6 Phase 3: since-checkpoint layer bytes (keys + values, a
     /// tombstone counts its key) per checkpoint.
     pub exec_checkpoint_layer_bytes: Histogram,
+    /// 8k L3.1 (`TORUS_BOOK_COALESCE`): Classic books whose per-block
+    /// whole-book encode was skipped (summed over pipelined blocks; each is
+    /// encoded once at its window's close instead). 0 with the flag off.
+    pub exec_book_coalesce_skipped: Counter,
+    /// 8k L3.1: exec-thread wall time of one window close's coalesced book
+    /// encode (every unsaved book encoded from the resident holder and put
+    /// into the closing layer), one observation per close with at least one
+    /// unsaved book. The spike E pays once per window.
+    pub exec_book_coalesce_close_seconds: Histogram,
+    /// 8k L3.1: books encoded per window close (same observations as
+    /// `exec_book_coalesce_close_seconds`).
+    pub exec_book_coalesce_close_books: Histogram,
     /// Item 6 Phase 3: the layer was still shared when the exec thread took
     /// it back to merge (deep copy instead; expected 0).
     pub exec_checkpoint_layer_shared: Counter,
@@ -1975,6 +1992,13 @@ impl Metrics {
             exec_post_engine_tail_seconds.clone(),
         );
 
+        let exec_liquidation_step_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 16));
+        registry.register(
+            "torus_exec_liquidation_step_seconds",
+            "Exec sub-phase: the liquidation step (whole run_liquidations call, inside the post-engine tail)",
+            exec_liquidation_step_seconds.clone(),
+        );
+
         let exec_engine_untimed_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_exec_engine_untimed_seconds",
@@ -2635,6 +2659,24 @@ impl Metrics {
             "Item 6 Phase 3: since-checkpoint layer bytes per checkpoint",
             exec_checkpoint_layer_bytes.clone(),
         );
+        let exec_book_coalesce_skipped = Counter::default();
+        registry.register(
+            "torus_exec_book_coalesce_skipped",
+            "8k L3.1: Classic books whose per-block encode was skipped (encoded once at the window close)",
+            exec_book_coalesce_skipped.clone(),
+        );
+        let exec_book_coalesce_close_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 16));
+        registry.register(
+            "torus_exec_book_coalesce_close_seconds",
+            "8k L3.1: exec-thread time of one window close's coalesced book encode",
+            exec_book_coalesce_close_seconds.clone(),
+        );
+        let exec_book_coalesce_close_books = Histogram::new(exponential_buckets(1.0, 2.0, 14));
+        registry.register(
+            "torus_exec_book_coalesce_close_books",
+            "8k L3.1: books encoded per window close",
+            exec_book_coalesce_close_books.clone(),
+        );
         let exec_checkpoint_layer_shared = Counter::default();
         registry.register(
             "torus_exec_checkpoint_layer_shared",
@@ -3190,6 +3232,7 @@ impl Metrics {
             exec_cache_flush_seconds,
             exec_settle_no_merge_fallbacks,
             exec_post_engine_tail_seconds,
+            exec_liquidation_step_seconds,
             exec_engine_untimed_seconds,
             exec_save_books_seconds,
             exec_flush_seconds,
@@ -3288,6 +3331,9 @@ impl Metrics {
             exec_checkpoints,
             exec_checkpoint_wait_seconds,
             exec_checkpoint_layer_bytes,
+            exec_book_coalesce_skipped,
+            exec_book_coalesce_close_seconds,
+            exec_book_coalesce_close_books,
             exec_checkpoint_layer_shared,
             exec_checkpoint_settle_wait_seconds,
             exec_checkpoint_deferred_join_seconds,
@@ -4032,6 +4078,9 @@ mod tests {
             "torus_exec_checkpoint_wait_seconds",
             "torus_exec_checkpoint_layer_bytes",
             "torus_exec_checkpoint_layer_shared",
+            "torus_exec_book_coalesce_skipped",
+            "torus_exec_book_coalesce_close_seconds",
+            "torus_exec_book_coalesce_close_books",
             "torus_exec_checkpoint_settle_wait_seconds",
             "torus_exec_checkpoint_deferred_join_seconds",
             "torus_exec_checkpoint_deferred_read_waits",
@@ -4096,6 +4145,7 @@ mod tests {
             "torus_exec_settle_pass_b_seconds",
             "torus_exec_cache_flush_seconds",
             "torus_exec_post_engine_tail_seconds",
+            "torus_exec_liquidation_step_seconds",
             "torus_exec_engine_untimed_seconds",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");

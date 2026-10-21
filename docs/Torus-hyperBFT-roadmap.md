@@ -510,7 +510,12 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
   `docs/plans/deep-book-save-options.md` on branch `docs/deep-book-save-options`. **L3.3 (`TORUS_BOOK_FAST_ENCODE`,
   default on since s131, section 105: deep book B/A blocks/s 1.086, p50 0.884, p99 0.919, CPU-s per 1M fills 0.989,
   n = 1; `0` turns it off) only affects Classic:** if the genesis picks mode 3 it is dead code and should be removed
-  in a cleanup.
+  in a cleanup. **L3.1 (`TORUS_BOOK_COALESCE`, checkpoint-coalesced Classic book save) is on by default since s131 where its
+  preconditions hold** (checkpoint interval, no `TORUS_CHECKPOINT_MAX_BYTES`, Classic resident books with the untouched-block
+  advance, running state hash not configured; otherwise one startup warning and off; `0` turns it off). Section 110
+  (bench 8y, n = 2): deep matched/s 1.160, exec-thread CPU per 1k fills 0.802, blocks/s 3.42 -> 15.76, p50 193 -> 13 ms,
+  p99 1,461 -> 672 ms; standard exec CPU 0.958. Also Classic-only (dead code under mode 3), and its gain is 0 once the
+  running state hash is activated (it then turns itself off).
 
 ---
 
