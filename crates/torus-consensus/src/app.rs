@@ -12933,6 +12933,61 @@ mod leader_state_tests {
         );
     }
 
+    /// The committed hotstuff validator set `members` (power 1 each) with `excluded` leader
+    /// excluded.
+    fn committed_set(
+        members: &[VerifyingKey],
+        excluded: &[VerifyingKey],
+    ) -> hotstuff_rs::types::validator_set::ValidatorSet {
+        let mut vs = hotstuff_rs::types::validator_set::ValidatorSet::new();
+        for vk in members {
+            vs.put(vk, Power::new(1));
+        }
+        for vk in excluded {
+            assert!(vs.exclude_leader(vk));
+        }
+        vs
+    }
+
+    /// Asserts the hint set excludes exactly `excluded` and that neither the boot fallback nor
+    /// the EVM-height predictions select an excluded validator over many views.
+    fn assert_hints_exclude(ls: &LeaderState, excluded: &[VerifyingKey]) {
+        assert_eq!(
+            ls.validators
+                .read()
+                .unwrap()
+                .leader_excluded()
+                .copied()
+                .collect::<Vec<_>>(),
+            {
+                let mut want = excluded.to_vec();
+                want.sort_by_key(|vk| vk.to_bytes());
+                want
+            },
+            "hint exclusions"
+        );
+        for view in 1..100u64 {
+            let leader = plain_iwrr(ls, view);
+            assert!(!excluded.contains(&leader), "view {view} selects {leader:?}");
+        }
+    }
+
+    /// Codex torus review P2 (dead-leader skip phase 1): a restart with execution behind an
+    /// insert-and-exclude boundary seeds the committed five-member set (new member excluded)
+    /// into a four-member hint set. The exclusion must survive until membership catches up:
+    /// syncing the fifth member must not make the excluded validator a hinted leader.
+    #[test]
+    fn boot_seed_keeps_exclusion_of_member_the_hints_lack_yet() {
+        let ls = LeaderState::new();
+        let (four, _) = make_set(4);
+        let (five, vks) = make_set(5);
+        let x = vks[4];
+        ls.sync_validators(&four);
+        ls.seed_leader_exclusions(&committed_set(&vks, &[x]));
+        ls.sync_validators(&five);
+        assert_hints_exclude(&ls, &[x]);
+    }
+
     /// Item 7 step 1 (E12): EVM txs go to the leader of the next EVM height
     /// (`height % N == 0`), not the current-view leader. That height is
     /// proposed one view per block after the newest observed proposal.
