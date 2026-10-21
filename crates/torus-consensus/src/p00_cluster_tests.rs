@@ -633,32 +633,42 @@ fn p00_mixed_binaries_three_of_four_go_on_and_the_old_node_halts_below_h() {
 /// Test plan 2 (mixed binaries, 2 of 4 upgraded): with two old nodes no block
 /// at `H` gets a quorum, so the chain stalls below `H` on every node, without
 /// a fork: no node stores a header at `H`, and all store the same headers below.
+///
+/// The four nodes first commit a common prefix on the old release; nodes 0
+/// and 1 then stop (no quorum: nothing commits) and restart upgraded, with `H`
+/// above every block the running nodes stored. Nothing assumes how far commits
+/// trail the tip: a block commits only after QCs in consecutive views, and
+/// legal view gaps leave fewer commits (Codex review of phase 5, P2: waiting
+/// for `H - 3` applied before the stall timed out at applied 1).
 #[test]
 fn p00_mixed_binaries_two_of_four_stall_below_h_without_a_fork() {
-    const H: u64 = 6;
     let mut c = Cluster::new();
-    c.start(0, &Binary::new(H));
-    c.start(1, &Binary::new(H));
-    c.start(2, &Binary::old());
-    c.start(3, &Binary::old());
-    // Commits up to the last block whose successor still had a quorum.
-    c.wait_applied(&ALL, H - 3);
+    c.start_all(&Binary::old());
+    c.wait_applied(&ALL, 2);
+    c.stop(0);
+    c.stop(1);
+    // Two of four down: no quorum, the stored tips are frozen. Blocks above a
+    // committed tip are at most a few heights ahead (certified, not committed).
+    let tip = [2, 3].iter().map(|&i| c.committed(i)).max().unwrap();
+    let h = tip + 8;
+    c.start(0, &Binary::new(h));
+    c.start(1, &Binary::new(h));
     c.wait_until("an old node refuses H", |c| {
         [2, 3]
             .iter()
-            .any(|&i| c.refusals(i).iter().any(|r| r.1 == H))
+            .any(|&i| c.refusals(i).iter().any(|r| r.1 == h))
     });
     let stalled: Vec<u64> = ALL.iter().map(|&i| c.committed(i)).collect();
     std::thread::sleep(Duration::from_secs(5));
     let after: Vec<u64> = ALL.iter().map(|&i| c.committed(i)).collect();
     assert!(
-        after.iter().all(|&h| h < H),
+        after.iter().all(|&height| height < h),
         "stalled below H: {}",
         c.status()
     );
     for i in ALL {
         assert!(
-            c.header_row(i, H).is_none(),
+            c.header_row(i, h).is_none(),
             "node {i} stored a header at H"
         );
         assert!(
@@ -669,12 +679,12 @@ fn p00_mixed_binaries_two_of_four_stall_below_h_without_a_fork() {
     // No fork: every node's committed headers are a prefix of the longest.
     let longest = (0..N).max_by_key(|&i| after[i]).unwrap();
     for i in ALL {
-        c.assert_headers(&[longest, i], after[i], Some(H));
+        c.assert_headers(&[longest, i], after[i], Some(h));
     }
     assert!(after.iter().zip(&stalled).all(|(a, s)| a >= s));
     let top = ALL.iter().map(|&i| c.applied(i)).min().unwrap();
     c.stop_all();
-    c.assert_agree(&ALL, top, Some(H));
+    c.assert_agree(&ALL, top, Some(h));
 }
 
 /// Test plan 3 (crash across `H`): node 3's execution stops before `hold`
