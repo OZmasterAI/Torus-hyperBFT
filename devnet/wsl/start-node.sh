@@ -50,6 +50,19 @@ start_node() {
         esac
         retention=("--retention-blocks=$TORUS_RETENTION_BLOCKS")
     fi
+    # Optional running state hash attestation (run-cell.sh STATE_HASH_ATTEST=1):
+    # STATE_HASH_ATTEST_KEY_DIR=D passes --state-hash-attest-key=D/val<idx>.key,
+    # the validator's secp256k1 ACCOUNT key (owner-only file; the node refuses
+    # group/other access), so the node signs AttestStateHash for every durable
+    # checkpoint. Unset or empty = no flag, the argv of every earlier cell. Last
+    # on the line (after the retention flag); launch and restart read the same
+    # variable, so a restarted node attests too.
+    local attest=()
+    if [ -n "${STATE_HASH_ATTEST_KEY_DIR:-}" ]; then
+        [ -r "$STATE_HASH_ATTEST_KEY_DIR/val$idx.key" ] || {
+            echo "start_node: STATE_HASH_ATTEST_KEY_DIR=$STATE_HASH_ATTEST_KEY_DIR has no readable val$idx.key" >&2; return 1; }
+        attest=("--state-hash-attest-key=$STATE_HASH_ATTEST_KEY_DIR/val$idx.key")
+    fi
     key=$(node_var KEY "$idx"); p2p=$(node_var P2P "$idx")
     rpc=$(node_var RPC "$idx"); met=$(node_var MET "$idx")
     [ -n "$key" ] && [ -n "$p2p" ] && [ -n "$rpc" ] && [ -n "$met" ] || {
@@ -71,6 +84,7 @@ start_node() {
         --log-level=info \
         --native-gossip=true \
         ${retention[@]+"${retention[@]}"} \
+        ${attest[@]+"${attest[@]}"} \
         >> "$log" 2>&1 &
     STARTED_PID=$!
 }
