@@ -84,8 +84,14 @@ count above 0 gives `RESULT: PASS with N flaky`, which is reported, not a clean 
 
 ## Maintenance
 
-- Each ref gets its own worktree; first gate on a new ref rebuilds the workspace crates
-  (dependencies stay cached in the shared target dir). Remove old worktrees with
+- Each ref gets its own worktree, and all worktrees share one target dir. Cargo gives
+  workspace crates the same artifact names in every worktree and decides freshness by
+  mtime, so without care a gate can test another worktree's code (seen at setup: main
+  failed to compile against `torus-state` built from `fix/pretestnet-p0-p1`). The script
+  therefore records the last worktree built in `~/.cargo-target-gate/.gate-last-worktree`
+  and, under the build lock, touches every tracked file when the worktree changed. Cost:
+  workspace crates rebuild when consecutive steps come from different refs (dependencies
+  stay cached); summaries say `workspace sources restamped` when that happened. Remove old worktrees with
   `git -C <gate repo> worktree remove ~/projects/gate-wt/<ref>`.
 - Update a host's script with write-to-temp + `mv` (atomic rename), never by overwriting
   `~/bin/remote-gate` in place: a running gate's bash reads the file as it goes.
