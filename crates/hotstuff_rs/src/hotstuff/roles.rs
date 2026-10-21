@@ -423,4 +423,78 @@ mod view_leader_tests {
             None
         );
     }
+
+    /// Dead-leader skip phase 1 (docs/plans/dead-leader-skip.md §3 "Fit with TC-required", §4):
+    /// leader(v) changes only through a validator-set update. While an exclusion update is pending
+    /// (committed, not decided) `is_proposer` accepts the leader of the CVS (new exclusions) or of
+    /// the PVS (old ones); once decided, only the CVS leader, so an excluded validator never
+    /// proposes. Covers an exclusion and a re-admission.
+    #[test]
+    fn is_proposer_across_a_leader_exclusion_update() {
+        use crate::types::data_types::BlockHeight;
+        let (pvs, vks) = make_validator_set(4);
+        let x = vks[2];
+        let mut cvs = pvs.clone();
+        let mut updates = ValidatorSetUpdates::new();
+        updates.exclude_leader(x);
+        cvs.apply_updates(&updates);
+        assert!(cvs.is_leader_excluded(&x));
+
+        // (PVS, CVS) = (before, after) for an exclusion, then for the re-admission of `x`.
+        for (pvs, cvs) in [(pvs.clone(), cvs.clone()), (cvs.clone(), pvs.clone())] {
+            let pending =
+                ValidatorSetState::new(cvs.clone(), pvs.clone(), Some(BlockHeight::new(9)), false);
+            let decided =
+                ValidatorSetState::new(cvs.clone(), pvs.clone(), Some(BlockHeight::new(9)), true);
+            let mut x_led_only_in_pvs = 0;
+            for v in 0..64u64 {
+                let view = ViewNumber::new(v);
+                let l_cvs = select_leader(view, &cvs);
+                let l_pvs = select_leader(view, &pvs);
+                if cvs.is_leader_excluded(&x) {
+                    assert_ne!(l_cvs, x, "view {v}: excluded in the CVS");
+                }
+                if l_pvs == x && l_cvs != x {
+                    x_led_only_in_pvs += 1;
+                }
+                for k in &vks {
+                    assert_eq!(
+                        is_proposer(k, view, &pending),
+                        *k == l_cvs || *k == l_pvs,
+                        "pending, view {v}"
+                    );
+                    assert_eq!(
+                        is_proposer(k, view, &decided),
+                        *k == l_cvs,
+                        "decided, view {v}"
+                    );
+                    assert_eq!(
+                        is_proposer_with_reputation(k, view, &pending, None),
+                        is_proposer(k, view, &pending)
+                    );
+                }
+                let nv = NewView {
+                    chain_id: crate::types::data_types::ChainID::new(0),
+                    view: ViewNumber::new(v.saturating_sub(1)),
+                    highest_pc: PhaseCertificate::genesis_pc(),
+                };
+                if v > 0 {
+                    assert_eq!(
+                        new_view_recipients_with_reputation(&nv, &pending, None),
+                        (l_cvs, Some(l_pvs))
+                    );
+                    assert_eq!(
+                        new_view_recipients_with_reputation(&nv, &decided, None),
+                        (l_cvs, None)
+                    );
+                }
+            }
+            if cvs.is_leader_excluded(&x) {
+                assert!(
+                    x_led_only_in_pvs > 0,
+                    "the window must exercise a view x leads only in the PVS"
+                );
+            }
+        }
+    }
 }

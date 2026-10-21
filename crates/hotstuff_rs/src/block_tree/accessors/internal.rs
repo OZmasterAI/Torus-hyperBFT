@@ -1405,7 +1405,7 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
         let _: () = self.0.set(
             &variables::COMMITTED_VALIDATOR_SET,
             &validator_set_bytes
-                .try_to_vec()
+                .encode()
                 .map_err(|err| KVSetError::SerializeValueError {
                     key: Key::CommittedValidatorSet,
                     source: err,
@@ -1421,8 +1421,7 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
         block: &CryptoHash,
         validator_set_updates: &ValidatorSetUpdates,
     ) -> Result<(), BlockTreeError> {
-        let block_vs_updates_bytes =
-            ValidatorSetUpdatesStatusBytes::Pending(validator_set_updates.into());
+        let block_vs_updates_bytes = ValidatorSetUpdatesStatusBytes::pending(validator_set_updates);
         let _: () = self.0.set(
             &concat(&variables::VALIDATOR_SET_UPDATES_STATUS, &block.bytes()),
             &block_vs_updates_bytes.try_to_vec().map_err(|err| {
@@ -1558,7 +1557,7 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
         let _: () = self.0.set(
             &variables::PREVIOUS_VALIDATOR_SET,
             &validator_set_bytes
-                .try_to_vec()
+                .encode()
                 .map_err(|err| KVSetError::SerializeValueError {
                     key: Key::PreviousValidatorSet,
                     source: err,
@@ -2815,5 +2814,145 @@ mod block_tree_pruner_tests {
         let mut wb = BlockTreeWriteBatch::new();
         wb.set_highest_pc(&pc).unwrap();
         bt.write(wb);
+    }
+}
+
+#[cfg(test)]
+mod leader_exclusion_storage_tests {
+    //! Dead-leader skip phase 1: an exclusion delta survives the block tree's storage path
+    //! (pending status -> commit -> committed/previous validator sets), so every replica's
+    //! `ValidatorSetState` (and hence `select_leader`) sees the same exclusions after a commit or a
+    //! restart.
+
+    use super::*;
+    use crate::block_tree::pluggables::{KVGet, KVStore, WriteBatch};
+    use crate::hotstuff::types::PhaseCertificate;
+    use crate::types::block::Block;
+    use crate::types::data_types::{BlockHeight, CryptoHash, Data, Power};
+    use ed25519_dalek::SigningKey;
+    use std::collections::HashMap;
+
+    #[derive(Clone, Default)]
+    struct MemKV {
+        map: HashMap<Vec<u8>, Vec<u8>>,
+    }
+
+    struct MemWb {
+        sets: Vec<(Vec<u8>, Vec<u8>)>,
+        deletes: Vec<Vec<u8>>,
+    }
+
+    #[derive(Clone)]
+    struct MemSnap(HashMap<Vec<u8>, Vec<u8>>);
+
+    impl WriteBatch for MemWb {
+        fn new() -> Self {
+            Self {
+                sets: Vec::new(),
+                deletes: Vec::new(),
+            }
+        }
+        fn set(&mut self, key: &[u8], value: &[u8]) {
+            self.sets.push((key.to_vec(), value.to_vec()));
+        }
+        fn delete(&mut self, key: &[u8]) {
+            self.deletes.push(key.to_vec());
+        }
+    }
+
+    impl KVGet for MemKV {
+        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.map.get(key).cloned()
+        }
+    }
+
+    impl KVGet for MemSnap {
+        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.0.get(key).cloned()
+        }
+    }
+
+    impl KVStore for MemKV {
+        type WriteBatch = MemWb;
+        type Snapshot<'a> = MemSnap;
+        fn write(&mut self, wb: MemWb) {
+            for (k, v) in wb.sets {
+                self.map.insert(k, v);
+            }
+            for k in wb.deletes {
+                self.map.remove(&k);
+            }
+        }
+        fn clear(&mut self) {
+            self.map.clear();
+        }
+        fn snapshot(&self) -> MemSnap {
+            MemSnap(self.map.clone())
+        }
+    }
+
+    fn vk(seed: u8) -> VerifyingKey {
+        SigningKey::from_bytes(&[seed; 32]).verifying_key()
+    }
+
+    #[test]
+    fn exclusion_delta_is_stored_committed_and_reloaded() {
+        let mut bt = BlockTreeSingleton::new(MemKV::default());
+        let mut genesis_vs = ValidatorSet::new();
+        for s in 1..=4 {
+            genesis_vs.put(&vk(s), Power::new(1));
+        }
+        let mut wb = BlockTreeWriteBatch::new();
+        wb.set_committed_validator_set(&genesis_vs).unwrap();
+        wb.set_previous_validator_set(&genesis_vs).unwrap();
+        wb.set_validator_set_update_decided(true).unwrap();
+        bt.write(wb);
+
+        let mut updates = ValidatorSetUpdates::new();
+        updates.exclude_leader(vk(3));
+        let block = Block::new(
+            BlockHeight::new(0),
+            PhaseCertificate::genesis_pc(),
+            CryptoHash::new([0; 32]),
+            Data::new(vec![]),
+        );
+        bt.insert(&block, None, Some(&updates)).unwrap();
+
+        // Pending: the stored status carries the delta.
+        match bt.validator_set_updates_status(&block.hash).unwrap() {
+            ValidatorSetUpdatesStatus::Pending(u) => {
+                assert_eq!(
+                    u.leader_excludes().copied().collect::<Vec<_>>(),
+                    vec![vk(3)]
+                );
+            }
+            _ => panic!("expected a pending update"),
+        }
+
+        // Commit: the CVS has the exclusion, the PVS does not, the update is not decided.
+        let mut wb = BlockTreeWriteBatch::new();
+        let committed = bt.commit(&mut wb, &block.hash).unwrap();
+        bt.write(wb);
+        assert_eq!(committed.len(), 1);
+        assert!(committed[0]
+            .1
+            .as_ref()
+            .is_some_and(|u| u.has_leader_exclusion_updates()));
+
+        let vss = bt.validator_set_state().unwrap();
+        assert!(vss.committed_validator_set().is_leader_excluded(&vk(3)));
+        assert!(!vss.previous_validator_set().is_leader_excluded(&vk(3)));
+        assert!(!vss.update_decided());
+        assert_eq!(
+            vss.committed_validator_set().total_power().int(),
+            4,
+            "voting power unchanged"
+        );
+
+        // A restart reads the same state from the KV store.
+        let reloaded = BlockTreeSingleton::new(bt.0.clone());
+        let vss2 = reloaded.validator_set_state().unwrap();
+        assert!(vss2.committed_validator_set() == vss.committed_validator_set());
+        assert!(vss2.previous_validator_set() == vss.previous_validator_set());
     }
 }

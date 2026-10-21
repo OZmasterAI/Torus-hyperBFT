@@ -1399,6 +1399,9 @@ impl LeaderState {
         }
     }
 
+    /// Replace the hint set's members and powers with `vs`. Dead-leader skip: the leader
+    /// exclusions of members that stay are kept (they change only through committed exclusion
+    /// deltas, [`Self::apply_leader_exclusion_updates`]).
     fn sync_validators(&self, vs: &torus_types::ValidatorSet) {
         let mut hs_vs = hotstuff_rs::types::validator_set::ValidatorSet::new();
         for v in &vs.validators {
@@ -1406,7 +1409,39 @@ impl LeaderState {
                 hs_vs.put(&vk, Power::new(v.power));
             }
         }
-        *self.validators.write().unwrap() = hs_vs;
+        let mut current = self.validators.write().unwrap();
+        for vk in current.leader_excluded() {
+            hs_vs.exclude_leader(vk);
+        }
+        *current = hs_vs;
+    }
+
+    /// Dead-leader skip: apply a committed validator-set update's leader exclusion delta to the
+    /// hint set (fed from hotstuff's `UpdateValidatorSet` event).
+    /// Only the delta: the powers come from [`Self::sync_validators`].
+    pub fn apply_leader_exclusion_updates(
+        &self,
+        updates: &hotstuff_rs::types::update_sets::ValidatorSetUpdates,
+    ) {
+        let mut vs = self.validators.write().unwrap();
+        for vk in updates.leader_readmits() {
+            vs.readmit_leader(vk);
+        }
+        for vk in updates.leader_excludes() {
+            vs.exclude_leader(vk);
+        }
+    }
+
+    /// Dead-leader skip: at boot, copy the committed hotstuff validator set's leader exclusions
+    /// into the hint set (members of the hint set only).
+    pub fn seed_leader_exclusions(
+        &self,
+        committed: &hotstuff_rs::types::validator_set::ValidatorSet,
+    ) {
+        let mut vs = self.validators.write().unwrap();
+        for vk in committed.leader_excluded() {
+            vs.exclude_leader(vk);
+        }
     }
 
     pub fn current_view(&self) -> u64 {
@@ -13724,6 +13759,74 @@ mod leader_state_tests {
         ls.observe_start_view(49, vks[1]);
         assert_eq!(ls.current_view(), 50);
         assert_eq!(ls.current_leader(), Some(vks[0]));
+    }
+
+    /// Dead-leader skip phase 1 (docs/plans/dead-leader-skip.md §3 A4): the leader hints (the
+    /// boot fallback of `current_leader` and the EVM-height predictions) run `select_leader` over
+    /// the same leader-excluded set as the committed hotstuff validator set: seeded from it at
+    /// boot, updated by every committed exclusion delta, kept across `sync_validators`.
+    #[test]
+    fn leader_hints_skip_leader_excluded_validators() {
+        use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
+        let ls = LeaderState::new();
+        let (set, vks) = make_set(4);
+        ls.sync_validators(&set);
+        let x = vks[1];
+        let mut updates = ValidatorSetUpdates::new();
+        updates.exclude_leader(x);
+        ls.apply_leader_exclusion_updates(&updates);
+
+        // Boot fallback (no StartView observed): never the excluded validator.
+        let mut views_led_by_x_without_exclusion = 0;
+        for view in 1..200u64 {
+            ls.set_view(view);
+            assert_ne!(ls.current_leader(), Some(x), "view {view}");
+            let plain = {
+                let mut vs = hotstuff_rs::types::validator_set::ValidatorSet::new();
+                for vk in &vks {
+                    vs.put(vk, Power::new(1));
+                }
+                hotstuff_rs::pacemaker::select_leader(
+                    hotstuff_rs::types::data_types::ViewNumber::new(view),
+                    &vs,
+                )
+            };
+            views_led_by_x_without_exclusion += usize::from(plain == x);
+        }
+        assert!(views_led_by_x_without_exclusion > 0);
+
+        // EVM-height predictions: never the excluded validator.
+        ls.set_evm_block_interval(1);
+        for (view, hs_height) in [(200u64, 10u64), (201, 11), (202, 12), (203, 13)] {
+            ls.observe_start_view(view, plain_iwrr(&ls, view));
+            ls.observe_hotstuff_proposal(view, hs_height);
+            assert_ne!(ls.next_evm_leader(), Some(x), "view {view}");
+        }
+
+        // An epoch sync of the same members keeps the exclusion.
+        ls.sync_validators(&set);
+        assert!(ls.validators.read().unwrap().is_leader_excluded(&x));
+
+        // A committed re-admission brings it back.
+        let mut readmit = ValidatorSetUpdates::new();
+        readmit.readmit_leader(x);
+        ls.apply_leader_exclusion_updates(&readmit);
+        assert!(!ls.validators.read().unwrap().is_leader_excluded(&x));
+
+        // Boot seeding copies the committed set's exclusions (members only).
+        let mut committed = hotstuff_rs::types::validator_set::ValidatorSet::new();
+        for vk in &vks {
+            committed.put(vk, Power::new(1));
+        }
+        committed.exclude_leader(&vks[3]);
+        let fresh = LeaderState::new();
+        fresh.sync_validators(&set);
+        fresh.seed_leader_exclusions(&committed);
+        let hint_set = fresh.validators.read().unwrap();
+        assert_eq!(
+            hint_set.leader_excluded().copied().collect::<Vec<_>>(),
+            vec![vks[3]]
+        );
     }
 
     /// Item 7 step 1 (E12): EVM txs go to the leader of the next EVM height
