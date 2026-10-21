@@ -7,7 +7,8 @@ block (T0), block-timestamp validation (T0b/T1), time-based aggregation 10 s /
 60 s (T2/T8), submission hardening (T3/T4), block-start aggregation (T5–T7).
 Review follow-ups (s517): fresh price needs >= 3 reporters holding
 > 2/3 of the Active stake (see *Decisions* 4–5, *Notes* below). The
-timestamp lower bound (M2) is NOT implemented — open, see Decision 5.
+timestamp lower bound (M2) is NOT implemented. It is a pre-mainnet item
+(owner s131), see Decision 5.
 Not merged / pushed. Liquidation (item 3): done on `feat/liquidation`
 (`docs/plans/liquidation.md`). Next: B (feeder), then C (HL mark). Client / deploy notes: `docs/parity-audit-fixes-s515.md`.
 
@@ -132,6 +133,28 @@ A now, on this branch (it is the "item 2" as listed), then B as its own item
    and the old price goes stale. Fix with the consensus item "validate
    before voting (CometBFT-style)": once bodies are validated before the
    vote, the 30 s lag check is enforceable like CometBFT PBTS.
+   **Status (owner s131): pre-mainnet item, NOT in the testnet genesis.**
+   It was built on `fix/pretestnet-p0-p1` as a pre-vote check (`ecba72ca`),
+   then given an exemption for authenticated re-proposals (`c779d72f`,
+   hotstuff `App::check_reproposal_data`) and TC tip power counted under the
+   signing set (`62a6f8f4`). All three are reverted on that branch and kept
+   on `wip/m2-timestamp-lower-bound` (`62a6f8f4`). The reviews found two
+   wedges:
+   - **Round 1 (Codex P1):** after a TC whose winning high tip is an
+     uncertified block, the leader must re-propose that exact block and
+     cannot refresh its timestamp. After a stall over 30 s, every replica
+     refused it forever.
+   - **Round 2 ([claude-review]), against the exemption:** one byzantine
+     validator signs `local_tip` = B in its timeout vote, where B is a safe
+     block with ts = parent.ts. `TipInfo.view` is unsigned, so B wins the
+     TC and the honest leader must re-propose B. `tip_vouched` sees power 1
+     (not > f), and header-first votes (`cast_header_vote`) never set
+     `local_tip`. So every honest replica refuses B, in every view.
+
+   The rule lands after "validate before voting" (CometBFT PBTS), as above.
+   It can ship after genesis through P0.0 activation gating. As a vote-rule
+   change it falls under P0.0 open question 4: old binaries must stop at
+   the activation height.
 
 ## Notes (review, s517)
 

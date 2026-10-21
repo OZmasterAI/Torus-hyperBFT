@@ -1280,6 +1280,10 @@ mod parallel_match_setup_flag_tests {
     fn in_jobs_calls(pin: bool, block: &[(Address, NativeAction)]) -> u64 {
         let dir = tempfile::tempdir().unwrap();
         let db = torus_state::StateDb::open(dir.path()).unwrap();
+        // Pre-testnet P0: orders need a listed market.
+        for m in [1u64, 2] {
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+        }
         let mut ctx = NativeExecContext::new(
             db,
             1,
@@ -1649,6 +1653,8 @@ fn reject_label(reason: FailureReason) -> OrderRejectReason {
         FailureReason::BadTriggerPx => OrderRejectReason::BadTriggerPx,
         FailureReason::Fill => OrderRejectReason::Fill,
         FailureReason::DuplicateCloid => OrderRejectReason::DuplicateCloid,
+        FailureReason::UnknownMarket => OrderRejectReason::UnknownMarket,
+        FailureReason::MarketDelisted => OrderRejectReason::MarketDelisted,
         FailureReason::Other | FailureReason::BatchCap => OrderRejectReason::Other,
     }
 }
@@ -2266,7 +2272,9 @@ pub(crate) struct BlockMarks {
     /// Changes exactly when the table or `margin_configs` differ from the
     /// previous block's ([`BlockMarksState`], kept in the resident rows slot);
     /// a changed block takes a new process-wide value, never one used before
-    /// (slot absent or rebuilt = changed). Keys the sums cache (C3).
+    /// (slot absent or rebuilt = changed). Keys the sums cache (C3). Also
+    /// renewed mid-block when the block itself changes `margin_configs`
+    /// (a governance params update, `NativeExecutor::renew_mark_version`).
     version: u64,
 }
 
@@ -5304,6 +5312,10 @@ mod block_marks_tests;
 mod sums_cache_tests;
 
 #[cfg(test)]
+#[path = "market_params_cache_tests.rs"]
+mod market_params_cache_tests;
+
+#[cfg(test)]
 #[path = "typed_loads_tests.rs"]
 mod typed_loads_tests;
 
@@ -5482,6 +5494,11 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     pub dirty_books: HashSet<MarketId>,
     /// Per-market margin configuration.
     pub margin_configs: HashMap<MarketId, MarketMarginConfig>,
+    /// Pre-testnet P1: markets governance delisted (their
+    /// `market_delisted_key` rows, read with the margin configs; a delist
+    /// executed in this block is added by `process_governance`). Only
+    /// reduce-only orders are placed there.
+    pub delisted_markets: HashSet<MarketId>,
     /// Item 6 C2: the block's mark table, filled by `begin_block_oracle`
     /// (`None` before it, or when it failed: marks read the oracle).
     block_marks: Option<BlockMarks>,
@@ -6114,13 +6131,13 @@ impl<T: StateBackend> NativeExecContext<T> {
         // Item 3 (F2, F8, D11): margin configs from the market listings. A read
         // error is a node fault (fatal, like the book load).
         let margin_configs_timer = std::time::Instant::now();
-        let margin_configs = match Self::load_margin_configs(&state) {
+        let (margin_configs, delisted_markets) = match Self::load_margin_configs(&state) {
             Ok(m) => m,
             Err(e) => {
                 if load_error.is_none() {
                     load_error = Some(format!("margin configs: {e}"));
                 }
-                HashMap::default()
+                (HashMap::default(), HashSet::default())
             }
         };
         load_timings.margin_configs_ns = margin_configs_timer.elapsed().as_nanos();
@@ -6134,6 +6151,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             order_books,
             dirty_books: HashSet::default(),
             margin_configs,
+            delisted_markets,
             block_marks: None,
             prev_marks: None,
             sums: None,
@@ -7092,19 +7110,27 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// Item 3 (F2, F8, D11): one [`market_margin_config`] per listed market
     /// (8-byte keys of `CF_NATIVE_MARKETS`; metadata rows skipped). Undecodable
     /// / non-positive rows get none (default 20x). One scan of <= M rows.
+    /// Pre-testnet P1: the same scan collects the delisted markets (9-byte
+    /// [`torus_types::market_delisted_key`] rows).
+    #[allow(clippy::type_complexity)]
     fn load_margin_configs(
         state: &T,
-    ) -> Result<HashMap<MarketId, MarketMarginConfig>, torus_state::error::StateError> {
+    ) -> Result<(HashMap<MarketId, MarketMarginConfig>, HashSet<MarketId>), torus_state::error::StateError> {
         use torus_state::cf::CF_NATIVE_MARKETS;
-        Ok(state
-            .iterate_cf(CF_NATIVE_MARKETS, None)?
-            .into_iter()
-            .filter(|(k, _)| k.len() == 8)
-            .filter_map(|(k, v)| {
-                let m = u64::from_be_bytes(k[..8].try_into().ok()?);
-                market_margin_config(m, &v).map(|c| (m, c))
-            })
-            .collect())
+        let mut configs = HashMap::default();
+        let mut delisted = HashSet::default();
+        for (k, v) in state.iterate_cf(CF_NATIVE_MARKETS, None)? {
+            let Ok(id) = <[u8; 8]>::try_from(&k[..k.len().min(8)]) else { continue };
+            let m = u64::from_be_bytes(id);
+            if k.len() == 8 {
+                if let Some(c) = market_margin_config(m, &v) {
+                    configs.insert(m, c);
+                }
+            } else if k[..] == torus_types::market_delisted_key(m)[..] {
+                delisted.insert(m);
+            }
+        }
+        Ok((configs, delisted))
     }
 
     /// Durable global-order-id counter row. Lives in `CF_NATIVE_MARKETS` — a
@@ -7307,10 +7333,10 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// this book's last write; an emptied book deletes it. One overlay point
     /// put (or delete) per moved market: no read, no Borsh, nothing per fill.
     /// Unhashed, so a node whose book was just loaded (`saved_bbo` = `None`)
-    /// writes the same bytes again. Delist has no hook: `DelistMarket`
-    /// executes nothing today; a delist must empty the book through the
-    /// dirty-marking path or delete the row. A failed write latches the
-    /// block's fail-stop like any book write.
+    /// writes the same bytes again. A governance delist (pre-testnet P1)
+    /// empties the book through the cancel-all path, which dirty-marks it, so
+    /// its bbo row is deleted here. A failed write latches the block's
+    /// fail-stop like any book write.
     fn write_bbo_rows(&mut self) {
         use torus_state::cf::CF_NATIVE_BBO;
         for &market_id in &self.dirty_books {
@@ -7910,10 +7936,18 @@ impl NativeExecutor {
             NativeAction::CancelOrder { order_id } => {
                 Self::exec_cancel_order(ctx, sender, *order_id)
             }
+            // Pre-testnet P0: a named market that is not listed is rejected
+            // (it holds nothing to cancel; was an `ok` that cancelled nothing).
             NativeAction::CancelAllOrders { market_id } => {
+                if let Some(r) = market_id.and_then(|m| Self::reject_unlisted(ctx, "cancel_all", m)) {
+                    return r;
+                }
                 Self::exec_cancel_all(ctx, sender, *market_id)
             }
             NativeAction::CancelByCloid { market_id, cloid } => {
+                if let Some(r) = Self::reject_unlisted(ctx, "cancel_by_cloid", *market_id) {
+                    return r;
+                }
                 Self::exec_cancel_by_cloid(ctx, sender, *market_id, *cloid)
             }
             NativeAction::ModifyOrder {
@@ -8278,11 +8312,21 @@ impl NativeExecutor {
                             match &flat[i].1 {
                                 FlatAction::Place(_) => place_order_indices.push(i),
                                 FlatAction::Other(NativeAction::CancelAllOrders { market_id }) => {
-                                    run.push((i, flat[i].0, *market_id))
+                                    // Pre-testnet P0: an unlisted market is
+                                    // rejected here, as on the single path; it
+                                    // holds nothing, so leaving it out of the
+                                    // run changes no other result.
+                                    match market_id.and_then(|m| Self::reject_unlisted(ctx, "cancel_all", m)) {
+                                        Some(r) => results[i] = r,
+                                        None => run.push((i, flat[i].0, *market_id)),
+                                    }
                                 }
                                 FlatAction::Other(_) => break,
                             }
                             i += 1;
+                        }
+                        if run.is_empty() {
+                            continue;
                         }
                         let run_results = match Self::exec_cancel_all_run(ctx, &run) {
                             Ok(run_results) => run_results,
@@ -8315,6 +8359,46 @@ impl NativeExecutor {
             }
         }
         ctx.phase_accum.phase1_actions_ns += phase1_timer.elapsed().as_nanos();
+
+        // Pre-testnet P0 (consensus rule): a placement on a market that is not
+        // listed (P1: or a non-reduce-only one on a delisted market) is
+        // rejected first, before the cloid pass and Phase 2, so it
+        // claims no cloid, slot, margin or order id and Phase 3 never creates
+        // its book. One registry read per market of the call (none for a
+        // market with a book).
+        {
+            let mut listed: HashMap<MarketId, Result<bool, CoreError>> = HashMap::default();
+            let (books, state, metrics) = (&ctx.order_books, &ctx.state, &ctx.metrics);
+            let delisted = &ctx.delisted_markets;
+            let mut fault: Option<String> = None;
+            place_order_indices.retain(|&i| {
+                let FlatAction::Place(p) = &flat[i].1 else {
+                    return true;
+                };
+                let m = p.market_id;
+                let rejection = match listed.entry(m).or_insert_with(|| Self::market_listed(books, state, m)) {
+                    // Pre-testnet P1: a delisted market takes reduce-only
+                    // orders only.
+                    Ok(true) if p.reduce_only || !delisted.contains(&m) => return true,
+                    Ok(true) => Self::delisted_rejection(m),
+                    Ok(false) => Self::unknown_market_rejection(m),
+                    Err(e) => {
+                        if e.is_local_fault() && fault.is_none() {
+                            fault = Some(format!("market registry read: {e}"));
+                        }
+                        (FailureReason::Other, e.to_string())
+                    }
+                };
+                if let Some(m) = metrics {
+                    RejectReason::Other.count(m, rejection.0);
+                }
+                results[i] = NativeActionResult::rejected("place_order", rejection);
+                false
+            });
+            if let (Some(f), None) = (fault, &ctx.fatal_error) {
+                ctx.fatal_error = Some(f);
+            }
+        }
 
         // s114: cloid uniqueness, serially in flat order, before Phase 2
         // reserves anything: a placement whose cloid is live for its sender
@@ -11276,6 +11360,66 @@ impl NativeExecutor {
             .unwrap_or((FixedPoint::ONE, FixedPoint::ONE)))
     }
 
+    /// Pre-testnet P0 (consensus rule, genesis-bound): `market_id` is listed
+    /// when it has a `CF_NATIVE_MARKETS` row (genesis or a governance
+    /// listing; the row the RPC intake check reads, decodable or not). A
+    /// market with a book is listed without a read: a book is only ever
+    /// created for a listed market and market rows are never deleted, so
+    /// every node answers the same. R02: a failed read is the `Err`.
+    fn market_listed<T: StateBackend>(
+        books: &HashMap<MarketId, OrderBook>,
+        state: &T,
+        market_id: MarketId,
+    ) -> Result<bool, CoreError> {
+        if books.contains_key(&market_id) {
+            return Ok(true);
+        }
+        Ok(state
+            .get_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &market_id.to_be_bytes())?
+            .is_some())
+    }
+
+    /// Pre-testnet P0: the rejection of an action on a market that is not
+    /// listed: reason `UnknownMarket`, the RPC intake text, no gas.
+    fn unknown_market_rejection(market_id: MarketId) -> Rejection {
+        (FailureReason::UnknownMarket, format!("unknown market_id {market_id}"))
+    }
+
+    /// Pre-testnet P1: the rejection of an order that is not reduce-only on a
+    /// delisted market (reduce-only wind-down).
+    fn delisted_rejection(market_id: MarketId) -> Rejection {
+        (FailureReason::MarketDelisted, format!("market {market_id} is delisted: only reduce-only orders"))
+    }
+
+    /// Pre-testnet P1: `Some(rejection)` for a placement that is not
+    /// reduce-only on a delisted market. Reduce-only orders (closing orders,
+    /// liquidation orders) pass.
+    fn reject_delisted<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        params: &PlaceOrderParams,
+    ) -> Option<NativeActionResult> {
+        (!params.reduce_only && ctx.delisted_markets.contains(&params.market_id))
+            .then(|| NativeActionResult::rejected("place_order", Self::delisted_rejection(params.market_id)))
+    }
+
+    /// Pre-testnet P0: `None` when `market_id` is listed, else the action's
+    /// rejection (nothing written, nothing charged). A failed registry read
+    /// fail-stops (R02) and rejects the action meanwhile.
+    fn reject_unlisted<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        action: &'static str,
+        market_id: MarketId,
+    ) -> Option<NativeActionResult> {
+        match Self::market_listed(&ctx.order_books, &ctx.state, market_id) {
+            Ok(true) => None,
+            Ok(false) => Some(NativeActionResult::rejected(action, Self::unknown_market_rejection(market_id))),
+            Err(e) => {
+                Self::latch_core_fault(ctx, "market registry read", &e);
+                Some(NativeActionResult::err(action, e.to_string()))
+            }
+        }
+    }
+
     /// s515 (BUG 2): signed position size (+long / -short / 0 flat).
     fn signed_position<T: StateBackend>(
         positions: &PositionManager<T>,
@@ -11496,6 +11640,17 @@ impl NativeExecutor {
         sender: &Address,
         params: &PlaceOrderParams,
     ) -> NativeActionResult {
+        // Pre-testnet P0: a market that is not listed first (the batch path's
+        // order: before the cloid and open-order checks claim anything).
+        // Pre-testnet P1: then a delisted market (reduce-only orders only).
+        if let Some(r) = Self::reject_unlisted(ctx, "place_order", params.market_id)
+            .or_else(|| Self::reject_delisted(ctx, params))
+        {
+            if let Some(ref m) = ctx.metrics {
+                RejectReason::Other.count(m, r.reason);
+            }
+            return r;
+        }
         // s114: a cloid live for the sender in any market.
         if let Some(msg) = params.client_order_id.and_then(|c| {
             let books = &mut ctx.order_books;
@@ -11583,6 +11738,14 @@ impl NativeExecutor {
         liquidation: bool,
     ) -> NativeActionResult {
         let market_id = params.market_id;
+        // Pre-testnet P0: never a book for a market that is not listed (a
+        // triggered stop or a liquidation order names a market that has a
+        // book or a position, so this only guards the invariant).
+        if let Some(r) = Self::reject_unlisted(ctx, "place_order", market_id)
+            .or_else(|| Self::reject_delisted(ctx, params))
+        {
+            return r;
+        }
 
         // s515 (BUG 1): market / stop orders need a positive price cap.
         // Fix A (s92): the book's dust / off-tick rejects, before any
@@ -11786,7 +11949,7 @@ impl NativeExecutor {
             }
         }
 
-        // Get or create order book for this market.
+        // Get or create order book for this market (listed: checked above).
         ctx.dirty_books.insert(market_id);
         let book = ctx
             .order_books
@@ -13780,8 +13943,29 @@ impl NativeExecutor {
                     ),
                 })
             }
-            ProposalAction::UpdateMarketParams { .. } | ProposalAction::DelistMarket { .. } => {
-                None // text-only for now
+            // Pre-testnet P1: executable (were text-only). The params keep
+            // the listing convention: initial margin = 1 / max leverage.
+            // `maintenance_margin_bps` and `max_funding_rate_bps` have no slot
+            // in the market row (maintenance is half the initial margin; no
+            // funding engine yet), as for `ListMarket`.
+            ProposalAction::UpdateMarketParams { market_id, params } => {
+                if params.max_leverage == 0 {
+                    return NativeActionResult::err(
+                        "submit_proposal",
+                        "market params max_leverage must be > 0".into(),
+                    );
+                }
+                Some(ExecutionPayload::MarketParamsUpdate {
+                    market_id: *market_id,
+                    lot_size: params.lot_size,
+                    tick_size: params.tick_size,
+                    initial_margin: torus_types::FixedPoint::from_raw(
+                        100 * torus_types::FixedPoint::SCALE / params.max_leverage as i128,
+                    ),
+                })
+            }
+            ProposalAction::DelistMarket { market_id } => {
+                Some(ExecutionPayload::MarketDelist { market_id: *market_id })
             }
             ProposalAction::ValidatorRegistration { candidate } => {
                 Some(ExecutionPayload::ValidatorRegistration {
@@ -14325,7 +14509,15 @@ impl NativeExecutor {
     ) -> Vec<NativeActionResult> {
         use torus_economics::governance::ProposalOutcome;
         match ctx.governance.process_pending_proposals(ctx.block_height) {
-            Ok(outcomes) => outcomes
+            Ok(outcomes) => {
+                // Pre-testnet P1: the live-state side of executed market
+                // proposals, in execution order (the rows are written).
+                for outcome in &outcomes {
+                    if let ProposalOutcome::Executed(id) = outcome {
+                        Self::apply_executed_market_proposal(ctx, *id);
+                    }
+                }
+                outcomes
                 .iter()
                 .map(|outcome| match outcome {
                     ProposalOutcome::Failed(id, reason) => NativeActionResult::err(
@@ -14338,8 +14530,137 @@ impl NativeExecutor {
                         NativeActionResult::ok("governance_process", 1000)
                     }
                 })
-                .collect(),
+                .collect()
+            }
             Err(e) => vec![Self::econ_err(ctx, "governance_process", e)],
+        }
+    }
+
+    /// Pre-testnet P1: after proposal `id` executed (its rows written in one
+    /// atomic write), bring the live state in line, deterministically:
+    /// - `MarketDelist`: the market goes reduce-only for the rest of this
+    ///   block too, and every resting order and pending stop in its book is
+    ///   cancelled, trader by trader in ascending address order, each
+    ///   trader's reservation released (the user cancel-all path). Positions
+    ///   are left open: how they settle is an open owner question (roadmap
+    ///   P1); they close with reduce-only orders and stay liquidatable.
+    /// - `MarketParamsUpdate`: when the row's tick, lot or margin config
+    ///   differs from the live one, every resting order and pending stop in
+    ///   the book is first cancelled the same way, each reservation released
+    ///   under the OLD config (Codex P1: a reservation is never re-priced
+    ///   under a config it was not placed with — lowering the leverage
+    ///   released other orders' collateral on cancel, raising it stranded
+    ///   collateral). Then the live book (if any) takes the row's tick and
+    ///   lot (the book meta is rewritten), the margin config follows the
+    ///   row, and, if the config changed, the block's mark version moves
+    ///   ([`Self::renew_mark_version`], the C2 / C3 invariant).
+    ///
+    /// A failed read of the proposal or the row is a local fault (fail-stop).
+    fn apply_executed_market_proposal<T: StateBackend>(ctx: &mut NativeExecContext<T>, id: u64) {
+        use torus_economics::governance::ExecutionPayload;
+        let payload = match ctx.governance.get_proposal(id) {
+            Ok(Some(p)) => p.execution_payload,
+            Ok(None) => None,
+            Err(e) => {
+                Self::latch_local_fault(ctx, "governance market proposal read", &e);
+                return;
+            }
+        };
+        match payload {
+            Some(ExecutionPayload::MarketDelist { market_id }) => {
+                ctx.delisted_markets.insert(market_id);
+                Self::cancel_market_orders_and_stops(ctx, market_id);
+            }
+            Some(ExecutionPayload::MarketParamsUpdate { market_id, .. }) => {
+                let row = match ctx
+                    .state
+                    .get_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &market_id.to_be_bytes())
+                {
+                    Ok(Some(row)) => row,
+                    Ok(None) => return, // cannot happen: execution checked it
+                    Err(e) => {
+                        Self::latch_core_fault(
+                            ctx,
+                            "governance market row read",
+                            &CoreError::from(e),
+                        );
+                        return;
+                    }
+                };
+                let shape = market_row_shape(&row);
+                let config = market_margin_config(market_id, &row);
+                let config_changed = ctx.margin_configs.get(&market_id) != config.as_ref();
+                let shape_changed = ctx.order_books.get(&market_id).is_some_and(|book| {
+                    shape.is_some_and(|s| s != (book.tick_size, book.lot_size))
+                });
+                if config_changed || shape_changed {
+                    // Codex P1: released under the old config (still in
+                    // `margin_configs`), before anything changes.
+                    Self::cancel_market_orders_and_stops(ctx, market_id);
+                }
+                if let (Some((tick, lot)), Some(book)) =
+                    (shape, ctx.order_books.get_mut(&market_id))
+                {
+                    book.tick_size = tick;
+                    book.lot_size = lot;
+                    ctx.dirty_books.insert(market_id);
+                }
+                match config {
+                    Some(c) => {
+                        ctx.margin_configs.insert(market_id, c);
+                    }
+                    None => {
+                        ctx.margin_configs.remove(&market_id);
+                    }
+                }
+                if config_changed {
+                    Self::renew_mark_version(ctx);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl NativeExecutor {
+    /// Pre-testnet P1: cancel every resting order and pending stop in
+    /// `market_id`'s book, trader by trader in ascending address order, each
+    /// trader's reservation released at the market's CURRENT margin config
+    /// (the user cancel-all path). No book: nothing to do.
+    fn cancel_market_orders_and_stops<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        market_id: MarketId,
+    ) {
+        let Some(book) = ctx.order_books.get(&market_id) else {
+            return;
+        };
+        let mut traders: Vec<Address> = book.traders_present().copied().collect();
+        traders.sort_unstable();
+        traders.dedup();
+        for trader in traders {
+            let total = Self::cancel_orders_and_stops(ctx, &trader, Some(market_id));
+            Self::release_order_margin(ctx, &trader, total);
+        }
+    }
+
+    /// Codex P1 (item 6 C2 / C3 invariant: the mark version changes whenever
+    /// the table or the margin configs it values with change; a new version
+    /// is never one used before): `margin_configs` changed after the block's
+    /// table was versioned (the governance step). Give the table a new
+    /// version and restart the sums memo at it, so no valuation made under
+    /// the old config is served again — not by this block's memo, not by the
+    /// slot's entries (joined at the old version), and not in the next
+    /// block, whose version check compares against this block's final
+    /// configs at the new version. No table: nothing is cached (every
+    /// valuation is direct). Node-local: the version never reaches state.
+    fn renew_mark_version<T: StateBackend>(ctx: &mut NativeExecContext<T>) {
+        let Some(marks) = ctx.block_marks.as_mut() else {
+            return;
+        };
+        let version = MARK_VERSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        marks.version = version;
+        if let Some(sums) = ctx.sums.as_mut() {
+            sums.start(Some(version));
         }
     }
 }

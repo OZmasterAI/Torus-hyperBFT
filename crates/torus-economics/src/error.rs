@@ -174,6 +174,19 @@ pub enum EconomicsError {
     #[error("market listing {field} must be > 0")]
     MarketListingNotPositive { field: &'static str },
 
+    /// Pre-testnet P1: a delist / params update of a market with no row.
+    #[error("market {0} is not listed")]
+    MarketNotListed(u64),
+
+    /// Pre-testnet P1: a delist / params update of a delisted market.
+    #[error("market {0} is delisted")]
+    MarketDelisted(u64),
+
+    /// Pre-testnet P1: a params update of a market whose row is not in the
+    /// genesis / governance layout (its names cannot be kept).
+    #[error("market {0} row does not decode")]
+    MarketRowUndecodable(u64),
+
     /// Row 74 review: a U256 overflow in an economics sum. Every validator
     /// hits it alike, so it is NOT a local fault. The text keeps the old
     /// `State(InvalidData)` message so action results stay byte-identical.

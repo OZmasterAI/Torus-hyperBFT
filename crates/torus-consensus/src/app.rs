@@ -12534,6 +12534,17 @@ mod crash_recovery_tests {
     use super::*;
     use torus_types::{Bloom, FixedPoint, NativeAction, SignedNativeAction, B256, U256};
 
+    /// Pre-testnet P0: orders need a listed market. Every fixture DB of this
+    /// module lists markets 1..=8 with placeholder rows (tick / lot 1, no
+    /// margin config: the book an unlisted market used to get).
+    fn list_test_markets(state_db: &StateDb) {
+        for m in 1..=8u64 {
+            state_db
+                .put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed")
+                .expect("list market");
+        }
+    }
+
     fn make_test_config_and_db() -> (ChainConfig, StateDb) {
         // Native trie maintenance is a process-global flag that only ever
         // goes off -> on (resolved off from the env on first use, forced on
@@ -12548,6 +12559,7 @@ mod crash_recovery_tests {
         // `cargo test` and in nextest.
         torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         let state_db = StateDb::open(&scratch_db_dir("torus-crash-test")).expect("open test db");
+        list_test_markets(&state_db);
         let config = ChainConfig {
             chain_id: torus_evm::TORUS_CHAIN_ID,
             chain_name: "crash-test".to_string(),
@@ -29526,6 +29538,7 @@ mod crash_recovery_tests {
         torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         let dir = scratch_db_dir("torus-r02-replay");
         let db = StateDb::open(&dir).expect("open test db");
+        list_test_markets(&db);
         torus_state::running_hash::configure_activation(&db, Some(1))
             .expect("configure running hash activation");
         (dir, db)
@@ -30586,6 +30599,7 @@ mod crash_recovery_tests {
                 .copied()
                 .filter(|cf| *cf != missing);
             let db = StateDb::from_existing_db(rocksdb::DB::open_cf(&opts, &dir, cfs).unwrap());
+            list_test_markets(&db);
             torus_state::running_hash::configure_activation(&db, Some(1))
                 .expect("configure running hash activation");
             evm_db_fault_setup(&db, &key);
@@ -30745,6 +30759,7 @@ mod crash_recovery_tests {
                 .copied()
                 .filter(|cf| *cf != CF_TX_HASH_TO_LOCATION);
             let db = StateDb::from_existing_db(rocksdb::DB::open_cf(&opts, &dir, cfs).unwrap());
+            list_test_markets(&db);
             torus_state::running_hash::configure_activation(&db, Some(1))
                 .expect("configure running hash activation");
             receipts_fault_setup(&db, &key);
@@ -32387,6 +32402,14 @@ mod crash_recovery_tests {
                 &U256::from(100 + slot),
             )
             .unwrap();
+        }
+        // Pre-testnet P0 merge: `make_test_config_and_db` lists markets
+        // 1..=8 with placeholder rows; the stream trades markets 1..=3 only
+        // (`C5_MARKETS`, listed by `c5_fixture`), so the extra rows are
+        // dropped and the DB is the one the golden was captured on.
+        for m in 4..=8u64 {
+            db.delete_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes())
+                .unwrap();
         }
         torus_state::incremental::ensure_trie_built(&db).unwrap();
         (config, db)

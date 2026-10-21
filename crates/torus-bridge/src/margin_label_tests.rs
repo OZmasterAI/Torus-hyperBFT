@@ -151,6 +151,11 @@ fn run(mode: Mode, metrics: bool) -> Run {
     ];
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
+    // Pre-testnet P0: orders need a listed market (placeholder rows,
+    // tick / lot 1, as the old implicit book).
+    for m in 1..=64u64 {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+    }
     configure_activation(&db, Some(1)).unwrap();
     capture_begin(&db);
     let m = Arc::new(Metrics::new());

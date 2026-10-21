@@ -99,6 +99,13 @@ fn gtc(market_id: MarketId, is_buy: bool, price: i64, cloid: Option<u128>) -> Pl
 /// Books persisted by the real executor save path in `mode`: `orders` (no
 /// crossing), every trader funded.
 fn seed_books(state: &StateDb, mode: BookMode, orders: Vec<(Address, PlaceOrderParams)>) {
+    // Pre-testnet P0: orders need a listed market (a placeholder row
+    // where the test has none).
+    for m in orders.iter().map(|(_, p)| p.market_id).collect::<std::collections::BTreeSet<_>>() {
+        if state.get_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes()).unwrap().is_none() {
+            state.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+        }
+    }
     let mut ctx = NativeExecContext::new_with_mode(
         state.clone(),
         1,

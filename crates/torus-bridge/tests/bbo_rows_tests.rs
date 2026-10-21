@@ -79,6 +79,11 @@ impl Chain {
         torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         let dir = tempfile::tempdir().expect("tempdir");
         let db = StateDb::open(dir.path()).expect("open db");
+        // Pre-testnet P0: orders need a listed market (placeholder rows,
+        // tick / lot 1, as the old implicit book).
+        for m in 1..=64u64 {
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+        }
         {
             let ctx0 = NativeExecContext::new_with_mode(
                 db.clone(),
