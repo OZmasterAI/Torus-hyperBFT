@@ -3280,6 +3280,16 @@ fn insertion_link_response(
     }
 }
 
+/// [`insertion_link_response`] for the block whose datum is `datum` and
+/// whose hotstuff block commits to `data_hash`.
+fn insertion_link_response_for_datum(
+    link: Result<BlockDataCheck, UpgradeRequired>,
+    _datum: &[u8],
+    _data_hash: &CryptoHash,
+) -> Option<ValidateBlockResponse> {
+    insertion_link_response(link)
+}
+
 /// Item 7 step 0, pre-vote only (like the native action count): the EVM body
 /// fits its header. `evm_tx_count` equals the body's tx count (crash replay
 /// loads a body only when the header counts are non-zero), and the txs'
@@ -10205,7 +10215,9 @@ impl App<RocksKVStore> for TorusApp {
             ),
             None => Ok(BlockDataCheck::Invalid),
         };
-        if let Some(response) = insertion_link_response(link) {
+        if let Some(response) =
+            insertion_link_response_for_datum(link, datums[0].bytes(), &block.data_hash)
+        {
             return response;
         }
 
@@ -25856,6 +25868,55 @@ mod crash_recovery_tests {
             "known bit off-schedule: invalid"
         );
         assert!(link(&old, &child_of(&parent, 2_000)).is_none(), "honest: linked");
+    }
+
+    /// P0.0, Codex review of phase 2 (P2): `UnsupportedUpgrade` (no blacklist)
+    /// only for a datum bound to the block: its bytes hash to the hotstuff
+    /// block's `data_hash`. A peer that adds an unknown bit to tampered data
+    /// (the datum no longer matches `data_hash`) is `Invalid`, so block sync
+    /// blacklists it. RED before the fix: the unknown bit answered
+    /// `UnsupportedUpgrade` before the datum hash was checked.
+    #[test]
+    fn tampered_datum_with_an_unknown_bit_is_invalid_not_an_unsupported_upgrade() {
+        let parent = tip_2000();
+        let old = gated_app(2_010, torus_types::ActivationSchedule::default());
+        let hs_parent = hs_block(&parent, PhaseCertificate::genesis_pc());
+        let verdict = |block: &TorusBlock, data_hash: &CryptoHash| {
+            let header = parent.header.clone();
+            let link = check_parent_link_or_upgrade(
+                &block.header,
+                &justify_for(&hs_parent),
+                &old.genesis_header,
+                &old.activations,
+                move |_| ParentHeader::Header(Box::new(header)),
+                |_| Ok(None),
+            );
+            let datum = bincode::serialize(block).unwrap();
+            insertion_link_response_for_datum(link, &datum, data_hash)
+        };
+        let bound = |block: &TorusBlock| {
+            CryptoHash::new(TorusApp::hash_datum(&bincode::serialize(block).unwrap()))
+        };
+        let newer = with_features(child_of(&parent, 2_000), parent.header.features | UNKNOWN_BIT);
+        assert!(
+            matches!(verdict(&newer, &bound(&newer)), Some(ValidateBlockResponse::UnsupportedUpgrade)),
+            "a datum bound to its block: unsupported upgrade"
+        );
+        // Tampered: the block commits to other bytes (another timestamp, or no
+        // unknown bit at all); the served datum carries the unknown bit.
+        let mut other = newer.clone();
+        other.header.timestamp += 1;
+        let plain = with_features(newer.clone(), parent.header.features);
+        for committed in [&other, &plain] {
+            assert!(
+                matches!(verdict(&newer, &bound(committed)), Some(ValidateBlockResponse::Invalid)),
+                "a datum that does not hash to data_hash is invalid (blacklist)"
+            );
+        }
+        assert!(
+            matches!(verdict(&newer, &CryptoHash::new([7; 32])), Some(ValidateBlockResponse::Invalid)),
+            "any other data_hash: invalid"
+        );
     }
 
     /// P0.0: the proposer stamps the schedule's bits, the genesis parent header
