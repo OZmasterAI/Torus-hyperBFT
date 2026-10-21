@@ -13,6 +13,7 @@ use ed25519_dalek::VerifyingKey;
 use crate::{
     block_sync::messages::{BlockSyncMessage, BlockSyncRequest, BlockSyncResponse},
     hotstuff::messages::{BlockDataRequest, HotStuffMessage},
+    pacemaker::messages::PacemakerMessage,
     types::data_types::{BufferSize, ChainID, ViewNumber},
 };
 
@@ -146,6 +147,10 @@ fn is_chain_neutral_genesis_body(message: &ProgressMessage) -> bool {
 /// **also** caches all messages for views greater than the current view, for processing in the intended
 /// view in case immediate processing is not possible.
 ///
+/// TC-required phase A: `TimeoutVote`s for the view **just before** the current one are returned too,
+/// and buffered ones survive the move to the current view, so the pacemaker can still form a TC for
+/// the view this replica just left (docs/plans/tc-required-and-tip-signing.md, C2).
+///
 /// ### BlockSyncTrigger messages
 ///
 /// `recv` returns block sync trigger messages immediately without buffering.
@@ -189,11 +194,13 @@ impl ProgressMessageStub {
         cur_view: ViewNumber,
         deadline: Instant,
     ) -> Result<(VerifyingKey, ProgressMessage), ProgressMessageReceiveError> {
-        // Clear buffer of messages with views lower than the current one.
+        // Clear buffer of messages with views lower than the current one
+        // (TC-required phase A: except TimeoutVotes for `cur_view - 1`).
         self.msg_buffer.remove_expired_msgs(cur_view);
 
-        // Try to get buffered messages for the current view.
-        if let Some((sender, msg)) = self.msg_buffer.get_msg(&cur_view) {
+        // Try to get buffered messages for the current view (and the kept
+        // TimeoutVotes for the previous one).
+        if let Some((sender, msg)) = self.msg_buffer.get_current_msg(cur_view) {
             return Ok((sender, msg));
         }
 
@@ -226,7 +233,7 @@ impl ProgressMessageStub {
         deadline: Instant,
     ) -> Result<(VerifyingKey, ProgressMessage), ProgressMessageReceiveError> {
         self.msg_buffer.remove_expired_msgs(cur_view);
-        if let Some(message) = self.msg_buffer.get_msg(&cur_view) {
+        if let Some(message) = self.msg_buffer.get_current_msg(cur_view) {
             return Ok(message);
         }
         for _ in 0..Self::MAX_BEFORE_RETRY_ENVELOPES {
@@ -299,12 +306,25 @@ impl ProgressMessageStub {
                         && hotstuff_msg.view() > cur_view)
             }
             ProgressMessage::PacemakerMessage(pacemaker_msg) => {
-                pacemaker_msg.view() >= cur_view
+                pacemaker_msg.view() >= cur_view || is_previous_view_timeout_vote(pacemaker_msg, cur_view)
             }
             ProgressMessage::BlockSyncAdvertiseMessage(_) => true,
         };
         return_msg.then_some((sender, msg))
     }
+}
+
+/// TC-required phase A (C2, docs/plans/tc-required-and-tip-signing.md): a
+/// TimeoutVote for the view just before `cur_view`. The pacemaker still
+/// collects these (into its previous-view collector), so leader(cur_view) can
+/// form TC(cur_view - 1) after it timed out of that view itself.
+fn is_previous_view_timeout_vote(msg: &PacemakerMessage, cur_view: ViewNumber) -> bool {
+    matches!(msg, PacemakerMessage::TimeoutVote(tv) if tv.view.int().checked_add(1) == Some(cur_view.int()))
+}
+
+/// [`is_previous_view_timeout_vote`] for a buffered [`ProgressMessage`].
+fn is_previous_view_progress_timeout_vote(msg: &ProgressMessage, cur_view: ViewNumber) -> bool {
+    matches!(msg, ProgressMessage::PacemakerMessage(pm) if is_previous_view_timeout_vote(pm, cur_view))
 }
 
 #[derive(Debug)]
@@ -424,15 +444,39 @@ impl ProgressMessageBuffer {
         });
     }
 
-    /// Remove all messages for views less than the current view.
+    /// Remove all messages for views less than the current view, except
+    /// TimeoutVotes for `cur_view - 1` (TC-required phase A, C2): a replica
+    /// that skipped over that view replays them into its previous-view
+    /// collector.
     fn remove_expired_msgs(&mut self, cur_view: ViewNumber) {
         let retained = self.buffer.split_off(&cur_view);
         let expired = mem::replace(&mut self.buffer, retained);
-        for queue in expired.into_values() {
-            for (_, msg) in queue {
-                self.buffer_size -= mem::size_of::<VerifyingKey>() as u64 + msg.size();
+        for (view, queue) in expired {
+            let mut kept = VecDeque::new();
+            for (sender, msg) in queue {
+                if is_previous_view_progress_timeout_vote(&msg, cur_view) {
+                    kept.push_back((sender, msg));
+                } else {
+                    self.buffer_size -= mem::size_of::<VerifyingKey>() as u64 + msg.size();
+                }
+            }
+            if !kept.is_empty() {
+                self.buffer.insert(view, kept);
             }
         }
+    }
+
+    /// The next buffered message to deliver at `cur_view`: kept TimeoutVotes
+    /// for `cur_view - 1` first (only those survive
+    /// [`remove_expired_msgs`](Self::remove_expired_msgs) below `cur_view`),
+    /// then messages for `cur_view`.
+    fn get_current_msg(&mut self, cur_view: ViewNumber) -> Option<(VerifyingKey, ProgressMessage)> {
+        if let Some(previous) = cur_view.int().checked_sub(1) {
+            if let Some(message) = self.get_msg(&ViewNumber::new(previous)) {
+                return Some(message);
+            }
+        }
+        self.get_msg(&cur_view)
     }
 }
 

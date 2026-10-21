@@ -188,6 +188,10 @@ impl<N: Network> Pacemaker<N> {
             .state
             .timeout_vote_collectors
             .update_validator_sets(&validator_set_state);
+        let _ = self
+            .state
+            .prev_timeout_vote_collectors
+            .update_validator_sets(&validator_set_state);
 
         // 3. If the current Highest PC in the block tree is for the current view or a higher view, and we have
         //    not sent an AdvanceView message in the current view, broadcast a new one with the Highest PC.
@@ -222,7 +226,8 @@ impl<N: Network> Pacemaker<N> {
     ///
     /// # Precondition
     ///
-    /// [`msg.view()`](PacemakerMessage::view) must be greater than or equal to the current view.
+    /// [`msg.view()`](PacemakerMessage::view) must be greater than or equal to the current view, or the
+    /// message is a `TimeoutVote` for the previous view (TC-required phase A, C2/C3).
     pub(crate) fn on_receive_msg<K: KVStore>(
         &mut self,
         msg: PacemakerMessage,
@@ -245,7 +250,8 @@ impl<N: Network> Pacemaker<N> {
     ///
     /// # Precondition
     ///
-    /// `timeout_vote.view >= self.query().view`
+    /// `timeout_vote.view + 1 >= self.query().view`. A vote for the previous view is only collected
+    /// (into the previous-view collector); it is not echoed (Bracha stays at `>= view`).
     fn on_receive_timeout_vote<K: KVStore>(
         &mut self,
         timeout_vote: TimeoutVote,
@@ -349,11 +355,15 @@ impl<N: Network> Pacemaker<N> {
             }
 
             // 3. Try to collect the TimeoutVote into a new `TimeoutCertificate`.
-            if let Some(new_tc) = self
-                .state
-                .timeout_vote_collectors
-                .collect(origin, timeout_vote)
-            {
+            //    TC-required phase A (C3): a vote for the view just left goes to
+            //    the collector kept for it, so leader(v) forms TC(v-1) after it
+            //    timed out of v-1 itself.
+            let collectors = if timeout_vote.view.int().checked_add(1) == Some(self.view_info.view.int()) {
+                &mut self.state.prev_timeout_vote_collectors
+            } else {
+                &mut self.state.timeout_vote_collectors
+            };
+            if let Some(new_tc) = collectors.collect(origin, timeout_vote) {
                 Event::CollectTC(CollectTCEvent {
                     timestamp: SystemTime::now(),
                     timeout_certificate: new_tc.clone(),
@@ -645,11 +655,27 @@ impl<N: Network> Pacemaker<N> {
         );
 
         // 4. Replace our current `timeout_vote_collectors` with new ones for the view we just entered.
-        self.state.timeout_vote_collectors = <ActiveCollectorPair<TimeoutVoteCollector>>::new(
-            self.config.chain_id,
-            next_view,
-            validator_set_state,
+        //    TC-required phase A (C1): keep collecting for `next_view - 1`, so
+        //    leader(next_view) can still form TC(next_view - 1). The outgoing
+        //    collector is kept when it is for that view (its votes count); a
+        //    skip gets a fresh one. Dropped on the next `update_view`.
+        let outgoing = std::mem::replace(
+            &mut self.state.timeout_vote_collectors,
+            <ActiveCollectorPair<TimeoutVoteCollector>>::new(
+                self.config.chain_id,
+                next_view,
+                validator_set_state,
+            ),
         );
+        self.state.prev_timeout_vote_collectors = if cur_view.int() + 1 == next_view.int() {
+            outgoing
+        } else {
+            <ActiveCollectorPair<TimeoutVoteCollector>>::new(
+                self.config.chain_id,
+                ViewNumber::new(next_view.int() - 1),
+                validator_set_state,
+            )
+        };
 
         // FIX CONS-PF-16: Prune bracha state for views we'll never revisit.
         let cutoff_view = ViewNumber::new(next_view.int().saturating_sub(100));
@@ -825,6 +851,11 @@ struct PacemakerState {
     /// `TimeoutVoteCollector`s for the at-most two validator sets that are active in the current view.
     timeout_vote_collectors: ActiveCollectorPair<TimeoutVoteCollector>,
 
+    /// TC-required phase A (C1): the collectors for the view before the
+    /// current one, so a TC for it can still form after this replica left it
+    /// (see docs/plans/tc-required-and-tip-signing.md §2).
+    prev_timeout_vote_collectors: ActiveCollectorPair<TimeoutVoteCollector>,
+
     /// The view in which this replica last broadcasted an [`AdvanceView`] message.
     last_advance_view: Option<ViewNumber>,
     /// Bracha timeout amplification: accumulated voting power per view.
@@ -880,6 +911,11 @@ impl PacemakerState {
             timeout_vote_collectors: <ActiveCollectorPair<TimeoutVoteCollector>>::new(
                 config.chain_id,
                 init_view,
+                validator_set_state,
+            ),
+            prev_timeout_vote_collectors: <ActiveCollectorPair<TimeoutVoteCollector>>::new(
+                config.chain_id,
+                ViewNumber::new(init_view.int().saturating_sub(1)),
                 validator_set_state,
             ),
             last_advance_view: None,

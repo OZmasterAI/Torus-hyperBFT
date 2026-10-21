@@ -39,13 +39,16 @@ use crate::{
             ProposalRequest, ProposalResponse,
         },
         roles::{is_phase_voter, new_view_recipients_with_reputation, view_leader_with_reputation},
-        types::{valid_proposal_certificates, NECollector, Phase, PhaseVoteCollector},
+        types::{
+            carries_required_certificate, valid_proposal_certificates, NECollector, Phase,
+            PhaseVoteCollector,
+        },
     },
     networking::{
         network::{Network, ValidatorSetUpdateHandle},
         sending::SenderHandle,
     },
-    pacemaker::implementation::ViewInfo,
+    pacemaker::{implementation::ViewInfo, types::TimeoutCertificate},
     types::{
         block::Block,
         crypto_primitives::Keypair,
@@ -168,6 +171,12 @@ pub(crate) struct HotStuff<N: Network> {
     /// True when enter_view succeeded but proposal production failed (parent block not yet in tree).
     /// The algorithm loop should retry the proposal after polling messages.
     proposal_deferred: bool,
+    /// TC-required phase A, leader rule L3 (docs/plans/tc-required-and-tip-signing.md
+    /// §2): this leader holds neither QC(v-1) nor TC(v-1) for its view v, so
+    /// a proposal would lack the certificate VALIDPROPOSAL V1 asks for. The
+    /// algorithm loop retries (through [`has_deferred_proposal`](Self::has_deferred_proposal))
+    /// until one arrives or the view times out.
+    awaiting_tc: bool,
     /// S432 follower body-starvation heal: throttles [`tick_missing_pc_block_fetch`]
     /// (which does a `block_tree.contains` DB read) to at most one evaluation per
     /// [`BODY_RETRY_INTERVAL`] on the hot algorithm loop.
@@ -253,6 +262,7 @@ impl<N: Network> HotStuff<N> {
             deferred_sync_retries: VecDeque::new(),
             deferred_sync_refresh: false,
             proposal_deferred: false,
+            awaiting_tc: false,
             last_missing_pc_check: Instant::now(),
             body_push_max_bytes: body_push_max_bytes_from_env(),
             defer_commit_feed: defer_commit_feed_from_env(),
@@ -541,8 +551,12 @@ impl<N: Network> HotStuff<N> {
         new_view_info.view != self.view_info.view
     }
 
+    /// Whether this leader still owes its view a proposal: deferred for a
+    /// missing parent body or the exec backlog, or (TC-required phase A, L3)
+    /// awaiting QC(v-1) or TC(v-1). The algorithm loop retries through
+    /// [`enter_view`](Self::enter_view) while this holds.
     pub(crate) fn has_deferred_proposal(&self) -> bool {
-        self.proposal_deferred
+        self.proposal_deferred || self.awaiting_tc
     }
 
     #[allow(dead_code)]
@@ -573,84 +587,22 @@ impl<N: Network> HotStuff<N> {
         block_tree: &mut BlockTreeSingleton<K>,
         app: &mut impl App<K>,
     ) -> Result<(), HotStuffError> {
-        // Retry deferred proposal: parent body has now arrived, skip view transition.
-        if self.proposal_deferred && new_view_info.view == self.view_info.view {
+        // Retry a deferred proposal (parent body now in the tree, exec backlog
+        // drained) or a leader awaiting QC(v-1) / TC(v-1) (TC-required phase A,
+        // L3) in the same view: no view transition. The retry runs the same
+        // leader rules as the first attempt, so a TC-based proposal keeps its TC.
+        if self.has_deferred_proposal() && new_view_info.view == self.view_info.view {
             self.proposal_deferred = false;
-            let highest_pc = block_tree.highest_pc()?;
-            if matches!(highest_pc.phase, Phase::Generic | Phase::Decide) {
-                let validator_set_state = block_tree.validator_set_state()?;
-                let reputation = block_tree.leader_reputation().ok();
-                if is_proposer_with_reputation(
-                    &self.config.keypair.public(),
-                    self.view_info.view,
-                    &validator_set_state,
-                    reputation.as_ref(),
-                ) {
-                    // S470 Piece 2: still over the exec watermark — keep the
-                    // proposal deferred (re-checked next loop iteration).
-                    if self.should_yield_proposal_for_exec_backpressure() {
-                        self.proposal_deferred = true;
-                        return Ok(());
-                    }
-                    let (parent_block, child_height) = if highest_pc.is_genesis_pc() {
-                        (None, BlockHeight::new(0))
-                    } else {
-                        match block_tree.block_height(&highest_pc.block)? {
-                            Some(h) => (Some(highest_pc.block), h + 1),
-                            None => {
-                                // S430: proactively by-hash fetch the missing parent
-                                // instead of waiting for laggy height-range sync.
-                                self.request_missing_parent(
-                                    highest_pc.block,
-                                    highest_pc.view,
-                                    &validator_set_state,
-                                );
-                                self.proposal_deferred = true;
-                                return Ok(());
-                            }
-                        }
-                    };
-
-                    let produce_block_request = ProduceBlockRequest::new(
-                        self.view_info.view,
-                        parent_block,
-                        block_tree.app_view(parent_block.as_ref())?,
-                    );
-                    let ProduceBlockResponse {
-                        data,
-                        data_hash,
-                        app_state_updates,
-                        validator_set_updates,
-                    } = app.produce_block(produce_block_request);
-
-                    let block = Block::new(child_height, highest_pc, data_hash, data);
-                    block_tree.insert(
-                        &block,
-                        app_state_updates.as_ref(),
-                        validator_set_updates.as_ref(),
-                    )?;
-                    Event::InsertBlock(InsertBlockEvent {
-                        timestamp: SystemTime::now(),
-                        block: block.clone(),
-                    })
-                    .publish(&self.event_publisher);
-                    let update_result = block_tree.update(&block.justify, &self.event_publisher).unwrap_or_else(|e| {
-                        if let BlockTreeError::BlockExpectedButNotFound { block: missing } = &e {
-                            log::warn!("enter_view: missing block {:?} in commit chain — triggering sync", missing);
-                            self.sync_needed = true;
-                        } else {
-                            log::warn!("enter_view: block_tree.update failed after self-insert: {:?}", e);
-                        }
-                        UpdateResult { validator_set_updates: None, committed_block_hashes: vec![] }
-                    });
-                    self.finish_leader_proposal(
-                        block,
-                        validator_set_updates.is_some(),
-                        update_result,
-                        block_tree,
-                        app,
-                    )?;
-                }
+            self.awaiting_tc = false;
+            let validator_set_state = block_tree.validator_set_state()?;
+            let reputation = block_tree.leader_reputation().ok();
+            if is_proposer_with_reputation(
+                &self.config.keypair.public(),
+                self.view_info.view,
+                &validator_set_state,
+                reputation.as_ref(),
+            ) {
+                self.propose_as_leader(block_tree, app)?;
             }
             return Ok(());
         }
@@ -734,10 +686,12 @@ impl<N: Network> HotStuff<N> {
         })
         .publish(&self.event_publisher);
 
-        // 4. If I am a proposer for the new view, then broadcast a `Proposal` or a `Nudge`.
-        //    If the parent block isn't in the tree yet (body fetch in progress),
-        //    defer the proposal and retry after message polling.
+        // 4. If I am a proposer for the new view, then broadcast a `Proposal` or a `Nudge`
+        //    (leader rules L1-L4, see `propose_as_leader`). If the parent block isn't in
+        //    the tree yet (body fetch in progress), or neither QC(v-1) nor TC(v-1) is
+        //    held yet, defer the proposal and retry after message polling.
         self.proposal_deferred = false;
+        self.awaiting_tc = false;
         let am_proposer = is_proposer_with_reputation(
             &self.config.keypair.public(),
             self.view_info.view,
@@ -745,146 +699,221 @@ impl<N: Network> HotStuff<N> {
             reputation.as_ref(),
         );
         if am_proposer {
-            // If a chain of consecutive views of voting for a validator-set-updating block has been interrupted, then
-            // re-propose an existing block.
-            if let Some(block_hash) = repropose_block(self.view_info.view, block_tree)? {
-                let block = block_tree
-                    .block(&block_hash)?
-                    .ok_or(BlockTreeError::BlockExpectedButNotFound { block: block_hash })?;
+            self.propose_as_leader(block_tree, app)?;
+        }
 
-                let proposal = Proposal {
-                    chain_id: self.config.chain_id,
-                    view: self.view_info.view,
-                    block,
-                    tc: None,
-                    nec: None,
-                };
+        Ok(())
+    }
 
-                self.broadcast_proposal_as_header(&proposal, true, block_tree);
+    /// TC-required phase A (docs/plans/tc-required-and-tip-signing.md §2):
+    /// the leader rules for this replica's view v.
+    ///
+    /// - **L1.** `highest_pc` is QC(v-1) (or the genesis PC): propose on it,
+    ///   no TC needed.
+    /// - **L2.** Else, with `highest_tc` = TC(v-1): propose through the TC
+    ///   (MonadBFT Algorithm 4) and attach it in every case. Case 3 (high QC
+    ///   wins) first applies a correct `tc.high_qc` above `highest_pc`, then
+    ///   proposes on `highest_pc` (deferring while its block is missing).
+    /// - **L3.** Else wait ([`awaiting_tc`](Self::awaiting_tc)): a proposal
+    ///   would lack the certificate VALIDPROPOSAL V1 asks for. Retried every
+    ///   loop pass; the view's own deadline is the limit.
+    /// - **L4.** Case 5 (high tip wins, block missing) waits for a
+    ///   ProposalResponse or an NEC; it never falls through to a fresh
+    ///   proposal (which, followed by the reproposal, was self-equivocation).
+    ///   Validator-set-update reproposals never satisfy L1, so they go
+    ///   through L2/L3.
+    fn propose_as_leader<K: KVStore>(
+        &mut self,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<(), HotStuffError> {
+        let view = self.view_info.view;
+        let highest_pc = block_tree.highest_pc()?;
 
+        // L1: the happy path.
+        if carries_required_certificate(view, &highest_pc, None) {
+            return self.propose_from_highest_pc(None, block_tree, app);
+        }
+
+        // L3: no certificate for v - 1 yet.
+        let Some(tc) = block_tree
+            .highest_tc()?
+            .filter(|tc| tc.view.int().checked_add(1) == Some(view.int()))
+        else {
+            log::debug!(
+                "leader awaiting QC or TC for view {}: highest_pc view {}",
+                view.int() - 1,
+                highest_pc.view.int(),
+            );
+            self.awaiting_tc = true;
+            return Ok(());
+        };
+
+        // L2.
+        match self.create_proposal_based_on_tc(&tc, block_tree, app)? {
+            TcProposal::Repropose(proposal) => {
+                self.broadcast_proposal_as_header(&proposal, false, block_tree);
                 Event::Propose(ProposeEvent {
                     timestamp: SystemTime::now(),
                     proposal,
                 })
                 .publish(&self.event_publisher);
-
-                return Ok(());
+                Ok(())
             }
-
-            // MonadBFT: Check if the previous view timed out and produced a TC.
-            if let Some(tc) = block_tree.highest_tc()? {
-                if tc.view + 1 == self.view_info.view {
-                    if let Some(proposal) =
-                        self.create_proposal_based_on_tc(&tc, block_tree, app)?
-                    {
-                        self.broadcast_proposal_as_header(&proposal, false, block_tree);
-                        Event::Propose(ProposeEvent {
-                            timestamp: SystemTime::now(),
-                            proposal,
-                        })
-                        .publish(&self.event_publisher);
-                        return Ok(());
+            // L4: wait for a ProposalResponse or an NEC.
+            TcProposal::Recovering => Ok(()),
+            TcProposal::HighQcWins => {
+                // Case 3: extend the TC's high QC, as an AdvanceView carrying it
+                // would (pacemaker `on_receive_advance_view`). The TC binds only
+                // the QC's view and block, so check the QC itself first.
+                if let Some(high_qc) = &tc.high_qc {
+                    if high_qc.view > highest_pc.view && high_qc.is_correct(block_tree)? {
+                        block_tree.advance_highest_pc_from_remote(high_qc, &self.event_publisher)?;
                     }
                 }
-            }
-
-            // Otherwise, propose a new block or nudge based on highest_pc.
-            let highest_pc = block_tree.highest_pc()?;
-            match highest_pc.phase {
-                // Produce and broadcast a new Proposal.
-                Phase::Generic | Phase::Decide => {
-                    // S470 Piece 2 (proposer exec-backpressure): a leader
-                    // whose exec backlog exceeds the watermark yields its
-                    // slot instead of producing off a stale executed tip.
-                    // Deferred, not abandoned: retried every loop iteration,
-                    // so the proposal fires as soon as the backlog drains
-                    // (yield-not-starve). Default OFF — see
-                    // `should_yield_proposal_for_exec_backpressure`.
-                    if self.should_yield_proposal_for_exec_backpressure() {
-                        self.proposal_deferred = true;
-                        return Ok(());
-                    }
-                    let (parent_block, child_height) = if highest_pc.is_genesis_pc() {
-                        (None, BlockHeight::new(0))
-                    } else {
-                        match block_tree.block_height(&highest_pc.block)? {
-                            Some(parent_height) => (Some(highest_pc.block), parent_height + 1),
-                            None => {
-                                // S430: proactively by-hash fetch the missing parent
-                                // instead of waiting for laggy height-range sync.
-                                self.request_missing_parent(
-                                    highest_pc.block,
-                                    highest_pc.view,
-                                    &validator_set_state,
-                                );
-                                self.proposal_deferred = true;
-                                return Ok(());
-                            }
-                        }
-                    };
-
-                    let produce_block_request = ProduceBlockRequest::new(
-                        self.view_info.view,
-                        parent_block,
-                        block_tree.app_view(parent_block.as_ref())?,
-                    );
-
-                    let ProduceBlockResponse {
-                        data,
-                        data_hash,
-                        app_state_updates,
-                        validator_set_updates,
-                    } = app.produce_block(produce_block_request);
-
-                    let block = Block::new(child_height, highest_pc, data_hash, data);
-
-                    // Proposer self-inserts before broadcasting: ensures the block
-                    // is in the tree before QC forms and next view references it.
-                    block_tree.insert(
-                        &block,
-                        app_state_updates.as_ref(),
-                        validator_set_updates.as_ref(),
-                    )?;
-                    Event::InsertBlock(InsertBlockEvent {
-                        timestamp: SystemTime::now(),
-                        block: block.clone(),
-                    })
-                    .publish(&self.event_publisher);
-
-                    let update_result = block_tree
-                        .update(&block.justify, &self.event_publisher)
-                        .unwrap_or(UpdateResult {
-                            validator_set_updates: None,
-                            committed_block_hashes: vec![],
-                        });
-                    self.finish_leader_proposal(
-                        block,
-                        validator_set_updates.is_some(),
-                        update_result,
-                        block_tree,
-                        app,
-                    )?;
-                }
-                // Produce and broadcast a Nudge.
-                Phase::Prepare | Phase::Precommit | Phase::Commit => {
-                    let nudge = Nudge {
-                        chain_id: self.config.chain_id,
-                        view: self.view_info.view,
-                        justify: highest_pc,
-                    };
-
-                    self.sender_handle
-                        .broadcast::<HotStuffMessage>(nudge.clone().into());
-
-                    Event::Nudge(NudgeEvent {
-                        timestamp: SystemTime::now(),
-                        nudge,
-                    })
-                    .publish(&self.event_publisher)
-                }
+                self.propose_from_highest_pc(Some(tc), block_tree, app)
             }
         }
+    }
 
+    /// Propose on `highest_pc`, attaching `tc` (L2) or not (L1): re-propose a
+    /// validator-set-updating block whose chain of consecutive views was
+    /// interrupted, else produce a new block (Generic / Decide highest PC) or
+    /// nudge (Prepare / Precommit / Commit). Defers while the parent block is
+    /// missing or the exec backlog is over the watermark.
+    fn propose_from_highest_pc<K: KVStore>(
+        &mut self,
+        tc: Option<TimeoutCertificate>,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<(), HotStuffError> {
+        // If a chain of consecutive views of voting for a validator-set-updating block has been interrupted, then
+        // re-propose an existing block.
+        if let Some(block_hash) = repropose_block(self.view_info.view, block_tree)? {
+            let block = block_tree
+                .block(&block_hash)?
+                .ok_or(BlockTreeError::BlockExpectedButNotFound { block: block_hash })?;
+
+            let proposal = Proposal {
+                chain_id: self.config.chain_id,
+                view: self.view_info.view,
+                block,
+                tc,
+                nec: None,
+            };
+
+            self.broadcast_proposal_as_header(&proposal, true, block_tree);
+
+            Event::Propose(ProposeEvent {
+                timestamp: SystemTime::now(),
+                proposal,
+            })
+            .publish(&self.event_publisher);
+
+            return Ok(());
+        }
+
+        let highest_pc = block_tree.highest_pc()?;
+        match highest_pc.phase {
+            // Produce and broadcast a new Proposal.
+            Phase::Generic | Phase::Decide => {
+                // S470 Piece 2 (proposer exec-backpressure): a leader
+                // whose exec backlog exceeds the watermark yields its
+                // slot instead of producing off a stale executed tip.
+                // Deferred, not abandoned: retried every loop iteration,
+                // so the proposal fires as soon as the backlog drains
+                // (yield-not-starve). Default OFF — see
+                // `should_yield_proposal_for_exec_backpressure`.
+                if self.should_yield_proposal_for_exec_backpressure() {
+                    self.proposal_deferred = true;
+                    return Ok(());
+                }
+                let (parent_block, child_height) = if highest_pc.is_genesis_pc() {
+                    (None, BlockHeight::new(0))
+                } else {
+                    match block_tree.block_height(&highest_pc.block)? {
+                        Some(parent_height) => (Some(highest_pc.block), parent_height + 1),
+                        None => {
+                            // S430: proactively by-hash fetch the missing parent
+                            // instead of waiting for laggy height-range sync.
+                            let validator_set_state = block_tree.validator_set_state()?;
+                            self.request_missing_parent(
+                                highest_pc.block,
+                                highest_pc.view,
+                                &validator_set_state,
+                            );
+                            self.proposal_deferred = true;
+                            return Ok(());
+                        }
+                    }
+                };
+
+                let produce_block_request = ProduceBlockRequest::new(
+                    self.view_info.view,
+                    parent_block,
+                    block_tree.app_view(parent_block.as_ref())?,
+                );
+
+                let ProduceBlockResponse {
+                    data,
+                    data_hash,
+                    app_state_updates,
+                    validator_set_updates,
+                } = app.produce_block(produce_block_request);
+
+                let block = Block::new(child_height, highest_pc, data_hash, data);
+
+                // Proposer self-inserts before broadcasting: ensures the block
+                // is in the tree before QC forms and next view references it.
+                block_tree.insert(
+                    &block,
+                    app_state_updates.as_ref(),
+                    validator_set_updates.as_ref(),
+                )?;
+                Event::InsertBlock(InsertBlockEvent {
+                    timestamp: SystemTime::now(),
+                    block: block.clone(),
+                })
+                .publish(&self.event_publisher);
+
+                let update_result = block_tree.update(&block.justify, &self.event_publisher).unwrap_or_else(|e| {
+                    if let BlockTreeError::BlockExpectedButNotFound { block: missing } = &e {
+                        log::warn!("propose: missing block {:?} in commit chain — triggering sync", missing);
+                        self.sync_needed = true;
+                    } else {
+                        log::warn!("propose: block_tree.update failed after self-insert: {:?}", e);
+                    }
+                    UpdateResult { validator_set_updates: None, committed_block_hashes: vec![] }
+                });
+                self.finish_leader_proposal(
+                    block,
+                    validator_set_updates.is_some(),
+                    update_result,
+                    tc,
+                    block_tree,
+                    app,
+                )?;
+            }
+            // Produce and broadcast a Nudge. Nudges carry no new block and are
+            // exempt from V1 (`safe_nudge` already requires `justify.view ==
+            // v - 1` unless the phase is Commit).
+            Phase::Prepare | Phase::Precommit | Phase::Commit => {
+                let nudge = Nudge {
+                    chain_id: self.config.chain_id,
+                    view: self.view_info.view,
+                    justify: highest_pc,
+                };
+
+                self.sender_handle
+                    .broadcast::<HotStuffMessage>(nudge.clone().into());
+
+                Event::Nudge(NudgeEvent {
+                    timestamp: SystemTime::now(),
+                    nudge,
+                })
+                .publish(&self.event_publisher)
+            }
+        }
         Ok(())
     }
 
@@ -906,6 +935,7 @@ impl<N: Network> HotStuff<N> {
         block: Block,
         has_validator_set_updates: bool,
         update_result: UpdateResult,
+        tc: Option<TimeoutCertificate>,
         block_tree: &mut BlockTreeSingleton<K>,
         app: &mut impl App<K>,
     ) -> Result<(), HotStuffError> {
@@ -922,7 +952,7 @@ impl<N: Network> HotStuff<N> {
             chain_id: self.config.chain_id,
             view: self.view_info.view,
             block,
-            tc: None,
+            tc,
             nec: None,
         };
         self.broadcast_proposal_as_header(&proposal, has_validator_set_updates, block_tree);
@@ -985,6 +1015,14 @@ impl<N: Network> HotStuff<N> {
         has_validator_set_updates: bool,
         block_tree: &BlockTreeSingleton<K>,
     ) {
+        // TC-required phase A: every leader proposal is backed by QC(v-1) or
+        // TC(v-1) (VALIDPROPOSAL V1), even while validators stay lax.
+        debug_assert!(
+            carries_required_certificate(proposal.view, &proposal.block.justify, proposal.tc.as_ref()),
+            "leader proposal for view {} justifies on view {} without TC(v-1)",
+            proposal.view.int(),
+            proposal.block.justify.view.int(),
+        );
         self.pending_bodies
             .insert(proposal.block.hash, proposal.block.clone());
         self.sender_handle
@@ -1015,12 +1053,12 @@ impl<N: Network> HotStuff<N> {
         tc: &crate::pacemaker::types::TimeoutCertificate,
         block_tree: &mut BlockTreeSingleton<K>,
         _app: &mut impl App<K>,
-    ) -> Result<Option<Proposal>, HotStuffError> {
+    ) -> Result<TcProposal, HotStuffError> {
         if tc.high_tip_is_winner {
             if let Some(ref tip) = tc.high_tip {
                 // Case 4: leader has the block — repropose.
                 if let Some(block) = block_tree.block(&tip.block_hash)? {
-                    return Ok(Some(Proposal {
+                    return Ok(TcProposal::Repropose(Proposal {
                         chain_id: self.config.chain_id,
                         view: self.view_info.view,
                         block,
@@ -1093,9 +1131,11 @@ impl<N: Network> HotStuff<N> {
                         validator_set,
                     ),
                 };
+                return Ok(TcProposal::Recovering);
             }
         }
-        Ok(None)
+        // Case 3: the caller extends the high QC and attaches the TC.
+        Ok(TcProposal::HighQcWins)
     }
 
     /// Process a newly received message for the current view according to the HotStuff subprotocol.
@@ -2113,6 +2153,10 @@ impl<N: Network> HotStuff<N> {
                 tc: Some(tc),
                 nec: Some(nec),
             };
+            debug_assert!(
+                carries_required_certificate(proposal.view, &proposal.block.justify, proposal.tc.as_ref()),
+                "NEC proposal without TC(v-1)",
+            );
             self.pending_bodies
                 .insert(proposal.block.hash, proposal.block.clone());
             self.sender_handle
@@ -3809,6 +3853,18 @@ mod body_fetch_rotation_tests {
             "rotation across other validators must exist"
         );
     }
+}
+
+/// What [`HotStuff::create_proposal_based_on_tc`] (MonadBFT Algorithm 4)
+/// decided for a TC-based view.
+enum TcProposal {
+    /// Case 4: the high tip won and its block is held: re-propose it.
+    Repropose(Proposal),
+    /// Case 5: the high tip won and its block is missing: RECOVER started;
+    /// wait for a ProposalResponse or an NEC (leader rule L4).
+    Recovering,
+    /// Case 3: the high QC won; the caller proposes on it with the TC.
+    HighQcWins,
 }
 
 /// Configuration parameters for the [`HotStuff`] struct.
