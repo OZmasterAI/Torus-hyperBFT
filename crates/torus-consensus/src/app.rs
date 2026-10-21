@@ -1657,6 +1657,8 @@ impl LeaderState {
 
 struct ExecutionContext {
     state_db: StateDb,
+    /// Dead-leader skip (A1): the activation hook's config and the installed leader-set cache.
+    leader_skip: crate::leader_skip::LeaderSkipExec,
     validator: BlockValidator,
     evm_executor: EvmExecutor,
     epoch_length: u64,
@@ -7375,6 +7377,9 @@ pub struct TorusApp {
     da_gc_inline: bool,
     /// The worker died (or could not spawn) and that was logged.
     da_gc_dead_logged: bool,
+    /// Dead-leader skip: the chain config whose [`ChainConfig::dead_leader_skip`] hook decides,
+    /// per committed header, whether the commit path writes the block's leader evidence row.
+    leader_skip_config: ChainConfig,
     /// A DA body GC pass at least this long (ns) logs one warn line with its
     /// phases and counts `torus_da_gc_slow_passes` (`TORUS_DA_GC_SLOW_MS`,
     /// default [`crate::da_gc::DA_GC_SLOW_PASS_MS`]; read in
@@ -8342,6 +8347,7 @@ impl TorusApp {
         let genesis_header = torus_bridge::genesis_parent_header_for(config);
         let mut exec_ctx = ExecutionContext {
             state_db: state_db.clone(),
+            leader_skip: crate::leader_skip::LeaderSkipExec::new(config),
             validator: exec_validator,
             evm_executor: EvmExecutor::new(config.chain_id),
             epoch_length: config.epoch_length,
@@ -8719,6 +8725,7 @@ impl TorusApp {
             da_gc_worker: None,
             da_gc_inline: false,
             da_gc_dead_logged: false,
+            leader_skip_config: config.clone(),
             da_gc_slow_pass_nanos: Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::da_gc::DA_GC_SLOW_PASS_MS * 1_000_000,
             )),
@@ -9346,6 +9353,10 @@ impl TorusApp {
             )
             .expect("a one-feature schedule"),
             book_mode: Default::default(),
+            // Dead-leader skip off: these fixtures execute blocks without hotstuff
+            // justify evidence (tests that need it turn it on).
+            leader_miss_threshold: 0,
+            leader_exclusion_cap: torus_types::DEFAULT_LEADER_EXCLUSION_CAP,
         };
         let mut seed = [0u8; 32];
         seed[..8].copy_from_slice(&id.to_le_bytes());
@@ -12530,6 +12541,10 @@ mod exec_throttle_tests {
                 exec_trust_cache: false,
                 activations: Default::default(),
                 book_mode: Default::default(),
+                // Dead-leader skip off: these fixtures execute blocks without hotstuff
+                // justify evidence (tests that need it turn it on).
+                leader_miss_threshold: 0,
+                leader_exclusion_cap: torus_types::DEFAULT_LEADER_EXCLUSION_CAP,
             };
             (config, state_db)
         };
@@ -14231,6 +14246,10 @@ mod crash_recovery_tests {
             // every `make_block` header and the genesis parent header.
             activations: rsh_at(1),
             book_mode: Default::default(),
+            // Dead-leader skip off: these fixtures execute blocks without hotstuff
+            // justify evidence (tests that need it turn it on).
+            leader_miss_threshold: 0,
+            leader_exclusion_cap: torus_types::DEFAULT_LEADER_EXCLUSION_CAP,
         };
         // P0.0 phase 3: what execution writes before block 1 (with it in
         // place, block 1 needs no pipeline barrier).
@@ -15778,7 +15797,7 @@ mod crash_recovery_tests {
             }
             let datum = bincode::serialize(&make_block(1, vec![])).unwrap();
             let committed = Block::new(
-                BlockHeight::new(1),
+                hotstuff_rs::types::data_types::BlockHeight::new(1),
                 PhaseCertificate::genesis_pc(),
                 CryptoHash::new(TorusApp::hash_datum(&datum)),
                 Data::new(vec![Datum::new(datum)]),
@@ -15953,6 +15972,276 @@ mod crash_recovery_tests {
         dispatch_and_execute(&ctx, &db, &blocks[3]);
         assert!(app.epoch_validator_set_updates(8).is_ok(), "applied 4: plan for 8 readable");
         drop(ctx);
+    }
+
+    // ---- dead-leader skip, phase 2 (docs/plans/dead-leader-skip.md: A1-A3 at execution,
+    // the exclusion delta at the boundary) ----
+
+    fn dls_vk(n: u8) -> VerifyingKey {
+        ed25519_dalek::SigningKey::from_bytes(&[n; 32]).verifying_key()
+    }
+
+    /// The fixture's installed set as hotstuff runs it, and each key's address.
+    fn dls_hs_set() -> (
+        hotstuff_rs::types::validator_set::ValidatorSet,
+        std::collections::HashMap<VerifyingKey, [u8; 20]>,
+    ) {
+        let mut set = hotstuff_rs::types::validator_set::ValidatorSet::new();
+        let mut map = std::collections::HashMap::new();
+        for n in 1..=4u8 {
+            set.put(&dls_vk(n), Power::new(100));
+            map.insert(dls_vk(n), [n; 20]);
+        }
+        (set, map)
+    }
+
+    /// The leader of `view` over the fixture's set (equal powers: position `view % 4`).
+    fn dls_leader(view: u64) -> VerifyingKey {
+        hotstuff_rs::pacemaker::select_leader(
+            hotstuff_rs::types::data_types::ViewNumber::new(view),
+            &dls_hs_set().0,
+        )
+    }
+
+    /// Dead-leader skip ON (K = 3, cap 6), epoch length 4, installed (genesis) set =
+    /// validators 1..=4 at equal power.
+    fn dls_fixture() -> (ChainConfig, StateDb) {
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 4;
+        config.leader_miss_threshold = 3;
+        let set = ValidatorSet {
+            validators: (1..=4u8)
+                .map(|n| torus_types::ValidatorInfo {
+                    address: Address::new([n; 20]),
+                    pubkey: torus_types::PublicKey(dls_vk(n).to_bytes()),
+                    power: 100,
+                    commission_bps: 0,
+                })
+                .collect(),
+            epoch: 0,
+        };
+        StakingManager::new(db.clone())
+            .record_genesis_epoch_set(&set)
+            .unwrap();
+        (config, db)
+    }
+
+    /// The fixture chain's justify QC of block `h`: block 1 on the genesis QC, block h >= 2
+    /// certifies the (h-1)-th view of 1.. that is not 3 mod 4. The owner of those slots
+    /// (`dls_leader(3)`) is dead: it never proposes and never signs.
+    fn dls_evidence(h: u64) -> crate::leader_skip::LeaderEvidence {
+        use crate::leader_skip::{LeaderEvidence, QC_GENERIC, QC_GENESIS};
+        if h == 1 {
+            return LeaderEvidence {
+                view: 0,
+                phase: QC_GENESIS,
+                signers: vec![],
+            };
+        }
+        let (set, _) = dls_hs_set();
+        let dead = dls_leader(3);
+        LeaderEvidence {
+            view: (1u64..).filter(|v| v % 4 != 3).nth((h - 2) as usize).unwrap(),
+            phase: QC_GENERIC,
+            signers: set.validators().map(|v| *v != dead).collect(),
+        }
+    }
+
+    /// The hashed leader-statistics and epoch-plan rows.
+    fn dls_rows(db: &StateDb) -> Vec<(Vec<u8>, Vec<u8>)> {
+        StateBackend::iterate_cf(db, CF_CONSENSUS_META, None)
+            .unwrap()
+            .into_iter()
+            .filter(|(k, _)| k.starts_with(b"leader_stats:") || k.starts_with(b"epoch_vset:"))
+            .collect()
+    }
+
+    fn dls_evidence_rows(db: &StateDb) -> usize {
+        StateBackend::iterate_cf(db, CF_CONSENSUS_META, None)
+            .unwrap()
+            .into_iter()
+            .filter(|(k, _)| k.starts_with(crate::leader_skip::LEADER_QC_PREFIX))
+            .count()
+    }
+
+    /// Execute heights `from..=to` live (evidence written at "commit", then executed).
+    fn dls_execute(ctx: &ExecutionContext, db: &StateDb, from: u64, to: u64) {
+        for h in from..=to {
+            crate::leader_skip::persist_leader_evidence(db, h, &dls_evidence(h)).unwrap();
+            ctx.execute_committed_block(&make_block(h, vec![]), vec![]);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "height {h} fail-stopped");
+        }
+    }
+
+    /// Commit heights `from..=to` without executing them (evidence + durable header/body), as a
+    /// crash before execution leaves them; the boot replay executes them.
+    fn dls_commit_only(db: &StateDb, from: u64, to: u64) {
+        for h in from..=to {
+            crate::leader_skip::persist_leader_evidence(db, h, &dls_evidence(h)).unwrap();
+            persist_block_for_test(db, &make_block(h, vec![]));
+        }
+    }
+
+    /// Determinism + A1/A2 end to end: the dead validator's slots (views 3, 7, 11) are missed in
+    /// blocks 4, 7 and 10; boundary 12 writes its exclusion for 16, boundary 16 installs it.
+    /// Serial execution, a full crash replay and a crash replay of the second half write
+    /// byte-identical hashed rows; every evidence row is deleted with its block.
+    #[test]
+    fn dead_leader_rows_identical_serial_and_crash_replay() {
+        let dead = dls_hs_set().1[&dls_leader(3)];
+
+        let (config, serial) = dls_fixture();
+        let ctx = make_exec_ctx(&config, &serial);
+        dls_execute(&ctx, &serial, 1, 16);
+        drop(ctx);
+
+        let (config, replayed) = dls_fixture();
+        dls_commit_only(&replayed, 1, 16);
+        let ctx = make_exec_ctx(&config, &replayed);
+        let (last, parked) = TorusApp::replay_committed(&replayed, &ctx);
+        assert_eq!((last.height, parked), (16, None));
+        drop(ctx);
+
+        let (config, half) = dls_fixture();
+        let ctx = make_exec_ctx(&config, &half);
+        dls_execute(&ctx, &half, 1, 8);
+        drop(ctx);
+        dls_commit_only(&half, 9, 16);
+        let ctx = make_exec_ctx(&config, &half);
+        let (last, _) = TorusApp::replay_committed(&half, &ctx);
+        assert_eq!(last.height, 16);
+        drop(ctx);
+
+        let rows = dls_rows(&serial);
+        assert_eq!(rows, dls_rows(&replayed), "full replay");
+        assert_eq!(rows, dls_rows(&half), "replay of 9..=16");
+        for db in [&serial, &replayed, &half] {
+            assert_eq!(dls_evidence_rows(db), 0, "evidence rows go with their block");
+            let installed: Vec<[u8; 20]> =
+                torus_economics::leader_stats::installed_leader_exclusions(db)
+                    .unwrap()
+                    .iter()
+                    .map(|m| m.address)
+                    .collect();
+            assert_eq!(installed, vec![dead], "excluded from 16 on");
+        }
+        let plan16 = torus_economics::leader_stats::leader_exclusion_plan(&serial, 16)
+            .unwrap()
+            .expect("written by boundary 12");
+        assert_eq!(plan16.exclude, vec![dls_leader(3).to_bytes()]);
+    }
+
+    /// K is not reached by two misses: blocks 1..=8 miss the dead slot twice (views 3, 7): no
+    /// exclusion plan by boundary 8.
+    #[test]
+    fn dead_leader_two_misses_plan_nothing() {
+        let (config, db) = dls_fixture();
+        let ctx = make_exec_ctx(&config, &db);
+        dls_execute(&ctx, &db, 1, 8);
+        let dead = dls_hs_set().1[&dls_leader(3)];
+        let st = torus_economics::leader_stats::leader_stats(&db, &dead).unwrap();
+        assert_eq!(st.miss_run, 2);
+        assert_eq!(
+            torus_economics::leader_stats::leader_exclusion_plan(&db, 12).unwrap(),
+            None
+        );
+    }
+
+    /// With the feature on, a committed height without its evidence row is never guessed:
+    /// execution fail-stops before applying it. Off, the same block executes.
+    #[test]
+    fn dead_leader_missing_evidence_fail_stops() {
+        let (config, db) = dls_fixture();
+        let ctx = make_exec_ctx(&config, &db);
+        ctx.execute_committed_block(&make_block(1, vec![]), vec![]);
+        assert!(ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(read_native_applied_height(&db), None);
+
+        let (mut config, db) = dls_fixture();
+        config.leader_miss_threshold = 0;
+        let ctx = make_exec_ctx(&config, &db);
+        ctx.execute_committed_block(&make_block(1, vec![]), vec![]);
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(read_native_applied_height(&db), Some(1));
+        assert!(dls_rows(&db).iter().all(|(k, _)| !k.starts_with(b"leader_stats:")));
+    }
+
+    /// The commit path writes the justify QC's evidence row before dispatching the block (on),
+    /// and nothing with the feature off.
+    #[test]
+    fn dead_leader_commit_writes_the_evidence_row() {
+        for on in [true, false] {
+            let (mut config, db) = dls_fixture();
+            if !on {
+                config.leader_miss_threshold = 0;
+            }
+            let mut app = TorusApp::new(db.clone(), &config, None, None, None);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+            app.replace_exec_tx(tx);
+            let block = make_block(1, vec![]);
+            let datum = bincode::serialize(&block).unwrap();
+            let committed = Block::new(
+                BlockHeight::new(1),
+                PhaseCertificate::genesis_pc(),
+                CryptoHash::new(TorusApp::hash_datum(&datum)),
+                Data::new(vec![Datum::new(datum)]),
+            );
+            app.on_committed_block(&committed, committed.hash);
+            let row = db
+                .get_cf_raw(CF_CONSENSUS_META, &crate::leader_skip::leader_qc_key(1))
+                .unwrap();
+            if on {
+                let ev: crate::leader_skip::LeaderEvidence =
+                    borsh::from_slice(&row.expect("evidence row written at commit")).unwrap();
+                assert_eq!(ev, dls_evidence(1));
+            } else {
+                assert_eq!(row, None, "off: no row");
+            }
+            drop(rx);
+        }
+    }
+
+    /// A4 (consensus side): the boundary's validator-set updates carry the exclusion delta of
+    /// the plan execution wrote for it (members unchanged: an exclusion-only update), and no
+    /// update without one (byte-identical to before).
+    #[test]
+    fn boundary_updates_carry_the_leader_exclusion_delta() {
+        let (config, db) = dls_fixture();
+        let mut app = TorusApp::new(db.clone(), &config, None, None, None);
+        EpochManager::execute_planned_rotation(&StakingManager::new(db.clone()), 4, 4, 4, None)
+            .unwrap();
+        write_native_applied_height(&db, 4);
+        assert!(matches!(app.epoch_validator_set_updates(8), Ok(None)));
+
+        torus_economics::leader_stats::put_leader_exclusion_plan(
+            &db,
+            &torus_economics::leader_stats::LeaderExclusionPlan {
+                boundary: 8,
+                excluded: vec![torus_economics::leader_stats::ExcludedMember {
+                    address: [2; 20],
+                    pubkey: dls_vk(2).to_bytes(),
+                }],
+                exclude: vec![dls_vk(2).to_bytes()],
+                readmit: vec![dls_vk(3).to_bytes()],
+            },
+        )
+        .unwrap();
+        app.cached_vs_updates = None;
+        let updates = match app.epoch_validator_set_updates(8) {
+            Ok(Some(u)) => u,
+            Ok(None) => panic!("expected the exclusion delta, got no update"),
+            Err(_) => panic!("expected the exclusion delta, got plan-not-ready"),
+        };
+        assert_eq!(updates.inserts().count(), 0);
+        assert_eq!(updates.deletes().count(), 0);
+        assert_eq!(
+            updates.leader_excludes().copied().collect::<Vec<_>>(),
+            vec![dls_vk(2)]
+        );
+        assert_eq!(
+            updates.leader_readmits().copied().collect::<Vec<_>>(),
+            vec![dls_vk(3)]
+        );
     }
 
     /// PART 2 (P0 SAFETY, "commit means commit"): a SECOND, DIFFERENT block
@@ -18016,6 +18305,7 @@ mod crash_recovery_tests {
     ) -> ExecutionContext {
         ExecutionContext {
             state_db: state_db.clone(),
+            leader_skip: crate::leader_skip::LeaderSkipExec::new(config),
             validator: BlockValidator::new(
                 config.chain_id,
                 config.epoch_length,

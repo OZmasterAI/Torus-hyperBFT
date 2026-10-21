@@ -80,6 +80,9 @@ fn test_config() -> ChainConfig {
         exec_trust_cache: false,
         activations: Default::default(),
         book_mode: Default::default(),
+        // Dead-leader skip off: this test drives execution without hotstuff blocks.
+        leader_miss_threshold: 0,
+        leader_exclusion_cap: torus_types::DEFAULT_LEADER_EXCLUSION_CAP,
     }
 }
 

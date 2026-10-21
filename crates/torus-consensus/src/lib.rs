@@ -15,6 +15,7 @@ pub mod exec_pipeline;
 pub(crate) mod feature_status;
 pub mod genesis;
 pub mod kv_store;
+pub mod leader_skip;
 pub mod network;
 pub mod shard_recovery;
 pub mod slashing;

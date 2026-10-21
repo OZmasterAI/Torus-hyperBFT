@@ -476,6 +476,8 @@ fn default_chain_config() -> ChainConfig {
         )
         .expect("the default genesis set never conflicts with the built-in table"),
         book_mode: Default::default(),
+        leader_miss_threshold: torus_types::DEFAULT_LEADER_MISS_THRESHOLD,
+        leader_exclusion_cap: torus_types::DEFAULT_LEADER_EXCLUSION_CAP,
     }
 }
 
