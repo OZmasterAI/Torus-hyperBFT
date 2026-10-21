@@ -74,6 +74,45 @@ def src_between(path, start, end, include_end=True):
     return s[a : b + (len(end) if include_end else 0)]
 
 
+# ------------------------------------------------------------------ run-cell.sh schedstat / procstat snapshot
+class SnapshotBlankPidTest(unittest.TestCase):
+    """9k smoke K (2026-10-22): after a no-restart kill the pids file has a blank line; schedstat_snapshot read
+    /proc//stat (= /proc/stat, 11 fields) and `${f[11]}` aborted run-cell.sh under `set -u` before 'bench exited'"""
+
+    def run_snapshot(self, *pids):
+        fn = src_between(RUN_CELL_SH, "schedstat_snapshot() {", "\n}\n")
+        d = tempfile.mkdtemp(prefix="knr-snap-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        script = (
+            "set -uo pipefail\nOUT=%s\nSCHED_THREADS='hotstuff-algo'\n"
+            "find_tid() { return 1; }\n%s\nschedstat_snapshot bench_end \"$@\"\necho DONE\n" % (d, fn)
+        )
+        r = subprocess.run(["bash", "-c", script, "_", *pids], capture_output=True, text=True, timeout=30)
+        with open(os.path.join(d, "schedstat.raw")) as f:
+            sched = f.read()
+        proc = ""
+        if os.path.exists(os.path.join(d, "procstat.raw")):
+            with open(os.path.join(d, "procstat.raw")) as f:
+                proc = f.read()
+        return r, sched, proc
+
+    def test_blank_pid_of_the_killed_node_is_skipped(self):
+        me = str(os.getpid())
+        r, sched, proc = self.run_snapshot(me, me, "")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("DONE", r.stdout)
+        self.assertIn("bench_end val2 main -", sched)
+        self.assertIn("bench_end val2 hotstuff-algo -", sched)
+        self.assertNotIn(" val2 ", proc)
+        self.assertEqual(len(proc.splitlines()), 2)  # val0 and val1 utime / stime only
+
+    def test_live_pids_unchanged(self):
+        me = str(os.getpid())
+        r, sched, proc = self.run_snapshot(me, me, me)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(proc.splitlines()), 3)
+
+
 # ------------------------------------------------------------------ crash-kill.sh library
 class QuorumAndPidLineTest(unittest.TestCase):
     def quorum(self, idx, stakes):
