@@ -889,6 +889,12 @@ pub struct Metrics {
     /// a flush worker could take. drain + write == `exec_save_books_seconds`
     /// to rounding.
     pub exec_save_books_write_seconds: Histogram,
+    /// b1 (`docs/plans/deep-book-save-options.md` section 4): the part of
+    /// `exec_save_books_write_seconds` the flush worker ran: pass 2 of a
+    /// deferred book save (book modes 2 / 3, pipelined, resident books),
+    /// one observation per deferred block, on a per-block `Flush` or a
+    /// checkpoint-window `Digest`. E's share is the total minus this.
+    pub flush_worker_save_books_write_seconds: Histogram,
     /// Native (loaded) blocks executed. Empty blocks in a window =
     /// `exec_block_seconds_count - exec_native_blocks_total`, which splits
     /// blk/s into native vs empty cadence.
@@ -2926,6 +2932,14 @@ impl Metrics {
             exec_save_books_write_seconds.clone(),
         );
 
+        let flush_worker_save_books_write_seconds =
+            Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_flush_worker_save_books_write_seconds",
+            "b1: save_books pass 2 run on the flush worker (deferred book save, modes 2/3), per deferred block",
+            flush_worker_save_books_write_seconds.clone(),
+        );
+
         let exec_native_blocks = Counter::default();
         registry.register(
             "torus_exec_native_blocks",
@@ -3468,6 +3482,7 @@ impl Metrics {
             order_age_future_nonce,
             exec_save_books_drain_seconds,
             exec_save_books_write_seconds,
+            flush_worker_save_books_write_seconds,
             exec_native_blocks,
             rocksdb,
             rocksdb_consensus,
@@ -4233,6 +4248,7 @@ mod tests {
             "torus_exec_checkpoint_db_write_end_ms",
             "torus_exec_save_books_drain_seconds",
             "torus_exec_save_books_write_seconds",
+            "torus_flush_worker_save_books_write_seconds",
             "torus_exec_native_blocks",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");

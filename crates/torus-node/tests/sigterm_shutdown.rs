@@ -526,29 +526,87 @@ fn explicit_zero_interval_keeps_the_per_block_flush() {
     assert_graceful_stop(&mut node, libc::SIGTERM, "SIGTERM");
 }
 
-/// A deferred book mode (genesis `consensus.book_mode` = mode 3) cannot run
-/// with checkpoints (owner s109, task 1.2). With the interval unset the
-/// compiled default yields (per-block flush, a warning) instead of refusing
-/// to start; an explicit interval still refuses.
+/// b0 / b1 (docs/plans/deep-book-save-options.md section 4): book mode 3
+/// (genesis `consensus.book_mode` = `level_authority_chunked`) runs with
+/// checkpoints: with an interval its book save's write half runs on the
+/// flush worker in each block's digest (b1). With the interval unset the
+/// compiled default (15 s on validators) applies to it.
 #[test]
-fn env_unset_interval_yields_to_a_deferred_book_mode() {
+fn env_unset_interval_runs_checkpoints_with_book_mode_3() {
     let work = tempfile::tempdir().unwrap();
-    let genesis = write_genesis(work.path());
-    let mut g: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&genesis).unwrap()).unwrap();
-    g["consensus"]["book_mode"] = serde_json::json!("level_authority_chunked");
-    std::fs::write(&genesis, serde_json::to_vec_pretty(&g).unwrap()).unwrap();
+    let genesis = write_genesis_book_mode_3(work.path());
     let mut node = Node::start(work.path(), &genesis, "a");
     node.wait_executed_above(MIN_BLOCKS);
     let log = node.log_text();
     assert!(
-        !log.contains("coalesced state checkpoints ON"),
-        "a deferred book mode must not run checkpoints:\n{}",
+        log.contains("coalesced state checkpoints ON") && log.contains("interval: Some(15s)"),
+        "book mode 3 must run the compiled default 15 s checkpoints:\n{}",
         node.tail()
     );
     assert!(
-        log.contains("compiled default checkpoint interval is off"),
-        "the yield must be logged:\n{}",
+        !log.contains("compiled default checkpoint interval is off"),
+        "the default must not yield to book mode 3 any more:\n{}",
+        node.tail()
+    );
+    assert_graceful_stop(&mut node, libc::SIGTERM, "SIGTERM");
+}
+
+/// [`write_genesis`] with the chain's book mode 3 (genesis
+/// `consensus.book_mode` = `level_authority_chunked`, s131).
+fn write_genesis_book_mode_3(dir: &Path) -> PathBuf {
+    let genesis = write_genesis(dir);
+    let mut g: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&genesis).unwrap()).unwrap();
+    g["consensus"]["book_mode"] = serde_json::json!("level_authority_chunked");
+    std::fs::write(&genesis, serde_json::to_vec_pretty(&g).unwrap()).unwrap();
+    genesis
+}
+
+/// b0: book mode 3 (genesis) with an explicit `TORUS_CHECKPOINT_INTERVAL_MS`
+/// starts (no refusal, no fail-stop). A SIGKILL mid-window (blocks above the
+/// durable marker lost) restarts: the node replays from the marker, its
+/// books load and pass boot verify, and it executes past the crash height.
+#[test]
+fn book_mode_3_with_explicit_interval_starts_and_survives_a_crash() {
+    const ENV: &[(&str, &str)] = &[("TORUS_CHECKPOINT_INTERVAL_MS", "15000")];
+    let work = tempfile::tempdir().unwrap();
+    let genesis = write_genesis_book_mode_3(work.path());
+    let data = work.path().join("data");
+
+    let mut node = Node::start_env(work.path(), &genesis, "a", ENV);
+    node.wait_executed_above(MIN_BLOCKS);
+    let log = node.log_text();
+    assert!(
+        log.contains("coalesced state checkpoints ON") && log.contains("interval: Some(15s)"),
+        "book mode 3 + explicit interval must run checkpoints:\n{}",
+        node.tail()
+    );
+    assert!(
+        !log.contains("needs a non-deferred book mode"),
+        "refused:\n{}",
+        node.tail()
+    );
+    node.signal(libc::SIGKILL);
+    let _ = node.wait_exit(STOP_BOUND);
+    let executed = node.executed_height().unwrap();
+    drop(node);
+    let durable = durable_marker(&data);
+    assert!(
+        durable <= executed,
+        "durable {durable} > executed {executed}"
+    );
+
+    let mut node = Node::start_env(work.path(), &genesis, "b", ENV);
+    node.wait_executed_above(executed);
+    let log = node.log_text();
+    assert!(
+        !log.contains("FATAL"),
+        "restart after a crash fail-stopped:\n{}",
+        node.tail()
+    );
+    assert!(
+        !log.contains("initializing from genesis"),
+        "restart re-ran genesis:\n{}",
         node.tail()
     );
     assert_graceful_stop(&mut node, libc::SIGTERM, "SIGTERM");
