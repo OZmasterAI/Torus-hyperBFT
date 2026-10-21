@@ -58,6 +58,12 @@ fn exec(ctx: &mut NativeExecContext<NativeStateOverlay>, batch: &[(Address, Nati
 fn addr(n: u8) -> Address {
     Address::new([n; 20])
 }
+/// A distinct trader per block number (beyond `addr`'s 255).
+fn block_trader(h: u64) -> Address {
+    let mut bytes = [0xBB; 20];
+    bytes[..8].copy_from_slice(&h.to_be_bytes());
+    Address::new(bytes)
+}
 fn fp(v: i64) -> FixedPoint {
     FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
 }
@@ -198,17 +204,20 @@ fn savebooks_deep_book_accumulate() {
     for h in 1..=500u64 {
         let ov = NativeStateOverlay::new(db.clone());
         let mut ctx = make_ctx(ov.clone(), h, &mut holder);
-        if h == 1 {
-            fund(&ctx, &addr(1), fp(1_000_000_000_000));
-        }
+        // One fresh trader per block: 400 orders each, under the 1000
+        // per-user open-order limit (one trader for every block hit it at
+        // block 3).
+        let who = block_trader(h);
+        fund(&ctx, &who, fp(1_000_000_000_000));
         // 40 bids/market at fixed prices (300..339) — never cross, always rest.
         let mut batch = Vec::with_capacity(400);
         for m in 1..=N_MARKETS {
             for lvl in 0..LEVELS {
-                batch.push(place(addr(1), gtc(m, true, 300 + lvl, 1)));
+                batch.push(place(who, gtc(m, true, 300 + lvl, 1)));
             }
         }
         exec(&mut ctx, &batch);
+        assert_eq!(ctx.resting_order_count() as u64, h * 400, "block {h}: resting depth");
         let take = sample.contains(&h);
         ctx.collect_save_timings = take;
         let t = Instant::now();
@@ -360,8 +369,11 @@ fn savebooks_levelcache_ab() {
                             ((m - 1) as u128) * (LEVELS as u128) * (DEPTH as u128)
                                 + (lvl as u128) * (DEPTH as u128)
                                 + 1;
+                        // The seed rotates the trader every 100 orders
+                        // within a market: the front order's owner.
+                        let owner = addr((lvl as usize * DEPTH / 100) as u8 + 1);
                         batch.push((
-                            addr(1),
+                            owner,
                             torus_types::NativeAction::ModifyOrder {
                                 order_id: front_id,
                                 new_price: None,
