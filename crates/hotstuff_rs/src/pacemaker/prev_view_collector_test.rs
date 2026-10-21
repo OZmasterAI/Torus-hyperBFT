@@ -63,13 +63,18 @@ struct Fixture {
 /// Four validators of power 1 (quorum 3, f = 1); the local replica is the
 /// fourth, at `init_view`.
 fn fixture(init_view: u64) -> Fixture {
+    fixture_with_epoch_length(init_view, 100_000)
+}
+
+/// [`fixture`] with epoch-change views every `epoch_length` views.
+fn fixture_with_epoch_length(init_view: u64, epoch_length: u32) -> Fixture {
     let keys = signing_keys(&[1, 2, 3, 4]);
     let set = validator_set(&keys);
     let (tree, vss) = steady_block_tree(&set);
     let config = PacemakerConfiguration {
         chain_id: CHAIN,
         keypair: Keypair::new(keys[3].clone()),
-        epoch_length: EpochLength::new(100_000),
+        epoch_length: EpochLength::new(epoch_length),
         max_view_time: Duration::from_millis(500),
         backoff_factor: 2,
         backoff_cap: 8,
@@ -232,4 +237,63 @@ fn a_timeout_vote_with_a_correct_high_qc_is_collected() {
     f.timeout_vote_with_qc(2, 5, None);
     let tc = f.tree.highest_tc().unwrap().expect("TC(5)");
     assert!(tc.high_qc.as_ref() == Some(&honest));
+}
+
+// ---------------------------------------------------------------------------
+// Found in phase B (phase-A bug): a TC for the view just left (C3), collected
+// after entering view v, went out in an AdvanceView that marked v as "already
+// advanced" (`last_advance_view = v`). When TC(v) then formed, no AdvanceView
+// carried it, and nothing else calls `update_view(v + 1)` for a TC: in an
+// epoch-change view (which extends on timeout instead of advancing) every
+// replica stayed in v with TC(v) in hand. Seen as the 2:2:1 / 4x1 one-down
+// clusters and the VSU test wedging at view 50 (DEFAULT_EPOCH_LENGTH) when
+// they were slow enough to reach it.
+//
+// RED-first: on 42d94443 no AdvanceView with TC(6) is broadcast and the
+// replica stays in view 6.
+// ---------------------------------------------------------------------------
+
+impl RecordingNetwork {
+    fn advance_views_sent(&self) -> Vec<AdvanceView> {
+        use crate::networking::messages::ProgressMessage;
+        self.broadcasts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|m| match m {
+                Message::ProgressMessage(ProgressMessage::PacemakerMessage(PacemakerMessage::AdvanceView(av))) => {
+                    Some(av.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+#[test]
+fn a_previous_view_tc_does_not_stop_the_current_view_tc_from_advancing() {
+    // View 6 is an epoch-change view: on timeout it extends, so only a TC(6)
+    // (through an AdvanceView) moves the replica to 7.
+    let mut f = fixture_with_epoch_length(5, 6);
+    f.enter(6);
+    for i in 0..3 {
+        f.timeout_vote(i, 5);
+    }
+    assert_eq!(f.highest_tc_view(), Some(5), "TC(5) from the previous-view collector");
+    for i in 0..3 {
+        f.timeout_vote(i, 6);
+    }
+    assert_eq!(f.highest_tc_view(), Some(6), "TC(6) collected");
+    let tc6 = f
+        .net
+        .advance_views_sent()
+        .into_iter()
+        .find(|av| av.progress_certificate.view() == ViewNumber::new(6))
+        .expect("an AdvanceView carrying TC(6) must be broadcast");
+    // Its loopback copy moves this replica on.
+    let me = f.keys[3].verifying_key();
+    f.pacemaker
+        .on_receive_msg(PacemakerMessage::AdvanceView(tc6), &me, &mut f.tree)
+        .unwrap();
+    assert_eq!(f.pacemaker.query().view, ViewNumber::new(7), "TC(6) must move the replica out of view 6");
 }
