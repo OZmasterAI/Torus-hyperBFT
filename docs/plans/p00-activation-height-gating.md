@@ -264,4 +264,22 @@ Each phase lands on its own branch with RED-first tests and full gates; each one
    Live P0.0 paths do not reach it (an old binary refuses insertion at H, so nothing commits after its
    fail-stop), but any execution fail-stop that a commit outruns before the process exits does.
 6. **Ops** (~0.5-1 d): features gauge, RPC schedule listing, upgrade runbook.
+   Built s134 on `feat/p00-phase6` (from phase 5 342aa460). Gauges (`crates/torus-consensus/src/feature_status.rs`):
+   `torus_feature_active{feature,id}` per known feature from the last applied header's bits (execution
+   runs by the header, so it follows the header, not the schedule), `torus_feature_activation_height{feature,id}`
+   per scheduled feature, `torus_feature_next_activation_height` (0 = none) and
+   `torus_feature_blocks_until_activation` (-1 = none) from `ActivationSchedule::next_activation_after`
+   at the applied height; set at boot from the last replayed header and after each applied block
+   (`FeatureMonitor`, gauges resolved once). `UPGRADE REQUIRED`: `torus_upgrade_required` = 1 (until the
+   restart), `_feature` / `_height` = the lowest height met and its lowest unknown id (later blocks above it
+   do not move it; a single faulty proposer's fake bit can also set it, the runbook says what a real
+   upgrade looks like), `torus_upgrade_required_refusals_total{site}` (`vote`, `insert` only for a datum
+   bound to its block, `propose`, `execute`; an execute fail-stop exits the process with 70 within 250 ms,
+   so the live signal is the vote / insert one). RPC `torus_getFeatureSchedule` (cheap read, no state read):
+   chain id, latest served height, `activeBits` at it, `knownBits` / `knownFeatures`, `schedule[]` (name, id,
+   bit, activationHeight, active, builtIn), next activation / blocks until it, `upgradeRequired` from the
+   gauges. Runbook: `docs/node-operator-guide.md`, "Feature activations and upgrades"; metrics in
+   `docs/monitoring-setup.md`; alerts `UpgradeRequired`, `FeatureActivationApproaching`
+   (`monitoring/alerts/consensus.yml`). Tests: unit (types, telemetry, feature_status, app boot / exec /
+   vote / propose), RPC (builder + over JSON-RPC), cluster tests 2 and 3c assert the old node's gauges.
 7. **Governance `ScheduleActivation`** (before mainnet, 3-4 d) through `EpochRotationPlan`.
