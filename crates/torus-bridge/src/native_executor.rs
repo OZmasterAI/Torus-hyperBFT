@@ -5627,6 +5627,11 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     pub evm_fee_window: Option<torus_types::EvmHeaderValues>,
     /// Item 7 step 2 (F3): this block's EVM gas, `(small lane, big lane)`.
     pub evm_gas: (u64, u64),
+    /// P0.0 phase 2: the feature bits of the executed block's header (set by
+    /// the block pipeline; 0 = none). Execution gates a feature on these bits
+    /// ([`Self::feature_active`]), never on node config, so replay runs each
+    /// height under the rules it was agreed under.
+    pub features: u128,
 
     /// T1.5: set (never cleared) when a market worker panicked mid-matching.
     /// The panicking worker consumed its market's `OrderBook`, so this block's
@@ -5883,6 +5888,12 @@ pub struct SaveTimings {
 }
 
 impl<T: StateBackend> NativeExecContext<T> {
+    /// P0.0 phase 2: whether `feature` is active in the executed block (its
+    /// header's bits, [`Self::features`]).
+    pub fn feature_active(&self, feature: torus_types::Feature) -> bool {
+        self.features & feature.bit() != 0
+    }
+
     /// Create a new execution context from a state backend and block metadata.
     /// Book persistence mode = the process's mode ([`book_mode`]: the chain's
     /// genesis mode on a node; default Classic).
@@ -6237,6 +6248,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             liq_value_sum: false,
             evm_fee_window: None,
             evm_gas: (0, 0),
+            features: 0,
             fatal_error: load_error,
             reader_fault: std::sync::OnceLock::new(),
             book_mode,

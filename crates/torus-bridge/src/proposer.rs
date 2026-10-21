@@ -30,6 +30,8 @@ pub struct BlockProposer {
     #[allow(dead_code)]
     dev_pool_address: Address,
     pub metrics: Option<std::sync::Arc<torus_telemetry::Metrics>>,
+    /// P0.0: the schedule the header `features` bits come from.
+    activations: torus_types::ActivationSchedule,
 }
 
 impl BlockProposer {
@@ -47,7 +49,14 @@ impl BlockProposer {
             treasury_address,
             dev_pool_address,
             metrics: None,
+            activations: torus_types::ActivationSchedule::default(),
         }
+    }
+
+    /// P0.0: build headers with the feature bits of `activations` (default: none).
+    pub fn with_activations(mut self, activations: torus_types::ActivationSchedule) -> Self {
+        self.activations = activations;
+        self
     }
 
     /// Build a block from the given EVM transactions.
@@ -85,13 +94,15 @@ impl BlockProposer {
         let decoded_txs = decode_all_txs(&evm_transactions)?;
         let tx_envs: Vec<_> = decoded_txs.iter().map(|d| d.tx_env.clone()).collect();
 
-        // 3. Build block environment.
+        // 3. Build block environment. P0.0 phase 2: at the bits this header carries.
+        let features = self.activations.active_at(block_height);
         let block_cfg = BlockEnvCfg {
             number: block_height,
             timestamp,
             beneficiary: proposer,
             gas_limit,
             base_fee: next_base_fee,
+            features,
         };
 
         // 4. Execute EVM transactions (skip invalid — don't abort block for one bad tx).
@@ -162,6 +173,8 @@ impl BlockProposer {
                     self.epoch_length,
                 ),
                 validator_set_hash: parent.validator_set_hash,
+                // P0.0: the bits validators require at this height.
+                features,
                 sig_attestation: [0u8; 64],
             },
             native_actions: vec![],
@@ -215,6 +228,7 @@ pub fn genesis_parent_header(evm_gas_limit: u64, evm_block_interval: u64) -> Tor
         big_base_fee_per_gas: torus_types::EVM_MIN_BASE_FEE, // 1 gwei, like the small lane
         epoch: 0,
         validator_set_hash: B256::ZERO,
+        features: 0,
         sig_attestation: [0u8; 64],
     }
 }
@@ -225,6 +239,9 @@ pub fn genesis_parent_header_for(config: &torus_types::ChainConfig) -> TorusBloc
     let mut header = genesis_parent_header(config.evm_gas_limit, config.evm_block_interval);
     header.evm_big_block_interval = config.evm_big_block_interval;
     header.evm_big_gas_limit = config.evm_big_gas_limit;
+    // P0.0: block 1's bits (features at 0 or 1), so another genesis set fails
+    // block 1's parent link.
+    header.features = config.activations.active_at(0);
     header
 }
 

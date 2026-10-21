@@ -107,6 +107,7 @@ async fn bare_eth_call_succeeds_at_height_with_base_fee() {
         big_base_fee_per_gas: 1_000_000_000,
         epoch: 0,
         validator_set_hash: alloy_primitives::B256::ZERO,
+        features: 0,
         sig_attestation: [0u8; 64],
     };
     let canonical = header.canonical_header_bytes();
@@ -411,6 +412,7 @@ fn store_head(state: &StateDb, h: Head) {
         big_base_fee_per_gas: h.big_base_fee,
         epoch: 0,
         validator_set_hash: alloy_primitives::B256::ZERO,
+        features: 0,
         sig_attestation: [0u8; 64],
     };
     let block_hash = alloy_primitives::keccak256(header.canonical_header_bytes());
@@ -1098,4 +1100,64 @@ async fn block_gas_limit_is_the_heights_cap() {
         assert_eq!(block["gasLimit"], hex_u64(cap), "height {height}");
     }
     handle.stop().unwrap();
+}
+
+/// P0.0 phase 2: eth_estimateGas (and eth_call) simulate at the EVM spec of
+/// the feature bits expected at the height above the eth head (here a rule
+/// moving to Prague with bit 0). Head 1: with the feature at 3, height 2 runs
+/// Cancun and a call with 1000 nonzero calldata bytes estimates 21000 + 16 *
+/// 1000 = 37000; with the feature at 2 it runs Prague and estimates the
+/// EIP-7623 floor, 21000 + 40 * 1000 = 61000. RED before phase 2: Cancun.
+#[tokio::test]
+async fn estimate_gas_runs_at_the_spec_of_the_next_height() {
+    const PRAGUE_WITH_BIT_0: torus_evm::EvmSpecRule = torus_evm::EvmSpecRule {
+        base: torus_evm::SpecId::CANCUN,
+        upgrades: &[(
+            torus_types::Feature::RunningStateHash,
+            torus_evm::SpecId::PRAGUE,
+        )],
+    };
+    for (activation, want) in [(3u64, 37_000u64), (2, 61_000)] {
+        let (_dir, state, mempool, _) = setup();
+        mempool.set_activations(
+            torus_types::ActivationSchedule::merge(
+                &[(torus_types::Feature::RunningStateHash, activation)]
+                    .into_iter()
+                    .collect(),
+                &[],
+            )
+            .unwrap(),
+        );
+        let executor = Arc::new(EvmExecutor::with_spec_rule(
+            TORUS_CHAIN_ID,
+            PRAGUE_WITH_BIT_0,
+        ));
+        store_head_with_base_fee(&state, 1_000_000_000, 30_000_000);
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        let client = HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let call = serde_json::json!({
+            "from": "0x00000000000000000000000000000000000000ee",
+            "to": "0x00000000000000000000000000000000000000bb",
+            "data": format!("0x{}", "ff".repeat(1000)),
+        });
+        let s: String = client
+            .request("eth_estimateGas", rpc_params![call.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap(),
+            want,
+            "feature at {activation}"
+        );
+        // eth_call at gas 50000: runs at Cancun, refused (floor) at Prague.
+        let mut capped = call;
+        capped["gas"] = serde_json::json!("0xc350");
+        let out: Result<String, _> = client
+            .request("eth_call", rpc_params![capped, "latest"])
+            .await;
+        assert_eq!(out.is_ok(), want == 37_000, "eth_call, feature at {activation}: {out:?}");
+        handle.stop().unwrap();
+    }
 }

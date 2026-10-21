@@ -6,7 +6,7 @@ pub use view_metrics::ViewMetricsRecorder;
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
-use prometheus_client::metrics::gauge::Gauge;
+pub use prometheus_client::metrics::gauge::Gauge;
 pub use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::metrics::histogram::exponential_buckets;
 use prometheus_client::registry::Registry;
@@ -443,6 +443,33 @@ pub struct Metrics {
     /// local chain: upgraded above the activation height, or a skipped
     /// height) — it neither attests nor fail-stops.
     pub state_hash_unverified: Gauge,
+    /// P0.0 phase 6: 1 when the last applied block's header carries the
+    /// feature, else 0; one series per feature this binary knows, labels
+    /// `feature` (genesis name) and `id` (bit position).
+    pub feature_active: Family<Vec<(String, String)>, Gauge>,
+    /// P0.0 phase 6: the height a feature switches on in this node's schedule
+    /// (genesis `consensus.activations` + the built-in table); only scheduled
+    /// features have a series. Labels as `feature_active`.
+    pub feature_activation_height: Family<Vec<(String, String)>, Gauge>,
+    /// P0.0 phase 6: the next height above the applied one at which this
+    /// node's schedule switches a feature on (0 = none scheduled).
+    pub feature_next_activation_height: Gauge,
+    /// P0.0 phase 6: blocks from the applied height to the next activation
+    /// (-1 = none scheduled).
+    pub feature_blocks_until_activation: Gauge,
+    /// P0.0 phase 6: 1 once this node met a header with a feature this binary
+    /// does not know (`UPGRADE REQUIRED`: no vote, no insertion, no proposal
+    /// on it, execution fail-stops before it); stays 1 until a restart.
+    pub upgrade_required: Gauge,
+    /// P0.0 phase 6: the lowest unknown feature id at
+    /// `upgrade_required_height` (-1 = none).
+    pub upgrade_required_feature: Gauge,
+    /// P0.0 phase 6: the lowest block height met with an unknown feature
+    /// (0 = none).
+    pub upgrade_required_height: Gauge,
+    /// P0.0 phase 6: `UPGRADE REQUIRED` refusals by `site` (`vote`, `insert`,
+    /// `propose`, `execute`).
+    pub upgrade_required_refusals: Family<Vec<(String, String)>, Counter>,
     /// rank-root: flush breakdown — WriteBatch build + RocksDB write
     /// (== build + db below; kept unsplit for series continuity).
     pub exec_state_write_seconds: Histogram,
@@ -2122,6 +2149,57 @@ impl Metrics {
             state_hash_unverified.clone(),
         );
 
+        let feature_active = Family::<Vec<(String, String)>, Gauge>::default();
+        registry.register(
+            "torus_feature_active",
+            "P0.0 feature gating: 1 when the last applied block's header carries the feature (labels feature, id)",
+            feature_active.clone(),
+        );
+        let feature_activation_height = Family::<Vec<(String, String)>, Gauge>::default();
+        registry.register(
+            "torus_feature_activation_height",
+            "P0.0 feature gating: the height a feature switches on in this node's schedule (labels feature, id)",
+            feature_activation_height.clone(),
+        );
+        let feature_next_activation_height = Gauge::default();
+        registry.register(
+            "torus_feature_next_activation_height",
+            "P0.0 feature gating: next scheduled activation above the applied height (0 = none)",
+            feature_next_activation_height.clone(),
+        );
+        let feature_blocks_until_activation = Gauge::default();
+        feature_blocks_until_activation.set(-1);
+        registry.register(
+            "torus_feature_blocks_until_activation",
+            "P0.0 feature gating: blocks from the applied height to the next scheduled activation (-1 = none)",
+            feature_blocks_until_activation.clone(),
+        );
+        let upgrade_required = Gauge::default();
+        registry.register(
+            "torus_upgrade_required",
+            "P0.0 feature gating: 1 once a header carried a feature this binary does not know (UPGRADE REQUIRED)",
+            upgrade_required.clone(),
+        );
+        let upgrade_required_feature = Gauge::default();
+        upgrade_required_feature.set(-1);
+        registry.register(
+            "torus_upgrade_required_feature",
+            "P0.0 feature gating: lowest unknown feature id at torus_upgrade_required_height (-1 = none)",
+            upgrade_required_feature.clone(),
+        );
+        let upgrade_required_height = Gauge::default();
+        registry.register(
+            "torus_upgrade_required_height",
+            "P0.0 feature gating: lowest block height met with a feature this binary does not know (0 = none)",
+            upgrade_required_height.clone(),
+        );
+        let upgrade_required_refusals = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "torus_upgrade_required_refusals",
+            "P0.0 feature gating: UPGRADE REQUIRED refusals by site (vote, insert, propose, execute)",
+            upgrade_required_refusals.clone(),
+        );
+
         let exec_state_write_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_exec_state_write_seconds",
@@ -3348,6 +3426,14 @@ impl Metrics {
             state_hash_attestations_submitted,
             state_hash_height,
             state_hash_unverified,
+            feature_active,
+            feature_activation_height,
+            feature_next_activation_height,
+            feature_blocks_until_activation,
+            upgrade_required,
+            upgrade_required_feature,
+            upgrade_required_height,
+            upgrade_required_refusals,
             exec_state_write_seconds,
             exec_state_write_build_seconds,
             exec_state_write_db_seconds,
@@ -4617,6 +4703,40 @@ mod tests {
             "torus_native_da_recovery_timeouts",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+    }
+
+    /// P0.0 phase 6: the feature schedule / UPGRADE REQUIRED series, with
+    /// the "none" defaults before anything is reported.
+    #[test]
+    fn feature_gating_metrics_registered_with_none_defaults() {
+        let m = Metrics::new();
+        let text = m.encode();
+        for line in [
+            "torus_feature_next_activation_height 0",
+            "torus_feature_blocks_until_activation -1",
+            "torus_upgrade_required 0",
+            "torus_upgrade_required_feature -1",
+            "torus_upgrade_required_height 0",
+        ] {
+            assert!(text.lines().any(|l| l == line), "{line} missing:\n{text}");
+        }
+        let labels = vec![
+            ("feature".to_string(), "running_state_hash".to_string()),
+            ("id".to_string(), "0".to_string()),
+        ];
+        m.feature_active.get_or_create(&labels).set(1);
+        m.feature_activation_height.get_or_create(&labels).set(42);
+        m.upgrade_required_refusals
+            .get_or_create(&vec![("site".to_string(), "vote".to_string())])
+            .inc();
+        let text = m.encode();
+        for line in [
+            "torus_feature_active{feature=\"running_state_hash\",id=\"0\"} 1",
+            "torus_feature_activation_height{feature=\"running_state_hash\",id=\"0\"} 42",
+            "torus_upgrade_required_refusals_total{site=\"vote\"} 1",
+        ] {
+            assert!(text.lines().any(|l| l == line), "{line} missing:\n{text}");
         }
     }
 

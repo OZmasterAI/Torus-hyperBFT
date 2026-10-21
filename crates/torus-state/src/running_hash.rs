@@ -222,8 +222,10 @@ pub fn read_activation_height(db: &StateDb) -> Option<u64> {
     read_u64(db, META_RUNNING_STATE_HASH_ACTIVATION)
 }
 
-/// The CHAIN-WIDE activation height this node is configured with (genesis
-/// `consensus.state_hash_activation_height`); `None` = running hash disabled.
+/// The CHAIN-WIDE activation height every flush's chain step reads; `None` =
+/// not hashing. P0.0 phase 3: set by execution from the committed headers
+/// (the first height whose header carries the `RunningStateHash` bit, see
+/// [`header_activation`]), never from this node's schedule.
 pub fn read_configured_activation(db: &StateDb) -> Option<u64> {
     read_u64(db, META_STATE_HASH_CONFIGURED_ACTIVATION)
 }
@@ -250,9 +252,43 @@ pub fn record_divergence(db: &StateDb, checkpoint: u64) -> Result<(), crate::Sta
     db.put_cf_raw(CF_CONSENSUS_META, META_STATE_HASH_DIVERGED, &checkpoint.to_be_bytes())
 }
 
-/// Apply the chain config at boot (before any block is flushed): store the
-/// CHAIN-WIDE activation height (`None` = disabled; `Some(0)` is treated as
-/// 1, the first executable height). When the configuration differs from the
+/// P0.0 phase 3: the running-hash activation the committed headers define at
+/// `height`, whose header carries the `RunningStateHash` bit iff `bit_on`:
+/// `None` when it does not (nothing is hashed at this height), else the first
+/// height whose header carries it (`h_{that-1}` = zeros). `bit_at(h)` reads
+/// the bit of the stored committed header at `h < height` (`Err`: the row is
+/// missing or does not decode). A schedule only ever switches a feature on,
+/// so the bit is monotone: the parent's bit settles the usual case (the
+/// activation height itself, or `height` 1), a binary search the rest.
+pub fn header_activation<E>(
+    height: u64,
+    bit_on: bool,
+    mut bit_at: impl FnMut(u64) -> Result<bool, E>,
+) -> Result<Option<u64>, E> {
+    if !bit_on {
+        return Ok(None);
+    }
+    if height <= 1 || !bit_at(height - 1)? {
+        return Ok(Some(height.max(1)));
+    }
+    // The bit is on at `hi`; the first height with it is in `lo..=hi`.
+    let (mut lo, mut hi) = (1, height - 1);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if bit_at(mid)? {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Ok(Some(lo))
+}
+
+/// Store the CHAIN-WIDE activation height the flushes chain from (`None` =
+/// disabled; `Some(0)` is treated as 1, the first executable height). P0.0
+/// phase 3: execution calls it with [`header_activation`] before a block whose
+/// headers change it (once per chain, at the first header with the bit), not
+/// the boot from the chain config. When the configuration differs from the
 /// one the stored chain was built under, the stored chain (hash, activation
 /// record, unverified marker, checkpoints) is discarded: it belongs to
 /// another chain definition. Returns whether a stored chain was discarded.
@@ -291,7 +327,7 @@ pub fn configure_activation(db: &StateDb, activation: Option<u64>) -> Result<boo
         None => batch.delete_cf(cf, META_STATE_HASH_CONFIGURED_ACTIVATION),
     }
     db.write(batch)?;
-    tracing::info!(?activation, "running state hash activation (chain config)");
+    tracing::info!(?activation, "running state hash activation (committed headers)");
     Ok(reset)
 }
 
@@ -717,6 +753,31 @@ mod tests {
     /// Golden vector, computed independently (Python hashlib) from the spec:
     /// h_n = SHA-256(h_{n-1} ‖ n u64 BE ‖ D_native ‖ D_evm), D_x = SHA-256 over
     /// cf_id ‖ len(key) u32 BE ‖ key ‖ (0x00 | 0x01 ‖ len(value) u32 BE ‖ value).
+    /// P0.0 phase 3: the first height whose header carries the bit, from
+    /// any later height, reading few headers (parent first, then a binary
+    /// search); `None` while the bit is off; a read error propagates.
+    #[test]
+    fn header_activation_is_the_first_height_with_the_bit() {
+        assert_eq!(header_activation::<()>(7, false, |_| panic!("no read")), Ok(None));
+        assert_eq!(header_activation::<()>(1, true, |_| panic!("no read")), Ok(Some(1)));
+        for first in 1..=40u64 {
+            for height in first..=40 {
+                let mut reads = 0;
+                let got = header_activation::<()>(height, true, |h| {
+                    assert!(h < height && h >= 1, "reads below {height} only: {h}");
+                    reads += 1;
+                    Ok(h >= first)
+                });
+                assert_eq!(got, Ok(Some(first)), "first {first}, at {height}");
+                assert!(reads <= 1 + 6, "first {first}, at {height}: {reads} reads");
+                if height == first {
+                    assert!(reads <= 1, "the activation height reads only its parent");
+                }
+            }
+        }
+        assert_eq!(header_activation(9, true, |h| if h == 8 { Ok(true) } else { Err(h) }), Err(4));
+    }
+
     #[test]
     fn running_hash_golden_vector() {
         let mut w = golden_writes();

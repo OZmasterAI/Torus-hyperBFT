@@ -243,6 +243,15 @@ pub struct Mempool {
     /// Item 7 step 2: the committed header's big base fee, the big lane's
     /// admission fee floor.
     current_big_base_fee: std::sync::atomic::AtomicU64,
+    /// P0.0 phase 2: the committed header's height ([`Self::set_evm_header`]);
+    /// admission checks a tx at the feature bits expected one height above it.
+    committed_height: std::sync::atomic::AtomicU64,
+    /// P0.0 phase 2: the node's activation schedule ([`Self::set_activations`];
+    /// default: none), the expected bits of a height.
+    activations: RwLock<torus_types::ActivationSchedule>,
+    /// P0.0 phase 2: feature bits -> EVM spec (this binary's rule unless a
+    /// test sets another, [`Self::set_evm_spec_rule`]).
+    evm_spec_rule: RwLock<torus_evm::EvmSpecRule>,
     /// Approximate total memory used by pooled transactions (Phase 3: 3.1.7).
     memory_used: std::sync::atomic::AtomicUsize,
     /// Outbound native action gossip channel (set once at startup).
@@ -322,6 +331,9 @@ impl Mempool {
             current_big_interval: std::sync::atomic::AtomicU64::new(0),
             current_big_gas_limit: std::sync::atomic::AtomicU64::new(0),
             current_big_base_fee: std::sync::atomic::AtomicU64::new(initial_base_fee),
+            committed_height: std::sync::atomic::AtomicU64::new(0),
+            activations: RwLock::new(torus_types::ActivationSchedule::default()),
+            evm_spec_rule: RwLock::new(torus_evm::BUILTIN_EVM_SPEC_RULE),
             memory_used: std::sync::atomic::AtomicUsize::new(0),
             native_gossip_tx: std::sync::OnceLock::new(),
             native_gossip_enabled: std::sync::atomic::AtomicBool::new(false),
@@ -787,6 +799,7 @@ impl Mempool {
             self.config.chain_id,
             max_gas,
             fee_floor,
+            self.admission_spec(),
         )?;
         let lane = self.evm_lane(&entry.sender);
         // A reinserted tx may join the other lane (below), so its caps are checked only once
@@ -1215,8 +1228,46 @@ impl Mempool {
         }
     }
 
+    /// P0.0 phase 2: the node's activation schedule (`ChainConfig::activations`),
+    /// set at startup. Admission and RPC simulation use the bits it expects at
+    /// the next height (best effort: consensus checks the header's bits).
+    pub fn set_activations(&self, activations: torus_types::ActivationSchedule) {
+        *self.activations.write().unwrap() = activations;
+    }
+
+    /// P0.0 phase 2: another feature-bits -> EVM spec rule (tests of a spec
+    /// switch; a node keeps this binary's `BUILTIN_EVM_SPEC_RULE`).
+    pub fn set_evm_spec_rule(&self, rule: torus_evm::EvmSpecRule) {
+        *self.evm_spec_rule.write().unwrap() = rule;
+    }
+
+    /// P0.0 phase 2: the feature bits the schedule expects at `height`.
+    pub fn expected_features(&self, height: u64) -> u128 {
+        self.activations.read().unwrap().active_at(height)
+    }
+
+    /// P0.0 phase 2: the bits admission checks a tx at: those expected at the
+    /// height above the last committed header ([`Self::set_evm_header`]).
+    pub fn admission_features(&self) -> u128 {
+        let committed = self
+            .committed_height
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.expected_features(committed.saturating_add(1))
+    }
+
+    /// P0.0 phase 2: the EVM spec of [`Self::admission_features`].
+    pub fn admission_spec(&self) -> torus_evm::SpecId {
+        self.evm_spec_rule
+            .read()
+            .unwrap()
+            .spec(self.admission_features())
+    }
+
     /// Item 7 step 2: every EVM value of a committed header the pools follow.
+    /// P0.0 phase 2: and its height (admission runs at the next height's bits).
     pub fn set_evm_header(&self, header: &torus_types::TorusBlockHeader) {
+        self.committed_height
+            .store(header.height, std::sync::atomic::Ordering::Relaxed);
         self.set_base_fee(header.base_fee_per_gas);
         self.set_evm_gas_limit(header.evm_gas_limit);
         self.set_big_lane(
@@ -5052,6 +5103,86 @@ mod tests {
         )
     }
 
+    /// P0.0 phase 2: a committed header at `height` (1 gwei, default limits).
+    fn committed_header(height: u64) -> torus_types::TorusBlockHeader {
+        torus_types::TorusBlockHeader {
+            height,
+            parent_hash: B256::ZERO,
+            timestamp: 1000,
+            proposer: Address::ZERO,
+            state_root: B256::ZERO,
+            receipts_root: B256::ZERO,
+            logs_bloom: alloy_primitives::Bloom::ZERO,
+            evm_gas_used: 0,
+            evm_fee_revenue: 0,
+            evm_gas_limit: torus_types::DEFAULT_EVM_GAS_LIMIT,
+            evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
+            evm_big_block_interval: 0,
+            evm_big_gas_limit: torus_types::DEFAULT_EVM_BIG_GAS_LIMIT,
+            native_action_count: 0,
+            evm_tx_count: 0,
+            base_fee_per_gas: 1_000_000_000,
+            big_base_fee_per_gas: 1_000_000_000,
+            epoch: 0,
+            validator_set_hash: B256::ZERO,
+            features: 0,
+            sig_attestation: [0u8; 64],
+        }
+    }
+
+    /// P0.0 phase 2: admission checks a tx at the EVM spec of the feature bits
+    /// the schedule expects at the height above the last committed header
+    /// (here a rule moving to Prague with bit 0, scheduled at 5): with the tip
+    /// at 3 the next height runs Cancun and a call with 1000 nonzero calldata
+    /// bytes needs 37000 gas; with the tip at 4 the next height is 5, Prague,
+    /// and it needs the EIP-7623 floor, 61000. RED before phase 2: Cancun
+    /// whatever the height.
+    #[test]
+    fn admission_runs_at_the_spec_of_the_next_height() {
+        const PRAGUE_WITH_BIT_0: torus_evm::EvmSpecRule = torus_evm::EvmSpecRule {
+            base: torus_evm::SpecId::CANCUN,
+            upgrades: &[(
+                torus_types::Feature::RunningStateHash,
+                torus_evm::SpecId::PRAGUE,
+            )],
+        };
+        let rsh = torus_types::Feature::RunningStateHash.bit();
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        pool.set_evm_spec_rule(PRAGUE_WITH_BIT_0);
+        pool.set_activations(
+            torus_types::ActivationSchedule::merge(
+                &[(torus_types::Feature::RunningStateHash, 5)]
+                    .into_iter()
+                    .collect(),
+                &[],
+            )
+            .unwrap(),
+        );
+        let call = |k: &SigningKey, gas: u64| {
+            eip1559_with(
+                k,
+                gas,
+                TxKind::Call(Address::repeat_byte(0xbb)),
+                vec![0xff; 1000],
+                Default::default(),
+            )
+        };
+        pool.set_evm_header(&committed_header(3));
+        assert_eq!(pool.expected_features(4), 0);
+        assert_eq!(pool.expected_features(5), rsh);
+        assert_eq!(pool.admission_features(), 0, "tip 3: bits of 4");
+        assert_eq!(pool.admission_spec(), torus_evm::SpecId::CANCUN);
+        let k = intrinsic_case(&state, 240);
+        assert_intrinsic_boundary(&pool, 37_000, |gas| call(&k, gas));
+
+        pool.set_evm_header(&committed_header(4));
+        assert_eq!(pool.admission_features(), rsh, "tip 4: bits of 5");
+        assert_eq!(pool.admission_spec(), torus_evm::SpecId::PRAGUE);
+        let k = intrinsic_case(&state, 241);
+        assert_intrinsic_boundary(&pool, 61_000, |gas| call(&k, gas));
+    }
+
     #[test]
     fn intrinsic_gas_plain_transfer() {
         let (_dir, state) = setup();
@@ -5677,6 +5808,7 @@ mod tests {
                 torus_types::eip712::TORUS_CHAIN_ID,
                 u64::MAX,
                 0,
+                torus_evm::SpecId::CANCUN,
             )
             .unwrap();
             let bytes = entry.raw_rlp.len();

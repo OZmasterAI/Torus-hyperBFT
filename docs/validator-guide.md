@@ -92,6 +92,7 @@ See [monitoring-setup.md](monitoring-setup.md) for setup instructions.
 | `torus_consensus_view` | Advancing | Stuck |
 | `torus_peers_connected` | >= 3 | < 3 |
 | `torus_block_build_seconds` | < 1s p99 | > 2s p99 |
+| `torus_state_hash_unverified` | 0 | 1: no valid running-hash chain, the node submits no state-hash attestations (see [node-operator-guide.md](node-operator-guide.md#running-state-hash-a-hash-unverified-node)) |
 
 ## Jailing
 

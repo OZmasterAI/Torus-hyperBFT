@@ -275,6 +275,7 @@ fn block_env_from_header(header: &TorusBlockHeader) -> BlockEnvCfg {
         beneficiary: header.proposer,
         gas_limit: header.evm_gas_limit,
         base_fee: header.base_fee_per_gas,
+        features: header.features,
     }
 }
 
@@ -307,7 +308,23 @@ fn lane_block_env<S: torus_state::backend::StateBackend>(
 /// The block env of an eth_call / eth_estimateGas at the eth head `head`: the head header in the
 /// caller's lane (`call.from`, else the zero address; the lane from the ingress view, see
 /// [`lane_block_env`]), or the default env before the first block.
+///
+/// P0.0 phase 2: the call runs at the feature bits this node's schedule expects at `head + 1`
+/// (the height a tx sent now lands in; best effort, as mempool admission), so its spec and
+/// intrinsic gas are the next block's.
 fn call_block_env(
+    state: &RpcState,
+    head: u64,
+    call: &CallRequest,
+) -> Result<BlockEnvCfg, RpcError> {
+    let next_features = state.mempool.expected_features(head.saturating_add(1));
+    let mut env = call_head_env(state, head, call)?;
+    env.features = next_features;
+    Ok(env)
+}
+
+/// [`call_block_env`] before the feature bits: the head header's env in the caller's lane.
+fn call_head_env(
     state: &RpcState,
     head: u64,
     call: &CallRequest,
@@ -1231,7 +1248,10 @@ impl EthApiServer for RpcState {
         // the cap's tx with only the limit changed (same defaulted nonce).
         let mut lo: u64 = result
             .gas_used
-            .max(torus_evm::intrinsic_gas(&tx_env))
+            .max(torus_evm::intrinsic_gas(
+                &tx_env,
+                self.executor.spec_at(block_env.features),
+            ))
             .max(21_000)
             - 1;
         while lo + 1 < hi {

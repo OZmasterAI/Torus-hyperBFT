@@ -28,3 +28,14 @@ threads-required = "num-cpus"
 [[profile.ci.overrides]]
 filter = "test(a_pin_waits_at_most_one_release_chunk)"
 threads-required = "num-cpus"
+
+# P0.0 phase 5: each multi-node activation test runs four in-process
+# validators (real TorusApps, ~1 s views). Give each the room of 4 threads so
+# a full parallel run does not starve their view timers.
+[[profile.default.overrides]]
+filter = "test(/p00_cluster_tests/)"
+threads-required = 4
+
+[[profile.ci.overrides]]
+filter = "test(/p00_cluster_tests/)"
+threads-required = 4

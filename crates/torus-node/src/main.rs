@@ -467,7 +467,12 @@ fn default_chain_config() -> ChainConfig {
         commit_lag_backoff_cap: 0,
         reputation_leader_selection: false,
         exec_trust_cache: false,
-        state_hash_activation_height: None,
+        // P0.0: no genesis, so only the built-in table (it cannot conflict).
+        activations: torus_types::ActivationSchedule::for_chain(
+            torus_evm::TORUS_CHAIN_ID,
+            &Default::default(),
+        )
+        .expect("an empty genesis set never conflicts with the built-in table"),
         book_mode: Default::default(),
     }
 }
@@ -629,8 +634,11 @@ fn read_passphrase_stdin() -> String {
 
 /// R19: load the genesis file; a malformed or ambiguous genesis refuses to
 /// start, naming the file.
-fn load_genesis(path: &std::path::Path) -> Result<Genesis, String> {
-    Genesis::from_file(path)
+/// Also returns the file's digest (P0.0 phase 4, `torus_genesis::digest`).
+fn load_genesis(
+    path: &std::path::Path,
+) -> Result<(Genesis, torus_genesis::GenesisDigest), String> {
+    Genesis::from_file_with_digest(path)
         .map_err(|e| format!("refusing to start: genesis {}: {e}", path.display()))
 }
 
@@ -710,35 +718,60 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         consensus_db = %torus_state::consensus_db_path(&cli.data_dir).display(),
         "state database and consensus database (HotStuff + DA store) opened"
     );
-    // 3b. Archive-upgrade rule (claude-review P1, s131): a defaulted retention
-    // on an unpruned data dir past N refuses before any pruner exists.
-    node_dbs::enforce_history_retention(
-        &state_db,
+    // 3b + 4. Archive-upgrade rule (claude-review P1, s131): a defaulted
+    // retention on an unpruned data dir past N refuses before any pruner
+    // exists. Genesis initialization: only on first run (see
+    // `node_dbs::genesis_applied`); P0.0 phase 4: the data dir is bound to the
+    // genesis file's digest, a changed file refuses to start.
+    let genesis_file = cli.genesis.as_deref().map(load_genesis).transpose()?;
+    // s131: the order-book storage mode is the genesis' (`consensus.book_mode`);
+    // `TORUS_BOOK_ROWS` may only repeat it, and a DB marker naming another
+    // mode refuses to start. Read-only, so it runs before genesis is applied
+    // (`bind_genesis_and_retention` seeds a fresh dir) and a refused start
+    // writes nothing. Without `--genesis` the DB marker gives the mode.
+    let book_rows_env = std::env::var(torus_types::book_mode::BOOK_ROWS_ENV).ok();
+    let book_mode = node_dbs::node_book_mode(
+        &dbs.state,
+        genesis_file.as_ref().map(|(genesis, _)| genesis.consensus.book_mode),
+        book_rows_env.as_deref(),
+    )?;
+    let binding = node_dbs::bind_genesis_and_retention(
+        &dbs,
+        genesis_file
+            .as_ref()
+            .zip(cli.genesis.as_deref())
+            .map(|((genesis, digest), path)| node_dbs::GenesisFile { genesis, digest, path }),
         retention,
         retention_is_explicit(&cli),
         &cli.data_dir,
     )?;
-
-    // 4. Genesis initialization. s131: the order-book storage mode is the
-    // genesis' (`consensus.book_mode`); `TORUS_BOOK_ROWS` may only repeat it,
-    // and a DB marker naming another mode refuses to start, checked before
-    // genesis is applied. Without `--genesis` the DB marker gives the mode.
-    let book_rows_env = std::env::var(torus_types::book_mode::BOOK_ROWS_ENV).ok();
-    let mut chain_config = if let Some(genesis_path) = &cli.genesis {
-        let genesis = load_genesis(genesis_path)?;
+    let mut chain_config = if let (Some((genesis, file_digest)), Some(genesis_path), Some(binding)) =
+        (&genesis_file, &cli.genesis, binding)
+    {
         let mut config = genesis.chain_config();
+        config.book_mode = book_mode;
         info!(genesis = %genesis_path.display(), "genesis file");
-        config.book_mode =
-            node_dbs::node_book_mode(&dbs.state, Some(config.book_mode), book_rows_env.as_deref())?;
-
-        // Only initialize on first run (see `node_dbs::genesis_applied`).
-        node_dbs::apply_genesis_if_fresh(&dbs, &genesis)?;
+        let digest = file_digest.digest;
+        match binding {
+            node_dbs::GenesisBinding::Fresh => {
+                info!(%digest, "genesis digest stored: this data dir is bound to the genesis file")
+            }
+            node_dbs::GenesisBinding::Legacy => warn!(
+                %digest,
+                "genesis digest stored for an existing data dir that had none (first boot of a \
+                 build with the genesis check); it is not verified against the genesis the dir \
+                 was initialized with. Later boots refuse a changed genesis file"
+            ),
+            node_dbs::GenesisBinding::Matched => {
+                info!(%digest, "genesis file matches the stored genesis digest")
+            }
+        }
 
         config
     } else {
         info!("no genesis file provided, using default chain config");
         let mut config = default_chain_config();
-        config.book_mode = node_dbs::node_book_mode(&dbs.state, None, book_rows_env.as_deref())?;
+        config.book_mode = book_mode;
         config
     };
     // Every execution context of this process (consensus, RPC reads, the
@@ -751,6 +784,21 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         epoch_length = chain_config.epoch_length,
         gas_limit = chain_config.evm_gas_limit,
         "chain configuration loaded"
+    );
+    // P0.0: the activation schedule this node proposes and votes by.
+    for (feature, height) in chain_config.activations.iter() {
+        info!(feature = feature.name(), id = feature.id(), height, "feature activation scheduled");
+    }
+    // P0.0 phase 6: what this binary can execute (an operator compares it with
+    // the network's schedule before an activation height).
+    info!(
+        known_features = ?torus_types::Feature::ALL
+            .iter()
+            .filter(|f| torus_types::KNOWN_FEATURES & f.bit() != 0)
+            .map(|f| f.name())
+            .collect::<Vec<_>>(),
+        known_bits = %format!("{:#x}", torus_types::KNOWN_FEATURES),
+        "features this binary knows (torus_getFeatureSchedule lists the schedule)"
     );
     // Every native action this node signs or verifies uses this network's
     // EIP-712 domain (genesis `chain_id`, devnet 7778). Set before any
@@ -1322,6 +1370,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     rpc_server.set_latest_height_handle(latest_height_shared);
     rpc_server.set_metrics(metrics.clone());
+    // P0.0 phase 6: torus_getFeatureSchedule lists this node's schedule.
+    rpc_server.set_activation_schedule(chain_config.activations.clone());
     // s80 fix 2: all-markets newTrades is off on validators unless
     // TORUS_ALL_MARKET_TRADES=1 (on for --rpc-only unless =0). Read once here.
     let all_market_trades = torus_rpc::streams::all_market_trades_allowed(
