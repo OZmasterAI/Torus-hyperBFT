@@ -431,11 +431,13 @@ config.
 reduce-only on a delisted market (`PlaceOrder`, or any order of a `PlaceOrderBatch`) with the
 executor's text `market N is delisted: only reduce-only orders`, before signature checks; the
 executor still decides in consensus. `torus_getMarkets` adds per market: `status` (`active` or
-`delisted`), `delisted`, `delistHeight`, `closeAt` (the grace end; `null` once the settlement walk
-is done), `settlement` (`none`, `grace` before `closeAt`, `settling` from `closeAt` until complete,
-including waiting for a price and the ADL drain, `settled`), `closePrice` (the fixed settlement
-price while the settlement row exists; it is not kept in state after the walk),
-`governanceClosePrice` (a `SetDelistClosePrice` price not yet used) and `settledHeight`.
+`delisted`), `delisted`, `delistHeight`, `closeAt` (the grace end; kept after the settlement),
+`settlement` (`none`, `grace` before `closeAt`, `settling` from `closeAt` until complete, including
+waiting for a price and the ADL drain, `settled`), `closePrice` (the fixed settlement price, from
+the first settlement block on; kept after the settlement: when the walk ends, every node writes a
+permanent record of the market's close price, close height and walk-end height in the same block),
+`governanceClosePrice` (a `SetDelistClosePrice` price not yet used) and `settledHeight` (the height
+the settlement completed, the oracle stopped; after the ADL drain if one was pending).
 
 **Relisting.** A delisted id is never listed again. List the asset again under a new id with a new
 `ListMarket` proposal.

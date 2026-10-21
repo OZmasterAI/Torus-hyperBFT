@@ -20,7 +20,7 @@ use torus_bridge::native_executor::{
     begin_resident, end_resident, NativeActionResult, NativeExecContext, NativeExecutor,
     ResidentBooks,
 };
-use torus_core::liquidation::{self as liq, DelistSettlement, LIQUIDATOR_VAULT};
+use torus_core::liquidation::{self as liq, DelistSettled, DelistSettlement, LIQUIDATOR_VAULT};
 use torus_core::position::{MarginType, NativeBalance};
 use torus_economics::governance::{GovernanceParams, ProposalStatus};
 use torus_economics::MIN_SELF_DELEGATION;
@@ -262,6 +262,11 @@ fn net_oi(s: &StateDb, m: MarketId) -> (FixedPoint, usize) {
 
 fn row(db: &StateDb) -> Option<DelistSettlement> {
     liq::delist_settlement(db, M).unwrap()
+}
+
+/// M's kept settlement record (0x0A, owner s134 keep-close-price).
+fn kept(db: &StateDb) -> Option<DelistSettled> {
+    liq::delist_settled(db, M).unwrap()
 }
 
 fn limit(m: MarketId, is_buy: bool, price: i64, qty: i64) -> PlaceOrderParams {
@@ -765,6 +770,17 @@ fn settlement_resident_lifecycle_equals_classic() {
         if h == E + 10 {
             assert_eq!(net_oi(db, M), (FixedPoint::ZERO, 0), "settled");
             assert_eq!(row(db), None);
+        }
+        // E + 6's tail (full budgets) ends the walk: the kept record from then
+        // on, unchanged; none before.
+        if h >= E + 6 {
+            assert_eq!(
+                kept(db),
+                Some(DelistSettled { market: M, close_at: E + 5, price: fp(110), settled_height: E + 6 }),
+                "h {h}: kept record written with the walk's end"
+            );
+        } else {
+            assert_eq!(kept(db), None, "h {h}: no kept record before the walk ends");
         }
         if h >= E + 5 {
             assert_eq!(net_oi(db, M).0, FixedPoint::ZERO, "h {h}: OI symmetric");
@@ -1386,8 +1402,10 @@ fn oracle_stops_only_after_the_adl_drain_of_a_delisted_market() {
     let (_, s) = block(&db, H + 5, 1, &[]);
     assert!(s.iter().all(|r| r.success), "{s:?}");
     assert_eq!(row(&db), None, "walk done");
+    let rec = DelistSettled { market: M, close_at: H + 5, price: fp(120), settled_height: H + 5 };
+    assert_eq!(kept(&db), Some(rec), "kept record written at the walk's end");
     assert_eq!(pos_of(&db, &LIQUIDATOR_VAULT, M), fp(10), "vault mirrors the escrow");
-    // Not complete: accepted.
+    // Not complete (the kept record is not completion): accepted.
     let r = run(&db, H + 6, 0, &oracle_sub(H + 6, &[(M, 121)]));
     assert!(all_ok(&r), "{r:?}");
     let sub = sub_row(&db, M);
@@ -1403,6 +1421,7 @@ fn oracle_stops_only_after_the_adl_drain_of_a_delisted_market() {
     let r = run(&db, H + 8, 0, &oracle_sub(H + 8, &[(M, 122)]));
     assert!(all_ok(&r), "{r:?}");
     assert_eq!(sub_row(&db, M), sub, "complete now: ignored");
+    assert_eq!(kept(&db), Some(rec), "the drain leaves the kept record alone");
 }
 
 /// 3b on every node: the resident node lifecycle (R + resident books) equals
@@ -1437,4 +1456,75 @@ fn oracle_stop_resident_lifecycle_equals_classic() {
             assert_eq!(stored, Some(ts(E + 5) * 1_000), "h {h}: M's submission row is the E + 5 one");
         }
     });
+}
+
+// ============================================================================
+// Part D: a settled market keeps its close price (owner s134)
+// ============================================================================
+
+/// The walk's end writes the kept record `0x0A ‖ market` (close_at, the ONE
+/// settlement price, the height the walk ended) in the block that deletes
+/// the settlement row; not before (grace, mid-walk). Afterwards it is not an
+/// active settlement: nothing is due, the step does nothing, the record
+/// never changes, and the liquidation step has nothing to do for it.
+#[test]
+fn settled_market_keeps_its_close_price_and_height() {
+    let (_d, db) = setup(&[]);
+    set_grace(&db, 5);
+    seed_pairs(&db);
+    set_mark(&db, M, 100, H);
+    delist_m(&db);
+    assert_eq!(kept(&db), None, "grace: no kept record");
+    let mut end = None;
+    for h in H + 5..H + 40 {
+        set_mark(&db, M, 110 + 10 * (h - H - 5) as i64, h);
+        let mut ctx = ctx_at(db.clone(), h);
+        let s = NativeExecutor::run_delist_settlements_with(&mut ctx, 3, 2);
+        assert!(s.iter().all(|r| r.success), "h {h}: {s:?}");
+        assert_eq!(ctx.take_fatal_error(), None);
+        drop(ctx);
+        if row(&db).is_some() {
+            assert_eq!(kept(&db), None, "h {h}: mid-walk: no kept record");
+        } else {
+            end = Some(h);
+            break;
+        }
+    }
+    let end = end.expect("the walk ends");
+    assert!(end > H + 5, "several blocks");
+    let rec = DelistSettled { market: M, close_at: H + 5, price: fp(110), settled_height: end };
+    assert_eq!(kept(&db), Some(rec));
+    assert_eq!(net_oi(&db, M), (FixedPoint::ZERO, 0));
+    // Not an active settlement.
+    assert!(!NativeExecutor::delist_settlement_due(&db, end + 100).unwrap());
+    assert!(liq::delist_settlements(&db).unwrap().is_empty());
+    for h in [end + 1, end + 2, end + 50] {
+        set_mark(&db, M, 500, h);
+        let (_, s) = block(&db, h, 1, &[]);
+        assert!(s.is_empty(), "h {h}: nothing to settle: {s:?}");
+        let mut ctx = ctx_at(db.clone(), h);
+        let _ = NativeExecutor::run_liquidations(&mut ctx);
+        assert_eq!(ctx.take_fatal_error(), None);
+        drop(ctx);
+        assert_eq!(kept(&db), Some(rec), "h {h}: the record never changes");
+        assert_eq!(net_oi(&db, M), (FixedPoint::ZERO, 0));
+    }
+}
+
+/// N = 0 with a governance close price: the record keeps the governance
+/// price, `close_at` = the delist height, settled in the delist's block.
+#[test]
+fn kept_record_holds_the_governance_close_price() {
+    let (_d, db) = setup(&[13, 14]);
+    set_grace(&db, 0);
+    open_pair(&db, M, 14, 13, 2, 100);
+    set_mark(&db, M, 100, H);
+    submit(&db, "Delist BTC", ProposalAction::DelistMarket { market_id: M });
+    submit(&db, "Close BTC at 80", close_price(M, 80));
+    pass_and_execute(&db, &[1, 2]);
+    assert_eq!(net_oi(&db, M), (FixedPoint::ZERO, 0), "settled in the delist block");
+    assert_eq!(
+        kept(&db),
+        Some(DelistSettled { market: M, close_at: H, price: fp(80), settled_height: H })
+    );
 }

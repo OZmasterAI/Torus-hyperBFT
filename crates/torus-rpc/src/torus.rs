@@ -466,7 +466,9 @@ pub(crate) fn validate_known_markets<S: StateBackend>(
 /// Delist follow-up (node-local read, `torus_getMarkets`): fills `info`'s
 /// delist fields from market `mid`'s governance rows: the delisted flag
 /// (`market_delisted_key`, value = delist height), the settlement row
-/// (`CF_NATIVE_LIQUIDATION 0x08`: `close_at`, the fixed price), a pending
+/// (`CF_NATIVE_LIQUIDATION 0x08`: `close_at`, the fixed price), the kept
+/// settlement record once the walk ended (`0x0A`: `close_at` and the close
+/// price stay after the 0x08 row is gone, owner s134), a pending
 /// governance close price (`0x09`) and the oracle-closed marker
 /// (`market_oracle_closed_key`, value = completion height). Point reads, not
 /// charged to the scan budget. `latest`: the node's committed height; a row
@@ -505,6 +507,11 @@ fn fill_delist_view<S: StateBackend>(
     if let Some(r) = row {
         info.close_at = Some(hex_u64(r.close_at));
         info.close_price = r.price.map(dec_fp);
+    } else if let Some(k) =
+        liq::delist_settled(state, mid).map_err(|e| internal("kept settlement record", e.to_string()))?
+    {
+        info.close_at = Some(hex_u64(k.close_at));
+        info.close_price = Some(dec_fp(k.price));
     }
     info.governance_close_price = liq::delist_close_price(state, mid)
         .map_err(|e| internal("governance close price", e.to_string()))?
