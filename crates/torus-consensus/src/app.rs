@@ -4984,7 +4984,8 @@ impl ExecutionContext {
         // Item 3: so is the liquidation step while a cooldown, cursor, pending
         // or (adl-budget P2) ADL obligation row exists (a pending chunk, a cut
         // pass, an account still under MM or an escrow still to drain must
-        // not wait for activity).
+        // not wait for activity). Delist option C: so is the settlement step
+        // once a delisted market's grace is over (until it is settled).
         // A read error is a node fault: fail-stop (C4), never "assume".
         // Bug (b): every boundary block runs it too (validator-set plans).
         let run_native = if has_native
@@ -4999,6 +5000,8 @@ impl ExecutionContext {
             let _probe_scope = torus_state::probes::scope(torus_state::probes::Reader::DueCheck);
             match NativeExecutor::oracle_due(&overlay)
                 .and_then(|due| Ok(due || NativeExecutor::liquidation_due(&overlay)?))
+                // Delist option C: a settlement row whose grace is over.
+                .and_then(|due| Ok(due || NativeExecutor::delist_settlement_due(&overlay, height)?))
             {
                 Ok(due) => due,
                 Err(e) => {
@@ -5561,6 +5564,10 @@ impl ExecutionContext {
                 return;
             }
             NativeExecutor::process_governance(&mut ctx);
+            // Delist option C: grace over -> force-close at the settlement
+            // price (after governance: a delist with N = 0 settles in its
+            // own block). A fault latches `fatal_error` (checked below).
+            NativeExecutor::run_delist_settlements(&mut ctx);
             NativeExecutor::distribute_fees(&mut ctx, computed_fee_revenue);
             NativeExecutor::process_epoch_boundary(&mut ctx);
             NativeExecutor::add_block_evm_gas(&mut ctx);
@@ -28045,6 +28052,45 @@ mod crash_recovery_tests {
         assert!(!NativeExecutor::liquidation_due(&db).unwrap(), "flat: nothing pending");
         ctx.execute_committed_block(&blocks[14], vec![]);
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+    }
+
+    /// Delist option C (app level): an EMPTY block whose height reaches a
+    /// delisted market's settlement `close_at` runs the native phase (the
+    /// due-check) and force-closes the market's positions at the last
+    /// aggregate (990); the empty blocks before it leave them open. The
+    /// market was delisted at height 0 with N = 16 (rows seeded).
+    #[test]
+    fn delist_settlement_runs_in_an_empty_block_once_due() {
+        use torus_core::liquidation::{self as liq, DelistSettlement};
+        let (config, db) = liq_fixture_db(10, 1_000_000);
+        db.put_cf_raw(
+            torus_state::cf::CF_NATIVE_MARKETS,
+            &torus_types::market_delisted_key(ORACLE_MARKET),
+            &0u64.to_be_bytes(),
+        )
+        .unwrap();
+        let row = DelistSettlement { market: ORACLE_MARKET, close_at: 16, price: None, cursor: None };
+        liq::put_delist_settlement(&db, &row).unwrap();
+        let ctx = make_exec_ctx(&config, &db);
+        let (t, s) = (oracle_addr(71), oracle_addr(72));
+        let mut rounds = vec![vec![oracle_sub(61, 1, 990), oracle_sub(62, 1, 990), oracle_sub(63, 1, 990)]];
+        rounds.extend(std::iter::repeat_n(Vec::new(), 15)); // 2..=16
+        let blocks = liq_blocks(rounds);
+        for b in &blocks[..15] {
+            ctx.execute_committed_block(b, vec![]);
+        }
+        assert!(oracle_sub_rows(&db).is_empty(), "rows pruned: no oracle-due");
+        assert!(!NativeExecutor::liquidation_due(&db).unwrap(), "nothing else due");
+        assert_eq!(signed_pos_of(&db, &t), px(10), "grace: still open at 15");
+        assert_eq!(liq::delist_settlement(&db, ORACLE_MARKET).unwrap(), Some(row));
+        ctx.execute_committed_block(&blocks[15], vec![]); // 16: empty, due
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(signed_pos_of(&db, &t), FixedPoint::ZERO, "block 16 force-closed the long");
+        assert_eq!(signed_pos_of(&db, &s), FixedPoint::ZERO, "and the short");
+        assert_eq!(liq::delist_settlement(&db, ORACLE_MARKET).unwrap(), None, "settled");
+        let pm = torus_core::position::PositionManager::new(db.clone());
+        assert_eq!(pm.get_native_balance(&t).unwrap().available, px(1_000_000 - 100), "10 x (990 - 1,000)");
+        assert_eq!(pm.get_native_balance(&s).unwrap().available, px(10_000_000 + 100));
     }
 
     /// adl-budget P2: T (71) and 13 accounts (seeds 80..=92) long 10 @ 1,000,

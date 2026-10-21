@@ -431,6 +431,11 @@ impl BalanceCache {
 #[path = "liquidation_step.rs"]
 mod liquidation_step;
 
+// Delist option C (s131): the settlement of a governance-delisted market
+// (child module: sees the private cancel helpers and `AccountReader`).
+#[path = "delist_settlement.rs"]
+mod delist_settlement;
+
 #[path = "users.rs"]
 mod users;
 use users::Users;
@@ -14634,8 +14639,11 @@ impl NativeExecutor {
     ///   block too, and every resting order and pending stop in its book is
     ///   cancelled, trader by trader in ascending address order, each
     ///   trader's reservation released (the user cancel-all path). Positions
-    ///   are left open: how they settle is an open owner question (roadmap
-    ///   P1); they close with reduce-only orders and stay liquidatable.
+    ///   stay open for the grace period (they close with reduce-only orders
+    ///   and stay liquidatable); delist option C: the market's settlement
+    ///   row is written (`close_at` = this height + `delist_grace_blocks`),
+    ///   and from then the settlement step force-closes what is left
+    ///   (`delist_settlement.rs`).
     /// - `MarketParamsUpdate`: when the row's tick, lot or margin config
     ///   differs from the live one, every resting order and pending stop in
     ///   the book is first cancelled the same way, each reservation released
@@ -14662,6 +14670,7 @@ impl NativeExecutor {
             Some(ExecutionPayload::MarketDelist { market_id }) => {
                 ctx.delisted_markets.insert(market_id);
                 Self::cancel_market_orders_and_stops(ctx, market_id);
+                Self::schedule_delist_settlement(ctx, market_id);
             }
             Some(ExecutionPayload::MarketParamsUpdate { market_id, .. }) => {
                 let row = match ctx

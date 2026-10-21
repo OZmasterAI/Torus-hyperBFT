@@ -544,7 +544,7 @@ impl NativeExecutor {
     /// holds the decoded records with R attached (traders the block wrote are
     /// looked up through the overlay); else the walk itself (one seek per
     /// trader).
-    fn liq_traders_after<T: StateBackend>(
+    pub(super) fn liq_traders_after<T: StateBackend>(
         ctx: &NativeExecContext<T>,
         after: Option<Address>,
         limit: usize,
@@ -1063,7 +1063,8 @@ impl NativeExecutor {
     /// [`Self::adl_cross`] (one pairing position per market and block); a
     /// row still open after both breaks escrow size = Σ rows and is fatal
     /// (review M1). A listed market without a usable mark waits; a delisted
-    /// one ranks at the stored price (owner s96). Then a flat escrow's
+    /// one (no market row, or governance-delisted: `ctx.delisted_markets`)
+    /// ranks at the stored price (owner s96). Then a flat escrow's
     /// balance (dust) goes to the vault.
     fn adl_drain<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
@@ -1095,9 +1096,17 @@ impl NativeExecutor {
             // the later rows of the key reuse that ranking, whatever their own
             // stored price (each still closes at its own price). 18c review
             // nit g: documented, not changed.
+            // Codex P2 (s131): a governance-delisted market stays in
+            // `listed` (its row and oracle remain) but is delisted too: its
+            // oracle may never return (a stale-price delist settlement leaves
+            // only the escrow and the vault's mirror), so it never waits.
             let rank_px = match marks.get(&o.market) {
                 Some(&mark) => mark,
-                None if listed.binary_search(&o.market).is_err() => o.price, // delisted
+                None if listed.binary_search(&o.market).is_err()
+                    || ctx.delisted_markets.contains(&o.market) =>
+                {
+                    o.price // delisted
+                }
                 None => {
                     waiting += 1; // listed, stale: wait
                     continue;
