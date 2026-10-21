@@ -401,15 +401,21 @@ action. It needs the normal vote and timelock.
 
 - Submission: `price` > 0, and `market_id` has a market row. The market need not be delisted yet,
   so the proposal can be voted alongside the delist.
-- Execution at height E: the market is delisted, and E <= its `close_at` (or the delist executed
-  in the same block, from a lower proposal id). Otherwise the proposal ends `Failed` with nothing
-  written: the price is already fixed, the market is already settled, or the market is not
-  delisted. A later close-price proposal that executes in time replaces an earlier one.
-- Plan the timing. The vote plus the timelock (24 h by default) must end at or before `close_at`.
-  With the default grace period (also 24 h), submit the close-price proposal before or together
-  with the delist, or raise `delist_grace_blocks` first.
-- After `close_at` governance cannot change or set the price. This includes a market that waits
-  for a price because it has no oracle price at all.
+- Execution at height E: the market is delisted and its settlement price is not fixed yet. That
+  covers the grace period, `close_at` itself (governance runs before the settlement step), a
+  settlement still waiting for a price after `close_at` (no oracle price at all), and the delist's
+  own block (the close-price proposal needs a higher proposal id than the delist). Otherwise the
+  proposal ends `Failed` with nothing written: the price is already fixed (first settlement block),
+  the market is already settled, or the market is not delisted. A later close-price proposal that
+  executes in time replaces an earlier one.
+- A settlement waiting after `close_at` takes an executed close price in the same block: the walk
+  starts at it, ahead of a mark that appears in that block.
+- Plan the timing. To set the price that the settlement uses when an oracle price exists, the vote
+  plus the timelock (24 h by default) must end at or before `close_at`. With the default grace
+  period (also 24 h), submit the close-price proposal before or together with the delist, or raise
+  `delist_grace_blocks` first. Once the price is fixed, governance cannot change it.
+- Not chosen (owner s134): the earlier, stricter rule "E <= `close_at` only". It left a market
+  with no oracle price at all waiting forever after `close_at`, with no governance way out.
 
 **Oracle submissions for a settled market.** A market's settlement is complete when its settlement
 row is gone and the liquidator vault and both ADL escrows hold no position in it. From then on

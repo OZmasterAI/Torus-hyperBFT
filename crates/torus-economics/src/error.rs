@@ -192,7 +192,7 @@ pub enum EconomicsError {
     DelistClosePriceNotPositive(u64),
 
     /// Delist decisions (owner s134, 1c): a close price executing after the
-    /// settlement price was fixed (height > `close_at`) or the market settled.
+    /// settlement price was fixed (first settlement block) or the market settled.
     #[error("market {0}: delist close price too late (settlement price fixed or market settled)")]
     DelistClosePriceTooLate(u64),
 

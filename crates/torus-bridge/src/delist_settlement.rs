@@ -11,10 +11,11 @@
 //!   (after `process_governance`) settles it:
 //!   1. the settlement price is chosen ONCE, at the first settlement block,
 //!      and stored in the row: the governance close price (owner s134, 1c:
-//!      `SetDelistClosePrice`, executed before or at `close_at`; consumed
-//!      here), else the usable oracle mark (block-start table), else the
-//!      last aggregated oracle price (stale but > 0, no age cap), else none:
-//!      the row waits (an error result, retried every block);
+//!      `SetDelistClosePrice`, executed while no price is fixed, also after
+//!      `close_at` while the row waits; consumed here), else the usable
+//!      oracle mark (block-start table), else the last aggregated oracle
+//!      price (stale but > 0, no age cap), else none: the row waits (an
+//!      error result, retried every block);
 //!   2. every resting order and pending stop in the market is cancelled and
 //!      refunded (each settlement block: reduce-only orders placed between
 //!      settlement blocks never survive one);

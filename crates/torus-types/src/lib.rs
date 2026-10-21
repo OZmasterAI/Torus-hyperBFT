@@ -1572,9 +1572,10 @@ pub enum ProposalAction {
     },
     /// Delist decisions (owner s134, 1c), appended: the settlement price of
     /// the delisted market `market_id`. Valid at submission when `price` > 0
-    /// and the market has a row; executes only while the settlement price is
-    /// not fixed (height <= `close_at`, or the delist's own block), else the
-    /// proposal fails. Stored in [`delist_close_price_key`]; at the first
+    /// and the market has a row; executes only while the market is delisted
+    /// and its settlement price is not fixed (grace period, `close_at`, a
+    /// settlement still waiting for a price after `close_at`, or the delist's
+    /// own block), else the proposal fails. Stored in [`delist_close_price_key`]; at the first
     /// settlement block it wins over the mark and the last aggregate.
     SetDelistClosePrice {
         market_id: MarketId,

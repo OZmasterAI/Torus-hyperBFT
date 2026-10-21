@@ -1853,14 +1853,17 @@ impl<T: StateBackend> GovernanceManager<T> {
     }
 
     /// Delist decisions (owner s134, 1c): a close price for `market_id` may
-    /// execute at `current_block` only while its settlement price is not
-    /// fixed: the market is delisted, and either its settlement row
-    /// (`CF_NATIVE_LIQUIDATION 0x08 ‖ market`, first 8 bytes `close_at` BE)
-    /// has `current_block <= close_at` (the settlement step runs after
-    /// governance, so at `close_at` it has not fixed a price yet), or the
+    /// execute at `current_block` while the market is delisted and its
+    /// settlement price is not fixed: either its settlement row
+    /// (`CF_NATIVE_LIQUIDATION 0x08 ‖ market`: `close_at` (8, BE), plus the
+    /// price (16) once fixed) holds no price yet (the grace period, `close_at`
+    /// itself since the settlement step runs after governance, or after
+    /// `close_at` while the settlement waits because no price exists), or the
     /// delist executed in this block (its flag value is the delist height;
-    /// the executor writes the row right after the governance step). No row
-    /// otherwise means the market is settled: too late.
+    /// the executor writes the row right after the governance step). A row
+    /// with a price, or no row otherwise (settled), is too late. Owner s134
+    /// loosened this from "E <= `close_at`" (not chosen: it stranded a
+    /// settlement with no oracle price at all).
     fn check_delist_close_price(&self, market_id: u64, price: FixedPoint, current_block: u64) -> Result<()> {
         if price <= FixedPoint::ZERO {
             return Err(EconomicsError::DelistClosePriceNotPositive(market_id));
@@ -1876,7 +1879,7 @@ impl<T: StateBackend> GovernanceManager<T> {
             .state
             .get_cf_raw(CF_NATIVE_LIQUIDATION, &torus_types::delist_settlement_key(market_id))?;
         let in_time = match row {
-            Some(v) => be8(&v).is_some_and(|close_at| current_block <= close_at),
+            Some(v) => v.len() == 8,
             None => be8(&flag) == Some(current_block),
         };
         if in_time {
