@@ -368,8 +368,9 @@ fn byzantine_voter_with_a_forged_high_qc_cannot_block_case_3() {
 /// vote with a forged tip, a header for the vote's own view over a block
 /// nobody has, signed by itself (not the view's leader), re-signed so the
 /// vote itself is correct. Without F4 the forged tip wins every TC it is in
-/// and the next leader can only recover through an NEC whose fresh block
-/// conflicts with the lock: the chain stalls behind every silent slot.
+/// and the next leader must run a recovery (ProposalRequest / NERequest) for
+/// a block nobody has; with F4 honest replicas drop the vote, so no TC carries
+/// the forged tip and nobody recovers it.
 #[test]
 fn byzantine_voter_with_a_forged_tip_cannot_block_the_tc() {
     let mut cluster = Cluster::new();
@@ -378,10 +379,26 @@ fn byzantine_voter_with_a_forged_tip_cannot_block_the_tc() {
     let byz = byz_key.verifying_key();
     let vs = cluster.validator_set();
     let forged = Arc::new(Mutex::new(0u64));
+    let recoveries = Arc::new(Mutex::new(0u64));
+    let justify = PhaseCertificate::genesis_pc();
+    let data_hash = CryptoHash::new([0xDD; 32]);
+    let height = hotstuff_rs::types::data_types::BlockHeight::new(0);
+    let forged_block = hotstuff_rs::types::block::Block::hash(height, &justify, &data_hash);
 
     let forged_in = forged.clone();
+    let recoveries_in = recoveries.clone();
     cluster.filter.rewrite(Arc::new(move |sender, _recipient, message| {
         if *sender != byz {
+            let tc = match &message {
+                Message::ProgressMessage(ProgressMessage::HotStuffMessage(HotStuffMessage::NERequest(r))) => Some(&r.tc),
+                Message::ProgressMessage(ProgressMessage::HotStuffMessage(HotStuffMessage::ProposalRequest(r))) => {
+                    Some(&r.tc)
+                }
+                _ => None,
+            };
+            if tc.and_then(|tc| tc.high_tip.as_ref()).is_some_and(|tip| tip.block_hash == forged_block) {
+                *recoveries_in.lock().unwrap() += 1;
+            }
             return Some(message);
         }
         match message {
@@ -391,17 +408,13 @@ fn byzantine_voter_with_a_forged_tip_cannot_block_the_tc() {
                     // A tip byz signs for its own view would be a real header.
                     return Some(PacemakerMessage::TimeoutVote(vote).into());
                 }
-                let justify = PhaseCertificate::genesis_pc();
-                let data_hash = CryptoHash::new([0xDD; 32]);
-                let height = hotstuff_rs::types::data_types::BlockHeight::new(0);
-                let block_hash = hotstuff_rs::types::block::Block::hash(height, &justify, &data_hash);
                 vote.local_tip = Some(TipInfo {
-                    block_hash,
+                    block_hash: forged_block,
                     block_height: height,
-                    block_justify: justify,
+                    block_justify: justify.clone(),
                     block_data_hash: data_hash,
                     view: vote.view,
-                    leader_signature: sign_proposal_header(&byz_key, vote.chain_id, vote.view, &block_hash),
+                    leader_signature: sign_proposal_header(&byz_key, vote.chain_id, vote.view, &forged_block),
                 });
                 vote.highest_qc = None;
                 vote.signature = SignatureBytes::new(byz_key.sign(&timeout_vote_bytes(&vote)).to_bytes());
@@ -414,6 +427,8 @@ fn byzantine_voter_with_a_forged_tip_cannot_block_the_tc() {
     cluster.start(&[]);
     cluster.wait_for_commits(TARGET_HEIGHT, "a byzantine voter forges its tip");
     assert!(*forged.lock().unwrap() > 0, "scenario: no forged timeout vote was sent");
+    let recoveries = *recoveries.lock().unwrap();
+    assert_eq!(recoveries, 0, "honest leaders ran {recoveries} recovery requests for the forged tip (its TC formed)");
 }
 
 // ---------------------------------------------------------------------------
@@ -496,7 +511,23 @@ fn validator_set_update_commits_through_timeout_views() {
     // itself while the block justifies below it (the V3 amendment's case).
     let amended = Arc::new(Mutex::new(HashSet::<u64>::new()));
     let amended_in = amended.clone();
+    // Force that case once: drop the first Prepare nudge (the leader of the
+    // view after the update block's carries its Prepare QC). That view times
+    // out with the Prepare QC only in the nudging leader's hands; with one of
+    // five down every live vote is in the TC (quorum 4), so the TC's high QC
+    // is that Prepare QC and the next leader re-proposes the update block
+    // under it, justifying below it.
+    let dropped_nudge = Arc::new(Mutex::new(None::<u64>));
     cluster.filter.rewrite(Arc::new(move |_sender, _recipient, message| {
+        if let Message::ProgressMessage(ProgressMessage::HotStuffMessage(HotStuffMessage::Nudge(nudge))) = &message {
+            if nudge.justify.phase == Phase::Prepare {
+                let mut dropped = dropped_nudge.lock().unwrap();
+                if dropped.is_none_or(|view| view == nudge.view.int()) {
+                    *dropped = Some(nudge.view.int());
+                    return None;
+                }
+            }
+        }
         if let Some(h) = header_of(&message) {
             let q = h.tc.as_ref().and_then(|tc| tc.high_qc.as_ref());
             if h.has_validator_set_updates && q.is_some_and(|q| q.block == h.block_hash && h.justify.view < q.view) {
