@@ -229,6 +229,37 @@ pub fn checkpoint_interval_explicit() -> bool {
     checkpoint_interval_env_set(std::env::var("TORUS_CHECKPOINT_INTERVAL_MS").ok().as_deref())
 }
 
+/// 8k L3.1 (`TORUS_BOOK_COALESCE`, node-local, requested by default since
+/// s131, perf doc section 110): pure parse. Unset, empty, `1` or `true`
+/// (trimmed, any case) = requested; `0` or `false` = off (the kill switch);
+/// anything else is warned and off, so a typo in an explicit value reads as
+/// the kill switch (as `TORUS_EPOCH_FAST_PATH`). Requested is not on: the
+/// node also needs a checkpoint interval without a byte cap, Classic +
+/// resident books with the untouched-block advance and the running hash not
+/// configured; otherwise it warns once at startup and stays off
+/// (`ExecutionContext::configure_book_coalesce`).
+pub fn parse_book_coalesce(v: Option<&str>) -> bool {
+    let Some(v) = v else {
+        return true;
+    };
+    match v.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "true" => true,
+        "0" | "false" => false,
+        _ => {
+            tracing::warn!(
+                value = v,
+                "TORUS_BOOK_COALESCE: not empty, 1, true, 0 or false (any case); reading it as off (0)"
+            );
+            false
+        }
+    }
+}
+
+/// [`parse_book_coalesce`] of the environment.
+pub fn book_coalesce_requested() -> bool {
+    parse_book_coalesce(std::env::var("TORUS_BOOK_COALESCE").ok().as_deref())
+}
+
 /// `TORUS_CHECKPOINT_MAX_BYTES`: cap on the since-checkpoint layer's bytes.
 pub fn checkpoint_max_bytes() -> Option<u64> {
     parse_checkpoint_max_bytes(std::env::var("TORUS_CHECKPOINT_MAX_BYTES").ok())
@@ -1249,6 +1280,7 @@ fn run_job(
             let landed = match flush_result {
                 Ok(stats) => {
                     observe_flush_stats(env, &stats);
+                    observe_checkpoint_write(env, *height, &stats);
                     Ok(())
                 }
                 Err(e) if marker_is(env, *height) => Err(JobError::TrieStale(e.to_string())),
@@ -1431,6 +1463,29 @@ fn resync_evm(env: &WorkerEnv, height: u64, evm_addrs: Vec<Address>) {
         m.exec_evm_resync_seconds
             .observe(resync_timer.elapsed().as_secs_f64());
     }
+}
+
+/// T5.3 part 0: the checkpoint's state-DB write window, as a histogram, two
+/// wall-clock gauges (unix ms) and one info line per checkpoint, so a bench
+/// can cut block intervals to the DB write itself (section 106 needed a /proc
+/// sampler for this) even when two checkpoints fall between two scrapes.
+fn observe_checkpoint_write(env: &WorkerEnv, height: u64, stats: &torus_state::NativeFlushStats) {
+    if let Some(m) = &env.metrics {
+        m.exec_checkpoint_db_write_seconds
+            .observe(stats.write_db_seconds);
+        m.exec_checkpoint_db_write_start_ms
+            .set(i64::try_from(stats.write_db_start_unix_ms).unwrap_or(i64::MAX));
+        m.exec_checkpoint_db_write_end_ms
+            .set(i64::try_from(stats.write_db_end_unix_ms).unwrap_or(i64::MAX));
+    }
+    tracing::info!(
+        height,
+        batch_bytes = stats.batch_bytes,
+        write_ms = (stats.write_db_seconds * 1e4).round() / 10.0,
+        start_ms = stats.write_db_start_unix_ms,
+        end_ms = stats.write_db_end_unix_ms,
+        "checkpoint db write"
+    );
 }
 
 /// Item 7 option 0 (task 2.1): stage a fast-path EVM block's side rows
@@ -1641,6 +1696,24 @@ mod tests {
             Some(268_435_456)
         );
         assert_eq!(parse_checkpoint_max_bytes(Some("lots".into())), None);
+    }
+
+    /// 8k L3.1: `TORUS_BOOK_COALESCE` is requested by default since s131
+    /// (perf doc section 110): unset, empty, `1` / `true` = requested; `0` /
+    /// `false` (trimmed, any case) = off; anything else is warned and off
+    /// (a typo in an explicit value is read as the kill switch, as
+    /// `TORUS_EPOCH_FAST_PATH`).
+    #[test]
+    fn book_coalesce_flag_parse() {
+        assert!(parse_book_coalesce(None), "requested by default");
+        for on in ["", " ", "1", " 1 ", "1\n", "true", "TRUE", " True"] {
+            assert!(parse_book_coalesce(Some(on)), "{on:?}");
+        }
+        for off in [
+            "0", " 0 ", "false", "FALSE", " False ", "yes", "2", "on", "off", "01",
+        ] {
+            assert!(!parse_book_coalesce(Some(off)), "{off:?}");
+        }
     }
 
     /// Step 6: the compiled default. Unset or empty = the role default
@@ -2122,6 +2195,83 @@ mod tests {
         assert!(worker.wait_idle());
         let (ref120, _r2) = reference_db(81..=120, 81);
         assert_dumps_eq(&dump_all(&db), &dump_all(&ref120), "checkpoint at 120");
+    }
+
+    /// T5.3 part 0: each checkpoint observes its DB write once (digests
+    /// observe nothing) and sets the write's start / end wall clock (unix ms)
+    /// gauges, so a bench can cut windows to the DB write without a /proc
+    /// sampler; the second checkpoint moves them forward.
+    #[test]
+    fn checkpoint_observes_the_db_write_window_once() {
+        let (mut env, _dir) = temp_env(None);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        env.metrics = Some(metrics.clone());
+        let db = env.state_db.clone();
+        torus_state::running_hash::configure_activation(&db, Some(1)).unwrap();
+        let worker = FlushWorker::spawn_checkpointing(env, 0);
+        let value = |text: &str, name: &str| -> f64 {
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("{name} ")))
+                .unwrap_or_else(|| panic!("{name} missing:\n{text}"))
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        let write = "torus_exec_checkpoint_db_write_seconds";
+        let start = "torus_exec_checkpoint_db_write_start_ms";
+        let end = "torus_exec_checkpoint_db_write_end_ms";
+        let before_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as f64;
+
+        let layer = digest_window(&worker, &db, 1..=10);
+        assert!(worker.wait_idle());
+        let text = metrics.encode();
+        assert_eq!(value(&text, &format!("{write}_count")), 0.0, "digests");
+        worker
+            .submit(Job::Checkpoint {
+                height: 10,
+                layer: Arc::new(layer),
+            })
+            .unwrap();
+        assert!(worker.wait_idle());
+        let text = metrics.encode();
+        assert_eq!(
+            value(&text, &format!("{write}_count")),
+            1.0,
+            "one checkpoint"
+        );
+        assert!(
+            value(&text, &format!("{write}_sum")) > 0.0,
+            "write wall timed"
+        );
+        let (s1, e1) = (value(&text, start), value(&text, end));
+        assert!(
+            before_ms <= s1 && s1 <= e1,
+            "span [{s1}, {e1}] after {before_ms}"
+        );
+
+        let layer = digest_window(&worker, &db, 11..=20);
+        assert!(worker.wait_idle());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        worker
+            .submit(Job::Checkpoint {
+                height: 20,
+                layer: Arc::new(layer),
+            })
+            .unwrap();
+        assert!(worker.wait_idle());
+        let text = metrics.encode();
+        assert_eq!(
+            value(&text, &format!("{write}_count")),
+            2.0,
+            "two checkpoints"
+        );
+        assert!(
+            value(&text, start) > e1,
+            "second window starts after the first ends"
+        );
     }
 
     /// A failed checkpoint write latches W and the shared fail-stop; nothing

@@ -57,6 +57,13 @@ fn order(market_id: MarketId, price: i64, ot: OrderType, cloid: Option<u128>) ->
 /// a bid without a cloid (market 1). Persisted by the real save path.
 fn seed(dir: &TempDir, mode: BookMode) -> StateDb {
     let db = StateDb::open(dir.path()).unwrap();
+    // Pre-testnet P0: orders need a listed market (a placeholder row
+    // where the test has none).
+    for m in [1u64, 2] {
+        if db.get_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes()).unwrap().is_none() {
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+        }
+    }
     let mut ctx = NativeExecContext::new_with_mode(
         db.clone(),
         1,

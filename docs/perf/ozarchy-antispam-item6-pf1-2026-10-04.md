@@ -17717,6 +17717,916 @@ Notes:
   `endpass-state.txt`), plus `chain-main.log`, `contention-main.tsv`, `foreign-main.txt`, `w8-samples/` and
   `w8-sampler-main.log`.
 
+## 113. Step 9a, merged-main baseline with every s131 default on: one binary main `654f047c` (= `5013cc79` + docs), code defaults, N = no EVM load vs E = `EVM_LOAD_RATE=10 EVM_LOAD_SENDERS=40`, Classic, 15 s checkpoints, standard shape, N E E N, 300 s cells, n = 2 (campaign ozarchy-9a, archy, 2026-10-20)
+
+**No regression visible. Merged main with all s131 defaults on matches the per-feature A/Bs: N runs 268.8k matched/s,
+15.47 native blocks/s, block p50 / p99 14 / 659 ms, 0 timeouts, exec-thread on-CPU 2.503 ms per 1k fills and 22.77
+CPU-s per 1M fills. Every metric is within ~1.5% of section 108 B (L2.2 on, 268.6k, 15.58 blocks/s), and exec on-CPU
+per fill is 2% lower (2.557 there, with L3.3 off; L3.3 and option 0 are on here). The EVM load costs nothing measurable: E / N
+matched/s 0.999 [0.944, 1.058], CPU-s per 1M 1.002 [0.983, 1.021], exec on-CPU per 1k fills 1.004 [0.963, 1.047],
+blocks/s 1.011, p50 0.992, 1 timeout in 9,463 E blocks (after_vote). In section 107 (other binaries, indicative only) the
+EVM load cost ~3.4% of block rate (Noff 13.88, Eon 13.41 blocks/s); here N 15.47, E 15.64. One thing to watch: the
+flush worker (off the exec thread) takes 8% more per 1k fills under E (1.081 [0.85, 1.37]), unresolved at n = 2.**
+
+### 113.1 Setup
+
+* Binary: one fresh build of main `654f047c` (`git diff --stat 5013cc79 654f047c -- ':!docs'` is empty) in worktree
+  `wt/9a-654f047c`, fresh `CARGO_TARGET_DIR` `~/.cargo-target-9a`, 8l4 flags (plain `release --locked`, one package at
+  a time, clang + mold from `.cargo/config`). Node md5 `ce0f110ce3501c55018754bba685caa9` on 3 / 3 nodes in all 5 cells;
+  bench `eaf9f007`, flood `dd59d50d` (`~/bench-results-matched/ozarchy-9a-stage/build/md5s.txt`). The node carries
+  `TORUS_EVM_FAST_PATH`, `TORUS_SETTLE_NO_MERGE`, `TORUS_BOOK_FAST_ENCODE` and `torus_exec_evm_fast_path_blocks` (checked
+  with `strings`).
+* Tools frozen from main `654f047c` (`ozarchy-9a-tools/FROZEN.txt`), so the cell line logs book mode and flags; same
+  N = 11 bench genesis as 8z.
+* Both arms: code defaults, nothing set (so L2.2, L3.3, option 0 E, PC, F, D / M / T on), 512 KB push threshold from
+  `env.sh`, custody 0, Classic (no `TORUS_BOOK_ROWS`; every `cell=` line shows `book_mode=classic`, flags unset),
+  15 s checkpoints, standard (hsdb-300m) load. **N** = no EVM load; **E** = `EVM_LOAD_RATE=10 EVM_LOAD_SENDERS=40`
+  (8l's E).
+* Order: w1 (N, 120 s, warm-up gate), then N E E N at 300 s, so n = 2 per arm. Campaign 19:33-20:02.
+* Cells: `~/bench-results-matched/ozarchy-9a-{w1,r1-N,r1-E,r2-E,r2-N}`.
+
+### 113.2 Validity
+
+* 5 / 5 cells rc 0, ACCEPT / AGREE / PASS, right node md5 on every node, 0 panic and 0 fail-stop lines, no-merge
+  fallbacks 0 on every node, boundary checkpoints all pipelined (true:false 58-60:0 per node).
+* Both E cells landed 3000 / 3000 EVM transactions, none off-cadence.
+* Contention (30 s sampler + post-run foreign-CPU check, adapted from 8z): no foreign process averaged over 0.1 core in
+  any cell (largest: claude, 0.054). A Telegram process showed up in 4 / 4 samples of the warm-up and 5 / 10 of r1-N
+  but never in the top-5 CPU list (under ~0.02 core), so no cell was rerun.
+
+### 113.3 Per cell (run order; node mean)
+
+| cell | arm | matched/s | native blk/s | fills/blk | exec block ms | block p50 / p99 ms | CPU-s / 1M | exec on-CPU ms / 1k fills | timeouts | RSS mean / max MB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| w1 | N | 272,345 | 15.352 | 15,234 | 51.7 | 14 / 662 | 22.19 | 2.474 | 0 | 3,537 / 4,370 |
+| r1 | N | 267,311 | 15.248 | 16,496 | 57.5 | 14 / 679 | 22.79 | 2.507 | 0 | 3,610 / 4,326 |
+| r1 | E | 268,343 | 15.891 | 15,834 | 54.9 | 14 / 644 | 22.80 | 2.509 | 1 | 3,560 / 4,350 |
+| r2 | E | 268,816 | 15.393 | 16,233 | 56.3 | 14 / 671 | 22.83 | 2.518 | 0 | 3,671 / 4,473 |
+| r2 | N | 270,212 | 15.686 | 16,133 | 55.9 | 14 / 640 | 22.76 | 2.499 | 0 | 3,636 / 4,478 |
+
+Replicate spread: N matched/s CV 0.76%, CPU-s per 1M CV 0.11%; E 0.12% and 0.10%.
+
+### 113.4 Arm means, E / N, and the references (ratio = geomean of the 2 per-round ratios, 95% t CI, 1 df)
+
+| metric | N | E | E / N [95% CI] | section 108 B (L2.2 on, `eabec5e5`) | N / 108 B |
+|---|---|---|---|---|---|
+| matched/s | 268,762 | 268,580 | 0.999 [0.944, 1.058] | 268.6k | 1.001 |
+| native blocks/s | 15.47 | 15.64 | 1.011 [0.69, 1.48] | 15.58 | 0.993 |
+| fills per native block | 16,314 | 16,033 | 0.983 | 16,247 | 1.004 |
+| block p50 / p99 ms | 14 / 659 | 14 / 657 | 0.992 / 0.997 | 14 / 649 | 1.00 / 1.015 |
+| timeouts per 1k native blocks | 0.000 (0 / 9,373) | 0.106 (1 / 9,463, after_vote) | n/a | 0 | n/a |
+| exec ms per 1k fills | 3.473 | 3.468 | 0.999 [0.956, 1.043] | 3.491 | 0.995 |
+| **exec-thread on-CPU ms per 1k fills** | 2.503 | 2.513 | 1.004 [0.963, 1.047] | 2.557 | 0.979 |
+| CPU-s per 1M fills | 22.77 | 22.82 | 1.002 [0.983, 1.021] | 22.66 | 1.005 |
+| RSS mean / max MB | 3,623 / 4,402 | 3,615 / 4,412 | 0.998 / 1.002 | 3,579 / 4,472 | 1.012 / 0.984 |
+| settle phase ms per 1k fills | 0.954 | 0.953 | 0.999 | | |
+| flush_all ms per 1k fills | 0.442 | 0.442 | 0.998 | | |
+| save_order_books ms per 1k fills | 0.187 | 0.190 | 1.016 [0.979, 1.055] | | |
+| flush worker ms per 1k fills | 0.314 | 0.339 | 1.081 [0.85, 1.37] | | |
+| exec busy share | 0.876 | 0.870 | 0.992 | | |
+
+Section 107 (8l4's binaries, Noff / Eon, indicative only): 13.88 / 13.41 native blocks/s, E / N ~0.966. Here 15.47 /
+15.64.
+
+### 113.5 Verdict
+
+* **No regression visible** against the per-feature A/Bs: matched/s, blocks/s, p50 / p99, exec ms per fill and CPU-s
+  per 1M fills on merged main all sit within ~1.5% of section 108 B, which is inside run-to-run noise between campaigns.
+  Exec-thread on-CPU per 1k fills is 2.1% lower than 108 B, consistent with L3.3 (section 105), off in both of 108's
+  arms (`eabec5e5` predates its default-on), now being on (different binary, genesis and campaign, so not a measured
+  effect).
+* The EVM load at 10 / s no longer moves the native path: every per-fill row is E / N 0.98-1.02 with CIs around 1.
+* Watch: flush worker ms per 1k fills +8% under E (both rounds higher, 1.06 / 1.10; CI spans 1). It runs off the exec
+  thread and does not show in exec on-CPU or blocks/s.
+
+### 113.6 Limits and data
+
+* n = 2 per arm, 1 df: the blocks/s, p99 and per-block CIs are wide (blocks/s 0.69-1.48). Only per-fill rows resolve.
+* The section 107 / 108 references are other binaries and campaigns (108 also another genesis, `d694b81b`, and L3.3
+  off); the comparison is indicative.
+* Analysis: `~/bench-results-matched/ozarchy-9a-run/analyst/9a.txt` (`9a-analyse.py`, a copy of 8t's).
+* Campaign: `~/bench-results-matched/ozarchy-9a-run/campaign/` (`campaign.log`, `cells.tsv`), `contention-main.tsv`;
+  spec and driver `ozarchy-9a-tools/{9a-spec.json,ozarchy-9a-campaign.sh}`; build `ozarchy-9a-stage/build/`.
+
+## 114. Step 9b, L2.1 A/B: streamed in-order settle: one binary `perf/l21-streamed-settle` `df9e1d8a`, both arms `TORUS_SETTLE_NO_MERGE=1 TORUS_BOOK_FAST_ENCODE=1`, A = those vs B = A + `TORUS_SETTLE_STREAMED=1`, Classic, 15 s checkpoints, no EVM load, deep (8i P1M) and standard shapes, A B B A, 300 s cells, n = 2 (campaign ozarchy-9b, archy, 2026-10-20)
+
+**L2.1 raises block rate and lowers latency but fails the exec-path merge rule on deep: exec-thread on-CPU per 1k fills
+1.044 [1.009, 1.081] (both rounds 1.04-1.05), standard 1.035 [0.934, 1.146]. Everything else under the rule is better or
+flat: native blocks/s deep 1.206 [0.911, 1.596] (3.68 -> 4.43), standard 1.103 [0.834, 1.460] (15.04 -> 16.60); block
+p50 deep 0.679 (179 -> 122 ms), standard 0.970 [0.930, 1.012]; p99 deep 0.882, standard 0.871; matched/s deep 1.021
+[0.983, 1.061], standard 0.998; CPU-s per 1M fills deep 0.997, standard 0.989; exec wall per 1k fills deep 0.978
+[0.968, 0.989]. Deep timeouts went up, 5 -> 10 (2.25 -> 3.73 per 1k blocks; view-timeout reasons 8 -> 25, mostly
+after_vote); standard 1 -> 0. Fallbacks 0 in every cell. The extra exec-thread work is wake-up cost: runqueue wait per 1k
+fills doubles (deep 2.11x, standard 1.88x), consistent with `StreamRx::take` parking the exec thread per market and the
+pool unparking it; exec-pool CPU per 1k fills falls 5-8%. Verdict: not a default-on candidate under the rule as written;
+default-off merge only as an owner exception. Suggested next step: batch the wake-ups (or spin briefly before parking)
+and rerun deep at n = 3.**
+
+### 114.1 Setup
+
+* Binary: one fresh build of `origin/perf/l21-streamed-settle` `df9e1d8a` (on main `be87c86e`) in worktree
+  `wt/9b-df9e1d8a`, fresh `CARGO_TARGET_DIR` `~/.cargo-target-9b`, 8l4 flags (plain `release --locked`, one package
+  at a time, clang + mold). Node md5 `c7ce653406267d8749b6f5e07a42a392` on 3 / 3 nodes in all 10 cells; bench
+  `7779bff1`, flood `dd59d50d` (`~/bench-results-matched/ozarchy-9b-stage/build/md5s.txt`). The node carries
+  `TORUS_SETTLE_STREAMED`, `TORUS_SETTLE_NO_MERGE` and `TORUS_BOOK_FAST_ENCODE` (checked with `strings`).
+* Tools: 9a's freeze of main `654f047c` (`ozarchy-9a-tools`), checked identical.
+* Both arms: code defaults plus `TORUS_SETTLE_NO_MERGE=1 TORUS_BOOK_FAST_ENCODE=1` (the base predates the s131
+  default flips), Classic (no `TORUS_BOOK_ROWS`; every `cell=` line shows `book_mode=classic` and the arm's flags, also
+  in node-env on all 3 nodes), 15 s checkpoints, 512 KB push threshold, custody 0, no EVM load. **B** adds
+  `TORUS_SETTLE_STREAMED=1`.
+* Shapes: **deep** = 8i P1M on 8y's 1M genesis (`a644d0a7`, PRELOAD and BULK_COUNT 1,000,000); **standard** =
+  hsdb-300m. Per shape: w1 (A, warm-up), then A B B A at 300 s, n = 2 per arm.
+* Cells: `~/bench-results-matched/ozarchy-9b{d,s}-{w1,r1-A,r1-B,r2-B,r2-A}`.
+
+### 114.2 Validity
+
+* 10 / 10 cells rc 0, ACCEPT / AGREE / PASS, right node md5 on every node, 0 panic and 0 fail-stop lines, boundary
+  checkpoints all pipelined.
+* Fallbacks: no-merge and streamed-resumed (`torus_exec_settle_streamed_resumed_fallbacks`) 0 / 0 / 0 in every cell.
+  Streamed markets per native block: A 0; B deep 191-204 (45 early), standard 97-101 (18 early), so the flag was live
+  in B only.
+* Contention: no foreign process averaged over 0.1 core (max 0.10 in deep w1, 0.04 in the measured cells); no rerun.
+* Pool busy: the node has no pool metric, so a /proc sampler of the `torus-exec-pool` threads ran (`b9-pool.py`,
+  `pool-main.tsv`; 32 pool threads).
+
+### 114.3 Per cell (run order; node mean)
+
+| shape | cell | arm | matched/s | native blk/s | fills/blk | exec block ms | block p50 / p99 ms | CPU-s / 1M | timeouts |
+|---|---|---|---|---|---|---|---|---|---|
+| deep | w1 | A | 218,863 | 4.902 | 40,439 | 173.7 | 88 / 1,228 | 25.83 | 1 |
+| deep | r1 | A | 231,349 | 3.689 | 60,272 | 255.6 | 169 / 1,416 | 24.82 | 1 |
+| deep | r1 | B | 235,575 | 4.548 | 50,546 | 209.5 | 110 / 1,197 | 24.63 | 5 |
+| deep | r2 | B | 238,905 | 4.321 | 53,651 | 220.4 | 133 / 1,165 | 24.52 | 5 |
+| deep | r2 | A | 233,219 | 3.663 | 61,221 | 256.9 | 188 / 1,266 | 24.48 | 4 |
+| std | w1 | A | 276,884 | 13.756 | 17,192 | 60.3 | 14 / 762 | 22.11 | 0 |
+| std | r1 | A | 270,897 | 14.778 | 17,166 | 59.5 | 14 / 731 | 22.58 | 0 |
+| std | r1 | B | 269,770 | 16.669 | 15,222 | 50.1 | 14 / 615 | 22.47 | 0 |
+| std | r2 | B | 270,464 | 16.521 | 15,489 | 50.1 | 14 / 615 | 22.12 | 0 |
+| std | r2 | A | 270,448 | 15.307 | 16,646 | 57.7 | 14 / 681 | 22.52 | 1 |
+
+### 114.4 Arm means and B / A (ratio = geomean of the 2 per-round ratios, 95% t CI, 1 df)
+
+| metric | deep A | deep B | deep B / A | std A | std B | std B / A |
+|---|---|---|---|---|---|---|
+| **exec-thread on-CPU ms per 1k fills** | 3.200 | 3.342 | **1.044 [1.009, 1.081]** | 2.541 | 2.629 | 1.035 [0.934, 1.146] |
+| native blocks/s | 3.676 | 4.434 | 1.206 [0.911, 1.596] | 15.04 | 16.60 | 1.103 [0.834, 1.460] |
+| block p50 ms | 179 | 122 | 0.679 [0.409, 1.128] | 14 | 14 | 0.970 [0.930, 1.012] |
+| block p99 ms | 1,341 | 1,181 | 0.882 [0.511, 1.522] | 706 | 615 | 0.871 [0.555, 1.367] |
+| timeouts per 1k native blocks | 2.25 (5 / 2,224) | 3.73 (10 / 2,683) | n/a | 0.11 (1 / 9,101) | 0 (0 / 10,040) | n/a |
+| view-timeout reasons (all / after_vote / leader / no_vote) | 8 / 8 / 0 / 0 | 25 / 20 / 4 / 1 | | 1 / 1 / 0 / 0 | 0 | |
+| matched/s | 232,284 | 237,240 | 1.021 [0.983, 1.061] | 270,672 | 270,117 | 0.998 [0.972, 1.025] |
+| CPU-s per 1M fills | 24.65 | 24.57 | 0.997 [0.941, 1.056] | 22.55 | 22.29 | 0.989 [0.909, 1.076] |
+| exec ms per 1k fills | 4.219 | 4.127 | 0.978 [0.968, 0.989] | 3.468 | 3.262 | 0.941 [0.848, 1.043] |
+| fills per native block | 60,746 | 52,099 | 0.858 | 16,906 | 15,356 | 0.908 |
+| exec-thread on-CPU s per cell | 224.5 | 239.6 | 1.068 | 208.0 | 214.8 | 1.033 |
+| exec-thread runqueue wait ms per 1k fills | 0.123 | 0.260 | 2.115 | 0.123 | 0.231 | 1.880 |
+| exec busy share | 0.942 | 0.953 | 1.011 | 0.882 | 0.831 | 0.943 |
+| settle phase ms / blk (per 1k fills) | 52.15 (0.858) | 46.64 (0.895) | 0.894 (1.043) | 16.80 (0.993) | 14.93 (0.972) | 0.889 (0.979) |
+| settle pass A ms / blk | 8.73 | 2.47 | 0.283 | 3.00 | 0.94 | 0.312 |
+| settle pass B ms / blk (per 1k fills) | 16.44 (0.271) | 16.06 (0.308) | 0.977 (1.139) | 5.09 (0.301) | 4.89 (0.318) | 0.960 (1.057) |
+| exec-pool on-CPU cores | 1.445 | 1.399 | 0.968 [0.888, 1.055] | 1.611 | 1.487 | 0.923 [0.853, 0.999] |
+| exec-pool on-CPU ms per 1k fills | 6.233 | 5.903 | 0.947 [0.883, 1.016] | 5.953 | 5.506 | 0.925 [0.832, 1.029] |
+| RSS mean MB | 6,231 | 6,252 | 1.003 | 3,665 | 3,687 | 1.006 |
+
+### 114.5 Verdict
+
+* **Merge rule (section 91, owner s128):** B adds exec-thread CPU per fill on deep with the CI above 1 (1.044 [1.009,
+  1.081]); standard points the same way (1.035, CI spans 1). Under the rule as written L2.1 does not merge default on.
+  Blocks/s, p50 and p99 move the right way on both shapes and CPU-s per 1M fills is flat, so this is not the failure
+  the rule guards against (bigger blocks, lower block rate): block rate rises because pass A overlaps matching (pass A
+  per block -70%), while the exec thread itself does ~7% (deep) / ~3% (std) more on-CPU work per cell.
+* **Where the extra exec-thread work comes from:** runqueue wait per 1k fills roughly doubles and pass B per 1k fills
+  rises (1.14 deep, 1.06 std), while pool CPU per fill falls. This fits the per-market park / unpark handoff in
+  `StreamRx::take` (`crates/torus-bridge/src/exec_pool.rs`: the exec thread parks on each market not yet ready and a
+  worker unparks it). Not profiled, so not localized beyond that.
+* **Deep timeouts doubled** (5 -> 10, both B cells 5; reasons 8 -> 25, after_vote 20, leader 4). Small counts at n = 2;
+  not resolved, but it is the wrong direction for the rule.
+* **Options for the owner:** (1) do not merge; (2) merge default off as an exception (+21% / +10% blocks/s, lower p50
+  and p99, 0 fallbacks); (3) cut the wake-ups (batch several markets per handoff or spin briefly before parking), then
+  rerun deep at n = 3 for exec on-CPU per fill and timeouts. Not measured here: the flag-off cost against main (both
+  arms ran the same binary).
+
+### 114.6 Limits and data
+
+* n = 2 per arm, 1 df: blocks/s, p50 and p99 CIs span 1 despite both rounds agreeing in direction.
+* Exec-pool busy comes from a 1 Hz /proc sampler of the `torus-exec-pool` threads, not from a node metric.
+* Analysis: `~/bench-results-matched/ozarchy-9b-run/analyst/` (`9b-analyse.py`; `9b-deep.txt`, `9b-std.txt`).
+* Campaign: `~/bench-results-matched/ozarchy-9b-run/{deep,std}/` (`cells.tsv`, `campaign.log`), `chain-main.log`,
+  `contention-main.tsv`, `pool-main.tsv`; tools and specs `ozarchy-9b-tools/` (`9bd-spec.json`, `9bs-spec.json`,
+  drivers, `9b-chain.sh`, `b9-contention.py`, `b9-foreign.py`, `b9-pool.py`); build `ozarchy-9b-stage/build/`.
+
+## 115. Step 9c, T5.3 A/B: commit manifest in the consensus DB + off-thread header / body write: one binary `perf/t53-manifest-consensus-db` `f72eda52`, both arms `TORUS_SETTLE_NO_MERGE=1 TORUS_BOOK_FAST_ENCODE=1`, A = `TORUS_MANIFEST_IN_STATE_DB=1` (old path) vs B = default (new path), Classic, 15 s checkpoints, standard shape, no EVM load, A B B A, 600 s cells, n = 2 (campaign ozarchy-9c, archy, 2026-10-20)
+
+**The commit hook no longer waits behind the checkpoint batch, and G falls by ~78% but not to 0. Block p99 inside the
+checkpoint DB-write windows (union of the 3 nodes' windows) A 917 -> B 485 ms, B / A 0.53 [0.42, 0.67]; out of window
+465 -> 385 ms (0.83, CI spans 1); G = in - out 452 -> 100 ms (0.22, both rounds 0.20 / 0.25, CI [0.04, 1.12]). Inside
+each node's own windows G is 511 -> 245 ms (0.48). Commit hook p99 in window 815 -> 93 ms (0.11); in-window block
+p50 184 -> 19 ms. No cost found: native blocks/s 16.7 -> 20.1 (1.20, both rounds 1.14 / 1.26, CI [0.64, 2.25]), block
+p50 0.95, p99 0.82, matched/s 0.997 [0.958, 1.037], CPU-s per 1M fills 1.018 [0.995, 1.040], exec-thread on-CPU per 1k
+fills 1.026 [0.935, 1.126] (passes the exec-path merge rule: CI spans 1; B's blocks are 17% smaller). Watch: timeouts
+0 -> 3 in 24,153 B blocks (0.12 per 1k; view-timeout reasons 2 -> 7, 5 no_vote); the persist write on the new writer
+thread is 2.3x slower per block (mean 1.66 -> 3.80 ms, p99 15.6 -> 29.0) and the manifest prune p99 is 115 ms, both
+off the consensus thread; exec waits on the writer only 0.02 ms mean (p99 0.10). A's in-window / out p99 and G sit below
+section 106 (1,071 / 542 / 529 ms) because L2.2 + L3.3 give smaller checkpoint batches (108-118 vs 128 MB).**
+
+### 115.1 Setup
+
+* Binary: one fresh build of `origin/perf/t53-manifest-consensus-db` `f72eda52` (on main `689b4c54`) in worktree
+  `wt/9c-f72eda52`, fresh `CARGO_TARGET_DIR` `~/.cargo-target-9c`, 8l4 flags (plain `release --locked`, one package
+  at a time, clang + mold). Node md5 `af6b207d7efea10eafeaa7e6388ee588` on 3 / 3 nodes in every cell; bench `0962a086`,
+  flood `dd59d50d` (`~/bench-results-matched/ozarchy-9c-stage/build/md5s.txt`). `strings` shows
+  `TORUS_MANIFEST_IN_STATE_DB`, `TORUS_SETTLE_NO_MERGE`, `TORUS_BOOK_FAST_ENCODE` and the new T5.3 metrics.
+* Tools: 9a's freeze of main `654f047c` (`git diff 654f047c..origin/main` over tools, devnet and testnet inputs empty).
+* Both arms: code defaults plus `TORUS_SETTLE_NO_MERGE=1 TORUS_BOOK_FAST_ENCODE=1` (the base predates the s131
+  default flips), Classic (every `cell=` line `book_mode=classic` with the arm's flags), 15 s checkpoints, 512 KB push
+  threshold, custody 0, standard (hsdb-300m) load, no EVM load. **A** adds `TORUS_MANIFEST_IN_STATE_DB=1`; each node
+  logged its manifest home (A true, B false, 3 / 3 nodes per cell).
+* Order: w1 (A, warm-up), then A B B A at 600 s, n = 2 per arm. r2-A rerun (see 115.2).
+* Cells: `~/bench-results-matched/ozarchy-9c-{w1,r1-A,r1-B,r2-B}` and `ozarchy-9crr-r2-A` (used as r2 A; the
+  original `ozarchy-9c-r2-A` is kept, not used).
+* Windows (section 106's method, `9c-t53.py`): each node's checkpoint DB-write windows from its "checkpoint db write"
+  log lines (gauge `torus_exec_checkpoint_db_write_{start,end}_ms` start counts match the log count on every node).
+  "Union" = a block interval counts as in window if it overlaps any of the 3 nodes' windows; "own" = only the node's own.
+  G = in-window p99 - out-of-window p99.
+
+### 115.2 Validity
+
+* All used cells rc 0, ACCEPT / AGREE / PASS, right node md5 on every node, 0 panic and 0 fail-stop lines, no-merge
+  fallbacks 0, boundary checkpoints all pipelined.
+* Contention: the original r2-A averaged 0.128 core of foreign load (codex and the desktop, 0.2-0.4 core in its last
+  ~2.5 min), so it was rerun as `ozarchy-9crr-r2-A` (warm-up `ozarchy-9crr-w1` first). The rerun averaged 0.106 core
+  total foreign load (mostly another Claude session and the desktop), with no single foreign process over 0.1 core,
+  so it passes the per-process rule and was not rerun again. All other cells 0.04-0.05 core. With the original r2-A
+  instead of the rerun, G union is A 476 vs B 100 (B / A 0.21) and in-window p99 936 vs 485: same conclusion.
+
+### 115.3 Per cell (run order; node mean)
+
+| cell | arm | matched/s | native blk/s | fills/blk | block p50 / p99 ms | CPU-s / 1M | exec on-CPU ms / 1k fills | timeouts | ckpt write ms mean (MB) |
+|---|---|---|---|---|---|---|---|---|---|
+| w1 | A | 268,308 | 15.171 | 15,429 | 13 / 663 | 22.26 | 2.518 | 0 | 408 (121.8) |
+| r1 | A | 264,114 | 17.821 | 14,451 | 14 / 503 | 23.63 | 2.632 | 0 | 382 (108.4) |
+| r1 | B | 262,439 | 20.360 | 12,599 | 13 / 480 | 24.00 | 2.681 | 1 | 332 (96.8) |
+| r2 | B | 263,391 | 19.762 | 12,946 | 14 / 480 | 23.81 | 2.664 | 2 | 354 (100.6) |
+| r2 (rerun) | A | 263,443 | 15.670 | 16,285 | 14 / 661 | 23.36 | 2.578 | 0 | 401 (118.4) |
+
+### 115.4 Checkpoint windows (ms, mean of 3 nodes)
+
+| cell | arm | union in p50 / p99 | union out p50 / p99 | **G union** | own in p99 | G own | hook in p50 / p99 / max | hook stalls >= 50 ms in / out |
+|---|---|---|---|---|---|---|---|---|
+| r1 | A | 204.5 / 928 | 11.1 / 423 | **505** | 969 | 540 | 21.8 / 836 / 1,234 | 259 / 529 |
+| r1 | B | 18.8 / 482 | 10.5 / 383 | **99** | 616 | 228 | 0.02 / 109 / 392 | 41 / 251 |
+| r2 | B | 19.5 / 488 | 11.6 / 387 | **101** | 654 | 261 | 0.03 / 78 / 729 | 45 / 255 |
+| r2 (rerun) | A | 163.4 / 905 | 11.7 / 508 | **398** | 989 | 482 | 8.0 / 795 / 982 | 204 / 439 |
+
+### 115.5 Arm means and B / A (ratio = geomean of the 2 per-round ratios, 95% t CI, 1 df)
+
+| metric | A | B | B / A [95% CI] |
+|---|---|---|---|
+| block p99 in window (union) | 917 | 485 | 0.53 [0.42, 0.67] |
+| block p99 out of window (union) | 465 | 385 | 0.83 [0.28, 2.46] |
+| **G (union)** | **452** | **100** | **0.22 [0.04, 1.12]** |
+| G (own windows) | 511 | 245 | 0.48 [0.10, 2.34] |
+| commit hook p99 in window | 815 | 93 | 0.11 [0.02, 0.67] |
+| checkpoint DB write ms mean | 391 | 343 | 0.88 [0.79, 0.97] |
+| native blocks/s | 16.75 | 20.06 | 1.20 [0.64, 2.25] |
+| block p50 / p99 ms (whole cell) | 14 / 582 | 13 / 480 | 0.95 / 0.82 |
+| timeouts per 1k native blocks | 0 (0 / 20,195) | 0.124 (3 / 24,153) | n/a |
+| view-timeout reasons (all / no_vote / after_vote / leader) | 2 / 0 / 2 / 0 | 7 / 5 / 0 / 2 | |
+| matched/s | 263,779 | 262,915 | 0.997 [0.958, 1.037] |
+| CPU-s per 1M fills | 23.49 | 23.90 | 1.018 [0.995, 1.040] |
+| **exec-thread on-CPU ms per 1k fills** | 2.605 | 2.672 | 1.026 [0.935, 1.126] |
+| fills per native block | 15,368 | 12,772 | 0.83 |
+| RSS mean MB | 3,607 | 3,454 | 0.96 |
+
+Timers (3 nodes, mean / bucket p99, ms):
+
+| timer | A | B |
+|---|---|---|
+| `torus_on_committed_block_seconds` | 13.3 / 189 | 8.9 / 153 |
+| `torus_commit_manifest_seconds` | 1.88 / 3.05 | 0.04 / 0.50 |
+| `torus_commit_persist_write_seconds` | 1.66 / 15.6 (inline) | 3.80 / 29.0 (writer thread) |
+| `torus_exec_commit_persist_wait_seconds` | absent | 0.02 / 0.10 |
+| `torus_commit_manifest_prune_seconds` | absent | 12.9 / 115 (about 1 per 20 blocks) |
+
+### 115.6 Verdict
+
+* **G falls toward 0 but does not reach it:** 452 -> 100 ms on the union windows, 511 -> 245 ms on each node's own
+  windows. The part section 106 put on `persist_commit_manifest` is gone: the hook's in-window p99 drops 815 -> 93 ms
+  and its in-window p50 22 / 8 -> 0.02 ms. What remains in window (own-window p99 ~635 vs ~390 out) is not the
+  manifest; not localized here.
+* **No cost to blocks/s or CPU:** blocks/s +20% (both rounds up), matched/s and CPU-s per 1M flat, exec-thread on-CPU
+  per fill within noise (passes the merge rule). The checkpoint write itself is 12% shorter (smaller batches without
+  the manifest; 97-101 vs 108-118 MB).
+* **Watch before merge:** 3 timeouts in B vs 0 in A (5 of 7 view timeouts no_vote); small counts at n = 2. The writer
+  thread's persist write is ~2.3x slower per block (it now contends with the checkpoint batch instead of the
+  consensus thread), and exec rarely waits on it (p99 0.10 ms).
+* Merge call is the owner's / 18c's: the question asked (does G fall, at no cost) answers yes for the fall and yes for
+  no cost, with the timeouts as the one open item.
+
+### 115.7 Limits and data
+
+* n = 2 per arm, 1 df: the G and blocks/s CIs span 1 even though both rounds agree in direction.
+* r2 A is a rerun cell run ~15 min after the others and has slightly more foreign load (0.106 core in total).
+* B logs 69 / 102 commit-hook fires per cell (of ~33k) with no matching "sending to execution pipeline" line (A: 0-1);
+  they are left out of the hook rows.
+* Analysis: `~/bench-results-matched/ozarchy-9c-run/analyst/` (`9c-analyse.py`; `9c-combined.txt` = rerun as r2 A,
+  `9c-std.txt` = original r2 A; `9c-t53-combined.{txt,json}` and `9c-t53-all.txt` from `ozarchy-9c-tools/9c-t53.py`;
+  `9c-foreign.txt`, `9crr-foreign.txt`).
+* Campaign: `~/bench-results-matched/ozarchy-9c-run/` (`std/`, `rerun/`, `combined/cells.tsv`, `chain-main.log`,
+  `contention-main.tsv`, `rerun-chain/`); tools `ozarchy-9c-tools/`; build `ozarchy-9c-stage/build/`.
+
+## 116. Step 9d, merged-main deep baseline with every s131 default on: one binary main `50cdd395` (non-doc tree = 9a's `654f047c`), code defaults, N = no EVM load vs E = `EVM_LOAD_RATE=10 EVM_LOAD_SENDERS=40`, Classic, 15 s checkpoints, deep (8i P1M) shape, N E E N, 300 s cells, n = 2 (campaign ozarchy-9d, archy, 2026-10-21)
+
+**Deep-book reference with all current defaults: N runs 232.7k matched/s, 3.537 native blocks/s, 63.3k fills per
+block, block p50 / p99 191 / 1,344 ms, 3.26 timeouts per 1k blocks (mostly after_vote), exec 4.196 ms and exec-thread
+on-CPU 3.170 ms per 1k fills, save_order_books 56.3 ms per block (0.889 ms per 1k fills), 24.72 CPU-s per 1M fills,
+RSS 6.5 / 8.0 GB (mean / max). That is within ~1% of section 114's deep A arm on matched/s, exec per fill and CPU-s
+per 1M (same genesis, other binary), with blocks/s 4% lower. Against 9a's standard shape (same binary) the deep book
+costs 13% of matched/s, 27% more exec on-CPU per fill and 4.8x the save_order_books time per fill. The EVM fast path
+keeps EVM load free on the deep book too: E / N matched/s 1.009 [1.001, 1.017], CPU-s per 1M 0.997 [0.982, 1.012],
+exec on-CPU per 1k fills 0.996 [0.974, 1.020], blocks/s 0.990, p50 1.002, save_order_books per block 1.000; every EVM
+block ran on the fast path (99 / 101 of 99 / 101). Watch: block p99 E / N 1.12 [0.84, 1.49] (both rounds higher,
+1.10 / 1.15; 9a standard 0.997) and flush worker per 1k fills 1.065 (9a 1.081), both unresolved at n = 2.**
+
+### 116.1 Setup
+
+* Binary: one fresh build of main `50cdd395` (`git diff --stat 654f047c 50cdd395 -- ':!docs'` is empty) in worktree
+  `wt/9d-50cdd395`, fresh `CARGO_TARGET_DIR` `~/.cargo-target-9d`, 8l4 flags (plain `release --locked`, one package at
+  a time, clang + mold). Node md5 `ce0f110ce3501c55018754bba685caa9` on 3 / 3 nodes in all 5 cells, byte-identical to
+  9a's node (section 113); bench `eaf9f007`, flood `dd59d50d` (`~/bench-results-matched/ozarchy-9d-stage/build/md5s.txt`).
+* Tools frozen in `ozarchy-9d-tools/standard`; genesis the 1M-account deep genesis of section 114
+  (`genesis-weighted-full.json` md5 `a644d0a7`, same as `ozarchy-9b-tools/deep`; bulk_count 1,000,000, 300 markets).
+  Preload 1,000,000 resting orders per cell (r1-N: 23 s).
+* Both arms: code defaults, nothing set (L2.2, L3.3, option 0 E, PC, F, D / M / T on; every `cell=` line shows
+  `book_mode=classic` and the flags unset; node-env checked on 3 nodes), 512 KB push threshold from `env.sh`, custody 0,
+  15 s checkpoints, standard load (rate 76,000, 5,000 senders). **N** = no EVM load; **E** = `EVM_LOAD_RATE=10
+  EVM_LOAD_SENDERS=40`.
+* Order: w1 (N, 120 s, warm-up gate), then N E E N at 300 s, n = 2 per arm. Campaign 00:08-00:57.
+* Cells: `~/bench-results-matched/ozarchy-9d-{w1,r1-N,r1-E,r2-E,r2-N}`.
+
+### 116.2 Validity
+
+* 5 / 5 cells rc 0, ACCEPT / AGREE / PASS, right node md5 on every node, 0 panic and 0 fail-stop lines, no CELL-FLAG,
+  rerun pass empty, end pass 0 failed. No-merge fallbacks 0 on every node; boundary checkpoints all pipelined
+  (true:false 32-39:0 per node).
+* Both E cells landed 3000 / 3000 EVM transactions (0 rejected, 0 off-cadence; 99 and 101 EVM blocks), and
+  `torus_exec_evm_fast_path_blocks_total` equals the EVM block count on all 3 nodes (99 / 101; 0 in N cells). EVM
+  execution 9.0-10.1 ms per EVM block (r1-E, per node).
+* Contention (30 s sampler, FOREIGN CPU rule): no foreign process averaged over 0.1 core in any cell (largest: claude
+  0.064 avg in r2-N, max sample 0.115 in r2-E; Hyprland ~0.03), no Telegram samples, no n19 load; no rerun.
+
+### 116.3 Per cell (run order; node mean)
+
+| cell | arm | matched/s | native blk/s | fills/blk | exec block ms | block p50 / p99 ms | CPU-s / 1M | exec on-CPU ms / 1k fills | save_order_books ms / blk | timeouts | RSS mean / max MB |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 | N | 226,726 | 4.320 | 49,278 | 207.0 | 115 / 1,252 | 25.87 | 3.249 | 41.37 | 1 | 5,991 / 7,246 |
+| r1 | N | 233,448 | 3.515 | 63,829 | 266.9 | 195 / 1,318 | 24.64 | 3.156 | 56.68 | 3 | 6,318 / 7,734 |
+| r1 | E | 235,745 | 3.480 | 64,758 | 269.7 | 196 / 1,446 | 24.54 | 3.139 | 56.62 | 3 | 6,506 / 8,148 |
+| r2 | E | 233,935 | 3.526 | 63,453 | 266.0 | 187 / 1,572 | 24.76 | 3.178 | 55.88 | 3 | 6,375 / 7,695 |
+| r2 | N | 231,943 | 3.558 | 62,773 | 264.3 | 187 / 1,370 | 24.80 | 3.184 | 55.84 | 4 | 6,629 / 8,224 |
+
+Replicate spread: N matched/s CV 0.46%, CPU-s per 1M CV 0.46%; E 0.54% and 0.62%. Drift: N falls 0.6% from r1 to r2
+(RSS mean +5%); the N E E N order cancels a linear trend, and the per-round E / N ratios agree (1.0098 / 1.0086).
+
+### 116.4 Arm means, E / N, and the references (ratio = geomean of the 2 per-round ratios, 95% t CI, 1 df)
+
+| metric | N | E | E / N [95% CI] | step / pooled sd | 114 deep A (`df9e1d8a`) | N / 114 A | 113 std N (same binary) | N / 113 N |
+|---|---|---|---|---|---|---|---|---|
+| matched/s | 232,695 | 234,840 | 1.009 [1.001, 1.017] | 1.8 | 232,284 | 1.002 | 268,762 | 0.866 |
+| native blocks/s | 3.537 | 3.503 | 0.990 [0.984, 0.997] | 1.1 | 3.676 | 0.962 | 15.47 | 0.229 |
+| fills per native block | 63,301 | 64,106 | 1.013 [0.989, 1.037] | 1.0 | 60,746 | 1.042 | 16,314 | 3.88 |
+| block p50 ms | 191 | 191 | 1.002 [0.992, 1.011] | 0.1 | 179 | 1.067 | 14 | |
+| block p99 ms | 1,344 | 1,509 | 1.122 [0.844, 1.492] | 2.4 | 1,341 | 1.002 | 659 | 2.04 |
+| timeouts per 1k native blocks | 3.26 (7 / 2,143) | 2.84 (6 / 2,116) | n/a | | 2.25 (5 / 2,224) | | 0 | |
+| view-timeout reasons (all / no_proposal / after_vote / leader) | 18 / 1 / 15 / 2 | 18 / 0 / 17 / 1 | | | 8 / 0 / 8 / 0 | | | |
+| exec ms per 1k fills | 4.196 | 4.179 | 0.996 [0.995, 0.996] | | 4.219 | 0.995 | 3.473 | 1.208 |
+| **exec-thread on-CPU ms per 1k fills** | 3.170 | 3.159 | 0.996 [0.974, 1.020] | 0.5 | 3.200 | 0.991 | 2.503 | 1.266 |
+| CPU-s per 1M fills | 24.72 | 24.65 | 0.997 [0.982, 1.012] | 0.5 | 24.65 | 1.003 | 22.77 | 1.086 |
+| save_order_books ms per native block | 56.26 | 56.25 | 1.000 [0.988, 1.011] | 0.0 | | | | |
+| save_order_books ms per 1k fills | 0.889 | 0.877 | 0.987 [0.953, 1.022] | | | | 0.187 | 4.75 |
+| RSS mean / max MB | 6,473 / 7,979 | 6,440 / 7,922 | 0.995 / 0.993 | | 6,231 (mean) | 1.039 | 3,623 / 4,402 | 1.79 / 1.81 |
+| settle phase ms per native block | 53.63 | 53.08 | 0.990 [0.936, 1.046] | | 52.15 | 1.028 | | |
+| flush_all ms per 1k fills | 0.399 | 0.388 | 0.972 [0.931, 1.014] | | | | 0.442 | |
+| flush worker ms per 1k fills | 0.345 | 0.367 | 1.065 [0.739, 1.537] | | | | 0.314 | |
+| exec runqueue wait ms per 1k fills | 0.130 | 0.126 | 0.969 [0.653, 1.437] | | 0.123 | | | |
+| exec busy share | 0.939 | 0.938 | 0.999 | | 0.942 | | 0.876 | |
+
+Section 114's deep A set `TORUS_SETTLE_NO_MERGE=1 TORUS_BOOK_FAST_ENCODE=1` by env on a base without option 0 (now
+defaults); same genesis, other binary and campaign, so the N / 114 A column is indicative only.
+
+### 116.5 Verdict
+
+* **(1) Deep-book reference** for L3.1 / L6.1 / head-to-head, all current defaults: use N above (232.7k matched/s,
+  3.54 blocks/s, p50 / p99 191 / 1,344 ms, exec on-CPU 3.170 ms per 1k fills, 24.72 CPU-s per 1M, save_order_books
+  56.3 ms per block). It matches section 114 deep A on per-fill rows (exec on-CPU 0.991, CPU-s 1.003, matched/s 1.002),
+  so merged main lost nothing on deep against the per-feature build. Blocks/s 0.962 and fills per block 1.042 are the
+  usual block-size trade between campaigns, not resolved here. The exec thread is busy 94% of wall time on deep (88%
+  on standard), and save_order_books is 21% of the exec block (56.3 of 265.6 ms) at 4.75x the standard cost per fill:
+  deep is exec-bound and the book write is the largest timed phase after the engine.
+* **(2) EVM load on deep: free.** Every per-fill row is E / N 0.97-1.01 with CIs around 1 (exec on-CPU, CPU-s, save
+  books, settle). matched/s 1.009 [1.001, 1.017] has a CI just above 1 at 1 df but is 1.8 pooled sd, so "no cost", not
+  a gain. Blocks/s 0.990 [0.984, 0.997] (1.1 pooled sd, -1%) with fills per block +1.3%: a block-size wobble, not
+  a throughput cost. All EVM blocks ran pipelined (fast-path counter = EVM block count). EVM execution is ~9.5 ms per
+  EVM block, ~0.9 s per 300 s cell, under 0.5% of exec-thread on-CPU time (223 s per cell).
+* **Watch: block p99 E / N 1.12** (1,344 -> 1,509 ms; rounds 1.10 / 1.15; 2.4 pooled sd; CI [0.84, 1.49]). Sized:
+  ~9.5 ms of EVM execution per EVM block explains at most ~6% of the +165 ms step. p99 rests on ~10 blocks per node per
+  cell, the timeouts did not move (18 / 18 view timeouts), and 9a standard showed 0.997, so this is not resolved. Also
+  flush worker per 1k fills 1.065 under E, the same direction as 9a (1.081), off the exec thread, CI spans 1 in both.
+
+### 116.6 Limits and data
+
+* n = 2 per arm, 1 df: the p99, RSS and flush-worker CIs are wide; the narrow per-fill CIs come from two agreeing
+  rounds, not many samples. Timeout counts are small (6-7 per arm).
+* The section 113 / 114 references are other campaigns (113 another shape; 114 another binary); indicative only.
+* Next cells if the p99 watch matters: N E E N E N N E at 300 s on the same binary (~1 h 20 with boot and preload)
+  gives n = 4 per arm for block p99 and the flush worker row.
+* Analysis: `~/bench-results-matched/ozarchy-9d-tools/analyst/9d.txt` (`9d-analyse.py`, a copy of 9a's) and
+  `9d-foreign.txt` (`d9-foreign.py`, a copy of `a9-foreign.py`).
+* Campaign: `~/bench-results-matched/ozarchy-9d-run/campaign/` (`campaign.log`, `cells.tsv`, `handoff.json`),
+  `contention-main.tsv`; spec and driver `ozarchy-9d-tools/{9d-spec.json,ozarchy-9d-campaign.sh,9d-chain.sh}`; build
+  `ozarchy-9d-stage/build/`.
+
+## 117. Step 9e, L3.1 on top of every s131 default, deep book: one binary `merge/l31-default-on` `e1106362` (= main `9e206ba4` + L3.1, `TORUS_BOOK_COALESCE` on by default), both arms `TORUS_SETTLE_NO_MERGE=1` by env (L2.2; the binary predates main's L2.2 default-on), A = `TORUS_BOOK_COALESCE=0` vs B = default (L3.1 on), Classic, 15 s checkpoints, running state hash off, no EVM load, deep (8i P1M) shape, A B B A, 300 s cells, n = 2 (campaign ozarchy-9e, archy, 2026-10-21)
+
+**L3.1's deep-book gain holds with every current default on. B / A: matched/s 1.137 [1.116, 1.157] (234.9k ->
+267.0k), native blocks/s 4.35 [4.21, 4.50] (3.50 -> 15.23), fills per block 64.4k -> 16.4k, block p50 / p99 191 /
+1,456 -> 13 / 723 ms, timeouts 3.78 -> 0.11 per 1k blocks, exec-thread on-CPU per 1k fills 0.766 [0.747, 0.785],
+CPU-s per 1M fills 0.949 [0.918, 0.981], save_order_books 56.4 -> 0.71 ms per block, RSS mean 6.5 -> 4.7 GB. Every
+step is 12-170 pooled sd. Window close: mean 68 ms, p50 63, p99 ~155 ms, 3 of 285 closes in the 128-256 ms bucket,
+~48 closes per node per 300 s, 300 books per close. Against section 110 (8y, older base): blocks/s 3.42 -> 15.76
+(4.61) there vs 3.50 -> 15.23 (4.35) here, matched/s 1.160 vs 1.137, exec on-CPU 0.802 vs 0.766, CPU-s 0.947 vs
+0.949: the same regime change at the same size. A reproduces 9d's N (section 116) on every per-fill row (matched/s
+1.0095, CPU-s 0.994, exec on-CPU 0.995). Deviation from the queue entry: `e1106362` lacks main's L2.2 default-on
+(`89655e95`), so L2.2 was set by env on both arms (owner + 18c), matching main `82fcd826`'s defaults.**
+
+Question (bench queue step 9e, owner s131): section 110 (8y) took the deep book 3.42 -> 15.76 native blocks/s with
+L3.1 on an older base (option 0, L2.2 off, no exec-hash). Section 116 (9d) measured merged main without L3.1 on the
+deep book: 3.54 blocks/s, save_order_books 56 ms per block, exec thread 94% busy. Does L3.1's gain hold with every
+current default on?
+
+### 117.1 Setup
+
+* Spec: `docs/perf/bench-queue.md` entry 9e on main.
+* **Deviation from the 9e entry as first written.** The entry described `e1106362` as carrying every s131 default.
+  It does not: its base `9e206ba4` predates main's L2.2 default-on (`89655e95`, merged via `5013cc79` / `9a597003`),
+  so on this branch `TORUS_SETTLE_NO_MERGE` is off by default. The owner and 18c agreed to set
+  `TORUS_SETTLE_NO_MERGE=1` by env on **both** arms, which matches main `82fcd826`'s defaults. The binary alone does
+  not have every s131 default on; binary + that env does.
+* Binary: one build of `merge/l31-default-on` `e1106362` (= main `9e206ba4` + L3.1 with `TORUS_BOOK_COALESCE` on by
+  default where its preconditions hold; L3.3, option 0, exec-hash on), worktree `wt/9e-e1106362` (detached, clean),
+  fresh target `~/.cargo-target-9e`, plain `release --locked`, one package at a time, clang + mold. Node md5
+  `135bc411167a6a3e1b97d49323ac3d29` on 3 / 3 nodes in all 5 cells; bench `dd2fc663`, flood `dd59d50d`
+  (`~/bench-results-matched/ozarchy-9e-stage/build/md5s.txt`).
+* Tools frozen from main `82fcd826` (harness `wt/9e-h-82fcd826`) in `ozarchy-9e-tools/deep`. The branch's
+  `run-cell.sh` pins `TORUS_BOOK_ROWS=3`, so the branch tools were not used.
+* Shape: deep 8i P1M, 1M-account genesis (`a644d0a7`), `PRELOAD=1000000` (r1-A: 23 s), standard load otherwise
+  (300 markets, rate 76,000, 5,000 senders, BLOCK_CAP 400, MAX_IN_FLIGHT 4, commit tail). Classic
+  (`TORUS_BOOK_ROWS` absent; every `cell=` line shows `book_mode=classic`), 15 s checkpoints (code default),
+  running state hash off (run.log `state_hash_activation = off` in every cell; L3.1's precondition),
+  `TORUS_CHECKPOINT_MAX_BYTES` unset (no byte cap), custody 0, no EVM load.
+* Arms: **A** = `TORUS_SETTLE_NO_MERGE=1 TORUS_BOOK_COALESCE=0` (L3.1 off by its kill switch); **B** =
+  `TORUS_SETTLE_NO_MERGE=1`, `TORUS_BOOK_COALESCE` unset (L3.1 on by default).
+* Order: w1 (A, 120 s, warm-up gate), then A B B A at 300 s, n = 2 per arm. Campaign 01:28-02:18.
+* Cells: `~/bench-results-matched/ozarchy-9e-{w1,r1-A,r1-B,r2-B,r2-A}`; smoke `ozarchy-9e-smoke-s0` (B, 60 s).
+
+### 117.2 Validity
+
+* 5 / 5 cells rc 0, ACCEPT / AGREE / PASS, node md5 `135bc411` on 3 / 3 nodes (re-checked from
+  `node-environ-trie.txt`), 0 panic and 0 fail-stop lines, 0 CHECK FAIL, no CELL-FLAG, rerun pass empty. Boundary
+  checkpoints all pipelined (true:false 44-46:0 per node in A, 79-80:0 in B).
+* L2.2 (`l22chk`): `TORUS_SETTLE_NO_MERGE=1` in 3 / 3 node env records and `torus_exec_settle_no_merge_fallbacks_total`
+  0 on every node in every cell. The node exposes no flush counter, so this proves the flag and zero fallbacks, not how
+  many flushes took the no-merge path.
+* L3.1 (`l31chk`): B: `L3.1 coalesced Classic book save ON` on 3 / 3 nodes, no precondition warning, and window
+  closes 47-48 per node per cell with ~596k skipped book encodes per node. A: no ON line, `TORUS_BOOK_COALESCE=0` in
+  3 / 3 env records, 0 closes and 0 skipped encodes on every node (the branch logs nothing for an explicit 0).
+* Contention (30 s sampler, FOREIGN CPU rule, `contention-main.tsv`): no foreign process averaged over 0.1 core or
+  peaked over 0.5 core in any cell (largest: claude 0.056 avg / 0.137 max in r1-A; Hyprland 0.048 avg in r2-B), no
+  Telegram samples, no nice >= 10 load; no rerun. Foreign total per window 0.086-0.209 core, nonbench 1.36-1.72 cores.
+
+### 117.3 Per cell (run order; node mean)
+
+| cell | arm | matched/s | native blk/s | fills/blk | exec block ms | block p50 / p99 ms | CPU-s / 1M | exec on-CPU ms / 1k fills | save_order_books ms / blk | timeouts | RSS mean / max MB |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 | A | 226,611 | 4.320 | 50,003 | 209.1 | 96 / 1,018 | 25.82 | 3.257 | 41.40 | 0 | 6,162 / 7,729 |
+| r1 | A | 235,603 | 3.540 | 63,989 | 266.7 | 186 / 1,498 | 24.46 | 3.152 | 55.81 | 5 | 6,556 / 7,846 |
+| r1 | B | 267,439 | 15.366 | 16,269 | 54.9 | 13 / 712 | 23.26 | 2.419 | 0.70 | 0 | 4,667 / 5,691 |
+| r2 | B | 266,619 | 15.096 | 16,531 | 55.7 | 13 / 733 | 23.34 | 2.414 | 0.72 | 1 | 4,759 / 5,718 |
+| r2 | A | 234,214 | 3.460 | 64,889 | 271.0 | 197 / 1,414 | 24.66 | 3.159 | 56.99 | 3 | 6,515 / 7,993 |
+
+Replicate spread: A matched/s CV 0.42%, CPU-s per 1M CV 0.58%; B 0.22% and 0.21%. Drift: A falls 0.6% and B 0.3%
+from r1 to r2; the A B B A order cancels a linear trend and the per-round B / A matched/s ratios agree (1.1351 /
+1.1384).
+
+### 117.4 Arm means, B / A, and the references (ratio = geomean of the 2 per-round ratios, 95% t CI, 1 df)
+
+| metric | A | B | B / A [95% CI] | step / pooled sd | 9d N (116) | A / 9d N [95% CI] | 8y deep A -> B (110) |
+|---|---|---|---|---|---|---|---|
+| matched/s | 234,908 | 267,029 | **1.137 [1.116, 1.157]** | 39.8 | 232,695 | 1.0095 [1.006, 1.013] | 220,714 -> 256,022 (1.160) |
+| native blocks/s | 3.500 | 15.231 | **4.35 [4.21, 4.50]** | 83 | 3.537 | 0.990 [0.79, 1.24] | 3.42 -> 15.76 (4.61) |
+| fills per native block | 64,439 | 16,400 | 0.2545 [0.2512, 0.2579] | 103 | 63,301 | 1.018 [0.84, 1.24] | 62,018 -> 15,172 (0.244) |
+| block p50 ms | 191 | 13 | **0.070 [0.054, 0.090]** | 32 | 191 | 1.001 [0.52, 1.91] | 193 -> 13 (0.065) |
+| block p99 ms | 1,456 | 723 | **0.497 [0.285, 0.865]** | 17 | 1,344 | 1.083 [0.59, 2.00] | 1,461 -> 672 (0.459) |
+| timeouts per 1k native blocks | 3.78 (8 / 2,114) | 0.11 (1 / 9,230) | 0.03 (CI n/a: 0 in r1-B) | | 3.26 (7 / 2,143) | | 2.91 -> 0.42 |
+| view-timeout reasons (all / after_vote / leader) | 21 / 18 / 3 | 5 / 5 / 0 | | | 18 / 15 / 2 | | |
+| exec ms per 1k fills | 4.172 | 3.371 | 0.808 [0.789, 0.827] | | 4.196 | 0.994 [0.966, 1.024] | 4.439 -> 3.692 (0.832) |
+| **exec-thread on-CPU ms per 1k fills** | 3.156 | 2.416 | **0.766 [0.747, 0.785]** | 172 | 3.170 | 0.995 [0.954, 1.038] | 3.446 -> 2.763 (0.802) |
+| CPU-s per 1M fills | 24.56 | 23.30 | **0.949 [0.918, 0.981]** | 11.7 | 24.72 | 0.994 [0.982, 1.005] | 25.07 -> 23.75 (0.947) |
+| save_order_books ms per native block | 56.40 | 0.71 | 0.0126 [0.0124, 0.0129] | 94 | 56.26 | 1.003 [0.80, 1.26] | 52.2 -> 0.64 |
+| save_order_books ms per 1k fills | 0.875 | 0.043 | 0.050 | | 0.889 | | |
+| RSS mean / max MB | 6,536 / 7,919 | 4,713 / 5,704 | 0.721 [0.612, 0.849] / 0.720 | 36 (mean) | 6,473 / 7,979 | 1.010 (mean) | 6,554 / 8,259 -> 4,675 / 5,648 |
+| exec busy share | 0.941 | 0.842 | 0.895 [0.876, 0.915] | | 0.939 | | 0.941 -> 0.881 |
+| exec engine ms per 1k fills | 2.319 | 2.778 | 1.198 [1.126, 1.275] | | | | 2.393 -> 2.875 (1.202) |
+| settle phase ms per 1k fills | 0.835 | 0.962 | 1.153 [1.145, 1.160] | | | | |
+| flush_all ms per 1k fills | 0.393 | 0.440 | 1.120 [1.052, 1.192] | | 0.399 | | |
+| flush worker ms per 1k fills | 0.348 | 0.462 | 1.331 [0.733, 2.417] | | 0.345 | | |
+| exec runqueue wait ms per 1k fills | 0.129 | 0.129 | 1.000 [0.776, 1.289] | | 0.130 | | 0.122 -> 0.128 |
+| hotstuff-algo on-CPU ms per block | 60.2 | 17.5 | 0.290 [0.288, 0.293] | | | | |
+
+**Window close (`torus_exec_book_coalesce_close_seconds`, B, load window, node mean):**
+
+| cell | closes per node | mean ms | p50 ms | p99 ms | slowest bucket | skipped encodes per node |
+|---|---|---|---|---|---|---|
+| r1-B | 48.0 | 66.4 | 61.6 | 159.5 | 128-256 ms (2 of 144 closes) | 591,935 |
+| r2-B | 47.0 | 69.6 | 65.1 | 149.8 | 128-256 ms (1 of 141 closes) | 600,771 |
+
+Every close encodes all 300 books (`torus_exec_book_coalesce_close_books`). ~48 closes per 300 s, not 20: the
+100-block checkpoint bound fires before 15 s at B's block rate, as in 8y (~49). 8y deep: mean 61 ms, median 58,
+p99 ~126 ms; 9e's close is ~10% slower at the mean, on the same order.
+
+### 117.5 Verdict
+
+* **The L3.1 gain holds on merged main's defaults (high confidence).** Every headline row moves the right way by
+  12-170 pooled sd with both rounds agreeing: matched/s +13.7%, blocks/s 4.35x, p50 191 -> 13 ms, p99 halved,
+  timeouts 3.78 -> 0.11 per 1k blocks, exec on-CPU per fill -23%, CPU-s per 1M -5%, RSS -28%. It passes the
+  exec-path merge rule on deep (exec on-CPU per 1k fills 0.766 [0.747, 0.785], CPU-s 0.949, no timeout cost).
+* **Same size as section 110.** Blocks/s 4.35 here vs 4.61 in 8y: A 3.50 vs 3.42, B 15.23 vs 15.76. matched/s 1.137
+  vs 1.160, CPU-s 0.949 vs 0.947, p50 0.070 vs 0.065, p99 0.497 vs 0.459. 8y's blocks/s CI was [2.58, 8.23], so 4.35
+  is inside it. Both arms run faster than 8y's (A 234.9k vs 220.7k, B 267.0k vs 256.0k; other base, other
+  campaign), A by more, so the matched/s ratio is a little smaller.
+* **Mechanism sized.** A spends 56.4 ms of a 268.8 ms exec block in save_order_books (0.875 ms per 1k fills); B
+  spends 0.71 ms per block plus ~3.2 s of closes per node per cell (48 x 66-70 ms, ~0.04 ms per 1k fills). The
+  ~0.83 ms per 1k fills saved matches the whole exec per-fill drop (4.172 -> 3.371, -0.80). With the book write gone,
+  blocks shrink 3.9x and per-fill engine (1.20x), settle (1.15x) and flush_all (1.12x) costs rise from per-block
+  fixed costs, as in 8y (engine 1.202).
+* **A check against 9d N (same effective defaults, other binary):** per-fill rows match within 1% (exec on-CPU 0.995,
+  CPU-s 0.994, exec ms 0.994, save_order_books per block 1.003). matched/s 1.0095 [1.006, 1.013] is a CI just above 1
+  at 1 df but under 1%, between two binaries and campaigns (9d N vs 114 A was 1.002); it is not attributable to
+  L3.1 (off in A). Blocks/s, p50 and p99 CIs span 1. So the L3.1 code path when off costs nothing
+  measurable, and 9d N remains the deep reference.
+* **Watch:** the close p99 ~155 ms (3 / 285 closes over 128 ms) sits on the exec thread once per ~6 s; B's block p99
+  is 723 ms vs 8y's 672 ms (other campaign, not resolved). Flush worker per 1k
+  fills 1.33 [0.73, 2.42] (off the exec thread; 9d E / N also leaned up), unresolved at n = 2.
+
+### 117.6 Limits and data
+
+* n = 2 per arm, 1 df: the p99, RSS and flush-worker CIs are wide; the narrow per-fill CIs come from two agreeing
+  rounds. Timeout counts are small (8 vs 1).
+* The L2.2 state is shown by flag + 0 fallbacks only, not by a no-merge flush count.
+* Sections 110 / 116 are other campaigns and binaries; their columns are indicative only.
+* Analysis: `~/bench-results-matched/ozarchy-9e-tools/analyst/9e.txt` (`9e-analyse.py`, a copy of 9d's with the L3.1
+  close rows and the 9d N check) and `9e-foreign.txt` (`e9-foreign.py`, a copy of `d9-foreign.py`).
+* Campaign: `~/bench-results-matched/ozarchy-9e-run/campaign/` (`campaign.log`, `cells.tsv`, `handoff.json`),
+  `ozarchy-9e-run/contention-main.tsv`; spec, checks and driver `ozarchy-9e-tools/{9e-spec.json,9e-checks.sh,
+  ozarchy-9e-campaign.sh,9e-chain.sh}`; build `ozarchy-9e-stage/build/`.
+
+## 118. Step 9f, b1 Classic gap: `qc_to_advance` sub-timers and a b0 / b1 bisect: three binaries carrying one identical timers-only commit, O = `perf/qca-timers-o` `bd09feb7` (`f8a45a2d` + timers) vs B0 = `perf/qca-timers-b0` `cc123463` (`f8a45a2d` + b0 + timers) vs B = `perf/qca-timers-b` `feebce0f` (`ab4ded4e` = b0 + b1, + timers), Classic, 15 s checkpoints, nothing set, no EVM load, standard shape, O B0 B B B0 O, 300 s cells, n = 2 (campaign ozarchy-9f, archy, 2026-10-21)
+
+**Section 111's gap did not reproduce; it reversed. With the timers in all three binaries, B is the fastest arm and
+O the slowest: native blocks/s O 8.03 / B0 9.40 / B 11.64, B / O 1.449 [1.051, 1.997] (14.3 pooled sd; 8z: O 14.4,
+B 10.7, B / O 0.746). `qc_to_advance` is O 40.6 / B0 34.8 / B 28.2 ms per advanced view (8z: O 21.1, B 30.6). No step
+carries a B-specific cost. In every arm `commit_feed_app` (the synchronous commit callback: decode, commit-manifest
+persist, `enqueue_for_execution` with the blocking exec send) holds 94-96% of `qc_to_advance`, and all of it scales
+with block size: `qc_to_advance` per 1k fills is 1.373 / 1.358 / 1.363 ms (B / O 0.992) and per second 219 / 217 /
+218 ms. The other 14 steps sum to 1.59-1.68 ms per view in every arm. So the timers cannot say whether b0 or b1 owns
+section 111's gap: no arm here has a fixed per-view excess. B pays a small per-fill cost: matched/s 0.980 [0.973,
+0.988] (46.6 sd), exec on-CPU per 1k fills 1.014 [0.985, 1.043], CPU-s per 1M 1.012. The O arm itself fell from 8z's
+14.4 to 8.0 blocks/s with the same env, genesis and load. The leading reading is a cadence equilibrium that moves
+with the binary, not a b1 code path.**
+
+Question (bench queue step 9f, owner s131): section 111 / 111.8 found Classic on b1 (`ab4ded4e`) at 0.746x O's
+native blocks/s with equal per-fill cost. Its `qc_to_advance` rose 21.1 -> 30.6 ms per view (~+30 ms per view,
+independent of block size), and a clean rebuild was byte-identical (8z2 part 2). Which `qc_to_advance` step carries
+B's extra time, and is it b0 (B0 vs O) or b1 (B vs B0)?
+
+### 118.1 Setup
+
+* Spec: `docs/perf/bench-queue.md` entry 9f on main.
+* Binaries: one timers-only commit (git patch-id `99630016` on all three, per the handoff) on three bases. Worktrees
+  `wt/9f-{o-bd09feb7,b0-cc123463,b-feebce0f}`, fresh targets `~/.cargo-target-9f-{o,b0,b}`, plain `release --locked`,
+  one package at a time, clang + mold. Node md5s: O `f1a096ce5fa7ba0ac026f1d72cc11a3a`, B0
+  `62b8dc827d017cad1e541a398a9aa039`, B `b7ab3c4859e246be37e1b99686e4e931`. Bench-throughput is per arm (O
+  `d9a5054b`, B0 `d97f6974`, B `01a6cc4c`); 8z ran one bench build (`ec15372b`) on both arms. Flood `dd59d50d` on all
+  arms (`~/bench-results-matched/ozarchy-9f-stage/build/md5s.txt`).
+* Tools frozen from main `913613eb` (harness `wt/9f-h-913613eb`) in `ozarchy-9f-tools/standard`.
+* Shape: standard, 100k genesis `d694b81b` (8z's), 300 markets, rate 76,000, 5,000 senders, BLOCK_CAP 400,
+  MAX_IN_FLIGHT 4, commit tail. Classic (`TORUS_BOOK_ROWS` empty), 15 s checkpoints (code default), custody 0, state
+  hash off, no EVM load. No arm env. `TORUS_EVM_FAST_PATH`, `TORUS_BOOK_FAST_ENCODE` (L3.3) and `TORUS_SETTLE_NO_MERGE`
+  (L2.2) are unset on every node, and all three bases predate those defaults. Node env records match 8z's r1-O
+  field for field, except the pids.
+* Order: w1 (O, 120 s, warm-up gate), then O B0 B B B0 O at 300 s, n = 2 per arm. Campaign 02:43-03:24.
+* Cells: `~/bench-results-matched/ozarchy-9f-{w1,r1-O,r1-B0,r1-B,r2-B,r2-B0,r2-O}`. Smokes (60 s, one per arm):
+  `ozarchy-9f-run/campaign/smoke`, `ozarchy-9fo-run/campaign/smoke`, `ozarchy-9fb0-run/campaign/smoke`.
+* Per view = sum / count of each `torus_qc_advance_<step>_seconds` over the bench window (metrics-1hz snapshots at
+  `t_bench0` / `t_bench1`, node mean). One sample comes per collector view that advanced: 5.4-7.9 per s per node, about
+  66% of commits. Per block = the `torus_commit_feed_*` / `torus_exec_dispatch_send_seconds` sum / count (one per
+  committed block).
+
+### 118.2 Validity
+
+* 7 / 7 cells rc 0, ACCEPT / AGREE / PASS, 0 panic and 0 fail-stop lines. Node md5 re-checked from
+  `node-environ-trie.txt`: 3 / 3 nodes on the arm's md5 in every cell. 57 CHECK OK, 0 CHECK FAIL, no CELL-FLAG, rerun
+  pass empty.
+* Timer check (`qcachk` in the campaign, re-checked here): in every cell and node each step's count equals
+  `torus_qc_advance_total_seconds_count` (max mismatch 0), and the 15 steps sum to the total to 4 significant figures
+  per view. `torus_view_qc_to_advance_seconds` per view matches the new total within 0.01 ms.
+* Contention (30 s sampler, FOREIGN CPU rule, `ozarchy-9f-run/contention-main.tsv`): no foreign app averaged over
+  0.1 core or peaked over 0.5 core in any cell. The largest was claude at 0.046 avg in r1-B0 and 0.101 max in r2-B. No
+  Telegram samples. Foreign total per cell was 0.10-0.14 core avg (max 0.268, r1-O), nonbench 1.33-1.42 cores. No
+  rerun.
+
+### 118.3 Per cell (run order; node mean)
+
+| cell | arm | matched/s | native blk/s | fills/blk | block p50 / p99 ms | timeouts | CPU-s / 1M | exec on-CPU ms / 1k fills | qc_to_advance ms / view | commit_feed_app ms / view | dispatch send ms / blk |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 | O | 267,568 | 8.557 | 23,177 | 25 / 903 | 0 | 22.35 | 2.749 | 43.09 | 41.29 | 15.91 |
+| r1 | O | 267,766 | 8.059 | 29,503 | 37 / 917 | 1 | 22.46 | 2.753 | 39.08 | 37.38 | 12.99 |
+| r1 | B0 | 265,920 | 9.834 | 24,634 | 24 / 860 | 0 | 22.72 | 2.782 | 33.81 | 32.14 | 10.59 |
+| r1 | B | 262,357 | 11.386 | 21,284 | 17 / 853 | 0 | 22.86 | 2.797 | 30.26 | 28.69 | 9.01 |
+| r2 | B | 262,530 | 11.888 | 20,119 | 15 / 839 | 4 | 22.87 | 2.806 | 26.23 | 24.63 | 7.01 |
+| r2 | B0 | 267,536 | 8.967 | 26,667 | 27 / 892 | 1 | 22.61 | 2.779 | 35.82 | 34.14 | 10.81 |
+| r2 | O | 267,622 | 8.000 | 29,550 | 37 / 919 | 0 | 22.73 | 2.775 | 42.02 | 40.35 | 13.76 |
+
+Per minute (native blocks/s): O 8.19 8.76 8.15 6.81 8.11 and 7.76 8.81 8.12 7.13 8.38 (steady); B 9.91-12.73 and
+10.67-12.99; B0 8.29 10.52 11.66 8.94 8.86 (r1 swings inside the cell) and 8.15-9.94. Drift: O is flat r1 -> r2 (8.06
+-> 8.00) at both ends of the campaign, so no campaign trend explains the arm order. B0's r1 / r2 spread (9.83 / 8.97)
+is the largest of the three.
+
+### 118.4 Arm means and ratios (ratio = geomean of the 2 per-round ratios, 95% t CI, 1 df; step / pooled sd)
+
+| metric | O | B0 | B | B / O [95% CI] | sd | B0 / O [95% CI] | sd | B / B0 [95% CI] | sd |
+|---|---|---|---|---|---|---|---|---|---|
+| matched/s | 267,694 | 266,728 | 262,444 | **0.980 [0.973, 0.988]** | -46.6 | 0.996 [0.956, 1.039] | -1.2 | 0.984 [0.951, 1.018] | -5.3 |
+| native blocks/s | 8.029 | 9.401 | 11.637 | **1.449 [1.051, 1.997]** | 14.3 | 1.170 [0.682, 2.006] | 3.2 | 1.239 [0.524, 2.929] | 4.5 |
+| fills per native block | 29,527 | 25,651 | 20,702 | 0.701 [0.485, 1.012] | -15.1 | 0.868 [0.530, 1.422] | -3.8 | 0.807 [0.341, 1.911] | -4.2 |
+| block p50 ms | 37.0 | 25.6 | 16.1 | 0.434 [0.160, 1.180] | -16.8 | 0.690 [0.282, 1.686] | -6.2 | 0.630 [0.095, 4.186] | -4.3 |
+| block p99 ms | 918 | 876 | 846 | 0.921 [0.817, 1.039] | -10.2 | 0.954 [0.771, 1.182] | -2.6 | 0.965 [0.691, 1.348] | -1.8 |
+| timeouts per 1k native blocks | 0.21 (1) | 0.19 (1) | 0.55 (4) | CI n/a (0 in a cell) | | | | | |
+| CPU-s per 1M fills | 22.60 | 22.66 | 22.86 | 1.012 [0.942, 1.087] | 2.0 | 1.003 [0.902, 1.115] | 0.5 | 1.009 [0.974, 1.044] | 3.5 |
+| exec-thread on-CPU ms per 1k fills | 2.764 | 2.780 | 2.802 | 1.014 [0.985, 1.043] | 3.3 | 1.006 [0.952, 1.063] | 1.5 | 1.008 [0.982, 1.035] | 4.6 |
+| exec busy share | 0.876 | 0.899 | 0.905 | 1.034 [0.955, 1.119] | 4.7 | 1.026 [0.913, 1.153] | 2.6 | 1.007 [0.970, 1.046] | 0.6 |
+| mean commit interval ms | 122.7 | 106.0 | 85.4 | 0.696 [0.494, 0.980] | -17.5 | 0.863 [0.526, 1.418] | -3.8 | 0.806 [0.348, 1.866] | -4.2 |
+| of which in intervals > 128 ms (bucket mid) | 104.1 | 87.5 | 66.5 | 0.639 [0.435, 0.938] | -19.6 | 0.839 [0.447, 1.574] | -3.7 | 0.761 [0.276, 2.097] | -4.3 |
+| of which in intervals > 256 ms | 84.2 | 69.4 | 52.3 | 0.621 [0.509, 0.757] | -25.0 | 0.822 [0.302, 2.240] | -2.9 | 0.756 [0.227, 2.510] | -3.3 |
+| intervals > 256 ms per 1k commits | 206 | 173 | 129 | 0.628 [0.470, 0.838] | -8.4 | 0.839 [0.237, 2.968] | -2.4 | 0.748 [0.158, 3.528] | -3.2 |
+| **qc_to_advance ms per view (= 15-step sum)** | **40.55** | **34.81** | **28.24** | 0.695 [0.177, 2.730] | -4.9 | 0.859 [0.782, 0.943] | -3.2 | 0.810 [0.226, 2.896] | -2.9 |
+| qc_to_advance ms per 1k fills | 1.373 | 1.358 | 1.363 | 0.992 [0.365, 2.696] | -0.1 | 0.989 [0.550, 1.779] | -0.3 | 1.003 [0.663, 1.516] | 0.1 |
+| qc_to_advance ms per s | 218.7 | 217.2 | 217.8 | 0.995 | -0.1 | 0.994 | -0.2 | 1.002 | 0.1 |
+| commit interval minus qc_to_advance ms | 82.2 | 71.2 | 57.1 | 0.696 [0.591, 0.818] | -20.9 | 0.866 [0.394, 1.902] | -3.1 | 0.803 [0.430, 1.500] | -4.2 |
+
+**The 15 steps, ms per advanced view** (sum = `qc_to_advance`; `commit_feed_app` share 0.958 / 0.952 / 0.944):
+
+| step | O | B0 | B | B / O [95% CI] | sd |
+|---|---|---|---|---|---|
+| **commit_feed_app** | **38.87** | **33.14** | **26.66** | 0.684 [0.160, 2.935] | -4.9 |
+| advance_rx | 0.510 | 0.510 | 0.498 | 0.975 [0.913, 1.041] | -0.9 |
+| commit_feed_tree | 0.199 | 0.180 | 0.163 | 0.803 [0.051, 12.56] | -1.2 |
+| wait_busy | 0.148 | 0.139 | 0.133 | 0.899 [0.763, 1.059] | -7.9 |
+| tree_update | 0.139 | 0.136 | 0.125 | 0.894 [0.770, 1.038] | -5.6 |
+| wait_recv | 0.131 | 0.136 | 0.135 | 1.032 [0.200, 5.310] | 0.3 |
+| post_commit | 0.128 | 0.129 | 0.119 | 0.937 [0.489, 1.795] | -1.8 |
+| pc_check | 0.105 | 0.103 | 0.103 | 0.978 [0.701, 1.365] | -1.1 |
+| enter_new_view | 0.104 | 0.106 | 0.105 | 1.015 [0.807, 1.277] | 1.2 |
+| loop_to_enter | 0.094 | 0.092 | 0.094 | 0.998 [0.758, 1.313] | -0.1 |
+| highest_pc | 0.059 | 0.072 | 0.055 | 0.928 [0.222, 3.877] | -0.9 |
+| enter_view_write | 0.037 | 0.047 | 0.036 | 0.991 [0.796, 1.234] | -0.7 |
+| advance_send | 0.016 | 0.013 | 0.012 | 0.764 [0.172, 3.394] | -2.3 |
+| wait_msg | 0.013 | 0.011 | 0.010 | 0.768 [0.018, 33.2] | -1.2 |
+| enter_start | 0.001 | 0.001 | 0.001 | 1.079 [0.308, 3.777] | 0.7 |
+| all but commit_feed_app | 1.683 | 1.674 | 1.587 | 0.943 [0.715, 1.245] | -3.7 |
+
+Side timers: own AdvanceView loopback 0.353 / 0.347 / 0.335 ms, swarm command wait 0.143 / 0.139 / 0.121 ms. Views
+advanced by own AdvanceView 61.6 / 62.6 / 64.5% (rest by a peer's, ~0.03% other), messages handled while waiting
+0.043 / 0.035 / 0.034 per view, committed blocks per advance 0.999 in every arm.
+
+**Commit feed, ms per committed block:**
+
+| timer | O | B0 | B | B / O [95% CI] | sd |
+|---|---|---|---|---|---|
+| commit_feed_decode | 2.461 | 2.114 | 1.675 | 0.680 [0.483, 0.957] | -21.1 |
+| commit_feed_evm | 0.003 | 0.003 | 0.003 | 0.920 | |
+| commit_feed_manifest | 3.918 | 3.118 | 2.899 | 0.741 [0.175, 3.137] | -3.5 |
+| commit_feed_enqueue | 29.93 | 25.13 | 19.33 | 0.644 [0.240, 1.728] | -8.3 |
+| of which exec_dispatch_send (blocked on the exec channel) | 13.38 | 10.70 | 8.01 | 0.594 [0.083, 4.238] | -5.0 |
+| enqueue minus send | 16.56 | 14.44 | 11.31 | 0.683 [0.515, 0.907] | -25.1 |
+| enqueue minus send, ms per 1k fills | 0.561 | 0.563 | 0.547 | 0.975 [0.895, 1.061] | -1.9 |
+| exec_dispatch_send, ms per 1k fills | 0.453 | 0.418 | 0.386 | 0.848 [0.172, 4.186] | -1.7 |
+| commit_event_handler | 0.148 | 0.145 | 0.142 | 0.959 [0.901, 1.021] | -1.2 |
+
+`commit_feed_app` minus the four feed timers is 2.6-2.8 ms per view in every arm (r1 / r2 1.9-3.4).
+
+### 118.5 Verdict
+
+* **The 8z direction did not reproduce (high confidence).** B is 1.45x O's native blocks/s here (14.3 pooled sd;
+  per-round 1.41 / 1.49). In 8z it was 0.746x. B0 sits between them at 1.17x (3.2 sd, CI spans 1).
+  `qc_to_advance` is highest on O (40.6 ms), not B (28.2). The O-B commit-interval gap, now O slower, again sits in
+  the long intervals: > 128 ms carries 37.6 of the 37.3 ms (101%), > 256 ms 31.9 ms (86%).
+* **No step carries a size-independent excess in any arm (high confidence).** `commit_feed_app` is 94-96% of
+  `qc_to_advance`. Per view, every other step is 0.5 ms or less, and together they come to 1.59-1.68 ms in all three
+  arms (B - O -0.10 ms). The blocking exec send is 8-13 ms per block, and the rest of `enqueue_for_execution` is 0.55
+  ms per 1k fills in every arm (B / O 0.975, 1.9 sd). `qc_to_advance` per 1k fills is flat (B / O 0.992, 0.1 sd), and
+  so is the time the hotstuff thread spends in it (218 ms per s). The ~+30 ms per view that 111.8 fitted does not
+  show here. Every per-view difference between the arms is its block-size difference.
+* **b0 vs b1: not attributable from this campaign.** The question assumed B carries a per-view excess. It does not
+  here, so neither b0 nor b1 owns one. B's one cost that stays per fill: matched/s -2.0% [-2.7, -1.2] (46.6 sd, both
+  rounds), exec on-CPU per 1k fills +1.4% and CPU-s per 1M +1.2% (CIs span 1). B0 shows little of it (matched/s 0.996,
+  exec on-CPU 1.006, CIs span 1).
+* **Mechanism, sized.** The collector's `qc_to_advance` sits on the commit cadence (28-41 ms of an 85-123 ms
+  interval, 33% in every arm). Nearly all of it is commit-callback work that grows with block size. The rest of the
+  interval also scales (82 / 71 / 57 ms, 0.696 like the interval). Matched/s is pinned near the offered load and
+  exec runs 0.88-0.91 busy, so block size and cadence feed each other: a slower view gives bigger blocks, and those
+  slow the next commit callback. The equilibrium is then set by small fixed costs and is easily moved. That reading
+  fits:
+  * O's own drop from 8z's 14.4 to 8.0 blocks/s (same env, genesis and load; different build, the timers commit and
+    a per-arm bench client);
+  * B0's in-cell swing (8.3 -> 11.7 -> 8.9 per minute in r1);
+  * the reversal against 8z.
+
+  This reading is medium-low confidence: nothing here isolates the fixed cost that picks the equilibrium.
+* **Next cells that would resolve it (~50 min):** one campaign with 8z's exact nodes O `74598d33` and B `f19d9385`,
+  plus 9f's O `f1a096ce` (and B `b7ab3c48`). Use one bench client (`ec15372b`) on every arm, standard Classic as
+  here, 300 s, ABBA-style n = 2. If 8z's pair still shows B / O 0.75 while 9f's pair shows 1.45, the cadence depends
+  on the binary build or layout, not on b0 / b1 code, and b1 is cleared on Classic. If 9f's O also runs ~14 blocks/s
+  with the 8z client, the bench client is the variable.
+
+### 118.6 Limits and data
+
+* n = 2 per arm, 1 df: the per-view and blocks/s CIs are wide whenever the two rounds differ (B / O per-round
+  `qc_to_advance` 0.774 / 0.624). The pooled-sd steps are the sharper test.
+* The timers sample only the collector views that advanced (~66% of commits), and the per-view figures are means
+  over them. Timeout counts are tiny (1 / 1 / 4).
+* 8z (section 111) is another campaign with other builds of the same bases, and 9f adds the timers commit; the 8z
+  figures are references, not a paired arm.
+* Analysis: `~/bench-results-matched/ozarchy-9f-tools/analyst/9f-cells.json` (`9f-analyse.py`: bench-window deltas
+  via `8z2-extract.py`, headline via `8x-headline.py`), `9f-tables.tsv` (`9f-tables.py`), and per-minute series
+  `9f-series.tsv` / `9f-8zcols.tsv` (`8z-analyse.py`).
+* Campaign: `~/bench-results-matched/ozarchy-9f-run/campaign/` (`campaign.log`, `cells.tsv`, `handoff.json`),
+  `ozarchy-9f-run/contention-main.tsv`; spec, checks and driver `ozarchy-9f-tools/{9f-spec.json,9f-checks.sh,
+  ozarchy-9f-campaign.sh,9f-chain.sh}`; build `ozarchy-9f-stage/build/`.
+
+## 119. Step 9h, L2.1 microbench on a quiet host: in-process `cargo test --release -p torus-bridge --test ubench_settle_streamed`, P = `perf/l21-streamed-settle` `0323b755` (before wake-up batching) vs Q = `39f8c7f3` (batched wake-ups, merged with main `be1c378d`), `UBENCH_L22=on`, 300 markets, 16.8k (17,100) and 65k (64,800) fills per call, `TORUS_SETTLE_STREAMED` off vs on (Q: on at wake batch 1 and auto), `TORUS_MATCH_WORKERS` unset and 17, 12 passes x 8 reps (campaign ozarchy-9h, archy, 2026-10-21)
+
+**On a quiet host L2.1 costs the exec thread about +2% CPU per call at 65k (1.017-1.022) and +2.2-3.7% at 16.8k, and batching does not
+change it. Q exec-thread on-CPU on / off: 65k 1.019 [1.012, 1.026] at batch 1, 1.017 [1.010, 1.024] at auto (+1.8-2.0
+ms per call on 104.2 ms); 16.8k 1.025 / 1.022; at `TORUS_MATCH_WORKERS=17` 65k 1.022 / 1.022, 16.8k 1.034 / 1.037. Every
+CI excludes 1. Batch auto vs batch 1, paired per pass: exec CPU -0.17 to +0.11 ms per call (|t| <= 0.7, ratio
+0.998-1.002) and wall within 0.3 ms, while parks fall by 0.5-3.8 per call (t -1.7 to -3.1). Section 114's deep node
+figure, 1.044 [1.009, 1.081] per 1k fills, overlaps this run's 65k CI ([1.010, 1.026]); its point estimate is about
+twice this one's. Exec wall per call falls with the flag on: 65k 0.899-0.900, 16.8k 0.948-0.950; with 17 match
+workers 0.857 and 0.908-0.913. P's wall ratios are close (65k w0 0.920, w17 0.862; 16.8k 0.914-0.952). Pass B grows 1.07-1.33x on Q and
+1.47-1.66x on P.**
+
+Question (bench queue step 9h, owner s131): 18c's L2.1 microbench numbers were too noisy (load ~100). On a quiet
+host, how large is L2.1's exec-thread CPU cost, and does wake-up batching (`39f8c7f3`) change it?
+
+### 119.1 Setup
+
+* Spec: `docs/perf/bench-queue.md` entry 9h on main.
+* Binaries: test executables built in worktrees `wt/9h-p-0323b755` and `wt/9h-q-39f8c7f3` with fresh targets
+  `~/.cargo-target-9h-{p,q}` (build rc 0), copied to `ozarchy-9h-run/bin/`. md5 P `72f72eb695d429454501ae2b983f739e`, Q
+  `718cdc65b59474c2a02936fd28c2ed0d`. Both were re-checked in all 48 raw block logs (12 per block, 0 mismatches).
+* Harness: one test process per block and pass. Arms rotate inside the process, 8 reps per arm and shape, and each
+  row is the per-process median. Q arms: off, on batch 1 (one wake-up per market, as before batching) and on batch
+  auto (the built-in policy). Q reports wall, exec on-CPU, runq, parks and parked time, match, settle and pass B. P has
+  no exec on-CPU, runq or park counters, so the CPU answer comes from Q only, and P vs Q is wall and pass B only.
+* Blocks: P0 / Q0 (`TORUS_MATCH_WORKERS` unset), P17 / Q17 (`=17`, `TORUS_SETTLE_WORKERS` unset). `UBENCH_L22=on`,
+  `UBENCH_BATCHES=1,auto` (P ignores it), `UBENCH_REPS=8`, no other `TORUS_*`, nothing pinned. Host parallelism 32,
+  6,000 traders, a 96,000-order ladder.
+* Order: 12 passes, block order rotated per pass. 05:02:14-05:15:23, blocks 13.7-19.3 s.
+* Extra rows: P also runs L2.2 off (the harness ignores `UBENCH_L22`), and the w17 blocks also run 16.8k. These are
+  outside the spec's cells; their w17 16.8k rows are listed below.
+
+### 119.2 Validity
+
+* 48 / 48 blocks rc 0, `test result: ok` in every raw log, 0 `panicked`. `campaign.done` reads `exit=0`. 1,347 CHECK
+  lines, all PASS (fills, arms, walls per block), `ALL CHECKS PASS`, no CELL-FLAG. `cells.tsv` has 336 rows, 12 per
+  (block, shape, L2.2, arm).
+* Contention (30 s sampler, FOREIGN CPU rule, `ozarchy-9h-run/contention-main.tsv`, 26 samples). No single foreign
+  process went above 0.064 core in any sample. The largest were claude sessions (0.064), quickshell (0.043) and
+  Hyprland (0.029), and no Telegram appeared, so the rule triggers no rerun. Foreign total over all samples was 0.094
+  core on average, max 0.200 (05:10:14). The time-weighted foreign total exceeded 0.1 core in 15 of 48 block windows
+  (passes 1, 7, 8, 9, 11, 12). Dropping those blocks moves every on / off ratio by 0.004 or less, so all 48 stay in.
+* Drift: the off-arm wall per pass shows no trend over the campaign in any block (e.g. Q0 65k 125.1-127.7 ms, Q17 65k
+  129.0-131.0 ms, P0 65k 123.3-126.4 ms). Q off exec CPU is flat as well (65k 103.0-105.3 ms).
+
+### 119.3 Per cell (mean of 12 per-pass medians +- sd across passes; ms per call; L2.2 on)
+
+| block | shape | arm | exec wall | exec on-CPU | exec on-CPU / 1k fills | runq | parks / call | parked | match | settle | pass B |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Q0 | 16.8k | off | 54.15 +- 0.41 | 47.44 +- 0.45 | 2.774 | 0.01 | 0.00 | 0.00 | 5.15 | 25.06 | 4.38 +- 0.22 |
+| Q0 | 16.8k | on b1 | 51.46 +- 0.56 | 48.62 +- 0.57 | 2.843 | 0.90 | 2.58 | 1.52 | 1.13 | 26.45 | 5.79 +- 0.34 |
+| Q0 | 16.8k | on auto | 51.33 +- 0.68 | 48.50 +- 0.59 | 2.836 | 0.78 | 2.08 | 1.49 | 1.32 | 26.23 | 5.71 +- 0.42 |
+| Q0 | 65k | off | 126.27 +- 0.78 | 104.19 +- 0.84 | 1.608 | 0.03 | 0.00 | 0.00 | 17.12 | 64.33 | 14.02 +- 0.57 |
+| Q0 | 65k | on b1 | 113.63 +- 1.11 | 106.14 +- 1.02 | 1.638 | 2.70 | 3.42 | 3.89 | 3.08 | 66.30 | 17.24 +- 1.07 |
+| Q0 | 65k | on auto | 113.57 +- 0.81 | 105.97 +- 1.05 | 1.635 | 2.39 | 2.92 | 3.90 | 3.20 | 65.69 | 17.08 +- 0.83 |
+| Q17 | 65k | off | 130.03 +- 0.56 | 103.10 +- 0.48 | 1.591 | 0.04 | 0.00 | 0.00 | 20.04 | 64.95 | 13.50 +- 0.49 |
+| Q17 | 65k | on b1 | 111.49 +- 0.59 | 105.33 +- 0.91 | 1.625 | 0.06 | 18.67 | 5.47 | 2.07 | 65.28 | 14.37 +- 0.62 |
+| Q17 | 65k | on auto | 111.46 +- 0.57 | 105.34 +- 0.72 | 1.626 | 0.06 | 14.92 | 5.38 | 2.34 | 64.90 | 14.53 +- 0.79 |
+| P0 | 16.8k | off | 53.73 +- 0.41 | n/a | | | | | 5.07 | 24.70 | 4.16 +- 0.17 |
+| P0 | 16.8k | on | 51.14 +- 0.55 | n/a | | | | | 1.12 | 26.13 | 6.62 +- 0.37 |
+| P0 | 65k | off | 124.71 +- 1.02 | n/a | | | | | 17.24 | 62.60 | 13.18 +- 0.62 |
+| P0 | 65k | on | 114.68 +- 1.55 | n/a | | | | | 2.87 | 67.11 | 21.73 +- 1.49 |
+| P17 | 65k | off | 127.96 +- 0.83 | n/a | | | | | 20.12 | 62.79 | 12.65 +- 0.39 |
+| P17 | 65k | on | 110.27 +- 1.04 | n/a | | | | | 2.10 | 64.02 | 19.07 +- 0.60 |
+
+Extra w17 16.8k rows: Q17 off 55.00 / CPU 46.88, on b1 49.95 / 48.49 (parks 4.00), on auto 50.23 / 48.60 (parks 2.83);
+pass B 4.36 / 5.20 / 5.12. P17 off 54.67, on 49.94, pass B 4.15 / 6.06.
+
+### 119.4 On / off ratios (mean of 12 per-pass ratios, 95% t CI, 11 df; sd = sd of the per-pass ratios)
+
+| block | shape | arm | exec wall | sd | exec on-CPU | sd | pass B | sd | settle | match |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Q0 | 16.8k | b1 | 0.950 [0.943, 0.958] | 0.012 | **1.025 [1.017, 1.033]** | 0.013 | 1.325 [1.271, 1.379] | 0.085 | 1.055 | 0.219 |
+| Q0 | 16.8k | auto | 0.948 [0.937, 0.959] | 0.017 | **1.022 [1.012, 1.032]** | 0.016 | 1.308 [1.236, 1.381] | 0.113 | 1.047 | 0.257 |
+| Q0 | 65k | b1 | 0.900 [0.895, 0.905] | 0.008 | **1.019 [1.012, 1.026]** | 0.011 | 1.231 [1.185, 1.276] | 0.072 | 1.031 | 0.180 |
+| Q0 | 65k | auto | 0.899 [0.895, 0.904] | 0.007 | **1.017 [1.010, 1.024]** | 0.011 | 1.220 [1.173, 1.268] | 0.075 | 1.021 | 0.187 |
+| Q17 | 16.8k | b1 | 0.908 [0.903, 0.914] | 0.009 | 1.034 [1.028, 1.041] | 0.010 | 1.193 [1.157, 1.230] | 0.057 | 0.998 | 0.161 |
+| Q17 | 16.8k | auto | 0.913 [0.907, 0.920] | 0.011 | 1.037 [1.029, 1.045] | 0.012 | 1.179 [1.111, 1.246] | 0.106 | 0.999 | 0.186 |
+| Q17 | 65k | b1 | 0.857 [0.854, 0.861] | 0.006 | **1.022 [1.016, 1.027]** | 0.008 | 1.065 [1.030, 1.101] | 0.055 | 1.005 | 0.103 |
+| Q17 | 65k | auto | 0.857 [0.854, 0.861] | 0.005 | **1.022 [1.017, 1.026]** | 0.007 | 1.077 [1.036, 1.119] | 0.066 | 0.999 | 0.117 |
+| P0 | 16.8k | on | 0.952 [0.944, 0.960] | 0.012 | n/a | | 1.592 [1.539, 1.644] | 0.083 | 1.058 | 0.221 |
+| P0 | 65k | on | 0.920 [0.910, 0.930] | 0.016 | n/a | | 1.655 [1.548, 1.763] | 0.169 | 1.072 | 0.167 |
+| P17 | 16.8k | on | 0.914 [0.907, 0.920] | 0.010 | n/a | | 1.466 [1.384, 1.548] | 0.130 | 1.021 | 0.154 |
+| P17 | 65k | on | 0.862 [0.855, 0.868] | 0.010 | n/a | | 1.509 [1.465, 1.553] | 0.070 | 1.019 | 0.104 |
+
+**Batch auto vs batch 1 (Q, paired per pass, auto - b1, t with 11 df):**
+
+| block | shape | exec CPU ms | t | exec wall ms | t | pass B ms | t | parks / call | t |
+|---|---|---|---|---|---|---|---|---|---|
+| Q0 | 16.8k | -0.12 | -0.5 | -0.13 | -0.4 | -0.08 | -0.5 | -0.50 | -2.6 |
+| Q0 | 65k | -0.17 | -0.4 | -0.06 | -0.2 | -0.16 | -0.5 | -0.50 | -1.9 |
+| Q17 | 16.8k | +0.11 | 0.7 | +0.28 | 1.3 | -0.08 | -0.7 | -1.17 | -1.7 |
+| Q17 | 65k | +0.01 | 0.0 | -0.03 | -0.3 | +0.16 | 0.5 | -3.75 | -3.1 |
+
+**P vs Q, same arm (L2.2 on; Q / P of the cell means; step / pooled sd across passes):**
+
+| workers | shape | arm | wall Q / P | sd | pass B Q / P | sd |
+|---|---|---|---|---|---|---|
+| unset | 16.8k | off | 1.008 | 1.0 | 1.051 | 1.1 |
+| unset | 16.8k | on (Q b1) | 1.006 | 0.6 | 0.874 | -2.3 |
+| unset | 65k | off | 1.013 | 1.7 | 1.064 | 1.4 |
+| unset | 65k | on (Q b1) | 0.991 | -0.8 | 0.793 | -3.5 |
+| unset | 65k | on (Q auto) | 0.990 | -0.9 | 0.786 | -3.9 |
+| 17 | 65k | off | 1.016 | 2.9 | 1.067 | 1.9 |
+| 17 | 65k | on (Q b1) | 1.011 | 1.4 | 0.753 | -7.8 |
+| 17 | 65k | on (Q auto) | 1.011 | 1.4 | 0.762 | -6.5 |
+
+### 119.5 Verdict
+
+* **L2.1's exec-thread CPU cost on a quiet host is +1.7-2.2% per call at 65k and +2.2-3.7% at 16.8k (high
+  confidence).** All eight Q on / off CPU ratios have CIs above 1. Each step is 1.5-3.4 sd of the per-pass ratio, and
+  in absolute terms it is +1.1-2.2 ms per call. Per 1k fills, Q0 65k goes 1.608 -> 1.635-1.638 ms. With 17 match
+  workers the cost is no smaller: 1.022 at 65k, 1.034-1.037 at 16.8k.
+* **Batching does not change it (high confidence).** Auto vs batch 1 moves exec CPU by -0.17 to +0.11 ms per call
+  (|t| <= 0.7), about 0.1% of the call, and the ratio CIs of the two arms overlap almost fully. Batching does cut
+  parks per call (Q0 3.42 -> 2.92 at 65k, Q17 18.67 -> 14.92). So the wake-ups are not where the CPU goes.
+* **Mechanism, sized.**
+  * Parks cannot carry the CPU step. Q17 65k parks 5.5x as often as Q0 (18.7 vs 3.4 per call at batch 1), yet its
+    CPU step is only +2.23 vs +1.95 ms. That bounds the cost per park at about (2.23 - 1.95) / (18.67 - 3.42) ≈ 0.02 ms,
+    so 3-4 parks per call explain under 0.1 ms of the ~2 ms step. Runq time (0.8-2.7 ms at w0, ~0.05 at w17) is off-CPU
+    and is not in the step either.
+  * At w0, the settle time measured on the exec thread rises by about as much as the CPU (65k b1: settle +1.97 ms, CPU
+    +1.95 ms; auto +1.36 / +1.78). This fits settle running slower beside a busy match pool (cache / memory
+    contention), as 18c noted.
+  * At w17, settle is flat (+0.33 / -0.05 ms) while CPU is still +2.2 ms, so part of the cost sits outside settle and
+    this run does not isolate it. Medium confidence on the mechanism.
+* **Against section 114 (medium confidence).** Deep node B / A was 1.044 [1.009, 1.081] per 1k fills on a loaded host.
+  This run's 65k CIs (Q0 [1.010, 1.026], Q17 [1.016, 1.027]) overlap it, at about half the point estimate. The two
+  measures differ: 114 counts exec on-CPU per 1k fills over all exec work in a node (`df9e1d8a`), while this run
+  counts one `execute_batch` call in-process on Q. A quiet-host cost of ~+2% is consistent with 114's lower bound.
+  This run cannot tell whether the node's extra ~2% is host load or node-only work.
+* **Exec wall and pass B.** The flag cuts exec wall per call by 5-14%, with sd 0.005-0.017 and every CI below 1. P's
+  ratios are within 0.006 of Q's except w0 65k (P 0.920 vs Q 0.899-0.900). Pass B grows with the flag on both commits. On Q the growth is
+  smaller (1.07-1.33x vs P's 1.47-1.66x), and Q's flag-on pass B is 21-25% below P's at 65k (3.5-7.8 sd). Q batch 1
+  shows the same pass B as auto, so the drop is not batching. It comes from something else between `0323b755` and
+  `39f8c7f3` (the main merge `be1c378d` or other changes on the branch). Q's off arm is slightly slower than P's: wall
+  +0.8-1.6% (1.0-2.9 sd), pass B +5-7% (1.1-1.9 sd).
+
+### 119.6 Limits and data
+
+* Q prints per-process medians only, so the spread is across 12 passes (n = 12), not across the 96 reps. P prints
+  per-rep walls, but the ratios here use its per-pass medians for parity.
+* P has no CPU, runq or park counters. The batch-1 arm stands in for "before batching" on the CPU question, but it
+  runs on Q's code (with the main merge), not on P's.
+* The sampler's `own_cores` (0.09-1.55) misses the short-lived test processes; they land in `nonbench_cores`
+  (1.1-3.0). The foreign columns are unaffected. The sampler stopped at 05:15:14, so the last block (p12 P17) has
+  9.0 of its 18.8 s covered.
+* Analysis: `~/bench-results-matched/ozarchy-9h-tools/analyst/an.py`, output `all.txt` (all blocks) and `excl.txt`
+  (blocks with foreign total > 0.1 core dropped).
+* Campaign: `~/bench-results-matched/ozarchy-9h-run/` (`campaign.log`, `cells.tsv`, `blocks.tsv`, `handoff.json`,
+  `exe-md5.txt`, `raw/p<n>-<block>.log`, `contention-main.tsv`); driver and parser
+  `ozarchy-9h-tools/{9h-campaign.sh,9h-parse.py,build-9h.sh,h9-contention.py}`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

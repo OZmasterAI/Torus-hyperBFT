@@ -60,7 +60,12 @@ fn consensus_db_has_only_its_cfs_and_survives_reopen_inside_the_state_dir() {
         );
         assert_eq!(
             CONSENSUS_DB_CFS,
-            [CF_CONSENSUS_META, CF_NATIVE_PENDING, CF_NATIVE_SHARDS]
+            [
+                CF_CONSENSUS_META,
+                CF_NATIVE_PENDING,
+                CF_NATIVE_SHARDS,
+                CF_COMMIT_MANIFEST
+            ]
         );
         state.put_cf_raw(CF_ACCOUNTS, b"acct", b"s").unwrap();
         state
@@ -110,6 +115,36 @@ fn consensus_db_has_only_its_cfs_and_survives_reopen_inside_the_state_dir() {
         ro.get_cf_raw(CF_CONSENSUS_META, &[5]).unwrap(),
         Some(b"vset".to_vec())
     );
+}
+
+/// T5.3: a consensus DB created before the commit-manifest CF moved there
+/// still opens read-only (`torus-unwedge --inspect`), without that CF; a
+/// read-write open adds it.
+#[test]
+fn pre_manifest_consensus_db_opens_read_only_and_gains_the_cf_read_write() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let old = StateDb::open_cfs(
+            dir.path(),
+            &DbTuning::default(),
+            book_cf_target_file_bytes(),
+            &[CF_CONSENSUS_META, CF_NATIVE_PENDING, CF_NATIVE_SHARDS],
+            CONSENSUS_DB_WRITE_BUFFER_BYTES,
+            CONSENSUS_BLOCK_CACHE_BYTES,
+            crate::prune_filter::PruneMode::Range,
+        )
+        .unwrap();
+        old.put_cf_raw(CF_CONSENSUS_META, &[5], b"vset").unwrap();
+    }
+    let ro = StateDb::open_consensus_read_only(dir.path()).unwrap();
+    assert_eq!(
+        ro.get_cf_raw(CF_CONSENSUS_META, &[5]).unwrap(),
+        Some(b"vset".to_vec())
+    );
+    assert!(ro.cf_handle(CF_COMMIT_MANIFEST).is_err());
+    drop(ro);
+    let rw = StateDb::open_consensus(dir.path()).unwrap();
+    assert!(rw.cf_handle(CF_COMMIT_MANIFEST).is_ok());
 }
 
 /// A `NativeDaStore` over the consensus DB writes its bodies (and shards)

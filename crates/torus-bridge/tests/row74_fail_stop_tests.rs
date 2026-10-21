@@ -151,8 +151,17 @@ fn setup_staker(db: &StateDb) -> Address {
     addr(2)
 }
 
-/// Text proposal 1 by `proposer`, voting open until block 101.
+/// Proposal 1 by `proposer`, voting open until block 101: a params update of
+/// market 1 (it was text-only before pre-testnet P1; it now needs a listed
+/// market, so market 1 is listed here; the tests only vote on it).
 fn submit_text_proposal(db: &StateDb, proposer: &Address) {
+    let s = torus_types::FixedPoint::SCALE;
+    db.put_cf_raw(
+        torus_state::cf::CF_NATIVE_MARKETS,
+        &1u64.to_be_bytes(),
+        &borsh::to_vec(&("BTC".to_string(), "USD".to_string(), s, s, 5 * s)).unwrap(),
+    )
+    .unwrap();
     let mut ctx = make_ctx(db.clone(), 1);
     let r = NativeExecutor::execute(
         &mut ctx,

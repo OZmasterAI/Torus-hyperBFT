@@ -84,6 +84,11 @@ fn exec(ctx: &mut NativeExecContext, mode: Mode, block: &[(Address, NativeAction
 fn fresh() -> (tempfile::TempDir, NativeExecContext) {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
+    // Pre-testnet P0: orders need a listed market (placeholder rows,
+    // tick / lot 1, as the old implicit book).
+    for m in 1..=64u64 {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+    }
     db.put_cf_raw(CF_NATIVE_MARKETS, &1u64.to_be_bytes(), &market_row(2 * S, 2 * S)).unwrap();
     let ctx = NativeExecContext::new(db, 1, 1000, 0, 100, 10, addr(99), addr(100), addr(101));
     fund_native(&ctx, &addr(1), fp(1_000_000));

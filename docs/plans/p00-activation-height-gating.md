@@ -105,6 +105,14 @@ Steps 1-6: ~8-9 days. Step 2 changes the block hash, so it must land before the 
 - L6.1: consensus-changing (`docs/perf/8k-explore-ideas.md:57`); first real adopter after launch.
 - Every later P1-P5 item gets gated.
 
+## Owner decisions (s131)
+- Schedule: built-in table per chain id now (plus genesis `activations`); governance `ScheduleActivation` later,
+  before mainnet.
+- Old binaries past an activation height: stop (refuse to vote, fail-stop with UPGRADE REQUIRED), as proposed.
+- Genesis check: a node refuses to start when the on-disk genesis file differs from the applied genesis (store a
+  genesis digest at first boot).
+- Running hash in the testnet genesis: undecided; L6.1 is being built so Classic keeps L3.1's gain with it on.
+
 ## 6. Open questions for the owner
 1. Running hash in the testnet genesis? Without it nothing detects divergent execution; only header bits are cross-checked.
 2. Built-in schedule now, governance later — or governance from day one (voting period / timelock for activations)?

@@ -129,6 +129,7 @@ fn verify_value_conservation(
 #[test]
 fn test_sustained_throughput() {
     let h = TestHarness::new();
+    h.list_markets(1..=64);
     let market = 1u64;
     let num_traders = 100usize;
     let orders_per_block = 200usize;
@@ -191,6 +192,7 @@ fn test_sustained_throughput() {
 #[test]
 fn test_multi_market_stress() {
     let h = TestHarness::new();
+    h.list_markets(1..=64);
     let num_markets = 5u64;
     let num_traders = 50usize;
     let orders_per_market = 1000usize;
@@ -247,6 +249,7 @@ fn test_multi_market_stress() {
 #[test]
 fn test_position_accumulation_precision() {
     let h = TestHarness::new();
+    h.list_markets(1..=64);
     let market = 1u64;
     let trader_a = addr(1);
     let trader_b = addr(2);
@@ -415,6 +418,7 @@ fn test_position_accumulation_precision() {
 #[test]
 fn test_deep_book_sweep() {
     let h = TestHarness::new();
+    h.list_markets(1..=64);
     let market = 1u64;
     let orders_per_level = 10usize;
     let num_levels = 1000usize;

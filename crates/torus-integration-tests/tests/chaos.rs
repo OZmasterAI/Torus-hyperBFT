@@ -255,6 +255,11 @@ fn test_replay_determinism() {
     let run_workload = || -> Vec<alloy_primitives::B256> {
         let tmp_dir = tempfile::TempDir::new().unwrap();
         let state_db = StateDb::open(tmp_dir.path()).unwrap();
+        // Pre-testnet P0: orders need a listed market (placeholder rows,
+        // tick / lot 1, as the old implicit book).
+        for m in 1..=64u64 {
+            state_db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+        }
         let positions = PositionManager::new(state_db.clone());
 
         // Fund all traders.
@@ -333,6 +338,11 @@ fn native_incremental_root_matches_full_scan_under_real_execution() {
 
     let tmp = tempfile::TempDir::new().unwrap();
     let state_db = StateDb::open(tmp.path()).unwrap();
+    // Pre-testnet P0: orders need a listed market (placeholder rows,
+    // tick / lot 1, as the old implicit book).
+    for m in 1..=64u64 {
+        state_db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+    }
 
     // Fund traders, then build the native trie base over the funded state.
     let positions = PositionManager::new(state_db.clone());
@@ -636,6 +646,7 @@ fn test_execution_ordering_enforced() {
 #[test]
 fn test_duplicate_action_handling() {
     let h = TestHarness::new();
+    h.list_markets(1..=64);
     let trader = addr(1);
     let market = 1u64;
 
@@ -716,6 +727,7 @@ fn test_empty_block() {
 #[test]
 fn test_all_actions_fail() {
     let h = TestHarness::new();
+    h.list_markets(1..=64);
     let unfunded = addr(99); // no balance
 
     // Record initial state root.
@@ -770,6 +782,7 @@ fn test_all_actions_fail() {
 #[test]
 fn test_mixed_success_failure() {
     let h = TestHarness::new();
+    h.list_markets(1..=64);
     let buyer = addr(1);
     let seller = addr(2);
     let unfunded = addr(99);
