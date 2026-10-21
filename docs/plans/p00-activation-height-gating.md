@@ -120,3 +120,21 @@ Steps 1-6: ~8-9 days. Step 2 changes the block hash, so it must land before the 
 4. Old binaries keep voting past H (liveness) or stop as proposed (safe when vote rules change)?
 5. u128 bitmap enough, or numbered fork bundles?
 6. Refuse to start when the on-disk genesis file differs from the applied genesis (store a genesis digest)?
+
+## Build phases (s134)
+Each phase lands on its own branch with RED-first tests and full gates; each one is mergeable alone.
+1. **Header bits and the rule** (~3.5 d; doc steps 1-2, plus the vote/propose refusal and the execution
+   fail-stop of step 3): `Feature` registry + `KNOWN_FEATURES`, `ActivationSchedule` (genesis `activations` +
+   the old `state_hash_activation_height` alias + built-in table per chain id, conflicts refuse to start),
+   `TorusBlockHeader.features` in the canonical bytes, genesis parent header bits, proposer bits,
+   `check_parent_link` rule (vote and insertion), unknown bit -> no vote / no proposal, execution and crash
+   replay: unknown bit -> fail-stop `UPGRADE REQUIRED`, known bits != own schedule -> execute by the header + ERROR.
+2. **Execution reads the bits** (~1 d): executor context `features`, EVM `SpecId` from the bits,
+   mempool / RPC admission with the expected bits for tip+1.
+3. **Running-hash migration** (~0.5-1 d): `configure_activation` checks the header bit from the start height;
+   `ChainConfig.state_hash_activation_height` comes only from the schedule.
+4. **Genesis digest** (~0.5 d, owner decision): store a digest of the applied genesis at first boot, refuse to
+   start when the on-disk file differs.
+5. **Integration tests 1-4** (~2-3 d): needs a test-only feature with a state-visible rule.
+6. **Ops** (~0.5-1 d): features gauge, RPC schedule listing, upgrade runbook.
+7. **Governance `ScheduleActivation`** (before mainnet, 3-4 d) through `EpochRotationPlan`.

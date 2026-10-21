@@ -324,6 +324,54 @@ fn state_root_determinism_two_validators() {
     drop(dir2);
 }
 
+/// P0.0: the proposer stamps each header with the schedule's bits for its
+/// height, and the genesis parent header carries block 1's bits (so a node with
+/// another genesis set computes another block-1 parent hash). RED before phase 1.
+#[test]
+fn proposer_and_genesis_header_carry_the_scheduled_feature_bits() {
+    use torus_types::{ActivationSchedule, Feature};
+    let (_dir, db) = open_test_db();
+    let executor = EvmExecutor::new(TORUS_CHAIN_ID);
+    let at = |h: u64| {
+        ActivationSchedule::merge(&[(Feature::RunningStateHash, h)].into_iter().collect(), &[])
+            .unwrap()
+    };
+    let mut config = torus_types::ChainConfig {
+        activations: at(2),
+        ..serde_json::from_value(serde_json::json!({
+            "chain_id": TORUS_CHAIN_ID, "chain_name": "t", "evm_gas_limit": 30_000_000u64,
+            "base_fee_per_gas": 1_000_000_000u64, "epoch_length": 100u64, "max_validators": 4,
+            "min_stake": "0x0", "fee_burn_bps": 0, "fee_validator_bps": 0, "fee_treasury_bps": 0,
+            "fee_dev_pool_bps": 0, "treasury_address": Address::ZERO,
+            "dev_pool_address": Address::ZERO
+        }))
+        .unwrap()
+    };
+    let genesis_later = torus_bridge::genesis_parent_header_for(&config);
+    assert_eq!(genesis_later.features, 0, "feature at 2: not in the genesis parent header");
+    config.activations = at(1);
+    let genesis_block1 = torus_bridge::genesis_parent_header_for(&config);
+    assert_eq!(genesis_block1.features, Feature::RunningStateHash.bit());
+    assert_ne!(
+        alloy_primitives::keccak256(genesis_later.canonical_header_bytes()),
+        alloy_primitives::keccak256(genesis_block1.canonical_header_bytes()),
+        "another genesis set, another block-1 parent hash"
+    );
+
+    let proposer = BlockProposer::new(TORUS_CHAIN_ID, 100, 4, Address::ZERO, Address::ZERO)
+        .with_activations(at(2));
+    let b1 = proposer
+        .build_block(&db, &executor, &genesis_later, vec![], 1, Address::ZERO)
+        .unwrap()
+        .block;
+    assert_eq!(b1.header.features, 0, "height 1 < 2");
+    let b2 = proposer
+        .build_block(&db, &executor, &b1.header, vec![], 2, Address::ZERO)
+        .unwrap()
+        .block;
+    assert_eq!(b2.header.features, Feature::RunningStateHash.bit(), "height 2");
+}
+
 // 5. Multi-block chain — state carries forward
 #[test]
 fn multi_block_chain() {
@@ -606,6 +654,7 @@ fn block_hash_uses_canonical_encoding() {
         big_base_fee_per_gas: 1_000_000_000,
         epoch: 7,
         validator_set_hash: B256::new([3u8; 32]),
+        features: 0,
         sig_attestation: [0u8; 64],
     };
 

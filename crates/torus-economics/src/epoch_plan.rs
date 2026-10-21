@@ -893,6 +893,7 @@ mod tests {
             big_base_fee_per_gas: 1_500_000_000,
             epoch: 0,
             validator_set_hash: alloy_primitives::B256::ZERO,
+            features: 0,
             sig_attestation: [0u8; 64],
         };
         let plan = PlanEvm {

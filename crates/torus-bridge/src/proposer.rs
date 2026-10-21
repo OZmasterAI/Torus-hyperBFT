@@ -30,6 +30,8 @@ pub struct BlockProposer {
     #[allow(dead_code)]
     dev_pool_address: Address,
     pub metrics: Option<std::sync::Arc<torus_telemetry::Metrics>>,
+    /// P0.0: the schedule the header `features` bits come from.
+    activations: torus_types::ActivationSchedule,
 }
 
 impl BlockProposer {
@@ -47,7 +49,14 @@ impl BlockProposer {
             treasury_address,
             dev_pool_address,
             metrics: None,
+            activations: torus_types::ActivationSchedule::default(),
         }
+    }
+
+    /// P0.0: build headers with the feature bits of `activations` (default: none).
+    pub fn with_activations(mut self, activations: torus_types::ActivationSchedule) -> Self {
+        self.activations = activations;
+        self
     }
 
     /// Build a block from the given EVM transactions.
@@ -162,6 +171,7 @@ impl BlockProposer {
                     self.epoch_length,
                 ),
                 validator_set_hash: parent.validator_set_hash,
+                features: 0,
                 sig_attestation: [0u8; 64],
             },
             native_actions: vec![],
@@ -215,6 +225,7 @@ pub fn genesis_parent_header(evm_gas_limit: u64, evm_block_interval: u64) -> Tor
         big_base_fee_per_gas: torus_types::EVM_MIN_BASE_FEE, // 1 gwei, like the small lane
         epoch: 0,
         validator_set_hash: B256::ZERO,
+        features: 0,
         sig_attestation: [0u8; 64],
     }
 }

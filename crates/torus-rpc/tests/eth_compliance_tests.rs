@@ -107,6 +107,7 @@ async fn bare_eth_call_succeeds_at_height_with_base_fee() {
         big_base_fee_per_gas: 1_000_000_000,
         epoch: 0,
         validator_set_hash: alloy_primitives::B256::ZERO,
+        features: 0,
         sig_attestation: [0u8; 64],
     };
     let canonical = header.canonical_header_bytes();
@@ -411,6 +412,7 @@ fn store_head(state: &StateDb, h: Head) {
         big_base_fee_per_gas: h.big_base_fee,
         epoch: 0,
         validator_set_hash: alloy_primitives::B256::ZERO,
+        features: 0,
         sig_attestation: [0u8; 64],
     };
     let block_hash = alloy_primitives::keccak256(header.canonical_header_bytes());

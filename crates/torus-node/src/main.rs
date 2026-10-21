@@ -468,6 +468,12 @@ fn default_chain_config() -> ChainConfig {
         reputation_leader_selection: false,
         exec_trust_cache: false,
         state_hash_activation_height: None,
+        // P0.0: no genesis, so only the built-in table (it cannot conflict).
+        activations: torus_types::ActivationSchedule::for_chain(
+            torus_evm::TORUS_CHAIN_ID,
+            &Default::default(),
+        )
+        .expect("an empty genesis set never conflicts with the built-in table"),
     }
 }
 
@@ -739,6 +745,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         gas_limit = chain_config.evm_gas_limit,
         "chain configuration loaded"
     );
+    // P0.0: the activation schedule this node proposes and votes by.
+    for (feature, height) in chain_config.activations.iter() {
+        info!(feature = feature.name(), id = feature.id(), height, "feature activation scheduled");
+    }
     // Every native action this node signs or verifies uses this network's
     // EIP-712 domain (genesis `chain_id`, devnet 7778). Set before any
     // component exists; fails if anything already used another id.

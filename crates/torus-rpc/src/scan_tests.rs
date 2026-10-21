@@ -1846,6 +1846,7 @@ fn put_block_with_slots(state: &StateDb, height: u64, slots: u32, executed: &[u3
         big_base_fee_per_gas: 1,
         epoch: 0,
         validator_set_hash: B256::ZERO,
+        features: 0,
         sig_attestation: [0u8; 64],
     };
     // commit_block's format: block_hash(32) || header_json.

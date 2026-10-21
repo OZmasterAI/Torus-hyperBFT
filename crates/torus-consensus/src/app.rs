@@ -1502,6 +1502,11 @@ struct ExecutionContext {
     /// same value as `TorusApp::genesis_header`): crash replay starts from
     /// it and execution links height 1 to it.
     pub(crate) genesis_header: TorusBlockHeader,
+    /// P0.0: this node's activation schedule (`ChainConfig::activations`).
+    /// Execution runs by the committed header's bits; a header bit this binary
+    /// does not know fail-stops (`UPGRADE REQUIRED`), known bits that differ
+    /// from this schedule are logged.
+    pub(crate) activations: torus_types::ActivationSchedule,
     metrics: Option<Arc<torus_telemetry::Metrics>>,
     /// Shared mempool handle for the exec trust-cache read path: a HIT lets the
     /// execution thread reuse a locally-verified sender and skip the secp256k1
@@ -3104,6 +3109,7 @@ fn check_parent_link(
     header: &TorusBlockHeader,
     justify: &PhaseCertificate,
     genesis: &TorusBlockHeader,
+    schedule: &torus_types::ActivationSchedule,
     parent: impl FnOnce(&CryptoHash) -> ParentHeader,
     boundary: impl FnOnce(u64) -> Result<Option<PlanEvm>, EpochPlanNotReady>,
 ) -> BlockDataCheck {
@@ -6603,6 +6609,9 @@ pub struct TorusApp {
     /// the chain config (`evm_gas_limit`, `evm_block_interval`). Height 1 links
     /// to it before the vote, at insertion and at execution.
     pub(crate) genesis_header: TorusBlockHeader,
+    /// P0.0: this node's activation schedule (`ChainConfig::activations`): the
+    /// `features` bits it proposes and requires before the vote and at insertion.
+    pub(crate) activations: torus_types::ActivationSchedule,
     staking: StakingManager,
     epoch_length: u64,
     last_validator_set: ValidatorSet,
@@ -7495,6 +7504,7 @@ impl TorusApp {
             config.dev_pool_address,
         );
         proposer.metrics = metrics.clone();
+        let proposer = proposer.with_activations(config.activations.clone());
         let mut validator = BlockValidator::new(
             config.chain_id,
             config.epoch_length,
@@ -7554,6 +7564,7 @@ impl TorusApp {
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
             genesis_header: genesis_header.clone(),
+            activations: config.activations.clone(),
             metrics: metrics.clone(),
             mempool: mempool.clone(),
             exec_trust_cache: config.exec_trust_cache,
@@ -7845,6 +7856,7 @@ impl TorusApp {
             proposer_address,
             last_header,
             genesis_header,
+            activations: config.activations.clone(),
             staking,
             epoch_length: config.epoch_length,
             last_validator_set: genesis_validator_set,
@@ -8494,6 +8506,7 @@ impl TorusApp {
             reputation_leader_selection: false,
             exec_trust_cache: false,
             state_hash_activation_height: None,
+            activations: Default::default(),
         };
         let mut seed = [0u8; 32];
         seed[..8].copy_from_slice(&id.to_le_bytes());
@@ -9552,9 +9565,14 @@ impl TorusApp {
                 (compact.header.clone(), Some(compact))
             }
         };
-        let link = check_parent_link(&header, &block.justify, &self.genesis_header, parent, |h| {
-            self.boundary_evm(h)
-        });
+        let link = check_parent_link(
+            &header,
+            &block.justify,
+            &self.genesis_header,
+            &self.activations,
+            parent,
+            |h| self.boundary_evm(h),
+        );
         if link != BlockDataCheck::Held {
             return link;
         }
@@ -9723,6 +9741,7 @@ impl TorusApp {
                 big_base_fee_per_gas: evm.big_base_fee,
                 epoch: parent_header.epoch,
                 validator_set_hash: parent_header.validator_set_hash,
+                features: 0,
                 sig_attestation,
             },
             native_actions,
@@ -9883,6 +9902,7 @@ impl App<RocksKVStore> for TorusApp {
                 &header,
                 &block.justify,
                 &self.genesis_header,
+                &self.activations,
                 |hash| tree_parent_header(request.block_tree(), hash),
                 |h| self.boundary_evm(h),
             ),
@@ -11507,6 +11527,7 @@ mod exec_throttle_tests {
                 reputation_leader_selection: false,
                 exec_trust_cache: false,
                 state_hash_activation_height: None,
+                activations: Default::default(),
             };
             (config, state_db)
         };
@@ -11709,6 +11730,7 @@ mod exec_dispatch_tests {
                 big_base_fee_per_gas: 1_000_000_000,
                 epoch: 0,
                 validator_set_hash: B256::ZERO,
+                features: 0,
                 sig_attestation: [0u8; 64],
             },
             native_actions,
@@ -13009,6 +13031,7 @@ mod crash_recovery_tests {
             // Running state hash on from height 1 (chain config), as a
             // genesis-synced node of a chain with activation 1.
             state_hash_activation_height: Some(1),
+            activations: Default::default(),
         };
         torus_state::running_hash::configure_activation(&state_db, config.state_hash_activation_height)
             .expect("configure running hash activation");
@@ -13074,6 +13097,7 @@ mod crash_recovery_tests {
                 big_base_fee_per_gas: 1_000_000_000,
                 epoch: 0,
                 validator_set_hash: B256::ZERO,
+                features: 0,
                 sig_attestation: [0u8; 64],
             },
             native_actions,
@@ -16789,6 +16813,7 @@ mod crash_recovery_tests {
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
             genesis_header: torus_bridge::genesis_parent_header_for(config),
+            activations: config.activations.clone(),
             metrics: None,
             mempool,
             exec_trust_cache,
@@ -25157,6 +25182,7 @@ mod crash_recovery_tests {
                 &far.header,
                 &justify_for(&hs_parent),
                 &app.genesis_header,
+                &app.activations,
                 move |_| ParentHeader::Header(Box::new(header)),
                 |_| Ok(None)
             ),
@@ -25202,6 +25228,7 @@ mod crash_recovery_tests {
                     &child_of(&parent, ts).header,
                     &justify_for(&hs_parent),
                     &app.genesis_header,
+                    &app.activations,
                     move |_| ParentHeader::Header(Box::new(header)),
                     |_| Ok(None)
                 ),
@@ -25275,6 +25302,203 @@ mod crash_recovery_tests {
         }
     }
 
+    // ---- P0.0: header feature bits (docs/plans/p00-activation-height-gating.md) ----
+
+    /// A schedule with `RunningStateHash` (id 0, bit 1) at `height`.
+    fn rsh_at(height: u64) -> torus_types::ActivationSchedule {
+        torus_types::ActivationSchedule::merge(
+            &[(torus_types::Feature::RunningStateHash, height)]
+                .into_iter()
+                .collect(),
+            &[],
+        )
+        .unwrap()
+    }
+
+    /// A bit no binary of this release knows (a feature of a newer release).
+    const UNKNOWN_BIT: u128 = 1 << 9;
+
+    fn gated_app(now: u64, schedule: torus_types::ActivationSchedule) -> TorusApp {
+        let (mut config, db) = make_test_config_and_db();
+        config.activations = schedule;
+        let mut app = TorusApp::new(db, &config, None, None, None);
+        app.test_now_secs = Some(now);
+        app
+    }
+
+    /// `check_parent_link` as `validate_block` runs it on insertion (full
+    /// proposal, header + body, block sync) of `block` on `parent`.
+    fn insertion_link(app: &TorusApp, parent: &TorusBlock, block: &TorusBlock) -> BlockDataCheck {
+        let hs_parent = hs_block(parent, PhaseCertificate::genesis_pc());
+        let header = parent.header.clone();
+        check_parent_link(
+            &block.header,
+            &justify_for(&hs_parent),
+            &app.genesis_header,
+            &app.activations,
+            move |_| ParentHeader::Header(Box::new(header)),
+            |_| Ok(None),
+        )
+    }
+
+    fn with_features(mut block: TorusBlock, features: u128) -> TorusBlock {
+        block.header.features = features;
+        block
+    }
+
+    /// P0.0 header rule: `features` must equal the voter's own
+    /// `schedule.active_at(height)`, before the vote (`check_proposal_data`)
+    /// and at insertion (`validate_block`'s `check_parent_link`): missing the
+    /// bit at the activation height, carrying it one height early, or an extra
+    /// bit are all refused; the honest bits are held.
+    /// RED before phase 1: every variant was `Held` (the bits were not checked).
+    #[test]
+    fn header_feature_bits_must_equal_the_schedule_before_the_vote_and_at_insertion() {
+        let rsh = torus_types::Feature::RunningStateHash.bit();
+        let parent = tip_2000(); // height 4, no bits
+        let mut app = gated_app(2_010, rsh_at(5));
+        let cases: [(&str, u128, BlockDataCheck); 4] = [
+            ("honest: bit from height 5", rsh, BlockDataCheck::Held),
+            ("bit missing at the activation height", 0, BlockDataCheck::Invalid),
+            ("extra unknown bit", rsh | UNKNOWN_BIT, BlockDataCheck::Invalid),
+            ("only an unknown bit", UNKNOWN_BIT, BlockDataCheck::Invalid),
+        ];
+        for (what, features, want) in cases {
+            let b5 = with_features(child_of(&parent, 2_000), features);
+            assert_eq!(pre_vote(&mut app, &parent, &b5), want, "pre-vote: {what}");
+            assert_eq!(insertion_link(&app, &parent, &b5), want, "insertion: {what}");
+        }
+        // Past H the bit stays on.
+        let b5 = with_features(child_of(&parent, 2_000), rsh);
+        for (features, want) in [(rsh, BlockDataCheck::Held), (0, BlockDataCheck::Invalid)] {
+            let b6 = with_features(child_of(&b5, 2_000), features);
+            assert_eq!(pre_vote(&mut app, &b5, &b6), want, "height 6, bits {features}");
+            assert_eq!(insertion_link(&app, &b5, &b6), want, "height 6 insertion, bits {features}");
+        }
+        // One height early (the voter schedules it at 6): refused.
+        let mut later = gated_app(2_010, rsh_at(6));
+        let early = with_features(child_of(&parent, 2_000), rsh);
+        assert_eq!(pre_vote(&mut later, &parent, &early), BlockDataCheck::Invalid, "early");
+        assert_eq!(insertion_link(&later, &parent, &early), BlockDataCheck::Invalid, "early");
+        let on_time = child_of(&parent, 2_000);
+        assert_eq!(pre_vote(&mut later, &parent, &on_time), BlockDataCheck::Held, "below H");
+    }
+
+    /// P0.0, owner decision (open question 4): an old binary stops at a
+    /// feature it does not know. A header carrying an unknown bit gets no vote
+    /// and is not inserted, and a leader whose parent carries one refuses to
+    /// propose (`refused_proposal`, a datum-less block) instead of building a
+    /// child it cannot execute. RED before phase 1: voted, inserted, proposed.
+    #[test]
+    fn unknown_feature_bit_refuses_the_vote_insertion_and_proposal() {
+        let parent = tip_2000();
+        let mut old = gated_app(2_010, torus_types::ActivationSchedule::default());
+        let newer = with_features(child_of(&parent, 2_000), UNKNOWN_BIT);
+        assert_eq!(pre_vote(&mut old, &parent, &newer), BlockDataCheck::Invalid, "no vote");
+        assert_eq!(insertion_link(&old, &parent, &newer), BlockDataCheck::Invalid, "no insert");
+        assert_eq!(
+            pre_vote(&mut old, &parent, &child_of(&parent, 2_000)),
+            BlockDataCheck::Held,
+            "control: no bits"
+        );
+
+        let resp = old.build_proposal(parent.header.clone());
+        assert!(!resp.data.vec().is_empty(), "control: a known parent gets a proposal");
+        let resp = old.build_proposal(newer.header.clone());
+        assert!(resp.data.vec().is_empty(), "parent with an unknown bit: refused proposal");
+        assert!(!old.pending_proposals.contains_key(&6), "nothing built on it");
+    }
+
+    /// P0.0: the proposer stamps the schedule's bits, the genesis parent header
+    /// carries block 1's bits (from the chain config), and the block it builds
+    /// passes its own pre-vote rule. A voter with another genesis set refuses
+    /// block 1 (another genesis parent header). RED before phase 1: no bits.
+    #[test]
+    fn proposer_stamps_the_scheduled_bits_and_genesis_binds_block_1() {
+        let rsh = torus_types::Feature::RunningStateHash.bit();
+        let no_lookup = |_: &CryptoHash| -> ParentHeader { panic!("genesis justify") };
+        let genesis_hs = |resp: &ProduceBlockResponse| {
+            Block::new(
+                hotstuff_rs::types::data_types::BlockHeight::new(1),
+                PhaseCertificate::genesis_pc(),
+                resp.data_hash,
+                resp.data.clone(),
+            )
+        };
+        let mut from_1 = gated_app(unix_now_secs(), rsh_at(1));
+        assert_eq!(from_1.genesis_header.features, rsh, "genesis parent header");
+        assert_eq!(from_1.last_header.features, rsh);
+        let resp = from_1.build_proposal(from_1.genesis_header.clone());
+        assert_eq!(from_1.pending_proposals[&1].block.header.features, rsh);
+        assert_eq!(
+            from_1.check_proposal_data(&genesis_hs(&resp), no_lookup),
+            BlockDataCheck::Held
+        );
+        let mut without = gated_app(unix_now_secs(), torus_types::ActivationSchedule::default());
+        assert_eq!(without.genesis_header.features, 0);
+        assert_eq!(
+            without.check_proposal_data(&genesis_hs(&resp), no_lookup),
+            BlockDataCheck::Invalid,
+            "another genesis set: block 1 does not link"
+        );
+
+        // Crossing H = 3 on a non-genesis parent.
+        let mut at_3 = gated_app(unix_now_secs(), rsh_at(3));
+        let mut parent = make_block(2, vec![]);
+        parent.header.timestamp = unix_now_secs();
+        let _ = at_3.build_proposal(parent.header.clone());
+        let b3 = at_3.pending_proposals[&3].block.clone();
+        assert_eq!(b3.header.features, rsh, "height 3");
+        assert_eq!(pre_vote(&mut at_3, &parent, &b3), BlockDataCheck::Held);
+        let mut parent = make_block(1, vec![]);
+        parent.header.timestamp = unix_now_secs();
+        let _ = at_3.build_proposal(parent.header.clone());
+        assert_eq!(at_3.pending_proposals[&2].block.header.features, 0, "height 2");
+    }
+
+    /// P0.0 replay rule: execution and crash replay run each committed block
+    /// by its stored header's bits. Known bits that differ from this node's
+    /// schedule (another binary moved a height) execute (logged); a bit this
+    /// binary does not know latches the fail-stop BEFORE that height executes
+    /// (`UPGRADE REQUIRED`): the applied height stays below it.
+    /// RED before phase 1: the unknown-bit height executed (applied 3).
+    #[test]
+    fn execution_and_replay_honour_header_bits_and_fail_stop_on_an_unknown_bit() {
+        let rsh = torus_types::Feature::RunningStateHash.bit();
+        for (bits, fails) in [(rsh, false), (UNKNOWN_BIT, true), (rsh | UNKNOWN_BIT, true)] {
+            for replay in [false, true] {
+                let what = format!("bits {bits:#x}, replay={replay}");
+                let (config, db) = make_test_config_and_db();
+                assert_eq!(config.activations, Default::default(), "own schedule: none");
+                let ctx = make_exec_ctx(&config, &db);
+                let mut blocks = vec![
+                    make_block(1, vec![]),
+                    with_features(make_block(2, vec![]), bits),
+                    with_features(make_block(3, vec![]), bits),
+                ];
+                link_blocks(&mut blocks);
+                if replay {
+                    for b in &blocks {
+                        persist_committed_block_durably(&db, b);
+                    }
+                    let (last, parked) = TorusApp::replay_committed(&db, &ctx);
+                    assert_eq!(parked, None, "{what}");
+                    assert_eq!(last.height, if fails { 1 } else { 3 }, "{what}");
+                    if !fails {
+                        assert_eq!(last.features, bits, "{what}: the stored bits");
+                    }
+                } else {
+                    for b in &blocks {
+                        ctx.execute_committed_block(b, vec![]);
+                    }
+                }
+                assert_eq!(ctx.exec_failed.load(Ordering::SeqCst), fails, "{what}");
+                let applied = if fails { 1 } else { 3 };
+                assert_eq!(read_native_applied_height(&db), Some(applied), "{what}");
+            }
+        }
+    }
+
     // ---- item 7 step 0: EVM header rules before the vote ----
 
     /// A signed EVM tx declaring `gas_limit` (a plain call, zero value).
@@ -25344,6 +25568,7 @@ mod crash_recovery_tests {
                     &b.header,
                     &justify_for(&hs_parent),
                     &app.genesis_header,
+                    &app.activations,
                     move |_| ParentHeader::Header(Box::new(header)),
                     |_| Ok(None)
                 ),
@@ -25557,6 +25782,7 @@ mod crash_recovery_tests {
             &block.header,
             &justify_for(&hs_parent),
             &app.genesis_header,
+            &app.activations,
             move |_| ParentHeader::Header(Box::new(header)),
             boundary,
         )
