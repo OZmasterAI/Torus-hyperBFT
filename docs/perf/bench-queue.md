@@ -975,6 +975,13 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    flag `TORUS_SETTLE_STREAMED` on vs off, interleaved, >= 12 reps per cell; also at 65k with `TORUS_MATCH_WORKERS=17`.
    Report per cell: exec wall per call (median), exec-thread CPU per call, pass B ms, parks per call (39f8c7f3 only), on/off
    ratios with spread. Question: on a quiet host, how large is L2.1's exec-thread CPU cost, and does batching change it?
+   **Done s73 (ozarchy-9h, section 119; P `0323b755` test exe `72f72eb6`, Q `39f8c7f3` `718cdc65`, 48 / 48 blocks rc 0,
+   1,347 CHECK PASS, 0 CHECK FAIL, no foreign-CPU rerun; 12 passes x 8 reps): exec-thread on-CPU on / off (Q) 65k
+   1.019 [1.012, 1.026] batch 1 / 1.017 [1.010, 1.024] auto (+1.8-2.0 ms on 104.2), 16.8k 1.025 / 1.022, w17 65k
+   1.022 / 1.022; batching changes CPU by -0.17 to +0.11 ms per call (|t| <= 0.7) while cutting parks 0.5-3.8 per call,
+   so wake-ups are not the cost (<= ~0.02 ms per park). Overlaps section 114's deep 1.044 [1.009, 1.081] at half the
+   point estimate. Exec wall on / off 0.90 (65k) / 0.95 (16.8k), w17 0.857; pass B 1.07-1.33x on Q vs 1.47-1.66x on P
+   (not from batching: Q batch 1 matches auto).**
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 

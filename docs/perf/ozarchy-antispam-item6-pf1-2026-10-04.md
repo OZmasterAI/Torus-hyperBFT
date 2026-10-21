@@ -18474,6 +18474,159 @@ advanced by own AdvanceView 61.6 / 62.6 / 64.5% (rest by a peer's, ~0.03% other)
   `ozarchy-9f-run/contention-main.tsv`; spec, checks and driver `ozarchy-9f-tools/{9f-spec.json,9f-checks.sh,
   ozarchy-9f-campaign.sh,9f-chain.sh}`; build `ozarchy-9f-stage/build/`.
 
+## 119. Step 9h, L2.1 microbench on a quiet host: in-process `cargo test --release -p torus-bridge --test ubench_settle_streamed`, P = `perf/l21-streamed-settle` `0323b755` (before wake-up batching) vs Q = `39f8c7f3` (batched wake-ups, merged with main `be1c378d`), `UBENCH_L22=on`, 300 markets, 16.8k (17,100) and 65k (64,800) fills per call, `TORUS_SETTLE_STREAMED` off vs on (Q: on at wake batch 1 and auto), `TORUS_MATCH_WORKERS` unset and 17, 12 passes x 8 reps (campaign ozarchy-9h, archy, 2026-10-21)
+
+**On a quiet host L2.1 costs the exec thread about +2% CPU per call at 65k (1.017-1.022) and +2.2-3.7% at 16.8k, and batching does not
+change it. Q exec-thread on-CPU on / off: 65k 1.019 [1.012, 1.026] at batch 1, 1.017 [1.010, 1.024] at auto (+1.8-2.0
+ms per call on 104.2 ms); 16.8k 1.025 / 1.022; at `TORUS_MATCH_WORKERS=17` 65k 1.022 / 1.022, 16.8k 1.034 / 1.037. Every
+CI excludes 1. Batch auto vs batch 1, paired per pass: exec CPU -0.17 to +0.11 ms per call (|t| <= 0.7, ratio
+0.998-1.002) and wall within 0.3 ms, while parks fall by 0.5-3.8 per call (t -1.7 to -3.1). Section 114's deep node
+figure, 1.044 [1.009, 1.081] per 1k fills, overlaps this run's 65k CI ([1.010, 1.026]); its point estimate is about
+twice this one's. Exec wall per call falls with the flag on: 65k 0.899-0.900, 16.8k 0.948-0.950; with 17 match
+workers 0.857 and 0.908-0.913. P's wall ratios are close (65k w0 0.920, w17 0.862; 16.8k 0.914-0.952). Pass B grows 1.07-1.33x on Q and
+1.47-1.66x on P.**
+
+Question (bench queue step 9h, owner s131): 18c's L2.1 microbench numbers were too noisy (load ~100). On a quiet
+host, how large is L2.1's exec-thread CPU cost, and does wake-up batching (`39f8c7f3`) change it?
+
+### 119.1 Setup
+
+* Spec: `docs/perf/bench-queue.md` entry 9h on main.
+* Binaries: test executables built in worktrees `wt/9h-p-0323b755` and `wt/9h-q-39f8c7f3` with fresh targets
+  `~/.cargo-target-9h-{p,q}` (build rc 0), copied to `ozarchy-9h-run/bin/`. md5 P `72f72eb695d429454501ae2b983f739e`, Q
+  `718cdc65b59474c2a02936fd28c2ed0d`. Both were re-checked in all 48 raw block logs (12 per block, 0 mismatches).
+* Harness: one test process per block and pass. Arms rotate inside the process, 8 reps per arm and shape, and each
+  row is the per-process median. Q arms: off, on batch 1 (one wake-up per market, as before batching) and on batch
+  auto (the built-in policy). Q reports wall, exec on-CPU, runq, parks and parked time, match, settle and pass B. P has
+  no exec on-CPU, runq or park counters, so the CPU answer comes from Q only, and P vs Q is wall and pass B only.
+* Blocks: P0 / Q0 (`TORUS_MATCH_WORKERS` unset), P17 / Q17 (`=17`, `TORUS_SETTLE_WORKERS` unset). `UBENCH_L22=on`,
+  `UBENCH_BATCHES=1,auto` (P ignores it), `UBENCH_REPS=8`, no other `TORUS_*`, nothing pinned. Host parallelism 32,
+  6,000 traders, a 96,000-order ladder.
+* Order: 12 passes, block order rotated per pass. 05:02:14-05:15:23, blocks 13.7-19.3 s.
+* Extra rows: P also runs L2.2 off (the harness ignores `UBENCH_L22`), and the w17 blocks also run 16.8k. These are
+  outside the spec's cells; their w17 16.8k rows are listed below.
+
+### 119.2 Validity
+
+* 48 / 48 blocks rc 0, `test result: ok` in every raw log, 0 `panicked`. `campaign.done` reads `exit=0`. 1,347 CHECK
+  lines, all PASS (fills, arms, walls per block), `ALL CHECKS PASS`, no CELL-FLAG. `cells.tsv` has 336 rows, 12 per
+  (block, shape, L2.2, arm).
+* Contention (30 s sampler, FOREIGN CPU rule, `ozarchy-9h-run/contention-main.tsv`, 26 samples). No single foreign
+  process went above 0.064 core in any sample. The largest were claude sessions (0.064), quickshell (0.043) and
+  Hyprland (0.029), and no Telegram appeared, so the rule triggers no rerun. Foreign total over all samples was 0.094
+  core on average, max 0.200 (05:10:14). The time-weighted foreign total exceeded 0.1 core in 15 of 48 block windows
+  (passes 1, 7, 8, 9, 11, 12). Dropping those blocks moves every on / off ratio by 0.004 or less, so all 48 stay in.
+* Drift: the off-arm wall per pass shows no trend over the campaign in any block (e.g. Q0 65k 125.1-127.7 ms, Q17 65k
+  129.0-131.0 ms, P0 65k 123.3-126.4 ms). Q off exec CPU is flat as well (65k 103.0-105.3 ms).
+
+### 119.3 Per cell (mean of 12 per-pass medians +- sd across passes; ms per call; L2.2 on)
+
+| block | shape | arm | exec wall | exec on-CPU | exec on-CPU / 1k fills | runq | parks / call | parked | match | settle | pass B |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Q0 | 16.8k | off | 54.15 +- 0.41 | 47.44 +- 0.45 | 2.774 | 0.01 | 0.00 | 0.00 | 5.15 | 25.06 | 4.38 +- 0.22 |
+| Q0 | 16.8k | on b1 | 51.46 +- 0.56 | 48.62 +- 0.57 | 2.843 | 0.90 | 2.58 | 1.52 | 1.13 | 26.45 | 5.79 +- 0.34 |
+| Q0 | 16.8k | on auto | 51.33 +- 0.68 | 48.50 +- 0.59 | 2.836 | 0.78 | 2.08 | 1.49 | 1.32 | 26.23 | 5.71 +- 0.42 |
+| Q0 | 65k | off | 126.27 +- 0.78 | 104.19 +- 0.84 | 1.608 | 0.03 | 0.00 | 0.00 | 17.12 | 64.33 | 14.02 +- 0.57 |
+| Q0 | 65k | on b1 | 113.63 +- 1.11 | 106.14 +- 1.02 | 1.638 | 2.70 | 3.42 | 3.89 | 3.08 | 66.30 | 17.24 +- 1.07 |
+| Q0 | 65k | on auto | 113.57 +- 0.81 | 105.97 +- 1.05 | 1.635 | 2.39 | 2.92 | 3.90 | 3.20 | 65.69 | 17.08 +- 0.83 |
+| Q17 | 65k | off | 130.03 +- 0.56 | 103.10 +- 0.48 | 1.591 | 0.04 | 0.00 | 0.00 | 20.04 | 64.95 | 13.50 +- 0.49 |
+| Q17 | 65k | on b1 | 111.49 +- 0.59 | 105.33 +- 0.91 | 1.625 | 0.06 | 18.67 | 5.47 | 2.07 | 65.28 | 14.37 +- 0.62 |
+| Q17 | 65k | on auto | 111.46 +- 0.57 | 105.34 +- 0.72 | 1.626 | 0.06 | 14.92 | 5.38 | 2.34 | 64.90 | 14.53 +- 0.79 |
+| P0 | 16.8k | off | 53.73 +- 0.41 | n/a | | | | | 5.07 | 24.70 | 4.16 +- 0.17 |
+| P0 | 16.8k | on | 51.14 +- 0.55 | n/a | | | | | 1.12 | 26.13 | 6.62 +- 0.37 |
+| P0 | 65k | off | 124.71 +- 1.02 | n/a | | | | | 17.24 | 62.60 | 13.18 +- 0.62 |
+| P0 | 65k | on | 114.68 +- 1.55 | n/a | | | | | 2.87 | 67.11 | 21.73 +- 1.49 |
+| P17 | 65k | off | 127.96 +- 0.83 | n/a | | | | | 20.12 | 62.79 | 12.65 +- 0.39 |
+| P17 | 65k | on | 110.27 +- 1.04 | n/a | | | | | 2.10 | 64.02 | 19.07 +- 0.60 |
+
+Extra w17 16.8k rows: Q17 off 55.00 / CPU 46.88, on b1 49.95 / 48.49 (parks 4.00), on auto 50.23 / 48.60 (parks 2.83);
+pass B 4.36 / 5.20 / 5.12. P17 off 54.67, on 49.94, pass B 4.15 / 6.06.
+
+### 119.4 On / off ratios (mean of 12 per-pass ratios, 95% t CI, 11 df; sd = sd of the per-pass ratios)
+
+| block | shape | arm | exec wall | sd | exec on-CPU | sd | pass B | sd | settle | match |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Q0 | 16.8k | b1 | 0.950 [0.943, 0.958] | 0.012 | **1.025 [1.017, 1.033]** | 0.013 | 1.325 [1.271, 1.379] | 0.085 | 1.055 | 0.219 |
+| Q0 | 16.8k | auto | 0.948 [0.937, 0.959] | 0.017 | **1.022 [1.012, 1.032]** | 0.016 | 1.308 [1.236, 1.381] | 0.113 | 1.047 | 0.257 |
+| Q0 | 65k | b1 | 0.900 [0.895, 0.905] | 0.008 | **1.019 [1.012, 1.026]** | 0.011 | 1.231 [1.185, 1.276] | 0.072 | 1.031 | 0.180 |
+| Q0 | 65k | auto | 0.899 [0.895, 0.904] | 0.007 | **1.017 [1.010, 1.024]** | 0.011 | 1.220 [1.173, 1.268] | 0.075 | 1.021 | 0.187 |
+| Q17 | 16.8k | b1 | 0.908 [0.903, 0.914] | 0.009 | 1.034 [1.028, 1.041] | 0.010 | 1.193 [1.157, 1.230] | 0.057 | 0.998 | 0.161 |
+| Q17 | 16.8k | auto | 0.913 [0.907, 0.920] | 0.011 | 1.037 [1.029, 1.045] | 0.012 | 1.179 [1.111, 1.246] | 0.106 | 0.999 | 0.186 |
+| Q17 | 65k | b1 | 0.857 [0.854, 0.861] | 0.006 | **1.022 [1.016, 1.027]** | 0.008 | 1.065 [1.030, 1.101] | 0.055 | 1.005 | 0.103 |
+| Q17 | 65k | auto | 0.857 [0.854, 0.861] | 0.005 | **1.022 [1.017, 1.026]** | 0.007 | 1.077 [1.036, 1.119] | 0.066 | 0.999 | 0.117 |
+| P0 | 16.8k | on | 0.952 [0.944, 0.960] | 0.012 | n/a | | 1.592 [1.539, 1.644] | 0.083 | 1.058 | 0.221 |
+| P0 | 65k | on | 0.920 [0.910, 0.930] | 0.016 | n/a | | 1.655 [1.548, 1.763] | 0.169 | 1.072 | 0.167 |
+| P17 | 16.8k | on | 0.914 [0.907, 0.920] | 0.010 | n/a | | 1.466 [1.384, 1.548] | 0.130 | 1.021 | 0.154 |
+| P17 | 65k | on | 0.862 [0.855, 0.868] | 0.010 | n/a | | 1.509 [1.465, 1.553] | 0.070 | 1.019 | 0.104 |
+
+**Batch auto vs batch 1 (Q, paired per pass, auto - b1, t with 11 df):**
+
+| block | shape | exec CPU ms | t | exec wall ms | t | pass B ms | t | parks / call | t |
+|---|---|---|---|---|---|---|---|---|---|
+| Q0 | 16.8k | -0.12 | -0.5 | -0.13 | -0.4 | -0.08 | -0.5 | -0.50 | -2.6 |
+| Q0 | 65k | -0.17 | -0.4 | -0.06 | -0.2 | -0.16 | -0.5 | -0.50 | -1.9 |
+| Q17 | 16.8k | +0.11 | 0.7 | +0.28 | 1.3 | -0.08 | -0.7 | -1.17 | -1.7 |
+| Q17 | 65k | +0.01 | 0.0 | -0.03 | -0.3 | +0.16 | 0.5 | -3.75 | -3.1 |
+
+**P vs Q, same arm (L2.2 on; Q / P of the cell means; step / pooled sd across passes):**
+
+| workers | shape | arm | wall Q / P | sd | pass B Q / P | sd |
+|---|---|---|---|---|---|---|
+| unset | 16.8k | off | 1.008 | 1.0 | 1.051 | 1.1 |
+| unset | 16.8k | on (Q b1) | 1.006 | 0.6 | 0.874 | -2.3 |
+| unset | 65k | off | 1.013 | 1.7 | 1.064 | 1.4 |
+| unset | 65k | on (Q b1) | 0.991 | -0.8 | 0.793 | -3.5 |
+| unset | 65k | on (Q auto) | 0.990 | -0.9 | 0.786 | -3.9 |
+| 17 | 65k | off | 1.016 | 2.9 | 1.067 | 1.9 |
+| 17 | 65k | on (Q b1) | 1.011 | 1.4 | 0.753 | -7.8 |
+| 17 | 65k | on (Q auto) | 1.011 | 1.4 | 0.762 | -6.5 |
+
+### 119.5 Verdict
+
+* **L2.1's exec-thread CPU cost on a quiet host is +1.7-2.2% per call at 65k and +2.2-3.7% at 16.8k (high
+  confidence).** All eight Q on / off CPU ratios have CIs above 1. Each step is 1.5-3.4 sd of the per-pass ratio, and
+  in absolute terms it is +1.1-2.2 ms per call. Per 1k fills, Q0 65k goes 1.608 -> 1.635-1.638 ms. With 17 match
+  workers the cost is no smaller: 1.022 at 65k, 1.034-1.037 at 16.8k.
+* **Batching does not change it (high confidence).** Auto vs batch 1 moves exec CPU by -0.17 to +0.11 ms per call
+  (|t| <= 0.7), about 0.1% of the call, and the ratio CIs of the two arms overlap almost fully. Batching does cut
+  parks per call (Q0 3.42 -> 2.92 at 65k, Q17 18.67 -> 14.92). So the wake-ups are not where the CPU goes.
+* **Mechanism, sized.**
+  * Parks cannot carry the CPU step. Q17 65k parks 5.5x as often as Q0 (18.7 vs 3.4 per call at batch 1), yet its
+    CPU step is only +2.23 vs +1.95 ms. That bounds the cost per park at about (2.23 - 1.95) / (18.67 - 3.42) ≈ 0.02 ms,
+    so 3-4 parks per call explain under 0.1 ms of the ~2 ms step. Runq time (0.8-2.7 ms at w0, ~0.05 at w17) is off-CPU
+    and is not in the step either.
+  * At w0, the settle time measured on the exec thread rises by about as much as the CPU (65k b1: settle +1.97 ms, CPU
+    +1.95 ms; auto +1.36 / +1.78). This fits settle running slower beside a busy match pool (cache / memory
+    contention), as 18c noted.
+  * At w17, settle is flat (+0.33 / -0.05 ms) while CPU is still +2.2 ms, so part of the cost sits outside settle and
+    this run does not isolate it. Medium confidence on the mechanism.
+* **Against section 114 (medium confidence).** Deep node B / A was 1.044 [1.009, 1.081] per 1k fills on a loaded host.
+  This run's 65k CIs (Q0 [1.010, 1.026], Q17 [1.016, 1.027]) overlap it, at about half the point estimate. The two
+  measures differ: 114 counts exec on-CPU per 1k fills over all exec work in a node (`df9e1d8a`), while this run
+  counts one `execute_batch` call in-process on Q. A quiet-host cost of ~+2% is consistent with 114's lower bound.
+  This run cannot tell whether the node's extra ~2% is host load or node-only work.
+* **Exec wall and pass B.** The flag cuts exec wall per call by 5-14%, with sd 0.005-0.017 and every CI below 1. P's
+  ratios are within 0.006 of Q's except w0 65k (P 0.920 vs Q 0.899-0.900). Pass B grows with the flag on both commits. On Q the growth is
+  smaller (1.07-1.33x vs P's 1.47-1.66x), and Q's flag-on pass B is 21-25% below P's at 65k (3.5-7.8 sd). Q batch 1
+  shows the same pass B as auto, so the drop is not batching. It comes from something else between `0323b755` and
+  `39f8c7f3` (the main merge `be1c378d` or other changes on the branch). Q's off arm is slightly slower than P's: wall
+  +0.8-1.6% (1.0-2.9 sd), pass B +5-7% (1.1-1.9 sd).
+
+### 119.6 Limits and data
+
+* Q prints per-process medians only, so the spread is across 12 passes (n = 12), not across the 96 reps. P prints
+  per-rep walls, but the ratios here use its per-pass medians for parity.
+* P has no CPU, runq or park counters. The batch-1 arm stands in for "before batching" on the CPU question, but it
+  runs on Q's code (with the main merge), not on P's.
+* The sampler's `own_cores` (0.09-1.55) misses the short-lived test processes; they land in `nonbench_cores`
+  (1.1-3.0). The foreign columns are unaffected. The sampler stopped at 05:15:14, so the last block (p12 P17) has
+  9.0 of its 18.8 s covered.
+* Analysis: `~/bench-results-matched/ozarchy-9h-tools/analyst/an.py`, output `all.txt` (all blocks) and `excl.txt`
+  (blocks with foreign total > 0.1 core dropped).
+* Campaign: `~/bench-results-matched/ozarchy-9h-run/` (`campaign.log`, `cells.tsv`, `blocks.tsv`, `handoff.json`,
+  `exe-md5.txt`, `raw/p<n>-<block>.log`, `contention-main.tsv`); driver and parser
+  `ozarchy-9h-tools/{9h-campaign.sh,9h-parse.py,build-9h.sh,h9-contention.py}`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
