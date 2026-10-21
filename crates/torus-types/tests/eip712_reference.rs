@@ -279,7 +279,7 @@ fn substituted_governance_action_does_not_recover_the_signer() {
             swapped.action = submit(other.clone());
             let rec = swapped.recover_sender_for_chain(TORUS_CHAIN_ID);
             assert!(
-                rec.map_or(true, |a| a != signer),
+                !matches!(rec, Ok(a) if a == signer),
                 "signature over {signed_action:?} recovers its signer for {other:?}"
             );
         }
