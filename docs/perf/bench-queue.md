@@ -32,6 +32,11 @@ Pull tools from main before the next campaign that has crash cells.
 explicitly for mode-3 arms. Each cell logs `cell=<label> book_mode=... <flag>='...'` and records `cell.book_mode` /
 `cell.node_flags` in summary.json. Pull tools from main before the next campaign.
 
+**Defaults on main (s131, after the L3.1 merge):** L3.3, L2.2, item 7 option 0, T5.3 (manifest in the consensus DB) and
+L3.1 (`TORUS_BOOK_COALESCE`, active with 15 s checkpoints, Classic, hash off, no byte cap) are ON by default; prune-by-default
+(retention 100,000) lands with the RH4 merge. A per-block-save control arm needs `TORUS_BOOK_COALESCE=0`; the old manifest
+path is `TORUS_MANIFEST_IN_STATE_DB=1`. Compare only against same-campaign controls.
+
 **Run the queue back to back (owner s131):** archy runs every ready item in queue order without stopping between
 them and without asking. **Nothing runs on archy during measured cells** (owner s131, after a build overlapped 8w's
 cells): no cargo builds, no analysis scripts, no doc work beyond trivial git. Builds, analysis and the previous item's
