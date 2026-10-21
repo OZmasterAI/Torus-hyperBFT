@@ -1740,9 +1740,9 @@ pub struct ChainConfig {
     /// upgrade. `None` (any genesis without the field) = running hash disabled.
     #[serde(default)]
     pub state_hash_activation_height: Option<u64>,
-    /// P0.0: when each [`Feature`] switches on (genesis `consensus.activations`
-    /// + the old `state_hash_activation_height` alias + the built-in table for
-    /// `chain_id`). CHAIN-WIDE: the header `features` rule checks every block
+    /// P0.0: when each [`Feature`] switches on: genesis `consensus.activations`,
+    /// its old `state_hash_activation_height` alias and the built-in table for
+    /// `chain_id`. CHAIN-WIDE: the header `features` rule checks every block
     /// against it. Empty = no feature ever active.
     #[serde(default)]
     pub activations: ActivationSchedule,
