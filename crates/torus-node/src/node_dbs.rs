@@ -226,19 +226,43 @@ pub fn genesis_changed_error(
 pub fn init_genesis(
     dbs: &NodeDbs,
     genesis: &torus_genesis::Genesis,
-    _file_digest: &GenesisDigest,
-    _genesis_path: &Path,
-    _data_dir: &Path,
+    file_digest: &GenesisDigest,
+    genesis_path: &Path,
+    data_dir: &Path,
 ) -> Result<GenesisBinding, String> {
-    // RED: today's behaviour, nothing bound.
+    if genesis_applied(dbs)? {
+        return match read_genesis_digest(&dbs.state)? {
+            Some(stored) if stored.digest == file_digest.digest => Ok(GenesisBinding::Matched),
+            Some(stored) => Err(genesis_changed_error(
+                &stored,
+                file_digest,
+                genesis_path,
+                data_dir,
+            )),
+            None => {
+                store_genesis_digest(&dbs.state, file_digest)?;
+                Ok(GenesisBinding::Legacy)
+            }
+        };
+    }
     apply_genesis_if_fresh(dbs, genesis)?;
+    store_genesis_digest(&dbs.state, file_digest)?;
     Ok(GenesisBinding::Fresh)
 }
 
 /// Boot step 4 without a genesis file: a data dir bound to a genesis file
 /// refuses (the default chain config would replace that genesis' config).
-pub fn check_no_genesis_file(_dbs: &NodeDbs, _data_dir: &Path) -> Result<(), String> {
-    Ok(())
+pub fn check_no_genesis_file(dbs: &NodeDbs, data_dir: &Path) -> Result<(), String> {
+    match read_genesis_digest(&dbs.state)? {
+        Some(stored) => Err(format!(
+            "refusing to start: data dir {dir} was initialized from a genesis file (digest \
+             {digest}) but no --genesis was given; the default chain config would replace that \
+             genesis' config. Start with the same genesis file.",
+            dir = data_dir.display(),
+            digest = stored.digest,
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Open the state DB and the consensus DB under `data_dir`, apply the

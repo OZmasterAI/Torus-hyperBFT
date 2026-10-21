@@ -55,7 +55,7 @@ The binary is at `target/release/torus-node`.
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--genesis` | path | none | Path to genesis.json (required for first run) |
+| `--genesis` | path | none | Path to genesis.json (required for first run; afterwards the same file, see [Genesis](#genesis)) |
 | `--data-dir` | path | `./data` | RocksDB data directory |
 | `--validator-key` | hex | none | **DEPRECATED** Ed25519 signing key (visible in ps/history) |
 | `--keystore` | path | none | Path to encrypted keystore file |
@@ -128,7 +128,24 @@ The `--genesis` flag points to a `genesis.json` file that contains:
 - Initial validator set
 
 Genesis initialization only runs on first start (when the database is empty).
-Subsequent starts skip genesis even if `--genesis` is provided.
+Subsequent starts do not apply it again, but the chain configuration (chain id,
+timeouts, feature activations, ...) is still read from the file at every start.
+
+The data directory is therefore bound to its genesis file: the first start
+stores a digest of the file (`genesis digest stored: this data dir is bound to
+the genesis file`), and a later start whose file differs refuses to start,
+naming the changed fields:
+
+```
+refusing to start: genesis file /etc/torus/genesis.json differs from the genesis data dir /data was initialized with (stored digest 0x.., file digest 0x..); changed: consensus.timeout_base_ms. ...
+```
+
+Only values count: reformatting the file or reordering its keys is fine.
+Restore the original file, or start from a fresh data directory to run a new
+genesis. A data directory created by an older build has no stored digest; its
+first start with this build stores the digest of the file it is given (logged
+as a warning, since it cannot be checked against the original). A bound data
+directory started without `--genesis` refuses to start.
 
 ## Data Directory
 

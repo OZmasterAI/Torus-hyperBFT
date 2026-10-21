@@ -25,14 +25,20 @@
 
 use std::collections::BTreeMap;
 
-use alloy_primitives::B256;
+use alloy_primitives::{keccak256, B256};
 use serde_json::Value;
 
 use crate::GenesisError;
 
+/// Domain prefix of the whole-file digest.
+const DIGEST_DOMAIN: &[u8] = b"torus-genesis-file-v1\0";
+
 /// A top-level object with at most this many keys gets one field digest per
 /// key; a larger one is a single field.
 pub const SPLIT_MAX_KEYS: usize = 32;
+
+/// Version byte of [`GenesisDigest::encode`].
+const ENCODING_VERSION: u64 = 1;
 
 /// Digest of a genesis file (whole-file digest plus field digests).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,34 +51,144 @@ pub struct GenesisDigest {
 }
 
 /// The canonical bytes of `v`: compact JSON, object keys sorted.
-pub fn canonical_json(_v: &Value) -> Vec<u8> {
-    todo!("P0.0 phase 4 RED")
+pub fn canonical_json(v: &Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_canonical(v, &mut out);
+    out
+}
+
+fn write_canonical(v: &Value, out: &mut Vec<u8>) {
+    match v {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            out.push(b'{');
+            for (i, k) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                // A string serializes infallibly.
+                out.extend(serde_json::to_vec(k).expect("serialize a JSON string"));
+                out.push(b':');
+                write_canonical(&map[k], out);
+            }
+            out.push(b'}');
+        }
+        Value::Array(items) => {
+            out.push(b'[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                write_canonical(item, out);
+            }
+            out.push(b']');
+        }
+        scalar => out.extend(serde_json::to_vec(scalar).expect("serialize a JSON scalar")),
+    }
 }
 
 impl GenesisDigest {
     /// Digest of a genesis file's text. `Err` when it is not JSON.
-    pub fn of_json(_json: &str) -> Result<Self, GenesisError> {
-        todo!("P0.0 phase 4 RED")
+    pub fn of_json(json: &str) -> Result<Self, GenesisError> {
+        let value: Value = serde_json::from_str(json)?;
+        Ok(Self::of_value(&value))
     }
 
     /// Digest of a parsed genesis JSON value.
-    pub fn of_value(_value: &Value) -> Self {
-        todo!("P0.0 phase 4 RED")
+    pub fn of_value(value: &Value) -> Self {
+        let canonical = canonical_json(value);
+        let mut pre = Vec::with_capacity(DIGEST_DOMAIN.len() + canonical.len());
+        pre.extend_from_slice(DIGEST_DOMAIN);
+        pre.extend_from_slice(&canonical);
+        let digest = keccak256(&pre);
+        let mut fields = BTreeMap::new();
+        match value {
+            Value::Object(top) => {
+                for (k, v) in top {
+                    match v {
+                        Value::Object(inner) if inner.len() <= SPLIT_MAX_KEYS => {
+                            if inner.is_empty() {
+                                fields.insert(k.clone(), keccak256(canonical_json(v)));
+                            }
+                            for (ik, iv) in inner {
+                                fields.insert(format!("{k}.{ik}"), keccak256(canonical_json(iv)));
+                            }
+                        }
+                        _ => {
+                            fields.insert(k.clone(), keccak256(canonical_json(v)));
+                        }
+                    }
+                }
+            }
+            // Not an object: the typed parse refuses it anyway.
+            other => {
+                fields.insert(String::new(), keccak256(canonical_json(other)));
+            }
+        }
+        GenesisDigest { digest, fields }
     }
 
-    /// The field paths whose values differ, sorted.
-    pub fn changed_fields(&self, _other: &GenesisDigest) -> Vec<String> {
-        todo!("P0.0 phase 4 RED")
+    /// The field paths whose values differ between `self` and `other`
+    /// (changed, added or removed), sorted.
+    pub fn changed_fields(&self, other: &GenesisDigest) -> Vec<String> {
+        let mut changed: Vec<String> = self
+            .fields
+            .iter()
+            .filter(|(k, d)| other.fields.get(*k) != Some(d))
+            .map(|(k, _)| k.clone())
+            .chain(
+                other
+                    .fields
+                    .keys()
+                    .filter(|k| !self.fields.contains_key(*k))
+                    .cloned(),
+            )
+            .collect();
+        changed.sort();
+        changed.dedup();
+        changed
     }
 
-    /// The stored form.
+    /// The stored form: JSON `{"version":1,"digest":"0x..","fields":{..}}`.
     pub fn encode(&self) -> Vec<u8> {
-        todo!("P0.0 phase 4 RED")
+        let fields: serde_json::Map<String, Value> = self
+            .fields
+            .iter()
+            .map(|(k, d)| (k.clone(), Value::String(format!("{d:#x}"))))
+            .collect();
+        let v = serde_json::json!({
+            "version": ENCODING_VERSION,
+            "digest": format!("{:#x}", self.digest),
+            "fields": fields,
+        });
+        canonical_json(&v)
     }
 
     /// Read [`Self::encode`]'s form back.
-    pub fn decode(_bytes: &[u8]) -> Result<Self, String> {
-        todo!("P0.0 phase 4 RED")
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        let v: Value =
+            serde_json::from_slice(bytes).map_err(|e| format!("stored genesis digest: {e}"))?;
+        let version = v["version"].as_u64();
+        if version != Some(ENCODING_VERSION) {
+            return Err(format!(
+                "stored genesis digest: unknown version {:?} (this build reads {ENCODING_VERSION})",
+                v["version"]
+            ));
+        }
+        let parse = |s: &Value| -> Result<B256, String> {
+            s.as_str()
+                .and_then(|s| s.parse::<B256>().ok())
+                .ok_or_else(|| format!("stored genesis digest: bad hash {s}"))
+        };
+        let digest = parse(&v["digest"])?;
+        let fields = v["fields"]
+            .as_object()
+            .ok_or("stored genesis digest: no fields")?
+            .iter()
+            .map(|(k, d)| Ok((k.clone(), parse(d)?)))
+            .collect::<Result<_, String>>()?;
+        Ok(GenesisDigest { digest, fields })
     }
 }
 

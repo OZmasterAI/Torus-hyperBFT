@@ -186,6 +186,25 @@ Each phase lands on its own branch with RED-first tests and full gates; each one
    replay and nodes with another schedule run it at the height the headers agreed.
 4. **Genesis digest** (~0.5 d, owner decision): store a digest of the applied genesis at first boot, refuse to
    start when the on-disk file differs.
+   Built s134 on `feat/p00-phase4` (from phase 3 8e269d77). `torus_genesis::GenesisDigest`: the file is parsed
+   as a JSON value (before the typed parse) and written in a canonical form (compact, object keys sorted by
+   their UTF-8 bytes, arrays in file order, strings and numbers as `serde_json` writes them);
+   `digest = keccak256("torus-genesis-file-v1\0" || canonical bytes)`. Whitespace, indentation and key order
+   do not change it; any value change does, including keys the typed parse ignores and an explicit value equal
+   to a default. The typed struct is not digested, so a newer binary with more (defaulted) genesis fields
+   computes the same digest for the same file. Field digests (one per top-level key; a top-level object with
+   at most 32 keys gets one per key of it, e.g. `consensus.timeout_base_ms`; `evm_alloc` stays one field) name
+   what changed. Stored in the state DB's `cf_consensus_meta` under `genesis_file_digest` (node-local, not in
+   the running hash). Boot step 4 (`node_dbs::init_genesis`): fresh data dir -> genesis applied, digest
+   stored; initialized dir with a stored digest -> the file must match, else
+   `refusing to start: genesis file <path> differs from the genesis data dir <dir> was initialized with
+   (stored digest .., file digest ..); changed: <fields>` (nothing written); initialized dir without a stored
+   digest (every data dir from before this build) -> the current file's digest is stored and a warning logged
+   (it cannot be checked against the genesis the dir was initialized with); a bound dir started without
+   `--genesis` refuses (the default chain config would replace the genesis one). No override flag: to run a
+   new genesis, start from a fresh data dir. Bench harness: none affected (run-cell.sh starts every cell with
+   `launch-3val.sh CLEAN=1`, fresh data dirs; the genesis edits (`LIQ_THIN`, cache fetch) happen before the
+   launch; crash-kill restarts reuse the same file).
 5. **Integration tests 1-4** (~2-3 d): needs a test-only feature with a state-visible rule.
 6. **Ops** (~0.5-1 d): features gauge, RPC schedule listing, upgrade runbook.
 7. **Governance `ScheduleActivation`** (before mainnet, 3-4 d) through `EpochRotationPlan`.
