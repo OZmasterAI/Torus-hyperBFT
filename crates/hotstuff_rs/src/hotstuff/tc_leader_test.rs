@@ -498,7 +498,7 @@ mod review {
     fn case4_reproposal_of_a_vsu_tip_keeps_the_vsu_flag() {
         let x = Block::new(BlockHeight::new(2), qc(3, &h()), CryptoHash::new([79; 32]), Data::new(vec![]));
         let the_tc = tc(VIEW - 1, Some(tip(&x, VIEW - 1)), None);
-        let mut l = recording_leader(&[g(), h()], &[x.clone()], qc(3, &h()), Some(the_tc));
+        let mut l = recording_leader(&[g(), h()], std::slice::from_ref(&x), qc(3, &h()), Some(the_tc));
         l.enter(&mut LeaderApp);
         let headers = l.headers();
         assert_eq!(headers.len(), 1);
