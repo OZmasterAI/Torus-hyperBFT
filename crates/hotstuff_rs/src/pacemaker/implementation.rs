@@ -15,6 +15,7 @@ use std::{
 
 use ed25519_dalek::VerifyingKey;
 
+use crate::hotstuff::types::PhaseCertificate;
 use crate::{
     block_tree::{
         accessors::internal::{BlockTreeError, BlockTreeSingleton, BlockTreeWriteBatch},
@@ -28,7 +29,7 @@ use crate::{
     networking::{messages::Message, network::Network, sending::SenderHandle},
     pacemaker::{
         messages::{AdvanceView, PacemakerMessage, ProgressCertificate, TimeoutVote},
-        types::{tip_leader_reputation, TimeoutVoteCollector},
+        types::{tip_leader_reputation, TimeoutVoteCollector, TipInfo},
     },
     types::{
         crypto_primitives::Keypair,
@@ -128,13 +129,14 @@ impl<N: Network> Pacemaker<N> {
             // 1.1. If the current view is an Epoch-Change view, broadcast a `TimeoutVote`, then extend the view.
             if is_epoch_change_view(&cur_view, self.config.epoch_length) {
                 if is_validator(&self.config.keypair.public(), &validator_set_state) {
+                    let (tip, highest_qc) = self.own_timeout_summaries(block_tree)?;
                     let pacemaker_message = PacemakerMessage::timeout_vote(
                         &self.config.keypair,
                         self.config.chain_id,
                         cur_view,
                         block_tree.highest_tc()?,
-                        block_tree.local_tip()?,
-                        block_tree.highest_qc_for_timeout()?,
+                        tip,
+                        highest_qc,
                     );
                     self.sender
                         .broadcast(Message::from(pacemaker_message.clone()));
@@ -153,13 +155,14 @@ impl<N: Network> Pacemaker<N> {
             // 1.2. MonadBFT: broadcast TimeoutVote before advancing on normal view timeout.
             } else {
                 if is_validator(&self.config.keypair.public(), &validator_set_state) {
+                    let (tip, highest_qc) = self.own_timeout_summaries(block_tree)?;
                     let pacemaker_message = PacemakerMessage::timeout_vote(
                         &self.config.keypair,
                         self.config.chain_id,
                         cur_view,
                         block_tree.highest_tc()?,
-                        block_tree.local_tip()?,
-                        block_tree.highest_qc_for_timeout()?,
+                        tip,
+                        highest_qc,
                     );
                     self.sender
                         .broadcast(Message::from(pacemaker_message.clone()));
@@ -348,13 +351,14 @@ impl<N: Network> Pacemaker<N> {
                         .last_timeout_vote_view
                         .is_none_or(|v| v < timeout_vote.view)
                 {
+                    let (tip, highest_qc) = self.own_timeout_summaries(block_tree)?;
                     let own_timeout = PacemakerMessage::timeout_vote(
                         &self.config.keypair,
                         self.config.chain_id,
                         timeout_vote.view,
                         block_tree.highest_tc()?,
-                        block_tree.local_tip()?,
-                        block_tree.highest_qc_for_timeout()?,
+                        tip,
+                        highest_qc,
                     );
                     self.sender.broadcast(Message::from(own_timeout.clone()));
                     if let PacemakerMessage::TimeoutVote(ref tv) = own_timeout {
@@ -479,6 +483,30 @@ impl<N: Network> Pacemaker<N> {
             }
         }
         Ok(())
+    }
+
+    /// The tip and highest QC this replica's own timeout vote reports: its local tip and
+    /// [`highest_qc_for_timeout`](BlockTreeSingleton::highest_qc_for_timeout), unless the tip no
+    /// longer passes F2 under the current validator sets (a tip from before the previous set):
+    /// every other replica would drop the whole vote (F4), so the vote goes without the tip and
+    /// with the highest PC instead.
+    fn own_timeout_summaries<K: KVStore>(
+        &self,
+        block_tree: &BlockTreeSingleton<K>,
+    ) -> Result<(Option<TipInfo>, Option<PhaseCertificate>), BlockTreeError> {
+        let Some(tip) = block_tree.local_tip()? else {
+            return Ok((None, block_tree.highest_qc_for_timeout()?));
+        };
+        let validator_set_state = block_tree.validator_set_state()?;
+        if tip.is_correct_under(self.config.chain_id, &validator_set_state, tip_leader_reputation(block_tree).as_ref()) {
+            return Ok((Some(tip), block_tree.highest_qc_for_timeout()?));
+        }
+        log::warn!(
+            "timeout vote without the local tip of view {}: it fails F2 under the current validator sets",
+            tip.view.int()
+        );
+        let highest_pc = block_tree.highest_pc()?;
+        Ok((None, (!highest_pc.is_genesis_pc()).then_some(highest_pc)))
     }
 
     /// Execute the required steps in the Pacemaker protocol upon receiving an `AdvanceView` message.

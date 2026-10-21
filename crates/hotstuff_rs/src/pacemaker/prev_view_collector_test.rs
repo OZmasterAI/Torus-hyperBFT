@@ -390,3 +390,55 @@ fn a_timeout_vote_with_a_valid_tip_is_collected() {
     assert!(tc.high_tip.as_ref() == Some(&honest));
     assert!(tc.is_correct(&f.tree).unwrap());
 }
+
+/// F4 makes every replica drop a vote whose tip fails F2, so an honest replica
+/// whose stored tip no longer passes F2 (signed under a validator set older
+/// than the previous one) must send its timeout votes without it, or none of
+/// its votes would count. Here the stored tip's signer is not leader(4).
+#[test]
+fn own_timeout_vote_omits_a_tip_that_fails_f2() {
+    let mut f = fixture(5);
+    let non_leader = f.keys.iter().map(|k| k.verifying_key()).find(|vk| *vk != f.leader(4)).unwrap();
+    let stale = f.tip_signed_by(9, 4, &non_leader);
+    f.tree.set_local_tip(&stale).unwrap();
+    // Two of four (above f = 1) time out of 5: the local replica echoes its own vote.
+    f.timeout_vote_with_tip(0, 5, None);
+    f.timeout_vote_with_tip(1, 5, None);
+    let own: Vec<TimeoutVote> = f
+        .net
+        .broadcasts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|m| match m {
+            Message::ProgressMessage(crate::networking::messages::ProgressMessage::PacemakerMessage(
+                PacemakerMessage::TimeoutVote(tv),
+            )) => Some(tv.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(own.len(), 1, "fixture: the Bracha echo sent one own timeout vote");
+    assert!(own[0].local_tip.is_none(), "a tip failing F2 is not reported");
+    // The vote is collectible: with two more votes it completes TC(5).
+    let msg = PacemakerMessage::TimeoutVote(own[0].clone());
+    let me = f.keys[3].verifying_key();
+    f.pacemaker.on_receive_msg(msg, &me, &mut f.tree).unwrap();
+    f.timeout_vote_with_tip(2, 5, None);
+    assert_eq!(f.highest_tc_view(), Some(5));
+}
+
+/// Control: a valid stored tip is reported.
+#[test]
+fn own_timeout_vote_reports_a_valid_tip() {
+    let mut f = fixture(5);
+    let tip = f.tip_signed_by(9, 4, &f.leader(4));
+    f.tree.set_local_tip(&tip).unwrap();
+    f.timeout_vote_with_tip(0, 5, None);
+    f.timeout_vote_with_tip(1, 5, None);
+    let reported = f.net.broadcasts.lock().unwrap().iter().any(|m| {
+        matches!(m, Message::ProgressMessage(crate::networking::messages::ProgressMessage::PacemakerMessage(
+            PacemakerMessage::TimeoutVote(tv),
+        )) if tv.local_tip.as_ref() == Some(&tip))
+    });
+    assert!(reported);
+}
