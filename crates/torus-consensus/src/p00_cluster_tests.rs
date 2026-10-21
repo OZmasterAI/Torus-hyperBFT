@@ -78,7 +78,9 @@ impl Binary {
     fn new(x_at: u64) -> Self {
         Self {
             schedule: schedule(Some(x_at)),
-            known: torus_types::KNOWN_FEATURES,
+            // The test feature is never in `KNOWN_FEATURES` (test-only): a
+            // test release knows it through the set it passes.
+            known: torus_types::KNOWN_FEATURES | X.bit(),
             hold: None,
         }
     }
@@ -87,7 +89,7 @@ impl Binary {
     fn old() -> Self {
         Self {
             schedule: schedule(None),
-            known: torus_types::KNOWN_FEATURES & !X.bit(),
+            known: torus_types::KNOWN_FEATURES,
             hold: None,
         }
     }

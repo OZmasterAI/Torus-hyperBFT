@@ -775,6 +775,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     info!(
         known_features = ?torus_types::Feature::ALL
             .iter()
+            .filter(|f| torus_types::KNOWN_FEATURES & f.bit() != 0)
             .map(|f| f.name())
             .collect::<Vec<_>>(),
         known_bits = %format!("{:#x}", torus_types::KNOWN_FEATURES),

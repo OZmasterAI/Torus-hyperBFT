@@ -7838,6 +7838,7 @@ mod feature_schedule_rpc_tests {
     fn known() -> Vec<RpcKnownFeature> {
         Feature::ALL
             .iter()
+            .filter(|f| KNOWN_FEATURES & f.bit() != 0)
             .map(|f| RpcKnownFeature {
                 name: f.name().to_string(),
                 id: f.id(),

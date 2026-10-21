@@ -30,10 +30,11 @@ pub enum Feature {
 }
 
 impl Feature {
-    /// Every feature this binary knows, in id order.
+    /// Every feature compiled in, in id order (test-only ones included in a
+    /// `test-features` build; [`KNOWN_FEATURES`] is what the node can run).
     #[cfg(not(feature = "test-features"))]
     pub const ALL: &'static [Feature] = &[Feature::RunningStateHash];
-    /// Every feature this binary knows, in id order.
+    /// Every feature compiled in, in id order (see above).
     #[cfg(feature = "test-features")]
     pub const ALL: &'static [Feature] = &[Feature::RunningStateHash, Feature::TestStateRule];
 
@@ -49,9 +50,13 @@ impl Feature {
 
     /// A test-only feature (cargo feature `test-features`): never in
     /// [`KNOWN_FEATURES`], refused in a node's schedule
-    /// ([`ActivationSchedule::for_chain`]). RED stub.
+    /// ([`ActivationSchedule::for_chain`]).
     pub const fn is_test_only(self) -> bool {
-        false
+        match self {
+            Feature::RunningStateHash => false,
+            #[cfg(feature = "test-features")]
+            Feature::TestStateRule => true,
+        }
     }
 
     /// The genesis name (`consensus.activations` key).
@@ -66,14 +71,20 @@ impl Feature {
 
 /// The bits of every feature this binary knows. A header bit outside this
 /// set is a feature of a newer release: the node refuses to vote or propose
-/// on it and fail-stops before executing it (`UPGRADE REQUIRED`).
+/// on it and fail-stops before executing it (`UPGRADE REQUIRED`). Test-only
+/// features ([`Feature::is_test_only`]) are never in it, whatever cargo
+/// features the build has: their rules exist in test code only (Codex review
+/// of phase 5, P2). Tests that run one add its bit to the known set they pass
+/// (`AppOptions::known_features`).
 pub const KNOWN_FEATURES: u128 = known_features();
 
 const fn known_features() -> u128 {
     let mut bits = 0u128;
     let mut i = 0;
     while i < Feature::ALL.len() {
-        bits |= Feature::ALL[i].bit();
+        if !Feature::ALL[i].is_test_only() {
+            bits |= Feature::ALL[i].bit();
+        }
         i += 1;
     }
     bits
@@ -156,8 +167,17 @@ impl ActivationSchedule {
     }
 
     /// The schedule of a network: genesis activations + its built-in table.
+    /// A feature outside [`KNOWN_FEATURES`] (a test-only one, in a build with
+    /// `test-features`) is refused: the node does not start.
     pub fn for_chain(chain_id: u64, genesis: &BTreeMap<Feature, u64>) -> Result<Self, String> {
-        Self::merge(genesis, builtin_activations(chain_id))
+        let schedule = Self::merge(genesis, builtin_activations(chain_id))?;
+        if let Some((feature, _)) = schedule.iter().find(|(f, _)| KNOWN_FEATURES & f.bit() == 0) {
+            return Err(format!(
+                "feature {} is test-only: a node cannot schedule it",
+                feature.name()
+            ));
+        }
+        Ok(schedule)
     }
 
     /// The bitmap a header at `height` must carry. Height 0 (the genesis parent
