@@ -1083,6 +1083,9 @@ impl NativeExecutor {
         // a row the pairing deleted ahead is never visited, one it reduced is
         // visited later (its key is after the current row's).
         let (mut waiting, mut at_end) = (0u64, false);
+        // Owner s134, 3b: delisted markets whose obligations this drain
+        // reduced; their settlement may be complete after it.
+        let mut delisted_drained: BTreeSet<MarketId> = BTreeSet::new();
         while used < work {
             let Some(mut o) = liq::next_obligation(&ctx.state, &start)? else {
                 at_end = true;
@@ -1153,6 +1156,9 @@ impl NativeExecutor {
             if o.size != owed {
                 liq::update_obligation(&ctx.state, &o)?; // deleted at 0
                 stats.adl_rows_removed += u64::from(o.size == FixedPoint::ZERO);
+                if ctx.delisted_markets.contains(&o.market) {
+                    delisted_drained.insert(o.market);
+                }
             }
             stats.adl_obligations += 1;
         }
@@ -1170,6 +1176,10 @@ impl NativeExecutor {
                     }
                 }
             }
+        }
+        // After the dust sweep: the vault and escrows are final for the block.
+        for m in delisted_drained {
+            Self::close_oracle_if_settled(ctx, m)?;
         }
         stats.adl_work = used;
         stats.adl_rows_left = at_end.then_some(waiting);

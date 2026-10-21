@@ -375,6 +375,60 @@ block wall of EVM blocks), `torus_exec_evm_seconds` (the EVM section on the exec
 unchanged), `torus_flush_worker_evm_trie_seconds` (the flush worker's EVM trie step; never observed with
 the flag off). See `docs/monitoring-setup.md`.
 
+## Market delisting (governance)
+
+A governance `DelistMarket` proposal makes a market reduce-only, cancels its resting orders and
+stops (refunded), and starts a grace period. When the grace period ends, the settlement step closes
+every remaining position at one settlement price against the liquidator vault, with no fee. Owner
+decisions and the options that were not chosen: `docs/Torus-hyperBFT-roadmap.md`, P1, "Decisions
+(owner s134)".
+
+| Governance key (`ParameterChange`) | Range | Default | Effect |
+|---|---|---|---|
+| `delist_grace_blocks` | 0..=302,400 | 43,200 (24 h at 2 s) | N: the settlement starts at `close_at` = delist height + N. Read once, when the delist executes; a later change does not move a running grace period. 0 = close in the delist's own block. An absent or invalid stored value reads as the default. |
+
+**Settlement price.** It is fixed once, at the first settlement block (height >= `close_at`), and
+never changes after that. The first available source wins:
+
+1. the governance close price (below), if one was set;
+2. the usable oracle mark;
+3. the last aggregated oracle price, of any age (no cap);
+4. none: the settlement waits, and the step reports an error result every block until a price
+   exists.
+
+**Governance close price: `SetDelistClosePrice { market_id, price }`.** This is a `SubmitProposal`
+action. It needs the normal vote and timelock.
+
+- Submission: `price` > 0, and `market_id` has a market row. The market need not be delisted yet,
+  so the proposal can be voted alongside the delist.
+- Execution at height E: the market is delisted and its settlement price is not fixed yet. That
+  covers the grace period, `close_at` itself (governance runs before the settlement step), a
+  settlement still waiting for a price after `close_at` (no oracle price at all), and the delist's
+  own block (the close-price proposal needs a higher proposal id than the delist). Otherwise the
+  proposal ends `Failed` with nothing written: the price is already fixed (first settlement block),
+  the market is already settled, or the market is not delisted. A later close-price proposal that
+  executes in time replaces an earlier one.
+- A settlement waiting after `close_at` takes an executed close price in the same block: the walk
+  starts at it, ahead of a mark that appears in that block.
+- Plan the timing. To set the price that the settlement uses when an oracle price exists, the vote
+  plus the timelock (24 h by default) must end at or before `close_at`. With the default grace
+  period (also 24 h), submit the close-price proposal before or together with the delist, or raise
+  `delist_grace_blocks` first. Once the price is fixed, governance cannot change it.
+- Not chosen (owner s134): the earlier, stricter rule "E <= `close_at` only". It left a market
+  with no oracle price at all waiting forever after `close_at`, with no governance way out.
+
+**Oracle submissions for a settled market.** A market's settlement is complete when its settlement
+row is gone and the liquidator vault and both ADL escrows hold no position in it. From then on
+validators ignore that market's entries in `SubmitOraclePrices`: they are not stored, the rest of
+the submission is, and the action still succeeds. The block-start aggregation also skips the
+market. Until then (grace period, settlement walk, ADL drain) prices are accepted and aggregated as
+usual. The price feeder still publishes a delisted market while `torus_getMarkets` lists it, which
+is harmless (the entry is ignored). To save the work, remove the market from the feeder's
+`[[markets]]` config once it is settled.
+
+**Relisting.** A delisted id is never listed again. List the asset again under a new id with a new
+`ListMarket` proposal.
+
 ## Economic Constants
 
 Defined in `torus-economics/src/types.rs`:

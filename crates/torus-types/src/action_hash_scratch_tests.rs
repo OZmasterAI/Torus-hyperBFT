@@ -180,6 +180,10 @@ fn actions() -> Vec<NativeAction> {
         ProposalAction::ValidatorRegistration {
             candidate: Address::repeat_byte(12),
         },
+        ProposalAction::SetDelistClosePrice {
+            market_id: u64::MAX,
+            price: FixedPoint::from_raw(i128::MIN),
+        },
     ] {
         actions.push(NativeAction::SubmitProposal(Proposal {
             title: "proposal\0é".into(),
@@ -523,6 +527,11 @@ fn legacy_canonical_bytes(action: &NativeAction) -> Vec<u8> {
                 ProposalAction::ValidatorRegistration { candidate } => {
                     buf.push(4);
                     buf.extend_from_slice(candidate.as_slice());
+                }
+                ProposalAction::SetDelistClosePrice { market_id, price } => {
+                    buf.push(5);
+                    buf.extend_from_slice(&market_id.to_be_bytes());
+                    buf.extend_from_slice(&price.raw().to_be_bytes());
                 }
             }
         }

@@ -17,5 +17,7 @@ rayon = "1"
 
 [dev-dependencies]
 serde_json = { workspace = true }
+# s134 P1: independent EIP-712 reference (sol! structs) for eip712_reference.rs.
+alloy-sol-types = "1.5"
 hex = { workspace = true }
 bincode = { workspace = true }

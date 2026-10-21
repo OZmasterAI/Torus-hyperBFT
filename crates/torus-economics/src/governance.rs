@@ -12,8 +12,8 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use torus_state::cf::{
-    CF_ACCOUNTS, CF_FEE_CONFIG, CF_GOVERNANCE_PROPOSALS, CF_GOVERNANCE_VOTES, CF_NATIVE_MARKETS,
-    CF_STAKING_DELEGATIONS, CF_STAKING_PERMANENT,
+    CF_ACCOUNTS, CF_FEE_CONFIG, CF_GOVERNANCE_PROPOSALS, CF_GOVERNANCE_VOTES,
+    CF_NATIVE_LIQUIDATION, CF_NATIVE_MARKETS, CF_STAKING_DELEGATIONS, CF_STAKING_PERMANENT,
 };
 use torus_state::{AtomicWriteOp, StateBackend, StateDb};
 use torus_types::FixedPoint;
@@ -119,6 +119,8 @@ pub enum ProposalType {
     MarketDelist,
     /// Pre-testnet P1: change a listed market's tick, lot and max leverage.
     MarketParamsUpdate,
+    /// Delist decisions (owner s134, 1c): set a delisted market's close price.
+    DelistClosePrice,
 }
 
 impl BorshSerialize for ProposalType {
@@ -132,6 +134,7 @@ impl BorshSerialize for ProposalType {
             Self::PermanentUnlock => 5,
             Self::MarketDelist => 6,
             Self::MarketParamsUpdate => 7,
+            Self::DelistClosePrice => 8,
         };
         writer.write_all(&[disc])
     }
@@ -150,6 +153,7 @@ impl BorshDeserialize for ProposalType {
             5 => Ok(Self::PermanentUnlock),
             6 => Ok(Self::MarketDelist),
             7 => Ok(Self::MarketParamsUpdate),
+            8 => Ok(Self::DelistClosePrice),
             x => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid ProposalType discriminant: {x}"),
@@ -255,6 +259,12 @@ pub enum ExecutionPayload {
         tick_size: FixedPoint,
         initial_margin: FixedPoint,
     },
+    /// Delist decisions (owner s134, 1c): the settlement price of delisted
+    /// `market_id`. Execution writes `CF_NATIVE_LIQUIDATION`
+    /// [`torus_types::delist_close_price_key`] -> price raw (16, BE) while
+    /// the settlement price is not fixed yet; the executor's settlement step
+    /// takes it ahead of the mark and the last aggregate.
+    DelistClosePrice { market_id: u64, price: FixedPoint },
 }
 
 impl BorshSerialize for ExecutionPayload {
@@ -318,6 +328,11 @@ impl BorshSerialize for ExecutionPayload {
                 BorshSerialize::serialize(&lot_size.raw(), writer)?;
                 BorshSerialize::serialize(&tick_size.raw(), writer)?;
                 BorshSerialize::serialize(&initial_margin.raw(), writer)?;
+            }
+            Self::DelistClosePrice { market_id, price } => {
+                writer.write_all(&[7u8])?;
+                BorshSerialize::serialize(market_id, writer)?;
+                BorshSerialize::serialize(&price.raw(), writer)?;
             }
         }
         Ok(())
@@ -386,6 +401,11 @@ impl BorshDeserialize for ExecutionPayload {
                     tick_size,
                     initial_margin,
                 })
+            }
+            7 => {
+                let market_id = u64::deserialize_reader(reader)?;
+                let price = FixedPoint::from_raw(i128::deserialize_reader(reader)?);
+                Ok(Self::DelistClosePrice { market_id, price })
             }
             x => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -953,6 +973,17 @@ impl<T: StateBackend> GovernanceManager<T> {
                 self.require_tradable_market(*market_id)?;
                 Self::validate_tick_lot(*tick_size, *lot_size)?;
             }
+            // Delist decisions (owner s134, 1c): the market needs a row but
+            // need not be delisted yet (voted alongside the delist); the
+            // rest is checked at execution.
+            Some(ExecutionPayload::DelistClosePrice { market_id, price }) => {
+                if *price <= FixedPoint::ZERO {
+                    return Err(EconomicsError::DelistClosePriceNotPositive(*market_id));
+                }
+                if !self.market_exists(*market_id)? {
+                    return Err(EconomicsError::MarketNotListed(*market_id));
+                }
+            }
             _ => {}
         }
 
@@ -967,6 +998,7 @@ impl<T: StateBackend> GovernanceManager<T> {
             Some(ExecutionPayload::PermanentUnlock { .. }) => ProposalType::PermanentUnlock,
             Some(ExecutionPayload::MarketDelist { .. }) => ProposalType::MarketDelist,
             Some(ExecutionPayload::MarketParamsUpdate { .. }) => ProposalType::MarketParamsUpdate,
+            Some(ExecutionPayload::DelistClosePrice { .. }) => ProposalType::DelistClosePrice,
             None => ProposalType::TextProposal,
         };
 
@@ -1488,6 +1520,15 @@ impl<T: StateBackend> GovernanceManager<T> {
                 tracing::debug!(market_id, "market params update staged");
                 vec![(CF_NATIVE_MARKETS, market_id.to_be_bytes().to_vec(), Some(data))]
             }
+            ExecutionPayload::DelistClosePrice { market_id, price } => {
+                self.check_delist_close_price(*market_id, *price, current_block)?;
+                tracing::debug!(market_id, %price, "delist close price staged");
+                vec![(
+                    CF_NATIVE_LIQUIDATION,
+                    torus_types::delist_close_price_key(*market_id).to_vec(),
+                    Some(price.raw().to_be_bytes().to_vec()),
+                )]
+            }
         };
         Ok(writes)
     }
@@ -1811,6 +1852,43 @@ impl<T: StateBackend> GovernanceManager<T> {
             .is_some())
     }
 
+    /// Delist decisions (owner s134, 1c): a close price for `market_id` may
+    /// execute at `current_block` while the market is delisted and its
+    /// settlement price is not fixed: either its settlement row
+    /// (`CF_NATIVE_LIQUIDATION 0x08 ‖ market`: `close_at` (8, BE), plus the
+    /// price (16) once fixed) holds no price yet (the grace period, `close_at`
+    /// itself since the settlement step runs after governance, or after
+    /// `close_at` while the settlement waits because no price exists), or the
+    /// delist executed in this block (its flag value is the delist height;
+    /// the executor writes the row right after the governance step). A row
+    /// with a price, or no row otherwise (settled), is too late. Owner s134
+    /// loosened this from "E <= `close_at`" (not chosen: it stranded a
+    /// settlement with no oracle price at all).
+    fn check_delist_close_price(&self, market_id: u64, price: FixedPoint, current_block: u64) -> Result<()> {
+        if price <= FixedPoint::ZERO {
+            return Err(EconomicsError::DelistClosePriceNotPositive(market_id));
+        }
+        let Some(flag) = self
+            .state
+            .get_cf_raw(CF_NATIVE_MARKETS, &torus_types::market_delisted_key(market_id))?
+        else {
+            return Err(EconomicsError::MarketNotDelisted(market_id));
+        };
+        let be8 = |v: &[u8]| v.get(..8).and_then(|b| b.try_into().ok()).map(u64::from_be_bytes);
+        let row = self
+            .state
+            .get_cf_raw(CF_NATIVE_LIQUIDATION, &torus_types::delist_settlement_key(market_id))?;
+        let in_time = match row {
+            Some(v) => v.len() == 8,
+            None => be8(&flag) == Some(current_block),
+        };
+        if in_time {
+            Ok(())
+        } else {
+            Err(EconomicsError::DelistClosePriceTooLate(market_id))
+        }
+    }
+
     /// Pre-testnet P1: `market_id` is listed and not delisted (the target of
     /// a delist or a params update).
     fn require_tradable_market(&self, market_id: u64) -> Result<()> {
@@ -1907,6 +1985,9 @@ fn is_execution_failure(e: &EconomicsError) -> bool {
             | EconomicsError::MarketNotListed(_)
             | EconomicsError::MarketDelisted(_)
             | EconomicsError::MarketRowUndecodable(_)
+            | EconomicsError::MarketNotDelisted(_)
+            | EconomicsError::DelistClosePriceNotPositive(_)
+            | EconomicsError::DelistClosePriceTooLate(_)
             | EconomicsError::PermanentStakeNotFound(_)
             | EconomicsError::PermanentUnlockExceedsStake { .. }
     )
@@ -2056,6 +2137,29 @@ mod tests {
     // ====================================================================
     // PermanentUnlock governance tests
     // ====================================================================
+
+    /// Delist decisions (owner s134, 1c): the close-price payload and type
+    /// take the next free tags (payload 7, type 8) and round-trip; the
+    /// existing tags do not move.
+    #[test]
+    fn delist_close_price_payload_borsh_is_appended() {
+        let price = FixedPoint::from_raw(-7);
+        let payload = ExecutionPayload::DelistClosePrice { market_id: 3, price };
+        let bytes = borsh::to_vec(&payload).unwrap();
+        let mut want = vec![7u8];
+        want.extend_from_slice(&3u64.to_le_bytes());
+        want.extend_from_slice(&(-7i128).to_le_bytes());
+        assert_eq!(bytes, want);
+        match ExecutionPayload::try_from_slice(&bytes).unwrap() {
+            ExecutionPayload::DelistClosePrice { market_id, price: p } => assert_eq!((market_id, p), (3, price)),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(borsh::to_vec(&ExecutionPayload::MarketDelist { market_id: 1 }).unwrap()[0], 5);
+        assert_eq!(borsh::to_vec(&ProposalType::DelistClosePrice).unwrap(), vec![8]);
+        assert_eq!(ProposalType::try_from_slice(&[8]).unwrap(), ProposalType::DelistClosePrice);
+        assert_eq!(borsh::to_vec(&ProposalType::MarketParamsUpdate).unwrap(), vec![7]);
+        assert!(ProposalType::try_from_slice(&[9]).is_err());
+    }
 
     /// Stored proposals carry the status byte: existing discriminants must not
     /// move; `Failed` (s94) takes the next free one.

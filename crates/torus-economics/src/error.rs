@@ -182,6 +182,20 @@ pub enum EconomicsError {
     #[error("market {0} is delisted")]
     MarketDelisted(u64),
 
+    /// Delist decisions (owner s134, 1c): a close price for a market that is
+    /// not delisted (at execution).
+    #[error("market {0} is not delisted")]
+    MarketNotDelisted(u64),
+
+    /// Delist decisions (owner s134, 1c): a close price <= 0.
+    #[error("market {0}: delist close price must be > 0")]
+    DelistClosePriceNotPositive(u64),
+
+    /// Delist decisions (owner s134, 1c): a close price executing after the
+    /// settlement price was fixed (first settlement block) or the market settled.
+    #[error("market {0}: delist close price too late (settlement price fixed or market settled)")]
+    DelistClosePriceTooLate(u64),
+
     /// Pre-testnet P1: a params update of a market whose row is not in the
     /// genesis / governance layout (its names cannot be kept).
     #[error("market {0} row does not decode")]
