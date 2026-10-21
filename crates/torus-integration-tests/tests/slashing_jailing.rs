@@ -297,7 +297,7 @@ fn double_sign_detection_produces_verifiable_evidence() {
             signer: sk.verifying_key().to_bytes(),
             signature: [0; 64],
         };
-        vote.signature = sk.sign(&vote.signed_message()).to_bytes();
+        vote.signature = sk.sign(&vote.signed_message().expect("phase 0 is Generic")).to_bytes();
         vote
     };
 
