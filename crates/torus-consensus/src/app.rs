@@ -26643,7 +26643,12 @@ mod crash_recovery_tests {
                 resp.data.clone(),
             )
         };
-        let mut from_1 = gated_app(unix_now_secs(), rsh_at(1));
+        // The voters' clock runs an hour ahead: the proposals carry the real
+        // clock, and under a loaded parallel run building an app took > 5 s,
+        // so a clock pinned before it tripped the 5 s drift check (Invalid
+        // for the wrong reason). This test is about bits, not drift.
+        let clock = || unix_now_secs() + 3_600;
+        let mut from_1 = gated_app(clock(), rsh_at(1));
         assert_eq!(from_1.genesis_header.features, rsh, "genesis parent header");
         assert_eq!(from_1.last_header.features, rsh);
         let resp = from_1.build_proposal(from_1.genesis_header.clone());
@@ -26652,7 +26657,7 @@ mod crash_recovery_tests {
             from_1.check_proposal_data(&genesis_hs(&resp), no_lookup),
             BlockDataCheck::Held
         );
-        let mut without = gated_app(unix_now_secs(), torus_types::ActivationSchedule::default());
+        let mut without = gated_app(clock(), torus_types::ActivationSchedule::default());
         assert_eq!(without.genesis_header.features, 0);
         assert_eq!(
             without.check_proposal_data(&genesis_hs(&resp), no_lookup),
@@ -26661,7 +26666,7 @@ mod crash_recovery_tests {
         );
 
         // Crossing H = 3 on a non-genesis parent.
-        let mut at_3 = gated_app(unix_now_secs(), rsh_at(3));
+        let mut at_3 = gated_app(clock(), rsh_at(3));
         let mut parent = make_block(2, vec![]);
         parent.header.timestamp = unix_now_secs();
         let _ = at_3.build_proposal(parent.header.clone());
