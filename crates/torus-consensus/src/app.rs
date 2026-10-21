@@ -1289,7 +1289,16 @@ pub type EvmForward = Arc<dyn Fn([u8; 32], Vec<u8>) + Send + Sync>;
 /// Shared consensus state for leader discovery by non-consensus components (RPC).
 pub struct LeaderState {
     view: AtomicU64,
+    /// The hint set: members and powers from execution ([`Self::sync_validators`]), leader
+    /// exclusions from `committed`.
     validators: RwLock<hotstuff_rs::types::validator_set::ValidatorSet>,
+    /// Dead-leader skip: a copy of the committed hotstuff validator set (seeded at boot,
+    /// then every committed update applied), kept apart from the hint set because execution's
+    /// membership can lag or lead it. The hint set excludes exactly its members that this set
+    /// excludes; members this set lacks keep their hint exclusion state until it catches up.
+    /// `None` until seeded: committed deltas then go to the hint set directly.
+    /// Lock order: `committed` before `validators`.
+    committed: RwLock<Option<hotstuff_rs::types::validator_set::ValidatorSet>>,
     /// `(view, leader)` as last observed from the pacemaker's own `StartView`
     /// event — the REAL view (not the committed_height+1 heuristic, which goes
     /// stale during timeout churn) and the REAL selection (reputation-aware
@@ -1311,6 +1320,7 @@ impl LeaderState {
         Self {
             view: AtomicU64::new(1),
             validators: RwLock::new(hotstuff_rs::types::validator_set::ValidatorSet::new()),
+            committed: RwLock::new(None),
             observed_leader: RwLock::new(None),
             tip: RwLock::new((0, 0)),
             evm_block_interval: AtomicU64::new(0),
@@ -1341,8 +1351,9 @@ impl LeaderState {
     }
 
     /// Replace the hint set's members and powers with `vs`. Dead-leader skip: the leader
-    /// exclusions of members that stay are kept (they change only through committed exclusion
-    /// deltas, [`Self::apply_leader_exclusion_updates`]).
+    /// exclusions of members that stay are kept, then every member the committed set knows
+    /// takes its exclusion from it ([`Self::reconcile_leader_exclusions`]), so a member synced
+    /// after its committed exclusion arrives excluded.
     fn sync_validators(&self, vs: &torus_types::ValidatorSet) {
         let mut hs_vs = hotstuff_rs::types::validator_set::ValidatorSet::new();
         for v in &vs.validators {
@@ -1350,39 +1361,73 @@ impl LeaderState {
                 hs_vs.put(&vk, Power::new(v.power));
             }
         }
+        let committed = self.committed.read().unwrap();
         let mut current = self.validators.write().unwrap();
         for vk in current.leader_excluded() {
             hs_vs.exclude_leader(vk);
         }
+        if let Some(committed) = committed.as_ref() {
+            Self::reconcile_leader_exclusions(&mut hs_vs, committed);
+        }
         *current = hs_vs;
     }
 
-    /// Dead-leader skip: apply a committed validator-set update's leader exclusion delta to the
-    /// hint set (fed from hotstuff's `UpdateValidatorSet` event).
-    /// Only the delta: the powers come from [`Self::sync_validators`].
+    /// Dead-leader skip: every member of `hints` that `committed` contains is leader-excluded
+    /// exactly when `committed` excludes it; the others keep their state.
+    fn reconcile_leader_exclusions(
+        hints: &mut hotstuff_rs::types::validator_set::ValidatorSet,
+        committed: &hotstuff_rs::types::validator_set::ValidatorSet,
+    ) {
+        let members: Vec<VerifyingKey> = hints.validators().copied().collect();
+        for vk in &members {
+            if !committed.contains(vk) {
+                continue;
+            }
+            if committed.is_leader_excluded(vk) {
+                hints.exclude_leader(vk);
+            } else {
+                hints.readmit_leader(vk);
+            }
+        }
+    }
+
+    /// Dead-leader skip: apply a committed validator-set update (hotstuff's
+    /// `UpdateValidatorSet` event) to the committed copy and take the hint set's exclusions from
+    /// it. Before seeding, only the exclusion delta, straight to the hint set.
+    /// The hint powers and members still come from [`Self::sync_validators`].
     pub fn apply_leader_exclusion_updates(
         &self,
         updates: &hotstuff_rs::types::update_sets::ValidatorSetUpdates,
     ) {
+        let mut committed = self.committed.write().unwrap();
         let mut vs = self.validators.write().unwrap();
-        for vk in updates.leader_readmits() {
-            vs.readmit_leader(vk);
-        }
-        for vk in updates.leader_excludes() {
-            vs.exclude_leader(vk);
+        match committed.as_mut() {
+            Some(committed) => {
+                committed.apply_updates(updates);
+                Self::reconcile_leader_exclusions(&mut vs, committed);
+            }
+            None => {
+                for vk in updates.leader_readmits() {
+                    vs.readmit_leader(vk);
+                }
+                for vk in updates.leader_excludes() {
+                    vs.exclude_leader(vk);
+                }
+            }
         }
     }
 
-    /// Dead-leader skip: at boot, copy the committed hotstuff validator set's leader exclusions
-    /// into the hint set (members of the hint set only).
+    /// Dead-leader skip: at boot, keep a copy of the committed hotstuff validator set (later
+    /// committed updates are applied to it) and take the hint set's exclusions from it. A
+    /// member the hints lack yet gets its exclusion when [`Self::sync_validators`] adds it.
     pub fn seed_leader_exclusions(
         &self,
         committed: &hotstuff_rs::types::validator_set::ValidatorSet,
     ) {
+        let mut seeded = self.committed.write().unwrap();
         let mut vs = self.validators.write().unwrap();
-        for vk in committed.leader_excluded() {
-            vs.exclude_leader(vk);
-        }
+        Self::reconcile_leader_exclusions(&mut vs, committed);
+        *seeded = Some(committed.clone());
     }
 
     pub fn current_view(&self) -> u64 {
