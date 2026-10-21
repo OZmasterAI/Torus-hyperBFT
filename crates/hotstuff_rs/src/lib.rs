@@ -146,3 +146,6 @@ mod committed_feed;
 mod event_bus;
 
 pub mod events;
+
+#[cfg(test)]
+pub(crate) mod test_keys;

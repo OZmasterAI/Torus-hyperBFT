@@ -16,10 +16,11 @@ use crate::{
         crypto_primitives::Keypair,
         data_types::*,
         signed_messages::{SignedMessage, Vote},
+        signing::timeout_vote_bytes,
     },
 };
 
-use super::types::{TimeoutCertificate, TipInfo};
+use super::types::{TimeoutCertificate, TipInfo, VoterMetadata};
 
 /// Enum wrapper around any kind of message sent between replicas as part of the Pacemaker subprotocol.
 #[derive(Clone, BorshSerialize, BorshDeserialize)]
@@ -46,7 +47,12 @@ impl PacemakerMessage {
     ) -> PacemakerMessage {
         // Sign the full message including local_tip and highest_qc to prevent
         // MITM substitution of these fields.
-        let message = TimeoutVote::build_message_bytes(chain_id, view, &local_tip, &highest_qc);
+        let message = timeout_vote_bytes(
+            chain_id,
+            view,
+            local_tip.as_ref().map(TipInfo::summary),
+            highest_qc.as_ref().map(|qc| (qc.view, qc.block)),
+        );
         let signature = keypair.sign(&message);
 
         PacemakerMessage::TimeoutVote(TimeoutVote {
@@ -135,36 +141,19 @@ pub struct TimeoutVote {
 }
 
 impl TimeoutVote {
-    /// Build the signed message bytes for a TimeoutVote, including local_tip
-    /// and highest_qc to prevent MITM substitution of these fields.
-    fn build_message_bytes(
-        chain_id: ChainID,
-        view: ViewNumber,
-        local_tip: &Option<TipInfo>,
-        highest_qc: &Option<PhaseCertificate>,
-    ) -> Vec<u8> {
-        let mut bytes = (chain_id, view).try_to_vec().unwrap();
-        // Include local_tip block hash to bind it to the signature.
-        if let Some(ref tip) = local_tip {
-            bytes.extend_from_slice(&tip.block_hash.bytes());
-        }
-        // Include highest_qc view and block hash to bind them to the signature.
-        if let Some(ref qc) = highest_qc {
-            bytes.extend_from_slice(&qc.view.int().to_be_bytes());
-            bytes.extend_from_slice(&qc.block.bytes());
-        }
-        bytes
+    /// What this vote signs about its local tip and its highest QC, besides `(chain_id, view)`.
+    pub fn signed_summaries(&self) -> VoterMetadata {
+        (
+            self.local_tip.as_ref().map(TipInfo::summary),
+            self.highest_qc.as_ref().map(|qc| (qc.view, qc.block)),
+        )
     }
 }
 
 impl SignedMessage for TimeoutVote {
     fn message_bytes(&self) -> Vec<u8> {
-        TimeoutVote::build_message_bytes(
-            self.chain_id,
-            self.view,
-            &self.local_tip,
-            &self.highest_qc,
-        )
+        let (tip, qc) = self.signed_summaries();
+        timeout_vote_bytes(self.chain_id, self.view, tip, qc)
     }
 
     fn signature_bytes(&self) -> SignatureBytes {

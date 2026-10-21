@@ -25,17 +25,7 @@ struct Rejoin {
 }
 
 fn header_for(body: &Block, view: ViewNumber) -> ProposalHeader {
-    ProposalHeader {
-        chain_id: ChainID::new(0),
-        view,
-        block_hash: body.hash,
-        height: body.height,
-        data_hash: body.data_hash,
-        justify: body.justify.clone(),
-        tc: None,
-        nec: None,
-        has_validator_set_updates: false,
-    }
+    crate::test_keys::seed_leader_header(ChainID::new(0), body, view)
 }
 
 fn body(seed: u8) -> Block {

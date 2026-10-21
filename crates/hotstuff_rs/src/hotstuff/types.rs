@@ -20,6 +20,7 @@ use crate::{
     types::{
         data_types::*,
         signed_messages::{Certificate, Collector},
+        signing::{no_endorsement_bytes, phase_vote_bytes},
         validator_set::*,
     },
 };
@@ -154,6 +155,7 @@ impl Certificate for PhaseCertificate {
         }
 
         // Check whether every signature is correct and tally up their powers.
+        let message = phase_vote_bytes(self.chain_id, self.view, &self.block, self.phase);
         let mut total_power: TotalPower = TotalPower::new(0);
         for (signature, (signer, power)) in self
             .signatures
@@ -163,12 +165,7 @@ impl Certificate for PhaseCertificate {
             if let Some(signature) = signature {
                 if let Ok(signature) = Signature::from_slice(&signature.bytes()) {
                     if signer
-                        .verify(
-                            &(self.chain_id, self.view, self.block, self.phase)
-                                .try_to_vec()
-                                .unwrap(),
-                            &signature,
-                        )
+                        .verify(&message, &signature)
                         .is_ok()
                     {
                         total_power += power;
@@ -425,6 +422,7 @@ pub struct NoEndorsementCertificate {
 ///    did not vote in the current view.
 pub fn valid_nec<K: KVStore>(
     nec: &NoEndorsementCertificate,
+    chain_id: ChainID,
     block_tree: &BlockTreeSingleton<K>,
 ) -> Result<bool, BlockTreeError> {
     // Condition 1: the high_tip's QC view must be strictly less than nec.view - 1.
@@ -440,40 +438,53 @@ pub fn valid_nec<K: KVStore>(
     // first checked only the committed set, then only the previous set; the
     // latter rejected every honest NEC in that window.
     let validator_set_state = block_tree.validator_set_state()?;
-    Ok(is_nec_correctly_signed(nec, validator_set_state.committed_validator_set())
+    Ok(is_nec_correctly_signed(nec, chain_id, validator_set_state.committed_validator_set())
         || (!validator_set_state.update_decided()
-            && is_nec_correctly_signed(nec, validator_set_state.previous_validator_set())))
+            && is_nec_correctly_signed(nec, chain_id, validator_set_state.previous_validator_set())))
 }
 
-/// VALIDPROPOSAL's certificate part: whether the TC and NEC a proposal for
-/// `view` of block `block_hash` carries are valid. The one check both the
-/// full-proposal path and the header-first path run.
+/// VALIDPROPOSAL's certificate part (docs/plans/tc-required-and-tip-signing.md
+/// §2): whether a proposal for `view` of block `block_hash` justified by
+/// `justify` carries the certificates it needs, and whether they are valid.
+/// The one check both the full-proposal path and the header-first path run.
 ///
-/// - An NEC must be valid ([`valid_nec`]), for `view`, and come with a TC
-///   whose high tip's QC view it is over (it proves that tip can be skipped).
+/// - **V1.** The block justifies on view `view - 1` or the genesis PC, or a
+///   TC for `view - 1` is attached ([`carries_required_certificate`]).
+/// - **V2.** TC attached, no NEC, the TC's high tip wins: the block is that
+///   tip.
+/// - **V3.** TC attached, no NEC, its high QC `q` wins: the block justifies
+///   on a view `>= q.view`, or is `q`'s block (a validator-set-update
+///   re-proposal of the block `q` certifies) ([`extends_tc_high_qc`]).
+/// - **V4.** An NEC must be valid ([`valid_nec`]), for `view`, and come with
+///   a TC whose high tip's QC view it is over (it proves that tip can be
+///   skipped).
 /// - A TC must be correct (which includes its high tip / high QC summaries
-///   matching what its signers signed) and for `view - 1`.
-/// - A re-proposal (the TC's high tip won) without an NEC must propose
-///   exactly the TC's high tip.
+///   matching what its signers signed, and its high QC being a correct QC)
+///   and for `view - 1`.
 pub(crate) fn valid_proposal_certificates<K: KVStore>(
+    chain_id: ChainID,
     view: ViewNumber,
     block_hash: &CryptoHash,
+    justify: &PhaseCertificate,
     tc: Option<&TimeoutCertificate>,
     nec: Option<&NoEndorsementCertificate>,
     block_tree: &BlockTreeSingleton<K>,
 ) -> Result<bool, BlockTreeError> {
+    if !carries_required_certificate(view, justify, tc) {
+        return Ok(false);
+    }
     if let Some(nec) = nec {
         let over_tc_tip = tc
             .and_then(|tc| tc.high_tip.as_ref())
             .is_some_and(|tip| tip.block_justify.view == nec.high_tip_qc_view);
-        if nec.view != view || !over_tc_tip || !valid_nec(nec, block_tree)? {
+        if nec.view != view || !over_tc_tip || !valid_nec(nec, chain_id, block_tree)? {
             return Ok(false);
         }
     }
     let Some(tc) = tc else {
         return Ok(true);
     };
-    if tc.view.int().checked_add(1) != Some(view.int()) {
+    if tc.chain_id != chain_id || tc.view.int().checked_add(1) != Some(view.int()) {
         return Ok(false);
     }
     if nec.is_none()
@@ -482,17 +493,53 @@ pub(crate) fn valid_proposal_certificates<K: KVStore>(
     {
         return Ok(false);
     }
+    if !extends_tc_high_qc(block_hash, justify, tc, nec) {
+        return Ok(false);
+    }
     tc.is_correct(block_tree)
 }
 
+/// VALIDPROPOSAL rule V1 (docs/plans/tc-required-and-tip-signing.md §2): a
+/// proposal for `view` whose block justifies on `justify` is backed by a
+/// certificate for `view - 1`: `justify` is that QC (or the genesis PC), or
+/// the proposal carries a TC for `view - 1`. Only the TC's view is checked
+/// here; [`valid_proposal_certificates`] checks the TC itself.
+pub(crate) fn carries_required_certificate(
+    view: ViewNumber,
+    justify: &PhaseCertificate,
+    tc: Option<&TimeoutCertificate>,
+) -> bool {
+    let is_previous = |v: ViewNumber| v.int().checked_add(1) == Some(view.int());
+    is_previous(justify.view) || justify.is_genesis_pc() || tc.is_some_and(|tc| is_previous(tc.view))
+}
+
+/// VALIDPROPOSAL rule V3 (docs/plans/tc-required-and-tip-signing.md §2, as
+/// amended in phase B): with `tc` attached, no NEC, and the TC's high QC `q`
+/// winning, the block (`block_hash`, justified by `justify`) justifies on a
+/// view `>= q.view` or is `q`'s block. The second arm is the
+/// validator-set-update re-proposal of the block `q` certifies, which
+/// justifies below `q.view`. Without V3 a valid TC would let a leader drop
+/// the high QC's block. True when the rule does not apply.
+pub(crate) fn extends_tc_high_qc(
+    block_hash: &CryptoHash,
+    justify: &PhaseCertificate,
+    tc: &TimeoutCertificate,
+    nec: Option<&NoEndorsementCertificate>,
+) -> bool {
+    match (&tc.high_qc, nec, tc.high_tip_is_winner) {
+        (Some(q), None, false) => justify.view >= q.view || *block_hash == q.block,
+        _ => true,
+    }
+}
+
 /// Check if the NEC's signatures are correct and form a quorum.
-fn is_nec_correctly_signed(nec: &NoEndorsementCertificate, validator_set: &ValidatorSet) -> bool {
+fn is_nec_correctly_signed(nec: &NoEndorsementCertificate, chain_id: ChainID, validator_set: &ValidatorSet) -> bool {
     if nec.signatures.len() != validator_set.len() {
         return false;
     }
 
     let mut total_power = TotalPower::new(0);
-    let ne_message_bytes = (nec.view, nec.high_tip_qc_view).try_to_vec().unwrap();
+    let ne_message_bytes = no_endorsement_bytes(chain_id, nec.view, nec.high_tip_qc_view);
 
     for (signature, (signer, power)) in nec
         .signatures
@@ -554,6 +601,7 @@ pub fn is_fresh_proposal(proposal: &Proposal) -> bool {
 /// that NEC signers did NOT vote in the current view.
 #[derive(Clone)]
 pub struct NECollector {
+    chain_id: ChainID,
     view: ViewNumber,
     high_tip_qc_view: ViewNumber,
     validator_set: ValidatorSet,
@@ -566,12 +614,14 @@ pub struct NECollector {
 
 impl NECollector {
     pub fn new(
+        chain_id: ChainID,
         view: ViewNumber,
         high_tip_qc_view: ViewNumber,
         validator_set: ValidatorSet,
     ) -> Self {
         let n = validator_set.len();
         Self {
+            chain_id,
             view,
             high_tip_qc_view,
             validator_set,
@@ -614,7 +664,7 @@ impl NECollector {
             }
 
             // Verify signature.
-            let ne_message_bytes = (ne_view, ne_high_tip_qc_view).try_to_vec().unwrap();
+            let ne_message_bytes = no_endorsement_bytes(self.chain_id, ne_view, ne_high_tip_qc_view);
             if let Ok(sig) = Signature::from_slice(&signature.bytes()) {
                 if signer.verify(&ne_message_bytes, &sig).is_err() {
                     return None;

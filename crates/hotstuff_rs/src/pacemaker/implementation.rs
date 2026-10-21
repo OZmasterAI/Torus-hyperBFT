@@ -15,6 +15,7 @@ use std::{
 
 use ed25519_dalek::VerifyingKey;
 
+use crate::hotstuff::types::PhaseCertificate;
 use crate::{
     block_tree::{
         accessors::internal::{BlockTreeError, BlockTreeSingleton, BlockTreeWriteBatch},
@@ -28,7 +29,7 @@ use crate::{
     networking::{messages::Message, network::Network, sending::SenderHandle},
     pacemaker::{
         messages::{AdvanceView, PacemakerMessage, ProgressCertificate, TimeoutVote},
-        types::TimeoutVoteCollector,
+        types::{tip_leader_reputation, TimeoutVoteCollector, TipInfo},
     },
     types::{
         crypto_primitives::Keypair,
@@ -128,13 +129,14 @@ impl<N: Network> Pacemaker<N> {
             // 1.1. If the current view is an Epoch-Change view, broadcast a `TimeoutVote`, then extend the view.
             if is_epoch_change_view(&cur_view, self.config.epoch_length) {
                 if is_validator(&self.config.keypair.public(), &validator_set_state) {
+                    let (tip, highest_qc) = self.own_timeout_summaries(block_tree)?;
                     let pacemaker_message = PacemakerMessage::timeout_vote(
                         &self.config.keypair,
                         self.config.chain_id,
                         cur_view,
                         block_tree.highest_tc()?,
-                        block_tree.local_tip()?,
-                        block_tree.highest_qc_for_timeout()?,
+                        tip,
+                        highest_qc,
                     );
                     self.sender
                         .broadcast(Message::from(pacemaker_message.clone()));
@@ -153,13 +155,14 @@ impl<N: Network> Pacemaker<N> {
             // 1.2. MonadBFT: broadcast TimeoutVote before advancing on normal view timeout.
             } else {
                 if is_validator(&self.config.keypair.public(), &validator_set_state) {
+                    let (tip, highest_qc) = self.own_timeout_summaries(block_tree)?;
                     let pacemaker_message = PacemakerMessage::timeout_vote(
                         &self.config.keypair,
                         self.config.chain_id,
                         cur_view,
                         block_tree.highest_tc()?,
-                        block_tree.local_tip()?,
-                        block_tree.highest_qc_for_timeout()?,
+                        tip,
+                        highest_qc,
                     );
                     self.sender
                         .broadcast(Message::from(pacemaker_message.clone()));
@@ -187,6 +190,10 @@ impl<N: Network> Pacemaker<N> {
         let _ = self
             .state
             .timeout_vote_collectors
+            .update_validator_sets(&validator_set_state);
+        let _ = self
+            .state
+            .prev_timeout_vote_collectors
             .update_validator_sets(&validator_set_state);
 
         // 3. If the current Highest PC in the block tree is for the current view or a higher view, and we have
@@ -222,7 +229,8 @@ impl<N: Network> Pacemaker<N> {
     ///
     /// # Precondition
     ///
-    /// [`msg.view()`](PacemakerMessage::view) must be greater than or equal to the current view.
+    /// [`msg.view()`](PacemakerMessage::view) must be greater than or equal to the current view, or the
+    /// message is a `TimeoutVote` for the previous view (TC-required phase A, C2/C3).
     pub(crate) fn on_receive_msg<K: KVStore>(
         &mut self,
         msg: PacemakerMessage,
@@ -245,7 +253,8 @@ impl<N: Network> Pacemaker<N> {
     ///
     /// # Precondition
     ///
-    /// `timeout_vote.view >= self.query().view`
+    /// `timeout_vote.view + 1 >= self.query().view`. A vote for the previous view is only collected
+    /// (into the previous-view collector); it is not echoed (Bracha stays at `>= view`).
     fn on_receive_timeout_vote<K: KVStore>(
         &mut self,
         timeout_vote: TimeoutVote,
@@ -270,7 +279,33 @@ impl<N: Network> Pacemaker<N> {
 
         // 2. Check whether the `TimeoutVote` is cryptographically correct.
         // MonadBFT: accept timeout votes for ALL views (not just epoch-change views).
-        if timeout_vote.is_correct(origin) {
+        //
+        // TC-required phase B: the vote's highest QC must be a correct QC. The vote signs only its
+        // (view, block) summary, so a byzantine voter could otherwise make a forged high-view QC the
+        // TC's high QC, which `TimeoutCertificate::is_correct` rejects and VALIDPROPOSAL V3 could not
+        // be met under: one such vote in the quorum would cost the next leader its view. Such a
+        // vote is dropped (neither echoed nor collected), so the TC forms from the honest votes.
+        // Honest voters usually report this replica's own (already verified) highest PC, which
+        // skips the n signature checks.
+        //
+        // TC-required phase C (F4): the vote's tip must be a real header (F2: its fields hash to
+        // its block, leader(tip.view) signed it) no newer than the vote. A forged tip would
+        // otherwise win the TC's high tip and force the next leader into recovery. Such a vote
+        // is dropped like a forged high QC.
+        let vote_ok = timeout_vote.is_correct(origin)
+            && match &timeout_vote.highest_qc {
+                Some(qc) => *qc == block_tree.highest_pc()? || qc.is_correct(block_tree)?,
+                None => true,
+            }
+            && timeout_vote.local_tip.as_ref().is_none_or(|tip| {
+                tip.view <= timeout_vote.view
+                    && tip.is_correct_under(
+                        self.config.chain_id,
+                        &validator_set_state,
+                        tip_leader_reputation(block_tree).as_ref(),
+                    )
+            });
+        if vote_ok {
             // MonadBFT Bracha amplification: accumulate voting power per view.
             if timeout_vote.view >= self.view_info.view {
                 // Deduplicate: skip if this voter already contributed to this view.
@@ -316,13 +351,14 @@ impl<N: Network> Pacemaker<N> {
                         .last_timeout_vote_view
                         .is_none_or(|v| v < timeout_vote.view)
                 {
+                    let (tip, highest_qc) = self.own_timeout_summaries(block_tree)?;
                     let own_timeout = PacemakerMessage::timeout_vote(
                         &self.config.keypair,
                         self.config.chain_id,
                         timeout_vote.view,
                         block_tree.highest_tc()?,
-                        block_tree.local_tip()?,
-                        block_tree.highest_qc_for_timeout()?,
+                        tip,
+                        highest_qc,
                     );
                     self.sender.broadcast(Message::from(own_timeout.clone()));
                     if let PacemakerMessage::TimeoutVote(ref tv) = own_timeout {
@@ -341,19 +377,16 @@ impl<N: Network> Pacemaker<N> {
                 _ => None,
             };
 
-            // FIX CONS-FIND-26: Validate TipInfo fields before collecting.
-            if let Some(ref tip) = timeout_vote.local_tip {
-                if tip.view > self.view_info.view {
-                    return Ok(());
-                }
-            }
-
             // 3. Try to collect the TimeoutVote into a new `TimeoutCertificate`.
-            if let Some(new_tc) = self
-                .state
-                .timeout_vote_collectors
-                .collect(origin, timeout_vote)
-            {
+            //    TC-required phase A (C3): a vote for the view just left goes to
+            //    the collector kept for it, so leader(v) forms TC(v-1) after it
+            //    timed out of v-1 itself.
+            let collectors = if timeout_vote.view.int().checked_add(1) == Some(self.view_info.view.int()) {
+                &mut self.state.prev_timeout_vote_collectors
+            } else {
+                &mut self.state.timeout_vote_collectors
+            };
+            if let Some(new_tc) = collectors.collect(origin, timeout_vote) {
                 Event::CollectTC(CollectTCEvent {
                     timestamp: SystemTime::now(),
                     timeout_certificate: new_tc.clone(),
@@ -361,18 +394,15 @@ impl<N: Network> Pacemaker<N> {
                 .publish(&self.event_publisher);
 
                 // MonadBFT B3: Record leader timeout for reputation tracking.
-                // Must use reputation-aware selection to blame the actual leader.
-                let timed_out_leader = match block_tree.leader_reputation().ok() {
-                    Some(ref rep) => select_leader_with_reputation(
-                        new_tc.view,
-                        validator_set_state.committed_validator_set(),
-                        rep,
-                    ),
-                    None => {
-                        select_leader(new_tc.view, validator_set_state.committed_validator_set())
-                    }
-                };
-                let _ = block_tree.record_leader_timeout(&timed_out_leader);
+                // Must use reputation-aware selection to blame the actual leader: the view's one
+                // fresh proposer, which during a validator-set update may be the previous set's
+                // leader (TC phase C review).
+                let reputation = block_tree.leader_reputation().ok();
+                if let Some(timed_out_leader) =
+                    crate::pacemaker::types::fresh_proposer(new_tc.view, &validator_set_state, reputation.as_ref())
+                {
+                    let _ = block_tree.record_leader_timeout(&timed_out_leader);
+                }
 
                 // 3.1. If a newly collected Timeout Certificate has a higher view than `highest_tc`, update `highest_tc`.
                 //
@@ -400,6 +430,11 @@ impl<N: Network> Pacemaker<N> {
                                 .last_advance_view
                                 .is_some_and(|v| v < self.view_info.view))
                     {
+                        // A TC for the view just left (C3) only pulls stragglers into this view; it
+                        // must not count as this view's AdvanceView, or the one carrying TC(view)
+                        // would be skipped and (in an epoch-change view, which never advances on
+                        // timeout) nothing would move this replica on.
+                        let advances_current_view = new_tc.view >= self.view_info.view;
                         let pacemaker_message = PacemakerMessage::advance_view(
                             ProgressCertificate::TimeoutCertificate(new_tc),
                         );
@@ -412,7 +447,9 @@ impl<N: Network> Pacemaker<N> {
                             })
                             .publish(&self.event_publisher)
                         }
-                        self.state.last_advance_view = Some(self.view_info.view);
+                        if advances_current_view {
+                            self.state.last_advance_view = Some(self.view_info.view);
+                        }
                     }
                 }
 
@@ -443,6 +480,30 @@ impl<N: Network> Pacemaker<N> {
             }
         }
         Ok(())
+    }
+
+    /// The tip and highest QC this replica's own timeout vote reports: its local tip and
+    /// [`highest_qc_for_timeout`](BlockTreeSingleton::highest_qc_for_timeout), unless the tip no
+    /// longer passes F2 under the current validator sets (a tip from before the previous set):
+    /// every other replica would drop the whole vote (F4), so the vote goes without the tip and
+    /// with the highest PC instead.
+    fn own_timeout_summaries<K: KVStore>(
+        &self,
+        block_tree: &BlockTreeSingleton<K>,
+    ) -> Result<(Option<TipInfo>, Option<PhaseCertificate>), BlockTreeError> {
+        let Some(tip) = block_tree.local_tip()? else {
+            return Ok((None, block_tree.highest_qc_for_timeout()?));
+        };
+        let validator_set_state = block_tree.validator_set_state()?;
+        if tip.is_correct_under(self.config.chain_id, &validator_set_state, tip_leader_reputation(block_tree).as_ref()) {
+            return Ok((Some(tip), block_tree.highest_qc_for_timeout()?));
+        }
+        log::warn!(
+            "timeout vote without the local tip of view {}: it fails F2 under the current validator sets",
+            tip.view.int()
+        );
+        let highest_pc = block_tree.highest_pc()?;
+        Ok((None, (!highest_pc.is_genesis_pc()).then_some(highest_pc)))
     }
 
     /// Execute the required steps in the Pacemaker protocol upon receiving an `AdvanceView` message.
@@ -645,11 +706,27 @@ impl<N: Network> Pacemaker<N> {
         );
 
         // 4. Replace our current `timeout_vote_collectors` with new ones for the view we just entered.
-        self.state.timeout_vote_collectors = <ActiveCollectorPair<TimeoutVoteCollector>>::new(
-            self.config.chain_id,
-            next_view,
-            validator_set_state,
+        //    TC-required phase A (C1): keep collecting for `next_view - 1`, so
+        //    leader(next_view) can still form TC(next_view - 1). The outgoing
+        //    collector is kept when it is for that view (its votes count); a
+        //    skip gets a fresh one. Dropped on the next `update_view`.
+        let outgoing = std::mem::replace(
+            &mut self.state.timeout_vote_collectors,
+            <ActiveCollectorPair<TimeoutVoteCollector>>::new(
+                self.config.chain_id,
+                next_view,
+                validator_set_state,
+            ),
         );
+        self.state.prev_timeout_vote_collectors = if cur_view.int() + 1 == next_view.int() {
+            outgoing
+        } else {
+            <ActiveCollectorPair<TimeoutVoteCollector>>::new(
+                self.config.chain_id,
+                ViewNumber::new(next_view.int() - 1),
+                validator_set_state,
+            )
+        };
 
         // FIX CONS-PF-16: Prune bracha state for views we'll never revisit.
         let cutoff_view = ViewNumber::new(next_view.int().saturating_sub(100));
@@ -825,6 +902,11 @@ struct PacemakerState {
     /// `TimeoutVoteCollector`s for the at-most two validator sets that are active in the current view.
     timeout_vote_collectors: ActiveCollectorPair<TimeoutVoteCollector>,
 
+    /// TC-required phase A (C1): the collectors for the view before the
+    /// current one, so a TC for it can still form after this replica left it
+    /// (see docs/plans/tc-required-and-tip-signing.md §2).
+    prev_timeout_vote_collectors: ActiveCollectorPair<TimeoutVoteCollector>,
+
     /// The view in which this replica last broadcasted an [`AdvanceView`] message.
     last_advance_view: Option<ViewNumber>,
     /// Bracha timeout amplification: accumulated voting power per view.
@@ -880,6 +962,11 @@ impl PacemakerState {
             timeout_vote_collectors: <ActiveCollectorPair<TimeoutVoteCollector>>::new(
                 config.chain_id,
                 init_view,
+                validator_set_state,
+            ),
+            prev_timeout_vote_collectors: <ActiveCollectorPair<TimeoutVoteCollector>>::new(
+                config.chain_id,
+                ViewNumber::new(init_view.int().saturating_sub(1)),
                 validator_set_state,
             ),
             last_advance_view: None,
@@ -1142,8 +1229,30 @@ static REPUTATION_LEADER_SELECTION_ENABLED: std::sync::atomic::AtomicBool =
 /// Leader selection must agree on every replica of a chain: set this to the
 /// same value on ALL replicas, before the replica starts, and never while it
 /// is running.
+///
+/// Enabling it is refused at replica start ([`check_leader_selection_mode`]):
+/// the TC tip checks (F2) pick a tip's leader with today's reputation rather
+/// than the tip view's (TC phase C review P2).
 pub fn set_reputation_leader_selection(enabled: bool) {
     REPUTATION_LEADER_SELECTION_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a replica may run with reputation-weighted leader selection set to `reputation_enabled`.
+///
+/// TC phase C review P2: refused. The tip checks (F2, docs/plans/tc-required-and-tip-signing.md §3)
+/// verify a tip's leader signature against leader(tip view), and with reputation that leader is
+/// computed from today's locally accumulated reputation, not the reputation the tip's view was led
+/// under; replicas would also disagree on it (see [`set_reputation_leader_selection`]). Reputation
+/// has to be derived from committed chain data and fixed per view before this can be lifted.
+/// Called by `ReplicaSpec::start` (panics) and by the node at startup (refuses to start).
+pub fn check_leader_selection_mode(reputation_enabled: bool) -> Result<(), &'static str> {
+    if reputation_enabled {
+        Err("reputation-weighted leader selection cannot run with the TC tip checks (F2): a tip's \
+             leader would be picked from today's reputation instead of the tip view's; keep \
+             reputation_leader_selection off")
+    } else {
+        Ok(())
+    }
 }
 
 /// Whether reputation-weighted leader selection is currently enabled.
@@ -1334,6 +1443,15 @@ pub(crate) fn boot_view(
 #[test]
 fn reputation_leader_selection_disabled_by_default() {
     assert!(!reputation_leader_selection_enabled());
+}
+
+/// TC phase C review P2: F2 picks a tip's leader with today's reputation, not the tip view's, so
+/// reputation-weighted selection cannot run together with the tip checks. A replica refuses it.
+#[test]
+fn reputation_leader_selection_is_refused_with_tip_checks() {
+    let refused = check_leader_selection_mode(true).expect_err("reputation-weighted selection must be refused");
+    assert!(refused.contains("reputation"), "the error names the setting: {refused}");
+    assert!(check_leader_selection_mode(false).is_ok(), "plain IWRR is accepted");
 }
 
 /// Tests if the number of times each validator is selected as a leader is proportional to its power.
@@ -2079,3 +2197,7 @@ fn update_view_threads_commit_lag() {
         "cap=0 must keep the exact pre-S470 schedule regardless of commit lag"
     );
 }
+
+#[cfg(test)]
+#[path = "prev_view_collector_test.rs"]
+mod prev_view_collector_test;

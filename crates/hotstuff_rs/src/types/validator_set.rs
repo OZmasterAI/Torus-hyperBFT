@@ -10,7 +10,7 @@ use ed25519_dalek::ed25519::Error;
 use std::{collections::HashMap, slice};
 
 use super::{
-    data_types::{BlockHeight, Power, TotalPower},
+    data_types::{BlockHeight, Power, TotalPower, ViewNumber},
     update_sets::{ValidatorSetUpdates, ValidatorSetUpdatesBytes, VerifyingKeyBytes},
 };
 
@@ -249,6 +249,7 @@ pub struct ValidatorSetState {
     previous_validator_set: ValidatorSet,
     update_height: Option<BlockHeight>,
     update_decided: bool,
+    update_view: Option<ViewNumber>,
 }
 
 impl ValidatorSetState {
@@ -264,7 +265,14 @@ impl ValidatorSetState {
             previous_validator_set,
             update_height,
             update_decided,
+            update_view: None,
         }
+    }
+
+    /// This state with [`update_view`](Self::update_view) set to `update_view`.
+    pub fn with_update_view(mut self, update_view: Option<ViewNumber>) -> Self {
+        self.update_view = update_view;
+        self
     }
 
     /// Get the committed validator set.
@@ -288,6 +296,35 @@ impl ValidatorSetState {
     /// [`committed_validator_set`](Self::committed_validator_set)) has been decided.
     pub fn update_decided(&self) -> bool {
         self.update_decided
+    }
+
+    /// The view up to which the previous validator set proposed (docs/plans/tc-required-and-tip-signing.md
+    /// §4): the view of the Commit or Decide PC on the block that caused the latest validator-set update,
+    /// recorded when that block was committed. `None` before any update was committed.
+    ///
+    /// While the update is undecided, fresh proposals of views up to this one came from the previous
+    /// set's leader and later ones from the committed set's leader ([`fresh_proposer_set`](Self::fresh_proposer_set)).
+    pub fn update_view(&self) -> Option<ViewNumber> {
+        self.update_view
+    }
+
+    /// The one validator set whose leader of `view` may make a fresh proposal in `view`, i.e. sign a
+    /// header that can become a tip (F2, docs/plans/tc-required-and-tip-signing.md §4):
+    ///
+    /// ||Update decided|Update not decided|
+    /// |---|---|---|
+    /// |`view <= update_view`|committed|previous|
+    /// |`view > update_view` (or no `update_view`)|committed|committed|
+    ///
+    /// Unlike `is_proposer` (hotstuff/roles.rs), which accepts either set's leader
+    /// while the update is undecided (for nudges and re-proposals), this names a single leader per
+    /// view, so no view has two legitimate fresh proposals (two valid tips) during the update window.
+    pub fn fresh_proposer_set(&self, view: ViewNumber) -> &ValidatorSet {
+        if !self.update_decided && self.update_view.is_some_and(|boundary| view <= boundary) {
+            &self.previous_validator_set
+        } else {
+            &self.committed_validator_set
+        }
     }
 }
 
