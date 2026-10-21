@@ -133,6 +133,16 @@ Validators can rotate their Ed25519 consensus key:
 5. **Safety cap**: At most floor(n/3) validators can rotate per epoch to
    maintain BFT quorum overlap
 
+## Delisted Markets and the Price Feeder
+
+When governance delists a market, the price feeder keeps publishing it through the grace period
+and the settlement. The settlement price is the mark, or the last aggregated price, at the end of
+the grace period, unless governance set a close price. Once the settlement is complete (no
+position, no ADL obligation and no settlement row left), every validator ignores that market's
+entries in `SubmitOraclePrices`. The rest of the submission is still stored, so nothing breaks.
+After that, remove the market from the feeder's `[[markets]]` config to save the work. Details:
+[Configuration Reference](configuration-reference.md#market-delisting-governance).
+
 ## Operational Checklist
 
 - [ ] Keystore file backed up securely
