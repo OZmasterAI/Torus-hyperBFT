@@ -36,7 +36,7 @@ use crate::pacemaker::messages::PacemakerMessage;
 use crate::pacemaker::select_leader;
 use crate::pacemaker::types::{TimeoutCertificate, TimeoutVoteCollector, TipInfo};
 use crate::test_keys::{key_of, signed_by, tip_signed_by};
-use crate::types::signing::no_endorsement_bytes;
+use crate::types::signing::{no_endorsement_bytes, phase_vote_bytes, sign_proposal_header};
 use crate::types::block::Block;
 use crate::types::crypto_primitives::{Keypair, SigningKey, VerifyingKey};
 use crate::types::data_types::{
@@ -727,4 +727,335 @@ fn carries_required_certificate_table() {
     assert!(carries_required_certificate(v, &qc(VIEW - 2), Some(&bare_tc(VIEW - 1))));
     assert!(!carries_required_certificate(v, &qc(VIEW - 2), Some(&bare_tc(VIEW - 2))));
     assert!(!carries_required_certificate(v, &qc(VIEW), None), "a justify for the view itself");
+}
+
+// ---------------------------------------------------------------------------
+// Phase C (docs/plans/tc-required-and-tip-signing.md §3): leader-signed
+// headers (F1), signed tips (F2), signed tip views (F3), tip checks before
+// collecting (F4, prev_view_collector_test), local tip from the header (F5),
+// and domain tags on every consensus signature.
+//
+// RED-first: on the phase-C skeleton (signatures carried, nothing checked,
+// untagged layouts) every test in this section fails.
+// ---------------------------------------------------------------------------
+
+/// `tip` claiming `view` instead of the view its leader signed.
+fn with_view(mut tip: TipInfo, view: u64) -> TipInfo {
+    tip.view = ViewNumber::new(view);
+    tip
+}
+
+/// F2 under the steady four-validator set.
+fn tip_is_correct(tip: &TipInfo) -> bool {
+    let (tree, _) = steady_block_tree(&validator_set(&keys()));
+    tip.is_correct(CHAIN_ID, &tree).unwrap()
+}
+
+/// A validator that is not leader(`view`).
+fn non_leader(view: u64) -> SigningKey {
+    let leader = select_leader(ViewNumber::new(view), &validator_set(&keys()));
+    keys().into_iter().find(|key| key.verifying_key() != leader).unwrap()
+}
+
+#[test]
+fn f2_honest_tip_is_correct() {
+    assert!(tip_is_correct(&tip(&block(1), VIEW - 1)));
+    assert!(tip_is_correct(&tip(&child(VIEW - 3, 60), VIEW - 2)));
+}
+
+#[test]
+fn f2_tip_with_a_forged_view_is_not_correct() {
+    let honest = tip(&block(1), VIEW - 3);
+    assert!(!tip_is_correct(&with_view(honest, VIEW - 1)), "view the leader did not sign");
+}
+
+#[test]
+fn f2_tip_whose_header_fields_do_not_hash_to_its_block_is_not_correct() {
+    let keys = keys();
+    let set = validator_set(&keys);
+    let honest = tip(&child(VIEW - 3, 61), VIEW - 2);
+    let mut justify = honest.clone();
+    justify.block_justify = generic_pc(ViewNumber::new(VIEW - 4), parent().hash, &keys[..3], &set);
+    assert!(!tip_is_correct(&justify), "block_justify that is not the block's justify");
+    let mut height = honest.clone();
+    height.block_height = BlockHeight::new(7);
+    assert!(!tip_is_correct(&height), "height that is not the block's");
+    let mut data = honest;
+    data.block_data_hash = CryptoHash::new([62; 32]);
+    assert!(!tip_is_correct(&data), "data hash that is not the block's");
+}
+
+#[test]
+fn f2_tip_signed_by_a_non_leader_is_not_correct() {
+    let b = block(1);
+    let view = VIEW - 1;
+    let forged = TipInfo::from_header(&header_of(&b, view).signed(&non_leader(view)));
+    assert!(!tip_is_correct(&forged));
+}
+
+/// A voter re-signs its own timeout vote with a forged tip view: its vote is
+/// correctly signed, but the tip fails F2, so the TC is not correct and the
+/// re-proposal it would force is rejected.
+#[test]
+fn f2_tc_carrying_a_tip_with_a_forged_view_is_rejected() {
+    let keys = keys();
+    let set = validator_set(&keys);
+    let b = block(1);
+    let forged = with_view(tip(&b, VIEW - 3), VIEW - 1);
+    let tips = vec![Some(forged.clone()), Some(forged.clone()), Some(forged)];
+    let tc = collected_tc(&keys[..3], &set, VIEW - 1, &tips, &[None, None, None]);
+    let (tree, _) = steady_block_tree(&set);
+    assert!(!tc.is_correct(&tree).unwrap(), "high tip fails F2");
+    assert_both_paths("re-proposal under a TC with a forged tip view", &b, (Some(tc), None), false);
+}
+
+/// F3: the TC's high tip must be the highest tip view any signer signed. A
+/// relayer swapping in a lower (genuine, signed) tip must be caught.
+#[test]
+fn f3_tc_whose_high_tip_is_not_the_highest_signed_view_is_not_correct() {
+    let keys = keys();
+    let set = validator_set(&keys);
+    let (tree, _) = steady_block_tree(&set);
+    let low = tip(&block(2), VIEW - 3);
+    let high = tip(&block(1), VIEW - 1);
+    let tc = collected_tc(&keys[..3], &set, VIEW - 1, &[Some(low.clone()), Some(high.clone()), None], &[None, None, None]);
+    assert!(tc.high_tip.as_ref() == Some(&high), "fixture: the collector keeps the highest tip");
+    assert!(tc.is_correct(&tree).unwrap(), "control: collector TC is correct");
+    let mut lower = tc.clone();
+    lower.high_tip = Some(low);
+    assert!(!lower.is_correct(&tree).unwrap(), "a lower signed tip is not the high tip");
+    assert_both_paths("re-proposal of the lower tip", &block(2), (Some(lower), None), false);
+}
+
+/// F3: the tip view is signed. The signers reported B at VIEW - 3; B was
+/// also (genuinely) proposed at VIEW - 1, but nobody signed that tip: a
+/// relayer cannot raise the high tip's view to it.
+#[test]
+fn f3_tc_high_tip_view_must_be_the_signed_view() {
+    let keys = keys();
+    let set = validator_set(&keys);
+    let (tree, _) = steady_block_tree(&set);
+    let b = block(1);
+    let tips = vec![Some(tip(&b, VIEW - 3)); 3];
+    let tc = collected_tc(&keys[..3], &set, VIEW - 1, &tips, &[None, None, None]);
+    assert!(tc.is_correct(&tree).unwrap(), "control: collector TC is correct");
+    let mut raised = tc.clone();
+    raised.high_tip = Some(tip(&b, VIEW - 1));
+    assert!(tip_is_correct(raised.high_tip.as_ref().unwrap()), "fixture: the raised tip passes F2");
+    assert!(!raised.is_correct(&tree).unwrap(), "a tip view no signer signed");
+}
+
+/// F3: a signed tip can be no newer than the view the TC times out.
+#[test]
+fn f3_tc_with_a_tip_from_a_later_view_is_not_correct() {
+    let keys = keys();
+    let set = validator_set(&keys);
+    let (tree, _) = steady_block_tree(&set);
+    let future = tip(&block(1), VIEW + 1);
+    let tc = collected_tc(&keys[..3], &set, VIEW - 1, &[Some(future), None, None], &[None, None, None]);
+    assert!(!tc.is_correct(&tree).unwrap(), "tip view VIEW + 1 in TC(VIEW - 1)");
+}
+
+/// F1: a header (or full proposal) must carry its proposer's signature over
+/// its own chain, view and block.
+#[test]
+fn f1_proposal_without_its_leaders_signature_is_rejected() {
+    let b = block(1);
+    let leader_key = key_of(&replica().leader);
+    let view = ViewNumber::new(VIEW);
+    let cases = [
+        ("signed by another validator", sign_proposal_header(&non_leader(VIEW), CHAIN_ID, view, &b.hash)),
+        ("leader signature for another view", sign_proposal_header(&leader_key, CHAIN_ID, view - 1, &b.hash)),
+        ("leader signature for another chain", sign_proposal_header(&leader_key, ChainID::new(1), view, &b.hash)),
+        ("leader signature for another block", sign_proposal_header(&leader_key, CHAIN_ID, view, &block(2).hash)),
+    ];
+    for (name, signature) in cases {
+        let mut r = replica();
+        let leader = r.leader;
+        let header = ProposalHeader { leader_signature: signature, ..header_of(&b, VIEW) };
+        r.hotstuff.on_receive_msg(HotStuffMessage::ProposalHeader(header), &leader, &mut r.tree, &mut ValidApp).unwrap();
+        let body = BlockDataResponse { view, block: b.clone() };
+        r.hotstuff.on_receive_msg(HotStuffMessage::BlockDataResponse(body), &leader, &mut r.tree, &mut ValidApp).unwrap();
+        assert!(!r.voted(), "header path, {name}");
+
+        let mut r = replica();
+        let mut proposal = Proposal::signed(&leader_key, CHAIN_ID, view, b.clone(), None, None);
+        proposal.leader_signature = signature;
+        r.hotstuff.on_receive_msg(HotStuffMessage::Proposal(proposal), &leader, &mut r.tree, &mut ValidApp).unwrap();
+        assert!(!r.voted(), "full path, {name}");
+    }
+}
+
+/// F1: an unsigned header cannot be used to frame the leader: it is not
+/// recorded as an equivocation.
+#[test]
+fn f1_unsigned_conflicting_header_is_not_equivocation() {
+    let mut r = replica();
+    let leader = r.leader;
+    let b = block(1);
+    let c = block(2);
+    let honest = signed_by(header_of(&b, VIEW), &leader);
+    r.hotstuff.on_receive_msg(HotStuffMessage::ProposalHeader(honest), &leader, &mut r.tree, &mut ValidApp).unwrap();
+    let mut forged = header_of(&c, VIEW);
+    forged.leader_signature = sign_proposal_header(&non_leader(VIEW), CHAIN_ID, ViewNumber::new(VIEW), &c.hash);
+    r.hotstuff.on_receive_msg(HotStuffMessage::ProposalHeader(forged), &leader, &mut r.tree, &mut ValidApp).unwrap();
+    assert!(
+        !r.events.try_iter().any(|event| matches!(event, Event::EquivocationDetected(_))),
+        "a header the leader did not sign is not its equivocation"
+    );
+}
+
+/// F5: voting for a fresh header sets the local tip to that signed header.
+#[test]
+fn f5_header_vote_sets_the_local_tip_from_the_header() {
+    let r = replica();
+    let leader = r.leader;
+    let b = block(1);
+    assert!(header_path_votes_on_tree(r, &b, None, None, |tree| {
+        let expected = TipInfo::from_header(&signed_by(header_of(&b, VIEW), &leader));
+        assert!(tree.local_tip().unwrap() == Some(expected), "local tip is the voted header");
+    }));
+}
+
+/// F5: voting for a re-proposal keeps the (verified) TC high tip, with its
+/// original view and leader signature.
+#[test]
+fn f5_reproposal_vote_copies_the_tc_high_tip() {
+    let b = block(1);
+    let tc = reproposal_tc(&b);
+    let high_tip = tc.high_tip.clone().unwrap();
+    assert!(header_path_votes_on_tree(replica(), &b, Some(tc), None, |tree| {
+        assert!(tree.local_tip().unwrap() == Some(high_tip.clone()), "local tip is the TC's high tip");
+    }));
+}
+
+/// [`header_path_votes_on`], then `check` the replica's block tree.
+fn header_path_votes_on_tree(
+    r: Replica,
+    block: &Block,
+    tc: Option<TimeoutCertificate>,
+    nec: Option<NoEndorsementCertificate>,
+    check: impl FnOnce(&BlockTreeSingleton<MemKV>),
+) -> bool {
+    let mut r = r;
+    let leader = r.leader;
+    let header = signed_by(ProposalHeader { tc, nec, ..header_of(block, VIEW) }, &leader);
+    r.hotstuff
+        .on_receive_msg(HotStuffMessage::ProposalHeader(header), &leader, &mut r.tree, &mut ValidApp)
+        .unwrap();
+    let body = BlockDataResponse { view: ViewNumber::new(VIEW), block: block.clone() };
+    r.hotstuff
+        .on_receive_msg(HotStuffMessage::BlockDataResponse(body), &leader, &mut r.tree, &mut ValidApp)
+        .unwrap();
+    let voted = r.voted();
+    check(&r.tree);
+    voted
+}
+
+/// F5: a nudge no longer writes the local tip (it stored the nudge's QC as
+/// the block's justify, breaking F2's hash recompute).
+#[test]
+fn f5_nudge_does_not_set_the_local_tip() {
+    use crate::hotstuff::messages::Nudge;
+    use crate::hotstuff::types::Phase;
+    use crate::types::update_sets::ValidatorSetUpdates;
+    use crate::types::data_types::Power;
+    let keys = keys();
+    let set = validator_set(&keys);
+    let mut r = replica();
+    let vsu = block(70);
+    let mut updates = ValidatorSetUpdates::new();
+    updates.insert(keys[0].verifying_key(), Power::new(2));
+    r.tree.insert(&vsu, None, Some(&updates)).unwrap();
+    let message = phase_vote_bytes(CHAIN_ID, ViewNumber::new(VIEW - 1), &vsu.hash, Phase::Prepare);
+    let mut signatures = SignatureSet::new(set.len());
+    for key in &keys[..3] {
+        signatures.set(set.position(&key.verifying_key()).unwrap(), Some(Keypair::new(key.clone()).sign(&message)));
+    }
+    let prepare = PhaseCertificate {
+        chain_id: CHAIN_ID,
+        view: ViewNumber::new(VIEW - 1),
+        block: vsu.hash,
+        phase: Phase::Prepare,
+        signatures,
+    };
+    let leader = r.leader;
+    r.hotstuff
+        .on_receive_msg(HotStuffMessage::Nudge(Nudge::new(CHAIN_ID, ViewNumber::new(VIEW), prepare)), &leader, &mut r.tree, &mut ValidApp)
+        .unwrap();
+    assert!(r.voted(), "fixture: the replica votes Precommit on the nudge");
+    assert!(r.tree.local_tip().unwrap().is_none(), "a nudge must not set the local tip");
+}
+
+// Domain tags ---------------------------------------------------------------
+
+/// The bytes of every kind of consensus signature, over field values chosen
+/// so that the untagged layouts coincided (header = timeout vote with tip;
+/// NE `(0, VIEW)` = bare timeout vote `(chain 0, VIEW)`).
+fn every_signed_layout() -> Vec<(&'static str, Vec<u8>)> {
+    use crate::hotstuff::types::Phase;
+    use crate::types::signing::{phase_vote_bytes, proposal_header_bytes, timeout_vote_bytes};
+    let (chain, view, hash) = (CHAIN_ID, ViewNumber::new(VIEW), CryptoHash::new([7; 32]));
+    vec![
+        ("header", proposal_header_bytes(chain, view, &hash)),
+        ("phase vote", phase_vote_bytes(chain, view, &hash, Phase::Generic)),
+        ("bare timeout vote", timeout_vote_bytes(chain, view, None, None)),
+        ("timeout vote with tip", timeout_vote_bytes(chain, view, Some((hash, view)), None)),
+        ("timeout vote with QC", timeout_vote_bytes(chain, view, None, Some((view, hash)))),
+        ("timeout vote with tip and QC", timeout_vote_bytes(chain, view, Some((hash, view)), Some((view, hash)))),
+        ("no-endorsement", no_endorsement_bytes(chain, ViewNumber::new(0), view)),
+    ]
+}
+
+/// No signature of one kind verifies as any other kind's message.
+#[test]
+fn every_signature_type_is_domain_separated() {
+    let all = every_signed_layout();
+    for (i, (kind, bytes)) in all.iter().enumerate() {
+        for (j, (other, other_bytes)) in all.iter().enumerate() {
+            if i != j {
+                assert!(bytes != other_bytes, "{kind} and {other} sign the same bytes");
+            }
+        }
+    }
+}
+
+/// A leader's header signature replayed as its timeout vote for the same
+/// view with that block as its tip (the untagged layouts were identical).
+#[test]
+fn header_signature_replayed_as_a_timeout_vote_is_rejected() {
+    use crate::pacemaker::messages::TimeoutVote;
+    use crate::types::signed_messages::SignedMessage;
+    let b = block(1);
+    let leader = key_of(&select_leader(ViewNumber::new(VIEW), &validator_set(&keys())));
+    let header = header_of(&b, VIEW).signed(&leader);
+    let replayed = TimeoutVote {
+        chain_id: CHAIN_ID,
+        view: ViewNumber::new(VIEW),
+        signature: header.leader_signature,
+        highest_tc: None,
+        local_tip: Some(TipInfo::from_header(&header)),
+        highest_qc: None,
+    };
+    assert!(!replayed.is_correct(&leader.verifying_key()), "header signature accepted as a timeout vote");
+}
+
+/// An NE replayed as a bare timeout vote: NE `(view, qc_view)` and a bare
+/// vote `(chain_id, view)` were both untagged u64 pairs.
+#[test]
+fn no_endorsement_replayed_as_a_timeout_vote_is_rejected() {
+    use crate::pacemaker::messages::TimeoutVote;
+    use crate::types::signed_messages::SignedMessage;
+    let key = keys()[0].clone();
+    // NE for recovery view 0 over QC view VIEW, signed for CHAIN_ID (0).
+    let ne = Keypair::new(key.clone()).sign(&no_endorsement_bytes(CHAIN_ID, ViewNumber::new(0), ViewNumber::new(VIEW)));
+    let replayed = TimeoutVote {
+        chain_id: ChainID::new(0),
+        view: ViewNumber::new(VIEW),
+        signature: ne,
+        highest_tc: None,
+        local_tip: None,
+        highest_qc: None,
+    };
+    assert!(!replayed.is_correct(&key.verifying_key()), "NE accepted as a timeout vote");
 }

@@ -15,6 +15,8 @@ use crate::hotstuff::header_fast_path_regression_test::{
 use crate::hotstuff::types::PhaseCertificate;
 use crate::types::crypto_primitives::SigningKey;
 use crate::types::data_types::CryptoHash;
+use crate::pacemaker::types::TipInfo;
+use crate::pacemaker::implementation::select_leader;
 
 const CHAIN: ChainID = ChainID::new(0);
 
@@ -296,4 +298,95 @@ fn a_previous_view_tc_does_not_stop_the_current_view_tc_from_advancing() {
         .on_receive_msg(PacemakerMessage::AdvanceView(tc6), &me, &mut f.tree)
         .unwrap();
     assert_eq!(f.pacemaker.query().view, ViewNumber::new(7), "TC(6) must move the replica out of view 6");
+}
+
+// ---------------------------------------------------------------------------
+// Phase C, F4 (docs/plans/tc-required-and-tip-signing.md §3): the pacemaker
+// checks a timeout vote's tip (F2: its header hashes to its block and
+// leader(view) signed it; and it is no newer than the vote) before echoing
+// or collecting the vote. A vote with an invalid tip is dropped, so the TC
+// forms from the honest votes and its high tip is a real header.
+//
+// RED-first: on the phase-C skeleton the forged vote is collected and TC(5)
+// forms from three votes with the forged tip as its high tip.
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// Deliver a TimeoutVote for `view` from validator `i` reporting `tip`.
+    fn timeout_vote_with_tip(&mut self, i: usize, view: u64, tip: Option<TipInfo>) {
+        let msg = PacemakerMessage::timeout_vote(
+            &Keypair::new(self.keys[i].clone()),
+            CHAIN,
+            ViewNumber::new(view),
+            None,
+            tip,
+            None,
+        );
+        let origin = self.keys[i].verifying_key();
+        self.pacemaker.on_receive_msg(msg, &origin, &mut self.tree).unwrap();
+    }
+
+    /// The tip of a vote for a genesis-justified block `seed` proposed at
+    /// `view`, signed by `signer` (leader(`view`) unless forging).
+    fn tip_signed_by(&self, seed: u8, view: u64, signer: &VerifyingKey) -> TipInfo {
+        let block = crate::types::block::Block::new(
+            crate::types::data_types::BlockHeight::new(0),
+            PhaseCertificate::genesis_pc(),
+            CryptoHash::new([seed; 32]),
+            crate::types::data_types::Data::new(vec![]),
+        );
+        let header = crate::test_keys::unsigned_header(CHAIN, &block, ViewNumber::new(view));
+        crate::test_keys::tip_signed_by(header, signer)
+    }
+
+    fn leader(&self, view: u64) -> VerifyingKey {
+        select_leader(ViewNumber::new(view), self.vss.committed_validator_set())
+    }
+}
+
+#[test]
+fn a_timeout_vote_with_an_invalid_tip_is_not_collected() {
+    let probe = fixture(5);
+    let honest = probe.tip_signed_by(7, 4, &probe.leader(4));
+    let mut forged_view = probe.tip_signed_by(8, 3, &probe.leader(3));
+    forged_view.view = ViewNumber::new(4);
+    let non_leader = probe.keys.iter().map(|k| k.verifying_key()).find(|vk| *vk != probe.leader(4)).unwrap();
+    let wrong_signer = probe.tip_signed_by(8, 4, &non_leader);
+    let mut wrong_justify = probe.tip_signed_by(8, 4, &probe.leader(4));
+    wrong_justify.block_height = crate::types::data_types::BlockHeight::new(3);
+    let from_the_future = probe.tip_signed_by(8, 6, &probe.leader(6));
+    for (name, forged) in [
+        ("forged view", forged_view),
+        ("signed by a non-leader", wrong_signer),
+        ("header fields not hashing to the block", wrong_justify),
+        ("tip newer than the vote", from_the_future),
+    ] {
+        for current in [5, 6] {
+            let mut f = fixture(5);
+            if current == 6 {
+                f.enter(6); // the previous-view collector (C3) as well
+            }
+            f.timeout_vote_with_tip(0, 5, Some(forged.clone()));
+            f.timeout_vote_with_tip(1, 5, Some(honest.clone()));
+            f.timeout_vote_with_tip(2, 5, None);
+            assert_eq!(f.highest_tc_view(), None, "{name}, at view {current}: the forged vote must not count");
+            f.timeout_vote_with_tip(3, 5, None);
+            let tc = f.tree.highest_tc().unwrap().expect("three honest votes form TC(5)");
+            assert!(tc.high_tip.as_ref() == Some(&honest), "{name}, at view {current}: the high tip is the honest one");
+            assert!(tc.is_correct(&f.tree).unwrap(), "{name}, at view {current}: the TC is correct");
+        }
+    }
+}
+
+/// Control: a valid tip is collected and becomes the high tip.
+#[test]
+fn a_timeout_vote_with_a_valid_tip_is_collected() {
+    let mut f = fixture(5);
+    let honest = f.tip_signed_by(7, 4, &f.leader(4));
+    f.timeout_vote_with_tip(0, 5, Some(honest.clone()));
+    f.timeout_vote_with_tip(1, 5, None);
+    f.timeout_vote_with_tip(2, 5, None);
+    let tc = f.tree.highest_tc().unwrap().expect("TC(5)");
+    assert!(tc.high_tip.as_ref() == Some(&honest));
+    assert!(tc.is_correct(&f.tree).unwrap());
 }

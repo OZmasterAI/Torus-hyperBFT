@@ -24,11 +24,12 @@ use hotstuff_rs::{
         types::{Phase, PhaseCertificate},
     },
     networking::messages::{Message, ProgressMessage},
-    pacemaker::{messages::PacemakerMessage, select_leader},
+    pacemaker::{messages::PacemakerMessage, select_leader, types::TipInfo},
     types::{
         crypto_primitives::{SigningKey, VerifyingKey},
         data_types::{CryptoHash, Power, SignatureBytes, SignatureSet, ViewNumber},
         update_sets::{AppStateUpdates, ValidatorSetUpdates},
+        signing::sign_proposal_header,
         validator_set::ValidatorSet,
     },
 };
@@ -194,6 +195,8 @@ struct ByzantineLeaderLog {
     honest_votes: HashSet<([u8; 32], u64, CryptoHash)>,
     /// (view, voter) of the honest votes for the honest leader's views that were withheld.
     withheld: HashSet<(u64, [u8; 32])>,
+    /// (view, block, voter) of the same withheld votes.
+    withheld_blocks: HashSet<(u64, CryptoHash, [u8; 32])>,
 }
 
 /// The byzantine validator `byz` strips the TC from every proposal header it
@@ -238,6 +241,7 @@ fn byzantine_leader_drops_the_tc(interrupt: Interrupt) {
                 log.honest_votes.insert((sender.to_bytes(), vote.view.int(), vote.block));
                 if interrupt == Interrupt::VotesWithheldByByzantineLeader && leader_of(vote.view) == honest {
                     log.withheld.insert((vote.view.int(), sender.to_bytes()));
+                    log.withheld_blocks.insert((vote.view.int(), vote.block, sender.to_bytes()));
                     return None;
                 }
             }
@@ -273,6 +277,22 @@ fn byzantine_leader_drops_the_tc(interrupt: Interrupt) {
             per_view.values().any(|&voters| voters >= 3),
             "scenario: no block of the honest leader got 2f+1 withheld votes: {per_view:?}"
         );
+        // Phase C (F3, F5): such a block B is every honest voter's signed tip,
+        // so TC(w) carries B as its winning high tip and an honest leader
+        // re-proposes B, which the honest validators vote for in a later view.
+        let mut voters_of = std::collections::HashMap::<(u64, CryptoHash), usize>::new();
+        for (view, block, _) in &log.withheld_blocks {
+            *voters_of.entry((*view, *block)).or_default() += 1;
+        }
+        let tail_fork_blocks: Vec<_> = voters_of.iter().filter(|(_, &n)| n >= 3).map(|(key, _)| *key).collect();
+        let reproposed = tail_fork_blocks.iter().any(|(w, b)| {
+            log.honest_votes.iter().any(|(_, view, block)| block == b && view > w)
+        });
+        assert!(
+            reproposed,
+            "no block with 2f+1 withheld votes was re-proposed and voted in a later view: {:?}",
+            tail_fork_blocks.iter().map(|(w, _)| w).collect::<Vec<_>>()
+        );
     }
 }
 
@@ -282,13 +302,9 @@ fn byzantine_leader_dropping_the_tc_loses_only_its_view() {
     byzantine_leader_drops_the_tc(Interrupt::HonestHeaderLost);
 }
 
-/// §6 tail-fork attempt: B gets 2f+1 votes, its QC is withheld, and a
-/// fresh-block proposal without the TC is rejected.
-///
-/// Re-proposing B (rather than a fresh block under a TC whose high QC wins)
-/// needs the TC to carry B as its high tip, which the header path does not set
-/// before phase C (F5); see tc_validation_test.rs
-/// `tail_fork_attempt_fresh_block_rejected_tip_reproposed` for V2 there.
+/// §6 tail-fork attempt: B gets 2f+1 votes, its QC is withheld, a
+/// fresh-block proposal without the TC is rejected, and B is re-proposed (and
+/// voted) in a later view (phase C, F5: the header path sets the tip).
 #[test]
 fn tail_fork_attempt_fresh_block_without_tc_is_rejected() {
     byzantine_leader_drops_the_tc(Interrupt::VotesWithheldByByzantineLeader);
@@ -344,6 +360,59 @@ fn byzantine_voter_with_a_forged_high_qc_cannot_block_case_3() {
     }));
     cluster.start(&[]);
     cluster.wait_for_commits(TARGET_HEIGHT, "a byzantine voter forges its high QC");
+    assert!(*forged.lock().unwrap() > 0, "scenario: no forged timeout vote was sent");
+}
+
+/// Phase C (§6 "byzantine voter with a forged tip: the TC still forms"): the
+/// byzantine validator `byz` stays silent as leader and sends every timeout
+/// vote with a forged tip, a header for the vote's own view over a block
+/// nobody has, signed by itself (not the view's leader), re-signed so the
+/// vote itself is correct. Without F4 the forged tip wins every TC it is in
+/// and the next leader can only recover through an NEC whose fresh block
+/// conflicts with the lock: the chain stalls behind every silent slot.
+#[test]
+fn byzantine_voter_with_a_forged_tip_cannot_block_the_tc() {
+    let mut cluster = Cluster::new();
+    let byz_index = cluster.leader(5);
+    let byz_key = cluster.keypairs[byz_index].clone();
+    let byz = byz_key.verifying_key();
+    let vs = cluster.validator_set();
+    let forged = Arc::new(Mutex::new(0u64));
+
+    let forged_in = forged.clone();
+    cluster.filter.rewrite(Arc::new(move |sender, _recipient, message| {
+        if *sender != byz {
+            return Some(message);
+        }
+        match message {
+            Message::ProgressMessage(ProgressMessage::HotStuffMessage(HotStuffMessage::ProposalHeader(_))) => None,
+            Message::ProgressMessage(ProgressMessage::PacemakerMessage(PacemakerMessage::TimeoutVote(mut vote))) => {
+                if select_leader(vote.view, &vs) == byz {
+                    // A tip byz signs for its own view would be a real header.
+                    return Some(PacemakerMessage::TimeoutVote(vote).into());
+                }
+                let justify = PhaseCertificate::genesis_pc();
+                let data_hash = CryptoHash::new([0xDD; 32]);
+                let height = hotstuff_rs::types::data_types::BlockHeight::new(0);
+                let block_hash = hotstuff_rs::types::block::Block::hash(height, &justify, &data_hash);
+                vote.local_tip = Some(TipInfo {
+                    block_hash,
+                    block_height: height,
+                    block_justify: justify,
+                    block_data_hash: data_hash,
+                    view: vote.view,
+                    leader_signature: sign_proposal_header(&byz_key, vote.chain_id, vote.view, &block_hash),
+                });
+                vote.highest_qc = None;
+                vote.signature = SignatureBytes::new(byz_key.sign(&timeout_vote_bytes(&vote)).to_bytes());
+                *forged_in.lock().unwrap() += 1;
+                Some(PacemakerMessage::TimeoutVote(vote).into())
+            }
+            other => Some(other),
+        }
+    }));
+    cluster.start(&[]);
+    cluster.wait_for_commits(TARGET_HEIGHT, "a byzantine voter forges its tip");
     assert!(*forged.lock().unwrap() > 0, "scenario: no forged timeout vote was sent");
 }
 
@@ -452,8 +521,9 @@ fn validator_set_update_commits_through_timeout_views() {
     );
     let after = cluster.max_committed();
     cluster.wait_for_commits(after + 2, "after the update");
-    eprintln!(
-        "VSU re-proposals in the V3-amendment case at views {:?}",
-        amended.lock().unwrap().iter().collect::<Vec<_>>()
+    let amended = std::mem::take(&mut *amended.lock().unwrap());
+    assert!(
+        !amended.is_empty(),
+        "scenario: no VSU re-proposal under a TC whose high QC certifies the block itself (the V3 amendment case)"
     );
 }

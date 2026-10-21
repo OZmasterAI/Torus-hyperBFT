@@ -107,3 +107,38 @@ pub fn sign_proposal_header(
     SignatureBytes::new(key.sign(&proposal_header_bytes(chain_id, view, block_hash)).to_bytes())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn domain_tags_are_distinct_and_prefix_free() {
+        for (i, a) in DOMAINS.iter().enumerate() {
+            for (j, b) in DOMAINS.iter().enumerate() {
+                if i != j {
+                    assert!(!b.starts_with(a), "{:?} is a prefix of {:?}", a, b);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_signed_layout_starts_with_its_tag() {
+        let (chain, view, hash) = (ChainID::new(7), ViewNumber::new(9), CryptoHash::new([3; 32]));
+        assert!(proposal_header_bytes(chain, view, &hash).starts_with(DOMAIN_PROPOSAL_HEADER));
+        assert!(phase_vote_bytes(chain, view, &hash, Phase::Generic).starts_with(DOMAIN_PHASE_VOTE));
+        assert!(timeout_vote_bytes(chain, view, None, None).starts_with(DOMAIN_TIMEOUT_VOTE));
+        assert!(no_endorsement_bytes(chain, view, view).starts_with(DOMAIN_NO_ENDORSEMENT));
+    }
+
+    /// The tip and QC summaries cannot be confused: a vote with only a tip
+    /// and one with only a QC sign different bytes even over the same hash
+    /// and view.
+    #[test]
+    fn timeout_vote_summaries_are_unambiguous() {
+        let (chain, view, hash) = (ChainID::new(1), ViewNumber::new(4), CryptoHash::new([5; 32]));
+        let tip_only = timeout_vote_bytes(chain, view, Some((hash, view)), None);
+        let qc_only = timeout_vote_bytes(chain, view, None, Some((view, hash)));
+        assert_ne!(tip_only, qc_only);
+    }
+}
