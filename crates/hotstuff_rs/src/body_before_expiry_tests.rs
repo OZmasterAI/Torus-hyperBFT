@@ -110,6 +110,7 @@ pub(super) fn new_algorithm(
         HotStuffConfiguration {
             chain_id: chain,
             keypair: keypair.clone(),
+            tc_required: false,
         },
         PacemakerConfiguration {
             chain_id: chain,

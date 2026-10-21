@@ -2079,3 +2079,7 @@ fn update_view_threads_commit_lag() {
         "cap=0 must keep the exact pre-S470 schedule regardless of commit lag"
     );
 }
+
+#[cfg(test)]
+#[path = "prev_view_collector_test.rs"]
+mod prev_view_collector_test;

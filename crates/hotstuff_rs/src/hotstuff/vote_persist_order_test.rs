@@ -273,6 +273,7 @@ pub(crate) fn replica(
         HotStuffConfiguration {
             chain_id: CHAIN_ID,
             keypair: Keypair::new(key.clone()),
+            tc_required: false,
         },
         ViewInfo::new(view, Instant::now() + Duration::from_secs(3600)),
         SenderHandle::new(net.clone()),

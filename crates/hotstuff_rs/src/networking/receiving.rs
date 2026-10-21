@@ -845,3 +845,7 @@ mod genesis_body_filter_tests {
 #[cfg(test)]
 #[path = "before_retry_receive_tests.rs"]
 mod before_retry_receive_tests;
+
+#[cfg(test)]
+#[path = "prev_view_timeout_vote_tests.rs"]
+mod prev_view_timeout_vote_tests;

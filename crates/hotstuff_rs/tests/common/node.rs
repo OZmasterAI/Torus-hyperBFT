@@ -12,7 +12,7 @@ use borsh::BorshDeserialize;
 use ed25519_dalek::SigningKey;
 use hotstuff_rs::{
     events::{
-        CommitBlockEvent, InsertBlockEvent, PhaseVoteEvent, ReceiveProposalEvent,
+        CommitBlockEvent, InsertBlockEvent, PhaseVoteEvent, ProposeEvent, ReceiveProposalEvent,
         UpdateHighestPCEvent,
     },
     replica::{Configuration, Replica, ReplicaSpec},
@@ -67,6 +67,10 @@ pub(crate) struct Node {
     tx_queue: Arc<Mutex<Vec<QueuedTransaction>>>,
     replica: Replica<MemDB>,
     kv_store: MemDB,
+    /// Proposals this node made that break VALIDPROPOSAL V1: the block does
+    /// not justify on the previous view (nor on the genesis PC) and no TC for
+    /// the previous view is attached. Phase A: always 0.
+    tc_less_proposals: Arc<AtomicU64>,
 }
 
 impl Node {
@@ -115,6 +119,7 @@ impl Node {
             WedgeOptions::default(),
             DEFAULT_EPOCH_LENGTH,
             None,
+            false,
         )
     }
 
@@ -143,6 +148,7 @@ impl Node {
             wedge_options,
             DEFAULT_EPOCH_LENGTH,
             None,
+            false,
         )
     }
 
@@ -174,6 +180,7 @@ impl Node {
             WedgeOptions::default(),
             DEFAULT_EPOCH_LENGTH,
             None,
+            false,
         )
     }
 
@@ -201,6 +208,34 @@ impl Node {
             WedgeOptions::default(),
             epoch_length,
             kv_store,
+            false,
+        )
+    }
+
+    /// Phase A of docs/plans/tc-required-and-tip-signing.md: like
+    /// [`new_with_max_view_time`](Self::new_with_max_view_time), with the
+    /// test-only VALIDPROPOSAL V1 switch on (`tc_required`): the replica
+    /// rejects a proposal whose justify is not for the previous view unless it
+    /// carries a TC for that view.
+    #[allow(dead_code)]
+    pub(crate) fn new_with_tc_required(
+        keypair: SigningKey,
+        network_stub: NetworkStub,
+        init_as_updates: AppStateUpdates,
+        init_vs_updates: ValidatorSetUpdates,
+        max_view_time: Duration,
+    ) -> Node {
+        Self::build(
+            keypair,
+            network_stub,
+            init_as_updates,
+            init_vs_updates,
+            max_view_time,
+            true,
+            WedgeOptions::default(),
+            DEFAULT_EPOCH_LENGTH,
+            None,
+            true,
         )
     }
 
@@ -219,6 +254,7 @@ impl Node {
         wedge_options: WedgeOptions,
         epoch_length: u32,
         kv_store: Option<MemDB>,
+        tc_required: bool,
     ) -> Node {
         let kv_store = kv_store.unwrap_or_else(|| {
             let kv_store = MemDB::new();
@@ -231,6 +267,7 @@ impl Node {
 
         let verifying_key = keypair.verifying_key().to_bytes();
         let tx_queue = Arc::new(Mutex::new(Vec::new()));
+        let tc_less_proposals = Arc::new(AtomicU64::new(0));
 
         // Sync trigger knobs: enabled uses the historical aggressive defaults; disabled pushes the
         // trigger far past any test window so height-range sync never fires.
@@ -256,6 +293,7 @@ impl Node {
             .max_view_time(max_view_time)
             // S470: commit-lag deadline backoff cap. 0 (the default) = today's schedule.
             .commit_lag_cap(wedge_options.commit_lag_cap)
+            .tc_required(tc_required)
             .log_events(false)
             .build();
 
@@ -273,6 +311,7 @@ impl Node {
             .on_commit_block(commit_block_handler(verifying_key))
             .on_update_highest_pc(update_highest_pc_handler(verifying_key))
             .on_phase_vote(phase_vote_handler(verifying_key))
+            .on_propose(propose_handler(tc_less_proposals.clone()))
             .build()
             .start();
 
@@ -281,6 +320,7 @@ impl Node {
             replica,
             tx_queue,
             kv_store,
+            tc_less_proposals,
         }
     }
 
@@ -389,9 +429,31 @@ impl Node {
             .expect("should have been able to get the highest view entered from the block tree")
     }
 
+    /// Phase A test hook: how many of this node's proposals lacked the
+    /// certificate VALIDPROPOSAL V1 asks for (see [`Node::tc_less_proposals`]).
+    #[allow(dead_code)]
+    pub(crate) fn tc_less_proposals(&self) -> u64 {
+        self.tc_less_proposals.load(Ordering::Relaxed)
+    }
+
     /// Query the verifying key of the node.
     pub(crate) fn verifying_key(&self) -> VerifyingKeyBytes {
         self.verifying_key
+    }
+}
+
+/// Phase A test hook: count proposals for view v whose block neither
+/// justifies on v - 1 (or the genesis PC) nor carries a TC for v - 1. Restated
+/// here independently of the library's own predicate.
+fn propose_handler(tc_less: Arc<AtomicU64>) -> impl Fn(&ProposeEvent) + Send + 'static {
+    move |event| {
+        let p = &event.proposal;
+        let previous = |view: ViewNumber| view.int() + 1 == p.view.int();
+        let justified = previous(p.block.justify.view) || p.block.justify.is_genesis_pc();
+        let has_tc = p.tc.as_ref().is_some_and(|tc| previous(tc.view));
+        if !justified && !has_tc {
+            tc_less.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 

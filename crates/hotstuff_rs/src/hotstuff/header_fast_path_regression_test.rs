@@ -303,6 +303,7 @@ pub(crate) fn hotstuff_at(
     let config = HotStuffConfiguration {
         chain_id: CHAIN_ID,
         keypair: Keypair::new(local),
+        tc_required: false,
     };
     let view_info = ViewInfo::new(view, Instant::now() + Duration::from_secs(3600));
     HotStuff::new(
@@ -325,6 +326,7 @@ pub(crate) fn hotstuff_at_with_events(
     let config = HotStuffConfiguration {
         chain_id: CHAIN_ID,
         keypair: Keypair::new(local),
+        tc_required: false,
     };
     let view_info = ViewInfo::new(view, Instant::now() + Duration::from_secs(3600));
     let (tx, rx) = std::sync::mpsc::channel();
@@ -865,6 +867,7 @@ fn hotstuff_recording_at(
     let config = HotStuffConfiguration {
         chain_id: CHAIN_ID,
         keypair: Keypair::new(local),
+        tc_required: false,
     };
     let view_info = ViewInfo::new(view, Instant::now() + Duration::from_secs(3600));
     let hotstuff = HotStuff::new(

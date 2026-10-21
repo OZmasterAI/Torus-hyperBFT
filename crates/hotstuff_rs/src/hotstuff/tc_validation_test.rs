@@ -161,7 +161,16 @@ impl Replica {
 /// Does a replica phase-vote for `block` proposed at VIEW with these
 /// certificates, sent header-first (header, then the body)?
 fn header_path_votes(block: &Block, tc: Option<TimeoutCertificate>, nec: Option<NoEndorsementCertificate>) -> bool {
-    let mut r = replica();
+    header_path_votes_on(replica(), block, tc, nec)
+}
+
+/// [`header_path_votes`] on a prepared replica `r`.
+fn header_path_votes_on(
+    mut r: Replica,
+    block: &Block,
+    tc: Option<TimeoutCertificate>,
+    nec: Option<NoEndorsementCertificate>,
+) -> bool {
     let header = ProposalHeader {
         chain_id: CHAIN_ID,
         view: ViewNumber::new(VIEW),
@@ -186,7 +195,16 @@ fn header_path_votes(block: &Block, tc: Option<TimeoutCertificate>, nec: Option<
 
 /// The same proposal sent as a full `Proposal`.
 fn full_path_votes(block: &Block, tc: Option<TimeoutCertificate>, nec: Option<NoEndorsementCertificate>) -> bool {
-    let mut r = replica();
+    full_path_votes_on(replica(), block, tc, nec)
+}
+
+/// [`full_path_votes`] on a prepared replica `r`.
+fn full_path_votes_on(
+    mut r: Replica,
+    block: &Block,
+    tc: Option<TimeoutCertificate>,
+    nec: Option<NoEndorsementCertificate>,
+) -> bool {
     let proposal = Proposal { chain_id: CHAIN_ID, view: ViewNumber::new(VIEW), block: block.clone(), tc, nec };
     let leader = r.leader;
     r.hotstuff
@@ -526,4 +544,88 @@ fn nec_from_either_active_set_is_valid_during_a_validator_set_change() {
     let decided = tree(true);
     assert!(valid_nec(&from_new, &decided).unwrap(), "committed-set NEC after the update is decided");
     assert!(!valid_nec(&from_old, &decided).unwrap(), "previous-set NEC after the update is decided");
+}
+
+// ---------------------------------------------------------------------------
+// Phase A of docs/plans/tc-required-and-tip-signing.md: VALIDPROPOSAL V1
+// behind the test-only `tc_required` switch. A block must justify on
+// VIEW - 1 (or the genesis PC), or carry a TC for VIEW - 1.
+// ---------------------------------------------------------------------------
+
+/// A replica at VIEW (as [`replica`]) holding `parent` (genesis-justified),
+/// with the V1 switch set to `tc_required`.
+fn replica_holding(parent: &Block, tc_required: bool) -> Replica {
+    let mut r = replica();
+    r.tree.insert(parent, None, None).unwrap();
+    r.hotstuff.set_tc_required(tc_required);
+    r
+}
+
+/// Does a replica (V1 switch `tc_required`) vote for a child of `parent`
+/// justified by a QC of `justify_view`, carrying `tc`, on both paths? Panics
+/// if the paths disagree.
+fn child_votes(tc_required: bool, justify_view: u64, tc: Option<TimeoutCertificate>) -> bool {
+    let keys = keys();
+    let set = validator_set(&keys);
+    let parent = block(40);
+    let qc = generic_pc(ViewNumber::new(justify_view), parent.hash, &keys[..3], &set);
+    let child = Block::new(BlockHeight::new(1), qc, CryptoHash::new([41; 32]), Data::new(vec![]));
+    let header = header_path_votes_on(replica_holding(&parent, tc_required), &child, tc.clone(), None);
+    let full = full_path_votes_on(replica_holding(&parent, tc_required), &child, tc, None);
+    assert_eq!(header, full, "header and full paths disagree (justify view {justify_view})");
+    header
+}
+
+/// A TC for `view` with no tips and no QCs (a fresh-proposal TC).
+fn bare_tc(view: u64) -> TimeoutCertificate {
+    let keys = keys();
+    let set = validator_set(&keys);
+    collected_tc(&keys[..3], &set, view, &[None, None, None], &[None, None, None])
+}
+
+#[test]
+fn v1_strict_rejects_a_stale_justify_without_a_tc() {
+    assert!(!child_votes(true, VIEW - 3, None), "justify view VIEW - 3, no TC");
+    assert!(!child_votes(true, VIEW - 3, Some(bare_tc(VIEW - 2))), "TC for VIEW - 2");
+}
+
+#[test]
+fn v1_strict_accepts_a_previous_view_justify_or_a_previous_view_tc() {
+    assert!(child_votes(true, VIEW - 1, None), "justify on VIEW - 1");
+    assert!(child_votes(true, VIEW - 3, Some(bare_tc(VIEW - 1))), "stale justify with TC(VIEW - 1)");
+    assert_both_paths_strict_genesis();
+}
+
+/// The genesis PC is exempt (V1).
+fn assert_both_paths_strict_genesis() {
+    let b = block(1);
+    let mut r = replica();
+    r.hotstuff.set_tc_required(true);
+    let header = header_path_votes_on(r, &b, None, None);
+    let mut r = replica();
+    r.hotstuff.set_tc_required(true);
+    let full = full_path_votes_on(r, &b, None, None);
+    assert!(header && full, "genesis justify: header voted={header}, full voted={full}");
+}
+
+/// Phase A keeps validators lax: without the switch a stale justify with no
+/// TC is still voted on.
+#[test]
+fn v1_lax_by_default_in_phase_a() {
+    assert!(child_votes(false, VIEW - 3, None));
+}
+
+#[test]
+fn carries_required_certificate_table() {
+    use crate::hotstuff::types::carries_required_certificate;
+    let keys = keys();
+    let set = validator_set(&keys);
+    let qc = |view: u64| generic_pc(ViewNumber::new(view), block(40).hash, &keys[..3], &set);
+    let v = ViewNumber::new(VIEW);
+    assert!(carries_required_certificate(v, &qc(VIEW - 1), None));
+    assert!(carries_required_certificate(v, &PhaseCertificate::genesis_pc(), None));
+    assert!(!carries_required_certificate(v, &qc(VIEW - 2), None));
+    assert!(carries_required_certificate(v, &qc(VIEW - 2), Some(&bare_tc(VIEW - 1))));
+    assert!(!carries_required_certificate(v, &qc(VIEW - 2), Some(&bare_tc(VIEW - 2))));
+    assert!(!carries_required_certificate(v, &qc(VIEW), None), "a justify for the view itself");
 }

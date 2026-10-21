@@ -455,13 +455,22 @@ pub fn valid_nec<K: KVStore>(
 ///   matching what its signers signed) and for `view - 1`.
 /// - A re-proposal (the TC's high tip won) without an NEC must propose
 ///   exactly the TC's high tip.
+/// - With `tc_required` (docs/plans/tc-required-and-tip-signing.md V1; a
+///   test-only switch in phase A, always on from phase B), the block must
+///   justify on view `view - 1` or the genesis PC, or carry a TC for
+///   `view - 1` ([`carries_required_certificate`]).
 pub(crate) fn valid_proposal_certificates<K: KVStore>(
     view: ViewNumber,
     block_hash: &CryptoHash,
+    justify: &PhaseCertificate,
     tc: Option<&TimeoutCertificate>,
     nec: Option<&NoEndorsementCertificate>,
+    tc_required: bool,
     block_tree: &BlockTreeSingleton<K>,
 ) -> Result<bool, BlockTreeError> {
+    if tc_required && !carries_required_certificate(view, justify, tc) {
+        return Ok(false);
+    }
     if let Some(nec) = nec {
         let over_tc_tip = tc
             .and_then(|tc| tc.high_tip.as_ref())
@@ -483,6 +492,24 @@ pub(crate) fn valid_proposal_certificates<K: KVStore>(
         return Ok(false);
     }
     tc.is_correct(block_tree)
+}
+
+/// VALIDPROPOSAL rule V1 (docs/plans/tc-required-and-tip-signing.md §2): a
+/// proposal for `view` whose block justifies on `justify` is backed by a
+/// certificate for `view - 1`: `justify` is that QC (or the genesis PC), or
+/// the proposal carries a TC for `view - 1`. Only the TC's view is checked
+/// here; [`valid_proposal_certificates`] checks the TC itself.
+///
+/// Phase A: every leader proposal satisfies this (debug-asserted where
+/// proposals are broadcast); validators enforce it only with the test-only
+/// `tc_required` switch.
+pub(crate) fn carries_required_certificate(
+    view: ViewNumber,
+    justify: &PhaseCertificate,
+    tc: Option<&TimeoutCertificate>,
+) -> bool {
+    let is_previous = |v: ViewNumber| v.int().checked_add(1) == Some(view.int());
+    is_previous(justify.view) || justify.is_genesis_pc() || tc.is_some_and(|tc| is_previous(tc.view))
 }
 
 /// Check if the NEC's signatures are correct and form a quorum.

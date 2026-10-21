@@ -282,6 +282,13 @@ impl<N: Network> HotStuff<N> {
         self.round_skip = on;
     }
 
+    /// Test-only override of the VALIDPROPOSAL V1 switch
+    /// ([`HotStuffConfiguration::tc_required`]).
+    #[cfg(test)]
+    pub(crate) fn set_tc_required(&mut self, on: bool) {
+        self.config.tc_required = on;
+    }
+
     /// s74 rejoin view sync: the checked future-view header that asks the
     /// pacemaker to skip to its view. Taken once.
     pub(crate) fn take_view_skip(&mut self) -> Option<(ProposalHeader, VerifyingKey)> {
@@ -1315,8 +1322,10 @@ impl<N: Network> HotStuff<N> {
         if !valid_proposal_certificates(
             self.view_info.view,
             &proposal.block.hash,
+            &proposal.block.justify,
             proposal.tc.as_ref(),
             proposal.nec.as_ref(),
+            self.config.tc_required,
             block_tree,
         )? {
             log::warn!(
@@ -2200,8 +2209,10 @@ impl<N: Network> HotStuff<N> {
         if !valid_proposal_certificates(
             header.view,
             &header.block_hash,
+            &header.justify,
             header.tc.as_ref(),
             header.nec.as_ref(),
+            self.config.tc_required,
             block_tree,
         )? {
             log::warn!(
@@ -3808,6 +3819,12 @@ pub(crate) struct HotStuffConfiguration {
 
     /// The keypair with which the HotStuff implementation should sign `PhaseVote`s.
     pub(crate) keypair: Keypair,
+
+    /// VALIDPROPOSAL rule V1 (docs/plans/tc-required-and-tip-signing.md):
+    /// reject a proposal whose justify is not for the previous view unless it
+    /// carries a TC for it. Phase A: a test-only switch (default off); leaders
+    /// already attach the TC either way.
+    pub(crate) tc_required: bool,
 }
 
 /// The different ways a call to a method of the `HotStuff` struct can fail.
@@ -4780,7 +4797,7 @@ mod s63_body_fetch_tests {
         let me = local.verifying_key();
         let net = TargetNet::default();
         let mut hotstuff = HotStuff::new(
-            HotStuffConfiguration { chain_id: ChainID::new(0), keypair: Keypair::new(local) },
+            HotStuffConfiguration { chain_id: ChainID::new(0), keypair: Keypair::new(local), tc_required: false },
             ViewInfo::new(view, Instant::now() + Duration::from_secs(3600)),
             SenderHandle::new(net.clone()),
             ValidatorSetUpdateHandle::new(net.clone()),
@@ -5421,7 +5438,7 @@ mod header_resend_tests {
         let me = keys.iter().find(|key| key.verifying_key() == leader).unwrap().clone();
         let net = DirectNet::default();
         let mut hotstuff = HotStuff::new(
-            HotStuffConfiguration { chain_id: ChainID::new(0), keypair: Keypair::new(me) },
+            HotStuffConfiguration { chain_id: ChainID::new(0), keypair: Keypair::new(me), tc_required: false },
             ViewInfo::new(view, Instant::now() + Duration::from_secs(3600)),
             SenderHandle::new(net.clone()),
             ValidatorSetUpdateHandle::new(net.clone()),
@@ -5516,7 +5533,7 @@ mod header_resend_tests {
         let me = keys.iter().find(|key| key.verifying_key() != leader).unwrap().clone();
         let net = DirectNet::default();
         let mut follower = HotStuff::new(
-            HotStuffConfiguration { chain_id: ChainID::new(0), keypair: Keypair::new(me) },
+            HotStuffConfiguration { chain_id: ChainID::new(0), keypair: Keypair::new(me), tc_required: false },
             ViewInfo::new(ViewNumber::new(VIEW), Instant::now() + Duration::from_secs(3600)),
             SenderHandle::new(net.clone()),
             ValidatorSetUpdateHandle::new(net.clone()),

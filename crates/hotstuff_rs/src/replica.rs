@@ -277,6 +277,18 @@ pub struct Configuration {
         )
     )]
     pub commit_lag_cap: u32,
+    #[builder(
+        default = false,
+        setter(
+            doc = "Reject a proposal whose block does not justify on the previous view unless it \
+    carries a timeout certificate for that view (VALIDPROPOSAL rule V1, \
+    docs/plans/tc-required-and-tip-signing.md). Phase A: a TEST-ONLY switch; leaders attach the \
+    TC either way, and phase B turns the rule on unconditionally. Every replica of a chain must \
+    use the same value. Optional (default: false)."
+        )
+    )]
+    #[doc(hidden)]
+    pub tc_required: bool,
     #[builder(setter(doc = "Enable logging? Required."))]
     pub log_events: bool,
 }
@@ -294,6 +306,7 @@ impl From<Configuration>
         let hotstuff_config = HotStuffConfiguration {
             chain_id: val.chain_id,
             keypair: keypair.clone(),
+            tc_required: val.tc_required,
         };
         let pacemaker_config = PacemakerConfiguration {
             chain_id: val.chain_id,
