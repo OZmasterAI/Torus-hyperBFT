@@ -67,6 +67,12 @@ fn ctx(
 fn build(per_market: u64) -> (tempfile::TempDir, StateDb) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = StateDb::open(dir.path()).expect("open db");
+    // Pre-testnet P0 (main d78ea41b): orders on an unlisted market are
+    // rejected (`UnknownMarket`), so list every market first.
+    for m in 1..=N_MARKETS {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed")
+            .unwrap();
+    }
     let mut holder = ResidentBooks::default();
     let traders = per_market / PER_TRADER;
     for (block, first) in (0..traders).step_by(TRADERS_PER_BLOCK as usize).enumerate() {
@@ -96,7 +102,12 @@ fn build(per_market: u64) -> (tempfile::TempDir, StateDb) {
                 }
             }
         }
-        let _ = NativeExecutor::execute_batch(&mut c, &batch);
+        let r = NativeExecutor::execute_batch(&mut c, &batch);
+        assert!(
+            r.results.iter().all(|r| r.success),
+            "build order rejected: {:?}",
+            r.results.iter().find(|r| !r.success)
+        );
         c.save_order_books();
         c.stash_resident(&mut holder);
         ov.flush(&db).unwrap();

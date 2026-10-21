@@ -67,6 +67,12 @@ fn signed_batch() -> Vec<SignedNativeAction> {
 fn bench_variant(c: &mut Criterion, name: &str, actions: Vec<SignedNativeAction>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = StateDb::open(dir.path()).expect("open db");
+    // Pre-testnet P0 (main d78ea41b): orders on an unlisted market are
+    // rejected (`UnknownMarket`), so list the bench market(s) first.
+    for m in 1..=MARKETS {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed")
+            .unwrap();
+    }
     let sender = actions[0].recover_sender().expect("recover");
     // Fund once, directly in RocksDB (overlay writes never flush).
     PositionManager::new(db.clone())
@@ -105,6 +111,11 @@ fn bench_variant(c: &mut Criterion, name: &str, actions: Vec<SignedNativeAction>
             .collect();
         let result = NativeExecutor::execute_batch(&mut ctx, &pairs);
         assert_eq!(result.results.len(), N, "same flattened work both variants");
+        assert!(
+            result.results.iter().all(|r| r.success),
+            "order rejected: {:?}",
+            result.results.iter().find(|r| !r.success)
+        );
     }
 
     c.bench_function(name, |b| {
