@@ -766,6 +766,13 @@ schedstat_snapshot() {
     local phase=$1 i=0 p t tid st f
     shift
     for p in "$@"; do
+        if [ -z "$p" ]; then
+            # KILL_NO_RESTART: the killed node's pids line is blank (crash-kill.sh norestart); /proc//stat would be
+            # /proc/stat and ${f[11]} would abort this shell under set -u (9k smoke K)
+            for t in main $SCHED_THREADS; do printf '%s val%s %s -\n' "$phase" "$i" "$t"; done >> "$OUT/schedstat.raw"
+            i=$((i+1))
+            continue
+        fi
         for t in main $SCHED_THREADS; do
             if [ "$t" = main ]; then tid=$p; else tid=$(find_tid "$p" "$t") || tid=""; fi
             if [ -n "$tid" ] && read -r st < /proc/"$p"/task/"$tid"/schedstat 2>/dev/null; then
@@ -778,7 +785,7 @@ schedstat_snapshot() {
         # 14 / 15 of /proc/<pid>/stat) -> summarize.py proc_cpu_by_node.
         if read -r st < /proc/"$p"/stat 2>/dev/null; then
             read -ra f <<< "${st##*) }"
-            printf '%s val%s %s %s %s\n' "$phase" "$i" "$p" "${f[11]}" "${f[12]}" >> "$OUT/procstat.raw"
+            [ "${#f[@]}" -ge 13 ] && printf '%s val%s %s %s %s\n' "$phase" "$i" "$p" "${f[11]}" "${f[12]}" >> "$OUT/procstat.raw"
         fi
         i=$((i+1))
     done
