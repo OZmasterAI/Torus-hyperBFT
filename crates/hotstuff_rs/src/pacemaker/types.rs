@@ -130,8 +130,10 @@ impl Certificate for TimeoutCertificate {
         if !signed {
             return Ok(false);
         }
+        // This replica's own highest PC was verified when it was accepted; skip its n
+        // signature checks (the common case: the TC's signers report the same QC).
         match &self.high_qc {
-            Some(high_qc) => high_qc.is_correct(block_tree),
+            Some(high_qc) => Ok(*high_qc == block_tree.highest_pc()? || high_qc.is_correct(block_tree)?),
             None => Ok(true),
         }
     }

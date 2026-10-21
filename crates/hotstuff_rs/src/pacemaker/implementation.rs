@@ -282,9 +282,11 @@ impl<N: Network> Pacemaker<N> {
         // TC's high QC, which `TimeoutCertificate::is_correct` rejects and VALIDPROPOSAL V3 could not
         // be met under: one such vote in the quorum would cost the next leader its view. Such a
         // vote is dropped (neither echoed nor collected), so the TC forms from the honest votes.
+        // Honest voters usually report this replica's own (already verified) highest PC, which
+        // skips the n signature checks.
         let vote_ok = timeout_vote.is_correct(origin)
             && match &timeout_vote.highest_qc {
-                Some(qc) => qc.is_correct(block_tree)?,
+                Some(qc) => *qc == block_tree.highest_pc()? || qc.is_correct(block_tree)?,
                 None => true,
             };
         if vote_ok {
