@@ -34,6 +34,33 @@ ORDER_FLOW = tuple(k for k in FLOW if k != 'torus_native_actions_processed_total
 CHAIN_SUM, CHAIN_COUNT = 'torus_exec_chain_seconds_sum', 'torus_exec_chain_seconds_count'
 DEFAULT_MAX_LAG = 2
 DEFAULT_FEED_MEMPOOL_MAX = 6  # 2 rounds x 3 validators x 1 chunk (<= 256 markets)
+# --attest-live (run-cell STATE_HASH_ATTEST=1): every validator signs one
+# AttestStateHash per 100-block checkpoint for as long as the chain commits
+# (crates/torus-consensus/src/state_hash.rs submit_attestations), and idle
+# blocks keep committing after the load, so torus_native_actions_processed_total
+# (app.rs: every replay-guard-passing native action of an executed block) and
+# the native mempool never go quiet. No metric counts EXECUTED attestations
+# (torus_state_hash_attestations_submitted_total counts this node's mempool
+# admissions, resubmissions included) or splits the native counter or mempool
+# by kind, so:
+#   * executed: the quiet keys are the order counters, and every other native
+#     action (CancelOrder / CancelAllOrders move books and margin but no order
+#     counter; oracle prices, transfers, ...) must not execute in the quiet
+#     window either: attest_window_step reads the window's block bodies by kind
+#     (attest_traffic.py; --attest-rpc) and restarts the window if one did
+#     (with --feed-live the running feed's SubmitOraclePrices are allowed);
+#   * pending: inside the window the native mempool may hold up to
+#     --attest-mempool-max entries, but the ACCEPTING sample needs it empty on
+#     every node (the feed's footprint with --feed-live): an entry there may be
+#     a stranded load action. Attestations are included within a block or two,
+#     so an empty sample comes within seconds (9g-hn cells: 3 samples in 4).
+# The traffic over the quiet window is recorded (drain.json .attest_live).
+ATTEST_SUBMITTED = 'torus_state_hash_attestations_submitted_total'
+# NativeAction variant of the oracle feed's submissions (torus_getBlockBody
+# serde tag; run-cell's "$BENCH" oracle-feed): allowed in the --feed-live
+# --attest-live scan.
+ORACLE_KIND = 'SubmitOraclePrices'
+DEFAULT_ATTEST_MEMPOOL_MAX = 6  # 2 checkpoints x 3 validators
 FEED_LIVE_COLUMNS = ('elapsed_s', 'node', 'committed', 'exec_lag', 'mempool',
                      'chain_blocks', 'chain_ms', 'quiet_elapsed_s')
 # --to-height (s64, run-cell's paused-feed settle): the executed height. The exec
@@ -145,14 +172,28 @@ class DrainTracker:
     hold up to feed_mempool_max entries and the exec lag (torus_exec_queue_depth:
     committed blocks not yet executed) must stay <= max_lag on every sample.
 
+    attest_live: as feed_live for the validators' AttestStateHash traffic: only
+    the order counters must be quiet and the native mempool may hold up to
+    attest_mempool_max entries (added to the feed's footprint when both run);
+    the exec queue keeps its bound (idle, or max_lag with feed_live). The
+    accepting sample needs the mempool within the feed's footprint alone (0
+    without feed_live) on every node: nothing tells a pending attestation from
+    a stranded load action. The window's other native traffic is checked by
+    attest_window_step (block bodies), outside this pure tracker.
+
     min_height: also every node's executed height (EXEC_HEIGHT) >= min_height;
     a node without the gauge never counts as there."""
     def __init__(self, quiet_s, feed_live=False, max_lag=DEFAULT_MAX_LAG,
-                 feed_mempool_max=DEFAULT_FEED_MEMPOOL_MAX, min_height=None):
+                 feed_mempool_max=DEFAULT_FEED_MEMPOOL_MAX, min_height=None,
+                 attest_live=False, attest_mempool_max=DEFAULT_ATTEST_MEMPOOL_MAX):
         self.quiet_s = quiet_s
         self.min_height = min_height
-        self.quiet_keys = ORDER_FLOW if feed_live else FLOW
-        self.limits = (feed_mempool_max, max_lag) if feed_live else (0, IDLE_EXEC_QUEUE_MAX)
+        self.quiet_keys = ORDER_FLOW if feed_live or attest_live else FLOW
+        self.attest_live = attest_live
+        self.final_mempool_max = feed_mempool_max if feed_live else 0
+        self.limits = ((feed_mempool_max if feed_live else 0) +
+                       (attest_mempool_max if attest_live else 0),
+                       max_lag if feed_live else IDLE_EXEC_QUEUE_MAX)
         self.base = None
         self.previous = None
         self.since = None
@@ -181,6 +222,10 @@ class DrainTracker:
                      all(s[COMMITTED] > b[COMMITTED] for s, b in zip(samples, self.base)))
         if same and not ready:
             reason = 'waiting for quiet interval and commit progress on every node'
+        if ready and self.attest_live and any(s[MEMPOOL] > self.final_mempool_max for s in samples):
+            ready = False
+            reason = ('waiting for a native mempool <= %d on every node (attestations may be '
+                      'pending inside the window, a load action may not)' % self.final_mempool_max)
         behind = self.behind(samples) if good else []
         if behind:
             ready = False
@@ -189,6 +234,11 @@ class DrainTracker:
         self.last_time = now
         return {'drained': ready, 'reason': 'quiet and advancing' if ready else reason,
                 'quiet_elapsed_s': now-self.since if self.since is not None else 0}
+
+    def restart(self, now, samples):
+        """Start a new quiet window at this (eligible) sample."""
+        self.base = [dict(s) for s in samples]
+        self.since = now
 
     def behind(self, samples):
         """[(node, executed height or None)] below min_height; [] without one."""
@@ -266,15 +316,81 @@ def fetch(url, extra=()):
         return {}
 
 
+def attest_live_summary(base, last, attest_mempool_max, final_mempool_max=0, window=None,
+                        restarts=0):
+    """drain.json .attest_live: the attestations' footprint bounds, what the
+    native counter and the submitted attestations (summed over the nodes) moved
+    over the final quiet window (base = its first samples; None = no window),
+    the last block-body scan of a window (attest_traffic.scan_window) and how
+    often a non-attestation action restarted the window."""
+    def delta(key):
+        if base is None or last is None or not all(key in d for d in base + last):
+            return None
+        return [int(s[key]-b[key]) for s, b in zip(last, base)]
+    native, submitted = delta(FLOW[2]), delta(ATTEST_SUBMITTED)
+    return {'attest_mempool_max': attest_mempool_max, 'final_mempool_max': final_mempool_max,
+            'native_actions_delta': native,
+            'attestations_submitted_delta': sum(submitted) if submitted is not None else None,
+            'window_scan': window, 'window_restarts': restarts}
+
+
+def attest_window_step(tracker, now, samples, result, scan):
+    """--attest-live, once the tracker drained: no native action other than
+    AttestStateHash may have executed in the quiet window. scan(lo, hi) reads
+    blocks lo..hi by kind (attest_traffic.scan_window): lo = the lowest
+    executed height at the window's first samples, hi = the highest committed
+    height now (executed + exec queue), so it covers every block any node can
+    have executed inside the window. A non-attestation action restarts the
+    window here (the legacy drain's native counter would have); an unreadable
+    height or body keeps it open (not drained). Returns (result, scan or None)."""
+    if not result['drained']:
+        return result, None
+    if not all(complete(s, (EXEC_HEIGHT,)) for s in tracker.base + samples):
+        return dict(result, drained=False,
+                    reason='attest-live: executed height (%s) unavailable, the quiet window '
+                           'cannot be scanned' % EXEC_HEIGHT), None
+    lo = int(min(s[EXEC_HEIGHT] for s in tracker.base))
+    hi = int(max(committed_height(s) for s in samples))
+    window = scan(lo, hi)
+    if window['other'] > 0:
+        tracker.restart(now, samples)
+        return dict(result, drained=False, quiet_elapsed_s=0,
+                    reason='attest-live: %d non-attestation native action(s) executed in blocks '
+                           '%d..%d (at %s): quiet window restarted'
+                           % (window['other'], lo, hi, window.get('other_heights'))), window
+    if not window['clean']:
+        return dict(result, drained=False,
+                    reason='attest-live: block bodies unreadable in %d..%d (%d heights, e.g. %s)'
+                           % (lo, hi, window['unread'], window.get('unread_heights'))), window
+    return result, window
+
+
 def wait_for_drain(urls, out, timeout_s, quiet_s, feed_live=False, max_lag=DEFAULT_MAX_LAG,
-                   feed_mempool_max=DEFAULT_FEED_MEMPOOL_MAX, to_height=None):
+                   feed_mempool_max=DEFAULT_FEED_MEMPOOL_MAX, to_height=None,
+                   attest_live=False, attest_mempool_max=DEFAULT_ATTEST_MEMPOOL_MAX,
+                   attest_rpcs=None, scan=None):
     """to_height: None (no height condition), an int, or 'auto' = the
-    height_target() of the first complete scrape (the chain at the call)."""
+    height_target() of the first complete scrape (the chain at the call).
+    attest_live: scan (lo, hi) -> attest_traffic.scan_window result; default:
+    over attest_rpcs."""
     tracker = DrainTracker(quiet_s, feed_live, max_lag, feed_mempool_max,
-                           to_height if isinstance(to_height, int) else None)
+                           to_height if isinstance(to_height, int) else None,
+                           attest_live, attest_mempool_max)
     extra = (CHAIN_SUM, CHAIN_COUNT) if feed_live else ()
-    if to_height is not None:
+    if attest_live:
+        extra += (ATTEST_SUBMITTED,)
+        if scan is None:
+            from attest_traffic import scan_window
+            # --feed-live: the oracle feed keeps submitting through this
+            # drain, so its own kind is expected traffic like the
+            # attestations. Without it (the settle drain after the feed is
+            # paused) and in run-cell's digest window, nothing is allowed.
+            allowed = (ORACLE_KIND,) if feed_live else ()
+            scan = lambda lo, hi: scan_window(list(attest_rpcs or ()), lo, hi, allowed)
+    if to_height is not None or attest_live:
         extra += (EXEC_HEIGHT,)
+    last = None
+    window, restarts = None, 0
     target_by_node, heights = None, {n: None for n in NODES}
     rows, previous = [], [{} for _ in urls]
     start = time.monotonic()
@@ -291,11 +407,17 @@ def wait_for_drain(urls, out, timeout_s, quiet_s, feed_live=False, max_lag=DEFAU
                 if EXEC_HEIGHT in s:
                     heights[n] = int(s[EXEC_HEIGHT])
             result = tracker.observe(elapsed, samples)
+            last = samples
             if to_height == 'auto' and tracker.min_height is None:
                 result = dict(result, drained=False,
                               reason='height target not recorded yet: no complete scrape')
             if elapsed >= timeout_s:
                 result = dict(result, drained=False, reason='drain deadline exceeded')
+            if attest_live:
+                result, scanned = attest_window_step(tracker, elapsed, samples, result, scan)
+                if scanned is not None:
+                    window = scanned
+                    restarts += scanned['other'] > 0
             log.write(json.dumps({'ts': time.time(), 'elapsed_s': elapsed, 'samples': samples,
                                   **result}, allow_nan=False)+'\n')
             log.flush()
@@ -324,6 +446,10 @@ def wait_for_drain(urls, out, timeout_s, quiet_s, feed_live=False, max_lag=DEFAU
                                      for k in FEED_LIVE_COLUMNS) + '\n' for r in rows)
         result['feed_live'] = dict(feed_live_summary(rows, tracker.since), max_lag_bound=max_lag,
                                    feed_mempool_max=feed_mempool_max)
+    if attest_live:
+        result['attest_live'] = attest_live_summary(
+            tracker.base if result['drained'] else None, last, attest_mempool_max,
+            tracker.final_mempool_max, window, restarts)
     (out/'drain.json').write_text(json.dumps(result, indent=2)+'\n')
     print(json.dumps(result))
     return 0 if result['drained'] else TARGET_MISSED_RC if target_missed else 1
@@ -368,6 +494,15 @@ def main():
                        help='--feed-live: max torus_exec_queue_depth on every sample')
     drain.add_argument('--feed-mempool-max', type=int, default=DEFAULT_FEED_MEMPOOL_MAX,
                        help="--feed-live: max native mempool size (the feed's own entries)")
+    drain.add_argument('--attest-live', action='store_true',
+                       help='STATE_HASH_ATTEST=1: tolerate the validators\' AttestStateHash traffic '
+                            '(see ATTEST_SUBMITTED)')
+    drain.add_argument('--attest-mempool-max', type=int, default=DEFAULT_ATTEST_MEMPOOL_MAX,
+                       help='--attest-live: max native mempool size from attestations inside the '
+                            'quiet window (added to --feed-mempool-max with --feed-live)')
+    drain.add_argument('--attest-rpc', nargs=3, default=None,
+                       help="--attest-live (required): the validators' JSON-RPC URLs; the quiet "
+                            'window\'s block bodies are read by action kind (attest_traffic.py)')
     drain.add_argument('--to-height', type=to_height_arg, default=None,
                        help="also wait until every node executed this height ('auto': the highest "
                             "committed height across the nodes at the first complete scrape); "
@@ -380,10 +515,14 @@ def main():
         return 0 if data.get('validity', {}).get('accepted') is True else 2
     if not math.isfinite(args.timeout) or not math.isfinite(args.quiet) or min(args.timeout, args.quiet) <= 0:
         parser.error('timeout and quiet must be positive finite seconds')
-    if min(args.max_lag, args.feed_mempool_max) < 0:
-        parser.error('max-lag and feed-mempool-max must be >= 0')
+    if min(args.max_lag, args.feed_mempool_max, args.attest_mempool_max) < 0:
+        parser.error('max-lag, feed-mempool-max and attest-mempool-max must be >= 0')
+    if args.attest_live and not args.attest_rpc:
+        parser.error('--attest-live needs --attest-rpc (3 URLs): without the block bodies the '
+                     'quiet window cannot tell attestations from other native actions')
     return wait_for_drain(args.urls, args.out, args.timeout, args.quiet, args.feed_live,
-                          args.max_lag, args.feed_mempool_max, args.to_height)
+                          args.max_lag, args.feed_mempool_max, args.to_height,
+                          args.attest_live, args.attest_mempool_max, args.attest_rpc)
 
 
 def to_height_arg(value):
