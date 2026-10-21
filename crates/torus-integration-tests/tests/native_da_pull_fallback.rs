@@ -80,6 +80,7 @@ fn test_config() -> ChainConfig {
         exec_trust_cache: false,
         state_hash_activation_height: None,
         book_mode: Default::default(),
+        book_window_commit: false,
     }
 }
 

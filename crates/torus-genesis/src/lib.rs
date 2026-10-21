@@ -130,6 +130,10 @@ pub struct ConsensusConfig {
     /// refuses the genesis. The node takes its mode from here.
     #[serde(default)]
     pub book_mode: torus_types::book_mode::BookMode,
+    /// L6.1 window-committed Classic order books (CHAIN-WIDE, consensus-
+    /// changing; docs/plans/l61-window-committed-books.md). Absent = off.
+    #[serde(default)]
+    pub book_window_commit: bool,
 }
 
 fn default_chain_id() -> u64 {
@@ -748,6 +752,7 @@ impl Genesis {
             exec_trust_cache: false,
             state_hash_activation_height: self.consensus.state_hash_activation_height,
             book_mode: self.consensus.book_mode,
+            book_window_commit: self.consensus.book_window_commit,
         }
     }
 
@@ -1143,6 +1148,31 @@ mod tests {
             serde_json::json!(true),
         ] {
             assert!(with(v.clone()).is_err(), "{v} must refuse the genesis");
+        }
+    }
+
+    /// L6.1: `consensus.book_window_commit` is a CHAIN-WIDE genesis field,
+    /// absent (every existing genesis) = off; on needs the running hash.
+    #[test]
+    fn genesis_book_window_commit_is_chain_config() {
+        let genesis = Genesis::from_json(&sample_genesis_json()).unwrap();
+        assert!(!genesis.consensus.book_window_commit);
+        assert!(!genesis.chain_config().book_window_commit, "off by default");
+        let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        json["consensus"]["book_window_commit"] = serde_json::json!(true);
+        json["consensus"]["state_hash_activation_height"] = serde_json::json!(1);
+        let mut config = Genesis::from_json(&json.to_string())
+            .unwrap()
+            .chain_config();
+        assert!(config.book_window_commit);
+        assert!(config.validate().is_ok());
+        config.state_hash_activation_height = None;
+        assert!(config.validate().is_err(), "L6.1 without the running hash");
+        // L6.1 is Classic-only: a row book mode with it refuses the genesis.
+        config.state_hash_activation_height = Some(1);
+        for mode in [1, 2, 3] {
+            config.book_mode = torus_types::book_mode::BookMode::from_marker_byte(mode).unwrap();
+            assert!(config.validate().is_err(), "L6.1 with book mode {mode}");
         }
     }
 

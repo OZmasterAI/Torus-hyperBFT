@@ -190,6 +190,8 @@ fi
 if [ "${BOOK_WINDOW_COMMIT:-0}" = 1 ]; then
     [ -n "${STATE_HASH_ACTIVATION:-}" ] \
         || { echo "FATAL: BOOK_WINDOW_COMMIT=1 needs STATE_HASH_ACTIVATION" >&2; exit 1; }
+    { [ -z "$BOOK_MODE_NAME" ] || [ "$BOOK_MODE_NAME" = classic ]; } \
+        || { echo "FATAL: BOOK_WINDOW_COMMIT=1 needs the classic book mode (BOOK_MODE=$BOOK_MODE_NAME)" >&2; exit 1; }
     tmp=$(mktemp) && jq '.consensus.book_window_commit = true' "$OUT" > "$tmp" && mv "$tmp" "$OUT"
     echo "  book_window_commit = on (L6.1)"
 fi

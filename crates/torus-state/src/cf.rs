@@ -238,6 +238,12 @@ pub const META_RUNNING_STATE_HASH_ACTIVATION: &[u8] = b"running_state_hash_activ
 /// running hash is disabled. Written at boot by `running_hash::configure_activation`.
 pub const META_STATE_HASH_CONFIGURED_ACTIVATION: &[u8] = b"state_hash_cfg_activation";
 
+/// Key in CF_CONSENSUS_META (node-local copy of the chain config): L6.1 window-committed Classic
+/// books (genesis `consensus.book_window_commit`, docs/plans/l61-window-committed-books.md),
+/// `[1]` when on, absent = off. Part of the hash chain's definition: a change resets the stored
+/// chain. Written at boot by `running_hash::configure_book_window`.
+pub const META_STATE_HASH_BOOK_WINDOW: &[u8] = b"state_hash_book_window";
+
 /// Key in CF_CONSENSUS_META (node-local): the first height at which this node could not extend
 /// a valid chain (no stored `h_{n-1}`: upgraded above the activation height, or a skipped
 /// height after a failed flush), 8 BE. Sticky: the node stops hashing, attesting and making

@@ -1750,6 +1750,15 @@ pub struct ChainConfig {
     /// env `TORUS_BOOK_ROWS` may only repeat it). Absent = Classic.
     #[serde(default, skip_serializing_if = "book_mode::BookMode::is_classic")]
     pub book_mode: book_mode::BookMode,
+    /// L6.1 window-committed Classic order books
+    /// (docs/plans/l61-window-committed-books.md): the running hash skips
+    /// `cf_native_order_books` except at attest heights (`h % 100 == 0`),
+    /// where the block writes and hashes every book. CHAIN-WIDE, consensus-
+    /// changing (genesis `consensus.book_window_commit`); needs
+    /// `state_hash_activation_height` and the Classic book mode. `false` (any
+    /// genesis without the field) = today's hash preimage.
+    #[serde(default)]
+    pub book_window_commit: bool,
 }
 
 fn default_timeout_base_ms() -> u64 {
@@ -1773,6 +1782,21 @@ fn default_backoff_cap() -> u32 {
 }
 
 impl ChainConfig {
+    /// L6.1: the first height of window-committed books, `None` = off.
+    /// Today `book_window_commit` starts with the running hash
+    /// (`state_hash_activation_height`); with P0.0 it becomes its own
+    /// activation height. Every L6.1 rule (the digest's book filter and the
+    /// execution's forced full save at attest heights) is a function of this
+    /// value and the height only, so every node applies the same rule from
+    /// its chain config.
+    pub fn book_window_activation(&self) -> Option<u64> {
+        if self.book_window_commit {
+            self.state_hash_activation_height
+        } else {
+            None
+        }
+    }
+
     /// FIX CONS-PF-04: Validate chain configuration parameters.
     pub fn validate(&self) -> Result<(), String> {
         if self.epoch_length == 0 {
@@ -1783,6 +1807,21 @@ impl ChainConfig {
         }
         if self.state_hash_activation_height == Some(0) {
             return Err("state_hash_activation_height must be >= 1".to_string());
+        }
+        if self.book_window_commit && self.state_hash_activation_height.is_none() {
+            return Err(
+                "book_window_commit needs state_hash_activation_height (it only changes the running hash)"
+                    .to_string(),
+            );
+        }
+        // L6.1 is a Classic-blob rule: row modes write per-order / level rows
+        // to the book CF every block, which the window digest would drop off
+        // attest heights (both fields are chain-wide genesis settings).
+        if self.book_window_commit && !self.book_mode.is_classic() {
+            return Err(format!(
+                "book_window_commit (L6.1) needs book_mode classic, not {}",
+                self.book_mode.describe()
+            ));
         }
         Ok(())
     }
