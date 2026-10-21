@@ -28,7 +28,9 @@
 //! that does not decode, names another trader / market, or decodes
 //! leniently — `is_long` byte 2, `margin_type` byte 7 — so that it would not
 //! re-encode to its bytes) is opaque: it has no record, its rows are kept raw
-//! and it reads through the overlay, as today. Rows under no trader
+//! and it reads through the overlay, as today (where a position row naming
+//! another trader / market is refused as corrupt since the pre-testnet
+//! aliased-rows fix, `torus_core::position::decode_position_row`). Rows under no trader
 //! (positions keys shorter than 20 bytes, balances keys neither 20 bytes nor
 //! `cvlm` + 20 bytes) are kept raw too, so the record set holds every row of
 //! the two CFs ([`Users::encode_rows`] == R's) and follows a delta without R.

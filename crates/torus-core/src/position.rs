@@ -279,6 +279,30 @@ fn decode_position(data: &[u8]) -> Result<Position, CoreError> {
     Position::try_from_slice(data).map_err(|e| CoreError::Borsh(e.to_string()))
 }
 
+/// Pre-testnet "aliased opaque position rows" (roadmap, found s128): the
+/// stored position row `data` at `key`, decoded and refused unless `key` is
+/// [`position_key`] of the row's own trader and market. The only writer of
+/// the CF ([`PositionManager::put_position`]) keys every row that way, and
+/// nothing else writes it (genesis writes no position rows, there are no
+/// migrations or state imports), so a row naming another key is corrupt
+/// state, refused like a row that does not decode: [`CoreError::Borsh`], a
+/// local fault, so the executor fail-stops the block (R02). Every position
+/// load goes through here; before, such a row was decoded and a fill on it
+/// filed under the key its fields name, so two markets' settle caches could
+/// hold one key and the parallel settle's merge dropped an update.
+pub fn decode_position_row(key: &[u8], data: &[u8]) -> Result<Position, CoreError> {
+    let pos = decode_position(data)?;
+    if key != position_key(&pos.trader, pos.market_id) {
+        return Err(CoreError::Borsh(format!(
+            "position row at key 0x{} names trader {} market {}",
+            alloy_primitives::hex::encode(key),
+            pos.trader,
+            pos.market_id
+        )));
+    }
+    Ok(pos)
+}
+
 fn decode_native_balance(data: &[u8]) -> Result<NativeBalance, CoreError> {
     NativeBalance::try_from_slice(data).map_err(|e| CoreError::Borsh(e.to_string()))
 }
@@ -317,7 +341,7 @@ impl<T: StateBackend> PositionManager<T> {
     ) -> Result<Option<Position>, CoreError> {
         let key = position_key(trader, market_id);
         match self.state.get_cf_raw(CF_NATIVE_POSITIONS, &key)? {
-            Some(data) => Ok(Some(decode_position(&data)?)),
+            Some(data) => Ok(Some(decode_position_row(&key, &data)?)),
             None => Ok(None),
         }
     }
@@ -336,8 +360,9 @@ impl<T: StateBackend> PositionManager<T> {
         let Some(typed) = typed else {
             return self.get_position(trader, market_id);
         };
-        match self.state.own_pending_row(CF_NATIVE_POSITIONS, &position_key(trader, market_id)) {
-            OwnPendingRow::Pending(row) => row.as_deref().map(decode_position).transpose(),
+        let key = position_key(trader, market_id);
+        match self.state.own_pending_row(CF_NATIVE_POSITIONS, &key) {
+            OwnPendingRow::Pending(row) => row.as_deref().map(|r| decode_position_row(&key, r)).transpose(),
             OwnPendingRow::Resident => match typed.position(trader, market_id) {
                 Some(pos) => Ok(pos),
                 None => self.get_position(trader, market_id),
@@ -368,8 +393,8 @@ impl<T: StateBackend> PositionManager<T> {
             .state
             .iterate_cf(CF_NATIVE_POSITIONS, Some(trader.as_slice()))?;
         let mut out = Vec::with_capacity(entries.len());
-        for (_key, value) in entries {
-            out.push(decode_position(&value)?);
+        for (key, value) in entries {
+            out.push(decode_position_row(&key, &value)?);
         }
         Ok(out)
     }
@@ -837,19 +862,15 @@ impl PositionCache {
                 e.insert(row)
             }
         };
-        if slot
-            .as_ref()
-            .is_some_and(|p| (p.trader, p.market_id) != key)
-        {
-            // A stored row whose fields name another key (`put_position`
-            // never writes one): `set` files the result under the fields'
-            // key, so keep the exact load + set sequence.
-            let (new_pos, out) = f(slot.clone());
-            match new_pos {
-                Some(pos) => self.set(pos),
-                None => self.remove(trader, market_id),
-            }
-            return Ok(out);
+        // Every entry sits under its own fields' key: a load refuses a row
+        // naming another key ([`decode_position_row`]) and `set` keys from
+        // the fields. Checked anyway (two compares): an entry that broke it
+        // would put a foreign key in this cache.
+        if let Some(p) = slot.as_ref().filter(|p| (p.trader, p.market_id) != key) {
+            return Err(CoreError::Borsh(format!(
+                "position cache entry ({trader}, {market_id}) names trader {} market {}",
+                p.trader, p.market_id
+            )));
         }
         let (new_pos, out) = f(slot.take());
         // `fill_transition` opens with (trader, market_id) or keeps the
@@ -886,11 +907,14 @@ impl PositionCache {
     /// what one shared cache would hold after sequential settlement — in any
     /// merge order. Callers merge in sorted market order anyway.
     ///
-    /// Not always disjoint: a stored row whose fields name another market
-    /// (an opaque row, see `update_in_place`) files a fill under that
-    /// market's key, so two market caches can share a key; `extend` then
-    /// keeps the later cache's entry (roadmap pre-testnet note "Parallel-
-    /// settle merge drops a position update for aliased opaque rows").
+    /// Pre-testnet: a stored row whose fields name another market (an
+    /// "aliased opaque" row) used to file a fill under that market's key, so
+    /// two market caches could share a key and `extend` kept the later
+    /// cache's entry, dropping an update. Loads now refuse such rows
+    /// ([`decode_position_row`]), so per-market caches filled by loads and
+    /// fills are disjoint; only an explicit [`Self::set`] / [`Self::remove`]
+    /// of a foreign market's key can still overlap them, and `extend` keeps
+    /// the later entry.
     pub fn merge_disjoint(&mut self, other: PositionCache) {
         self.map.extend(other.map);
         self.dirty.extend(other.dirty);
@@ -904,8 +928,9 @@ impl PositionCache {
     /// key sets, from the key-market ranges alone (O(runs), no key walk):
     /// the non-empty runs' ranges are strictly ascending (each run's lowest
     /// market above the previous run's highest) and this cache's range
-    /// meets none of them. Pass B's per-market caches satisfy it unless an
-    /// opaque row put a foreign market's key in one. `false` = not proven
+    /// meets none of them. Pass B's per-market caches satisfy it (loads
+    /// refuse rows naming another key, [`decode_position_row`]); a foreign
+    /// market's key put in one by `set` / `remove` fails it. `false` = not proven
     /// (conservative: disjoint caches can fail it, overlapping ones never
     /// pass).
     pub fn runs_disjoint(&self, runs: &[PositionCache]) -> bool {
@@ -979,8 +1004,9 @@ impl PositionCache {
     /// of every run (clean read hits included) into one map, and the second
     /// lookup per dirty key.
     ///
-    /// Otherwise ([`RunsFlush::Merged`]; an opaque row put one market's key
-    /// in another market's cache): it IS merge + flush_all, run by run in
+    /// Otherwise ([`RunsFlush::Merged`]; a `set` / `remove` put one market's
+    /// key in another market's cache, or the ranges merely touch): it IS
+    /// merge + flush_all, run by run in
     /// slice order (`std::mem::take` leaves each run empty), so a clean
     /// entry of a later run replaces an earlier run's dirty row exactly as
     /// the flag-off path does.

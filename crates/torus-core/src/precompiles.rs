@@ -642,9 +642,8 @@ fn read_position(
 ) -> Result<Vec<u8>, CoreError> {
     let key = crate::position::position_key(trader, market_id);
     let pos = match state_db.get_cf_raw(CF_NATIVE_POSITIONS, &key)? {
-        Some(data) => {
-            Position::try_from_slice(&data).map_err(|e| CoreError::Borsh(e.to_string()))?
-        }
+        // Pre-testnet: a row naming another key is refused, as every load.
+        Some(data) => crate::position::decode_position_row(&key, &data)?,
         None => {
             // No position — return zeros
             let mut out = Vec::with_capacity(160);
