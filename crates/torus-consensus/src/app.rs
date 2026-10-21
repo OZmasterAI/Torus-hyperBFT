@@ -2946,7 +2946,7 @@ fn parent_block_ms<B: StateBackend>(
 
 /// The committed header at `height` (its `CF_BLOCK_HEADERS` row: 32-byte hash ‖ JSON). An absent
 /// or undecodable row is a local fault (`Err`): the caller fail-stops.
-fn header_at<B: StateBackend>(
+pub(crate) fn header_at<B: StateBackend>(
     state: &B,
     height: u64,
 ) -> Result<TorusBlockHeader, torus_state::StateError> {
@@ -7999,6 +7999,10 @@ impl TorusApp {
         // Running state hash: a fail-stop latched before the restart stays
         // latched (persisted record; `TORUS_STATE_HASH_FAILSTOP=1`).
         state_hash.relatch_at_boot(&state_db, &exec_failed);
+        // Owner s134 (option b): a node without a valid running-hash chain
+        // keeps running and voting, reports it (ERROR + gauge) and never
+        // attests until the chain is valid again.
+        state_hash.report_at_boot(&state_db, metrics.as_deref());
 
         // The proposer identity, resolved from the replayed state before the
         // execution thread starts.
@@ -24424,6 +24428,70 @@ mod crash_recovery_tests {
                 assert_eq!(gauge, 1.0, "unverified gauge");
             }
         }
+    }
+
+    /// Owner s134 (option b): a node whose running-hash chain rows are lost
+    /// (the stored hash and its start row; checkpoints and the activation
+    /// kept) is reported at boot (the gauge, also through `TorusApp::new`)
+    /// and submits no attestation even before a flush marks it unverified (a
+    /// pipelined node's first `after_block` can run before its first durable
+    /// flush). It keeps executing (no fail-stop) and never attests after.
+    #[test]
+    fn state_hash_lost_chain_rows_reported_at_boot_and_never_attested() {
+        use crate::state_hash::{ChainHealth, StateHashMonitor};
+        use torus_state::cf::{META_RUNNING_STATE_HASH, META_RUNNING_STATE_HASH_ACTIVATION};
+        use torus_state::running_hash::{read_checkpoint, read_unverified_since};
+        let gauge = |m: &torus_telemetry::Metrics| {
+            metric_value(&m.encode(), "torus_state_hash_unverified")
+        };
+        let key = k256::ecdsa::SigningKey::from_slice(&[74u8; 32]).unwrap();
+        let (config, db) = make_test_config_and_db();
+        let fresh = torus_telemetry::Metrics::new();
+        assert_eq!(StateHashMonitor::default().report_at_boot(&db, Some(&fresh)), ChainHealth::Off);
+        seed_active_validators(&db, &[&key]);
+        let ctx = make_exec_ctx(&config, &db);
+        run_empty_blocks(&ctx, &db, 1, 150);
+        drop(ctx);
+        assert!(read_checkpoint(&db, 100).is_some());
+        let healthy = torus_telemetry::Metrics::new();
+        assert_eq!(
+            StateHashMonitor::default().report_at_boot(&db, Some(&healthy)),
+            ChainHealth::Verified
+        );
+        assert_eq!(gauge(&healthy), 0.0);
+
+        for k in [META_RUNNING_STATE_HASH, META_RUNNING_STATE_HASH_ACTIVATION] {
+            db.delete_cf_raw(CF_CONSENSUS_META, k).unwrap();
+        }
+        let booted = Arc::new(torus_telemetry::Metrics::new());
+        drop(TorusApp::new(db.clone(), &config, Some(booted.clone()), None, None));
+        assert_eq!(gauge(&booted), 1.0, "TorusApp boot reports the lost chain");
+
+        let pool = mempool_for(&db);
+        let mut ctx = make_exec_ctx_with_mempool(&config, &db, Some(pool.clone()), false);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        ctx.metrics = Some(metrics.clone());
+        ctx.state_hash.set_attest_key(key.clone());
+        assert_eq!(
+            ctx.state_hash.report_at_boot(&db, Some(&metrics)),
+            ChainHealth::RowsMissing { applied: 150, hashed: None }
+        );
+        assert_eq!(gauge(&metrics), 1.0);
+        // The attest path before any flush marked the node.
+        ctx.state_hash.after_block(
+            &make_block(150, vec![]),
+            &db,
+            Some(&pool),
+            Some(&metrics),
+            &ctx.exec_failed,
+        );
+        assert!(pooled_attestations(&pool).is_empty(), "rows lost: no attestation");
+        assert_eq!(gauge(&metrics), 1.0);
+        run_empty_blocks(&ctx, &db, 151, 250);
+        assert_eq!(read_unverified_since(&db), Some(151));
+        assert!(pooled_attestations(&pool).is_empty(), "hash-unverified: never attests");
+        assert_eq!(gauge(&metrics), 1.0);
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst), "keeps running");
     }
 
     /// Review findings 1 / 5: a node whose local chain broke — a block whose

@@ -10,13 +10,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use torus_economics::types::ValidatorStatus;
 use torus_economics::StakingManager;
 use torus_mempool::Mempool;
 use torus_state::running_hash::{
-    checkpoint_heights, read_applied_height, read_checkpoint, read_configured_activation,
-    read_divergence, read_running_hash, read_unverified_since, record_divergence,
+    checkpoint_heights, read_activation_height, read_applied_height, read_checkpoint,
+    read_configured_activation, read_divergence, read_running_hash, read_unverified_since,
+    record_divergence,
     STATE_HASH_CHECKPOINT_INTERVAL, STATE_HASH_CHECKPOINT_RETAIN,
 };
 use torus_state::StateDb;
@@ -50,6 +52,46 @@ pub fn account_address(key: &k256::ecdsa::SigningKey) -> Address {
 /// acceptance window everywhere (mempool admission rejects and evicts it),
 /// plus a margin for clock skew between nodes.
 pub const DEFAULT_RESUBMIT_AFTER_MS: u64 = torus_types::eip712::NONCE_WINDOW_MS + 5_000;
+
+/// While hash-unverified, the loud ERROR repeats at most this often (owner
+/// s134, option b: boot and periodically).
+pub const UNVERIFIED_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The periodic hash-unverified ERROR is due: never logged yet, or the last
+/// one is at least [`UNVERIFIED_LOG_INTERVAL`] old.
+pub fn unverified_log_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|t| now.saturating_duration_since(t) >= UNVERIFIED_LOG_INTERVAL)
+}
+
+/// The node's running-hash chain as the attest path sees it at boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainHealth {
+    /// Not hashing at the applied height (no applied height, or the header
+    /// there does not carry the `RunningStateHash` bit).
+    Off,
+    /// A stored chain ends at the applied height.
+    Verified,
+    /// Marked hash-unverified since this height (sticky until a resync or a
+    /// chain reset).
+    Unverified { since: u64 },
+    /// Hashing at the applied height but the stored chain rows do not end
+    /// there (lost: a restore without them, a damaged DB). The next flush
+    /// marks the node unverified; until then it already never attests.
+    RowsMissing { applied: u64, hashed: Option<u64> },
+}
+
+impl ChainHealth {
+    /// No valid local chain: never attest, never fail-stop on a mismatch.
+    pub fn is_unverified(self) -> bool {
+        matches!(self, ChainHealth::Unverified { .. } | ChainHealth::RowsMissing { .. })
+    }
+}
+
+/// [`ChainHealth`] of `state_db`. Reads META and at most one header; call it
+/// when nothing writes the DB (boot, after the replay).
+pub fn chain_health(_state_db: &StateDb) -> ChainHealth {
+    todo!("owner s134 option b RED")
+}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -156,6 +198,18 @@ impl StateHashMonitor {
             );
             false
         }
+    }
+
+    /// Boot (after the replay): report a node without a valid running-hash
+    /// chain (owner s134, option b): a loud ERROR, the
+    /// `torus_state_hash_unverified` gauge, and no attestation until the
+    /// chain is valid again. It keeps running and voting. Returns the health.
+    pub fn report_at_boot(
+        &self,
+        _state_db: &StateDb,
+        _metrics: Option<&torus_telemetry::Metrics>,
+    ) -> ChainHealth {
+        ChainHealth::Off
     }
 
     /// After block `block` executed: compare the attestations that became
@@ -391,5 +445,27 @@ impl StateHashMonitor {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unverified_error_repeats_once_per_interval() {
+        let t = Instant::now();
+        assert!(unverified_log_due(None, t), "the first one is due");
+        assert!(!unverified_log_due(Some(t), t));
+        assert!(!unverified_log_due(Some(t), t + UNVERIFIED_LOG_INTERVAL - Duration::from_millis(1)));
+        assert!(unverified_log_due(Some(t), t + UNVERIFIED_LOG_INTERVAL));
+    }
+
+    #[test]
+    fn rows_missing_and_marked_are_unverified() {
+        assert!(ChainHealth::Unverified { since: 5 }.is_unverified());
+        assert!(ChainHealth::RowsMissing { applied: 5, hashed: None }.is_unverified());
+        assert!(!ChainHealth::Verified.is_unverified());
+        assert!(!ChainHealth::Off.is_unverified());
     }
 }
