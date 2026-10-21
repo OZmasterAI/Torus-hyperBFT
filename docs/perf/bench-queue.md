@@ -1048,6 +1048,25 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    blocks/s 0.920 [0.874, 0.968]. The 100-block checkpoint bound fires first, so 5 s vs 15 s changes the checkpoint
    count only 1.17-1.63x. Mode 3 / Classic (15 s, standard): matched/s 0.951 [0.949, 0.954], CPU-s per 1M fills 1.136;
    flush worker busy 0.51 vs 0.13.
+   **Stage 2 done (ozarchy-9j2, section 124): Classic CL21 beats mode 3 M15 on both shapes.**
+   * Run: tools `0f8eedb3` + hole-wait patch `1aa2fd0a`; 22 / 22 cells rc 0, ACCEPT AGREE PASS, md5 ok; attest ok=1
+     with quorum and 3 voters in every A / B cell, none in R; margin rejects 0; no foreign-CPU flag; no CELL-FLAG.
+     The standard r3-CL21 hole at 6800 was healed and is cleared offline: h_n equal, 0 mismatch lines. The late vote
+     came from the bench-only oracle / attestation same-ms nonce, resubmitted after 65 s.
+   * **Arm A = CL21 by owner exception** (18c msg 82, 2026-10-21 21:29): +0.75% exec-thread CPU per fill vs C15 on
+     standard [1.0034, 1.0116], accepted for deep blocks/s +8.6%.
+   * M15 / CL21, n = 4 round-matched, deep / standard:
+     * matched/s 0.963 [0.948, 0.978] / 0.952 [0.939, 0.965];
+     * blocks/s 0.714 [0.617, 0.825] / 0.747 [0.615, 0.907];
+     * p50 1.210 / 1.162 (CIs above 1); p99 1.318 [1.156, 1.502] / 1.191 (not resolved);
+     * CPU-s per 1M fills 1.159 / 1.149; timeouts per 1k 1.18 vs 0.46 / 1.30 vs 0.04.
+   * Exec-path rule: M15 cannot replace CL21 (blocks/s and p50 on the wrong side). M15 wins only exec-thread on-CPU
+     per fill: 0.918 [0.905, 0.931] / 0.973 [0.951, 0.996]. It gets there by moving the book save to the flush worker
+     (busy 0.51 vs 0.21 / 0.13). On that row CL21 stands only by the owner exception.
+   * R (hash off) / CL21: exec-thread CPU per fill 0.916 [0.896, 0.936] deep and 0.965 [0.955, 0.975] standard. That
+     row is the cost of hash on + attestation + L6.1 + L2.1. matched/s is not resolved (1.022 / 1.001).
+   * R vs section 120 A (cross-campaign): matched/s -1.7% / -3.0% and exec CPU per fill +5.3% / +8.7%. The binary,
+     not the hash, carries most of section 123's gap to section 120.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
