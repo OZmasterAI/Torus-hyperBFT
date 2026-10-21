@@ -64,6 +64,8 @@ pub const CHEAP_READS: &[&str] = &[
     "torus_getLeader",
     "torus_getEpoch",
     "torus_getStateHash",
+    // P0.0 phase 6: the schedule from memory, no state read.
+    "torus_getFeatureSchedule",
     "torus_getOrderBook",
     // Item 7 step 2: one header read (as eth_gasPrice), one lane row.
     "torus_bigBlockGasPrice",

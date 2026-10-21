@@ -300,6 +300,9 @@ pub struct RpcState {
     pub(crate) max_scan_rows: usize,
     /// R24: rows examined by bounded reads since start (all methods).
     pub(crate) scan_rows_examined: Arc<AtomicU64>,
+    /// P0.0 phase 6: this node's activation schedule (`torus_getFeatureSchedule`).
+    /// Default: the built-in table for `chain_id`; the node sets the genesis one.
+    pub(crate) activations: torus_types::ActivationSchedule,
 }
 
 /// JSON-RPC server combining eth, net, and web3 namespaces.
@@ -380,6 +383,11 @@ impl RpcServer {
                     std::env::var(scan::ENV_MAX_SCAN_ROWS).ok().as_deref(),
                 ),
                 scan_rows_examined: Arc::new(AtomicU64::new(0)),
+                activations: torus_types::ActivationSchedule::for_chain(
+                    chain_id,
+                    &Default::default(),
+                )
+                .unwrap_or_default(),
             },
             ip_limiter: None,
             max_subs_per_conn: ip_limit::DEFAULT_MAX_SUBS_PER_CONN,
@@ -470,6 +478,12 @@ impl RpcServer {
     /// [`streams::all_market_trades_allowed`] (off on validators by default).
     pub fn set_all_market_trades(&mut self, allowed: bool) {
         self.state.all_market_trades = allowed;
+    }
+
+    /// P0.0 phase 6: this node's activation schedule
+    /// (`ChainConfig::activations`), listed by `torus_getFeatureSchedule`.
+    pub fn set_activation_schedule(&mut self, schedule: torus_types::ActivationSchedule) {
+        self.state.activations = schedule;
     }
 
     /// Set the Prometheus metrics handle for RPC instrumentation.
@@ -1173,6 +1187,7 @@ mod tests {
             big_base_fee_per_gas: base_fee,
             epoch: 0,
             validator_set_hash: B256::ZERO,
+            features: 0,
             sig_attestation: [0u8; 64],
         }
     }
@@ -7805,5 +7820,159 @@ mod state_hash_rpc_tests {
             assert!(get(Some(gone)).await.is_err(), "height {gone} must be an error");
         }
         handle.stop().unwrap();
+    }
+}
+
+/// P0.0 phase 6: `torus_getFeatureSchedule`.
+#[cfg(test)]
+mod feature_schedule_rpc_tests {
+    use super::*;
+    use crate::types::{
+        RpcFeatureSchedule, RpcKnownFeature, RpcScheduledFeature, RpcUpgradeRequired,
+    };
+    use jsonrpsee::core::client::ClientT;
+    use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
+    use torus_mempool::{Mempool, MempoolConfig};
+    use torus_types::{ActivationSchedule, Feature, KNOWN_FEATURES};
+
+    fn known() -> Vec<RpcKnownFeature> {
+        Feature::ALL
+            .iter()
+            .filter(|f| KNOWN_FEATURES & f.bit() != 0)
+            .map(|f| RpcKnownFeature {
+                name: f.name().to_string(),
+                id: f.id(),
+                bit: format!("{:#x}", f.bit()),
+            })
+            .collect()
+    }
+
+    fn rsh(at: u64, active: bool) -> RpcScheduledFeature {
+        RpcScheduledFeature {
+            name: "running_state_hash".into(),
+            id: 0,
+            bit: "0x1".into(),
+            activation_height: format!("{at:#x}"),
+            active,
+            built_in: false,
+        }
+    }
+
+    /// The reply over the schedule, the known set, the height and the
+    /// UPGRADE REQUIRED state. RED before phase 6: an empty reply.
+    #[test]
+    fn feature_schedule_lists_the_schedule_known_features_and_the_next_activation() {
+        let schedule = ActivationSchedule::merge(
+            &[(Feature::RunningStateHash, 10)].into_iter().collect(),
+            &[],
+        )
+        .unwrap();
+        let below = torus::feature_schedule(&schedule, KNOWN_FEATURES, 7, 4, None);
+        assert_eq!(
+            below,
+            RpcFeatureSchedule {
+                chain_id: "0x7".into(),
+                height: "0x4".into(),
+                active_bits: "0x0".into(),
+                known_bits: format!("{KNOWN_FEATURES:#x}"),
+                known_features: known(),
+                schedule: vec![rsh(10, false)],
+                next_activation_height: Some("0xa".into()),
+                blocks_until_activation: Some("0x6".into()),
+                upgrade_required: None,
+            }
+        );
+        let on = torus::feature_schedule(&schedule, KNOWN_FEATURES, 7, 10, Some((9, 12)));
+        assert_eq!(on.active_bits, "0x1");
+        assert_eq!(on.schedule, vec![rsh(10, true)]);
+        assert_eq!(on.next_activation_height, None);
+        assert_eq!(on.blocks_until_activation, None);
+        assert_eq!(
+            on.upgrade_required,
+            Some(RpcUpgradeRequired {
+                feature: 9,
+                height: "0xc".into()
+            })
+        );
+        // An "old binary" (a smaller known set) lists only what it knows.
+        let old = torus::feature_schedule(&ActivationSchedule::default(), 0, 7, 3, None);
+        assert!(old.known_features.is_empty() && old.schedule.is_empty());
+        assert_eq!(old.known_bits, "0x0");
+        assert_eq!(old.next_activation_height, None);
+    }
+
+    /// Over JSON-RPC: the node's schedule (`set_activation_schedule`), the
+    /// shared latest height, and `UPGRADE REQUIRED` from the node's gauges.
+    /// RED before phase 6: an empty reply.
+    #[tokio::test]
+    async fn feature_schedule_rpc_reads_the_schedule_height_and_upgrade_gauges() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pool_dir = tempfile::TempDir::new().unwrap();
+        let mut server = RpcServer::new(
+            StateDb::open(dir.path()).unwrap(),
+            Arc::new(Mempool::new(
+                StateDb::open(pool_dir.path()).unwrap(),
+                MempoolConfig::default(),
+            )),
+            Arc::new(EvmExecutor::new(TORUS_CHAIN_ID)),
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_activation_schedule(
+            ActivationSchedule::merge(
+                &[(Feature::RunningStateHash, 10)].into_iter().collect(),
+                &[],
+            )
+            .unwrap(),
+        );
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        server.set_metrics(metrics.clone());
+        let height = server.latest_height();
+        height.store(4, Ordering::Relaxed);
+        let (_handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let get = || async {
+            client
+                .request::<RpcFeatureSchedule, _>(
+                    "torus_getFeatureSchedule",
+                    jsonrpsee::rpc_params![],
+                )
+                .await
+                .unwrap()
+        };
+        let r = get().await;
+        assert_eq!(r.chain_id, format!("{TORUS_CHAIN_ID:#x}"));
+        assert_eq!(r.height, "0x4");
+        assert_eq!(r.schedule, vec![rsh(10, false)]);
+        assert_eq!(r.known_features, known());
+        assert_eq!(r.blocks_until_activation.as_deref(), Some("0x6"));
+        assert_eq!(r.upgrade_required, None);
+
+        height.store(10, Ordering::Relaxed);
+        metrics.upgrade_required.set(1);
+        metrics.upgrade_required_feature.set(9);
+        metrics.upgrade_required_height.set(12);
+        let r = get().await;
+        assert_eq!(r.schedule, vec![rsh(10, true)]);
+        assert_eq!(r.active_bits, "0x1");
+        assert_eq!(
+            r.upgrade_required,
+            Some(RpcUpgradeRequired {
+                feature: 9,
+                height: "0xc".into()
+            })
+        );
+        // The raw JSON uses camelCase names.
+        let raw: serde_json::Value = client
+            .request("torus_getFeatureSchedule", jsonrpsee::rpc_params![])
+            .await
+            .unwrap();
+        assert_eq!(raw["schedule"][0]["activationHeight"], "0xa");
+        assert_eq!(raw["schedule"][0]["builtIn"], false);
+        assert_eq!(raw["knownFeatures"][0]["name"], "running_state_hash");
+        assert!(raw["nextActivationHeight"].is_null());
     }
 }

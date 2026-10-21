@@ -60,6 +60,17 @@ impl ChannelNetwork {
     }
 }
 
+impl ChannelNetwork {
+    /// Drop every message queued for this validator. A network does not
+    /// deliver to a stopped process: a test restarting a validator calls this
+    /// so the restarted replica does not first wade through what the others
+    /// sent while it was down.
+    pub fn discard_pending(&self) {
+        self.my_inbox.lock().unwrap().clear();
+        self.block_data_inbox.lock().unwrap().clear();
+    }
+}
+
 impl Network for ChannelNetwork {
     fn init_validator_set(&mut self, _validator_set: ValidatorSet) {
         // All inboxes are pre-registered at construction time.

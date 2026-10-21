@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 pub mod book_mode;
 pub mod eip1559;
 pub mod eip712;
+pub mod features;
+
+pub use features::{ActivationSchedule, Feature, KNOWN_FEATURES};
 
 // ============================================================================
 // Identifiers
@@ -589,6 +592,13 @@ pub struct TorusBlockHeader {
     pub epoch: u64,
     /// Validator set hash for this epoch.
     pub validator_set_hash: B256,
+    /// P0.0: the bitmap of the [`Feature`]s active at this height
+    /// (`ActivationSchedule::active_at`; bit = feature id). Hashed (appended to
+    /// the canonical bytes when non-zero, so a header without bits keeps its
+    /// pre-P0.0 hash) and checked against each voter's own schedule
+    /// (`check_parent_link`); execution reads the bits from here.
+    #[serde(default)]
+    pub features: u128,
     #[serde(with = "attestation_bytes", default = "attestation_bytes::default")]
     pub sig_attestation: [u8; 64],
 }
@@ -625,6 +635,13 @@ impl TorusBlockHeader {
         buf.extend_from_slice(&self.big_base_fee_per_gas.to_be_bytes());
         buf.extend_from_slice(&self.epoch.to_be_bytes());
         buf.extend_from_slice(self.validator_set_hash.as_slice());
+        // P0.0: the feature bits are agreed per block (`check_parent_link`).
+        // Appended only when a feature is active, so a header without bits keeps
+        // its pre-P0.0 bytes and block hash. Every other field is fixed-width:
+        // the length tells the two encodings apart.
+        if self.features != 0 {
+            buf.extend_from_slice(&self.features.to_be_bytes());
+        }
         buf
     }
 
@@ -1814,13 +1831,12 @@ pub struct ChainConfig {
     /// and safe rollback.
     #[serde(default)]
     pub exec_trust_cache: bool,
-    /// Running state hash activation height (docs/plans/running-state-hash-impl.md):
-    /// the first height every node hashes, from `h_{activation-1}` = zeros.
-    /// CHAIN-WIDE (genesis `consensus.state_hash_activation_height`) so every
-    /// node's chain starts at the same height whatever its applied height at
-    /// upgrade. `None` (any genesis without the field) = running hash disabled.
+    /// P0.0: when each [`Feature`] switches on: genesis `consensus.activations`,
+    /// its old `state_hash_activation_height` alias and the built-in table for
+    /// `chain_id`. CHAIN-WIDE: the header `features` rule checks every block
+    /// against it. Empty = no feature ever active.
     #[serde(default)]
-    pub state_hash_activation_height: Option<u64>,
+    pub activations: ActivationSchedule,
     /// Order-book storage mode (owner s131; genesis `consensus.book_mode`).
     /// CHAIN-WIDE and fixed for the chain's life: modes 1-3 change the state
     /// format, so every node of a chain takes its mode from here (the node
@@ -1858,10 +1874,20 @@ impl ChainConfig {
         if self.max_validators == 0 {
             return Err("max_validators must be >= 1".to_string());
         }
-        if self.state_hash_activation_height == Some(0) {
-            return Err("state_hash_activation_height must be >= 1".to_string());
-        }
         Ok(())
+    }
+
+    /// The running state hash height this node's schedule expects
+    /// (docs/plans/running-state-hash-impl.md): `activations.running_state_hash`
+    /// (the genesis `consensus.state_hash_activation_height` is its alias), 0
+    /// read as 1; `None` = not scheduled. P0.0 phase 3: derived from the
+    /// schedule only, and only an expectation: execution starts the hash at
+    /// the first committed header carrying the `RunningStateHash` bit, never
+    /// at this height (`torus_state::running_hash::configure_activation`).
+    pub fn state_hash_activation_height(&self) -> Option<u64> {
+        self.activations
+            .height_of(Feature::RunningStateHash)
+            .map(|h| h.max(1))
     }
 }
 
@@ -2402,6 +2428,7 @@ mod tests {
             big_base_fee_per_gas: 1_000_000_000,
             epoch: 0,
             validator_set_hash: B256::ZERO,
+            features: 0,
             sig_attestation: [0u8; 64],
         };
         header.sig_attestation = [42u8; 64];
@@ -2438,6 +2465,7 @@ mod tests {
             big_base_fee_per_gas: 1_000_000_000,
             epoch: 0,
             validator_set_hash: B256::ZERO,
+            features: 0,
             sig_attestation: [0u8; 64],
         }
     }
@@ -2706,6 +2734,7 @@ mod tests {
             big_base_fee_per_gas: 1_000_000_000,
             epoch: 0,
             validator_set_hash: B256::ZERO,
+            features: 0,
             sig_attestation: [0u8; 64],
         };
         let mut h2 = h1.clone();
@@ -2733,6 +2762,34 @@ mod tests {
             alloy_primitives::keccak256(h1.canonical_header_bytes()),
             alloy_primitives::keccak256(h2.canonical_header_bytes()),
         );
+    }
+
+    /// P0.0: the feature bits are part of the block identity (two headers
+    /// differing only in them hash differently) and survive the bincode wire
+    /// format and the JSON header record. RED before phase 1: not hashed.
+    #[test]
+    fn features_in_canonical_bytes_and_round_trip() {
+        let a = test_header();
+        let mut b = a.clone();
+        b.features = 1;
+        assert_ne!(a.canonical_header_bytes(), b.canonical_header_bytes());
+        // No bits: the pre-P0.0 encoding (and block hash); bits: 16 BE bytes appended.
+        let base = a.canonical_header_bytes();
+        assert_eq!(base.len(), 8 + 32 + 8 + 20 + 32 + 256 + 8 + 16 + 8 * 4 + 4 + 4 + 8 * 3 + 32);
+        assert_eq!(b.canonical_header_bytes(), [&base[..], &1u128.to_be_bytes()[..]].concat());
+        let mut c = a.clone();
+        c.features = 1 << 127;
+        assert_ne!(b.canonical_header_bytes(), c.canonical_header_bytes());
+        let wire: TorusBlockHeader =
+            bincode::deserialize(&bincode::serialize(&c).unwrap()).unwrap();
+        assert_eq!(wire.features, 1 << 127);
+        // No bits too: the field is always on the bincode wire (never skipped).
+        let wire: TorusBlockHeader =
+            bincode::deserialize(&bincode::serialize(&a).unwrap()).unwrap();
+        assert_eq!(wire.canonical_header_bytes(), base);
+        let json: TorusBlockHeader =
+            serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
+        assert_eq!(json.features, 1 << 127);
     }
 
     /// Item 7 step 1: N is part of the block identity, so two headers that

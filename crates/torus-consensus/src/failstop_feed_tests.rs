@@ -54,7 +54,10 @@ fn chain_config() -> ChainConfig {
         commit_lag_backoff_cap: 0,
         reputation_leader_selection: false,
         exec_trust_cache: false,
-        state_hash_activation_height: None,
+        // P0.0: an empty schedule (no feature, no header bits; the running
+        // state hash off, as `state_hash_activation_height: None` was), so
+        // the fail-stop here is the injected one, never `UPGRADE REQUIRED`.
+        activations: Default::default(),
         book_mode: Default::default(),
     }
 }

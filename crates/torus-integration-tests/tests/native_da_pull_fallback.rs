@@ -78,7 +78,7 @@ fn test_config() -> ChainConfig {
         commit_lag_backoff_cap: 0,
         reputation_leader_selection: false,
         exec_trust_cache: false,
-        state_hash_activation_height: None,
+        activations: Default::default(),
         book_mode: Default::default(),
     }
 }
@@ -122,6 +122,7 @@ fn compact_referencing(body: &SignedNativeAction, height: u64) -> CompactBlock {
             big_base_fee_per_gas: 1_000_000_000,
             epoch: 0,
             validator_set_hash: B256::ZERO,
+            features: 0,
             sig_attestation: [0u8; 64],
         },
         native_action_hashes: vec![compute_action_hash(body)],

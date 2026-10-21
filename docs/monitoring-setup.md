@@ -67,6 +67,13 @@ All metrics are prefixed with `torus_`:
 | `torus_exec_evm_block_seconds` | Histogram | `torus_exec_block_seconds` of the blocks with EVM txs only (exec time at EVM heights vs the rest) |
 | `torus_exec_evm_seconds` | Histogram | The EVM section on the exec thread (validate, plus on the serial path the bundle commit and block metadata), observed every block |
 | `torus_flush_worker_evm_trie_seconds` | Histogram | The flush worker's EVM trie step (hashed mirror + trie nodes) per fast-path EVM block at interval 0, or per checkpoint whose window holds one. Never observed with `TORUS_EVM_FAST_PATH` off (the EVM root runs on the exec thread) |
+| `torus_feature_active{feature,id}` | Gauge | P0.0 feature gating: 1 when the last applied block's header carries the feature, else 0; one series per feature this binary knows (`feature`: genesis name, `id`: bit). Follows the header, not the node's schedule |
+| `torus_feature_activation_height{feature,id}` | Gauge | P0.0: the height a scheduled feature switches on in this node's schedule (genesis `consensus.activations` + the binary's built-in table); unscheduled features have no series |
+| `torus_feature_next_activation_height` | Gauge | P0.0: the next activation above the applied height in this node's schedule (0 = none) |
+| `torus_feature_blocks_until_activation` | Gauge | P0.0: blocks from the applied height to that activation (-1 = none) |
+| `torus_upgrade_required` | Gauge | P0.0: 1 once a header carried a feature this binary does not know (`UPGRADE REQUIRED`); stays 1 until the restart. Alert `UpgradeRequired` |
+| `torus_upgrade_required_feature` / `torus_upgrade_required_height` | Gauge | P0.0: the lowest height met with an unknown feature and its lowest unknown feature id (-1 / 0 = none) |
+| `torus_upgrade_required_refusals_total{site}` | Counter | P0.0: `UPGRADE REQUIRED` refusals by `site`: `vote`, `insert` (also block sync), `propose`, `execute` (the process then exits 70) |
 | `torus_peers_connected` | Gauge | Number of connected P2P peers |
 | `torus_db_size_bytes` | Gauge | Total RocksDB data directory size in bytes |
 
@@ -110,7 +117,7 @@ See `monitoring/alerts/README.md` for detailed setup instructions.
 
 | File | Source | Description |
 |------|--------|-------------|
-| `monitoring/alerts/consensus.yml` | torus-telemetry | Block stalls, consensus issues |
+| `monitoring/alerts/consensus.yml` | torus-telemetry | Block stalls, consensus issues, `UpgradeRequired`, `FeatureActivationApproaching` |
 | `monitoring/alerts/node.yml` | torus-telemetry | Peer count, database size |
 | `monitoring/alerts/infrastructure.yml` | node_exporter | Disk, memory, CPU |
 

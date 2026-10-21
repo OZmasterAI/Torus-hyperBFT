@@ -55,6 +55,7 @@ fn default_block_cfg() -> BlockEnvCfg {
         beneficiary: Address::with_last_byte(0xFF),
         gas_limit: 30_000_000,
         base_fee: 1_000_000_000, // 1 gwei
+        features: 0,
     }
 }
 
@@ -1566,6 +1567,7 @@ fn zero_fee_block_cfg(number: u64) -> BlockEnvCfg {
         beneficiary: Address::with_last_byte(0xFF),
         gas_limit: 30_000_000,
         base_fee: 0,
+        features: 0,
     }
 }
 
@@ -2370,4 +2372,70 @@ fn execute_block_lanes_over_layers_equals_db() {
             .unwrap()
             .is_none()
     );
+}
+
+// ---------------------------------------------------------------------------
+// P0.0 phase 2: a block runs at the spec of its header's feature bits.
+// ---------------------------------------------------------------------------
+
+/// Prague with `RunningStateHash` (id 0), a stand-in for a future spec feature.
+const PRAGUE_WITH_BIT_0: torus_evm::EvmSpecRule = torus_evm::EvmSpecRule {
+    base: torus_evm::SpecId::CANCUN,
+    upgrades: &[(torus_types::Feature::RunningStateHash, torus_evm::SpecId::PRAGUE)],
+};
+
+/// A call carrying 1000 nonzero calldata bytes at gas limit 50000: valid under
+/// Cancun (intrinsic 37000), invalid from Prague (EIP-7623 floor 61000).
+fn floor_tx(nonce: u64) -> TxEnv {
+    TxEnv {
+        caller: ALICE,
+        gas_limit: 50_000,
+        gas_price: 1_000_000_000,
+        kind: TxKind::Call(BOB),
+        data: Bytes::from(vec![0xffu8; 1000]),
+        nonce,
+        chain_id: Some(TORUS_CHAIN_ID),
+        ..Default::default()
+    }
+}
+
+/// RED before P0.0 phase 2: the block ran at Cancun whatever its bits.
+#[test]
+fn block_runs_at_the_spec_of_its_feature_bits() {
+    let rsh = torus_types::Feature::RunningStateHash.bit();
+    for (rule, bits, included) in [
+        (PRAGUE_WITH_BIT_0, 0, true),
+        (PRAGUE_WITH_BIT_0, rsh, false),
+        (torus_evm::BUILTIN_EVM_SPEC_RULE, rsh, true),
+    ] {
+        let (_dir, db) = open_test_db();
+        db.put_account(&ALICE, &test_account(U256::from(10u128.pow(18))))
+            .unwrap();
+        let executor = EvmExecutor::with_spec_rule(TORUS_CHAIN_ID, rule);
+        let cfg = BlockEnvCfg {
+            features: bits,
+            ..default_block_cfg()
+        };
+        // The committed path skips an invalid tx; the strict path refuses the block.
+        let skip = executor
+            .execute_block(&db, &cfg, vec![floor_tx(0)], true)
+            .unwrap();
+        assert_eq!(
+            skip.included_indices.len(),
+            usize::from(included),
+            "bits {bits:#x}, base {:?}",
+            rule.base
+        );
+        let strict = executor.execute_block(&db, &cfg, vec![floor_tx(0)], false);
+        assert_eq!(strict.is_ok(), included, "strict, bits {bits:#x}");
+        let overlay = torus_state::StateOverlay::new(db.clone());
+        let over = executor
+            .execute_block_with_overlay(&overlay, &cfg, vec![floor_tx(0)], true)
+            .unwrap();
+        assert_eq!(over.included_indices.len(), usize::from(included), "overlay");
+        let one = executor
+            .execute_tx(&db, &cfg, floor_tx(0))
+            .is_ok_and(|(r, _)| r.success);
+        assert_eq!(one, included, "execute_tx, bits {bits:#x}");
+    }
 }

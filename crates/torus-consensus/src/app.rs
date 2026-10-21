@@ -1263,7 +1263,7 @@ fn book_coalesce_off_reason(
     } else if checkpoint.is_some_and(|p| p.max_bytes.is_some()) {
         Some("a checkpoint byte cap is set (TORUS_CHECKPOINT_MAX_BYTES): it cannot count the coalesced book blobs")
     } else if hash_activation.is_some() {
-        Some("the running state hash is configured (genesis state_hash_activation_height)")
+        Some("the running state hash is scheduled (genesis activations.running_state_hash) or already on")
     } else {
         book_blocker
     }
@@ -1528,6 +1528,14 @@ struct ExecutionContext {
     /// same value as `TorusApp::genesis_header`): crash replay starts from
     /// it and execution links height 1 to it.
     pub(crate) genesis_header: TorusBlockHeader,
+    /// P0.0: this node's activation schedule (`ChainConfig::activations`).
+    /// Execution runs by the committed header's bits; a header bit this binary
+    /// does not know fail-stops (`UPGRADE REQUIRED`), known bits that differ
+    /// from this schedule are logged.
+    pub(crate) activations: torus_types::ActivationSchedule,
+    /// P0.0: the features this binary knows (`KNOWN_FEATURES`; the phase 5
+    /// cluster tests run an "old binary" with a smaller set).
+    pub(crate) known_features: u128,
     metrics: Option<Arc<torus_telemetry::Metrics>>,
     /// Shared mempool handle for the exec trust-cache read path: a HIT lets the
     /// execution thread reuse a locally-verified sender and skip the secp256k1
@@ -1559,6 +1567,9 @@ struct ExecutionContext {
     header_hook: HeaderHookSlot,
     /// Running state hash: attestation submitter (shared with `TorusApp`).
     state_hash: Arc<crate::state_hash::StateHashMonitor>,
+    /// P0.0 phase 6: the feature-schedule gauges (applied header bits, next
+    /// activation, blocks until it).
+    features: crate::feature_status::FeatureMonitor,
     /// L3 flush-pipe (b): background writer for the exec-time block-body persist
     /// (CF_BLOCK_BODIES), gated by `TORUS_ASYNC_POST_FLUSH`. `Some` moves the
     /// (already-durable-at-dispatch) exec-time body rewrite off the exec critical
@@ -1647,6 +1658,11 @@ struct ExecutionContext {
     /// (needs a checkpoint interval, Classic + resident books and the running
     /// hash not configured), after `checkpoint`.
     book_coalesce: bool,
+    /// P0.0 phase 3: `(height, activation)` as of the last block this context
+    /// executed: the running-hash activation the committed headers define
+    /// (`None`: the `RunningStateHash` bit was off), already in META. `None`
+    /// until the first block. See [`Self::follow_running_hash_bit`].
+    hash_activation: std::sync::Mutex<Option<(u64, Option<u64>)>>,
     /// 8k L3.1 test seam (mutation): a close of this kind skips the
     /// coalesced encode (the books stay owed to a later close).
     #[cfg(test)]
@@ -1660,6 +1676,15 @@ struct ExecutionContext {
     /// `mode` with the resident holder attached.
     #[cfg(test)]
     test_book_mode: Option<torus_bridge::native_executor::BookMode>,
+    /// Test-only (P0.0 phase 2): `(height, ctx.features)` of every native
+    /// context the pipeline built, in execution order.
+    #[cfg(test)]
+    test_exec_features: std::sync::Mutex<Vec<(u64, u128)>>,
+    /// Test-only (P0.0 phase 5): holds the execution thread before a height
+    /// (a node whose execution lags its commits), then lets it go on or dies
+    /// there like a killed process (`p00_cluster_tests`).
+    #[cfg(test)]
+    pub(crate) test_exec_hold: Option<Arc<ExecHold>>,
     /// Test-only: with `test_book_mode` set, build the contexts WITHOUT the
     /// resident holder (the per-block reload, `TORUS_RESIDENT_BOOKS=0`).
     #[cfg(test)]
@@ -2962,7 +2987,7 @@ fn parent_block_ms<B: StateBackend>(
 
 /// The committed header at `height` (its `CF_BLOCK_HEADERS` row: 32-byte hash ‖ JSON). An absent
 /// or undecodable row is a local fault (`Err`): the caller fail-stops.
-fn header_at<B: StateBackend>(
+pub(crate) fn header_at<B: StateBackend>(
     state: &B,
     height: u64,
 ) -> Result<TorusBlockHeader, torus_state::StateError> {
@@ -3112,6 +3137,45 @@ fn datum_evm_transactions(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
     }
 }
 
+/// P0.0: the feature-bit rule at execution (live and crash replay) of a
+/// committed block. Execution runs by the header's bits, never this node's
+/// schedule, so history replays under the rules it was agreed under:
+/// - a bit outside `KNOWN_FEATURES` (a newer release's feature): log
+///   `UPGRADE REQUIRED`, latch the fail-stop and return `true` (the caller
+///   executes and flushes nothing; the applied height stays below it);
+/// - known bits that differ from `schedule.active_at(height)` (another binary
+///   moved a height): log ERROR, return `false` (execute by the header).
+fn feature_bits_fail_stop(
+    header: &TorusBlockHeader,
+    schedule: &torus_types::ActivationSchedule,
+    known: u128,
+    exec_failed: &std::sync::atomic::AtomicBool,
+) -> bool {
+    if let Some(id) = torus_types::features::first_unknown_feature_in(header.features, known) {
+        tracing::error!(
+            height = header.height,
+            feature = id,
+            features = header.features,
+            "UPGRADE REQUIRED: feature {id} at {} -- this binary cannot execute the committed \
+             block (fail-stop)",
+            header.height
+        );
+        exec_failed.store(true, Ordering::SeqCst);
+        return true;
+    }
+    let own = schedule.active_at(header.height);
+    if header.features != own {
+        tracing::error!(
+            height = header.height,
+            features = header.features,
+            own_schedule = own,
+            "committed header feature bits differ from this node's activation schedule -- \
+             executing by the header"
+        );
+    }
+    false
+}
+
 /// s84 decision 2: the link a block's torus header must have to its parent's
 /// before a replica votes for the block or inserts it: `height` = parent
 /// height + 1 and `parent_hash` = keccak of the parent's canonical header
@@ -3130,20 +3194,53 @@ fn datum_evm_transactions(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
 /// where they equal the epoch plan's values (`boundary`, `PlanEvm::resolve`;
 /// an unset value or no plan: the parent's). A plan this node cannot read yet
 /// is `Missing`, like the validator-set plan in `finish_validate`.
+///
+/// P0.0: the header's `features` equal `schedule.active_at(height)` (this
+/// node's activation schedule); a bit outside `KNOWN_FEATURES` is refused with
+/// `UPGRADE REQUIRED`.
 fn check_parent_link(
     header: &TorusBlockHeader,
     justify: &PhaseCertificate,
     genesis: &TorusBlockHeader,
+    schedule: &torus_types::ActivationSchedule,
+    known: u128,
     parent: impl FnOnce(&CryptoHash) -> ParentHeader,
     boundary: impl FnOnce(u64) -> Result<Option<PlanEvm>, EpochPlanNotReady>,
 ) -> BlockDataCheck {
+    check_parent_link_or_upgrade(header, justify, genesis, schedule, known, parent, boundary)
+        .unwrap_or(BlockDataCheck::Invalid)
+}
+
+/// P0.0: a header carries a feature this binary does not know (a newer
+/// release's): this node cannot vote on, insert or execute it, but the block
+/// is not invalid, so a block-sync peer serving it is not at fault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UpgradeRequired {
+    /// The lowest unknown feature id.
+    feature: u32,
+}
+
+/// [`check_parent_link`] telling an unknown feature bit (`Err`) apart from an
+/// invalid header. The vote path folds it into `Invalid` (no vote);
+/// insertion maps it to `ValidateBlockResponse::UnsupportedUpgrade`
+/// ([`insertion_link_response`]), so block sync does not blacklist the
+/// upgraded peer that served the block (Codex review of phase 1, P2).
+fn check_parent_link_or_upgrade(
+    header: &TorusBlockHeader,
+    justify: &PhaseCertificate,
+    genesis: &TorusBlockHeader,
+    schedule: &torus_types::ActivationSchedule,
+    known: u128,
+    parent: impl FnOnce(&CryptoHash) -> ParentHeader,
+    boundary: impl FnOnce(u64) -> Result<Option<PlanEvm>, EpochPlanNotReady>,
+) -> Result<BlockDataCheck, UpgradeRequired> {
     let parent = if justify.is_genesis_pc() {
         genesis.clone()
     } else {
         match parent(&justify.block) {
             ParentHeader::Header(header) => *header,
-            ParentHeader::NotInTree => return BlockDataCheck::Missing,
-            ParentHeader::Undecodable => return BlockDataCheck::Invalid,
+            ParentHeader::NotInTree => return Ok(BlockDataCheck::Missing),
+            ParentHeader::Undecodable => return Ok(BlockDataCheck::Invalid),
         }
     };
     let expected = alloy_primitives::keccak256(parent.canonical_header_bytes());
@@ -3157,7 +3254,7 @@ fn check_parent_link(
             parent_timestamp = parent.timestamp,
             "REJECTED -- block timestamp regresses below its parent's"
         );
-        return BlockDataCheck::Invalid;
+        return Ok(BlockDataCheck::Invalid);
     }
     if header.height != parent.height + 1 || header.parent_hash != expected {
         tracing::warn!(
@@ -3167,14 +3264,38 @@ fn check_parent_link(
             expected_parent = %expected,
             "REJECTED -- header does not link to its parent block's header (ancestry violation)"
         );
-        return BlockDataCheck::Invalid;
+        return Ok(BlockDataCheck::Invalid);
+    }
+    // P0.0: the feature bits are this node's schedule at this height. A bit this binary does not
+    // know is a newer release's feature: no vote, no insertion (owner decision: an old binary
+    // stops). After the link check, so a bogus height is Invalid first.
+    if let Some(id) = torus_types::features::first_unknown_feature_in(header.features, known) {
+        tracing::error!(
+            height = header.height,
+            feature = id,
+            features = header.features,
+            "UPGRADE REQUIRED: feature {id} at {} -- refusing a header with a feature this binary \
+             does not know",
+            header.height
+        );
+        return Err(UpgradeRequired { feature: id });
+    }
+    let want = schedule.active_at(header.height);
+    if header.features != want {
+        tracing::warn!(
+            height = header.height,
+            features = header.features,
+            expected = want,
+            "REJECTED -- header feature bits differ from this node's activation schedule"
+        );
+        return Ok(BlockDataCheck::Invalid);
     }
     // Item 7 steps 1-2: the six EVM values (gas limit, N, M, big gas limit, both base fees) are the
     // rule values. Off a boundary: the parent's. At a boundary: the plan's (unset or no plan: the
     // parent's). After the link check, so a bogus height is Invalid and never waits on a plan.
     let rule = match boundary(header.height) {
         Ok(plan) => plan.unwrap_or_default().resolve(&parent),
-        Err(EpochPlanNotReady) => return BlockDataCheck::Missing,
+        Err(EpochPlanNotReady) => return Ok(BlockDataCheck::Missing),
     };
     let got = torus_types::EvmHeaderValues::of(header);
     if got != rule {
@@ -3184,9 +3305,51 @@ fn check_parent_link(
             ?rule,
             "REJECTED -- EVM header values differ from the rule values"
         );
-        return BlockDataCheck::Invalid;
+        return Ok(BlockDataCheck::Invalid);
     }
-    BlockDataCheck::Held
+    Ok(BlockDataCheck::Held)
+}
+
+/// `validate_block`'s verdict from the parent link (`None`: linked, go on).
+/// An unknown feature bit is `UnsupportedUpgrade`: not inserted, and block
+/// sync ends the session without blacklisting the serving peer.
+fn insertion_link_response(
+    link: Result<BlockDataCheck, UpgradeRequired>,
+) -> Option<ValidateBlockResponse> {
+    match link {
+        Ok(BlockDataCheck::Held) => None,
+        Ok(BlockDataCheck::Missing) => Some(ValidateBlockResponse::MissingData),
+        Ok(BlockDataCheck::Invalid) => Some(ValidateBlockResponse::Invalid),
+        Err(UpgradeRequired { .. }) => Some(ValidateBlockResponse::UnsupportedUpgrade),
+    }
+}
+
+/// [`insertion_link_response`] for the block whose datum is `datum` and
+/// whose hotstuff block commits to `data_hash`. An unknown feature bit is
+/// `UnsupportedUpgrade` (block sync does not blacklist the serving peer) only
+/// for a datum bound to its block: the bytes hash to `data_hash` (Codex
+/// review of phase 2, P2). Otherwise a peer could add an unknown bit to
+/// tampered data and escape the blacklist; tampered data is `Invalid`. The
+/// link checks before the bit (height, parent hash, timestamp) have run; the
+/// rules after it (the schedule's bits, the EVM header values) may be what
+/// the unknown feature changes, so they are not judged here.
+fn insertion_link_response_for_datum(
+    link: Result<BlockDataCheck, UpgradeRequired>,
+    datum: &[u8],
+    data_hash: &CryptoHash,
+) -> Option<ValidateBlockResponse> {
+    if let Err(UpgradeRequired { feature }) = link {
+        if CryptoHash::new(TorusApp::hash_datum(datum)) != *data_hash {
+            tracing::warn!(
+                feature,
+                datum_len = datum.len(),
+                "validate_block: REJECTED -- data_hash mismatch (a datum with an unknown feature \
+                 bit is not an upgrade unless the block commits to it)"
+            );
+            return Some(ValidateBlockResponse::Invalid);
+        }
+    }
+    insertion_link_response(link)
 }
 
 /// Item 7 step 0, pre-vote only (like the native action count): the EVM body
@@ -3494,6 +3657,143 @@ impl ExecutionContext {
             applied,
             "bl2 exec pipeline ENABLED (TORUS_EXEC_PIPELINE=1): flush worker attached after replay"
         );
+    }
+
+    /// P0.0 phase 3: where the `RunningStateHash` bit turned on, for the first
+    /// block (`height`, bit on) this context executes. The parent's stored
+    /// header first (a pipelined parent may not be durable yet: drain once);
+    /// without the bit, `height` itself. Otherwise the stored activation or
+    /// stored chain start, if the stored headers confirm it (the bit at it,
+    /// not below), else `running_hash::header_activation`'s binary search.
+    /// Stored headers that cannot be read (a DB without its old header rows)
+    /// leave the stored value, else 1 (logged): with no chain stored that
+    /// only makes this node hash-unverified. `None`: the fail-stop latched.
+    fn derive_running_hash_activation(&self, height: u64) -> Option<u64> {
+        use torus_state::running_hash::{
+            header_activation, read_activation_height, read_configured_activation,
+        };
+        let rsh = torus_types::Feature::RunningStateHash.bit();
+        let bit_at = |h: u64| header_at(&self.state_db, h).map(|p| p.features & rsh != 0);
+        if height <= 1 {
+            return Some(1);
+        }
+        let parent_on = match bit_at(height - 1) {
+            Ok(on) => Some(on),
+            Err(_) => {
+                if !self.pipeline_barrier() {
+                    return None;
+                }
+                bit_at(height - 1).ok()
+            }
+        };
+        if parent_on == Some(false) {
+            return Some(height);
+        }
+        let stored = read_configured_activation(&self.state_db).filter(|a| *a <= height);
+        let start = read_activation_height(&self.state_db).filter(|s| *s <= height);
+        let starts_at = |a: u64| -> Result<bool, torus_state::StateError> {
+            let on = a == height || bit_at(a)?;
+            Ok(on && (a == 1 || !bit_at(a - 1)?))
+        };
+        for hint in [stored, start].into_iter().flatten() {
+            if let Ok(true) = starts_at(hint) {
+                return Some(hint);
+            }
+        }
+        match header_activation(height, true, bit_at) {
+            Ok(found) => found,
+            Err(e) => {
+                let fallback = stored.or(start).unwrap_or(1);
+                tracing::warn!(
+                    %e,
+                    height,
+                    fallback,
+                    "running state hash: the stored headers do not say where the RunningStateHash \
+                     bit turned on; using the stored activation (with no stored chain this node is \
+                     hash-unverified)"
+                );
+                Some(fallback)
+            }
+        }
+    }
+
+    /// P0.0 phase 3: the running state hash follows the committed headers'
+    /// `RunningStateHash` bit, never this node's schedule: it starts at the
+    /// first header carrying the bit (`h_{H-1}` = zeros), on every node, live
+    /// and in crash replay. Before block `header.height` executes, makes the
+    /// META activation every flush's chain step reads the headers' one
+    /// (`running_hash::header_activation`: `None` while the bit is off).
+    /// Steady state reads nothing; the first block of this context reads at
+    /// most a few stored headers. A change (once per chain, at H; or the
+    /// first block after a boot whose stored value disagrees) first drains
+    /// the pipeline (`pipeline_barrier`: every earlier height durable, the
+    /// flush worker reloads its chain state), then `configure_activation`
+    /// (a stored chain of another definition is discarded). `false`: the
+    /// fail-stop is latched; execute nothing.
+    fn follow_running_hash_bit(&self, header: &TorusBlockHeader) -> bool {
+        use torus_state::running_hash::{configure_activation, read_configured_activation};
+        let rsh = torus_types::Feature::RunningStateHash.bit();
+        let height = header.height;
+        let on = header.features & rsh != 0;
+        let mut last = self.hash_activation.lock().unwrap();
+        let want = match (*last, on) {
+            (Some((_, Some(a))), true) if a <= height => {
+                *last = Some((height, Some(a)));
+                return true;
+            }
+            (Some((_, None)), false) => {
+                *last = Some((height, None));
+                return true;
+            }
+            // The parent (executed by this context) had no bit: H is here.
+            (Some((prev, None)), true) if prev + 1 == height => Some(height),
+            (_, false) => None,
+            // First block of this context with the bit on (or the bit came back).
+            (_, true) => match self.derive_running_hash_activation(height) {
+                Some(want) => Some(want),
+                None => return false,
+            },
+        };
+        let stored = read_configured_activation(&self.state_db);
+        if stored != want {
+            // 8k L3.1 (coalesced book saves) needs the hash off: h_n needs every
+            // block's book bytes. It is on only when this node's schedule has no
+            // running hash, so these headers are another schedule's.
+            if want.is_some() && self.book_coalesce {
+                tracing::error!(
+                    height,
+                    ?want,
+                    "FATAL: the committed headers turn the running state hash on, but L3.1 \
+                     coalesced book saves are on (this node's schedule has no running hash): \
+                     fix the genesis activations and restart (fail-stop)"
+                );
+                self.exec_failed.store(true, Ordering::SeqCst);
+                return false;
+            }
+            if !self.pipeline_barrier() {
+                return false;
+            }
+            match configure_activation(&self.state_db, want) {
+                Ok(discarded) => tracing::info!(
+                    height,
+                    ?stored,
+                    activation = ?want,
+                    discarded,
+                    "running state hash: activation follows the committed headers' RunningStateHash bit"
+                ),
+                Err(e) => {
+                    tracing::error!(
+                        %e,
+                        height,
+                        "FATAL: running state hash: activation write failed (fail-stop)"
+                    );
+                    self.exec_failed.store(true, Ordering::SeqCst);
+                    return false;
+                }
+            }
+        }
+        *last = Some((height, want));
+        true
     }
 
     /// bl2: barrier — every path that writes the DB directly, reads it
@@ -4072,8 +4372,8 @@ impl ExecutionContext {
     /// a checkpoint interval (`self.checkpoint`, set before this) without a
     /// byte cap (`TORUS_CHECKPOINT_MAX_BYTES`: the cap's estimate never sees
     /// the coalesced blobs; owner option C, as b1), the running state hash
-    /// not configured (`hash_activation`: the genesis
-    /// `consensus.state_hash_activation_height`; with the hash on, h_n needs
+    /// not configured (`hash_activation`: the schedule's running-hash height,
+    /// or the one the replayed headers turned on, P0.0 phase 3; with the hash on, h_n needs
     /// every block's book bytes, so this needs L6.1 first) and the process's
     /// book settings ([`torus_bridge::native_executor::book_coalesce_blocker`]).
     /// Otherwise warns once with the reason and stays off. Requested by
@@ -4303,6 +4603,29 @@ impl ExecutionContext {
             &self.genesis_header,
             &self.exec_failed,
         ) {
+            return;
+        }
+
+        // P0.0: execution runs by the committed header's bits (crash replay
+        // too). A bit this binary does not know: fail-stop BEFORE executing.
+        if feature_bits_fail_stop(
+            &torus_block.header,
+            &self.activations,
+            self.known_features,
+            &self.exec_failed,
+        ) {
+            crate::feature_status::report_upgrade_required(
+                self.metrics.as_deref(),
+                "execute",
+                torus_block.header.features,
+                self.known_features,
+                height,
+            );
+            return;
+        }
+        // P0.0 phase 3: the running state hash follows the header's bit (before
+        // anything of this block is flushed).
+        if !self.follow_running_hash_bit(&torus_block.header) {
             return;
         }
 
@@ -4992,7 +5315,14 @@ impl ExecutionContext {
         // once a delisted market's grace is over (until it is settled).
         // A read error is a node fault: fail-stop (C4), never "assume".
         // Bug (b): every boundary block runs it too (validator-set plans).
+        // P0.0 phase 5 (test builds only): the test feature's rule runs in the
+        // native phase, so a block carrying its bit runs that phase.
+        #[cfg(test)]
+        let test_rule = torus_block.header.features & torus_types::Feature::TestStateRule.bit() != 0;
+        #[cfg(not(test))]
+        let test_rule = false;
         let run_native = if has_native
+            || test_rule
             || computed_fee_revenue > 0
             || evm_gas != (0, 0)
             || core_writer_due
@@ -5417,6 +5747,17 @@ impl ExecutionContext {
             ctx.metrics = self.metrics.clone();
             ctx.evm_fee_window = fee_window;
             ctx.evm_gas = evm_gas;
+            // P0.0 phase 2: execution gates features on the committed header's bits,
+            // never this node's schedule (crash replay runs the stored header).
+            ctx.features = torus_block.header.features;
+            // P0.0 phase 5: the test feature's state-visible rule (test builds only).
+            #[cfg(test)]
+            p00_cluster_tests::test_state_rule(&ctx);
+            #[cfg(test)]
+            self.test_exec_features
+                .lock()
+                .unwrap()
+                .push((torus_block.header.height, ctx.features));
             // Plan 9.8: the test-only reference paths (bridge feature
             // `test-reference-paths`, enabled by this crate's dev-dependency).
             #[cfg(test)]
@@ -6455,6 +6796,8 @@ impl ExecutionContext {
             self.metrics.as_deref(),
             &self.exec_failed,
         );
+        // P0.0 phase 6: the feature gauges follow the applied header.
+        self.features.after_block(&torus_block.header);
 
         *self.last_block_end.lock().unwrap() = Some(std::time::Instant::now());
         tracing::info!(height, "execution pipeline: block done");
@@ -6501,6 +6844,16 @@ fn execution_loop(rx: std::sync::mpsc::Receiver<CommittedBlockMsg>, ctx: Executi
             }
             None => durable,
         };
+        // P0.0 phase 5 (test-only): a held execution thread; killed = the
+        // process died here (nothing of this height or later executes).
+        #[cfg(test)]
+        if let Some(hold) = ctx.test_exec_hold.as_ref() {
+            if !hold.may_execute(height) {
+                ctx.exec_failed.store(true, Ordering::SeqCst);
+                tracing::warn!(height, "test: execution thread killed before this height");
+                return;
+            }
+        }
         // T1.5: contain execution panics — a panic here must become a
         // controlled fail-stop (latch + loop exit), not silent thread death
         // with consensus zombie-advancing while state is frozen.
@@ -6636,6 +6989,21 @@ pub struct TorusApp {
     /// the chain config (`evm_gas_limit`, `evm_block_interval`). Height 1 links
     /// to it before the vote, at insertion and at execution.
     pub(crate) genesis_header: TorusBlockHeader,
+    /// P0.0: this node's activation schedule (`ChainConfig::activations`): the
+    /// `features` bits it proposes and requires before the vote and at insertion.
+    pub(crate) activations: torus_types::ActivationSchedule,
+    /// P0.0: the features this binary knows (`KNOWN_FEATURES`; the phase 5
+    /// cluster tests run an "old binary" with a smaller set). A header bit
+    /// outside it: no vote, no insertion, no proposal on it, no execution.
+    pub(crate) known_features: u128,
+    /// Test-only (P0.0 phase 5): every `UPGRADE REQUIRED` refusal of this
+    /// node, `(site, height)` with site `vote` / `insert` / `propose`.
+    #[cfg(test)]
+    pub(crate) test_upgrade_refusals: Arc<std::sync::Mutex<Vec<(&'static str, u64)>>>,
+    /// Test-only (P0.0 phase 5): the execution thread's [`ExecHold`]; a drop
+    /// (the node stopping) kills a held thread, as a killed process.
+    #[cfg(test)]
+    test_exec_hold: Option<Arc<ExecHold>>,
     staking: StakingManager,
     epoch_length: u64,
     last_validator_set: ValidatorSet,
@@ -7462,6 +7830,70 @@ impl Drop for AsyncValidateWorker {
 /// racing-push window distribution is unmeasured — measure on devnet before
 /// finalizing the consts (1 vs 2 slices). The old 5 × 20 ms in-line budget moved
 /// off-thread to the recovery worker (`WORKER_PULL_RETRIES`/`WORKER_PULL_DELAY`).
+/// Construction options of a [`TorusApp`] that are not chain config. The
+/// node uses the defaults.
+#[derive(Clone)]
+pub(crate) struct AppOptions {
+    /// The features this binary knows: `KNOWN_FEATURES`. The P0.0 phase 5
+    /// cluster tests pass a smaller set to run an "old binary" in process.
+    pub(crate) known_features: u128,
+    /// Test-only: hold the execution thread before a height.
+    #[cfg(test)]
+    pub(crate) exec_hold: Option<Arc<ExecHold>>,
+}
+
+impl Default for AppOptions {
+    fn default() -> Self {
+        Self {
+            known_features: torus_types::KNOWN_FEATURES,
+            #[cfg(test)]
+            exec_hold: None,
+        }
+    }
+}
+
+/// Test-only (P0.0 phase 5): the execution thread waits before executing any
+/// height `>= from` until it is killed ([`Self::kill`], which the app's drop
+/// calls: the node stops like a killed process, its consensus side first, so
+/// every block it was fed is durable and nothing is fed it ignores). The
+/// killed thread exits there without executing; the fail-stop latch keeps it
+/// from writing more.
+#[cfg(test)]
+pub(crate) struct ExecHold {
+    pub(crate) from: u64,
+    /// `None` = holding, `Some(false)` = killed.
+    verdict: std::sync::Mutex<Option<bool>>,
+    cv: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl ExecHold {
+    pub(crate) fn new(from: u64) -> Arc<Self> {
+        Arc::new(Self {
+            from,
+            verdict: std::sync::Mutex::new(None),
+            cv: std::sync::Condvar::new(),
+        })
+    }
+
+    pub(crate) fn kill(&self) {
+        *self.verdict.lock().unwrap() = Some(false);
+        self.cv.notify_all();
+    }
+
+    /// Whether the execution thread may execute `height` (blocks while held).
+    fn may_execute(&self, height: u64) -> bool {
+        if height < self.from {
+            return true;
+        }
+        let mut verdict = self.verdict.lock().unwrap();
+        while verdict.is_none() {
+            verdict = self.cv.wait(verdict).unwrap();
+        }
+        verdict.unwrap()
+    }
+}
+
 const RECONSTRUCT_RETRIES: usize = 1;
 const RECONSTRUCT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
 
@@ -7514,6 +7946,29 @@ impl TorusApp {
         mempool: Option<Arc<Mempool>>,
         signing_key: Option<ed25519_dalek::SigningKey>,
     ) -> Result<Self, String> {
+        Self::try_new_with_options(
+            state_db,
+            manifest_db,
+            config,
+            metrics,
+            mempool,
+            signing_key,
+            AppOptions::default(),
+        )
+    }
+
+    /// [`Self::try_new_with_manifest_db`] with [`AppOptions`] (the node uses
+    /// the defaults; the P0.0 phase 5 cluster tests run an "old binary" and a
+    /// node whose execution lags its commits).
+    pub(crate) fn try_new_with_options(
+        state_db: StateDb,
+        manifest_db: StateDb,
+        config: &ChainConfig,
+        metrics: Option<Arc<torus_telemetry::Metrics>>,
+        mempool: Option<Arc<Mempool>>,
+        signing_key: Option<ed25519_dalek::SigningKey>,
+        options: AppOptions,
+    ) -> Result<Self, String> {
         // s131: the consensus executor runs `config.book_mode`; every other
         // context of the process (RPC reads, the checkpoint layer) runs the
         // process mode the node set from the same chain config. Refuse a
@@ -7550,6 +8005,7 @@ impl TorusApp {
             config.dev_pool_address,
         );
         proposer.metrics = metrics.clone();
+        let proposer = proposer.with_activations(config.activations.clone());
         let mut validator = BlockValidator::new(
             config.chain_id,
             config.epoch_length,
@@ -7609,6 +8065,8 @@ impl TorusApp {
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
             genesis_header: genesis_header.clone(),
+            activations: config.activations.clone(),
+            known_features: options.known_features,
             metrics: metrics.clone(),
             mempool: mempool.clone(),
             exec_trust_cache: config.exec_trust_cache,
@@ -7618,6 +8076,11 @@ impl TorusApp {
             fill_sink: fill_sink.clone(),
             header_hook: header_hook.clone(),
             state_hash: state_hash.clone(),
+            features: crate::feature_status::FeatureMonitor::new(
+                metrics.as_deref(),
+                &config.activations,
+                options.known_features,
+            ),
             trade_writer: Some(torus_state::BackgroundCfWriter::spawn(
                 state_db.clone(),
                 "torus-trade-writer",
@@ -7649,12 +8112,17 @@ impl TorusApp {
             ckpt: Default::default(),
             book_mode: config.book_mode,
             book_coalesce: false,
+            hash_activation: Default::default(),
             #[cfg(test)]
             test_coalesce_skip: None,
             #[cfg(test)]
             test_ckpt_due: None,
             #[cfg(test)]
             test_book_mode: None,
+            #[cfg(test)]
+            test_exec_features: Default::default(),
+            #[cfg(test)]
+            test_exec_hold: options.exec_hold.clone(),
             #[cfg(test)]
             test_no_resident: false,
             #[cfg(test)]
@@ -7734,17 +8202,26 @@ impl TorusApp {
         // fail-stop latch — execution parks at `h` and the live heal loop + backfill
         // get a bounded window to close it (see the `exec_next_height` /
         // `exec_hole_since` wiring in the struct literal below).
-        // Running state hash: the CHAIN-WIDE activation height (genesis) must
-        // be in place before the replay flushes any block.
-        if let Err(e) =
-            torus_state::running_hash::configure_activation(&state_db, config.state_hash_activation_height)
-        {
-            tracing::error!(%e, "running state hash: failed to apply the activation config");
-        }
+        // Running state hash (P0.0 phase 3): no boot-time configuration from the
+        // chain config. Execution (the replay included) sets the activation from
+        // the committed headers' RunningStateHash bit before the block that
+        // changes it (`ExecutionContext::follow_running_hash_bit`).
         let (last_header, parked_hole) = Self::replay_committed(&state_db, &exec_ctx);
         // Running state hash: a fail-stop latched before the restart stays
         // latched (persisted record; `TORUS_STATE_HASH_FAILSTOP=1`).
         state_hash.relatch_at_boot(&state_db, &exec_failed);
+        // Owner s134 (option b): a node without a valid running-hash chain
+        // keeps running and voting, reports it (ERROR + gauge) and never
+        // attests until the chain is valid again.
+        state_hash.report_at_boot(&state_db, metrics.as_deref());
+        // P0.0 phase 6: the feature gauges from the last applied header (a
+        // clean restart replays nothing and gets genesis back: read the
+        // durable applied-height header instead).
+        exec_ctx.features.after_block(&Self::feature_gauge_header(
+            &state_db,
+            &exec_ctx,
+            &last_header,
+        ));
 
         // The proposer identity, resolved from the replayed state before the
         // execution thread starts.
@@ -7790,9 +8267,13 @@ impl TorusApp {
             );
         }
         // 8k L3.1: after `checkpoint` (it needs one), before any block runs.
+        // P0.0 phase 3: the schedule's running-hash height, or the one the
+        // replayed headers already turned on.
         exec_ctx.configure_book_coalesce(
             crate::exec_pipeline::book_coalesce_requested(),
-            config.state_hash_activation_height,
+            config
+                .state_hash_activation_height()
+                .or(torus_state::running_hash::read_configured_activation(&state_db)),
         );
         // s124: the epoch fast path only changes which blocks take the
         // pipelined path, so it needs W.
@@ -7872,6 +8353,9 @@ impl TorusApp {
         // Item 7 step 2: the pools follow the last committed header at boot too, so a restarted
         // node admits by the current lanes and fees before its first commit.
         if let Some(ref m) = mempool {
+            // P0.0 phase 2: admission and RPC simulation run at the bits this schedule
+            // expects one height above the committed tip.
+            m.set_activations(config.activations.clone());
             m.set_evm_header(&last_header);
         }
 
@@ -7900,6 +8384,12 @@ impl TorusApp {
             proposer_address,
             last_header,
             genesis_header,
+            activations: config.activations.clone(),
+            known_features: options.known_features,
+            #[cfg(test)]
+            test_upgrade_refusals: Default::default(),
+            #[cfg(test)]
+            test_exec_hold: options.exec_hold.clone(),
             staking,
             epoch_length: config.epoch_length,
             last_validator_set: genesis_validator_set,
@@ -8551,7 +9041,15 @@ impl TorusApp {
             commit_lag_backoff_cap: 0,
             reputation_leader_selection: false,
             exec_trust_cache: false,
-            state_hash_activation_height: None,
+            // P0.0: the running state hash from block 1, as the test fixtures'
+            // headers (`make_block`) carry it.
+            activations: torus_types::ActivationSchedule::merge(
+                &[(torus_types::Feature::RunningStateHash, 1)]
+                    .into_iter()
+                    .collect(),
+                &[],
+            )
+            .expect("a one-feature schedule"),
             book_mode: Default::default(),
         };
         let mut seed = [0u8; 32];
@@ -8575,6 +9073,32 @@ impl TorusApp {
     /// caller parks execution at `h` and lets the live heal loop + block-sync
     /// backfill get a bounded window to re-deliver and heal it, fail-stopping only
     /// if the budget expires — instead of latching the fail-stop pre-network.
+    /// P0.0 phase 6 (Codex P2): the header the boot feature gauges report.
+    /// `replayed` (from [`Self::replay_committed`]) when replay executed a
+    /// block; otherwise (a clean restart: applied == committed, nothing
+    /// replayed, genesis returned) the durable header at the applied height.
+    /// Genesis only when nothing has applied (or that header cannot be read).
+    fn feature_gauge_header(
+        state_db: &StateDb,
+        exec_ctx: &ExecutionContext,
+        replayed: &TorusBlockHeader,
+    ) -> TorusBlockHeader {
+        if replayed.height > 0 {
+            return replayed.clone();
+        }
+        match exec_ctx.applied_height() {
+            Ok(Some(applied)) if applied > 0 => load_replay_header(state_db, applied)
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        applied,
+                        "feature gauges: applied-height header unreadable, reporting from genesis"
+                    );
+                    replayed.clone()
+                }),
+            _ => replayed.clone(),
+        }
+    }
+
     fn replay_committed(
         state_db: &StateDb,
         exec_ctx: &ExecutionContext,
@@ -9057,6 +9581,12 @@ impl Drop for TorusApp {
         // thread latches the fail-stop when its channel closes below.
         if !std::thread::panicking() {
             self.exec_shutdown.store(true, Ordering::SeqCst);
+        }
+        // P0.0 phase 5 (test-only): a held execution thread dies where it
+        // waits (the node is stopping like a killed process).
+        #[cfg(test)]
+        if let Some(hold) = self.test_exec_hold.as_ref() {
+            hold.kill();
         }
         self.exec_tx.take();
         if let Some(handle) = self.exec_handle.take() {
@@ -9611,10 +10141,29 @@ impl TorusApp {
                 (compact.header.clone(), Some(compact))
             }
         };
-        let link = check_parent_link(&header, &block.justify, &self.genesis_header, parent, |h| {
-            self.boundary_evm(h)
-        });
+        let link = check_parent_link(
+            &header,
+            &block.justify,
+            &self.genesis_header,
+            &self.activations,
+            self.known_features,
+            parent,
+            |h| self.boundary_evm(h),
+        );
         if link != BlockDataCheck::Held {
+            if torus_types::features::first_unknown_feature_in(header.features, self.known_features)
+                .is_some()
+            {
+                crate::feature_status::report_upgrade_required(
+                    self.metrics.as_deref(),
+                    "vote",
+                    header.features,
+                    self.known_features,
+                    header.height,
+                );
+                #[cfg(test)]
+                self.test_upgrade_refusals.lock().unwrap().push(("vote", header.height));
+            }
             return link;
         }
         // T0b (rebase s87): refuse to vote for a block too far ahead of this
@@ -9668,6 +10217,31 @@ impl TorusApp {
         parent_header: TorusBlockHeader,
         ancestry: &dyn ProposalAncestry,
     ) -> ProduceBlockResponse {
+        // P0.0: a parent carrying a feature this binary does not know cannot be
+        // executed here; refuse to build on it (owner decision: an old binary stops).
+        if let Some(id) =
+            torus_types::features::first_unknown_feature_in(parent_header.features, self.known_features)
+        {
+            tracing::error!(
+                parent_height = parent_header.height,
+                feature = id,
+                "UPGRADE REQUIRED: feature {id} at {} -- refusing to propose on it",
+                parent_header.height
+            );
+            crate::feature_status::report_upgrade_required(
+                self.metrics.as_deref(),
+                "propose",
+                parent_header.features,
+                self.known_features,
+                parent_header.height,
+            );
+            #[cfg(test)]
+            self.test_upgrade_refusals
+                .lock()
+                .unwrap()
+                .push(("propose", parent_header.height + 1));
+            return refused_proposal();
+        }
         // Bug (b): a planned boundary block needs this node's execution at the
         // previous boundary — check before touching the mempool.
         let next_height = parent_header.height + 1;
@@ -9782,6 +10356,8 @@ impl TorusApp {
                 big_base_fee_per_gas: evm.big_base_fee,
                 epoch: parent_header.epoch,
                 validator_set_hash: parent_header.validator_set_hash,
+                // P0.0: the bits every voter requires at this height (`check_parent_link`).
+                features: self.activations.active_at(next_height),
                 sig_attestation,
             },
             native_actions,
@@ -9938,19 +10514,39 @@ impl App<RocksKVStore> for TorusApp {
         // is inserted), so a block inserted by any path (full proposal, sync,
         // header + body) links to its parent's header.
         let link = match datum_header(datums[0].bytes()) {
-            Some(header) => check_parent_link(
+            Some(header) => check_parent_link_or_upgrade(
                 &header,
                 &block.justify,
                 &self.genesis_header,
+                &self.activations,
+                self.known_features,
                 |hash| tree_parent_header(request.block_tree(), hash),
                 |h| self.boundary_evm(h),
             ),
-            None => BlockDataCheck::Invalid,
+            None => Ok(BlockDataCheck::Invalid),
         };
-        match link {
-            BlockDataCheck::Held => {}
-            BlockDataCheck::Missing => return ValidateBlockResponse::MissingData,
-            BlockDataCheck::Invalid => return ValidateBlockResponse::Invalid,
+        #[cfg(test)]
+        if link.is_err() {
+            let height = datum_header(datums[0].bytes()).map_or(0, |h| h.height);
+            self.test_upgrade_refusals.lock().unwrap().push(("insert", height));
+        }
+        if let Some(response) =
+            insertion_link_response_for_datum(link, datums[0].bytes(), &block.data_hash)
+        {
+            // P0.0 phase 6: only a datum bound to its block is an upgrade
+            // (tampered data with an unknown bit is `Invalid`).
+            if matches!(response, ValidateBlockResponse::UnsupportedUpgrade) {
+                if let Some(header) = datum_header(datums[0].bytes()) {
+                    crate::feature_status::report_upgrade_required(
+                        self.metrics.as_deref(),
+                        "insert",
+                        header.features,
+                        self.known_features,
+                        header.height,
+                    );
+                }
+            }
+            return response;
         }
 
         self.validate_datum_after_fail_stop(datums[0].bytes(), &block.data_hash)
@@ -11637,7 +12233,7 @@ mod exec_throttle_tests {
                 commit_lag_backoff_cap: 0,
                 reputation_leader_selection: false,
                 exec_trust_cache: false,
-                state_hash_activation_height: None,
+                activations: Default::default(),
                 book_mode: Default::default(),
             };
             (config, state_db)
@@ -11841,6 +12437,7 @@ mod exec_dispatch_tests {
                 big_base_fee_per_gas: 1_000_000_000,
                 epoch: 0,
                 validator_set_hash: B256::ZERO,
+                features: 0,
                 sig_attestation: [0u8; 64],
             },
             native_actions,
@@ -13138,12 +13735,15 @@ mod crash_recovery_tests {
             commit_lag_backoff_cap: 0,
             reputation_leader_selection: false,
             exec_trust_cache: false,
-            // Running state hash on from height 1 (chain config), as a
-            // genesis-synced node of a chain with activation 1.
-            state_hash_activation_height: Some(1),
+            // Running state hash on from height 1, as a genesis-synced node
+            // of a chain with activation 1: the schedule here, the bit in
+            // every `make_block` header and the genesis parent header.
+            activations: rsh_at(1),
             book_mode: Default::default(),
         };
-        torus_state::running_hash::configure_activation(&state_db, config.state_hash_activation_height)
+        // P0.0 phase 3: what execution writes before block 1 (with it in
+        // place, block 1 needs no pipeline barrier).
+        torus_state::running_hash::configure_activation(&state_db, config.state_hash_activation_height())
             .expect("configure running hash activation");
         (config, state_db)
     }
@@ -13162,11 +13762,18 @@ mod crash_recovery_tests {
     /// (`make_test_config_and_db`: the default gas limit, N =
     /// `TEST_EVM_BLOCK_INTERVAL`).
     fn default_genesis_header() -> TorusBlockHeader {
-        torus_bridge::genesis_parent_header(
+        let mut header = torus_bridge::genesis_parent_header(
             torus_types::DEFAULT_EVM_GAS_LIMIT,
             TEST_EVM_BLOCK_INTERVAL,
-        )
+        );
+        // P0.0: block 1's bits (`make_test_config_and_db`: the running hash from 1).
+        header.features = TEST_FEATURES;
+        header
     }
+
+    /// P0.0 phase 3: the feature bits of every `make_block` header (the
+    /// running hash on from block 1, as `make_test_config_and_db`'s schedule).
+    const TEST_FEATURES: u128 = torus_types::Feature::RunningStateHash.bit();
 
     fn make_block(height: u64, native_actions: Vec<SignedNativeAction>) -> TorusBlock {
         // Header-identity hardening: the commit-time ancestry check
@@ -13207,6 +13814,7 @@ mod crash_recovery_tests {
                 big_base_fee_per_gas: 1_000_000_000,
                 epoch: 0,
                 validator_set_hash: B256::ZERO,
+                features: TEST_FEATURES,
                 sig_attestation: [0u8; 64],
             },
             native_actions,
@@ -13425,10 +14033,18 @@ mod crash_recovery_tests {
         let (mut config, state_db) = make_test_config_and_db();
         config.evm_gas_limit = 3_000_000;
         config.evm_block_interval = 5;
-        let genesis = torus_bridge::genesis_parent_header(3_000_000, 5);
+        // P0.0: with block 1's bits (`make_test_config_and_db`'s schedule).
+        let genesis = TorusBlockHeader {
+            features: TEST_FEATURES,
+            ..torus_bridge::genesis_parent_header(3_000_000, 5)
+        };
         let hash_3m = alloy_primitives::keccak256(genesis.canonical_header_bytes());
         let hash_30m = alloy_primitives::keccak256(
-            torus_bridge::genesis_parent_header(30_000_000, 5).canonical_header_bytes(),
+            TorusBlockHeader {
+                features: TEST_FEATURES,
+                ..torus_bridge::genesis_parent_header(30_000_000, 5)
+            }
+            .canonical_header_bytes(),
         );
         let latch = AtomicBool::new(false);
         assert!(!detect_parent_link_violation(
@@ -16922,6 +17538,8 @@ mod crash_recovery_tests {
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
             genesis_header: torus_bridge::genesis_parent_header_for(config),
+            activations: config.activations.clone(),
+            known_features: torus_types::KNOWN_FEATURES,
             metrics: None,
             mempool,
             exec_trust_cache,
@@ -16932,6 +17550,7 @@ mod crash_recovery_tests {
             fill_sink: Default::default(),
             header_hook: Default::default(),
             state_hash: Default::default(),
+            features: Default::default(),
             // None -> exec-time body write is synchronous (exact-today). Tests that
             // exercise the async stage build their own writer explicitly.
             post_flush_writer: None,
@@ -16953,12 +17572,17 @@ mod crash_recovery_tests {
             ckpt: Default::default(),
             book_mode: config.book_mode,
             book_coalesce: false,
+            hash_activation: Default::default(),
             #[cfg(test)]
             test_coalesce_skip: None,
             #[cfg(test)]
             test_ckpt_due: None,
             #[cfg(test)]
             test_book_mode: None,
+            #[cfg(test)]
+            test_exec_features: Default::default(),
+            #[cfg(test)]
+            test_exec_hold: None,
             #[cfg(test)]
             test_no_resident: false,
             #[cfg(test)]
@@ -23822,33 +24446,44 @@ mod crash_recovery_tests {
         );
     }
 
-    /// Review finding 1: the activation height is CHAIN-WIDE (chain config):
-    /// nodes that ran a pre-upgrade binary (no running hash) up to different
-    /// applied heights below it — serial or pipelined — and a node synced
-    /// from genesis all hold the identical hash from the activation height
-    /// on. A node whose DB is already above it is hash-unverified.
+    /// Review finding 1, P0.0 phase 3: the activation height is CHAIN-WIDE,
+    /// the first header carrying the `RunningStateHash` bit: nodes stopped at
+    /// different heights below or above it and restarted — serial or
+    /// pipelined — and a node run from genesis all hold the identical hash
+    /// from the activation height on. A node whose DB lost its chain rows
+    /// (restored without them) above it is hash-unverified; it finds the
+    /// activation from the stored headers.
     #[test]
     fn running_hash_chain_wide_activation_nodes_upgraded_at_different_heights_agree() {
         use torus_bridge::native_executor::BookMode;
         use torus_state::running_hash::{
-            configure_activation, read_activation_height, read_running_hash, read_unverified_since,
+            configure_activation, read_activation_height, read_configured_activation,
+            read_running_hash, read_unverified_since,
         };
         let mode = BookMode::LevelAuthorityChunked;
         let act = 6u64;
-        let blocks = book_fixture_blocks();
-        let node = |upgraded_at: usize, on: bool| {
+        let mut blocks: Vec<TorusBlock> = book_fixture_blocks()
+            .into_iter()
+            .map(|b| {
+                let bits = if b.header.height >= act { TEST_FEATURES } else { 0 };
+                with_features(b, bits)
+            })
+            .collect();
+        link_blocks(&mut blocks);
+        let node = |stop_at: usize, on: bool, lose_chain: bool| {
             let (_c, db) = make_test_config_and_db();
-            configure_activation(&db, None).unwrap(); // pre-upgrade binary
             fund_book_fixture(&db);
             let ctx = book_pipeline_ctx(&db, on, None, mode);
-            for b in &blocks[..upgraded_at] {
+            for b in &blocks[..stop_at] {
                 dispatch_and_execute(&ctx, &db, b);
             }
             drop(ctx);
-            configure_activation(&db, Some(act)).unwrap(); // upgrade + restart
+            if lose_chain {
+                configure_activation(&db, None).unwrap(); // the chain rows are gone
+            }
             torus_state::running_hash::capture_begin(&db);
             let ctx = book_pipeline_ctx(&db, on, None, mode);
-            for b in &blocks[upgraded_at..] {
+            for b in &blocks[stop_at..] {
                 dispatch_and_execute(&ctx, &db, b);
             }
             assert!(!ctx.exec_failed.load(Ordering::SeqCst));
@@ -23856,22 +24491,23 @@ mod crash_recovery_tests {
             let captured = torus_state::running_hash::capture_take(&db);
             (db, captured)
         };
-        let (genesis_node, captured) = node(0, false);
+        let (genesis_node, captured) = node(0, false, false);
         assert_eq!(captured.first().map(|(h, _)| *h), Some(act), "first hashed height = activation");
         assert_eq!(read_activation_height(&genesis_node), Some(act));
         let reference = read_running_hash(&genesis_node).unwrap();
         assert_eq!(reference, fold_captured(&captured), "h_act chains from zeros");
         assert_eq!(reference.0, 13);
-        for (upgraded_at, on) in [(2, false), (3, true), (5, false), (5, true)] {
-            let (db, _) = node(upgraded_at, on);
-            assert_eq!(read_running_hash(&db), Some(reference), "upgraded at {upgraded_at} on={on}");
+        for (stop_at, on) in [(2, false), (3, true), (5, false), (5, true), (6, true), (9, false)] {
+            let (db, _) = node(stop_at, on, false);
+            assert_eq!(read_running_hash(&db), Some(reference), "stopped at {stop_at} on={on}");
             assert_eq!(read_unverified_since(&db), None);
         }
-        // DB above the activation height at upgrade: no valid h_{act..}.
-        let (late, captured) = node(8, false);
+        // Chain rows lost above the activation height: no valid h_{act..}.
+        let (late, captured) = node(8, false, true);
         assert!(captured.is_empty(), "never hashed");
         assert_eq!(read_running_hash(&late), None);
         assert_eq!(read_unverified_since(&late), Some(9));
+        assert_eq!(read_configured_activation(&late), Some(act), "found in the stored headers");
     }
 
     /// Task 4: kill after flushing N (committed blocks N+1.. durable, not yet
@@ -24207,32 +24843,35 @@ mod crash_recovery_tests {
         Arc::new(Mempool::new(db.clone(), torus_mempool::MempoolConfig::default()))
     }
 
-    /// Review finding 1: a hash-unverified node (DB above the activation
-    /// height when it upgraded) never attests and reports itself unverified;
-    /// one upgraded below the activation height attests every checkpoint.
+    /// Review finding 1: a hash-unverified node (no valid chain above the
+    /// activation height) never attests and reports itself unverified; one
+    /// with a valid chain across a restart attests every checkpoint.
     #[test]
     fn state_hash_unverified_node_never_attests() {
         use torus_state::running_hash::{configure_activation, read_unverified_since};
         let key = k256::ecdsa::SigningKey::from_slice(&[73u8; 32]).unwrap();
-        for (upgraded_at, attests) in [(30u64, true), (60, false)] {
+        // P0.0 phase 3: hashing from block 1 (the headers' bit); a node whose
+        // chain rows are lost at 60 (restored without them) is unverified.
+        for (restart_at, lose_chain, attests) in [(30u64, false, true), (60, true, false)] {
             let (config, db) = make_test_config_and_db();
             seed_active_validators(&db, &[&key]);
-            configure_activation(&db, None).unwrap();
             let ctx = make_exec_ctx(&config, &db);
-            run_empty_blocks(&ctx, &db, 1, upgraded_at);
+            run_empty_blocks(&ctx, &db, 1, restart_at);
             drop(ctx);
-            configure_activation(&db, Some(50)).unwrap();
+            if lose_chain {
+                configure_activation(&db, None).unwrap();
+            }
             let pool = mempool_for(&db);
             let mut ctx = make_exec_ctx_with_mempool(&config, &db, Some(pool.clone()), false);
             let metrics = Arc::new(torus_telemetry::Metrics::new());
             ctx.metrics = Some(metrics.clone());
             ctx.state_hash.set_attest_key(key.clone());
-            run_empty_blocks(&ctx, &db, upgraded_at + 1, 250);
+            run_empty_blocks(&ctx, &db, restart_at + 1, 250);
             let mut heights: Vec<u64> = pooled_attestations(&pool).iter().map(|(_, h, _)| *h).collect();
             heights.sort();
             let gauge = metric_value(&metrics.encode(), "torus_state_hash_unverified");
             if attests {
-                assert_eq!(heights, vec![100, 200], "upgraded below the activation height: attests");
+                assert_eq!(heights, vec![100, 200], "a valid chain: attests");
                 assert_eq!(gauge, 0.0);
             } else {
                 assert_eq!(read_unverified_since(&db), Some(61));
@@ -24240,6 +24879,70 @@ mod crash_recovery_tests {
                 assert_eq!(gauge, 1.0, "unverified gauge");
             }
         }
+    }
+
+    /// Owner s134 (option b): a node whose running-hash chain rows are lost
+    /// (the stored hash and its start row; checkpoints and the activation
+    /// kept) is reported at boot (the gauge, also through `TorusApp::new`)
+    /// and submits no attestation even before a flush marks it unverified (a
+    /// pipelined node's first `after_block` can run before its first durable
+    /// flush). It keeps executing (no fail-stop) and never attests after.
+    #[test]
+    fn state_hash_lost_chain_rows_reported_at_boot_and_never_attested() {
+        use crate::state_hash::{ChainHealth, StateHashMonitor};
+        use torus_state::cf::{META_RUNNING_STATE_HASH, META_RUNNING_STATE_HASH_ACTIVATION};
+        use torus_state::running_hash::{read_checkpoint, read_unverified_since};
+        let gauge = |m: &torus_telemetry::Metrics| {
+            metric_value(&m.encode(), "torus_state_hash_unverified")
+        };
+        let key = k256::ecdsa::SigningKey::from_slice(&[74u8; 32]).unwrap();
+        let (config, db) = make_test_config_and_db();
+        let fresh = torus_telemetry::Metrics::new();
+        assert_eq!(StateHashMonitor::default().report_at_boot(&db, Some(&fresh)), ChainHealth::Off);
+        seed_active_validators(&db, &[&key]);
+        let ctx = make_exec_ctx(&config, &db);
+        run_empty_blocks(&ctx, &db, 1, 150);
+        drop(ctx);
+        assert!(read_checkpoint(&db, 100).is_some());
+        let healthy = torus_telemetry::Metrics::new();
+        assert_eq!(
+            StateHashMonitor::default().report_at_boot(&db, Some(&healthy)),
+            ChainHealth::Verified
+        );
+        assert_eq!(gauge(&healthy), 0.0);
+
+        for k in [META_RUNNING_STATE_HASH, META_RUNNING_STATE_HASH_ACTIVATION] {
+            db.delete_cf_raw(CF_CONSENSUS_META, k).unwrap();
+        }
+        let booted = Arc::new(torus_telemetry::Metrics::new());
+        drop(TorusApp::new(db.clone(), &config, Some(booted.clone()), None, None));
+        assert_eq!(gauge(&booted), 1.0, "TorusApp boot reports the lost chain");
+
+        let pool = mempool_for(&db);
+        let mut ctx = make_exec_ctx_with_mempool(&config, &db, Some(pool.clone()), false);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        ctx.metrics = Some(metrics.clone());
+        ctx.state_hash.set_attest_key(key.clone());
+        assert_eq!(
+            ctx.state_hash.report_at_boot(&db, Some(&metrics)),
+            ChainHealth::RowsMissing { applied: 150, hashed: None }
+        );
+        assert_eq!(gauge(&metrics), 1.0);
+        // The attest path before any flush marked the node.
+        ctx.state_hash.after_block(
+            &make_block(150, vec![]),
+            &db,
+            Some(&pool),
+            Some(&metrics),
+            &ctx.exec_failed,
+        );
+        assert!(pooled_attestations(&pool).is_empty(), "rows lost: no attestation");
+        assert_eq!(gauge(&metrics), 1.0);
+        run_empty_blocks(&ctx, &db, 151, 250);
+        assert_eq!(read_unverified_since(&db), Some(151));
+        assert!(pooled_attestations(&pool).is_empty(), "hash-unverified: never attests");
+        assert_eq!(gauge(&metrics), 1.0);
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst), "keeps running");
     }
 
     /// Review findings 1 / 5: a node whose local chain broke — a block whose
@@ -25304,6 +26007,8 @@ mod crash_recovery_tests {
         let mut b = make_block(h, vec![]);
         b.header.parent_hash = alloy_primitives::keccak256(parent.header.canonical_header_bytes());
         b.header.timestamp = ts;
+        // P0.0: the parent's feature bits (a bitless parent: a bitless child).
+        b.header.features = parent.header.features;
         b
     }
 
@@ -25357,6 +26062,8 @@ mod crash_recovery_tests {
                 &far.header,
                 &justify_for(&hs_parent),
                 &app.genesis_header,
+                &app.activations,
+                app.known_features,
                 move |_| ParentHeader::Header(Box::new(header)),
                 |_| Ok(None)
             ),
@@ -25402,6 +26109,8 @@ mod crash_recovery_tests {
                     &child_of(&parent, ts).header,
                     &justify_for(&hs_parent),
                     &app.genesis_header,
+                    &app.activations,
+                    app.known_features,
                     move |_| ParentHeader::Header(Box::new(header)),
                     |_| Ok(None)
                 ),
@@ -25475,6 +26184,839 @@ mod crash_recovery_tests {
         }
     }
 
+    // ---- P0.0: header feature bits (docs/plans/p00-activation-height-gating.md) ----
+
+    /// A schedule with `RunningStateHash` (id 0, bit 1) at `height`.
+    fn rsh_at(height: u64) -> torus_types::ActivationSchedule {
+        torus_types::ActivationSchedule::merge(
+            &[(torus_types::Feature::RunningStateHash, height)]
+                .into_iter()
+                .collect(),
+            &[],
+        )
+        .unwrap()
+    }
+
+    /// A bit no binary of this release knows (a feature of a newer release).
+    const UNKNOWN_BIT: u128 = 1 << 9;
+
+    fn gated_app(now: u64, schedule: torus_types::ActivationSchedule) -> TorusApp {
+        let (mut config, db) = make_test_config_and_db();
+        config.activations = schedule;
+        let mut app = TorusApp::new(db, &config, None, None, None);
+        app.test_now_secs = Some(now);
+        app
+    }
+
+    /// `check_parent_link` as `validate_block` runs it on insertion (full
+    /// proposal, header + body, block sync) of `block` on `parent`.
+    fn insertion_link(app: &TorusApp, parent: &TorusBlock, block: &TorusBlock) -> BlockDataCheck {
+        let hs_parent = hs_block(parent, PhaseCertificate::genesis_pc());
+        let header = parent.header.clone();
+        check_parent_link(
+            &block.header,
+            &justify_for(&hs_parent),
+            &app.genesis_header,
+            &app.activations,
+            app.known_features,
+            move |_| ParentHeader::Header(Box::new(header)),
+            |_| Ok(None),
+        )
+    }
+
+    fn with_features(mut block: TorusBlock, features: u128) -> TorusBlock {
+        block.header.features = features;
+        block
+    }
+
+    /// Link `blocks` (from height 1) to the genesis parent header of `config`
+    /// (its block-1 bits) and to each other.
+    fn link_from_genesis(config: &ChainConfig, blocks: &mut [TorusBlock]) {
+        let genesis = torus_bridge::genesis_parent_header_for(config);
+        blocks[0].header.parent_hash = alloy_primitives::keccak256(genesis.canonical_header_bytes());
+        link_blocks(blocks);
+    }
+
+    /// P0.0 header rule: `features` must equal the voter's own
+    /// `schedule.active_at(height)`, before the vote (`check_proposal_data`)
+    /// and at insertion (`validate_block`'s `check_parent_link`): missing the
+    /// bit at the activation height, carrying it one height early, or an extra
+    /// bit are all refused; the honest bits are held.
+    /// RED before phase 1: every variant was `Held` (the bits were not checked).
+    #[test]
+    fn header_feature_bits_must_equal_the_schedule_before_the_vote_and_at_insertion() {
+        let rsh = torus_types::Feature::RunningStateHash.bit();
+        let parent = with_features(tip_2000(), 0); // height 4, no bits
+        let mut app = gated_app(2_010, rsh_at(5));
+        let cases: [(&str, u128, BlockDataCheck); 4] = [
+            ("honest: bit from height 5", rsh, BlockDataCheck::Held),
+            (
+                "bit missing at the activation height",
+                0,
+                BlockDataCheck::Invalid,
+            ),
+            (
+                "extra unknown bit",
+                rsh | UNKNOWN_BIT,
+                BlockDataCheck::Invalid,
+            ),
+            ("only an unknown bit", UNKNOWN_BIT, BlockDataCheck::Invalid),
+        ];
+        for (what, features, want) in cases {
+            let b5 = with_features(child_of(&parent, 2_000), features);
+            assert_eq!(pre_vote(&mut app, &parent, &b5), want, "pre-vote: {what}");
+            assert_eq!(
+                insertion_link(&app, &parent, &b5),
+                want,
+                "insertion: {what}"
+            );
+        }
+        // Past H the bit stays on.
+        let b5 = with_features(child_of(&parent, 2_000), rsh);
+        for (features, want) in [(rsh, BlockDataCheck::Held), (0, BlockDataCheck::Invalid)] {
+            let b6 = with_features(child_of(&b5, 2_000), features);
+            assert_eq!(
+                pre_vote(&mut app, &b5, &b6),
+                want,
+                "height 6, bits {features}"
+            );
+            assert_eq!(
+                insertion_link(&app, &b5, &b6),
+                want,
+                "height 6 insertion, bits {features}"
+            );
+        }
+        // One height early (the voter schedules it at 6): refused.
+        let mut later = gated_app(2_010, rsh_at(6));
+        let early = with_features(child_of(&parent, 2_000), rsh);
+        assert_eq!(
+            pre_vote(&mut later, &parent, &early),
+            BlockDataCheck::Invalid,
+            "early"
+        );
+        assert_eq!(
+            insertion_link(&later, &parent, &early),
+            BlockDataCheck::Invalid,
+            "early"
+        );
+        let on_time = child_of(&parent, 2_000);
+        assert_eq!(
+            pre_vote(&mut later, &parent, &on_time),
+            BlockDataCheck::Held,
+            "below H"
+        );
+    }
+
+    /// P0.0, owner decision (open question 4): an old binary stops at a
+    /// feature it does not know. A header carrying an unknown bit gets no vote
+    /// and is not inserted, and a leader whose parent carries one refuses to
+    /// propose (`refused_proposal`, a datum-less block) instead of building a
+    /// child it cannot execute. RED before phase 1: voted, inserted, proposed.
+    #[test]
+    fn unknown_feature_bit_refuses_the_vote_insertion_and_proposal() {
+        let parent = with_features(tip_2000(), 0); // height 4, no bits
+        let mut old = gated_app(2_010, torus_types::ActivationSchedule::default());
+        let newer = with_features(child_of(&parent, 2_000), UNKNOWN_BIT);
+        assert_eq!(
+            pre_vote(&mut old, &parent, &newer),
+            BlockDataCheck::Invalid,
+            "no vote"
+        );
+        assert_eq!(
+            insertion_link(&old, &parent, &newer),
+            BlockDataCheck::Invalid,
+            "no insert"
+        );
+        assert_eq!(
+            pre_vote(&mut old, &parent, &child_of(&parent, 2_000)),
+            BlockDataCheck::Held,
+            "control: no bits"
+        );
+
+        let resp = old.build_proposal(parent.header.clone());
+        assert!(
+            !resp.data.vec().is_empty(),
+            "control: a known parent gets a proposal"
+        );
+        let resp = old.build_proposal(newer.header.clone());
+        assert!(
+            resp.data.vec().is_empty(),
+            "parent with an unknown bit: refused proposal"
+        );
+        assert!(
+            !old.pending_proposals.contains_key(&6),
+            "nothing built on it"
+        );
+    }
+
+    /// P0.0 phase 6: a node's feature gauges at boot (the schedule, the bits
+    /// of the last applied header, the next activation) and after each applied
+    /// block, and `UPGRADE REQUIRED` from the vote and proposal sites and from
+    /// execution. RED before phase 6: nothing reported.
+    #[test]
+    fn feature_gauges_at_boot_after_each_block_and_on_upgrade_required() {
+        let rsh = torus_types::Feature::RunningStateHash;
+        let series =
+            |m: &torus_telemetry::Metrics, name: &str| -> f64 { metric_value(&m.encode(), name) };
+        let active = format!(
+            "torus_feature_active{{feature=\"{}\",id=\"0\"}}",
+            rsh.name()
+        );
+        let at = format!(
+            "torus_feature_activation_height{{feature=\"{}\",id=\"0\"}}",
+            rsh.name()
+        );
+        // Boot (fresh data dir: the genesis parent header at 0).
+        let (mut config, db) = make_test_config_and_db();
+        config.activations = rsh_at(6);
+        let m = Arc::new(torus_telemetry::Metrics::new());
+        let app = TorusApp::new(db, &config, Some(m.clone()), None, None);
+        assert_eq!(series(&m, &at), 6.0);
+        assert_eq!(series(&m, &active), 0.0);
+        assert_eq!(series(&m, "torus_feature_next_activation_height"), 6.0);
+        assert_eq!(series(&m, "torus_feature_blocks_until_activation"), 6.0);
+        assert_eq!(series(&m, "torus_upgrade_required"), 0.0);
+        drop(app);
+
+        // Execution: the gauges follow each applied header.
+        let (mut config, db) = make_test_config_and_db();
+        config.activations = rsh_at(3);
+        let m = Arc::new(torus_telemetry::Metrics::new());
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.metrics = Some(m.clone());
+        ctx.features = crate::feature_status::FeatureMonitor::new(
+            Some(&m),
+            &config.activations,
+            torus_types::KNOWN_FEATURES,
+        );
+        let mut blocks = vec![
+            with_features(make_block(1, vec![]), 0),
+            with_features(make_block(2, vec![]), 0),
+            with_features(make_block(3, vec![]), rsh.bit()),
+            with_features(make_block(4, vec![]), rsh.bit() | UNKNOWN_BIT),
+        ];
+        link_from_genesis(&config, &mut blocks);
+        let want = [(1, 0.0, 3.0, 2.0), (2, 0.0, 3.0, 1.0), (3, 1.0, 0.0, -1.0)];
+        for (b, (height, on, next, until)) in blocks.iter().zip(want) {
+            ctx.execute_committed_block(b, vec![]);
+            assert_eq!(read_native_applied_height(&db), Some(height));
+            assert_eq!(series(&m, &active), on, "{height}");
+            assert_eq!(
+                series(&m, "torus_feature_next_activation_height"),
+                next,
+                "{height}"
+            );
+            assert_eq!(
+                series(&m, "torus_feature_blocks_until_activation"),
+                until,
+                "{height}"
+            );
+        }
+        assert_eq!(series(&m, "torus_upgrade_required"), 0.0);
+        ctx.execute_committed_block(&blocks[3], vec![]);
+        assert!(ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(series(&m, "torus_upgrade_required"), 1.0);
+        assert_eq!(
+            series(&m, "torus_upgrade_required_feature"),
+            f64::from(UNKNOWN_BIT.trailing_zeros())
+        );
+        assert_eq!(series(&m, "torus_upgrade_required_height"), 4.0);
+        assert_eq!(
+            series(
+                &m,
+                "torus_upgrade_required_refusals_total{site=\"execute\"}"
+            ),
+            1.0
+        );
+        drop(ctx);
+
+        // Vote and proposal refusals.
+        let parent = with_features(tip_2000(), 0); // height 4, no bits
+        let mut old = gated_app(2_010, torus_types::ActivationSchedule::default());
+        let m = Arc::new(torus_telemetry::Metrics::new());
+        old.metrics = Some(m.clone());
+        let newer = with_features(child_of(&parent, 2_000), UNKNOWN_BIT);
+        assert_eq!(
+            pre_vote(&mut old, &parent, &child_of(&parent, 2_000)),
+            BlockDataCheck::Held
+        );
+        assert_eq!(
+            series(&m, "torus_upgrade_required"),
+            0.0,
+            "control: no bits"
+        );
+        assert_eq!(pre_vote(&mut old, &parent, &newer), BlockDataCheck::Invalid);
+        assert_eq!(series(&m, "torus_upgrade_required"), 1.0);
+        assert_eq!(series(&m, "torus_upgrade_required_height"), 5.0);
+        assert_eq!(
+            series(&m, "torus_upgrade_required_refusals_total{site=\"vote\"}"),
+            1.0
+        );
+        assert!(old
+            .build_proposal(newer.header.clone())
+            .data
+            .vec()
+            .is_empty());
+        assert_eq!(
+            series(
+                &m,
+                "torus_upgrade_required_refusals_total{site=\"propose\"}"
+            ),
+            1.0
+        );
+    }
+
+    /// P0.0 phase 6, Codex review (P2): a clean restart (applied == committed,
+    /// nothing to replay, no new block) reports the feature gauges from the
+    /// durable applied-height header, not from genesis: a feature active
+    /// before the restart stays active, the countdown keeps its value.
+    /// RED before the fix: `replay_committed` returned the genesis header, so
+    /// the gauges read inactive / next = activation / until = activation.
+    #[test]
+    fn feature_gauges_after_clean_restart_follow_the_applied_header() {
+        let rsh = torus_types::Feature::RunningStateHash;
+        let series =
+            |m: &torus_telemetry::Metrics, name: &str| -> f64 { metric_value(&m.encode(), name) };
+        let active = format!(
+            "torus_feature_active{{feature=\"{}\",id=\"0\"}}",
+            rsh.name()
+        );
+        // (activation height, applied height, active, next, until)
+        for (at, applied, on, next, until) in [(2u64, 4u64, 1.0, 0.0, -1.0), (6, 2, 0.0, 6.0, 4.0)]
+        {
+            let (mut config, db) = make_test_config_and_db();
+            config.activations = rsh_at(at);
+            let mut blocks: Vec<TorusBlock> = (1..=applied)
+                .map(|h| {
+                    let bits = if h >= at { rsh.bit() } else { 0 };
+                    with_features(make_block(h, vec![]), bits)
+                })
+                .collect();
+            link_from_genesis(&config, &mut blocks);
+            for b in &blocks {
+                persist_block_for_test(&db, b);
+            }
+            write_native_applied_height(&db, applied);
+
+            let m = Arc::new(torus_telemetry::Metrics::new());
+            let app = TorusApp::new(db, &config, Some(m.clone()), None, None);
+            assert_eq!(series(&m, &active), on, "at {at} applied {applied}");
+            assert_eq!(
+                series(&m, "torus_feature_next_activation_height"),
+                next,
+                "at {at} applied {applied}"
+            );
+            assert_eq!(
+                series(&m, "torus_feature_blocks_until_activation"),
+                until,
+                "at {at} applied {applied}"
+            );
+            drop(app);
+        }
+    }
+
+    /// P0.0, Codex review of phase 1 (P2): insertion (`validate_block`, which
+    /// block sync runs through `validate_block_for_sync`) of a header with a
+    /// bit this binary does not know answers `UnsupportedUpgrade`, not
+    /// `Invalid`: block sync then ends the session without blacklisting the
+    /// upgraded peer that served it (`warrants_blacklist`), and this node
+    /// halts at H (no insertion, no vote; execution fail-stops with UPGRADE
+    /// REQUIRED). A header that does not link, or whose known bits differ from
+    /// the schedule, stays `Invalid`. The vote path is unchanged (`Invalid`).
+    /// RED before the fix: `Invalid` (the honest peer was blacklisted).
+    #[test]
+    fn unknown_feature_bit_at_insertion_is_an_unsupported_upgrade_not_invalid() {
+        let rsh = torus_types::Feature::RunningStateHash.bit();
+        let parent = with_features(tip_2000(), 0); // height 4, no bits
+        let mut old = gated_app(2_010, torus_types::ActivationSchedule::default());
+        let link = |app: &TorusApp, block: &TorusBlock| {
+            let hs_parent = hs_block(&parent, PhaseCertificate::genesis_pc());
+            let header = parent.header.clone();
+            insertion_link_response(check_parent_link_or_upgrade(
+                &block.header,
+                &justify_for(&hs_parent),
+                &app.genesis_header,
+                &app.activations,
+                app.known_features,
+                move |_| ParentHeader::Header(Box::new(header)),
+                |_| Ok(None),
+            ))
+        };
+        for bits in [UNKNOWN_BIT, rsh | UNKNOWN_BIT, 1 << 126] {
+            let newer = with_features(child_of(&parent, 2_000), bits);
+            assert!(
+                matches!(
+                    link(&old, &newer),
+                    Some(ValidateBlockResponse::UnsupportedUpgrade)
+                ),
+                "bits {bits:#x}: unsupported upgrade, not invalid"
+            );
+            assert_eq!(
+                pre_vote(&mut old, &parent, &newer),
+                BlockDataCheck::Invalid,
+                "bits {bits:#x}: still no vote"
+            );
+            assert_eq!(
+                insertion_link(&old, &parent, &newer),
+                BlockDataCheck::Invalid,
+                "bits {bits:#x}: the folded link check is unchanged"
+            );
+            // The link is checked first: a header that does not link is invalid.
+            let mut bogus = newer.clone();
+            bogus.header.height += 1;
+            assert!(
+                matches!(link(&old, &bogus), Some(ValidateBlockResponse::Invalid)),
+                "bits {bits:#x}, bad height"
+            );
+        }
+        let wrong_known = with_features(child_of(&parent, 2_000), rsh);
+        assert!(
+            matches!(link(&old, &wrong_known), Some(ValidateBlockResponse::Invalid)),
+            "known bit off-schedule: invalid"
+        );
+        assert!(link(&old, &child_of(&parent, 2_000)).is_none(), "honest: linked");
+    }
+
+    /// P0.0, Codex review of phase 2 (P2): `UnsupportedUpgrade` (no blacklist)
+    /// only for a datum bound to the block: its bytes hash to the hotstuff
+    /// block's `data_hash`. A peer that adds an unknown bit to tampered data
+    /// (the datum no longer matches `data_hash`) is `Invalid`, so block sync
+    /// blacklists it. RED before the fix: the unknown bit answered
+    /// `UnsupportedUpgrade` before the datum hash was checked.
+    #[test]
+    fn tampered_datum_with_an_unknown_bit_is_invalid_not_an_unsupported_upgrade() {
+        let parent = tip_2000();
+        let old = gated_app(2_010, torus_types::ActivationSchedule::default());
+        let hs_parent = hs_block(&parent, PhaseCertificate::genesis_pc());
+        let verdict = |block: &TorusBlock, data_hash: &CryptoHash| {
+            let header = parent.header.clone();
+            let link = check_parent_link_or_upgrade(
+                &block.header,
+                &justify_for(&hs_parent),
+                &old.genesis_header,
+                &old.activations,
+                old.known_features,
+                move |_| ParentHeader::Header(Box::new(header)),
+                |_| Ok(None),
+            );
+            let datum = bincode::serialize(block).unwrap();
+            insertion_link_response_for_datum(link, &datum, data_hash)
+        };
+        let bound = |block: &TorusBlock| {
+            CryptoHash::new(TorusApp::hash_datum(&bincode::serialize(block).unwrap()))
+        };
+        let newer = with_features(child_of(&parent, 2_000), parent.header.features | UNKNOWN_BIT);
+        assert!(
+            matches!(verdict(&newer, &bound(&newer)), Some(ValidateBlockResponse::UnsupportedUpgrade)),
+            "a datum bound to its block: unsupported upgrade"
+        );
+        // Tampered: the block commits to other bytes (another timestamp, or no
+        // unknown bit at all); the served datum carries the unknown bit.
+        let mut other = newer.clone();
+        other.header.timestamp += 1;
+        let plain = with_features(newer.clone(), parent.header.features);
+        for committed in [&other, &plain] {
+            assert!(
+                matches!(verdict(&newer, &bound(committed)), Some(ValidateBlockResponse::Invalid)),
+                "a datum that does not hash to data_hash is invalid (blacklist)"
+            );
+        }
+        assert!(
+            matches!(verdict(&newer, &CryptoHash::new([7; 32])), Some(ValidateBlockResponse::Invalid)),
+            "any other data_hash: invalid"
+        );
+    }
+
+    /// P0.0: the proposer stamps the schedule's bits, the genesis parent header
+    /// carries block 1's bits (from the chain config), and the block it builds
+    /// passes its own pre-vote rule. A voter with another genesis set refuses
+    /// block 1 (another genesis parent header). RED before phase 1: no bits.
+    #[test]
+    fn proposer_stamps_the_scheduled_bits_and_genesis_binds_block_1() {
+        let rsh = torus_types::Feature::RunningStateHash.bit();
+        let no_lookup = |_: &CryptoHash| -> ParentHeader { panic!("genesis justify") };
+        let genesis_hs = |resp: &ProduceBlockResponse| {
+            Block::new(
+                hotstuff_rs::types::data_types::BlockHeight::new(1),
+                PhaseCertificate::genesis_pc(),
+                resp.data_hash,
+                resp.data.clone(),
+            )
+        };
+        // The voters' clock runs an hour ahead: the proposals carry the real
+        // clock, and under a loaded parallel run building an app took > 5 s,
+        // so a clock pinned before it tripped the 5 s drift check (Invalid
+        // for the wrong reason). This test is about bits, not drift.
+        let clock = || unix_now_secs() + 3_600;
+        let mut from_1 = gated_app(clock(), rsh_at(1));
+        assert_eq!(from_1.genesis_header.features, rsh, "genesis parent header");
+        assert_eq!(from_1.last_header.features, rsh);
+        let resp = from_1.build_proposal(from_1.genesis_header.clone());
+        assert_eq!(from_1.pending_proposals[&1].block.header.features, rsh);
+        assert_eq!(
+            from_1.check_proposal_data(&genesis_hs(&resp), no_lookup),
+            BlockDataCheck::Held
+        );
+        let mut without = gated_app(clock(), torus_types::ActivationSchedule::default());
+        assert_eq!(without.genesis_header.features, 0);
+        assert_eq!(
+            without.check_proposal_data(&genesis_hs(&resp), no_lookup),
+            BlockDataCheck::Invalid,
+            "another genesis set: block 1 does not link"
+        );
+
+        // Crossing H = 3 on a non-genesis parent.
+        let mut at_3 = gated_app(clock(), rsh_at(3));
+        let mut parent = make_block(2, vec![]);
+        parent.header.timestamp = unix_now_secs();
+        let _ = at_3.build_proposal(parent.header.clone());
+        let b3 = at_3.pending_proposals[&3].block.clone();
+        assert_eq!(b3.header.features, rsh, "height 3");
+        assert_eq!(pre_vote(&mut at_3, &parent, &b3), BlockDataCheck::Held);
+        let mut parent = make_block(1, vec![]);
+        parent.header.timestamp = unix_now_secs();
+        let _ = at_3.build_proposal(parent.header.clone());
+        assert_eq!(
+            at_3.pending_proposals[&2].block.header.features, 0,
+            "height 2"
+        );
+    }
+
+    /// P0.0 replay rule: execution and crash replay run each committed block
+    /// by its stored header's bits. Known bits that differ from this node's
+    /// schedule (another binary moved a height) execute (logged); a bit this
+    /// binary does not know latches the fail-stop BEFORE that height executes
+    /// (`UPGRADE REQUIRED`): the applied height stays below it.
+    /// RED before phase 1: the unknown-bit height executed (applied 3).
+    #[test]
+    fn execution_and_replay_honour_header_bits_and_fail_stop_on_an_unknown_bit() {
+        let rsh = torus_types::Feature::RunningStateHash.bit();
+        for (bits, fails) in [(rsh, false), (UNKNOWN_BIT, true), (rsh | UNKNOWN_BIT, true)] {
+            for replay in [false, true] {
+                let what = format!("bits {bits:#x}, replay={replay}");
+                let (mut config, db) = make_test_config_and_db();
+                config.activations = Default::default(); // own schedule: none
+                let ctx = make_exec_ctx(&config, &db);
+                let mut blocks = vec![
+                    with_features(make_block(1, vec![]), 0),
+                    with_features(make_block(2, vec![]), bits),
+                    with_features(make_block(3, vec![]), bits),
+                ];
+                link_from_genesis(&config, &mut blocks);
+                if replay {
+                    for b in &blocks {
+                        persist_committed_block_durably(&db, b);
+                    }
+                    let (last, parked) = TorusApp::replay_committed(&db, &ctx);
+                    assert_eq!(parked, None, "{what}");
+                    assert_eq!(last.height, if fails { 1 } else { 3 }, "{what}");
+                    if !fails {
+                        assert_eq!(last.features, bits, "{what}: the stored bits");
+                    }
+                } else {
+                    for b in &blocks {
+                        ctx.execute_committed_block(b, vec![]);
+                    }
+                }
+                assert_eq!(ctx.exec_failed.load(Ordering::SeqCst), fails, "{what}");
+                let applied = if fails { 1 } else { 3 };
+                assert_eq!(read_native_applied_height(&db), Some(applied), "{what}");
+            }
+        }
+    }
+
+    /// P0.0 phase 2: a call with 1000 nonzero calldata bytes at gas limit 50000
+    /// from `key`: valid under Cancun (intrinsic 37000), invalid from Prague
+    /// (EIP-7623 floor 61000).
+    fn floor_tx(key: &k256::ecdsa::SigningKey, nonce: u64) -> Vec<u8> {
+        let to = alloy_primitives::TxKind::Call(Address::repeat_byte(0x42));
+        signed_eip1559_gas(key, nonce, to, vec![0xff; 1000], U256::ZERO, 50_000)
+    }
+
+    /// P0.0 phase 2: execution and crash replay run each committed block at
+    /// its stored header's bits, not at this node's schedule: the native
+    /// context gets the header's `features`, and the EVM runs at the spec of
+    /// those bits (here a rule moving to Prague with bit 0, under which the
+    /// floor tx is skipped). Both ways: a node without the feature executes a
+    /// header carrying it, and a node scheduling it executes a header without
+    /// it, by the header. RED before phase 2: the native context saw 0 and
+    /// the EVM ran at Cancun whatever the header said.
+    #[test]
+    fn execution_and_replay_run_at_the_header_bits_not_the_local_schedule() {
+        const PRAGUE_WITH_BIT_0: torus_evm::EvmSpecRule = torus_evm::EvmSpecRule {
+            base: torus_evm::SpecId::CANCUN,
+            upgrades: &[(
+                torus_types::Feature::RunningStateHash,
+                torus_evm::SpecId::PRAGUE,
+            )],
+        };
+        let rsh = torus_types::Feature::RunningStateHash.bit();
+        let key = k256::ecdsa::SigningKey::from_slice(&[83u8; 32]).unwrap();
+        let sender = {
+            let pubkey = key.verifying_key().to_encoded_point(false);
+            Address::from_slice(&alloy_primitives::keccak256(&pubkey.as_bytes()[1..])[12..])
+        };
+        for (own, bits) in [
+            (torus_types::ActivationSchedule::default(), rsh),
+            (rsh_at(2), 0),
+        ] {
+            for replay in [false, true] {
+                let what = format!("own {own:?}, header bits {bits:#x}, replay={replay}");
+                let (mut config, db) = make_test_config_and_db();
+                config.activations = own.clone();
+                db.put_account(
+                    &sender,
+                    &revm::state::AccountInfo {
+                        balance: U256::from(10u128.pow(18)),
+                        nonce: 0,
+                        code_hash: KECCAK_EMPTY_CODE,
+                        code: None,
+                        account_id: None,
+                    },
+                )
+                .unwrap();
+                let mut ctx = make_exec_ctx(&config, &db);
+                ctx.evm_executor = EvmExecutor::with_spec_rule(config.chain_id, PRAGUE_WITH_BIT_0);
+                // A native action, so block 2 builds a native context whatever its EVM part.
+                let mut blocks = vec![
+                    with_features(make_block(1, vec![]), 0),
+                    make_block(2, vec![sign_claim_rewards(0)]),
+                ];
+                blocks[1].evm_transactions = vec![floor_tx(&key, 0)];
+                blocks[1].header.evm_tx_count = 1;
+                blocks[1].header.features = bits;
+                link_from_genesis(&config, &mut blocks);
+                if replay {
+                    for b in &blocks {
+                        persist_committed_block_durably(&db, b);
+                    }
+                    let (last, parked) = TorusApp::replay_committed(&db, &ctx);
+                    assert_eq!(parked, None, "{what}");
+                    assert_eq!(last.height, 2, "{what}");
+                } else {
+                    for b in &blocks {
+                        let durable = persist_committed_block_durably(&db, b);
+                        ctx.execute_committed_block_with(b, vec![], durable);
+                    }
+                }
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}");
+                let seen = ctx.test_exec_features.lock().unwrap().clone();
+                assert_eq!(seen.last(), Some(&(2, bits)), "{what}: native ctx bits");
+                drop(ctx);
+                let nonce = db.get_account(&sender).unwrap().map_or(0, |a| a.nonce);
+                let included = bits & rsh == 0;
+                assert_eq!(nonce, u64::from(included), "{what}: EVM spec of the header bits");
+            }
+        }
+    }
+
+    // ---- P0.0 phase 3: the running state hash follows the header bit ----
+
+    /// P0.0 phase 3 fixture: empty blocks 1..=n linked from `genesis` (the
+    /// nodes' genesis parent header), carrying the `RunningStateHash` bit from
+    /// height `from` on (`None`: never).
+    fn p3_blocks(genesis: &TorusBlockHeader, n: u64, from: Option<u64>) -> Vec<TorusBlock> {
+        let rsh = torus_types::Feature::RunningStateHash.bit();
+        let mut blocks: Vec<TorusBlock> = (1..=n)
+            .map(|h| {
+                let bits = if from.is_some_and(|f| h >= f) { rsh } else { 0 };
+                with_features(make_block(h, vec![]), bits)
+            })
+            .collect();
+        blocks[0].header.parent_hash = alloy_primitives::keccak256(genesis.canonical_header_bytes());
+        link_blocks(&mut blocks);
+        blocks
+    }
+
+    /// The chain config of a node whose genesis schedules `RunningStateHash`
+    /// at `local` (`None`: never). Never at 1: block 1's bits are in the
+    /// genesis parent header, so such a node could not link the fixture.
+    fn p3_config(local: Option<u64>) -> ChainConfig {
+        assert!(local.is_none_or(|h| h > 1));
+        let (mut config, _) = make_test_config_and_db();
+        config.activations = local.map(rsh_at).unwrap_or_default();
+        config
+    }
+
+    /// Boot a node on `db` with `config` (`TorusApp::new`: the boot-time
+    /// running-hash setup and the crash replay of every committed block above
+    /// the applied height), then shut it down.
+    fn p3_boot(db: &StateDb, config: &ChainConfig) {
+        drop(TorusApp::new(db.clone(), config, None, None, None));
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum P3Exec {
+        Serial,
+        Pipelined,
+        /// Pipelined with a checkpoint every 3 blocks.
+        Checkpointed,
+    }
+
+    /// Execute `blocks` live (dispatch + execute) on `db` in `mode`, then
+    /// drain: every executed height is durable.
+    fn p3_execute(db: &StateDb, config: &ChainConfig, blocks: &[TorusBlock], mode: P3Exec) {
+        let mut ctx = make_exec_ctx(config, db);
+        match mode {
+            P3Exec::Serial => {}
+            P3Exec::Pipelined => ctx.attach_flush_worker(None),
+            P3Exec::Checkpointed => {
+                ctx.checkpoint = Some(ckpt_every(3));
+                ctx.attach_flush_worker(None);
+            }
+        }
+        for b in blocks {
+            dispatch_and_execute(&ctx, db, b);
+        }
+        assert!(ctx.pipeline_barrier(), "{mode:?}: W failed");
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{mode:?}: fail-stop");
+    }
+
+    /// `(N, h_N)` of a node scheduling the bit where the headers carry it
+    /// (`H`), executing `blocks` serially; asserts nothing is hashed below
+    /// `H` and the chain starts at `H`.
+    fn p3_reference(blocks: &[TorusBlock], h: u64) -> (u64, [u8; 32]) {
+        use torus_state::running_hash::{read_activation_height, read_running_hash};
+        let config = p3_config(Some(h));
+        let (_, db) = make_test_config_and_db();
+        p3_boot(&db, &config);
+        let below = (h - 1) as usize;
+        p3_execute(&db, &config, &blocks[..below], P3Exec::Serial);
+        assert_eq!(read_running_hash(&db), None, "reference: nothing hashed below H");
+        p3_execute(&db, &config, &blocks[below..=below], P3Exec::Serial);
+        assert_eq!(read_running_hash(&db).map(|(at, _)| at), Some(h), "reference: hashed at H");
+        assert_eq!(read_activation_height(&db), Some(h), "reference: chain starts at H");
+        p3_execute(&db, &config, &blocks[h as usize..], P3Exec::Serial);
+        let end = read_running_hash(&db).expect("reference: hashed");
+        assert_eq!(end.0, blocks.len() as u64);
+        end
+    }
+
+    /// The running-hash rows of `db` after a P0.0 phase 3 run, against the
+    /// uninterrupted reference.
+    fn p3_assert_chain(db: &StateDb, h: u64, reference: (u64, [u8; 32]), what: &str) {
+        use torus_state::running_hash::{
+            read_activation_height, read_configured_activation, read_running_hash,
+            read_unverified_since,
+        };
+        assert_eq!(read_native_applied_height(db), Some(reference.0), "{what}: applied");
+        assert_eq!(read_unverified_since(db), None, "{what}: hash-verified");
+        assert_eq!(
+            read_activation_height(db),
+            Some(h),
+            "{what}: the chain starts at the first header with the bit"
+        );
+        assert_eq!(read_configured_activation(db), Some(h), "{what}: configured from the headers");
+        assert_eq!(read_running_hash(db), Some(reference), "{what}: the same h_n");
+    }
+
+    /// P0.0 phase 3: the running state hash starts at the first block whose
+    /// header carries the `RunningStateHash` bit (`h_{H-1}` = zeros), on every
+    /// node whatever its own genesis schedule (none, earlier, the same,
+    /// later), executed live (serial, pipelined, pipelined with checkpoints)
+    /// or by the boot replay: the same activation record and the same h_n as
+    /// a node scheduling it at H. A chain whose headers never carry the bit is
+    /// never hashed, even on a node scheduling it.
+    /// RED before phase 3: the hash followed the node's own schedule (the
+    /// boot-time `configure_activation` from the chain config).
+    #[test]
+    fn running_hash_starts_at_the_first_header_with_the_bit_whatever_the_local_schedule() {
+        use torus_state::running_hash::{
+            read_activation_height, read_configured_activation, read_running_hash,
+        };
+        const H: u64 = 5;
+        const N: u64 = 12;
+        let genesis = torus_bridge::genesis_parent_header_for(&p3_config(None));
+        let blocks = p3_blocks(&genesis, N, Some(H));
+        let reference = p3_reference(&blocks, H);
+        for local in [None, Some(3), Some(H), Some(8)] {
+            let config = p3_config(local);
+            for mode in [
+                Some(P3Exec::Serial),
+                Some(P3Exec::Pipelined),
+                Some(P3Exec::Checkpointed),
+                None,
+            ] {
+                let what = format!("local schedule {local:?}, {}", match mode {
+                    Some(m) => format!("live {m:?}"),
+                    None => "boot replay".into(),
+                });
+                let (_, db) = make_test_config_and_db();
+                p3_boot(&db, &config);
+                match mode {
+                    Some(m) => p3_execute(&db, &config, &blocks, m),
+                    None => {
+                        for b in &blocks {
+                            persist_committed_block_durably(&db, b);
+                        }
+                        p3_boot(&db, &config);
+                    }
+                }
+                p3_assert_chain(&db, H, reference, &what);
+            }
+        }
+        // Headers without the bit: never hashed, whatever the local schedule.
+        let plain = p3_blocks(&genesis, N, None);
+        for local in [Some(3), Some(8)] {
+            let config = p3_config(local);
+            for replay in [false, true] {
+                let what = format!("no bit, local schedule {local:?}, replay={replay}");
+                let (_, db) = make_test_config_and_db();
+                p3_boot(&db, &config);
+                if replay {
+                    for b in &plain {
+                        persist_committed_block_durably(&db, b);
+                    }
+                    p3_boot(&db, &config);
+                } else {
+                    p3_execute(&db, &config, &plain, P3Exec::Pipelined);
+                }
+                assert_eq!(read_native_applied_height(&db), Some(N), "{what}");
+                assert_eq!(read_running_hash(&db), None, "{what}: nothing hashed");
+                assert_eq!(read_activation_height(&db), None, "{what}");
+                assert_eq!(read_configured_activation(&db), None, "{what}");
+            }
+        }
+    }
+
+    /// P0.0 phase 3: a node stopped before, just before, at, just after and
+    /// after the activation height H and restarted (continuing live, or
+    /// replaying the committed blocks above its applied height at boot)
+    /// holds the same chain as an uninterrupted node: start H, the same h_n.
+    /// Its own schedule is none, H or a later height.
+    /// RED before phase 3: nodes not scheduling H hashed from their own
+    /// height (or never).
+    #[test]
+    fn running_hash_restart_before_at_and_after_the_activation_matches_an_uninterrupted_node() {
+        const H: u64 = 5;
+        const N: u64 = 12;
+        let genesis = torus_bridge::genesis_parent_header_for(&p3_config(None));
+        let blocks = p3_blocks(&genesis, N, Some(H));
+        let reference = p3_reference(&blocks, H);
+        for local in [None, Some(H), Some(8)] {
+            let config = p3_config(local);
+            for stop in [3, H - 1, H, H + 1, 8] {
+                for replay in [false, true] {
+                    let what = format!("local schedule {local:?}, stop at {stop}, replay={replay}");
+                    let (_, db) = make_test_config_and_db();
+                    p3_boot(&db, &config);
+                    p3_execute(&db, &config, &blocks[..stop as usize], P3Exec::Pipelined);
+                    let rest = &blocks[stop as usize..];
+                    if replay {
+                        for b in rest {
+                            persist_committed_block_durably(&db, b);
+                        }
+                        p3_boot(&db, &config);
+                    } else {
+                        p3_boot(&db, &config);
+                        p3_execute(&db, &config, rest, P3Exec::Serial);
+                    }
+                    p3_assert_chain(&db, H, reference, &what);
+                }
+            }
+        }
+    }
+
     // ---- item 7 step 0: EVM header rules before the vote ----
 
     /// A signed EVM tx declaring `gas_limit` (a plain call, zero value).
@@ -25544,6 +27086,8 @@ mod crash_recovery_tests {
                     &b.header,
                     &justify_for(&hs_parent),
                     &app.genesis_header,
+                    &app.activations,
+                    app.known_features,
                     move |_| ParentHeader::Header(Box::new(header)),
                     |_| Ok(None)
                 ),
@@ -25757,6 +27301,8 @@ mod crash_recovery_tests {
             &block.header,
             &justify_for(&hs_parent),
             &app.genesis_header,
+            &app.activations,
+            app.known_features,
             move |_| ParentHeader::Header(Box::new(header)),
             boundary,
         )
@@ -28426,7 +29972,7 @@ mod crash_recovery_tests {
                     drop(ctx);
                     drop(db);
                     db = StateDb::open(&dir).expect("reopen the state db");
-                    torus_state::running_hash::configure_activation(&db, config.state_hash_activation_height)
+                    torus_state::running_hash::configure_activation(&db, config.state_hash_activation_height())
                         .expect("configure running hash activation");
                     assert_eq!(adl_rows(&db), 8, "mid-drain after the reopen");
                     ctx = open_ctx(&db);
@@ -40230,7 +41776,12 @@ mod crash_recovery_tests {
         probe: Option<&BlockProbe>,
         fast: Option<bool>,
     ) -> P2Run {
-        let (config, db) = p2_fixture();
+        let (mut config, db) = p2_fixture();
+        // P0.0: a fixture whose headers carry no running-hash bit runs on a
+        // chain without it (its genesis parent header has no bits).
+        if blocks.first().is_some_and(|b| b.header.features == 0) {
+            config.activations = Default::default();
+        }
         seed(&db);
         torus_state::running_hash::capture_begin(&db);
         let metrics = Arc::new(torus_telemetry::Metrics::new());
@@ -40832,9 +42383,20 @@ mod crash_recovery_tests {
     /// never closed by time is still open at shutdown.
     const L31_BLOCKS: u64 = 260;
 
-    /// The deep P2 stream (reduce-only places on) over `L31_BLOCKS` heights.
+    /// The deep P2 stream (reduce-only places on) over `L31_BLOCKS` heights,
+    /// on a chain without the running state hash (L3.1 runs only with it off;
+    /// P0.0 phase 3: the hash follows the header bit, so no header carries it
+    /// and `p2_run_full` runs them on a genesis without it).
     fn l31_blocks() -> Vec<TorusBlock> {
-        p2_blocks_len(L31_BLOCKS, true, false, true).0
+        let mut blocks: Vec<TorusBlock> = p2_blocks_len(L31_BLOCKS, true, false, true)
+            .0
+            .into_iter()
+            .map(|b| with_features(b, 0))
+            .collect();
+        let (mut config, _) = make_test_config_and_db();
+        config.activations = Default::default();
+        link_from_genesis(&config, &mut blocks);
+        blocks
     }
 
     /// The deep traders, and the running state hash NOT configured (L3.1
@@ -41084,7 +42646,8 @@ mod crash_recovery_tests {
         };
 
         // Mid-window: the rebuild fail-stops.
-        let (config, db) = p2_fixture();
+        let (mut config, db) = p2_fixture();
+        config.activations = Default::default(); // `l31_blocks`: no running hash
         l31_seed(&db);
         let mut ctx = ctx_for(&config, &db, ckpt_never());
         ctx.attach_flush_worker(None);
@@ -41127,7 +42690,8 @@ mod crash_recovery_tests {
         );
 
         // Right after a close: nothing owed, a plain rebuild.
-        let (config, db) = p2_fixture();
+        let (mut config, db) = p2_fixture();
+        config.activations = Default::default(); // `l31_blocks`: no running hash
         l31_seed(&db);
         let mut ctx = ctx_for(&config, &db, ckpt_every(5));
         ctx.attach_flush_worker(None);
@@ -47142,3 +48706,8 @@ mod crash_recovery_tests {
         );
     }
 }
+
+/// P0.0 phase 5: the multi-node activation tests (test plan items 1-4).
+#[cfg(test)]
+#[path = "p00_cluster_tests.rs"]
+mod p00_cluster_tests;

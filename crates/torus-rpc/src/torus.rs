@@ -160,6 +160,12 @@ pub trait TorusApi {
     #[method(name = "getEpoch")]
     async fn get_epoch(&self) -> RpcResult<RpcEpochInfo>;
 
+    /// P0.0 phase 6: this node's feature activation schedule (name, bit,
+    /// height, active at the latest block), the features this binary knows,
+    /// the next activation and whether this node met an `UPGRADE REQUIRED`.
+    #[method(name = "getFeatureSchedule")]
+    async fn get_feature_schedule(&self) -> RpcResult<RpcFeatureSchedule>;
+
     #[method(name = "getDelegations")]
     async fn get_delegations(&self, delegator: String) -> RpcResult<Vec<RpcDelegation>>;
 
@@ -1140,6 +1146,55 @@ fn book_read_err(e: torus_core::error::CoreError) -> ErrorObjectOwned {
 /// hold, so a user at the cap still sees every resting order.
 const OPEN_ORDERS_LIMIT: usize = OPEN_ORDER_MAX_LIMIT as usize;
 
+/// P0.0 phase 6: the `torus_getFeatureSchedule` reply for `schedule` (this
+/// node's), the features `known` (the node passes `KNOWN_FEATURES`), at the
+/// latest served `height`, with the node's `UPGRADE REQUIRED` state
+/// (`(feature id, height)`).
+pub(crate) fn feature_schedule(
+    schedule: &torus_types::ActivationSchedule,
+    known: u128,
+    chain_id: u64,
+    height: u64,
+    upgrade: Option<(u32, u64)>,
+) -> RpcFeatureSchedule {
+    let builtin = torus_types::features::builtin_activations(chain_id);
+    let feature_bit = |f: torus_types::Feature| format!("{:#x}", f.bit());
+    let next = schedule.next_activation_after(height);
+    RpcFeatureSchedule {
+        chain_id: hex_u64(chain_id),
+        height: hex_u64(height),
+        active_bits: format!("{:#x}", schedule.active_at(height)),
+        known_bits: format!("{known:#x}"),
+        known_features: torus_types::Feature::ALL
+            .iter()
+            .filter(|f| known & f.bit() != 0)
+            .map(|&f| RpcKnownFeature {
+                name: f.name().to_string(),
+                id: f.id(),
+                bit: feature_bit(f),
+            })
+            .collect(),
+        schedule: schedule
+            .iter()
+            .filter(|(f, _)| known & f.bit() != 0)
+            .map(|(f, at)| RpcScheduledFeature {
+                name: f.name().to_string(),
+                id: f.id(),
+                bit: feature_bit(f),
+                activation_height: hex_u64(at),
+                active: schedule.active_at(height) & f.bit() != 0,
+                built_in: builtin.iter().any(|(b, _)| *b == f),
+            })
+            .collect(),
+        next_activation_height: next.map(hex_u64),
+        blocks_until_activation: next.map(|n| hex_u64(n - height)),
+        upgrade_required: upgrade.map(|(feature, at)| RpcUpgradeRequired {
+            feature,
+            height: hex_u64(at),
+        }),
+    }
+}
+
 #[async_trait]
 impl TorusApiServer for RpcState {
     // === 2.9.1: Trading reads ===
@@ -1651,6 +1706,24 @@ impl TorusApiServer for RpcState {
             .collect();
 
         Ok(result)
+    }
+
+    async fn get_feature_schedule(&self) -> RpcResult<RpcFeatureSchedule> {
+        let upgrade = self.metrics.as_deref().and_then(|m| {
+            (m.upgrade_required.get() != 0).then(|| {
+                (
+                    u32::try_from(m.upgrade_required_feature.get()).unwrap_or(0),
+                    u64::try_from(m.upgrade_required_height.get()).unwrap_or(0),
+                )
+            })
+        });
+        Ok(feature_schedule(
+            &self.activations,
+            torus_types::KNOWN_FEATURES,
+            self.chain_id,
+            self.latest_height.load(Ordering::Relaxed),
+            upgrade,
+        ))
     }
 
     async fn get_epoch(&self) -> RpcResult<RpcEpochInfo> {

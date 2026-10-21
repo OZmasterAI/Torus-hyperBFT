@@ -2887,7 +2887,11 @@ impl<N: Network> HotStuff<N> {
         let validation = app.validate_block(validate_block_request);
         let trace_validated = trace_start.map(|_| crate::logging::BodyFetchTraceStamp::capture());
         // Read the discriminant before the `if let` below moves `validation`'s fields.
-        let app_invalid = matches!(validation, ValidateBlockResponse::Invalid);
+        // An unsupported upgrade is not inserted either, exactly like `Invalid` (P0.0).
+        let app_invalid = matches!(
+            validation,
+            ValidateBlockResponse::Invalid | ValidateBlockResponse::UnsupportedUpgrade
+        );
 
         if let ValidateBlockResponse::Valid {
             app_state_updates,

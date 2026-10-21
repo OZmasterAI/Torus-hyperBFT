@@ -1,7 +1,7 @@
 //! EVM execution engine for the Torus-hyperBFT blockchain.
 //!
-//! Wraps [revm](https://crates.io/crates/revm) (v36, Cancun spec) to execute
-//! EVM transactions against a [`torus_state::StateDb`] backend.
+//! Wraps [revm](https://crates.io/crates/revm) (v36; each block runs at the spec of
+//! its feature bits, Cancun in this binary) to execute EVM transactions against a [`torus_state::StateDb`] backend.
 //!
 //! # Public API
 //!
@@ -19,11 +19,13 @@ pub use bloom::logs_bloom;
 pub use eip1559::calc_next_block_base_fee;
 pub use error::EvmError;
 pub use executor::{
-    intrinsic_gas, BigLane, BlockEnvCfg, BlockExecResult, CoreWriterOrigin, EvmExecutor,
-    TxExecResult, DEFAULT_BLOCK_GAS_LIMIT, TORUS_CHAIN_ID,
+    intrinsic_gas, intrinsic_gas_for, BigLane, BlockEnvCfg, BlockExecResult, CoreWriterOrigin,
+    EvmExecutor, EvmSpecRule, TxExecResult, BUILTIN_EVM_SPEC_RULE, DEFAULT_BLOCK_GAS_LIMIT,
+    TORUS_CHAIN_ID,
 };
 pub use precompile_provider::TorusPrecompiles;
 
 // Re-export key revm types used in the public API.
 pub use revm::context::TxEnv;
 pub use revm::database::BundleState;
+pub use revm::primitives::hardfork::SpecId;

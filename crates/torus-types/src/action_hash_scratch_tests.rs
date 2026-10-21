@@ -328,6 +328,7 @@ fn compact_block_hash_order_matches_frozen_encoder() {
             big_base_fee_per_gas: 1,
             epoch: 0,
             validator_set_hash: B256::ZERO,
+            features: 0,
             sig_attestation: [0; 64],
         },
         native_actions: vec![

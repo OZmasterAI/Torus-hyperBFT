@@ -211,6 +211,7 @@ mod tests {
                 big_base_fee_per_gas: 0,
                 epoch: 0,
                 validator_set_hash: B256::ZERO,
+                features: 0,
                 sig_attestation: [0u8; 64],
             },
             native_actions: (0..actions as u64)
