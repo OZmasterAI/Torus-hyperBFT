@@ -26234,6 +26234,56 @@ mod crash_recovery_tests {
         );
     }
 
+    /// P0.0 phase 6, Codex review (P2): a clean restart (applied == committed,
+    /// nothing to replay, no new block) reports the feature gauges from the
+    /// durable applied-height header, not from genesis: a feature active
+    /// before the restart stays active, the countdown keeps its value.
+    /// RED before the fix: `replay_committed` returned the genesis header, so
+    /// the gauges read inactive / next = activation / until = activation.
+    #[test]
+    fn feature_gauges_after_clean_restart_follow_the_applied_header() {
+        let rsh = torus_types::Feature::RunningStateHash;
+        let series =
+            |m: &torus_telemetry::Metrics, name: &str| -> f64 { metric_value(&m.encode(), name) };
+        let active = format!(
+            "torus_feature_active{{feature=\"{}\",id=\"0\"}}",
+            rsh.name()
+        );
+        // (activation height, applied height, active, next, until)
+        for (at, applied, on, next, until) in
+            [(2u64, 4u64, 1.0, 0.0, -1.0), (6, 2, 0.0, 6.0, 4.0)]
+        {
+            let (mut config, db) = make_test_config_and_db();
+            config.activations = rsh_at(at);
+            let mut blocks: Vec<TorusBlock> = (1..=applied)
+                .map(|h| {
+                    let bits = if h >= at { rsh.bit() } else { 0 };
+                    with_features(make_block(h, vec![]), bits)
+                })
+                .collect();
+            link_from_genesis(&config, &mut blocks);
+            for b in &blocks {
+                persist_block_for_test(&db, b);
+            }
+            write_native_applied_height(&db, applied);
+
+            let m = Arc::new(torus_telemetry::Metrics::new());
+            let app = TorusApp::new(db, &config, Some(m.clone()), None, None);
+            assert_eq!(series(&m, &active), on, "at {at} applied {applied}");
+            assert_eq!(
+                series(&m, "torus_feature_next_activation_height"),
+                next,
+                "at {at} applied {applied}"
+            );
+            assert_eq!(
+                series(&m, "torus_feature_blocks_until_activation"),
+                until,
+                "at {at} applied {applied}"
+            );
+            drop(app);
+        }
+    }
+
     /// P0.0, Codex review of phase 1 (P2): insertion (`validate_block`, which
     /// block sync runs through `validate_block_for_sync`) of a header with a
     /// bit this binary does not know answers `UnsupportedUpgrade`, not
