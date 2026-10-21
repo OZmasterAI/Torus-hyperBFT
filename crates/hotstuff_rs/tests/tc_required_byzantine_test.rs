@@ -365,9 +365,10 @@ fn byzantine_voter_with_a_forged_high_qc_cannot_block_case_3() {
 
 /// Phase C (§6 "byzantine voter with a forged tip: the TC still forms"): the
 /// byzantine validator `byz` stays silent as leader and sends every timeout
-/// vote with a forged tip, a header for the vote's own view over a block
-/// nobody has, signed by itself (not the view's leader), re-signed so the
-/// vote itself is correct. Without F4 the forged tip wins every TC it is in
+/// vote with a forged tip, a header for the view before the vote's over a
+/// block nobody has, signed by itself (not that view's leader), re-signed so
+/// the vote itself is correct. The views byz leads time out, and their tip
+/// view (the previous view) is above every honest high QC. Without F4 the forged tip wins every TC it is in
 /// and the next leader must run a recovery (ProposalRequest / NERequest) for
 /// a block nobody has; with F4 honest replicas drop the vote, so no TC carries
 /// the forged tip and nobody recovers it.
@@ -404,8 +405,9 @@ fn byzantine_voter_with_a_forged_tip_cannot_block_the_tc() {
         match message {
             Message::ProgressMessage(ProgressMessage::HotStuffMessage(HotStuffMessage::ProposalHeader(_))) => None,
             Message::ProgressMessage(ProgressMessage::PacemakerMessage(PacemakerMessage::TimeoutVote(mut vote))) => {
-                if select_leader(vote.view, &vs) == byz {
-                    // A tip byz signs for its own view would be a real header.
+                let tip_view = ViewNumber::new(vote.view.int().saturating_sub(1));
+                if select_leader(tip_view, &vs) == byz {
+                    // A tip byz signs for a view it leads would be a real header.
                     return Some(PacemakerMessage::TimeoutVote(vote).into());
                 }
                 vote.local_tip = Some(TipInfo {
@@ -413,8 +415,8 @@ fn byzantine_voter_with_a_forged_tip_cannot_block_the_tc() {
                     block_height: height,
                     block_justify: justify.clone(),
                     block_data_hash: data_hash,
-                    view: vote.view,
-                    leader_signature: sign_proposal_header(&byz_key, vote.chain_id, vote.view, &forged_block),
+                    view: tip_view,
+                    leader_signature: sign_proposal_header(&byz_key, vote.chain_id, tip_view, &forged_block),
                 });
                 vote.highest_qc = None;
                 vote.signature = SignatureBytes::new(byz_key.sign(&timeout_vote_bytes(&vote)).to_bytes());
