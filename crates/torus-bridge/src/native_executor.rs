@@ -627,9 +627,10 @@ pub fn parse_settle_defer_results(v: Option<&str>) -> bool {
     on_by_default_flag("TORUS_SETTLE_DEFER_RESULTS", v)
 }
 
-/// 8k L3.3 (`TORUS_BOOK_FAST_ENCODE`, node-local, OFF by default): pure
-/// parse. `1` or `true` (trimmed, any case) = on; unset, empty, `0` or
-/// `false` = off; anything else is warned and off.
+/// 8k L3.3 (`TORUS_BOOK_FAST_ENCODE`, node-local, ON by default since s131,
+/// perf doc section 105): pure parse (`on_by_default_flag`). `0` or `false`
+/// (trimmed, any case) = off; unset, empty, `1` or `true` = on; anything
+/// else is warned and on.
 ///
 /// Classic book mode only (`TORUS_BOOK_ROWS` unset or `0`): modes 1, 2 and 3
 /// never call the Classic encoder, so the flag does nothing there. If the
@@ -637,20 +638,7 @@ pub fn parse_settle_defer_results(v: Option<&str>) -> bool {
 /// decision), remove this flag and `encode_classic` in a cleanup.
 #[doc(hidden)]
 pub fn parse_book_fast_encode(v: Option<&str>) -> bool {
-    let Some(v) = v else {
-        return false;
-    };
-    match v.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" => true,
-        "" | "0" | "false" => false,
-        _ => {
-            tracing::warn!(
-                value = v,
-                "TORUS_BOOK_FAST_ENCODE: not empty, 1, true, 0 or false (any case); using the default (off)"
-            );
-            false
-        }
-    }
+    on_by_default_flag("TORUS_BOOK_FAST_ENCODE", v)
 }
 
 thread_local! {
@@ -682,12 +670,13 @@ pub fn book_fast_encodes_on_this_thread() -> u64 {
     BOOK_FAST_ENCODES.with(std::cell::Cell::get)
 }
 
-/// 8k L3.3 (`TORUS_BOOK_FAST_ENCODE=1`, node-local, off by default): the
-/// Classic save encodes each dirty book with `OrderBook::encode_classic`
-/// (one allocation sized from the book's counts, one copy per resting order)
-/// instead of `borsh::to_vec` (1 KiB start, doubling: the blob is copied on
-/// every growth). Same bytes (proptest `classic_encode_tests`). The thread's
-/// pin if set, else the env read once per process.
+/// 8k L3.3 (`TORUS_BOOK_FAST_ENCODE`, node-local, on by default; `0` turns
+/// it off): the Classic save encodes each dirty book with
+/// `OrderBook::encode_classic` (one allocation sized from the book's counts,
+/// one copy per resting order) instead of `borsh::to_vec` (1 KiB start,
+/// doubling: the blob is copied on every growth). Same bytes (proptest
+/// `classic_encode_tests`). The thread's pin if set, else the env read once
+/// per process.
 fn book_fast_encode_enabled() -> bool {
     if let Some(on) = BOOK_FAST_ENCODE_PIN.with(std::cell::Cell::get) {
         return on;
@@ -718,14 +707,18 @@ mod book_fast_encode_flag_tests {
         BOOK_FAST_ENCODE_PIN,
     };
 
-    /// Off by default: only `1` / `true` (trimmed, any case) turn it on.
+    /// On by default (s131, bench 8u section 105): unset, empty, `1` /
+    /// `true` and garbage (warned) are on; only `0` / `false` (trimmed, any
+    /// case) turn it off.
     #[test]
-    fn parse_off_by_default() {
-        assert!(!parse_book_fast_encode(None));
-        for v in ["1", " 1", "1\n", "true", "TRUE", " True "] {
+    fn parse_on_by_default() {
+        assert!(parse_book_fast_encode(None));
+        for v in [
+            "", " ", "1", " 1", "1\n", "true", "TRUE", " True ", "2", "on", "yes", "01",
+        ] {
             assert!(parse_book_fast_encode(Some(v)), "{v:?}");
         }
-        for v in ["", " ", "0", "false", "FALSE", "2", "on", "yes", "01"] {
+        for v in ["0", " 0 ", "false", "FALSE", " False "] {
             assert!(!parse_book_fast_encode(Some(v)), "{v:?}");
         }
     }
@@ -751,25 +744,13 @@ mod book_fast_encode_flag_tests {
     }
 }
 
-/// 8k L2.2 (`TORUS_SETTLE_NO_MERGE`, node-local, OFF by default): pure
-/// parse. `1` or `true` (trimmed, any case) = on; unset, empty, `0` or
-/// `false` = off; anything else is warned and off.
+/// 8k L2.2 (`TORUS_SETTLE_NO_MERGE`, node-local, ON by default since s131,
+/// perf doc section 108): pure parse (`on_by_default_flag`). `0` or `false`
+/// (trimmed, any case) = off; unset, empty, `1` or `true` = on; anything
+/// else is warned and on.
 #[doc(hidden)]
 pub fn parse_settle_no_merge(v: Option<&str>) -> bool {
-    let Some(v) = v else {
-        return false;
-    };
-    match v.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" => true,
-        "" | "0" | "false" => false,
-        _ => {
-            tracing::warn!(
-                value = v,
-                "TORUS_SETTLE_NO_MERGE: not empty, 1, true, 0 or false (any case); using the default (off)"
-            );
-            false
-        }
-    }
+    on_by_default_flag("TORUS_SETTLE_NO_MERGE", v)
 }
 
 thread_local! {
@@ -815,13 +796,13 @@ pub fn settle_no_merge_fallbacks_on_this_thread() -> u64 {
     SETTLE_NO_MERGE_FALLBACKS.with(std::cell::Cell::get)
 }
 
-/// 8k L2.2 (`TORUS_SETTLE_NO_MERGE=1`, node-local, off by default): the
-/// parallel settle's pass B keeps each market's plan cache as a run instead
-/// of `merge_disjoint`-ing it into the batch cache, and the end-of-call
-/// flush writes the batch cache and the runs together in the same sorted key
-/// order (`PositionCache::flush_with_runs`): the same writes in the same
-/// order, without moving every entry into one map. The thread's pin if set,
-/// else the env read once per process.
+/// 8k L2.2 (`TORUS_SETTLE_NO_MERGE`, node-local, on by default; `0` turns
+/// it off): the parallel settle's pass B keeps each market's plan cache as a
+/// run instead of `merge_disjoint`-ing it into the batch cache, and the
+/// end-of-call flush writes the batch cache and the runs together in the same
+/// sorted key order (`PositionCache::flush_with_runs`): the same writes in
+/// the same order, without moving every entry into one map. The thread's pin
+/// if set, else the env read once per process.
 fn settle_no_merge_enabled() -> bool {
     if let Some(on) = SETTLE_NO_MERGE_PIN.with(std::cell::Cell::get) {
         return on;
@@ -843,14 +824,18 @@ mod settle_no_merge_flag_tests {
         parse_settle_no_merge, settle_no_merge_enabled, with_settle_no_merge, SETTLE_NO_MERGE_PIN,
     };
 
-    /// Off by default: only `1` / `true` (trimmed, any case) turn it on.
+    /// On by default (s131, bench 8t section 108): unset, empty, `1` /
+    /// `true` and garbage (warned) are on; only `0` / `false` (trimmed, any
+    /// case) turn it off.
     #[test]
-    fn parse_off_by_default() {
-        assert!(!parse_settle_no_merge(None));
-        for v in ["1", " 1", "1\n", "true", "TRUE", " True "] {
+    fn parse_on_by_default() {
+        assert!(parse_settle_no_merge(None));
+        for v in [
+            "", " ", "1", " 1", "1\n", "true", "TRUE", " True ", "2", "on", "yes", "01",
+        ] {
             assert!(parse_settle_no_merge(Some(v)), "{v:?}");
         }
-        for v in ["", " ", "0", "false", "FALSE", "2", "on", "yes", "01"] {
+        for v in ["0", " 0 ", "false", "FALSE", " False "] {
             assert!(!parse_settle_no_merge(Some(v)), "{v:?}");
         }
     }
@@ -14137,14 +14122,16 @@ impl NativeExecutor {
     /// pipeline must then run the native path (and so [`Self::drain_core_writer`]) even
     /// for a block with no native actions and no fees. Queue entries for `height` are
     /// buffered by an earlier block's EVM execution (`height - 1`, or `height - K` and
-    /// earlier for order kinds and rows a full block moved on, item 7 step 2) and
-    /// committed in the SAME atomic batch as that block's EVM bundle (s515 F1), which
-    /// lands before this block runs; no later block rewrites them before their drain
-    /// (EVM blocks are serial barriers) — so a DB read is authoritative here. R02 (C4): a
-    /// read error is a local fault and propagates; the caller fail-stops the block (never
-    /// "assume due").
-    pub fn core_writer_due(state_db: &StateDb, height: u64) -> Result<bool, CoreError> {
-        Ok(CoreWriterQueue::pending_count(state_db, height)? > 0)
+    /// earlier for order kinds and rows a full block moved on, item 7 step 2) and ride
+    /// that block's consensus writes (s515 F1). Item 7 option 0 (task 1.3): `state` is
+    /// the block overlay (DB + the in-flight layers: parent, L, C), read after the
+    /// block's own EVM rows were absorbed into it. Those target `height + 1` or later,
+    /// so they never answer for `height`; an earlier block's row may still sit in a
+    /// layer (not durable yet), and a drained row may be a layer tombstone over a DB
+    /// row. The answer equals `pending_count > 0`. R02 (C4): a read error is a local
+    /// fault and propagates; the caller fail-stops the block (never "assume due").
+    pub fn core_writer_due<T: StateBackend>(state: &T, height: u64) -> Result<bool, CoreError> {
+        Ok(state.prefix_exists(torus_state::cf::CF_CORE_WRITER_QUEUE, &height.to_be_bytes())?)
     }
 
     /// Item 2: whether this block must run the native phase for the oracle —

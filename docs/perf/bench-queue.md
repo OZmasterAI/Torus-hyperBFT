@@ -22,6 +22,24 @@ Why: Q7 run 1 (s66) ran the bare defaults (MAX_IN_FLIGHT, IN_FLIGHT_TAIL, OPEN_O
 unset): ~140-156k matched/s instead of ~240-250k, deeper books, ~76k fills per block vs ~50k, ~4.9 vs ~2.9 ms exec per
 1k fills. The A/B stayed fair but not at the load every other bench uses.
 
+**Harness fix (s131, main after `c3c8b142`):** crash cells: rewind bound 2 without checkpoints, 202 with
+checkpoints (section 107's false REJECT fixed); `crash-kill.sh` and `run-cell.sh` count only `panicked` and ERROR-level
+fail-stop / FATAL / conflicting-blocks lines (the INFO "running state hash fail-stop ... on=false" no longer counts).
+Pull tools from main before the next campaign that has crash cells.
+
+**Harness fix (s131, branch `tools/harness-book-mode`):** `run-cell.sh` no longer pins book mode 3 (its RECORD_ENV set
+`TORUS_BOOK_ROWS=3`; an 8y Classic smoke ran mode 3 that way): no override = Classic. Set `TORUS_BOOK_ROWS=3`
+explicitly for mode-3 arms. Each cell logs `cell=<label> book_mode=... <flag>='...'` and records `cell.book_mode` /
+`cell.node_flags` in summary.json. Pull tools from main before the next campaign.
+
+**Run the queue back to back (owner s131):** archy runs every ready item in queue order without stopping between
+them and without asking. **Nothing runs on archy during measured cells** (owner s131, after a build overlapped 8w's
+cells): no cargo builds, no analysis scripts, no doc work beyond trivial git. Builds, analysis and the previous item's
+doc section (perf doc section + its Done line, on a `docs/perf-section-*` branch; 18c merges) happen in the gap
+between campaigns, then the next ready item launches right away. Stop only when the queue has no ready item, a cell
+fails validity, an item needs an owner action (e.g. `perf_event_paranoid`), or 18c or the owner says stop; then say
+why in one line. Any cell that overlapped a build or other foreign load (check `contention.tsv`) is rerun.
+
 **Exec-path A/B merge rule (owner s128, after section 91):** any A/B that decides a merge of an exec-path change
 judges, besides matched/s, exec ms per 1k fills and CPU-s per 1M fills: **exec-thread on-CPU ms per 1k fills**, native
 blocks/s, block p50 / p99 and timeouts per 1,000 blocks. A change that adds exec-thread CPU per fill (CI above 1) or
@@ -46,6 +64,11 @@ main at or after 50d2316c.
   `TORUS_HEADER_RESEND_MS=3000` (`=0` = off). Compare against results from before the merge only with the
   pre-merge arms' env spelled out. Binaries built before it (M `e3d11cb9`, Q9's `e1be6c15` / `b2dd21a4`, step Z's
   `9d770519`) keep the old defaults: their arms set PC + F by env, as in sections 83-87.
+- **Defaults change (s131, item 7 option 0 merge `merge/item7-option0`; binaries built from main after it):** an arm
+  that leaves E (`TORUS_EVM_FAST_PATH`) unset gets the EVM fast path ON. A flag-off arm must set `TORUS_EVM_FAST_PATH=0`
+  (an `absent_env` entry for it now means ON). Without EVM load (`EVM_LOAD_RATE` unset) the flag is inert (section 107).
+  Binaries built before the merge (`f8a45a2d` and branches on it: `perf/mode3-b1`, `perf/l31-coalesced-save`) keep it
+  off when unset.
 - Block rate from cells shorter than about 5 min is indicative only: under sustained load it falls to exec pace
   (5.9 -> 3.0 blocks/s by minute 5) while matched/s stays flat (section 79). matched/s stays the primary metric.
 - Watch `no_proposal` in every replicate (1 in the s58dmt check cell, 1 in the s58safe soak).
@@ -470,6 +493,15 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    (digests agree, replay length); one mixed-flag cell (val0 on, val1 off, val2 on with
    `TORUS_CHECKPOINT_INTERVAL_MS=0`): attestations agree for the whole cell. The default flip is the owner's call
    after this.
+   **Done s70 (ozarchy-8l4, section 107; B `f8a45a2d` node `74598d33`, M `fd94818d` node `602e1a5a`, tools `eabec5e5`;
+   25 / 25 cells valid (crash REJECT harness-made), 625 CHECK OK, 0 FAIL; n = 4 via the spec's trigger; end_pass=1,
+   gaps 5-6 s): option 0 passes the exec-path merge rule on E-on / E-off with every CI resolved: matched/s 1.079
+   [1.074, 1.084], exec-thread CPU per 1k fills 0.981 [0.972, 0.991], blocks/s 3.53 x, p50 0.090, p99 0.496, timeouts
+   22 -> 3. E-off / M not worse (exec CPU 0.998 [0.988, 1.008], blocks/s 1.066, p50 0.897, CPU-s per 1M 1.005 [0.999,
+   1.010]); N-on / N-off within noise; all six option 0 passes (pipelined 100%, idle before EVM p50 0.05 ms, 0 deferred
+   waits / rebuilds / shared layers, no forced checkpoints, all EVM landed). E-heavy 1.077; crash: digests agree after
+   a 27-block replay; mixed flags agree at 35 / 35 checkpoints. Harness fixes for 18c: crash rewind limit 2 predates
+   coalesced checkpoints; `crash-kill.sh` counts an INFO fail-stop line. Default flip: owner's call.**
 8m. **Book storage mode at depth, + L3.1's zero-build flag** (owner s131; NEXT, 8l is paused; ~1 h 15: 7 cells of
    300 s, ~10 min each incl. genesis / boot / pre-load / post checks, ~1 min between cells). 8i: at 1M resting orders
    Classic's `save_books` is 73% whole-book encode, linear in depth. The other modes save only what changed but were
@@ -624,8 +656,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    per node, x 2.0, 4 / 4), not the DA GC; with the GC it accounts for CPU per fill; exec us / fill +14-16% in
    state-compaction seconds (23% vs 13% of seconds); blocks/s link medium-low (bigger blocks, saturated exec); no
    RocksDB stalls. Next: retention-on arm with block-body pruning off. Raw 8r data: branch `data/ozarchy-8r` 7c8323ac.**
-8s. **b0 screen: Classic vs mode 3 + b0 (mode 3 with checkpoints)** (owner s131; NOW: pause 8l, run 8s, then 8l
-   restarts from scratch; ~40 min). 8p
+8s. **b0 screen: Classic vs mode 3 + b0 (mode 3 with checkpoints)** (owner s131; DONE s131, section 104; ~40 min). 8p
    (section 102): mode 3 wins deep (blocks/s 2.16x) but loses shallow (blocks/s 0.62x, p50 3.3x, CPU per fill +17%)
    because modes 2/3 flushed every block. b0 (`perf/mode3-checkpoints-b0` `c2fbfbc0`, Codex torus-adversarial approve,
    137 targeted tests): with a checkpoint interval set, modes 2/3 use checkpoints; the write half of the book save runs
@@ -638,6 +669,205 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    on-CPU per 1k fills, `save_books` ms per block and per 1k fills, flush-worker ms per 1k fills and busy share,
    CPU-s per 1M fills, RSS; and compare with 8p's mode 3 (per-block flush) cells. Question: does b0 close mode 3's
    shallow gap while keeping most of its deep win? It decides whether b1 gets built. Tools: main `3aaaa046` or later.
+   **Done s68 (ozarchy-8s = 8ss shallow + 8sd deep, section 104; b0 `c2fbfbc0` node `fde31231`, tools `be87c86e`, 6 / 6
+   cells valid, md5 18 / 18, 0 CHECK FAIL; every B node ran 15 s checkpoints with the b0 exec-thread save, no per-block
+   flush): no, b0 widens the shallow gap: matched/s B / A 0.911 (8p 0.937), blocks/s 13.65 -> 3.99 (3.2x fills per
+   block), p50 14 -> 136 ms, timeouts 1 -> 9. It keeps a smaller deep win: matched/s 1.061 (8p 1.087), blocks/s 1.28x
+   (8p 2.16x), p50 189 -> 107 ms. CPU per 1M fills falls to +8.9% / +5.7% over Classic (8p +17.3% / +18.5%) and the
+   flush worker is busy 0.11 / 0.12 (8p 0.42 / 0.41). The cost moved to the saturated exec thread: the write half is
+   ~20-22 ms per block (save_books 29.8 / 28.3 ms per block). b0 is not enough; if mode 3 is still wanted, build b1
+   (the write half off the exec thread, with checkpoints) and re-test both shapes. Gaps 15-17 s shallow, 69 s deep.**
+8t. **L2.2 before default-on: standard-shape A/B + longer timeout check** (owner s131; after 8l; ~2 h 20). L2.2
+   (`TORUS_SETTLE_NO_MERGE`, merged on main flag off, `be65552e`) was benched on the 1M deep book only (8n, 8q: exec
+   on-CPU 0.972, matched/s 1.022; timeouts 7 -> 14 unresolved). One main binary (current), A = flag unset, B =
+   `TORUS_SETTLE_NO_MERGE=1`. (1) **Standard** shape, 300 s, warm-up then A B B A A B (n = 3): exec-path merge rule +
+   settle / pass B / cache flush ms per block, fallbacks (must be 0). (2) **Timeouts**, deep book (8i P1M), **900 s**
+   cells, A B B A (n = 2): timeouts per 1,000 blocks and per pair, view-timeout reasons (`torus_view_timeout_*`),
+   p99. Verdict: default-on candidate or not; say plainly whether timeouts rise with B.
+   **Done s70 (ozarchy-8t, section 108; main `eabec5e5` node `32120afc`, 12 / 12 cells valid, 314 CHECK OK, 0 FAIL,
+   fallbacks 0 everywhere, L3.3 off in both arms; gaps 5-6 s): L2.2 is a default-on candidate. Standard (n = 3): exec-
+   thread on-CPU per 1k fills 0.957 [0.936, 0.978], blocks/s 1.095 [1.080, 1.111], p99 0.877 [0.832, 0.924], p50 0.959
+   (spans 1), CPU-s per 1M 0.997, matched/s 0.998 (load-bound), timeouts 0 vs 0; settle -20% per block, cache flush
+   +12%. Deep 900 s (n = 2): timeouts do not rise, 27 vs 28 (5.09 vs 5.19 per 1k blocks), view timeouts 64 vs 63, same
+   reasons; pooled with 8n / 8q 46 vs 48; exec on-CPU 0.977, blocks/s 1.018, matched/s 1.015, p50 / p99 flat.**
+8u. **L3.3 engine-timer profile** (owner s131; DONE s131, section 105; ~40 min). L3.3 (`TORUS_BOOK_FAST_ENCODE`, merged flag off)
+   showed exec engine ms per 1k fills +2.8% [1.020, 1.037] and runqueue wait +5.5% on the deep book (section 97.8),
+   unexplained. One main binary, 1M deep book (8i P1M), A = flag unset, B = `TORUS_BOOK_FAST_ENCODE=1`, one 300 s cell
+   each with the Q8 perf recipe on the exec thread, **`perf_event_paranoid=1` for this run only** (owner sets it before
+   8u and restores 2 after; kernel sampling is needed for page faults, kernel time and off-CPU stacks, which the
+   scheduling-artefact question depends on; log the value at every cell start and end). Report the engine phase split A vs B (match, settle, cancel-all, allocation, memmove,
+   jemalloc, page faults) and whether the rise is real or a scheduling artefact. Only matters if Classic stays.
+   **Done s70 (ozarchy-8u, section 105; main `0e514a5c` node `bbc03997`, 3 / 3 cells valid, 73 CHECK OK, 0 FAIL;
+   paranoid 1 throughout, restored to 2 after; no contention overlap): not a scheduling artefact (exec runqueue per 1k
+   fills +1.3%, 8kd +5.5%). With one binary, engine per 1k fills is +2.0% node-consistent (+3.1% in 97.8's definition),
+   n = 1, not resolved: 44% of it is the post-engine tail (liquidation step on-CPU +20%), margin +2.0%, settle +1.0%;
+   the profiled 60 s window is flat (1.002). Allocation / jemalloc / memmove / page faults inside the engine are flat;
+   L3.3's change is confined to save_books (memmove 0.124 -> 0.001, page faults +20%). matched/s 1.020, save_books per
+   1k fills 0.869. 8kd's uniform rise was two binaries (likely code layout, untested). Next if wanted: 2 more
+   one-binary deep pairs without perf, or a liquidation-step timer.**
+8v. **T5.3 attribution: block p99 inside checkpoint windows** (owner s131; NOW: right after 8u, before 8l; ~1 h incl.
+   analysis; no code; `perf_event_paranoid` back at 2, no perf needed).
+   Roadmap T5.3: during a checkpoint DB write, block p99 sits ~500-650 ms above the out-of-window p99 (sections 87,
+   89); A1 (checkpoint slicing) is parked because its target (manifest put, ~6-12 ms) can't explain it. One main
+   binary, code defaults (15 s checkpoints), standard shape, 3 cells of 600 s. Align every view / block with the
+   checkpoint windows (start / end of each checkpoint write from the checkpoint metrics / log) and split, inside vs
+   outside the windows, the consensus thread's phases (proposal wait, validate, vote, QC collect, commit, manifest /
+   body persist) and the exec thread's (checkpoint upkeep, freeze, flush handoff, settle wait), plus RocksDB write /
+   stall / flush activity and per-thread CPU if sampled. Name the dominant phase of the in-window gap with numbers.
+   This decides whether A1 or something else gets built.
+   **Order (owner s131):** 8u and 8v run before 8l and the RH4 3-arm rerun (8w; filter built and reviewed, `baffa3a5`). **Queue (owner s131, latest):** 8s, 8u, 8v, 8l, 8t, 8x done; **8y running** (L3.1 A/B), then **8z** (Classic
+   cadence check, clears b1), then 8w (RH4 rerun), then 8z2 (conditional, clean b1 build; part 2 paused by the owner). **9a (merged-main baseline) is next**, then 8z2 (resumed), then 9b (L2.1 A/B), then 9c (T5.3 A/B). Run them back to back. A merged-main baseline follows once L2.2
+   default-on lands.
+   **L3.3 default-on (owner s131):** `TORUS_BOOK_FAST_ENCODE` becomes on by default (branch `perf/l33-default-on`,
+   merges on owner call). Classic cells on any binary built after that merge include L3.3 (section 105: blocks/s
+   1.086, p50 0.884 on the deep book), so their baselines shift slightly vs older sections: compare against
+   same-campaign controls only, and log the flag state per cell (`TORUS_BOOK_FAST_ENCODE=0` restores the old encoder).
+   **Done s70 (ozarchy-8v, section 106; main `fd2557c3` node `32120afc`, 3 / 3 cells of 600 s valid, 101 CHECK OK,
+   0 FAIL; no perf, paranoid 2; windows from a 50 Hz /proc sampler on the flush worker): the gap reproduces, in-window
+   p99 1,071 vs 542 ms out (G 529, 424-643). Dominant phase: the consensus thread's commit hook
+   (`on_commit_block fired` -> `on_committed_block: sending`) blocks until its own node's checkpoint DB write
+   (~128 MB, ~480 ms) ends: 98% of the stalls end with it, 78% of the in-window tail excess, 446 of G's 529 ms (84%).
+   Likely the commit-manifest put (`persist_commit_manifest`) waiting in the state DB's write queue (inferred; no
+   timer on main). A1 aims at the right mechanism (87 judged the put by its mean, the gap is its tail); cheaper:
+   write the manifest outside the state DB's write queue or off the consensus thread. Missing: timers on the put and
+   the commit handler, a checkpoint DB-write start / end line. Gaps 14-19 s (`end_pass=0`, switched too late).**
+8w. **RH4 3-arm rerun: state pruner compaction filter** (owner s131; after 8z; ~1 h 50). 8r (section 103.6): the
+   cost both retention arms share is state-DB compaction of `cf_block_bodies` from the state pruner's
+   `delete_range_cf` range deletes (compaction CPU x2.0, L0 3.3 vs 1.2). Fix: `perf/rh4-gc-worker` `baffa3a5` (on
+   `a0181b8b`, pushed, not merged; Codex torus review: no findings): `TORUS_PRUNE_MODE=filter` (default) saves the
+   cutoff durably, drops whole SSTs below it (`DeleteFilesInRange`) and lets a compaction filter drop the rest;
+   `TORUS_PRUNE_MODE=range` keeps the old path (microbench: compaction CPU 23.2 -> 7.6 s, write 408 -> 124 MiB).
+   **One binary** from `baffa3a5` (code defaults; 512 KB from `env.sh`; custody 0). Arms: **A** = no retention;
+   **B** = `TORUS_RETENTION_BLOCKS=1000` (filter, the branch default); **C** = `TORUS_RETENTION_BLOCKS=1000` +
+   `TORUS_PRUNE_MODE=range` (as 8r's B), all via `EXTRA_ENV`. Standard unpaced load, 300 markets, 300 s cells,
+   warm-up then A B C C B A twice (n = 4 per arm). Report as 8r plus state-DB compaction CPU per node,
+   `cf_block_bodies` L0 count, SSTs / bytes dropped whole, on-disk size at cell end. Verdicts: B vs A (retention
+   within noise: p50, blocks/s, CPU per fill?) and C vs A (does 8r's cost reproduce on this binary?). Prune-by-default
+   and the RH4 merge wait on this.
+   **Done s70 (ozarchy-8w, section 112; `baffa3a5` node `afb09e79`, tools `651c288b`, 13 / 13 cells valid, 313 CHECK OK,
+   0 FAIL; prune mode per node A none / B Filter / C Range; Classic; no foreign-CPU rerun; paused once for 8z during its
+   warm-up): the filter fixes the cost that reproduces. B / A p50 1.003 [0.925, 1.088], CPU-s per 1M 1.003 [0.991, 1.016],
+   exec on-CPU 1.003, matched/s 0.999; blocks/s 0.963 [0.906, 1.025] (4 / 4 lower, mostly before the filter acts),
+   unresolved. C / A: CPU-s per 1M +1.6% [1.2, 2.0], matched/s -1.0%, cf_block_bodies compaction 21.6 vs 7.3 s per node
+   (8r's cost back) but blocks/s 0.994 (not back). Filter: -74% of the extra cf_block_bodies compaction CPU, all pruning
+   by whole-SST drops (row filter 0 rows in 300 s). Blocks/s is the owner's call; n >= 6 at 900 s would resolve it.**
+8x. **b1 screen: mode 3 with checkpoints, book write off the exec thread** (owner s131; after 8t; ~50 min, then ~2 h
+   A/B if it passes). 8s (section 104): b0 (pass 2 on E when checkpoints are on) moved the ~20-22 ms/blk write half
+   onto the saturated exec thread: deep native blocks/s mode 3 / Classic 2.16x (8p) -> 1.28x, shallow p50 14 -> 136 ms.
+   b1 keeps pass 2 on the flush worker W, reading through `window.side`; checkpoint = L + side + marker in one batch.
+   **One binary** `perf/mode3-b1` `ab4ded4e` (on option 0 `f8a45a2d` + b0; Codex torus review: no findings; nextest
+   4196/4196), code defaults, 512 KB from `env.sh`, custody 0, `TORUS_CHECKPOINT_MAX_BYTES` unset (a cap with mode 2/3
+   refuses to start). Arms, all this binary: **C** = Classic, 15 s checkpoints; **F** = `TORUS_BOOK_ROWS=3` with
+   checkpoints off (`TORUS_CHECKPOINT_INTERVAL_MS=0`: 8p's per-block-flush mode 3, the in-campaign target); **B1** =
+   `TORUS_BOOK_ROWS=3` with 15 s checkpoints. Note: this binary predates L3.3's merge, so C is Classic without L3.3.
+   Shapes: shallow (standard load) and deep (8i P1M); warm-up, then one 300 s cell per arm per shape (C F B1 per
+   shape). Report: native blocks/s, matched/s, block p50 / p99, exec-thread and W busy, exec on-CPU ms per 1k fills,
+   CPU-s per 1M fills, `exec_save_books_write_seconds` vs `torus_flush_worker_save_books_write_seconds` (E's write
+   share = total minus W's), checkpoints per node, any fail-stop / tripwire line (must be 0). **Pass:** deep B1/C
+   blocks/s near F/C; shallow B1 >= F on blocks/s and p50; B1 CPU per fill no worse than b0's +8.9% vs Classic
+   (section 104); E's write share ~0. If it passes: C vs B1 full A/B, n = 3 per shape (~2 h), right after.
+   **Done s70 (ozarchy-8x, section 109; `ab4ded4e` node `f19d9385`, 8 / 8 cells valid, 250 CHECK OK, 0 tripwire /
+   fail-stop lines; deep C and F rerun after a Telegram overlap, originals kept as *-telegram-unused): FAIL on the CPU
+   rule, A/B not run. CPU-s per 1M fills B1 +13.3% shallow / +11.4% deep vs Classic (limit b0's +8.9%; F +16.8% /
+   +20.1%). Passes the other three: deep B1 / C blocks/s 3.18x (F 1.86x), p50 17 ms (F 75, C 210), matched/s 1.129;
+   shallow B1 11.59 vs F 6.38 blk/s, p50 16 vs 62 ms, matched/s 0.967; E's write share 0. Extra CPU is off the exec
+   thread (exec on-CPU per fill -0.08 / -0.82): W ~+1.4-1.5 (book write + per-block digest), deep state compaction
+   +0.78, unnamed threads ~+1.2. Caveat: shallow Classic on this binary is slow (8.10 blk/s, p50 31 ms vs 12-14 /
+   14-18 elsewhere): check before any A/B. CPU rule vs throughput gain: owner's call.**
+8y. **L3.1 A/B: Classic book save once per checkpoint window** (owner s131; after 8x; ~1 h 30). Classic encodes every
+   dirty book's whole blob each block (`save_order_books` 78.9 ms per block at P1M). L3.1 skips the per-block encode and
+   encodes each owed book once at every window close. **One binary** `perf/l31-coalesced-save` `b7bb3666` (on option 0
+   `f8a45a2d` + L3.3 cherry-pick `7d1c2510` + L3.1 `54fbc7f6` + liquidation-step timer `b7bb3666`; Codex torus review:
+   no findings; nextest 4197/4197). Running state hash OFF (L3.1 refuses to run with any activation height), 15 s
+   checkpoints, `TORUS_CHECKPOINT_MAX_BYTES` unset (a cap keeps L3.1 off). Arms: **A** = `TORUS_BOOK_FAST_ENCODE=1`;
+   **B** = A + `TORUS_BOOK_COALESCE=1` (check the startup log says on). Shapes: deep (8i P1M) and standard, A B B A per
+   shape (n = 2), 300 s cells. Report: native blocks/s, matched/s, block p50 / p99, exec on-CPU ms per 1k fills, CPU-s
+   per 1M fills, `exec_save_books_seconds`, the window-close spike (`torus_exec_book_coalesce_close_seconds` and
+   `_close_books`; design estimate ~56 ms at P1M), `_skipped`, the new `torus_exec_liquidation_step_seconds` (8u's open
+   question), and `torus_exec_resident_rebuilds` (must stay 1). Verdict under the exec-path merge rule.
+   **Done s70 (ozarchy-8y, section 110; `b7bb3666` node `127dac63`, 10 / 10 cells valid, 0 CHECK FAIL, resident
+   rebuilds 1, state hash off, coalesce ON in every B node; no foreign-CPU rerun): L3.1 passes the exec-path merge rule
+   in both shapes. Deep (n = 2): matched/s 1.160 [1.077, 1.249], exec-thread on-CPU per 1k fills 0.802 [0.760, 0.847],
+   CPU-s per 1M 0.947, blocks/s 3.42 -> 15.76, p50 193 -> 13 ms, p99 1,461 -> 672 ms, timeouts 2.91 -> 0.42 per 1k blocks
+   (save_order_books 52.2 -> 0.64 ms per block; blocks 62k -> 15k fills). Standard: exec on-CPU 0.958 [0.936, 0.980],
+   CPU-s per 1M 1.001, matched/s 1.022, blocks/s 1.25, p50 0.87, p99 0.84 (CIs span 1). Window close P1M mean 61 ms
+   (design ~56), p99 ~126 ms, ~49 per 300 s; standard 4.6 ms. Liquidation step = 99.5% of 8u's tail, 1.91 ms per block
+   + 0.127 ms per 1k fills in both arms. Harness: `run-cell.sh` RECORD_ENV pins `TORUS_BOOK_ROWS=3`, so set `=0`.**
+8z. **Classic cadence check: does the b1 binary slow Classic?** (owner s131; after 8y; ~35 min). Section 109: Classic on
+   `perf/mode3-b1` `ab4ded4e` ran shallow at 8.10 native blocks/s, p50 31 ms, ~30k fills per block (w1 7.89 too) vs
+   12.3-16.0 / ~18k on the same base in 8l (section 107 Noff, `f8a45a2d`) and 13.7-14.2 elsewhere. A read-only code
+   study (s131) found no Classic-path change in b0 / b1 (Classic keeps the serial save on E; `Job::Digest.books` is
+   None; the deferred-books flag never sets) and equal per-fill costs (exec on-CPU 2.78 vs 2.67-2.84 ms per 1k fills,
+   CPU-s per 1M 22.85): likely a cadence flip, not code. **Two binaries:** **O** = `feat/item7-option0` `f8a45a2d`;
+   **B** = `perf/mode3-b1` `ab4ded4e`. Both Classic (`TORUS_BOOK_ROWS` unset), 15 s checkpoints, code defaults (L3.3 and
+   the EVM fast path are off on both: they predate those defaults), no EVM load, standard (shallow) shape. Warm-up,
+   then O B B O (n = 2), 300 s cells. Report per cell and per arm: native blocks/s, fills per block, block p50 / p99,
+   matched/s, exec ms and exec on-CPU ms per 1k fills, CPU-s per 1M fills, exec busy, checkpoints per node, and the
+   blocks/s time series per minute (a cadence flip shows as a level shift within or between cells). **Verdict:** B/A
+   blocks/s within noise (or both arms swinging alike) -> b1 cleared to merge; B consistently ~0.6x with equal
+   per-fill cost -> report it (18c then bisects b0 vs b1).
+   **Done s70 (ozarchy-8z, section 111; O `f8a45a2d` node `74598d33`, B `ab4ded4e` node `f19d9385`, one bench pair
+   `ec15372b`; 5 / 5 cells valid, 111 CHECK OK, 0 FAIL; Classic, EVM fast path and L3.3 off on every node; no foreign-
+   CPU rerun): b1 NOT cleared: Classic native blocks/s B / O 0.746 [0.712, 0.780] (pairs 0.743, 0.748), per-fill cost
+   equal (exec on-CPU 0.999, CPU-s per 1M 0.998, matched/s 1.005); fills per block 1.32x, p50 1.20x, p99 1.24x,
+   timeouts 0.11 -> 0.77 per 1k blocks. No level flip per minute (O 13.2-16.7, B 10.0-12.6): a steady binary effect,
+   not a cadence swing. Next per spec: 18c bisects b0 `704a089d` vs b1 `244a767c` with this shallow Classic ABBA.**
+8z2. **8z rerun with a clean b1 build (conditional)** (owner s131; after 8w; ~35 min + rebuild). Section 111: Classic
+   native blocks/s on b1 `ab4ded4e` (node `f19d9385`) vs `f8a45a2d` (`74598d33`) = 0.746 [0.712, 0.780] with equal
+   per-fill CPU, steady (no cadence flip), the loss in the tail (p99 +171 ms, timeouts 0.11 -> 0.77 per 1k). Code study
+   (s131): no Classic-path wait in b0 / b1 (W tripwire O(1) on W, handoff wait 0.02 ms, deferred-books flag never set);
+   `wall_ms_per_committed_block` is span / ncommit (= 1 / blocks/s), not a measured wait. Top suspect: the build (B was
+   an incremental rebuild in a reflink copy of 8l's target dir; O a fresh build). (1) Analysis only, alongside 8w, from
+   8z's data, O vs B: `torus_commit_interval_seconds` buckets (share of the gap from intervals > 100 ms), view timeout
+   reasons and `view_entered_past_deadline`, per-view propose_delay / proposal_arrival / vote_gather / qc_collect /
+   qc_to_advance / entry_slack, `block_build_*` and `validate_block_*` per 1k txs, exec_queue_depth, flush_worker_seconds,
+   `exec_checkpoint_{wait,upkeep,settle_wait,deferred_join}` per checkpoint; note in section 111. (2) Rebuild `ab4ded4e`
+   in a FRESH target dir with the 8l4 flags; if its md5 differs from `f19d9385`, run 8z2 = 8z's spec with O vs B-clean
+   (ABBA n = 2); if identical, report and 18c bisects b0 (`704a089d`) vs b1 (`244a767c`).
+9a. **Merged-main baseline: every s131 default on** (owner s131; NEXT, ready now; ~35 min). Main `5013cc79` or later
+   carries all agreed defaults: exec-hash quick wins (section 94), L3.3 `TORUS_BOOK_FAST_ENCODE` on (105), L2.2
+   `TORUS_SETTLE_NO_MERGE` on (108), item 7 option 0 `TORUS_EVM_FAST_PATH` on (107). Question: the new main baseline,
+   and did anything go backwards vs the per-feature A/Bs? **One binary** (main, code defaults, nothing set; 512 KB from
+   `env.sh`; custody 0), Classic (no `TORUS_BOOK_ROWS`; pull tools from main so the cell line logs book_mode + flags),
+   15 s checkpoints, standard (hsdb-300m) shape. Arms: **N** = no EVM load; **E** = `EVM_LOAD_RATE=10
+   EVM_LOAD_SENDERS=40` (8l's E). Warm-up, then N E E N (n = 2), 300 s cells. Report per arm: matched/s, native
+   blocks/s, fills per block, block p50 / p99, timeouts per 1k blocks, exec ms and exec on-CPU ms per 1k fills, CPU-s
+   per 1M fills, RSS; and place them next to section 108 B (L2.2 on: 268.6k, 15.58 blk/s) and section 107 Noff / Eon
+   (13.88 / 13.41 blk/s) as references (different binaries, so indicative only). No verdict needed beyond "no
+   regression visible"; flag anything clearly worse.
+   **Done s72 (ozarchy-9a, section 113; main `654f047c` node `ce0f110c`, tools `654f047c`, 5 / 5 cells valid, Classic,
+   flags unset, EVM 3000 / 3000 landed in both E cells, no foreign-CPU rerun): no regression visible. N 268.8k matched/s,
+   15.47 blk/s, p50 / p99 14 / 659 ms, 0 timeouts, exec on-CPU 2.503 ms per 1k fills, 22.77 CPU-s per 1M: within ~1.5%
+   of 108 B, exec on-CPU 2% lower (L3.3 off there). E / N matched/s 0.999 [0.944, 1.058], CPU-s per 1M 1.002, exec
+   on-CPU 1.004, blocks/s 1.011, 1 timeout in 9,463 E blocks. Watch: flush worker per 1k fills 1.081 [0.85, 1.37] under
+   E (off the exec thread).**
+9b. **L2.1 A/B: streamed in-order settle** (owner s131; after 9a and 8z2; ~1 h 30). L2.1 (`TORUS_SETTLE_STREAMED`,
+   default off) starts each market's pass B as soon as that market is matched (in market order) instead of after all
+   markets; on any fallback it undoes the streamed prefix and replays the call on the flag-off path. Branch
+   `perf/l21-streamed-settle` `df9e1d8a` (on main `be87c86e`; 3 Codex/Claude review rounds, last [claude-review]: no
+   findings; nextest 4207/4207; microbench exec wall per call on/off 0.870-0.939 on a busy host). **One binary**
+   `df9e1d8a`, code defaults, Classic, 15 s checkpoints. That base predates L2.2 / L3.3 default-on and option 0, so set
+   explicitly in BOTH arms: `TORUS_SETTLE_NO_MERGE=1 TORUS_BOOK_FAST_ENCODE=1` (production defaults). Arms: **A** =
+   those; **B** = A + `TORUS_SETTLE_STREAMED=1`. Shapes: standard and deep (8i P1M), warm-up then A B B A per shape
+   (n = 2), 300 s cells. Report under the exec-path merge rule: exec-thread on-CPU per 1k fills, native blocks/s, block
+   p50 / p99, timeouts per 1k blocks, matched/s, CPU-s per 1M fills, plus settle / pass B ms per block, pool busy and
+   fallbacks (must be 0 in clean cells). Verdict: merge candidate (default off or on) or not.
+9c. **T5.3 A/B: commit manifest in the consensus DB + off-thread header/body write** (owner s131; after 9b; ~45 min).
+   Section 106: block p99 inside checkpoint DB-write windows 1,071 vs 542 ms (G = 529); 446 ms of it is the consensus
+   commit hook waiting behind its own node's checkpoint batch in the state DB (`persist_commit_manifest`). Fix on
+   `perf/t53-manifest-consensus-db` `f72eda52` (on main `689b4c54`): manifest in the consensus DB (still the first
+   synchronous durable action); dispatch's header + body state-DB write on one FIFO writer thread (exec waits on a
+   per-height ticket); manifest pruned only after the state-DB write is durable; RPC / WS heads published once the
+   header is readable. Unit measurement: commit hook with a held 400k-entry state-DB batch 1,320 ms (old) -> 0.9 ms.
+   Reviews: Codex torus (1 P2, fixed) + [claude-review] (2 P3, fixed); nextest 4207/4207. **One binary** `f72eda52`,
+   code defaults, Classic, 15 s checkpoints, standard shape (no EVM load). That base predates the s131 default flips,
+   so set in BOTH arms `TORUS_SETTLE_NO_MERGE=1 TORUS_BOOK_FAST_ENCODE=1`. Arms: **A** = `TORUS_MANIFEST_IN_STATE_DB=1`
+   (old path); **B** = default. Warm-up, then A B B A, 600 s cells. Report: in-window vs out-of-window block p99 and G
+   (windows from the new `torus_exec_checkpoint_db_write_{start,end}_ms` gauges / "checkpoint db write" log line),
+   native blocks/s, p50, timeouts, matched/s, CPU-s per 1M fills, and the timers `torus_on_committed_block_seconds`,
+   `torus_commit_manifest_seconds`, `torus_commit_persist_write_seconds` (writer thread),
+   `torus_exec_commit_persist_wait_seconds`, `torus_commit_manifest_prune_seconds`. Verdict: does G fall toward 0, at
+   no cost to blocks/s or CPU?
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 

@@ -90,7 +90,7 @@ class ClassificationTest(unittest.TestCase):
             uses,
         )
         for inline in (
-            "panics=$(grep -E",
+            "panics=$(sed -E",
             "errors=$(grep -c",
             "collect_logs.py",
             'crash-kill.sh" scan',

@@ -1,6 +1,11 @@
 # Implementation Plan: item 7 step 3 option 0, the EVM fast path
 
-Status (s128): PLAN revision 2, nothing built. Design: `docs/plans/item7-step3-design.md` revision 2 (on main;
+Status (s131): **BUILT and MERGED, `TORUS_EVM_FAST_PATH` ON by default** (owner s131). Steps 0-4 (G0-G4) built on
+`feat/item7-option0` (`f8a45a2d`), merged to main via `merge/item7-option0`; bench Q11 (step 8l, perf doc section
+107, n = 4, 25/25 valid) passed: at EVM load flag on vs off exec-thread CPU per 1k fills 0.981 [0.972, 0.991],
+matched/s 1.079, blocks/s 3.53x, p99 0.496x; no EVM load inert; branch flag-off vs main not worse. The default flip
+is its own commit on the merge branch; `TORUS_EVM_FAST_PATH=0` turns it off per node. Plan history: (s128) PLAN
+revision 2, nothing built. Design: `docs/plans/item7-step3-design.md` revision 2 (on main;
 section 7 picks 1-11 accepted by the owner s127). This plan covers option 0 only: design phases P1 and P2 (section 4.1). T (P3) gets
 its own plan after P2 merges; C0 stays parked (design question 6). Format: `item7-step2-impl.md`,
 `item6-phase5-impl.md`.
@@ -56,7 +61,7 @@ P="-p torus-types -p torus-genesis -p torus-bridge -p torus-consensus -p torus-e
 
 ## Design decision (short)
 
-Behind the node-local flag `TORUS_EVM_FAST_PATH` (default off until Q11 passes, then on), a block with EVM txs takes
+Behind the node-local flag `TORUS_EVM_FAST_PATH` (default off until Q11 passes, then on; on since s131), a block with EVM txs takes
 the pipelined path like any native block. Its EVM part reads through the block's layered overlay (own pending ->
 parent -> L -> C -> DB), never the raw DB. Its EVM rows (bundle plain rows, writer-precompile journal rows) enter the
 block overlay, so they ride the frozen set, the digest, L and the checkpoint. Its EVM trie work moves to the flush
@@ -260,9 +265,45 @@ and changed meaning.
   the batch with the marker at `app.rs:4674`, the resync at `4743-4753`. A marker-keyed snapshot can therefore see
   height h's native state next to h-1's EVM mirror (Codex probe: `same_marker=true same_hashed_account=false`). A
   RocksDB snapshot does not help: the interval lies between two separate writes. A height is complete only after
-  `run_job` returns `Ok` or `TrieStale` (`worker_loop` `766-786`, before `durable_height.store` and
+  `run_job` returns `Ok`, or `TrieStale` for a Checkpoint (a TrieStale Flush skips the resync, F4b)
+  (`worker_loop` `766-786`, before `durable_height.store` and
   `finish_job`), or on E after the resync (`app.rs:4759`) or the marker-only flush (`4970`). W runs its jobs in
   order on one thread, so no later job writes before that point.
+- **F4b (Codex P2 on `543980f0`, step 0). A TrieStale Flush on W skips the EVM mirror resync, for good.** When a
+  Flush's batch lands but its native trie maintenance fails (only with `TORUS_NATIVE_TRIE_MAINTENANCE=1`; off by
+  default), `run_job`'s Flush arm returns `TrieStale` before `resync_evm`, and nothing makes it up: the block's
+  native-credited EVM accounts keep a pre-resync CF_HASHED_* / CF_TRIE_* mirror until a later block resyncs them, so
+  the incremental EVM root drifts from the full scan (the F4 failure mode, from the native side). The three sites
+  disagree today: a Checkpoint resyncs even on `TrieStale`, W's Flush skips it and goes on, and E's serial flush
+  fail-stops on the same error (its flush `Err` arm). Step 0 changes no production code: the completion hook does not
+  fire for a TrieStale Flush (its height is not complete), the next completed height records it, and
+  `o0_trie_stale_flush_is_not_a_completion` pins the gap (a manual `resync_evm_accounts` fixes the row). Task 2.3
+  closes it: resync on `TrieStale` as the Checkpoint does, or set F4's stale marker so the root routes to the full
+  scan and boot rebuilds.
+
+- **F12 (s132, task 3.6). With Every5, the EIP-161 next-block re-fund is not an in-flight read.** Z's fund (e-3), drain
+  (e-2) and touch (e) share one Every5 window, so until that window lands the DB has no row of Z: at e+1 the deletion
+  in the parent / C answers "absent", which is what the DB answers too. By R2's definition (the DB answer differs) the
+  read is not in flight, and a raw-DB reader would read the same. The in-flight case exists at interval 0 (G mode, the
+  parent held: asserted). Task 3.6's flip asserts in flight at interval 0 and "answered by a frozen layer" with Every5.
+- **F13 (s132, task 3.6). The 300-block stream reaches C3-C6 only in part, and several bypasses only trip.** (a) Its
+  in-flight enqueue cursor reads never change a decision (the stale and the layer value pick the same target), so the
+  journal and enqueue bypasses diverge only on a hand stream (210 cancels spill into h+2, the next cancel's seq reads
+  the parent). (b) A reader precompile called from an EOA leaves no state: a skipped deferred part or a layer-less
+  journal changes only the answer, which no ledger sees; the planted test runs a recorder contract that stores
+  keccak(answer) (`o0_fixture_recorder`; the golden's fixture is untouched). (c) No in-flight queue row of the stream
+  targets an otherwise idle block, so the due-check bypass diverges only on a deposit-then-empty hand stream. (d) Revm
+  code / storage at the parent or C, journal markets / staking / queue rows in flight, the lane read at the parent and
+  the due-check over a tombstone are never reached: `o0_poison_readers_answer_from_every_layer` forces every reader x
+  CF x layer cell. Every bypass trips the armed tripwire except the layer-less journal (an overlay read by design).
+- **F14 (s132, task 3.7). No fast-path twin of `evm_state_root_compute_fault_fail_stops_block`.** On the fast path E
+  computes no EVM root (`RootMode::Skip`), so a node without CF_STORAGE fail-stops only where a read touches it (a revm
+  SLOAD: `evm_db_read_fault_fail_stops_block` has a flag-on run), not at a root compute; W's EVM trie step reads the
+  hashed mirror and trie CFs, and its own failure marks the trie stale (F4, task 2.3), it does not fail-stop. By design;
+  listed for the G4 review.
+  **Accepted (owner s131):** a W trie-step failure marks the trie stale and rebuilds; it does not fail-stop. A
+  fail-stop on that failure remains an option if we need it later (e.g. if stale-trie rebuilds hide a real storage
+  fault in production): it would latch `exec_failed` in W's trie step instead of marking the trie stale.
 
 ## 3. Shape of the fast-path EVM section
 
@@ -324,6 +365,46 @@ finding, not a re-bless). Task 3.1's commit names the fix commit in its message,
     targets), staking writer calls; lockbox deposits; BLOCKHASH of h-1 and h-256; reader precompile calls
     (`getPosition`, balances, oracle, staking, bbo).
   - An account destroyed or EIP-161-emptied, then re-created with new storage inside one checkpoint window.
+    - Destroy is same-block only: the EVM spec is CANCUN (`torus-evm/src/executor.rs:75`), so SELFDESTRUCT
+      (EIP-6780) deletes only an account created in the same tx; a pre-existing account's storage can never be wiped.
+      The stream's `destroy_recreate` (create + destroy in one tx, re-create by the next tx of the same block) reads
+      no lower layer.
+    - The cross-block deletion is EIP-161, and it is reachable (s131, `o0_eip161_native_drained_account_is_deleted_by_touch`):
+      `Withdraw { to: Z }` writes Z's CF_ACCOUNTS row (nonce 0, KECCAK_EMPTY: `torus-core/src/lockbox.rs:146-194`,
+      new row `236-247`); Z's `TransferToPerp` of its whole EVM balance rewrites the row with balance 0 and keeps it
+      (`lockbox.rs:62-103`, `build_evm_balance_update` preserves nonce and code hash and never deletes); a zero-value
+      EVM call to Z in a later block then deletes the row (revm state clear; `apply_bundle_plain` deletes
+      CF_ACCOUNTS, `torus-state/src/incremental.rs:291-294`). A native credit re-creates it, and Z sends again
+      from nonce 0. The stream runs this cycle for 5 addresses (`O0_EMPTIED`, shape `O0Recreate`, alternating):
+      fund at e-3, drain at e-2, touch at the EVM height e (`e % 5 == 0`, so drain and touch share one Every5
+      window), then the re-creation in one of two shapes, then Z's create (new storage) at the next EVM height:
+      - **next-block** (3 cycles, fed `eip161_cross_block`, floor 3): Z's `TransferToSpot` at e+1, the first height
+        of the next window. Seed `O0_SEED`: touches 20, 60, 90; reuse 25, 65, 95.
+      - **same-block** (2 cycles, fed `eip161_same_block`, floor 2): a trader's `Withdraw { to: Z }` in block e's
+        native phase, which runs after the EVM section: deletion and re-creation in one block, one window. Touches
+        30, 70; reuse 40, 80.
+      `o0_stream_eip161_cycles_delete_and_recreate` checks each row on the serial run (written, empty, then gone
+      and re-created at nonce 0 / re-created in the touch block, then nonce 1).
+      `o0_eip161_recreation_reads_by_layer` (serial, G interval 0, G Every5 with parked checkpoints) pins where
+      the re-creation reads Z, with a key watch on the probe (`Probe::watch` / `set_height`, test-probes only: the
+      per-(reader, layer, CF) counters cannot attribute a read to one key or height):
+      - same-block: every native-phase read of Z in block e is answered by the block's own pending layer, the
+        first with the tombstone `seed_from_bundle` put there for the EVM deletion (all three configurations).
+      - next-block: **today the deletion is never read from an in-flight layer**. e is an EVM height, so it
+        barriers (the barrier closes the window into a checkpoint and drains W, `pipeline_barrier`) and its
+        serial flush writes the deletion to the DB with the marker. At e+1 the overlay has no parent, L or C, and
+        the re-fund's first read of Z is a DB miss. The test pins that (no frozen-layer read of Z at e+1).
+        With the flag on, e is pipelined and its deletion sits in the parent / C at e+1: task 3.6 asserts that
+        read in flight (the stream already has the input).
+      **Why no EVM re-creation inside the deletion's Every5 window.** The deletion is an EVM touch at an EVM
+      height e, which with `TEST_EVM_BLOCK_INTERVAL` 5 is on the Every5 grid (e % 5 == 0; flag on, the
+      checkpoint triggers at `height - base >= 5`, base a checkpoint height, attest and epoch heights are
+      multiples of 5 too): e is the last height of its window. An EVM re-creation (a value transfer to Z or Z's
+      own tx) needs a later EVM height, at least e+5, the last height of the next window. A re-creation by a later
+      tx of block e itself collapses into the block's bundle (Z stays a put, no deletion reaches any layer), and
+      today every EVM height ends its window anyway (barrier). The re-creation inside the window is therefore
+      native: the same-block shape. The golden was re-written with the 5 cycles (serial, interval 0 and Every5
+      agree).
   - `TransferToSpot` in a native block, spent by the next EVM height; `TransferToPerp` in the same block as EVM txs.
   - Native credits (fees, rewards) to EVM accounts the window's EVM bundles also touch.
   - Big lane: the fixture header carries `evm_big_block_interval` M = 10 (big heights `h % 10 == 0`, with
@@ -392,7 +473,8 @@ finding, not a re-bless). Task 3.1's commit names the fix commit in its message,
     known complete: a `#[cfg(test)] test_on_complete: Option<Arc<dyn Fn(u64, &StateDb) + Send + Sync>>` on the
     worker env and on `ExecutionContext`, called with the completed height:
     - on W in `worker_loop` (`exec_pipeline.rs:766-786`), for a Flush, Marker or Checkpoint whose `run_job` returned
-      `Ok` or `TrieStale`. That is after `resync_evm` (`957`, `1054`) and before `durable_height.store` /
+      `Ok`, or `TrieStale` for a Checkpoint (a TrieStale Flush returns before its resync and is not complete, F4b;
+      the next completed height covers it). That is after `resync_evm` (`957`, `1054`) and before `durable_height.store` /
       `finish_job`, and so before W can `recv` the next job. Never for a Digest (nothing durable) or a failed job;
     - on E after the serial flush's resync (`app.rs:4743-4753`, at the end of the serial-flush block `4759`) and after
       a successful `flush_marker_only` (`4970`). S takes all its heights here; a pipelined node takes its barrier
@@ -402,9 +484,11 @@ finding, not a re-bless). Task 3.1's commit names the fix commit in its message,
     status and side rows, and at a dump point the per-CF dump hashes. It asserts the marker in the snapshot equals h
     (a check on the hook site). Hashing may run on a ledger thread after the snapshot is handed over (the snapshot
     pins the bytes). Neither E nor the gate waits on the hook: W pauses only for the snapshot call, and E is never
-    drained between blocks. Header and body rows above h are filtered out (the dispatcher writes them ahead,
-    `persist_committed_block_durably`, the only other writer in the harness while W is in the hook); the filter
-    covers that one CF pair and nothing else (`o0_snapshot_filter_is_dispatch_rows_only`).
+    drained between blocks. Two writers besides W can run while W is in the hook, and their rows are filtered out: the
+    dispatcher's header and body rows above h (it writes them ahead, `persist_committed_block_durably`), and E's
+    trade-history rows (`CF_NATIVE_TRADES`, `CF_NATIVE_USER_TRADES`) of blocks at or above h, written outside the
+    block batch (found in step 0, s131; the plan first named the dispatcher only). The filter covers those rows and
+    nothing else (`o0_snapshot_filter_is_dispatch_rows_only`).
   - `o0_compare(a: &O0Ledger, b: &O0Ledger)`: compares each key present in both (height for `hn`, status and side
     rows; completed height for dumps) as soon as both have it, and never compares markers. A divergence names the
     height and the CF. At the end both nodes drain once, and completeness is asserted: every height in `hn` and
@@ -436,7 +520,8 @@ finding, not a re-bless). Task 3.1's commit names the fix commit in its message,
     in-flight parent and C hits at interval 0 (the masking, pinned).
   - `o0_planted_skip_parent_caught_only_in_g`: a `test-probes` switch makes the overlay skip the parent layer
     (`with_split_layers`). D mode at interval 0 does not see it (asserted, the reason G exists); G mode reports a
-    divergence. Same for `o0_planted_skip_inflight_checkpoint` (skip C) with an interval.
+    divergence. Same for `o0_planted_skip_inflight_checkpoint` (skip C) with an interval; on today's native-only
+    stream it is caught only with the resident rows R off: with R the native phase reads too little through C (s131).
   - `o0_golden_today_g`: today's code in G mode reproduces the golden (determinism under timing).
   - `o0_marker_keyed_snapshot_sees_pre_resync_mirror` (guard, pins F11): a pipelined interval-0 block that credits an
     EVM account (a fee to an EVM address, so `evm_addrs` is non-empty), with W parked between its batch and
@@ -483,6 +568,23 @@ Everything in step 1 runs on today's paths. The golden must stay byte-equal afte
   `InvalidPrecompileInput` first, with a test.
 - Verify: `cargo nextest run -E 'rdeps(torus-evm)' $F`; golden unchanged (no fault in the stream).
 - Decision 3 (settled, R3): the fix ships on its own branch ahead of option 0; gate D1 enforces the order.
+- **Done (s131, on base `fd94818d`, F1 fix `86cd520f` + scan fix `a361e764`).** (1) The tests exist under other
+  names, all green: `balance_reader_read_fault_is_a_local_fault` and `enqueue_read_fault_is_a_local_fault` are
+  cases of `f1_precompile_read_fault_is_a_local_fault` (`0x0801 getBalances balance read`, CF_NATIVE_BALANCES;
+  `0x0810 placeOrder delay read`, CF_FEE_CONFIG; 8 cases, block / overlay / tx paths) plus
+  `f1_reader_read_fault_in_eth_call_is_an_error`; the guard is `f1_deterministic_precompile_errors_stay_reverts`;
+  `precompile_read_fault_fail_stops_block` (+ `precompile_scan_fault_fail_stops_block`) in torus-consensus. Added
+  here: `f1_undecodable_stored_row_is_a_local_fault` (guard, the row-decoding sources). (2) The audit (table in the
+  commit message): every `State` / `Borsh` source reachable from `execute_precompile_metered` is a local storage
+  fault (19: 18 reads, every CF a constant, and the journal's puts) or a local row fault (3: `Position` and `NativeBalance` decodes, the bbo
+  row length; the calldata picks the key, but every key it can address is written only by that row's codec), plus
+  one unreachable `Borsh` (encoding a `QueuedAction` into a `Vec`). No `MissingCf` / `BookCorrupt` source is
+  reachable. **No input-dependent source**: nothing maps to `InvalidPrecompileInput`, no behaviour change, golden
+  byte-equal. (3) **Option 0 extension, no code now:** on the fast path the journal (and the revm adapter) reads
+  through the block overlay, so a read that reaches L's deferred part after its merge failed returns
+  `StateError::Io` (`backend.rs` `layer_for`, "since-checkpoint layer merge failed"). From a precompile it is
+  `CoreError::State`, a local fault: the provider records it, the block aborts with `EvmError::LocalFault` and E
+  fail-stops, like a missing CF today. Tested in task 3.4 (`fast_path_deferred_merge_failure_under_journal_fail_stops`).
 
 **Task 1.2: absorb the EVM rows into the block overlay on the serial path**
 - Test first:
@@ -509,6 +611,12 @@ Everything in step 1 runs on today's paths. The golden must stay byte-equal afte
   - The plain fallback on an incremental error (`3580-3587`) becomes "trie ops dropped + stale marker" (task 2.3);
     until step 2 it keeps the plain rows in the overlay and logs as today.
 - Verify: `cargo nextest run -E 'rdeps(torus-state)' $F` (big core change); golden green.
+- **Done (s131, G1b, `619d1f83`, after 1.3).** As planned; `absorb_evm` moves a journal CF the overlay has not
+  touched without a copy. Deviations: `absorb_keeps_h_n_and_flush_bytes` is a torus-state test (today's path rebuilt
+  in-test from its parts: prefix batch, `HashExtras`, the seeded CF_ACCOUNTS rows; 40 random blocks with native
+  writes overlapping the EVM rows), not torus-consensus; the golden is the end-to-end check. F8's test uses the
+  probe's key watch, extended to scans (`Probe::watch_scans`), instead of a counting backend (the native phase
+  runs on the concrete overlay). New path flag `evm.absorb` (the coverage test's exact map gained it).
 
 **Task 1.3: the overlay before the EVM part; due-check through it after the absorb (R5)**
 - Test first:
@@ -526,6 +634,8 @@ Everything in step 1 runs on today's paths. The golden must stay byte-equal afte
     the EVM part; for native blocks that only moves time.
   - The `ExecutionContext::core_writer_due` test seam (`2623`) keeps its `ReplayFault::CoreWriterDueRead` switch.
 - Verify: `cargo nextest run -E 'rdeps(torus-bridge)' $F`; golden green.
+- **Done (s131, G1b, `cf6b9b2b`, first G1b commit).** As planned; the due-check runs under the `DueCheck` probe
+  scope. `pending_count` stays (test callers), over any backend.
 
 **Task 1.4: the lane read and the enqueue reads go through a backend (R7, R8)**
 - Test first: `lane_row_in_parent_layer_sets_big_fee` (`torus-bridge`): `validate_block_inner` over a layered backend
@@ -536,6 +646,9 @@ Everything in step 1 runs on today's paths. The golden must stay byte-equal afte
   (`154-178`; the comment "runs after a barrier" goes). Enqueue already takes `&impl StateBackend`: fix the doc
   (`precompiles.rs:1407`).
 - Verify: `cargo nextest run -E 'rdeps(torus-bridge)' $F`; golden green.
+- **Done (s131, G1b, `10eabfad`, after 1.5: the lane read uses 1.5's `EvmReads`).** `EvmReads::get_cf_raw` (Db:
+  the DB; Layered: `EvmBlockState::lane_read`, probe scope `Lane`). `enqueue_reads_cursor_rows_from_layers` is a
+  guard (enqueue already read through its backend): rows only in the parent, L or C give the same seqs and rows.
 
 **Task 1.5: EVM entry points take `EvmReads`, not `&StateDb`**
 - Test first: `execute_block_lanes_over_layers_equals_db` (`torus-evm`): the same block over the DB and over an
@@ -554,6 +667,14 @@ Everything in step 1 runs on today's paths. The golden must stay byte-equal afte
     reads) or `Db`. Both are covered by the golden.
   - `append_links(&StateDb)` stays on the serial path; the fast path drops it (task 2.2).
 - Verify: `cargo nextest run -E 'rdeps(torus-evm)' $F`; golden green.
+- **Done (s131, G1b, `1ee11778`).** Deviations: `EvmReads::Layered` holds the `EvmBlockState` by value (not
+  `&EvmBlockState`): the journal moves into the executor and comes back as `native_writes`, which the absorb consumes,
+  so no layer handle outlives the EVM part (3.2's "journal dropped before native"). `RootMode { OnE, Skip }` is in
+  (Skip: zero root, no `TrieUpdates`, no oracle; unused until 3.2). The serial path passes `EvmReads::Db`: the same
+  reads and journal as before, without the overlay's per-read lookups (perf: the flag-off path is unchanged).
+  The shared decoders live in `db.rs` (`decode_code`, `decode_storage_value`, `decode_block_hash`).
+  Open for step 3: the journal's precompile reads carry no `Journal` probe scope yet (torus-evm has no
+  `test-probes` feature); the revm adapter's reads carry `Revm`.
 
 **Task 1.6: the raw-DB tripwire**
 - Test first: `tripwire_fires_on_raw_read_in_armed_scope` and `tripwire_allows_overlay_bottom_reads` (`torus-state`).
@@ -563,9 +684,17 @@ Everything in step 1 runs on today's paths. The golden must stay byte-equal afte
   `2671`, `2690`, `2723`) hold an exemption token around the call. Release builds compile it out. Step 3 arms it for
   the fast-path EVM section.
 - Verify: `cargo nextest run -p torus-state $F` + `cargo check --workspace --tests -q`.
+- **Done (s131, G1b, `4a7665a7`).** Also trips `multi_get_cf_raw`, `exists_cf_raw`, `get_storage`, `get_code`,
+  `all_accounts`, `account_storage`, `get_session`, `count_sessions_for_owner`. The overlay exempts each read method
+  for its whole call (its DB fall-through and the probes' re-reads run inside). `cargo check` ran on the plan's -p
+  set, not `--workspace` (feature re-unification); the rest of the workspace ran its nextest after 1.7.
 
 **Task 1.7: docs of the barrier assumptions** (`native_executor.rs:13619-13628`, `precompiles.rs:1407`,
 `validator.rs:154-157`, `app.rs:3418-3426`): they now say "read through the block overlay".
+- **Done (s131, G1b).** `native_executor.rs` (`core_writer_due`) in 1.3, `precompiles.rs` (`enqueue`) and
+  `validator.rs` (lane read) in 1.4; this task: the pipelined-predicate comment in `app.rs` (the EVM part's reads go
+  through the block overlay; an EVM block still barriers for its writes until step 3). "EVM blocks are never
+  pipelined" (the hand-off assert, the no-native comment) stays true until 3.2.
 
 Step 1 size: ~500-800 lines, about half tests (estimate; task 1.1 is now ~50-150, the fix's own lines are on its
 branch). Golden green after every task.
@@ -584,6 +713,12 @@ branch). Golden green after every task.
   a second writer would break Q6 A1's key disjointness (design point 7). A shared encoder in `torus-bridge` serves
   both `commit_block_metadata` and W.
 - Verify: `cargo nextest run -E 'rdeps(torus-consensus)' $F`.
+- **Done (s131, G2, `c2162f7f`).** As planned. `EvmSideRows { height, block_hash, receipts, links }` and the shared
+  encoder `metadata_side_rows` are in `torus-bridge/src/committer.rs`; `commit_block_metadata` now writes its
+  receipts / hash -> number / tx-index rows through it (same rows, same order; header and body stay there). W stages
+  them with `stage_evm_side_rows` (`exec_pipeline.rs`): a receipt that does not serialize is logged and nothing is
+  staged (the serial path writes none either); a put error fails the job (fail-stop). Verify widened to
+  `rdeps(torus-bridge)` (the bridge changed): 1940 passed.
 
 **Task 2.2: the EVM trie step on W**
 - Test first (`torus-state`, `incremental.rs` tests):
@@ -609,13 +744,46 @@ branch). Golden green after every task.
 - Decision 4: if the window step cannot match per-block CF_TRIE_* bytes (reth's update sets differ by batching) while
   the roots and the mirror agree, fall back to per-block steps on W in height order over reth's in-memory
   trie / hashed cursor overlays.
+- **Done (s131, G2, `601e5f93`).** Decision 4 holds without the fallback: one step over a window gives CF_HASHED_*
+  and CF_TRIE_* byte-equal to the per-block path (80 random windows of 1-8 blocks, 60 windows of one, a
+  delete-with-storage / re-create case; a mutation dropping the forced storage-trie delete is caught). Shape, refined
+  from the plan: the ACCOUNT side is the window's final CF_ACCOUNTS row for every account the window wrote (each bundle
+  account and each noted native credit: every CF_ACCOUNTS write is in E's `dirty_evm_accounts`, so per block the
+  mirror ends at that row), not a per-account keep flag; the STORAGE side folds `apply_bundle_hashed` (mirror: kept
+  accounts' slots last-value-wins, a not-kept account wipes) and reth's `HashedPostState::extend` of each block's
+  `from_bundle_state` with the EIP-161 override (trie), plus a storage wipe for each account a block leaves out of the
+  trie; that account's storage trie is deleted (`is_deleted`) before its new nodes are written. The W wiring (the
+  prefix on Flush / Checkpoint) needs the job fields, so it landed in 2.4; this task added the torus-state plumbing
+  (`EvmWindowDelta`, `FrozenPending::flush_on_worker_after_batch`, `CheckpointLayer::flush_checkpoint_after_batch`,
+  `lookup_row` on both). Assumption (in the doc comment): an account holds no storage while EIP-161 empty or after a
+  native resync to absent (true for EOAs; a contract is never empty). Verify: `rdeps(torus-state)`, 3229 passed.
 
 **Task 2.3: stale trie: marker, full-scan fallback, boot rebuild (F4)**
 - Test first: `evm_trie_step_failure_marks_stale_and_boot_rebuilds` and `stale_trie_routes_root_to_full_scan`.
 - Code: a node-local key outside `META_CONSENSUS_PREFIXES` (not hashed) set in the same batch when the step fails (the
   checkpoint lands without the EVM ops). `evm_root_routed` (`state_root.rs:37`) uses the full scan while it is set.
   `ensure_trie_built` (`incremental.rs:131`) wipes and rebuilds when it is set, then clears it.
+- F4b: a TrieStale Flush returns before `resync_evm`. Make it resync (as the Checkpoint) or set the stale marker;
+  then flip `o0_trie_stale_flush_is_not_a_completion`'s pinned pre-resync row and let the hook fire for it.
 - Verify: `cargo nextest run -E 'rdeps(torus-bridge)' $F`.
+- **Done (s131, G2, `751cd9bf`).** Marker `META_EVM_TRIE_STALE` (`b"evm_trie_stale"`, CF_CONSENSUS_META, outside
+  `META_CONSENSUS_PREFIXES`: never hashed). `incremental::evm_window_prefix` (W's prefix): the step's batch; nothing
+  when already stale (a stale trie is never extended); the marker alone when the step fails. `evm_root_routed`: full
+  scan while stale (no `TrieUpdates`, no oracle). `ensure_trie_built` (boot, before replay): a stale trie is wiped (the
+  four CFs) and rebuilt EIP-161 clean, the marker cleared in the trie nodes' batch (a crash before it rebuilds again).
+  Also, as task 1.2 deferred here, the serial EVM section: an incremental trie-batch error marks the trie stale in the
+  block's prefix (was: logged, the trie silently lagging), a stale trie gets no trie batch, and the marker read
+  fail-stops (`ReplayFault::EvmTrieStaleRead`, test `o0_evm_trie_stale_marker_read_fault_fail_stops_block`). F4b:
+  "resync, as the Checkpoint" chosen. **Production behaviour change** (only with `TORUS_NATIVE_TRIE_MAINTENANCE=1`,
+  off by default): a TrieStale Flush on W now runs the EVM mirror resync and is a completion (hook fires). The pin test
+  is renamed `o0_trie_stale_flush_resyncs_and_is_a_completion`. E's serial flush keeps its fail-stop on that error.
+  Test placement: `evm_trie_step_failure_marks_stale_and_boot_rebuilds` in torus-state (on `evm_window_prefix` and
+  `ensure_trie_built`; the rebuilt mirror and trie are byte-equal to the maintained ones, with an EIP-161 empty row in
+  the plain state), `stale_trie_routes_root_to_full_scan` in torus-bridge (unmarked, the lagging trie trips the debug
+  oracle). Verify widened to `rdeps(torus-state)`: 3232 passed. Finding (unchanged code): `build_trie_to_cf`, the
+  first-boot build, mirrors EIP-161 empty accounts, which maintenance drops; harmless from a fresh genesis, but a first
+  build over a DB holding empty rows gives a trie whose root differs from the full-scan oracle
+  (`compute_post_bundle_evm_root` drops empties). The stale rebuild does not have this.
 
 **Task 2.4: job plumbing**
 - Code: `Job::Flush`, `Job::Digest` and `Job::Marker` gain `evm: Option<EvmJobRows { bundle, side }>`; `Job::Marker`
@@ -626,6 +794,19 @@ branch). Golden green after every task.
 - Test first: `marker_job_carries_action_status_to_checkpoint` and
   `marker_job_side_rows_land_at_interval_0_and_at_checkpoint` (an all-skipped block's hash -> number row is in the DB after its Marker at interval 0, and after the checkpoint
   with Every5, byte-equal to `commit_block_metadata`'s).
+- **Done (s131, G2, `7d01dce6`).** As planned, plus `EvmJobRows { bundle, side }` and `Job::into_digest` (the
+  Flush / Marker -> Digest conversion, now used by `pipeline_handoff`, which keeps the books fail-stop). W: a Flush
+  with `evm` runs the step for a window of one (final rows: sidecar, the frozen set, then the DB) into
+  `flush_on_worker_after_batch`, side rows into its sidecar; a Marker writes its status and side rows through a
+  sidecar of the marker batch (debug assert: no absorbed rows); a Digest stages them into `window.side` and folds a
+  non-empty bundle into `Window.evm`; a Checkpoint notes the window's `evm_addrs`, runs the window's step (final rows:
+  L, then the DB) into `flush_checkpoint_after_batch`. An empty bundle (all skipped) gets no trie step: today's
+  post-write resync covers its native credits. Both planned tests are W-level, through `Job::into_digest` (no E path
+  builds a Marker with status before step 3). Added `evm_jobs_flush_and_checkpoint_equal_serial`: 10 EVM blocks (one
+  all-skipped) as Flush jobs and as Digests closed by two Checkpoints equal today's serial pieces (trie-batch prefix +
+  links, `commit_block_metadata`, flush, resync) on every CF but header / body, root == full scan; a mutation emptying
+  W's prefix is caught. Open for step 3: W has no path counter (C13 needs one on the worker env); the EVM step's
+  panic seam for task 3.5 is not built; E's debug assert on the Marker (3.3) is not built (W has one).
 
 Step 2 size: ~580-800 lines (estimate; +30-50 for the Marker's `evm` field and its tests).
 
@@ -674,7 +855,9 @@ Step 2 size: ~580-800 lines (estimate; +30-50 for the Marker's `evm` field and i
 
 **Task 3.4: local faults on the fast path**
 - Test first: `fast_path_adapter_read_fault_fail_stops`, `fast_path_deferred_merge_failure_under_journal_fail_stops`
-  (the merge thread's failure seam), `fast_path_absorb_put_fault_fail_stops`. The faults are injected in G mode with
+  (the merge thread's failure seam; task 1.1's option 0 extension: a precompile journal read that reaches L's
+  deferred part after a failed merge gets `StateError::Io`, so `CoreError::State`, a local fault: never a revert),
+  `fast_path_absorb_put_fault_fail_stops`. The faults are injected in G mode with
   the parent's job (interval 0) or the checkpoint (interval) still held (R2). Each is a fail-stop on E, which latches
   `exec_failed`, so W must refuse the held jobs (`exec_pipeline.rs:742-744`) and not land them. The checks follow
   task 3.5's crash protocol (R4): d = the marker before the fault; before the drop, `exec_failed` is set and
@@ -724,6 +907,9 @@ Step 2 size: ~580-800 lines (estimate; +30-50 for the Marker's `evm` field and i
   `o0_coverage_floor_per_config` (in-flight hits, 5.2) and the planted bypasses of 5.4.
 - Also update `epoch_fast_path_evm_or_slash_boundary_stays_serial`: with the EVM flag on, an EVM boundary block is
   pipelined; a slash or a non-durable header still barriers.
+- And flip the next-block half of `o0_eip161_recreation_reads_by_layer` (task 0.1): with the flag on, the re-fund at
+  e+1 reads Z's EIP-161 deletion from an in-flight layer (parent at interval 0, C or L with Every5 in G mode) at
+  least once per configuration; the same-block half (the block's own pending layer) stays.
 
 **Task 3.7: existing EVM tests on the fast path**
 - `corewriter_evm_row_drains_in_empty_next_block` (+ `_with_interval`, `app.rs:25834`, `25923`),
@@ -739,6 +925,50 @@ Step 2 size: ~580-800 lines (estimate; +30-50 for the Marker's `evm` field and i
   interval 0) agree on every `h_n` and every state-hash attestation row (`h % 100`). Their checkpoint policies differ,
   so the comparison is task 0.4's ledger (by height), never `p5_compare` (it would fail on the marker lag). Run in D
   and in G mode (the two flag-on nodes gated on independent schedules).
+
+**Done (s132, G3, on `41f6407f`; F1 fix `86cd520f` + `a361e764` in the base, gate D1).** Commits: 3.1 `4a3f7aad`,
+3.2 `b28fd4ff`, 3.3 `fbdfd079`, 3.4 `c14ac3bd`, 3.5 `d5997009`, 3.6 `ce8b413e` (counters, poison grid, planted
+bypasses) + `9437b9d9` (coverage floor, matrix, flips), 3.7 `5bbdcc07`, 3.8 `7123cc3d`.
+- **Flag-on golden: byte-equal** (`o0_golden_fast_path_d` / `_g`, the matrix, the mixed replicas): Classic at interval
+  0, Every5 and Never, D and G mode, epoch flag on and off, `TORUS_CKPT_DEFER_BOOKS=1`; every flag-off cell too.
+  OrderRows and modes 2 / 3 against S in their mode (the golden is Classic).
+- 3.1: as planned, except that the predicate term moved to 3.2, so no commit runs today's serial EVM section (DB
+  reads, root on E, receipts written on E) on a pipelined block.
+- 3.2: as planned. The tripwire is also armed around the pipelined due-check (debug / test-probes builds). Seams:
+  torus-evm `test-probes` (precompile reads labelled `Journal`), W path counters shared with E (C13, `w.*`), the
+  drain-checkpoint flag, the panic seam inside W's EVM trie step.
+- 3.3: the Marker carries `action_status` and the EVM part (all-skipped `Ok`) or `None` (failed section); E's debug
+  assert as planned. Flag-on golden reachable from here (`o0_golden_fast_path_d` / `_g`).
+- 3.4: the three planned tests, each at interval 0 (the parent's Flush held) and Every5 (the checkpoint held) where it
+  applies. The faults are taken with W held on a fixed schedule (`hold_from`, `hold_checkpoints`), not the seeded G
+  controller, so the held job is the one the fault needs; same semantics (no drain between the held blocks). The
+  crash protocol `o0_crash` (R4, steps 1-5) is built here, where it is first needed; step 4 compares the whole DB
+  with the hook snapshot at d. New seams: `Plant::FaultRevmRead`, `ReplayFault::AbsorbPut`,
+  `DeferredGate::fail_next`; `test_crash_after_evm_section` now latches.
+- 3.5: every planned crash point (before / after the absorb, after the hand-off, inside W's EVM trie step, during the
+  replay of an EVM block; repeated crashes; an all-skipped Marker held) at interval 0 and Every5, plus the two guards.
+- 3.6: section 5.2's table is `o0_coverage_floor_per_config` (47 rows x 7 configurations, the reachable pairs and the
+  reasons for the others next to it; asserted unreachable: no in-flight parent in D at interval 0, no C read in D, no
+  second deferred-read wait in a block, no shared L / C / R). C4 is read as "every CF has an in-flight layer hit and
+  every layer an in-flight hit" on the stream; the full reader x CF x layer grid, the stale answer of each planted
+  bypass and its tripwire are `o0_poison_readers_answer_from_every_layer` (F13). Planted bypasses (5.4): revm, lane,
+  due-check, enqueue, journal (`o0_planted_bypass_*`); in-flight-only skips limited to the EVM section (new plants
+  `SkipParentEvm`, `SkipCheckpointEvm`, `SkipDeferredEvm`): skip parent caught in G at interval 0 and not in D, skip C
+  caught with R on in G and not in D, skip deferred caught. The defer-books cell runs in a child process of the test
+  binary (the routing is read once per process). The EIP-161 flip holds at interval 0 (F12 for Every5). Added: the
+  C2 non-durable header case (`fast_path_evm_block_not_dispatch_durable_stays_serial`), the controller knob
+  `every_parent`.
+- 3.7: as planned; all R02 fault runs now also assert that the replay re-hashes exactly the faulted height (F14 for
+  the root-compute case).
+- 3.8: three replicas (off Every5; on Every5; on interval 0), D and G (independent schedules): equal ledgers, equal
+  attestation rows (checkpoints 100 / 200 / 300), all equal the golden.
+- Tripwire: 0 hits on every flag-on run (a hit panics); the planted bypasses show it live.
+- Gates on `7123cc3d`: plan -p set nextest 3703 passed / 0 failed (40 skipped); rest of the workspace (torus-network,
+  -telemetry, -explorer, -faucet, -price-feeder, -tx-flood, bench-throughput) 473 passed; doc tests rc=0 (1 passed);
+  `o0_*` 48 / 48 twice in a row; fast_path | journal_dropped | epoch_fast_path 38 / 38 once more; release
+  `cargo build -p torus-node` OK (tripwire and probes compiled out).
+- Open for G4: task 4.2's metrics (`torus_exec_evm_fast_path_blocks`, `torus_flush_worker_evm_trie_seconds`) and the
+  mempool prune on the view (4.1) are not built; F14's behaviour difference; Codex torus-adversarial review of G3.
 
 Step 3 size: ~750-1,070 lines, mostly tests (estimate; +100-150 for the all-skipped cases, the G-mode wiring of the
 matrix, the in-flight planted faults; +50-70 in revision 2 for the `o0_crash` protocol, the seam latches and their
@@ -766,6 +996,55 @@ two guards, R4).
 **Task 4.4: reviews**
 - Codex torus-adversarial review of the branch (`codex_worktree.py`, scope branch). Its fixes come with tests.
   Then Q11.
+
+**Done (G4, 2026-10-19, on `04a25711`; 4.4 is 18c's).** Commits: 4.1 `4249c92c`, 4.2 `53ace0c9` + `a070eafd`,
+4.3 `998719d7`, clippy `795cc291`, harness fix F15 `9bc80fce`.
+- 4.1: as planned. `prune_committed_txs(h)` keeps the raw DB; both share `prune_committed_with` (a height closure
+  called once, before the first nonce read). Tests: `prune_on_view_uses_view_height_and_view_nonces` (decision 7's
+  nonce and height rules on a view; the raw-DB prune does not see the view's nonce; the view's height wins over the
+  DB marker), guard `prune_without_view_reads_db_marker`. Deviation: `notify_block_committed` (design point 8, "both
+  functions") stays on the raw DB: it has no production caller (F3). `torus-node` reads the flag once more for the
+  commit handler (an invalid value warns twice).
+- 4.2: `torus_exec_evm_fast_path_blocks`, `torus_flush_worker_evm_trie_seconds` as planned (W times
+  `evm_window_prefix`: a fast-path block's step at interval 0, a checkpoint window's otherwise), plus three cheap
+  series Q11 reads: `torus_exec_evm_blocks` (all EVM blocks: the pipelined share), `torus_exec_evm_idle_before_seconds`
+  (per EVM block, E from the previous block's end to this one's start, the barrier included, as the q5-gaps view) and
+  `torus_exec_evm_block_seconds` (exec ms at EVM heights). `torus_exec_evm_seconds` unchanged (same count flag off and
+  on). The startup line of 3.1 now also names the view prune, the checkpoint rule and the metrics. Tests:
+  `evm_fast_path_metrics_register` (telemetry), `evm_fast_path_metrics_count_evm_blocks_and_w_trie_step` (flag off /
+  on at interval 0, on Every5, on without W).
+- 4.3: config reference (the row, a section "EVM fast path (item 7 option 0)" with the 4 a freshness rule and the
+  metrics), new `docs/api/eth-head.md`, `docs/monitoring-setup.md` rows, the design's status line. Deviation:
+  `docs/perf/bench-queue.md` (Q11) is not edited on this branch; 18c queues Q11 on main.
+- **What Q11 (section 6) can read from metrics:** pass 2 (fast / all EVM blocks; idle p50 from
+  `torus_exec_evm_idle_before_seconds`, buckets 0.5, 1, 2, 4, 8 ms...: "p50 < 5 ms" holds if >= 50% fall in the
+  4 ms bucket, a p50 between 4 and 8 ms needs the log lines), pass 3 (`torus_exec_checkpoint_deferred_read_waits`),
+  pass 4 (`torus_exec_resident_rows_rebuilds`, `torus_exec_checkpoint_layer_shared`), pass 5
+  (`torus_exec_checkpoints`, `torus_exec_checkpoint_layer_bytes`); report rows: `torus_exec_evm_seconds` per EVM block
+  (sum / `torus_exec_evm_blocks_total`; other blocks observe ~0), exec ms at EVM heights vs others
+  (`torus_exec_evm_block_seconds` vs `torus_exec_block_seconds`), `torus_flush_worker_evm_trie_seconds`, W busy
+  (`torus_flush_worker_seconds`, `_checkpoint_seconds`), native blocks (`torus_exec_native_blocks`), timeouts and
+  `no_proposal` (`torus_consensus_timeout_total`, `torus_view_timeout_no_proposal`). **Not from metrics:** matched/s,
+  CPU-s / 1M, exec-thread on-CPU (`sched_by_node`), block p50 / p99, commit -> exec lag (logs; order-age exec minus
+  commit approximates it), the exec queue PEAK (`torus_exec_queue_depth` is a gauge: the max of the scrapes), the EVM
+  checks of pass 6 (`evm_load.py`: landed, `off_cadence_blocks`, eth head; attestation and fail-stop lines in the logs).
+- **F15 (harness, found by the G4 gates).** `o0_coverage_floor_per_config` lost its C18 row (a deferred-read wait,
+  G mode Every5 epoch-off) in 1 of 5 `o0_*` runs at load average 260 on 18 cores. Cause: `DeferredGate`'s 2 s hold
+  timeout opened the gate for the rest of the run (right for the item 6 p3 tests, which count a timeout as a
+  failure), so one block slower than 2 s dropped every later forced wait. Fix: `DeferredGate::rearming()` for the
+  option 0 G-mode nodes: a timed-out hold lets only its own merge through. Test
+  `deferred_gate_rearm_holds_after_a_timeout`. The p3 tests keep the default gate.
+- **F16 (open, pre-merge).** `cargo fmt --check` on the P set: 3534 hunks on the branch vs 3334 on `fd94818d`, all from
+  G0-G3 (G4's lines are clean). Section 11's "fmt counts not above main's" is open; a whole-file `rustfmt` also
+  rewrites main's own debt, so format only the branch's hunks.
+- **F16 fixed.** rustfmt applied to the branch's own hunks only (whole for the 4 new files; hunks that would rewrite
+  main's own unformatted lines skipped): P set 3333 hunks vs 3334 on `fd94818d` (-1: a main line the branch rewrote).
+- Clippy: the branch had 20 warnings over main (all on G0-G3 lines, mostly tests); `795cc291` brings it to main's 322
+  with the same lint set. Known load-flaky `hot_path_fails_view_fast_when_body_never_arrives` failed once in the first
+  P-set run (S395: load-flaky by design), passed in the rerun.
+- Gates: P set nextest 3706 / 3706 (40 skipped) on `795cc291`; torus-consensus 525 / 525 after F15; rest of the
+  workspace 474 passed (1 skipped); doc tests rc=0 (1 passed); `o0_*` 48 / 48 twice after F15; release
+  `cargo build -p torus-node` OK; `RUSTFLAGS="-D warnings"` build of the P set (all targets) OK; clippy 322 = main.
 
 Step 4 size: ~150-300 lines (estimate).
 
@@ -865,7 +1144,8 @@ Planted faults that only an in-flight read exposes (R2). They read through the o
 but skip one layer, so their answer differs only while that layer is not yet durable:
 - `o0_planted_skip_parent_layer` (the EVM section's overlay and journal built without the parent): caught in G mode at
   interval 0; in D mode at interval 0 it passes (asserted: the drain hides it, the reason G exists);
-- `o0_planted_skip_inflight_checkpoint` (without C): caught only in G mode with a held checkpoint;
+- `o0_planted_skip_inflight_checkpoint` (without C): caught only in G mode with a held checkpoint (on the native
+  phase only with R off, task 0.4; the EVM section reads no R, so step 3 must show it caught with R on);
 - `o0_planted_skip_deferred_part` (without L's deferred part): caught with a held merge.
 Task 0.4 proves the same switches on today's native phase before any option 0 code exists.
 

@@ -1,6 +1,8 @@
 # Item 7: EVM lanes (design, s99)
 
-Status: step 1 merged (853fed28, s123); step 2 built (s126, see below), not merged yet; step 3 is design. Owner decision s99: item 7 is its own
+Status: step 1 merged (853fed28, s123); step 2 merged (cfa35ed1, s127); step 3 option 0 (the EVM fast path,
+`item7-option0-impl.md`) merged s131 with `TORUS_EVM_FAST_PATH` on by default (perf doc section 107); T, HL order
+and C0 are not built. Owner decision s99: item 7 is its own
 item; design now, build after item 6 Phase 2 (before Phase 3 and before testnet; a block-format
 change needs a fresh genesis, which is free before testnet). Context: `item6-phase1-impl.md` 9.16.
 

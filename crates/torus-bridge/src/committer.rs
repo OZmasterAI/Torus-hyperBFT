@@ -172,24 +172,16 @@ impl BlockCommitter {
             .map_err(BridgeError::Serialization)?;
         batch.put_cf(cf_bodies, height_key, &body_bytes);
 
-        for receipt in receipts {
-            let mut key = [0u8; 12];
-            key[..8].copy_from_slice(&height_key);
-            key[8..12].copy_from_slice(&receipt.tx_index.to_be_bytes());
-            let receipt_bytes = serde_json::to_vec(receipt)
-                .map_err(|e| BridgeError::Serialization(e.to_string()))?;
-            batch.put_cf(cf_receipts_cf, key, &receipt_bytes);
-        }
-
-        batch.put_cf(cf_hash_to_num, block_hash.as_slice(), height_key);
-
-        // D5 (S392): drive off the receipts (see commit_block step 7) — skipped
-        // txs get no receipt and therefore no location entry.
-        for receipt in receipts {
-            let mut location = [0u8; 12];
-            location[..8].copy_from_slice(&height_key);
-            location[8..12].copy_from_slice(&receipt.tx_index.to_be_bytes());
-            batch.put_cf(cf_tx_loc, receipt.tx_hash.as_slice(), location);
+        // Item 7 option 0 (task 2.1): receipts, hash -> number and the tx
+        // index through the encoder the flush worker shares
+        // ([`metadata_side_rows`]); same rows, same order as before.
+        for (cf, key, value) in metadata_side_rows(block.header.height, &block_hash, receipts)? {
+            let handle = match cf {
+                CF_RECEIPTS => cf_receipts_cf,
+                CF_BLOCK_HASH_TO_NUMBER => cf_hash_to_num,
+                _ => cf_tx_loc,
+            };
+            batch.put_cf(handle, key, value);
         }
 
         state_db.write(batch)?;
@@ -262,5 +254,104 @@ impl BlockCommitter {
             native.append_pending_to_batch(state_db, &mut batch)?;
         }
         Ok(batch)
+    }
+}
+
+/// One node-local side row: `(cf, key, value)`.
+pub type SideRow = (&'static str, Vec<u8>, Vec<u8>);
+
+/// Item 7 option 0 (task 2.1): the metadata rows of an EVM block other than
+/// its header and body, in [`BlockCommitter::commit_block_metadata`]'s
+/// order: one `CF_RECEIPTS` row per receipt (key `height ‖ tx_index`, the
+/// receipt's JSON), the `CF_BLOCK_HASH_TO_NUMBER` row (ALWAYS, also for zero
+/// receipts: an all-skipped block writes it today, plan F2), then one
+/// `CF_TX_HASH_TO_LOCATION` row per receipt (D5: driven off the receipts, a
+/// skipped tx has none). The one encoder `commit_block_metadata` and the
+/// flush worker share. A receipt that does not serialize is an `Err`
+/// (deterministic: the same block and receipts on every node), and then no
+/// row is returned.
+pub fn metadata_side_rows(
+    height: u64,
+    block_hash: &B256,
+    receipts: &[Receipt],
+) -> Result<Vec<SideRow>, BridgeError> {
+    let height_key = height.to_be_bytes();
+    let mut rows = Vec::with_capacity(2 * receipts.len() + 1);
+    for receipt in receipts {
+        let mut key = [0u8; 12];
+        key[..8].copy_from_slice(&height_key);
+        key[8..12].copy_from_slice(&receipt.tx_index.to_be_bytes());
+        let receipt_bytes =
+            serde_json::to_vec(receipt).map_err(|e| BridgeError::Serialization(e.to_string()))?;
+        rows.push((CF_RECEIPTS, key.to_vec(), receipt_bytes));
+    }
+    rows.push((
+        CF_BLOCK_HASH_TO_NUMBER,
+        block_hash.as_slice().to_vec(),
+        height_key.to_vec(),
+    ));
+    for receipt in receipts {
+        let mut location = [0u8; 12];
+        location[..8].copy_from_slice(&height_key);
+        location[8..12].copy_from_slice(&receipt.tx_index.to_be_bytes());
+        rows.push((
+            CF_TX_HASH_TO_LOCATION,
+            receipt.tx_hash.as_slice().to_vec(),
+            location.to_vec(),
+        ));
+    }
+    Ok(rows)
+}
+
+/// Item 7 option 0 (task 2.1): the node-local side rows of a fast-path EVM
+/// block, built on the executing thread from the validated block and written
+/// by the flush worker in the block's batch (interval 0) or at the
+/// checkpoint (plan section 3). They are what
+/// [`BlockCommitter::commit_block_metadata`] plus
+/// `torus_state::corewriter_tx::append_links` write on the serial path,
+/// minus the header and the body: the dispatcher wrote those for a pipelined
+/// block, and a second writer would break the key disjointness of the
+/// dispatch rows (design point 7). None of these CFs is hashed or a root CF.
+#[derive(Clone, Debug)]
+pub struct EvmSideRows {
+    pub height: u64,
+    /// `keccak256(header.canonical_header_bytes())`, the key of the
+    /// hash -> number row.
+    pub block_hash: B256,
+    /// The block's receipts (empty for an all-skipped block: then the side
+    /// rows are just the hash -> number row, plan F2).
+    pub receipts: Vec<Receipt>,
+    /// `(target block, seq, link)` per queued CoreWriter row (`CF_CORE_WRITER_TX`).
+    pub links: Vec<(u64, u64, torus_state::corewriter_tx::CoreWriterTxLink)>,
+}
+
+impl EvmSideRows {
+    /// The side rows of `block` with its validated `receipts` and CoreWriter `links`.
+    pub fn of(
+        block: &TorusBlock,
+        receipts: Vec<Receipt>,
+        links: Vec<(u64, u64, torus_state::corewriter_tx::CoreWriterTxLink)>,
+    ) -> Self {
+        Self {
+            height: block.header.height,
+            block_hash: alloy_primitives::keccak256(block.header.canonical_header_bytes()),
+            receipts,
+            links,
+        }
+    }
+
+    /// Every row: [`metadata_side_rows`], then one `CF_CORE_WRITER_TX` row
+    /// per link (the bytes of `append_links`). `Err` only for a receipt that
+    /// does not serialize (no row then).
+    pub fn rows(&self) -> Result<Vec<SideRow>, BridgeError> {
+        let mut rows = metadata_side_rows(self.height, &self.block_hash, &self.receipts)?;
+        for (target, seq, link) in &self.links {
+            rows.push((
+                torus_state::cf::CF_CORE_WRITER_TX,
+                torus_state::corewriter_tx::key(*target, *seq).to_vec(),
+                link.encode().to_vec(),
+            ));
+        }
+        Ok(rows)
     }
 }

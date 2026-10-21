@@ -1028,19 +1028,129 @@ else:
 # What the gate proves for TORUS_EXEC_PIPELINE: the applied-height marker is the
 # crash fence, so the restarted node must replay from it, converge to the SAME
 # state as the two survivors, and rewind no further than the work that was
-# already committed-but-unexecuted at the kill.
+# already committed-but-unexecuted at the kill plus what was executed but not
+# yet durable (the hand-off; with coalesced checkpoints, since the last
+# checkpoint W finished).
 #
 #   rewind_blocks             committed - applied at the crash (the replay gap)
 #   exec_queue_depth_at_kill  committed-but-unexecuted blocks already queued on E
-#   rewind_beyond_exec_queue  what the PIPELINE cost on top: depth-1 hand-off
-#                             plus the in-flight batch => <= 2
+#   rewind_beyond_exec_queue  what the PIPELINE cost on top of that queue
+#
+# The bound on rewind_beyond_exec_queue (max_rewind_beyond_exec_queue, per kill):
+#
+#   checkpoints off (per-block flush):   PER_BLOCK_REWIND_SLACK = 2
+#       the depth-1 hand-off plus the in-flight batch; W writes every block.
+#   checkpoints on (item 6 Phase 3, interval > 0):   MAX_REWIND_HARD_CAP = 202
+#       = 2 + CHECKPOINTS_IN_REWIND x CHECKPOINT_FORCED_STRIDE = 2 + 2 x 100.
+#     The durable applied height is the LAST checkpoint W finished, so a kill
+#     also replays every block E executed since then: the open checkpoint
+#     window, plus the previous checkpoint if W was still writing it
+#     (checkpoints are depth-1 on W, `second_checkpoint_waits_for_first`, so
+#     at most one more): CHECKPOINTS_IN_REWIND = 2. Neither spans more than 100
+#     blocks, because every 100th height (attest heights, h % 100 == 0) always
+#     checkpoints (exec_pipeline.rs `CheckpointPolicy`). A rewind past 202 is a
+#     broken fence or a runaway replay: FAIL.
+#   No block-rate estimate: a survivor's torus_block_height rate does not bound
+#     the KILLED node's checkpoint span (block_height advances after local
+#     execution, and survivors can lag), and a failed scrape writes zeros into
+#     the sampler (Codex review of d7867617). The forced stride is the only
+#     bound the node itself guarantees.
+#   Whether checkpoints are on resolves exactly as the node does
+#     (exec_pipeline.rs `effective_checkpoint_interval` + app.rs):
+#     TORUS_EXEC_PIPELINE=0 -> off (checkpoints need W);
+#     TORUS_CHECKPOINT_INTERVAL_MS set -> that value (0 or garbage -> off);
+#     unset -> the validator default 15 s, unless TORUS_BOOK_ROWS=2/3 (a
+#     deferred book save turns the default off).
+#
+# Bench 8l (perf doc 107.6): 15 s checkpoints, a 27-block replay (23 beyond the
+# queue) with agreeing digests was REJECTed by the old constant bound of 2.
 #
 # Absent crash.json => `crash` is null and the headline gate is null (NOT "FAIL"):
 # an ordinary cell simply did not run the gate.
-MAX_REWIND_BEYOND_EXEC_QUEUE = 2
+PER_BLOCK_REWIND_SLACK = 2
+CHECKPOINT_FORCED_STRIDE = 100
+CHECKPOINTS_IN_REWIND = 2
+VALIDATOR_CHECKPOINT_INTERVAL_S = 15.0
+MAX_REWIND_HARD_CAP = PER_BLOCK_REWIND_SLACK + CHECKPOINTS_IN_REWIND * CHECKPOINT_FORCED_STRIDE
 
 
-def kill_checks(raw, out):
+# Rust `char::is_whitespace` (Unicode White_Space), what `str::trim` strips.
+# Python's str.strip() differs (it also strips U+001C..U+001F).
+RUST_WHITESPACE = ("\t\n\x0b\x0c\r \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004"
+                   "\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000")
+U64_MAX = 2 ** 64 - 1
+
+
+def rust_trim(v):
+    return (v or "").strip(RUST_WHITESPACE)
+
+
+def rust_parse_u64(v):
+    """Rust `v.parse::<u64>()` (v already trimmed): an optional single leading
+    '+', then one or more ASCII digits, value <= u64::MAX; else None (Err)."""
+    body = v[1:] if v.startswith("+") else v
+    if not body or not all("0" <= ch <= "9" for ch in body):
+        return None
+    n = int(body)
+    return n if n <= U64_MAX else None
+
+
+# s131: per-cell audit of the book mode and the default-changed flags (same
+# list, order and wording as run-cell.sh NODE_FLAGS_AUDIT / node_flags_line).
+NODE_FLAGS_AUDIT = (
+    "TORUS_BOOK_ROWS",
+    "TORUS_BOOK_FAST_ENCODE",
+    "TORUS_SETTLE_NO_MERGE",
+    "TORUS_EVM_FAST_PATH",
+    "TORUS_BOOK_COALESCE",
+    "TORUS_CHECKPOINT_INTERVAL_MS",
+)
+
+
+def book_mode(node_env):
+    """torus_bridge::native_executor::parse_book_rows_mode: trimmed "1"/"2"/"3"
+    -> mode1/mode2/mode3, anything else (incl. unset/empty) -> classic. None
+    when the cell recorded no node env (legacy): unknown, not guessed."""
+    if not isinstance(node_env, dict):
+        return None
+    v = rust_trim(node_env.get("TORUS_BOOK_ROWS"))
+    return "mode" + v if v in ("1", "2", "3") else "classic"
+
+
+def node_flags(node_env):
+    if not isinstance(node_env, dict):
+        return None
+    out = {}
+    for k in NODE_FLAGS_AUDIT:
+        v = node_env.get(k)
+        out[k] = "unset (default)" if v is None else "empty (default)" if v == "" else v
+    return out
+
+
+def checkpoint_interval_s(node_env):
+    """The checkpoint interval (s) the cell's validators ran, None = per-block
+    flush. Mirrors the node's resolution (see the block comment above):
+    exec_pipeline::parse_checkpoint_interval treats a value that is blank
+    after trim as unset (role default); otherwise `trim().parse::<u64>()`,
+    where Ok(0) and every Err (sign '-', non-digits, overflow) mean OFF."""
+    if rust_trim(node_env.get("TORUS_EXEC_PIPELINE")) == "0":
+        return None
+    raw = rust_trim(node_env.get("TORUS_CHECKPOINT_INTERVAL_MS"))
+    if raw:
+        ms = rust_parse_u64(raw)
+        return ms / 1000.0 if ms else None
+    if rust_trim(node_env.get("TORUS_BOOK_ROWS")) in ("2", "3"):
+        return None
+    return VALIDATOR_CHECKPOINT_INTERVAL_S
+
+
+def rewind_limit(node_env):
+    """(max rewind beyond the exec queue, checkpoint interval s or None)."""
+    iv = checkpoint_interval_s(node_env)
+    return (PER_BLOCK_REWIND_SLACK if iv is None else MAX_REWIND_HARD_CAP), iv
+
+
+def kill_checks(raw, out, node_env):
     """The part of the gate that ONE kill's record + log scan decides on its
     own (shared by crash.json and every s75 multi-crash crash-<k>.json):
     fills the rewind fields into `out`, returns the failures."""
@@ -1049,17 +1159,21 @@ def kill_checks(raw, out):
     gap = int(r.get("gap") or 0)
     q = pre.get("exec_queue_depth")
     q = int(q) if q is not None else None
+    limit, iv = rewind_limit(node_env)
     out["rewind_blocks"] = gap
     out["exec_queue_depth_at_kill"] = q
     out["rewind_beyond_exec_queue"] = (gap - q) if q is not None else None
+    out["checkpoint_interval_s"] = iv
+    out["max_rewind_beyond_exec_queue"] = limit
+    out["max_rewind_hard_cap"] = MAX_REWIND_HARD_CAP
     fail = []
     if not raw.get("restarted_pid"):
         fail.append("killed node did not restart")
     if out["rewind_beyond_exec_queue"] is None:
         fail.append("no exec_queue_depth sampled at the kill — rewind unbounded")
-    elif out["rewind_beyond_exec_queue"] > MAX_REWIND_BEYOND_EXEC_QUEUE:
-        fail.append("rewind %d blocks beyond the exec queue (max %d)"
-                    % (out["rewind_beyond_exec_queue"], MAX_REWIND_BEYOND_EXEC_QUEUE))
+    elif out["rewind_beyond_exec_queue"] > limit:
+        fail.append("rewind %d blocks beyond the exec queue (max %d: checkpoint interval %s s)"
+                    % (out["rewind_beyond_exec_queue"], limit, iv))
     if int(r.get("panic_or_failstop_lines") or 0) > 0:
         fail.append("panic/fail-stop after the restart")
     if int(r.get("hole_lines") or 0) > 0:
@@ -1072,8 +1186,7 @@ def crash_gate(raw, agreement, node_env):
         return None
     r = raw.get("restart") or {}
     out = dict(raw)
-    fail = kill_checks(raw, out)
-    out["max_rewind_beyond_exec_queue"] = MAX_REWIND_BEYOND_EXEC_QUEUE
+    fail = kill_checks(raw, out, node_env)
     # The gate exists to unblock the FLAG: if the restarted node came back
     # without the flush worker, it crash-tested the serial path and proves
     # nothing. (A flag-off crash cell is a legitimate serial control.)
@@ -1141,7 +1254,7 @@ def crash_kill_list(out_dir, first, node_env):
             raw = crash_record(os.path.join(out_dir, "crash-kill-%d.json" % k)) or {}
         e = {f: raw.get(f) for f in KILL_FIELDS}
         e["kill_seq"] = e["kill_seq"] or k
-        fail = kill_checks(raw, e)
+        fail = kill_checks(raw, e, node_env)
         r = raw.get("restart") or {}
         e.update({f: r.get(f) for f in SCAN_FIELDS})
         if not scanned:
@@ -1297,6 +1410,9 @@ summary = {
              # Row 76 liquidation stress: load senders 0..liq_thin-1 seeded thin (0 = off).
              "liq_thin": int(A.liq_thin or 0),
              "liq_thin_avail": A.liq_thin_avail if int(A.liq_thin or 0) > 0 else None,
+             # s131: the effective book mode and default-changed flags (None = no node env recorded).
+             "book_mode": book_mode(NODE_ENV if A.node_env else None),
+             "node_flags": node_flags(NODE_ENV if A.node_env else None),
              "extra_env": A.extra_env, "node_env": NODE_ENV,
              "env_digests_per_node": A.env_digests.split(), "bench_cmd": A.bench_cmd, "node_pids": A.pids.split()},
     "timing": {"t_bench0": t0, "t_bench1": t1, "t_drain": td, "bench_wall_s": t1 - t0, "drain_s": td - t1,

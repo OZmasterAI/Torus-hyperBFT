@@ -489,16 +489,17 @@ DEFAULT_EVM_N=11
 WSL="$WT/devnet/wsl"
 RUN_DIR="$DATA_ROOT/run"
 
-# RE-PROOF5 record cell (R190) node env, with TORUS_BOOK_ROWS bumped 2 -> 3
-# after the r2 merge (level-hash-seq-chunked: mode 3 chunked level digest,
-# consensus-visible, fleet-uniform, fresh genesis — all three hold here since
-# every cell is CLEAN=1 with one env for all 3 nodes). Since plan 9.13 the
-# node-code defaults equal this list except TORUS_BOOK_ROWS (the node-code
-# default stays Classic until the book mode is in genesis, so the =3 here is
-# required) and TORUS_COMMIT_LAG_BACKOFF_CAP (genesis-sourced, 0); the other
-# exports keep OLDER binaries equivalent. EXTRA_ENV entries are applied AFTER these, so a cell
-# can override any of them (e.g. EXTRA_ENV='TORUS_BOOK_ROWS=2' for a mode-2
-# control, or 'TORUS_PARALLEL_SETTLE=0').
+# RE-PROOF5 record cell (R190) node env. Since plan 9.13 the node-code
+# defaults equal this list except TORUS_COMMIT_LAG_BACKOFF_CAP (genesis-sourced,
+# 0); the other exports keep OLDER binaries equivalent. EXTRA_ENV entries are
+# applied AFTER these, so a cell can override any of them (e.g.
+# 'TORUS_PARALLEL_SETTLE=0').
+# NO book mode here (s131, bench 8y / perf doc section 110): from the r2 merge
+# (3bf5a313) to s131 this list pinned TORUS_BOOK_ROWS=3, so a cell ran mode 3
+# unless its campaign overrode it, and one 8y Classic smoke silently did. A
+# cell now runs the node default (Classic, the testnet genesis mode) unless
+# EXTRA_ENV sets TORUS_BOOK_ROWS (=3 for a mode-3 arm, =2 mode 2, =1 OrderRows);
+# the cell=... book_mode=... line and summary.json cell.book_mode record it.
 # TORUS_PARALLEL_BUCKET_HASH: 4 -> 8 after the r5 root-and-save-workers sweep
 # (+10.8 % n=3 vs n=3, agreement clean); 8 is ALSO the compiled default now
 # (DEFAULT_BUCKET_HASH_THREADS), the explicit export keeps env-only cells on
@@ -511,7 +512,6 @@ RUN_DIR="$DATA_ROOT/run"
 # durability change. Control = EXTRA_ENV='TORUS_ROCKSDB_PIPELINED_WRITE=0'.
 RECORD_ENV=(
     TORUS_ROCKSDB_PIPELINED_WRITE=1
-    TORUS_BOOK_ROWS=3
     TORUS_RESIDENT_BOOKS=1
     TORUS_NATIVE_ROOT_CACHE=1
     TORUS_PARALLEL_SETTLE=1
@@ -519,6 +519,39 @@ RECORD_ENV=(
     TORUS_BUCKET_MEMBER_CACHE_MB=256
     TORUS_COMMIT_LAG_BACKOFF_CAP=8
 )
+
+# Per-cell audit of the node settings whose default is not obvious from the
+# cell (s131): the book mode and the flags whose compiled default changed.
+# Logged as "cell=<label> book_mode=<m> K='v' ..." after the node env is final;
+# summarize.py records the same as summary.json cell.book_mode / cell.node_flags.
+# The order is fixed so two arms' lines diff cleanly.
+NODE_FLAGS_AUDIT=(
+    TORUS_BOOK_ROWS
+    TORUS_BOOK_FAST_ENCODE
+    TORUS_SETTLE_NO_MERGE
+    TORUS_EVM_FAST_PATH
+    TORUS_BOOK_COALESCE
+    TORUS_CHECKPOINT_INTERVAL_MS
+)
+# book_mode: mirrors torus_bridge::native_executor::parse_book_rows_mode —
+# trimmed "1"/"2"/"3" -> mode1/mode2/mode3, anything else (incl. unset and
+# empty) -> classic. Flags: unset -> 'unset (default)', empty -> 'empty
+# (default)' (every audited flag reads empty as its default), else the value.
+node_flags_line() {
+    local v k mode
+    v=${TORUS_BOOK_ROWS-}
+    v=${v#"${v%%[![:space:]]*}"}
+    v=${v%"${v##*[![:space:]]}"}
+    case "$v" in 1|2|3) mode="mode$v" ;; *) mode=classic ;; esac
+    printf 'book_mode=%s' "$mode"
+    for k in "${NODE_FLAGS_AUDIT[@]}"; do
+        if [ -z "${!k+x}" ]; then printf " %s='unset (default)'" "$k"
+        elif [ -z "${!k}" ]; then printf " %s='empty (default)'" "$k"
+        else printf " %s='%s'" "$k" "${!k}"
+        fi
+    done
+    printf '\n'
+}
 
 # block-cap-raise sweep bundle (r2 candidate block-cap-raise-sweep). All four
 # knobs are PROPOSER-LOCAL selection policy / node-local cache sizing
@@ -1214,6 +1247,7 @@ for kv in $EXTRA_ENV; do export "$kv"; done
 [ -n "$HOTSTUFF_CPUS" ] && export HOTSTUFF_CPUS
 NODE_ENV_JSON=$(env | grep -E '^(TORUS_|HOTSTUFF_CPUS=)' | sort | python3 -c 'import sys,json;print(json.dumps(dict(l.rstrip("\n").split("=",1) for l in sys.stdin)))')
 log "node env: $NODE_ENV_JSON"
+log "cell=$LABEL $(node_flags_line)"
 T_LAUNCH=$(date +%s)
 CLEAN=1 "$WSL/launch-3val.sh" >>"$OUT/run.log" 2>&1 || die "launch-3val.sh failed"
 sleep 2
@@ -1754,8 +1788,12 @@ for i in 0 1 2; do
     # mid-run "resident books stale" stall — check val$i.log.excerpt for the reason.
     rebuilds=$(mval torus_exec_resident_rebuilds_total < "$OUT/metrics-after-val$i.txt")
     lg="$RUN_DIR/val$i.log"
-    # s83: INFO/DEBUG/TRACE lines are config echoes (e.g. "state hash fail-stop ... on=false"), not failures.
-    panics=$(grep -E 'panicked|FAIL-STOP|fail-stop|Latching fail-stop|conflicting blocks' "$lg" 2>/dev/null | grep -cvE ' (INFO|DEBUG|TRACE)[^A-Z]'); panics=${panics:-0}
+    # s83/s131: count raw `panicked` lines plus fail-stop / FATAL / conflicting-blocks lines whose
+    # tracing level is ERROR (the node emits every real fail-stop at ERROR); INFO/WARN lines only
+    # mention it (e.g. "INFO ... state hash fail-stop ... on=false", "WARN ... fail-stop is off").
+    # Level = first TRACE|DEBUG|INFO|WARN|ERROR word after ANSI codes are stripped (fmt + JSON
+    # shapes). Same rule as crash-kill.sh crash_failstop_count.
+    panics=$(sed -E 's/\x1b\[[0-9;]*m//g' "$lg" 2>/dev/null | awk '/panicked/ { n++; next } /FAIL-STOP|fail-stop|FATAL|conflicting blocks/ { if (match($0, /(^|[^A-Za-z])(TRACE|DEBUG|INFO|WARN|ERROR)([^A-Za-z]|$)/) && substr($0, RSTART, RLENGTH) ~ /ERROR/) n++ } END { print n + 0 }'); panics=${panics:-0}
     errors=$(grep -c ' ERROR ' "$lg" 2>/dev/null); errors=${errors:-0}
     printf '{"node":"val%s","height":%s,"cmp_height":%s,"block_hash":"%s","header_state_root":"%s","state_digest":"%s","digest_height":%s,"digest_seconds":%s,"matched":%s,"placed":%s,"resting":%s,"actions":%s,"resident_rebuilds":%s,"panic_or_failstop_lines":%s,"error_lines":%s}\n' \
         "$i" "${HGT[$i]}" "$HCMP" "$bh" "$sr" "$dig" "${DHGT[$i]}" "${DIGSECS[$i]}" "${matched%.*}" "${placed%.*}" "${resting%.*}" "${actions%.*}" "${rebuilds%.*}" "$panics" "$errors" >> "$OUT/agreement.jsonl"
