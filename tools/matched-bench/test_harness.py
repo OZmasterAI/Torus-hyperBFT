@@ -3275,6 +3275,48 @@ class OracleFeedHarnessTest(unittest.TestCase):
             shutil.rmtree(tmp)
 
 
+    def test_separate_signer_feed_needs_the_signer_key_file(self):
+        """s134: a bench binary whose oracle-feed has --signer (separate oracle
+        signers by default) needs devnet/wsl/bench-oracle-signer-keys.json next
+        to the validator key file; an older binary (no --signer) does not."""
+        for help_text, with_file, rc in (
+            ("Usage: oracle-feed --price <PRICE> --signer <SIGNER>", False, 1),
+            ("Usage: oracle-feed --price <PRICE>", False, None),
+            ("Usage: oracle-feed --price <PRICE> --signer <SIGNER>", True, None),
+        ):
+            tmp = tempfile.mkdtemp(prefix="oracle-signer-pre-")
+            try:
+                fake_target(tmp, help_text)
+                script, wt = sandbox_repo(tmp)
+                if with_file:
+                    shutil.copy2(
+                        os.path.join(REPO, "devnet", "wsl", "bench-oracle-signer-keys.json"),
+                        os.path.join(wt, "devnet", "wsl"),
+                    )
+                r = subprocess.run(
+                    [script, wt, "oracle-signer-pre-x"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=dict(
+                        os.environ,
+                        TARGET_DIR=tmp,
+                        RESULTS_ROOT=tmp,
+                        DATA_ROOT=tmp,
+                        BENCH_ALLOW_UNDETACHED="1",
+                        ORACLE_FEED="1",
+                    ),
+                )
+                if rc is not None:
+                    self.assertEqual(r.returncode, rc, r.stderr)
+                    self.assertIn("bench-oracle-signer-keys.json is missing", r.stderr)
+                    self.assertFalse(os.path.exists(os.path.join(tmp, "oracle-signer-pre-x")))
+                else:
+                    self.assertNotIn("bench-oracle-signer-keys.json", r.stderr)
+            finally:
+                shutil.rmtree(tmp)
+
+
 LIQUIDATOR_VAULT = "0x746f7275732d6c697175696461746f722d766c74"
 # torus_core::liquidation::ADL_ESCROW_LONG / ADL_ESCROW_SHORT.
 ADL_ESCROW_LONG = "0x746f7275732d61646c2d657363726f772d6c6e67"
