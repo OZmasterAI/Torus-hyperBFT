@@ -381,9 +381,13 @@
 #                an unreadable node) = validity REJECT and the cell FAILS.
 #                The attestations keep moving the native counter and mempool
 #                on the idle chain after the load: the drains run with
-#                health.py --attest-live, the digest quiescence snapshot leaves
-#                the native counter out, and metrics-after is re-scraped until
-#                the three native counters agree (section 7/8 comments).
+#                health.py --attest-live (order counters quiet, no other native
+#                action executed in the quiet window, read by kind from the
+#                block bodies; an empty native mempool on the accepting
+#                sample), the digest quiescence snapshot leaves the native
+#                counter out and scans the digest window's blocks the same
+#                way (attest_traffic.py), and metrics-after is re-scraped
+#                until the three native counters agree (section 7/8 comments).
 #   PRELOAD=N    bench queue 8f: after node ready (and fresh oracle marks)
 #                and BEFORE the metrics-before snapshot, the samplers and the
 #                load, `bench-throughput preload` places N non-crossing resting
@@ -894,6 +898,9 @@ case "$STATE_HASH_ATTEST" in
         [ -n "${STATE_HASH_ACTIVATION:-}" ] \
             || { echo "FATAL: STATE_HASH_ATTEST=1 needs STATE_HASH_ACTIVATION (the genesis running state hash; without it no node hashes or attests)" >&2; exit 2; }
         [ -f "$SELF_DIR/state_attest.py" ] || { echo "FATAL: STATE_HASH_ATTEST=1 needs $SELF_DIR/state_attest.py" >&2; exit 1; }
+        [ -f "$SELF_DIR/attest_traffic.py" ] || { echo "FATAL: STATE_HASH_ATTEST=1 needs $SELF_DIR/attest_traffic.py" >&2; exit 1; }
+        grep -q -- '--attest-rpc' "$TOOLS_DIR/health.py" 2>/dev/null \
+            || { echo "FATAL: STATE_HASH_ATTEST=1 needs a drain that reads the attestation window by kind, and $TOOLS_DIR/health.py has no --attest-rpc (TOOLS_FROM_WORKTREE=$TOOLS_FROM_WORKTREE; point TOOLS_DIR= at a newer tools/matched-bench)" >&2; exit 1; }
         [ -s "$ORACLE_KEYS" ] || { echo "FATAL: STATE_HASH_ATTEST=1 needs the validator key file $ORACLE_KEYS" >&2; exit 1; }
         grep -q 'STATE_HASH_ATTEST_KEY_DIR' "$WSL/start-node.sh" 2>/dev/null \
             || { echo "FATAL: STATE_HASH_ATTEST=1 but $WSL/start-node.sh does not pass --state-hash-attest-key (STATE_HASH_ATTEST_KEY_DIR): run the cell from a worktree whose devnet/wsl/start-node.sh has it" >&2; exit 1; }
@@ -1805,12 +1812,14 @@ fi
 # after the load, so torus_native_actions_processed_total and the native mempool
 # never go quiet (9g-hn smoke 2026-10-21: drained=0 after 780 s). Unlike the
 # oracle feed they cannot be paused (the node submits them), so every drain
-# below tolerates them (health.py --attest-live: order counters quiet, native
-# mempool <= 2 checkpoints x 3 validators of attestations).
+# below tolerates them (health.py --attest-live: order counters quiet, no
+# other native action executed in the quiet window (block bodies read by kind
+# over the RPCs), native mempool <= 2 checkpoints x 3 validators of
+# attestations inside the window and empty on the accepting sample).
 ATTEST_DRAIN_ARGS=()
 if state_attest_on; then
-    ATTEST_DRAIN_ARGS=(--attest-live --attest-mempool-max 6)
-    log "attest-live drain: ${ATTEST_DRAIN_ARGS[*]} (order counters quiet; the validators' AttestStateHash actions may move the native counter and mempool)"
+    ATTEST_DRAIN_ARGS=(--attest-live --attest-mempool-max 6 --attest-rpc "${RPCS[@]}")
+    log "attest-live drain: ${ATTEST_DRAIN_ARGS[*]} (order counters quiet and no other native action executed; the validators' AttestStateHash actions may move the native counter and mempool)"
 fi
 if python3 "$TOOLS_DIR/health.py" drain --out "$OUT" --timeout "$DRAIN_TIMEOUT" --quiet "$QUIET_S" \
     --urls "${DRAIN_URLS[@]}" "${FEED_DRAIN_ARGS[@]}" ${ATTEST_DRAIN_ARGS[@]+"${ATTEST_DRAIN_ARGS[@]}"} \
@@ -1938,7 +1947,10 @@ funnel_counters() {
     # consensus vote rows (staking.rs record_state_hash_attestation ->
     # CF_STATE_HASH_VOTES) and the validator's nonce, none of which the digest
     # reads (books, open interest, the load accounts' balances and positions):
-    # the native counter is left out and the order counters must hold.
+    # the native counter is left out and the order counters must hold. Every
+    # OTHER native action (CancelOrder / CancelAllOrders move books and margin
+    # but no order counter; oracle prices, transfers, ...) is still checked:
+    # attest_window_clean scans the window's block bodies by kind.
     local attest=0
     [ "${STATE_HASH_ATTEST:-0}" = 1 ] && attest=1
     python3 -c '
@@ -1971,7 +1983,39 @@ funnel_snapshot() {
     # Emit only a complete three-node snapshot, never a successful partial one.
     printf '%s\n' "$snapshot"
 }
+# STATE_HASH_ATTEST=1 digest window (the native counter is out of the funnel
+# snapshot, see funnel_counters): no native action other than AttestStateHash
+# may execute while the nodes are digested. No metric splits the native
+# counter by kind, so the window's blocks are read by kind from their bodies
+# (attest_traffic.py). The window is every block any node can have executed
+# between the two snapshots: from the lowest executed height (torus_block_height)
+# scraped BEFORE the first funnel snapshot to the highest committed height
+# (executed + torus_exec_queue_depth) scraped AFTER the second one. An
+# unreadable height or body is unavailable evidence: not quiescent.
+attest_window_height() { # lo|hi -> min executed / max committed height over the 3 nodes
+    local i metrics h q v best=""
+    for i in 0 1 2; do
+        metrics=$(scrape_one "${METS[$i]}") || return 1
+        h=$(printf '%s\n' "$metrics" | awk '$1 == "torus_block_height" { print $2 }')
+        q=$(printf '%s\n' "$metrics" | awk '$1 == "torus_exec_queue_depth" { print $2 }')
+        [[ "$h" =~ ^[0-9]+$ && "$q" =~ ^[0-9]+$ ]] || return 1
+        if [ "$1" = lo ]; then v=$h; else v=$((h + q)); fi
+        if [ -z "$best" ] || { [ "$1" = lo ] && [ "$v" -lt "$best" ]; } || { [ "$1" != lo ] && [ "$v" -gt "$best" ]; }; then
+            best=$v
+        fi
+    done
+    printf '%s\n' "$best"
+}
+attest_window_clean() { # LO -> 0 iff blocks LO..(max committed now) executed no non-attestation native action
+    local lo=$1 hi
+    : > "$OUT/digest-attest-window.json"
+    [[ "$lo" =~ ^[0-9]+$ ]] || return 1
+    hi=$(attest_window_height hi) || return 1
+    python3 -I "$SELF_DIR/attest_traffic.py" window --from "$lo" --to "$hi" --rpc "${RPCS[@]}" \
+        > "$OUT/digest-attest-window.json"
+}
 declare -a DHGT DIGSHA DIGSECS
+ATTEST_WIN_LO=""; if [ "${STATE_HASH_ATTEST:-0}" = 1 ]; then ATTEST_WIN_LO=$(attest_window_height lo) || ATTEST_WIN_LO=""; fi
 Q_BEFORE_OK=0
 if Q_BEFORE=$(funnel_snapshot); then Q_BEFORE_OK=1; fi
 for i in 0 1 2; do
@@ -1991,6 +2035,7 @@ wait "${DIG_PIDS[@]}"
 TDIG1=$(date +%s)
 Q_AFTER_OK=0
 if Q_AFTER=$(funnel_snapshot); then Q_AFTER_OK=1; fi
+ATTEST_WIN_OK=1; if [ "${STATE_HASH_ATTEST:-0}" = 1 ]; then ATTEST_WIN_OK=0; attest_window_clean "$ATTEST_WIN_LO" && ATTEST_WIN_OK=1; fi
 # Liquidation stress: each node's vault (cash, deficit, open positions) while
 # the chain is still quiet; "RPC_ERR" if a node did not answer.
 if liq_stress_on; then
@@ -2000,13 +2045,14 @@ if liq_stress_on; then
     done
     log "liquidator vault: $(for i in 0 1 2; do printf 'val%s=%s ' "$i" "$(cat "$OUT/vault-val$i.json")"; done)"
 fi
-if [ "$Q_BEFORE_OK" = 1 ] && [ "$Q_AFTER_OK" = 1 ] && [ -n "$Q_BEFORE" ] && [ "$Q_BEFORE" = "$Q_AFTER" ]; then DIGEST_QUIESCENT=1; else DIGEST_QUIESCENT=0; fi
+if [ "$Q_BEFORE_OK" = 1 ] && [ "$Q_AFTER_OK" = 1 ] && [ -n "$Q_BEFORE" ] && [ "$Q_BEFORE" = "$Q_AFTER" ] && [ "$ATTEST_WIN_OK" = 1 ]; then DIGEST_QUIESCENT=1; else DIGEST_QUIESCENT=0; fi
 for i in 0 1 2; do
     sha=""; secs=""; read -r sha secs < "$OUT/digest-val$i.out" || true
     DIGSHA[$i]=${sha:-ERR}; DIGSECS[$i]=${secs:-0}
 done
 log "state digest done in $((TDIG1 - TDIG0))s wall (per node: ${DIGSECS[*]} s), quiescent=$DIGEST_QUIESCENT"
 [ "$DIGEST_QUIESCENT" = 1 ] || log "WARNING: funnel counters moved or snapshot evidence was unavailable during the digest — digest is NOT a determinism proof for this cell"
+state_attest_on && log "state digest attest window (blocks from the lowest executed height before to the highest committed after; only AttestStateHash may execute): ok=$ATTEST_WIN_OK $(cat "$OUT/digest-attest-window.json" 2>/dev/null)"
 if [ "$ORACLE_FEED" = 1 ]; then
     stop_oracle_feed
     log "oracle feed: oracle_feed=1 $(jq -c '{sent,accepted,rejected,last_error}' "$OUT/oracle-feed-stats.json" 2>/dev/null || echo 'stats=MISSING') stale_marks_at_bench_end=$(jq -r '.markets - .usable' <<<"$ORACLE_MEND" 2>/dev/null) fresh_after_s=$ORACLE_FRESH_S"

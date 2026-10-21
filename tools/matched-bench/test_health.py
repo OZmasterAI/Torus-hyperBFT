@@ -11,8 +11,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from health import (COMMITTED, MEMPOOL, EXEC_QUEUE, FLUSH, FLOW, NODES, TRADE_WRITER,
                     CHAIN_SUM, CHAIN_COUNT, EXEC_HEIGHT, DrainTracker, acceptance,
-                    assess_liveness, committed_height, feed_live_rows, feed_live_summary,
-                    height_target, parse_metrics)
+                    assess_liveness, attest_window_step, committed_height, feed_live_rows,
+                    feed_live_summary, height_target, parse_metrics)
+from test_attest_traffic import ATTEST_KIND, FakeRpc, body as block_body
 from test_harness import BENCH_START, run_summarize, write_agreement, write_cell
 from collect_logs import collect
 
@@ -394,6 +395,14 @@ def attest(t, commits=100, mempool=None, flow=1000, every=4):
     return s
 
 
+def attest_h(t, **kw):
+    """attest() plus the executed height (torus_block_height): 100 + t, the
+    committed blocks queued for execution t % 3 on top of it."""
+    s = attest(t, **kw)
+    s[EXEC_HEIGHT] = 100 + t
+    return s
+
+
 class AttestLiveDrainTest(unittest.TestCase):
     """--attest-live: the validators' own AttestStateHash actions move the
     native counter and mempool forever; only the order counters must be quiet
@@ -442,14 +451,146 @@ class AttestLiveDrainTest(unittest.TestCase):
             self.assertFalse(tracker.observe(t, nodes)['drained'])
 
     def test_feed_and_attest_live_add_their_mempool_footprints(self):
+        """Inside the window the bound is feed + attestations; the accepting
+        sample may hold only the feed's own footprint (the attestations do
+        not count there: no metric tells them apart from a load action)."""
         both = DrainTracker(10, feed_live=True, feed_mempool_max=6, attest_live=True,
                             attest_mempool_max=6)
         feed_only = DrainTracker(10, feed_live=True, feed_mempool_max=6)
         for t in range(12):
             nodes = [attest(t, mempool=10) for _ in NODES]
             r_both, r_feed = both.observe(t, nodes), feed_only.observe(t, nodes)
+        self.assertFalse(r_both['drained'])
+        self.assertIn('native mempool', r_both['reason'])
+        nodes = [attest(12, mempool=6) for _ in NODES]
+        r_both, r_feed = both.observe(12, nodes), feed_only.observe(12, nodes)
         self.assertTrue(r_both['drained'])
         self.assertFalse(r_feed['drained'])
+
+    def test_stranded_load_action_never_drains(self):
+        """Codex 18c P1 probe (stranded_load_action=1): one load action stays
+        in the native mempool while the order counters are quiet and empty
+        blocks (with attestations) keep committing. The legacy drain never
+        accepts it; the attest drain must not either."""
+        for holders in ((0, 1, 2), (2,)):
+            legacy, live = DrainTracker(10), DrainTracker(10, attest_live=True)
+            for t in range(60):
+                nodes = [attest(t) for _ in NODES]
+                for i in holders:
+                    nodes[i][MEMPOOL] += 1
+                self.assertFalse(legacy.observe(t, nodes)['drained'], (holders, t))
+                r = live.observe(t, nodes)
+                self.assertFalse(r['drained'], (holders, t))
+            self.assertIn('native mempool', r['reason'])
+
+    def test_accepting_sample_needs_an_empty_mempool_on_every_node(self):
+        tracker = DrainTracker(10, attest_live=True)
+        for t in range(12):
+            r = tracker.observe(t, [attest(t, mempool=3) for _ in NODES])
+            self.assertFalse(r['drained'], t)
+        nodes = [attest(12, mempool=0) for _ in NODES]
+        nodes[1][MEMPOOL] = 1
+        self.assertFalse(tracker.observe(12, nodes)['drained'])
+        # still the same window: an empty mempool on every node accepts
+        self.assertTrue(tracker.observe(13, [attest(13, mempool=0) for _ in NODES])['drained'])
+
+
+REPLAY = Path(__file__).with_name('testdata')/'attest-drain'
+
+
+def replay(name):
+    """9g-hn STATE_HASH_ATTEST=1 cells (2026-10-21): health.py drain samples
+    after the load, attestations only (drain.json drained=1 in every cell)."""
+    return [json.loads(line) for line in (REPLAY/(name + '.jsonl')).read_text().splitlines()]
+
+
+class AttestReplayTest(unittest.TestCase):
+    CELLS = ('ozarchy-9ghn-deep-r1-B', 'ozarchy-9ghn-std-r1-B')
+
+    def test_attestation_traffic_drains_on_an_empty_mempool(self):
+        for cell in self.CELLS:
+            legacy, live = DrainTracker(10), DrainTracker(10, attest_live=True)
+            drained = None
+            for row in replay(cell):
+                self.assertFalse(legacy.observe(row['elapsed_s'], row['samples'])['drained'])
+                if live.observe(row['elapsed_s'], row['samples'])['drained']:
+                    drained = row
+                    break
+            self.assertIsNotNone(drained, cell)
+            self.assertTrue(all(s[MEMPOOL] == 0 for s in drained['samples']), cell)
+
+    def test_the_same_traffic_with_a_stranded_load_action_never_drains(self):
+        for cell in self.CELLS:
+            for node in range(3):
+                live = DrainTracker(10, attest_live=True)
+                for row in replay(cell):
+                    samples = [dict(s) for s in row['samples']]
+                    samples[node][MEMPOOL] += 1
+                    self.assertFalse(live.observe(row['elapsed_s'], samples)['drained'],
+                                     (cell, node, row['elapsed_s']))
+
+
+def window(other=0, unread=0, attest=3):
+    return {'clean': other == 0 and unread == 0, 'other': other, 'unread': unread,
+            'attest': attest, 'blocks': 10}
+
+
+class AttestWindowStepTest(unittest.TestCase):
+    """--attest-live: the order counters are the tracker's quiet keys; every
+    other native action (cancels, oracle prices, transfers, ...) must not have
+    executed in the quiet window either, checked by kind from the block bodies
+    of [min executed height at the window start, max committed height now]."""
+
+    def drained_tracker(self):
+        tracker = DrainTracker(10, attest_live=True)
+        for t in range(13):  # t = 12: past the quiet interval, mempool 12 % 4 = 0
+            r = tracker.observe(t, [attest_h(t) for _ in NODES])
+        return tracker, r, [attest_h(12) for _ in NODES]
+
+    def test_attestation_only_window_drains_and_scans_the_whole_window(self):
+        tracker, r, samples = self.drained_tracker()
+        self.assertTrue(r['drained'])
+        seen = []
+        def scan(lo, hi):
+            seen.append((lo, hi))
+            return window()
+        r2, w = attest_window_step(tracker, 12, samples, r, scan)
+        self.assertTrue(r2['drained'])
+        base_exec = min(s[EXEC_HEIGHT] for s in tracker.base)
+        self.assertEqual(seen, [(int(base_exec), int(max(committed_height(s) for s in samples)))])
+        self.assertTrue(w['clean'])
+
+    def test_a_non_attestation_action_in_the_window_restarts_it(self):
+        tracker, r, samples = self.drained_tracker()
+        r2, w = attest_window_step(tracker, 12, samples, r, lambda lo, hi: window(other=1))
+        self.assertFalse(r2['drained'])
+        self.assertIn('non-attestation', r2['reason'])
+        self.assertEqual(tracker.since, 12)
+        self.assertEqual(tracker.base, samples)
+        # the new window needs its own quiet interval
+        for t in range(13, 22):
+            self.assertFalse(tracker.observe(t, [attest_h(t) for _ in NODES])['drained'], t)
+
+    def test_unreadable_bodies_or_heights_do_not_drain(self):
+        tracker, r, samples = self.drained_tracker()
+        r2, _ = attest_window_step(tracker, 12, samples, r, lambda lo, hi: window(unread=2))
+        self.assertFalse(r2['drained'])
+        self.assertIn('unreadable', r2['reason'])
+        no_height = [dict(s) for s in samples]
+        del no_height[2][EXEC_HEIGHT]
+        def scan(lo, hi):
+            raise AssertionError('no scan without heights')
+        r3, w = attest_window_step(tracker, 12, no_height, r, scan)
+        self.assertFalse(r3['drained'])
+        self.assertIsNone(w)
+
+    def test_not_drained_is_passed_through_without_a_scan(self):
+        tracker = DrainTracker(10, attest_live=True)
+        samples = [attest_h(0) for _ in NODES]
+        r = tracker.observe(0, samples)
+        def scan(lo, hi):
+            raise AssertionError('no scan before the tracker drains')
+        self.assertEqual(attest_window_step(tracker, 0, samples, r, scan), (r, None))
 
     def test_counter_reset_of_the_native_counter_is_still_a_reset(self):
         tracker = DrainTracker(10, attest_live=True)
@@ -461,14 +602,14 @@ class AttestLiveDrainTest(unittest.TestCase):
 
 
 class AttestLiveHttpTest(unittest.TestCase):
-    def test_cli_drains_with_attestations_and_records_their_traffic(self):
+    def run_drain(self, bodies, extra, timeout='8'):
         class Metrics(BaseHTTPRequestHandler):
             ticks = {}
             def log_message(self, *_args):
                 pass
             def do_GET(self):
                 t = self.ticks[self.path] = self.ticks.get(self.path, 0) + 1
-                body = ''.join(f'{k} {v}\n' for k, v in attest(t, every=2).items()).encode()
+                body = ''.join(f'{k} {v}\n' for k, v in attest_h(t, every=2).items()).encode()
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(body)
@@ -476,35 +617,74 @@ class AttestLiveHttpTest(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            with tempfile.TemporaryDirectory() as directory:
+            with FakeRpc(bodies) as rpc, tempfile.TemporaryDirectory() as directory:
                 command = ['python3', str(Path(__file__).with_name('health.py')), 'drain',
-                           '--out', directory, '--timeout', '8', '--quiet', '3', '--urls',
+                           '--out', directory, '--timeout', timeout, '--quiet', '3', '--urls',
                            *[f'http://127.0.0.1:{server.server_port}/{n}' for n in NODES]]
-                legacy = subprocess.run(command, capture_output=True, text=True, timeout=30)
-                self.assertEqual(legacy.returncode, 1, legacy.stderr)
-                self.assertNotIn('attest_live', json.loads((Path(directory)/'drain.json').read_text()))
-                live = subprocess.run(command + ['--attest-live', '--attest-mempool-max', '6'],
-                                      capture_output=True, text=True, timeout=30)
-                self.assertEqual(live.returncode, 0, live.stderr)
+                extra = [rpc.url if a == 'RPC' else a for a in extra]
+                r = subprocess.run(command + extra, capture_output=True, text=True, timeout=60)
                 drain = json.loads((Path(directory)/'drain.json').read_text())
-                self.assertTrue(drain['drained'])
-                info = drain['attest_live']
-                self.assertEqual(info['attest_mempool_max'], 6)
-                # the quiet window moved the native counter (attestations only)
-                self.assertEqual(len(info['native_actions_delta']), 3)
-                self.assertTrue(all(d > 0 for d in info['native_actions_delta']), info)
-                self.assertGreater(info['attestations_submitted_delta'], 0)
+                return r, drain
         finally:
             server.shutdown()
             server.server_close()
             thread.join()
 
+    ATTEST = ['--attest-live', '--attest-mempool-max', '6', '--attest-rpc', 'RPC', 'RPC', 'RPC']
+
+    def test_cli_drains_with_attestations_and_records_their_traffic(self):
+        bodies = {h: block_body(*([ATTEST_KIND]*3 if h % 2 else [])) for h in range(0, 400)}
+        legacy, drain = self.run_drain(bodies, [])
+        self.assertEqual(legacy.returncode, 1, legacy.stderr)
+        self.assertNotIn('attest_live', drain)
+        live, drain = self.run_drain(bodies, self.ATTEST)
+        self.assertEqual(live.returncode, 0, live.stderr)
+        self.assertTrue(drain['drained'])
+        info = drain['attest_live']
+        self.assertEqual(info['attest_mempool_max'], 6)
+        self.assertEqual(info['final_mempool_max'], 0)
+        # the quiet window moved the native counter (attestations only)
+        self.assertEqual(len(info['native_actions_delta']), 3)
+        self.assertTrue(all(d > 0 for d in info['native_actions_delta']), info)
+        self.assertGreater(info['attestations_submitted_delta'], 0)
+        scan = info['window_scan']
+        self.assertTrue(scan['clean'], scan)
+        self.assertGreater(scan['attest'], 0)
+        self.assertEqual((scan['other'], scan['unread']), (0, 0))
+
+    def test_cli_cancels_executing_through_the_quiet_window_never_drain(self):
+        """Codex 18c P2 shape in the drain: CancelOrder / CancelAllOrders move
+        neither the placement, match nor resting counter."""
+        bodies = {h: block_body(ATTEST_KIND, 'CancelOrder') for h in range(0, 400)}
+        live, drain = self.run_drain(bodies, self.ATTEST, timeout='6')
+        self.assertEqual(live.returncode, 1, live.stderr)
+        self.assertFalse(drain['drained'])
+        self.assertGreater(drain['attest_live']['window_restarts'], 0)
+        self.assertGreater(drain['attest_live']['window_scan']['other'], 0)
+
+    def test_cli_unreadable_bodies_never_drain(self):
+        live, drain = self.run_drain({}, self.ATTEST, timeout='6')
+        self.assertEqual(live.returncode, 1, live.stderr)
+        self.assertFalse(drain['drained'])
+        scan = drain['attest_live']['window_scan']
+        self.assertGreater(scan['unread'], 0)
+        self.assertFalse(scan['clean'])
+
     def test_negative_attest_mempool_max_is_a_usage_error(self):
         r = subprocess.run(['python3', str(Path(__file__).with_name('health.py')), 'drain',
                             '--out', '/nonexistent', '--timeout', '1', '--attest-live',
-                            '--attest-mempool-max', '-1', '--urls', 'a', 'b', 'c'],
+                            '--attest-mempool-max', '-1', '--urls', 'a', 'b', 'c',
+                            '--attest-rpc', 'a', 'b', 'c'],
                            capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 2)
+
+    def test_attest_live_needs_the_rpc_urls(self):
+        r = subprocess.run(['python3', str(Path(__file__).with_name('health.py')), 'drain',
+                            '--out', '/nonexistent', '--timeout', '1', '--attest-live',
+                            '--urls', 'a', 'b', 'c'],
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('--attest-rpc', r.stderr)
 
 
 def hsample(height, queue=1, commits=None, flow=1000):

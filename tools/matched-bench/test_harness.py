@@ -38,6 +38,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ATTEST_RPCS = " ".join("http://127.0.0.1:%d" % p for p in (8645, 8646, 8647))
 DIGEST_SH = os.path.join(HERE, "digest-node.sh")
 CRASH_KILL_SH = os.path.join(HERE, "crash-kill.sh")
 SUMMARIZE = os.path.join(HERE, "summarize.py")
@@ -1581,8 +1582,23 @@ class StateHashAttestHarnessTest(unittest.TestCase):
                 self.assertEqual(r.returncode, rc, r.stderr)
                 self.assertIn(msg, r.stderr)
                 self.assertFalse(os.path.exists(os.path.join(tmp, "attest-pre-x")), "must fail before any launch")
-            # with state_attest.py beside run-cell.sh: a worktree whose start-node.sh lacks the key dir is refused
+            # with state_attest.py beside run-cell.sh: the attestation-window reader and a
+            # health.py that uses it (--attest-rpc) are required next
             shutil.copy2(os.path.join(HERE, "state_attest.py"), os.path.dirname(script))
+            for missing, msg in (("attest_traffic.py", "needs %s/attest_traffic.py" % os.path.dirname(script)),
+                                 ("health.py", "has no --attest-rpc")):
+                r = subprocess.run(
+                    [script, wt, "attest-pre-x"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=dict(env0, STATE_HASH_ATTEST="1", STATE_HASH_ACTIVATION="1"),
+                )
+                self.assertEqual(r.returncode, 1, r.stderr)
+                self.assertIn(msg, r.stderr)
+                self.assertFalse(os.path.exists(os.path.join(tmp, "attest-pre-x")))
+                shutil.copy2(os.path.join(HERE, missing), os.path.dirname(script))
+            # a worktree whose start-node.sh lacks the key dir is refused
             with open(os.path.join(wt, "devnet", "wsl", "start-node.sh"), "w") as f:
                 f.write("start_node() { :; }\n")
             r = subprocess.run(
@@ -3012,6 +3028,7 @@ class OracleFeedHarnessTest(unittest.TestCase):
             "FEED_STOP_SETTLE_MAX_S=%s STATE_HASH_ATTEST=%s T_BENCH1=$(date +%%s)\n"
             % (tmp, feed, mode, max_lag, settle_max, attest)
             + "METS=(9161 9162 9163)\n"
+            + "RPCS=(http://127.0.0.1:8645 http://127.0.0.1:8646 http://127.0.0.1:8647)\n"
             + pause
             + "\n"
             + drain
@@ -3143,18 +3160,21 @@ class OracleFeedHarnessTest(unittest.TestCase):
         self.assertEqual(
             py,
             ["PY S /tools/health.py drain --out %s --timeout 780 --quiet 10 --urls %s "
-             "--attest-live --attest-mempool-max 6" % (out_dir, urls)],
+             "--attest-live --attest-mempool-max 6 --attest-rpc %s" % (out_dir, urls, ATTEST_RPCS)],
         )
-        self.assertIn("LOG attest-live drain: --attest-live --attest-mempool-max 6", out)
+        self.assertIn("LOG attest-live drain: --attest-live --attest-mempool-max 6 --attest-rpc "
+                      + ATTEST_RPCS, out)
 
     def test_attest_with_feed_drain_reaches_both_drains(self):
         out_dir, out = self._run_drain_flow("1", attest="1")
         py = [l for l in out.splitlines() if l.startswith("PY ")]
         self.assertEqual(len(py), 2, out)
         self.assertTrue(py[0].endswith(
-            " --feed-live --feed-mempool-max 12 --max-lag 2 --attest-live --attest-mempool-max 6"), py[0])
+            " --feed-live --feed-mempool-max 12 --max-lag 2 --attest-live --attest-mempool-max 6"
+            " --attest-rpc " + ATTEST_RPCS), py[0])
         # the paused settle: the feed is stopped, the attestations are not
-        self.assertTrue(py[1].endswith(" --attest-live --attest-mempool-max 6"), py[1])
+        self.assertTrue(py[1].endswith(" --attest-live --attest-mempool-max 6 --attest-rpc "
+                                       + ATTEST_RPCS), py[1])
         self.assertIn(" --to-height auto ", py[1])
         self.assertNotIn("--feed-live", py[1])
 
