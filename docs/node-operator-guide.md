@@ -147,6 +147,30 @@ first start with this build stores the digest of the file it is given (logged
 as a warning, since it cannot be checked against the original). A bound data
 directory started without `--genesis` refuses to start.
 
+## Running state hash: a hash-unverified node
+
+With the running state hash on (genesis `consensus.activations.running_state_hash`;
+it starts at the first block whose header carries the `RunningStateHash` bit),
+each node chains a hash of its state over every block, and validators started
+with `--state-hash-attest-key` post the hash every 100 blocks so nodes can
+compare them on-chain. A node whose stored chain rows are lost (a data dir
+restored without them, a damaged DB) or that skipped a height cannot extend
+the chain: it is **hash-unverified**. Such a node:
+
+- keeps running, executing and voting (it is not stopped);
+- logs `RUNNING STATE HASH UNVERIFIED` at ERROR level at startup and again
+  every 60 seconds while it lasts;
+- sets the gauge `torus_state_hash_unverified` to 1 (alert on it);
+- submits **no** state-hash attestations, not even for checkpoints it still
+  holds from before the loss, and takes no fail-stop decision on a quorum
+  mismatch (mismatches are still reported).
+
+It stays that way until the chain is valid again: resync the node from a
+fresh data dir, or restore a data dir that has its chain rows.
+Options considered (owner, s134): (a) keep running and only log it; (b) keep
+running and voting, ERROR + gauge, no attestations (chosen); (c) refuse to
+start.
+
 ## Data Directory
 
 The `--data-dir` directory contains:

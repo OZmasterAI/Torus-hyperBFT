@@ -89,8 +89,37 @@ impl ChainHealth {
 
 /// [`ChainHealth`] of `state_db`. Reads META and at most one header; call it
 /// when nothing writes the DB (boot, after the replay).
-pub fn chain_health(_state_db: &StateDb) -> ChainHealth {
-    todo!("owner s134 option b RED")
+pub fn chain_health(state_db: &StateDb) -> ChainHealth {
+    if let Some(since) = read_unverified_since(state_db) {
+        return ChainHealth::Unverified { since };
+    }
+    let Some(applied) = read_applied_height(state_db).filter(|h| *h > 0) else {
+        return ChainHealth::Off;
+    };
+    let bit = torus_types::Feature::RunningStateHash.bit();
+    // The header the applied height executed under says whether it was
+    // hashed; without the row, the configured activation.
+    let hashing = match crate::app::header_at(state_db, applied) {
+        Ok(h) => h.features & bit != 0,
+        Err(_) => read_configured_activation(state_db).is_some_and(|a| a <= applied),
+    };
+    if !hashing {
+        return ChainHealth::Off;
+    }
+    match read_running_hash(state_db) {
+        Some((hashed, _)) if hashed == applied && read_activation_height(state_db).is_some() => {
+            ChainHealth::Verified
+        }
+        stored => ChainHealth::RowsMissing { applied, hashed: stored.map(|(h, _)| h) },
+    }
+}
+
+/// A stored chain ends exactly at `durable` (the applied height read before).
+/// Read while the flush worker may write: a batch moves the hash and the
+/// applied marker together, so a torn read only ever says "not valid".
+fn chain_valid_at(state_db: &StateDb, durable: u64) -> bool {
+    read_activation_height(state_db).is_some()
+        && read_running_hash(state_db).is_some_and(|(h, _)| h == durable)
 }
 
 fn now_ms() -> u64 {
@@ -119,6 +148,9 @@ struct Inner {
     reported: BTreeSet<(u64, Option<Address>)>,
     /// Checkpoints already reported as all-votes-in without quorum.
     no_quorum: BTreeSet<u64>,
+    /// When the hash-unverified ERROR was last logged (see
+    /// [`unverified_log_due`]).
+    unverified_logged: Option<Instant>,
 }
 
 /// Per-node running-state-hash monitor, shared by the app (configuration) and
@@ -132,6 +164,10 @@ pub struct StateHashMonitor {
     failstop: bool,
     /// See [`DEFAULT_RESUBMIT_AFTER_MS`].
     resubmit_after_ms: u64,
+    /// [`Self::report_at_boot`] found [`ChainHealth::RowsMissing`]: no
+    /// attestation until a stored chain ends at the durable height again
+    /// (normally the next flush marks the node unverified first).
+    rows_missing_at_boot: AtomicBool,
     inner: Mutex<Inner>,
 }
 
@@ -141,6 +177,7 @@ impl Default for StateHashMonitor {
             attest_key: OnceLock::new(),
             failstop: false,
             resubmit_after_ms: DEFAULT_RESUBMIT_AFTER_MS,
+            rows_missing_at_boot: AtomicBool::new(false),
             inner: Mutex::default(),
         }
     }
@@ -206,10 +243,26 @@ impl StateHashMonitor {
     /// chain is valid again. It keeps running and voting. Returns the health.
     pub fn report_at_boot(
         &self,
-        _state_db: &StateDb,
-        _metrics: Option<&torus_telemetry::Metrics>,
+        state_db: &StateDb,
+        metrics: Option<&torus_telemetry::Metrics>,
     ) -> ChainHealth {
-        ChainHealth::Off
+        let health = chain_health(state_db);
+        self.rows_missing_at_boot
+            .store(matches!(health, ChainHealth::RowsMissing { .. }), Ordering::SeqCst);
+        if let Some(m) = metrics {
+            m.state_hash_unverified.set(health.is_unverified() as i64);
+        }
+        if health.is_unverified() {
+            self.inner.lock().unwrap().unverified_logged = Some(Instant::now());
+            tracing::error!(
+                ?health,
+                "RUNNING STATE HASH UNVERIFIED: this node has no valid running-hash chain (the stored \
+                 chain rows are lost or a height was never hashed). It keeps running and voting but \
+                 submits NO state-hash attestations and makes no fail-stop decision until the chain is \
+                 valid again: resync the node or restore its data dir (torus_state_hash_unverified = 1)"
+            );
+        }
+        health
     }
 
     /// After block `block` executed: compare the attestations that became
@@ -217,7 +270,9 @@ impl StateHashMonitor {
     /// attestations for durable checkpoints whose vote is not on-chain yet.
     /// Reads durable state only — identical behaviour serial or pipelined (a
     /// pipelined block's votes are checked once it is durable). A
-    /// hash-unverified node neither attests nor fail-stops.
+    /// hash-unverified node (marked, or its rows found lost at boot) neither
+    /// attests nor fail-stops; it logs a loud ERROR once per
+    /// [`UNVERIFIED_LOG_INTERVAL`].
     pub fn after_block(
         &self,
         block: &TorusBlock,
@@ -232,7 +287,15 @@ impl StateHashMonitor {
         let Some(durable) = read_applied_height(state_db) else {
             return;
         };
-        let unverified = read_unverified_since(state_db).is_some();
+        let since = read_unverified_since(state_db);
+        let mut unverified = since.is_some();
+        if !unverified && self.rows_missing_at_boot.load(Ordering::SeqCst) {
+            if chain_valid_at(state_db, durable) {
+                self.rows_missing_at_boot.store(false, Ordering::SeqCst);
+            } else {
+                unverified = true;
+            }
+        }
         if let Some(m) = metrics {
             m.state_hash_unverified.set(unverified as i64);
             if let Some((hashed, _)) = read_running_hash(state_db) {
@@ -261,12 +324,19 @@ impl StateHashMonitor {
             let floor = durable.saturating_sub(STATE_HASH_CHECKPOINT_INTERVAL * STATE_HASH_CHECKPOINT_RETAIN);
             inner.reported.retain(|(h, _)| *h > floor);
             inner.no_quorum.retain(|h| *h > floor);
-        }
-        if unverified {
-            return; // no valid local chain: never attest
+            if unverified && unverified_log_due(inner.unverified_logged, Instant::now()) {
+                inner.unverified_logged = Some(Instant::now());
+                tracing::error!(
+                    unverified_since = ?since,
+                    durable,
+                    "RUNNING STATE HASH UNVERIFIED: no valid running-hash chain; still running and \
+                     voting, NO state-hash attestations until the node is resynced or its data dir \
+                     restored (torus_state_hash_unverified = 1)"
+                );
+            }
         }
         if let (Some(key), Some(mempool)) = (self.attest_key.get(), mempool) {
-            self.submit_attestations(key, durable, state_db, mempool, metrics);
+            self.submit_attestations(key, durable, state_db, mempool, metrics, unverified);
         }
     }
 
@@ -374,7 +444,13 @@ impl StateHashMonitor {
         state_db: &StateDb,
         mempool: &Mempool,
         metrics: Option<&torus_telemetry::Metrics>,
+        unverified: bool,
     ) {
+        // Owner s134 (option b): a node without a valid local chain never
+        // attests, not even a checkpoint it still holds from before the loss.
+        if unverified {
+            return;
+        }
         let window = STATE_HASH_CHECKPOINT_INTERVAL * STATE_HASH_CHECKPOINT_RETAIN;
         let in_window = |h: u64| h + window > durable + 1;
         let latest = durable - durable % STATE_HASH_CHECKPOINT_INTERVAL;

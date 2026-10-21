@@ -113,6 +113,21 @@ Steps 1-6: ~8-9 days. Step 2 changes the block hash, so it must land before the 
   genesis digest at first boot).
 - Running hash in the testnet genesis: undecided; L6.1 is being built so Classic keeps L3.1's gain with it on.
 
+## Owner decisions (s134)
+- A node that lost its running-hash chain rows (phase 3: it keeps running, hash-unverified, with the stored
+  activation or 1): options (a) keep running and log it, (b) keep running and voting, a loud ERROR at boot and
+  periodically, the `torus_state_hash_unverified` gauge, and no state-hash attestations until resynced /
+  restored, (c) refuse to start. **Chosen: (b).** Built s134 on `feat/p00-phase4`:
+  `state_hash::chain_health` at boot (after the replay, `TorusApp::new`): `Unverified` (the sticky marker),
+  `RowsMissing` (the header at the applied height carries the bit, or the configured activation covers it,
+  but no stored chain ends there) or `Verified` / `Off`. `StateHashMonitor::report_at_boot` sets the gauge
+  and logs the ERROR; `after_block` repeats the ERROR at most once per 60 s while unverified; the attest
+  path (`submit_attestations`) returns without submitting while unverified, and a node found `RowsMissing`
+  at boot does not attest before its next flush marks it (a pipelined node's first `after_block` can run
+  before that flush) unless a stored chain ends at the durable height again. Voting and execution are
+  unchanged (no fail-stop). Operator text: `docs/node-operator-guide.md`, "Running state hash: a
+  hash-unverified node".
+
 ## 6. Open questions for the owner
 1. Running hash in the testnet genesis? Without it nothing detects divergent execution; only header bits are cross-checked.
 2. Built-in schedule now, governance later — or governance from day one (voting period / timelock for activations)?
