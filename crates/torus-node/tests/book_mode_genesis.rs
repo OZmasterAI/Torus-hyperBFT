@@ -257,7 +257,9 @@ fn genesis_without_book_mode_runs_classic() {
 }
 
 /// Genesis mode 3, env unset: the executor runs mode 3 (marker 3), and a
-/// restart without `--genesis` keeps the DB's mode.
+/// restart with the same genesis keeps it. A restart without `--genesis`
+/// refuses (P0.0 phase 4: the data dir is bound to its genesis file), so the
+/// default chain config can never replace the genesis mode either.
 #[test]
 fn genesis_mode_3_runs_mode_3_without_the_env() {
     let work = tempfile::tempdir().unwrap();
@@ -273,8 +275,23 @@ fn genesis_mode_3_runs_mode_3_without_the_env() {
         "no env, no deprecation warning:\n{log}"
     );
     assert_eq!(marker(work.path(), "data"), Some(vec![3]));
-    // Restart without --genesis: the mode comes from the DB marker.
-    let log = run_some_blocks(work.path(), "data", None, None, "b");
+    // Restart without --genesis: refused (the dir is bound to the genesis
+    // file), after the book mode was read from the DB marker; nothing written.
+    let log = assert_refused(
+        work.path(),
+        "data",
+        None,
+        None,
+        "b",
+        &["refusing to start", "no --genesis was given"],
+    );
+    assert!(
+        log.contains("book mode: level authority, chunked level hash"),
+        "no-genesis restart reads the DB marker's mode:\n{log}"
+    );
+    assert_eq!(marker(work.path(), "data"), Some(vec![3]));
+    // Restart with the same genesis: still mode 3.
+    let log = run_some_blocks(work.path(), "data", Some(&genesis), None, "c");
     assert!(
         log.contains("book mode: level authority, chunked level hash"),
         "restart mode:\n{log}"
