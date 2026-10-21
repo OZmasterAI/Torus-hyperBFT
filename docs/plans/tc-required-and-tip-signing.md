@@ -194,6 +194,15 @@ If this lands after genesis: the P0.0 feature bits (feat/p00-activation-gating) 
 header, not a consensus wire version. Borsh messages would need new variants plus a height-gated switch. Not
 recommended.
 
+**Stored data (batch 9 merge).** Phase C changes what the consensus DB holds: `LOCAL_TIP` gains the leader signature
+(an old record no longer decodes), and every stored PC / TC / NEC was signed over the untagged layout (each fails
+`is_correct` under the tagged one). Without a check an old data dir would boot and stall: every proposal on an old
+justify and every TC over an old high QC fails verification, and the algorithm thread only logs it. So the block
+tree records `CONSENSUS_DB_FORMAT` (variable 25, `CONSENSUS_DB_FORMAT_VERSION` = 1) at `initialize`, and torus-node's
+`open_node_dbs` refuses an initialized consensus DB of any other format (absent = pre-phase-C) before writing
+anything: start from a fresh data dir (docs/node-operator-guide.md, "Consensus DB format"). There is no migration;
+only local devnets exist.
+
 ## 4. Safety
 
 - **Tail-fork closed.** Suppose block B of view v got votes from 2f+1 power, which a QC(v) or a speculative commit

@@ -2,7 +2,7 @@
 //!
 //! # Initializing the Block Tree
 //!
-//! All variables in the Block Tree start out empty except eight. These eight variables, which must be
+//! All variables in the Block Tree start out empty except nine. These nine variables, which must be
 //! initialized using the [`initialize`](BlockTree::initialize) function before doing anything else with
 //! the Block Tree, are:
 //!
@@ -16,6 +16,7 @@
 //! |Locked PC|The [Genesis PC](crate::hotstuff::types::PhaseCertificate::genesis_pc)|
 //! |Highest View Entered|0|
 //! |Highest Phase Certificate|The [Genesis PC](crate::hotstuff::types::PhaseCertificate::genesis_pc)|
+//! |Consensus DB Format|[`CONSENSUS_DB_FORMAT_VERSION`](crate::block_tree::variables::CONSENSUS_DB_FORMAT_VERSION)|
 //!
 //! # Mutating the Block Tree directly from user code
 //!
@@ -190,6 +191,8 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         wb.set_highest_view_entered(ViewNumber::init())?;
 
         wb.set_highest_pc(&PhaseCertificate::genesis_pc())?;
+
+        wb.set_consensus_db_format(variables::CONSENSUS_DB_FORMAT_VERSION)?;
 
         self.write(wb);
 
@@ -1577,6 +1580,18 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
                     key: Key::ValidatorSetUpdateHeight,
                     source: err,
                 })?,
+        );
+        Ok(())
+    }
+
+    /* ↓↓↓ Consensus DB Format ↓↓↓ */
+    pub fn set_consensus_db_format(&mut self, format: u32) -> Result<(), BlockTreeError> {
+        let _: () = self.0.set(
+            &variables::CONSENSUS_DB_FORMAT,
+            &format.try_to_vec().map_err(|err| KVSetError::SerializeValueError {
+                key: Key::ConsensusDbFormat,
+                source: err,
+            })?,
         );
         Ok(())
     }

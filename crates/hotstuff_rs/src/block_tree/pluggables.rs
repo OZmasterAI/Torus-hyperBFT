@@ -412,6 +412,19 @@ pub trait KVGet {
         }
     }
 
+    /* ↓↓↓ Consensus DB Format ↓↓↓ */
+
+    /// The [`CONSENSUS_DB_FORMAT`](variables::CONSENSUS_DB_FORMAT) of this store; `None` for a store
+    /// written before the key existed (or an empty one).
+    fn consensus_db_format(&self) -> Result<Option<u32>, KVGetError> {
+        match self.get(&variables::CONSENSUS_DB_FORMAT) {
+            Some(bytes) => u32::deserialize(&mut &*bytes)
+                .map(Some)
+                .map_err(|err| KVGetError::DeserializeValueError { key: Key::ConsensusDbFormat, source: err }),
+            None => Ok(None),
+        }
+    }
+
     /* ↓↓↓ Validator Set Update Complete ↓↓↓ */
     fn validator_set_update_complete(&self) -> Result<bool, KVGetError> {
         bool::deserialize(
@@ -500,6 +513,7 @@ pub enum Key {
     ValidatorSetUpdateDecided,
     HighestViewPhaseVoted,
     ValidatorSetUpdateView,
+    ConsensusDbFormat,
 }
 
 impl Display for Key {
@@ -531,6 +545,7 @@ impl Display for Key {
             Key::ValidatorSetUpdateDecided => write!(f, "Validator Set Update Decided"),
             Key::HighestViewPhaseVoted => write!(f, "Highest View Phase-Voted"),
             Key::ValidatorSetUpdateView => write!(f, "Validator Set Update View"),
+            Key::ConsensusDbFormat => write!(f, "Consensus DB Format"),
         }
     }
 }

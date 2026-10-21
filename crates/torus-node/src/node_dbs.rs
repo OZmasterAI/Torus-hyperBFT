@@ -22,7 +22,8 @@
 
 use std::path::Path;
 
-use hotstuff_rs::block_tree::variables::COMMITTED_VALIDATOR_SET;
+use hotstuff_rs::block_tree::pluggables::KVGet;
+use hotstuff_rs::block_tree::variables::{COMMITTED_VALIDATOR_SET, CONSENSUS_DB_FORMAT_VERSION};
 use torus_consensus::RocksKVStore;
 use torus_state::cf::{CF_ACCOUNTS, CF_BLOCK_HEADERS, CF_CONSENSUS_META, CF_STAKING_VALIDATORS};
 use torus_genesis::GenesisDigest;
@@ -87,6 +88,35 @@ pub fn check_layout(p: LayoutProbe, data_dir: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The consensus DB format rule (batch 9, TC-required phase C): an
+/// initialized consensus DB must be of this build's
+/// [`CONSENSUS_DB_FORMAT_VERSION`] (`found`; `None` = written before the key
+/// existed). There is no in-place migration: a store of another format is
+/// refused before anything is written. A pre-phase-C store holds
+/// certificates signed without domain tags and a local tip without a leader
+/// signature; this build would fail every one of those signature checks and
+/// stall without stopping.
+pub fn check_consensus_db_format(found: Option<u32>, data_dir: &Path) -> Result<(), String> {
+    if found == Some(CONSENSUS_DB_FORMAT_VERSION) {
+        return Ok(());
+    }
+    let cdb = consensus_db_path(data_dir);
+    let found = match found {
+        None => "written before TC-required phase C (no format key)".to_string(),
+        Some(f) => format!("format {f}"),
+    };
+    Err(format!(
+        "refusing to start: the consensus DB {cdb} is {found}, and this build reads consensus \
+         DB format {CONSENSUS_DB_FORMAT_VERSION} only (domain-tagged consensus signatures, \
+         leader-signed proposals and tips). Its stored certificates would fail every signature \
+         check and the chain would stall. There is no in-place migration: run this build on \
+         every node of the chain, each from a fresh data dir (remove {dir}); the genesis file \
+         can stay the same.",
+        cdb = cdb.display(),
+        dir = data_dir.display(),
+    ))
 }
 
 /// HotStuff state is present: `Replica::initialize` always writes the
@@ -449,6 +479,14 @@ pub fn open_node_dbs(data_dir: &Path) -> Result<NodeDbs, String> {
         },
         data_dir,
     )?;
+    if has_hotstuff_state(&consensus)? {
+        check_consensus_db_format(
+            RocksKVStore::new(consensus.db_arc())
+                .consensus_db_format()
+                .map_err(|e| format!("read the consensus DB format: {e:?}"))?,
+            data_dir,
+        )?;
+    }
     state
         .attach_wal_peer(&consensus)
         .map_err(|e| format!("attach consensus DB WAL: {e}"))?;
@@ -570,7 +608,8 @@ mod tests {
     use super::*;
     use hotstuff_rs::block_tree::pluggables::{KVGet, KVStore, WriteBatch};
     use hotstuff_rs::block_tree::variables::{
-        APP_FED_BLOCK_HEIGHT, HIGHEST_PC, HIGHEST_VIEW_ENTERED, HIGHEST_VIEW_PHASE_VOTED, LOCKED_PC,
+        CONSENSUS_DB_FORMAT, CONSENSUS_DB_FORMAT_VERSION, HIGHEST_PC, HIGHEST_VIEW_ENTERED,
+        HIGHEST_VIEW_PHASE_VOTED, LOCKED_PC,
     };
     use hotstuff_rs::replica::Replica;
     use torus_consensus::kv_store::RocksWriteBatch;
@@ -716,10 +755,10 @@ mod tests {
             .collect()
     }
 
-    /// HotStuff keys are a 1-byte variable prefix (0..=23); state meta keys
-    /// are ASCII.
+    /// HotStuff keys are a 1-byte variable prefix (0..=25, the highest is
+    /// `CONSENSUS_DB_FORMAT`); state meta keys are ASCII.
     fn is_hotstuff_key(key: &[u8]) -> bool {
-        key.first().is_some_and(|b| *b <= APP_FED_BLOCK_HEIGHT[0])
+        key.first().is_some_and(|b| *b <= CONSENSUS_DB_FORMAT[0])
     }
 
     const HOTSTUFF_INIT_KEYS: [[u8; 1]; 4] = [
@@ -895,6 +934,81 @@ mod tests {
         let err = open_node_dbs(dir.path()).err().expect("must refuse");
         assert!(err.contains("state DB"), "{err}");
         assert!(err.contains("is empty"), "{err}");
+    }
+
+    // ---- Consensus DB format (batch 9, TC-required phase C) ----
+
+    /// Genesis records this build's consensus DB format, in the consensus DB
+    /// only, and a restart passes the check.
+    #[test]
+    fn genesis_records_the_consensus_db_format() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let dbs = open_node_dbs(dir.path()).unwrap();
+            init_chain(&dbs);
+            assert_eq!(
+                dbs.kv_store().consensus_db_format().unwrap(),
+                Some(CONSENSUS_DB_FORMAT_VERSION)
+            );
+            assert!(dbs
+                .state
+                .get_cf_raw(CF_CONSENSUS_META, &CONSENSUS_DB_FORMAT)
+                .unwrap()
+                .is_none());
+        }
+        open_node_dbs(dir.path()).expect("restart on this build's format");
+    }
+
+    /// A consensus DB written before TC-required phase C has no format key:
+    /// its certificates are signed without domain tags and its local tip has
+    /// no leader signature. It is refused (not run into a silent stall), and
+    /// left as it was.
+    #[test]
+    fn consensus_db_from_before_tc_phase_c_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let dbs = open_node_dbs(dir.path()).unwrap();
+            init_chain(&dbs);
+            let mut kv = dbs.kv_store();
+            let mut wb = RocksWriteBatch::new();
+            wb.delete(&CONSENSUS_DB_FORMAT);
+            kv.write(wb);
+        }
+        let err = open_node_dbs(dir.path()).err().expect("must refuse");
+        assert!(err.contains("refusing to start"), "{err}");
+        assert!(err.contains("before TC-required phase C"), "{err}");
+        assert!(err.contains("fresh data dir"), "{err}");
+        assert!(err.contains(&dir.path().display().to_string()), "{err}");
+        let dbs = open_node_dbs_unchecked_for_test(dir.path());
+        assert_eq!(dbs.kv_store().consensus_db_format().unwrap(), None, "refusal wrote the key");
+    }
+
+    /// A consensus DB of another (newer) format is refused too.
+    #[test]
+    fn consensus_db_of_another_format_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let dbs = open_node_dbs(dir.path()).unwrap();
+            init_chain(&dbs);
+            let mut kv = dbs.kv_store();
+            let mut wb = RocksWriteBatch::new();
+            wb.set(&CONSENSUS_DB_FORMAT, &(CONSENSUS_DB_FORMAT_VERSION + 1).to_le_bytes());
+            kv.write(wb);
+        }
+        let err = open_node_dbs(dir.path()).err().expect("must refuse");
+        assert!(err.contains("refusing to start"), "{err}");
+        assert!(
+            err.contains(&format!("format {}", CONSENSUS_DB_FORMAT_VERSION + 1)),
+            "{err}"
+        );
+    }
+
+    /// The consensus DB without the boot checks (to inspect a refused dir).
+    fn open_node_dbs_unchecked_for_test(data_dir: &Path) -> NodeDbs {
+        NodeDbs {
+            state: StateDb::open(data_dir).unwrap(),
+            consensus: StateDb::open_consensus(&consensus_db_path(data_dir)).unwrap(),
+        }
     }
 
     // ---- Boot step 4: genesis applied once, cheap probe (bench queue 8f) ----
