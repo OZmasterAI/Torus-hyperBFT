@@ -36,10 +36,34 @@ const CHILD_ENV: &str = "TORUS_WEDGE_CHILD";
 /// backstop's floor (5 s grace + tick), so the kick itself is what passes.
 /// Before the fix: 75 s (60 s grace + 10 s tick).
 const RECOVERY_BUDGET: Duration = Duration::from_secs(5);
-/// Watchdog-only recovery budget: 5 s grace + 1 s tick on the restarted
-/// node, plus one backed-off retry (another grace) if the first redial lands
-/// before the peers' dead QUIC connection has idled out (10 s after the kill).
-const WATCHDOG_ONLY_BUDGET: Duration = Duration::from_secs(20);
+/// Kill -> restart gap in [`restart_scenario`].
+const RESTART_GAP: Duration = Duration::from_millis(1500);
+
+/// Watchdog-only recovery budget, derived from the watchdog's own kick
+/// schedule (shipped defaults: grace G = 5 s, tick T = 1 s).
+///
+/// A and C hold B's dead QUIC connection until it idles out (10 s after the
+/// kill), and any kick before that redials into a second connection that is
+/// again left unsubscribed. Kicks of one peer back off G, G, 2G, ... (each
+/// up to a tick late), so the kicks land at about G+T, 2G+2T and 4G+3T
+/// after B is up. The first one (~6 s) always precedes the idle-out
+/// (8.5 s after the restart); the second normally recovers (measured
+/// 11.5-14.3 s under a 24-busy-loop CPU load, 12.4-17.7 s with the whole
+/// binary in one process under that load, s135). The budget covers the
+/// THIRD kick (4G + 3T = 23 s) plus 4 s for B's process start, redial,
+/// subscription exchange and the next 200 ms publish, times 1.5 for host
+/// load: 40.5 s. The old fixed 20 s sat below the third kick and flaked at
+/// load avg ~24 (s134).
+///
+/// Still proves the watchdog ALONE recovers: with the watchdog disabled
+/// (`TORUS_MESH_WATCHDOG_GRACE_MS=3600000`) the wedge never clears and the
+/// test fails at the budget; and the pre-s114 schedule (60 s grace, 10 s
+/// tick: 75 s) is outside it, so a regression to it fails too.
+fn watchdog_only_budget() -> Duration {
+    use torus_network::mesh_watchdog::{DEFAULT_WATCHDOG_GRACE, DEFAULT_WATCHDOG_TICK};
+    let third_kick = 4 * DEFAULT_WATCHDOG_GRACE + 3 * DEFAULT_WATCHDOG_TICK;
+    (third_kick + Duration::from_secs(4)).mul_f64(1.5)
+}
 /// Views carry `generation * GEN_STRIDE + counter`, so the parent can tell
 /// post-restart publishes apart from anything the first incarnation sent.
 const GEN_STRIDE: u64 = 1_000_000;
@@ -310,7 +334,7 @@ async fn restart_scenario(
     // kill -9 B, restart it on the same key and port within ~1.5 s, while A
     // and C still hold the dead QUIC connection.
     child.kill();
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    tokio::time::sleep(RESTART_GAP).await;
     let _child2 = spawn_child(&spec(2));
     let restarted = Instant::now();
 
@@ -378,12 +402,13 @@ async fn restarted_validator_single_stale_connection_within_budget() {
 /// s114: the unsubscribed-watchdog BACKSTOP alone (stale-connection kick off
 /// on every node), one dead connection per pair: the restarted node sees its
 /// peers connected but unsubscribed and kicks them after the 5 s grace
-/// (1 s tick), retrying once if the first redial lands before the peers'
-/// dead connection idles out. With the old 60 s grace / 10 s tick: 75 s.
+/// (1 s tick), retrying with backoff while the peers' dead connection has
+/// not idled out yet. Budget: [`watchdog_only_budget`] (third kick + slack,
+/// 40.5 s). With the old 60 s grace / 10 s tick: 75 s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restarted_validator_recovers_via_watchdog_alone() {
     let _ = tracing_subscriber::fmt::try_init();
-    let budget = budget_or(WATCHDOG_ONLY_BUDGET);
+    let budget = budget_or(watchdog_only_budget());
     let (_, recovered) = restart_scenario(false, false, budget).await;
     assert!(
         recovered.is_some(),
