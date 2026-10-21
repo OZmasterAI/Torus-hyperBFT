@@ -467,7 +467,6 @@ fn default_chain_config() -> ChainConfig {
         commit_lag_backoff_cap: 0,
         reputation_leader_selection: false,
         exec_trust_cache: false,
-        state_hash_activation_height: None,
         // P0.0: no genesis, so only the built-in table (it cannot conflict).
         activations: torus_types::ActivationSchedule::for_chain(
             torus_evm::TORUS_CHAIN_ID,

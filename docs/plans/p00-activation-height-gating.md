@@ -157,6 +157,28 @@ Each phase lands on its own branch with RED-first tests and full gates; each one
    sync logs UPGRADE REQUIRED and ends the session without blacklisting the peer).
 3. **Running-hash migration** (~0.5-1 d): `configure_activation` checks the header bit from the start height;
    `ChainConfig.state_hash_activation_height` comes only from the schedule.
+   Built s134 on `feat/p00-phase3` (from phase 2 8a5632a6). The running hash follows the committed headers,
+   not the node's schedule: before block h executes (live and crash replay),
+   `ExecutionContext::follow_running_hash_bit` makes META's configured activation (what every flush's chain
+   step reads) `running_hash::header_activation`: `None` while the `RunningStateHash` bit is off, else the
+   first height whose header carries it (parent bit first, then a binary search over the stored headers, which
+   are never pruned). Steady state reads nothing (cached per execution context); a change (once per chain, at
+   H; or the first block after a boot whose stored value disagrees) runs `pipeline_barrier` (every earlier
+   height durable, the checkpoint window closed, the flush worker reloads its chain memo) and then
+   `configure_activation` (its reset logic kept: a stored chain of another definition is discarded). The boot
+   no longer writes the activation from the chain config. `ChainConfig.state_hash_activation_height` is now a
+   method over `activations` (0 read as 1); the field is gone (the genesis alias stays). L3.1 on main:
+   `configure_book_coalesce` is blocked by the schedule's height or an activation the replayed headers already
+   set, and a header turning the hash on while L3.1 is on fail-stops (it cannot happen under the phase 1 header
+   rule, which refuses such headers before the vote and at insertion). Test fixtures: `make_test_config_and_db`
+   schedules the running hash at 1 and `make_block` / `default_genesis_header` carry the bit, so the module's
+   running-hash coverage stays on.
+   **L6.1 switch (not done here):** `perf/l61-window-books` keys its L3.1 gate on
+   `ChainConfig::book_window_activation()` through `l31_hash_blocker`. Once it is a `Feature` (window books),
+   `l31_hash_blocker` should take the header-derived running-hash activation (`read_configured_activation`
+   after the replay, as `configure_book_coalesce` does here) plus the schedule, and the window-book rule itself
+   should read the executed header's bit (`NativeExecContext::feature_active`) instead of a height compare, so
+   replay and nodes with another schedule run it at the height the headers agreed.
 4. **Genesis digest** (~0.5 d, owner decision): store a digest of the applied genesis at first boot, refuse to
    start when the on-disk file differs.
 5. **Integration tests 1-4** (~2-3 d): needs a test-only feature with a state-visible rule.

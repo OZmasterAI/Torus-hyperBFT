@@ -1733,13 +1733,6 @@ pub struct ChainConfig {
     /// and safe rollback.
     #[serde(default)]
     pub exec_trust_cache: bool,
-    /// Running state hash activation height (docs/plans/running-state-hash-impl.md):
-    /// the first height every node hashes, from `h_{activation-1}` = zeros.
-    /// CHAIN-WIDE (genesis `consensus.state_hash_activation_height`) so every
-    /// node's chain starts at the same height whatever its applied height at
-    /// upgrade. `None` (any genesis without the field) = running hash disabled.
-    #[serde(default)]
-    pub state_hash_activation_height: Option<u64>,
     /// P0.0: when each [`Feature`] switches on: genesis `consensus.activations`,
     /// its old `state_hash_activation_height` alias and the built-in table for
     /// `chain_id`. CHAIN-WIDE: the header `features` rule checks every block
@@ -1777,10 +1770,20 @@ impl ChainConfig {
         if self.max_validators == 0 {
             return Err("max_validators must be >= 1".to_string());
         }
-        if self.state_hash_activation_height == Some(0) {
-            return Err("state_hash_activation_height must be >= 1".to_string());
-        }
         Ok(())
+    }
+
+    /// The running state hash height this node's schedule expects
+    /// (docs/plans/running-state-hash-impl.md): `activations.running_state_hash`
+    /// (the genesis `consensus.state_hash_activation_height` is its alias), 0
+    /// read as 1; `None` = not scheduled. P0.0 phase 3: derived from the
+    /// schedule only, and only an expectation: execution starts the hash at
+    /// the first committed header carrying the `RunningStateHash` bit, never
+    /// at this height (`torus_state::running_hash::configure_activation`).
+    pub fn state_hash_activation_height(&self) -> Option<u64> {
+        self.activations
+            .height_of(Feature::RunningStateHash)
+            .map(|h| h.max(1))
     }
 }
 

@@ -787,10 +787,6 @@ impl Genesis {
             // Node-local perf toggle; never sourced from genesis. Enabled per-node
             // via the `--exec-trust-cache` CLI flag.
             exec_trust_cache: false,
-            // P0.0: derived from the schedule (the old field is its alias).
-            state_hash_activation_height: activations
-                .height_of(torus_types::Feature::RunningStateHash)
-                .map(|h| h.max(1)),
             activations,
         }
     }
@@ -1108,15 +1104,17 @@ mod tests {
     fn genesis_state_hash_activation_height_is_chain_config() {
         let genesis = Genesis::from_json(&sample_genesis_json()).unwrap();
         assert_eq!(genesis.consensus.state_hash_activation_height, None);
-        assert_eq!(genesis.chain_config().state_hash_activation_height, None);
+        assert_eq!(genesis.chain_config().state_hash_activation_height(), None);
         let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
         json["consensus"]["state_hash_activation_height"] = serde_json::json!(5000);
         let genesis = Genesis::from_json(&json.to_string()).unwrap();
-        assert_eq!(genesis.chain_config().state_hash_activation_height, Some(5000));
-        let mut config = genesis.chain_config();
-        assert!(config.validate().is_ok());
-        config.state_hash_activation_height = Some(0);
-        assert!(config.validate().is_err(), "height 0 is never executed");
+        assert_eq!(genesis.chain_config().state_hash_activation_height(), Some(5000));
+        assert!(genesis.chain_config().validate().is_ok());
+        // P0.0 phase 3: derived from the schedule only; 0 there is block 1.
+        let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        json["consensus"]["activations"] = serde_json::json!({"running_state_hash": 0});
+        let genesis = Genesis::from_json(&json.to_string()).unwrap();
+        assert_eq!(genesis.chain_config().state_hash_activation_height(), Some(1));
     }
 
     /// P0.0: `consensus.activations` names features (an unknown name refuses
@@ -1144,7 +1142,7 @@ mod tests {
         assert_eq!(config.activations.active_at(299), 0);
         assert_eq!(config.activations.active_at(300), RunningStateHash.bit());
         assert_eq!(
-            config.state_hash_activation_height,
+            config.state_hash_activation_height(),
             Some(300),
             "derived from the schedule"
         );
@@ -1160,7 +1158,7 @@ mod tests {
             g.chain_config().activations.height_of(RunningStateHash),
             Some(40)
         );
-        assert_eq!(g.chain_config().state_hash_activation_height, Some(40));
+        assert_eq!(g.chain_config().state_hash_activation_height(), Some(40));
 
         // Both, same height: fine; different: refused.
         let both = |alias: u64, new: u64| {

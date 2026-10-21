@@ -78,7 +78,6 @@ fn test_config() -> ChainConfig {
         commit_lag_backoff_cap: 0,
         reputation_leader_selection: false,
         exec_trust_cache: false,
-        state_hash_activation_height: None,
         activations: Default::default(),
     }
 }

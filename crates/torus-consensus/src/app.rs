@@ -1622,6 +1622,11 @@ struct ExecutionContext {
     /// (needs a checkpoint interval, Classic + resident books and the running
     /// hash not configured), after `checkpoint`.
     book_coalesce: bool,
+    /// P0.0 phase 3: `(height, activation)` as of the last block this context
+    /// executed: the running-hash activation the committed headers define
+    /// (`None`: the `RunningStateHash` bit was off), already in META. `None`
+    /// until the first block. See [`Self::follow_running_hash_bit`].
+    hash_activation: std::sync::Mutex<Option<(u64, Option<u64>)>>,
     /// 8k L3.1 test seam (mutation): a close of this kind skips the
     /// coalesced encode (the books stay owed to a later close).
     #[cfg(test)]
@@ -3582,6 +3587,108 @@ impl ExecutionContext {
         );
     }
 
+    /// P0.0 phase 3: the running state hash follows the committed headers'
+    /// `RunningStateHash` bit, never this node's schedule: it starts at the
+    /// first header carrying the bit (`h_{H-1}` = zeros), on every node, live
+    /// and in crash replay. Before block `header.height` executes, makes the
+    /// META activation every flush's chain step reads the headers' one
+    /// (`running_hash::header_activation`: `None` while the bit is off).
+    /// Steady state reads nothing; the first block of this context reads at
+    /// most a few stored headers. A change (once per chain, at H; or the
+    /// first block after a boot whose stored value disagrees) first drains
+    /// the pipeline (`pipeline_barrier`: every earlier height durable, the
+    /// flush worker reloads its chain state), then `configure_activation`
+    /// (a stored chain of another definition is discarded). `false`: the
+    /// fail-stop is latched; execute nothing.
+    fn follow_running_hash_bit(&self, header: &TorusBlockHeader) -> bool {
+        use torus_state::running_hash::{configure_activation, header_activation, read_configured_activation};
+        let rsh = torus_types::Feature::RunningStateHash.bit();
+        let height = header.height;
+        let on = header.features & rsh != 0;
+        let mut last = self.hash_activation.lock().unwrap();
+        let want = match (*last, on) {
+            (Some((_, Some(a))), true) if a <= height => {
+                *last = Some((height, Some(a)));
+                return true;
+            }
+            (Some((_, None)), false) => {
+                *last = Some((height, None));
+                return true;
+            }
+            // The parent (executed by this context) had no bit: H is here.
+            (Some((prev, None)), true) if prev + 1 == height => Some(height),
+            _ => {
+                // First block of this context (or a bit that went off again):
+                // the stored headers below say where the bit turned on. A
+                // pipelined parent may not be durable yet: drain once, retry.
+                let derive = || {
+                    header_activation(height, on, |h| {
+                        header_at(&self.state_db, h).map(|p| p.features & rsh != 0)
+                    })
+                };
+                match derive().or_else(|_| {
+                    if self.pipeline_barrier() {
+                        derive()
+                    } else {
+                        Err(torus_state::StateError::InvalidData("pipeline barrier failed".into()))
+                    }
+                }) {
+                    Ok(want) => want,
+                    Err(e) => {
+                        tracing::error!(
+                            %e,
+                            height,
+                            "FATAL: running state hash: cannot read the committed headers below this \
+                             block to find where the RunningStateHash bit turned on (fail-stop)"
+                        );
+                        self.exec_failed.store(true, Ordering::SeqCst);
+                        return false;
+                    }
+                }
+            }
+        };
+        let stored = read_configured_activation(&self.state_db);
+        if stored != want {
+            // 8k L3.1 (coalesced book saves) needs the hash off: h_n needs every
+            // block's book bytes. It is on only when this node's schedule has no
+            // running hash, so these headers are another schedule's.
+            if want.is_some() && self.book_coalesce {
+                tracing::error!(
+                    height,
+                    ?want,
+                    "FATAL: the committed headers turn the running state hash on, but L3.1 \
+                     coalesced book saves are on (this node's schedule has no running hash): \
+                     fix the genesis activations and restart (fail-stop)"
+                );
+                self.exec_failed.store(true, Ordering::SeqCst);
+                return false;
+            }
+            if !self.pipeline_barrier() {
+                return false;
+            }
+            match configure_activation(&self.state_db, want) {
+                Ok(discarded) => tracing::info!(
+                    height,
+                    ?stored,
+                    activation = ?want,
+                    discarded,
+                    "running state hash: activation follows the committed headers' RunningStateHash bit"
+                ),
+                Err(e) => {
+                    tracing::error!(
+                        %e,
+                        height,
+                        "FATAL: running state hash: activation write failed (fail-stop)"
+                    );
+                    self.exec_failed.store(true, Ordering::SeqCst);
+                    return false;
+                }
+            }
+        }
+        *last = Some((height, want));
+        true
+    }
+
     /// bl2: barrier — every path that writes the DB directly, reads it
     /// bypassing the overlay, or must see a settled marker (EVM blocks,
     /// slashes, epoch boundaries unless the epoch fast path is on,
@@ -4158,8 +4265,8 @@ impl ExecutionContext {
     /// a checkpoint interval (`self.checkpoint`, set before this) without a
     /// byte cap (`TORUS_CHECKPOINT_MAX_BYTES`: the cap's estimate never sees
     /// the coalesced blobs; owner option C, as b1), the running state hash
-    /// not configured (`hash_activation`: the genesis
-    /// `consensus.state_hash_activation_height`; with the hash on, h_n needs
+    /// not configured (`hash_activation`: the schedule's running-hash height,
+    /// or the one the replayed headers turned on, P0.0 phase 3; with the hash on, h_n needs
     /// every block's book bytes, so this needs L6.1 first) and the process's
     /// book settings ([`torus_bridge::native_executor::book_coalesce_blocker`]).
     /// Otherwise warns once with the reason and stays off. Requested by
@@ -4195,7 +4302,7 @@ impl ExecutionContext {
             // the cap would be silently blind to them.
             Some("a checkpoint byte cap is set (TORUS_CHECKPOINT_MAX_BYTES): it cannot count the coalesced book blobs")
         } else if hash_activation.is_some() {
-            Some("the running state hash is configured (genesis state_hash_activation_height)")
+            Some("the running state hash is scheduled (genesis activations.running_state_hash) or already on")
         } else {
             book_blocker
         };
@@ -4400,6 +4507,11 @@ impl ExecutionContext {
         // P0.0: execution runs by the committed header's bits (crash replay
         // too). A bit this binary does not know: fail-stop BEFORE executing.
         if feature_bits_fail_stop(&torus_block.header, &self.activations, &self.exec_failed) {
+            return;
+        }
+        // P0.0 phase 3: the running state hash follows the header's bit (before
+        // anything of this block is flushed).
+        if !self.follow_running_hash_bit(&torus_block.header) {
             return;
         }
 
@@ -7728,6 +7840,7 @@ impl TorusApp {
             checkpoint: None,
             ckpt: Default::default(),
             book_coalesce: false,
+            hash_activation: Default::default(),
             #[cfg(test)]
             test_coalesce_skip: None,
             #[cfg(test)]
@@ -7815,13 +7928,10 @@ impl TorusApp {
         // fail-stop latch — execution parks at `h` and the live heal loop + backfill
         // get a bounded window to close it (see the `exec_next_height` /
         // `exec_hole_since` wiring in the struct literal below).
-        // Running state hash: the CHAIN-WIDE activation height (genesis) must
-        // be in place before the replay flushes any block.
-        if let Err(e) =
-            torus_state::running_hash::configure_activation(&state_db, config.state_hash_activation_height)
-        {
-            tracing::error!(%e, "running state hash: failed to apply the activation config");
-        }
+        // Running state hash (P0.0 phase 3): no boot-time configuration from the
+        // chain config. Execution (the replay included) sets the activation from
+        // the committed headers' RunningStateHash bit before the block that
+        // changes it (`ExecutionContext::follow_running_hash_bit`).
         let (last_header, parked_hole) = Self::replay_committed(&state_db, &exec_ctx);
         // Running state hash: a fail-stop latched before the restart stays
         // latched (persisted record; `TORUS_STATE_HASH_FAILSTOP=1`).
@@ -7872,9 +7982,13 @@ impl TorusApp {
             );
         }
         // 8k L3.1: after `checkpoint` (it needs one), before any block runs.
+        // P0.0 phase 3: the schedule's running-hash height, or the one the
+        // replayed headers already turned on.
         exec_ctx.configure_book_coalesce(
             crate::exec_pipeline::book_coalesce_requested(),
-            config.state_hash_activation_height,
+            config
+                .state_hash_activation_height()
+                .or(torus_state::running_hash::read_configured_activation(&state_db)),
         );
         // s124: the epoch fast path only changes which blocks take the
         // pipelined path, so it needs W.
@@ -8634,7 +8748,6 @@ impl TorusApp {
             commit_lag_backoff_cap: 0,
             reputation_leader_selection: false,
             exec_trust_cache: false,
-            state_hash_activation_height: None,
             activations: Default::default(),
         };
         let mut seed = [0u8; 32];
@@ -11665,7 +11778,6 @@ mod exec_throttle_tests {
                 commit_lag_backoff_cap: 0,
                 reputation_leader_selection: false,
                 exec_trust_cache: false,
-                state_hash_activation_height: None,
                 activations: Default::default(),
             };
             (config, state_db)
@@ -13167,12 +13279,14 @@ mod crash_recovery_tests {
             commit_lag_backoff_cap: 0,
             reputation_leader_selection: false,
             exec_trust_cache: false,
-            // Running state hash on from height 1 (chain config), as a
-            // genesis-synced node of a chain with activation 1.
-            state_hash_activation_height: Some(1),
-            activations: Default::default(),
+            // Running state hash on from height 1, as a genesis-synced node
+            // of a chain with activation 1: the schedule here, the bit in
+            // every `make_block` header and the genesis parent header.
+            activations: rsh_at(1),
         };
-        torus_state::running_hash::configure_activation(&state_db, config.state_hash_activation_height)
+        // P0.0 phase 3: what execution writes before block 1 (with it in
+        // place, block 1 needs no pipeline barrier).
+        torus_state::running_hash::configure_activation(&state_db, config.state_hash_activation_height())
             .expect("configure running hash activation");
         (config, state_db)
     }
@@ -13191,11 +13305,18 @@ mod crash_recovery_tests {
     /// (`make_test_config_and_db`: the default gas limit, N =
     /// `TEST_EVM_BLOCK_INTERVAL`).
     fn default_genesis_header() -> TorusBlockHeader {
-        torus_bridge::genesis_parent_header(
+        let mut header = torus_bridge::genesis_parent_header(
             torus_types::DEFAULT_EVM_GAS_LIMIT,
             TEST_EVM_BLOCK_INTERVAL,
-        )
+        );
+        // P0.0: block 1's bits (`make_test_config_and_db`: the running hash from 1).
+        header.features = TEST_FEATURES;
+        header
     }
+
+    /// P0.0 phase 3: the feature bits of every `make_block` header (the
+    /// running hash on from block 1, as `make_test_config_and_db`'s schedule).
+    const TEST_FEATURES: u128 = torus_types::Feature::RunningStateHash.bit();
 
     fn make_block(height: u64, native_actions: Vec<SignedNativeAction>) -> TorusBlock {
         // Header-identity hardening: the commit-time ancestry check
@@ -13236,7 +13357,7 @@ mod crash_recovery_tests {
                 big_base_fee_per_gas: 1_000_000_000,
                 epoch: 0,
                 validator_set_hash: B256::ZERO,
-                features: 0,
+                features: TEST_FEATURES,
                 sig_attestation: [0u8; 64],
             },
             native_actions,
@@ -16983,6 +17104,7 @@ mod crash_recovery_tests {
             checkpoint: None,
             ckpt: Default::default(),
             book_coalesce: false,
+            hash_activation: Default::default(),
             #[cfg(test)]
             test_coalesce_skip: None,
             #[cfg(test)]
@@ -25863,7 +25985,6 @@ mod crash_recovery_tests {
         assert!(local.is_none_or(|h| h > 1));
         let (mut config, _) = make_test_config_and_db();
         config.activations = local.map(rsh_at).unwrap_or_default();
-        config.state_hash_activation_height = local;
         config
     }
 
@@ -28918,7 +29039,7 @@ mod crash_recovery_tests {
                     drop(ctx);
                     drop(db);
                     db = StateDb::open(&dir).expect("reopen the state db");
-                    torus_state::running_hash::configure_activation(&db, config.state_hash_activation_height)
+                    torus_state::running_hash::configure_activation(&db, config.state_hash_activation_height())
                         .expect("configure running hash activation");
                     assert_eq!(adl_rows(&db), 8, "mid-drain after the reopen");
                     ctx = open_ctx(&db);
