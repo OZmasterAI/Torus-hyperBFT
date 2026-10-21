@@ -11,6 +11,7 @@ torus-evm = { workspace = true }
 torus-bridge = { workspace = true }
 torus-mempool = { workspace = true }
 torus-economics = { workspace = true }
+borsh = { workspace = true }
 torus-telemetry = { workspace = true }
 hotstuff_rs = { workspace = true }
 alloy-primitives = { workspace = true }

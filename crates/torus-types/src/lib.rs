@@ -1750,6 +1750,53 @@ pub struct ChainConfig {
     /// env `TORUS_BOOK_ROWS` may only repeat it). Absent = Classic.
     #[serde(default, skip_serializing_if = "book_mode::BookMode::is_classic")]
     pub book_mode: book_mode::BookMode,
+    /// Dead-leader skip (docs/plans/dead-leader-skip.md, b1): K, the run of missed leader slots
+    /// after which execution plans a validator's leader exclusion. 0 = off. CHAIN-WIDE (genesis
+    /// `consensus.leader_miss_threshold`); absent = [`DEFAULT_LEADER_MISS_THRESHOLD`].
+    #[serde(default = "default_leader_miss_threshold")]
+    pub leader_miss_threshold: u32,
+    /// Dead-leader skip: the cap of j, the exclusion count whose `L * 2^j` floor a re-admission
+    /// waits out. CHAIN-WIDE (genesis `consensus.leader_exclusion_cap`); absent =
+    /// [`DEFAULT_LEADER_EXCLUSION_CAP`].
+    #[serde(default = "default_leader_exclusion_cap")]
+    pub leader_exclusion_cap: u32,
+}
+
+/// Dead-leader skip: default K (owner s134).
+pub const DEFAULT_LEADER_MISS_THRESHOLD: u32 = 3;
+/// Dead-leader skip: default j cap (owner s134).
+pub const DEFAULT_LEADER_EXCLUSION_CAP: u32 = 6;
+/// Dead-leader skip: valid K when on (0 = off is valid too). 1 would exclude a validator for one
+/// missed slot (a network blip).
+pub const LEADER_MISS_THRESHOLD_RANGE: std::ops::RangeInclusive<u32> = 2..=64;
+/// Dead-leader skip: valid j cap (the longest floor is `L * 2^cap` heights).
+pub const LEADER_EXCLUSION_CAP_RANGE: std::ops::RangeInclusive<u32> = 0..=10;
+
+/// Dead-leader skip parameters in force for a block (see [`ChainConfig::dead_leader_skip`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeadLeaderParams {
+    /// K: a validator whose run of missed leader slots reaches K is excluded at the next plan.
+    pub miss_threshold: u32,
+    /// The cap of the exclusion count j.
+    pub exclusion_cap: u32,
+}
+
+impl DeadLeaderParams {
+    /// Genesis range check: K is 0 (off) or in [`LEADER_MISS_THRESHOLD_RANGE`], the cap in
+    /// [`LEADER_EXCLUSION_CAP_RANGE`].
+    pub fn check(miss_threshold: u32, exclusion_cap: u32) -> Result<(), String> {
+        // RED stub (phase 2 test commit).
+        let _ = (miss_threshold, exclusion_cap);
+        Ok(())
+    }
+}
+
+fn default_leader_miss_threshold() -> u32 {
+    DEFAULT_LEADER_MISS_THRESHOLD
+}
+
+fn default_leader_exclusion_cap() -> u32 {
+    DEFAULT_LEADER_EXCLUSION_CAP
 }
 
 fn default_timeout_base_ms() -> u64 {
@@ -1784,7 +1831,29 @@ impl ChainConfig {
         if self.state_hash_activation_height == Some(0) {
             return Err("state_hash_activation_height must be >= 1".to_string());
         }
+        DeadLeaderParams::check(self.leader_miss_threshold, self.leader_exclusion_cap)?;
         Ok(())
+    }
+
+    /// Dead-leader skip: the parameters in force for the block with `header`, `None` = off (the
+    /// execution of that block attributes no leader slots and plans no exclusion; consensus then
+    /// emits no exclusion delta, as no plan carries one).
+    ///
+    /// THE activation hook (P0.0, docs/plans/p00-activation-height-gating.md): this ships in the
+    /// genesis, so it reads only the genesis parameters. If it lands after a genesis, AND the
+    /// feature bit of `header.features` here, the one place every execution and commit-path
+    /// caller goes through.
+    ///
+    /// Off as well with reputation-weighted leader selection (B3): execution derives leader(v)
+    /// with plain IWRR over the installed set, which B3's local inputs would not match.
+    pub fn dead_leader_skip(&self, _header: &TorusBlockHeader) -> Option<DeadLeaderParams> {
+        if self.leader_miss_threshold == 0 || self.reputation_leader_selection {
+            return None;
+        }
+        Some(DeadLeaderParams {
+            miss_threshold: self.leader_miss_threshold,
+            exclusion_cap: self.leader_exclusion_cap,
+        })
     }
 }
 
@@ -1843,6 +1912,70 @@ pub struct ValidatorSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dead-leader skip: the chain config range check and the activation hook (off for K = 0
+    /// and under reputation-weighted leader selection).
+    #[test]
+    fn dead_leader_params_range_check_and_hook() {
+        for (k, cap, ok) in [
+            (0, 6, true),
+            (1, 6, false),
+            (2, 6, true),
+            (3, 6, true),
+            (64, 6, true),
+            (65, 6, false),
+            (3, 0, true),
+            (3, 10, true),
+            (3, 11, false),
+        ] {
+            assert_eq!(DeadLeaderParams::check(k, cap).is_ok(), ok, "K {k} cap {cap}");
+        }
+        let json = serde_json::json!({
+            "chain_id": 1, "chain_name": "t", "evm_gas_limit": 1, "base_fee_per_gas": 1,
+            "epoch_length": 4, "max_validators": 4, "min_stake": "0x0",
+            "fee_burn_bps": 0, "fee_validator_bps": 0, "fee_treasury_bps": 0, "fee_dev_pool_bps": 0,
+        });
+        let mut config: ChainConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            (config.leader_miss_threshold, config.leader_exclusion_cap),
+            (DEFAULT_LEADER_MISS_THRESHOLD, DEFAULT_LEADER_EXCLUSION_CAP),
+            "absent: the defaults"
+        );
+        let header = TorusBlockHeader {
+            height: 1,
+            parent_hash: B256::ZERO,
+            timestamp: 0,
+            proposer: Address::ZERO,
+            state_root: B256::ZERO,
+            receipts_root: B256::ZERO,
+            logs_bloom: Bloom::ZERO,
+            evm_gas_used: 0,
+            evm_fee_revenue: 0,
+            evm_gas_limit: 0,
+            evm_block_interval: 1,
+            evm_big_block_interval: 0,
+            evm_big_gas_limit: 0,
+            native_action_count: 0,
+            evm_tx_count: 0,
+            base_fee_per_gas: 0,
+            big_base_fee_per_gas: 0,
+            epoch: 0,
+            validator_set_hash: B256::ZERO,
+            sig_attestation: [0; 64],
+        };
+        assert_eq!(
+            config.dead_leader_skip(&header),
+            Some(DeadLeaderParams { miss_threshold: 3, exclusion_cap: 6 })
+        );
+        config.leader_exclusion_cap = 11;
+        assert!(config.validate().is_err());
+        config.leader_exclusion_cap = 6;
+        config.reputation_leader_selection = true;
+        assert_eq!(config.dead_leader_skip(&header), None, "B3 on: off");
+        config.reputation_leader_selection = false;
+        config.leader_miss_threshold = 0;
+        assert_eq!(config.dead_leader_skip(&header), None, "K = 0: off");
+    }
 
     /// Item 7 step 2: EVM txs ride the small cadence (`h % N == 0`) or a big height
     /// (M > 0, `h % M == 0`); M = 0 switches big heights off.

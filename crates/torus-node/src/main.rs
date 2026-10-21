@@ -469,6 +469,8 @@ fn default_chain_config() -> ChainConfig {
         exec_trust_cache: false,
         state_hash_activation_height: None,
         book_mode: Default::default(),
+        leader_miss_threshold: torus_types::DEFAULT_LEADER_MISS_THRESHOLD,
+        leader_exclusion_cap: torus_types::DEFAULT_LEADER_EXCLUSION_CAP,
     }
 }
 
