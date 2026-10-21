@@ -547,33 +547,48 @@ fn nec_from_either_active_set_is_valid_during_a_validator_set_change() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase A of docs/plans/tc-required-and-tip-signing.md: VALIDPROPOSAL V1
-// behind the test-only `tc_required` switch. A block must justify on
-// VIEW - 1 (or the genesis PC), or carry a TC for VIEW - 1.
+// docs/plans/tc-required-and-tip-signing.md §2, VALIDPROPOSAL V1 (always on
+// from phase B): a block must justify on VIEW - 1 (or the genesis PC), or
+// carry a TC for VIEW - 1.
+//
+// RED-first (phase B): on phase A (3e5317ff) validators are lax without the
+// test-only switch, so every `*_rejects_*` / `*_not_correct` case below
+// fails.
 // ---------------------------------------------------------------------------
 
-/// A replica at VIEW (as [`replica`]) holding `parent` (genesis-justified),
-/// with the V1 switch set to `tc_required`.
-fn replica_holding(parent: &Block, tc_required: bool) -> Replica {
+/// A replica at VIEW (as [`replica`]) holding `parent` (genesis-justified).
+fn replica_holding(parent: &Block) -> Replica {
     let mut r = replica();
     r.tree.insert(parent, None, None).unwrap();
-    r.hotstuff.set_tc_required(tc_required);
     r
 }
 
-/// Does a replica (V1 switch `tc_required`) vote for a child of `parent`
-/// justified by a QC of `justify_view`, carrying `tc`, on both paths? Panics
-/// if the paths disagree.
-fn child_votes(tc_required: bool, justify_view: u64, tc: Option<TimeoutCertificate>) -> bool {
+/// Does a replica holding `parent` vote for `child` carrying `tc`, on both
+/// paths? Panics if the paths disagree.
+fn votes_for_child_of(parent: &Block, child: &Block, tc: Option<TimeoutCertificate>) -> bool {
+    let header = header_path_votes_on(replica_holding(parent), child, tc.clone(), None);
+    let full = full_path_votes_on(replica_holding(parent), child, tc, None);
+    assert_eq!(header, full, "header and full paths disagree (justify view {})", child.justify.view.int());
+    header
+}
+
+/// The genesis-justified parent the V1 / V3 cases extend.
+fn parent() -> Block {
+    block(40)
+}
+
+/// A child of [`parent`] justified by a QC of `justify_view`.
+fn child(justify_view: u64, tag: u8) -> Block {
     let keys = keys();
     let set = validator_set(&keys);
-    let parent = block(40);
-    let qc = generic_pc(ViewNumber::new(justify_view), parent.hash, &keys[..3], &set);
-    let child = Block::new(BlockHeight::new(1), qc, CryptoHash::new([41; 32]), Data::new(vec![]));
-    let header = header_path_votes_on(replica_holding(&parent, tc_required), &child, tc.clone(), None);
-    let full = full_path_votes_on(replica_holding(&parent, tc_required), &child, tc, None);
-    assert_eq!(header, full, "header and full paths disagree (justify view {justify_view})");
-    header
+    let qc = generic_pc(ViewNumber::new(justify_view), parent().hash, &keys[..3], &set);
+    Block::new(BlockHeight::new(1), qc, CryptoHash::new([tag; 32]), Data::new(vec![]))
+}
+
+/// Does a replica vote for a child of [`parent`] justified by a QC of
+/// `justify_view`, carrying `tc`, on both paths?
+fn child_votes(justify_view: u64, tc: Option<TimeoutCertificate>) -> bool {
+    votes_for_child_of(&parent(), &child(justify_view, 41), tc)
 }
 
 /// A TC for `view` with no tips and no QCs (a fresh-proposal TC).
@@ -584,35 +599,125 @@ fn bare_tc(view: u64) -> TimeoutCertificate {
 }
 
 #[test]
-fn v1_strict_rejects_a_stale_justify_without_a_tc() {
-    assert!(!child_votes(true, VIEW - 3, None), "justify view VIEW - 3, no TC");
-    assert!(!child_votes(true, VIEW - 3, Some(bare_tc(VIEW - 2))), "TC for VIEW - 2");
+fn v1_rejects_a_stale_justify_without_a_tc() {
+    assert!(!child_votes(VIEW - 3, None), "justify view VIEW - 3, no TC");
+    assert!(!child_votes(VIEW - 3, Some(bare_tc(VIEW - 2))), "TC for VIEW - 2");
 }
 
 #[test]
-fn v1_strict_accepts_a_previous_view_justify_or_a_previous_view_tc() {
-    assert!(child_votes(true, VIEW - 1, None), "justify on VIEW - 1");
-    assert!(child_votes(true, VIEW - 3, Some(bare_tc(VIEW - 1))), "stale justify with TC(VIEW - 1)");
-    assert_both_paths_strict_genesis();
-}
-
-/// The genesis PC is exempt (V1).
-fn assert_both_paths_strict_genesis() {
+fn v1_accepts_a_previous_view_justify_or_a_previous_view_tc() {
+    assert!(child_votes(VIEW - 1, None), "justify on VIEW - 1");
+    assert!(child_votes(VIEW - 3, Some(bare_tc(VIEW - 1))), "stale justify with TC(VIEW - 1)");
+    // The genesis PC is exempt.
     let b = block(1);
-    let mut r = replica();
-    r.hotstuff.set_tc_required(true);
-    let header = header_path_votes_on(r, &b, None, None);
-    let mut r = replica();
-    r.hotstuff.set_tc_required(true);
-    let full = full_path_votes_on(r, &b, None, None);
+    let header = header_path_votes_on(replica(), &b, None, None);
+    let full = full_path_votes_on(replica(), &b, None, None);
     assert!(header && full, "genesis justify: header voted={header}, full voted={full}");
 }
 
-/// Phase A keeps validators lax: without the switch a stale justify with no
-/// TC is still voted on.
+// ---------------------------------------------------------------------------
+// V3 (phase B, amended): TC attached, no NEC, high QC `q` wins => the block
+// justifies on a view >= q.view, or is q's block (a validator-set-update
+// re-proposal of the block q certifies).
+// ---------------------------------------------------------------------------
+
+/// A case-3 TC for VIEW - 1: three signers, the first reports `high_qc`,
+/// the others no QC and nobody a tip, so the high QC wins.
+fn high_qc_tc(high_qc: PhaseCertificate) -> TimeoutCertificate {
+    let keys = keys();
+    let set = validator_set(&keys);
+    let tc = collected_tc(&keys[..3], &set, VIEW - 1, &[None, None, None], &[Some(high_qc), None, None]);
+    assert!(!tc.high_tip_is_winner && tc.high_qc.is_some(), "fixture: the high QC wins");
+    tc
+}
+
 #[test]
-fn v1_lax_by_default_in_phase_a() {
-    assert!(child_votes(false, VIEW - 3, None));
+fn v3_rejects_a_case_3_block_below_the_tc_high_qc() {
+    let keys = keys();
+    let set = validator_set(&keys);
+    // q certifies another block at VIEW - 2; the proposal justifies on VIEW - 3.
+    let q = generic_pc(ViewNumber::new(VIEW - 2), block(43).hash, &keys[..3], &set);
+    assert!(!child_votes(VIEW - 3, Some(high_qc_tc(q))), "justify VIEW - 3 < q.view VIEW - 2");
+}
+
+#[test]
+fn v3_accepts_a_case_3_block_at_or_above_the_tc_high_qc() {
+    let keys = keys();
+    let set = validator_set(&keys);
+    let at = generic_pc(ViewNumber::new(VIEW - 2), parent().hash, &keys[..3], &set);
+    assert!(child_votes(VIEW - 2, Some(high_qc_tc(at))), "justify == q");
+    let below = generic_pc(ViewNumber::new(VIEW - 3), block(43).hash, &keys[..3], &set);
+    assert!(child_votes(VIEW - 2, Some(high_qc_tc(below))), "justify above q");
+}
+
+/// The V3 amendment: a validator-set-update re-proposal of the block q
+/// certifies justifies below q.view and must still be voted on.
+#[test]
+fn v3_accepts_a_reproposal_of_the_block_the_high_qc_certifies() {
+    let keys = keys();
+    let set = validator_set(&keys);
+    let x = child(VIEW - 3, 42);
+    let q = generic_pc(ViewNumber::new(VIEW - 2), x.hash, &keys[..3], &set);
+    assert!(votes_for_child_of(&parent(), &x, Some(high_qc_tc(q))), "B is q's block");
+}
+
+// ---------------------------------------------------------------------------
+// Phase-A open question 2: a timeout vote's highest QC is only bound by its
+// (view, block) summary, so a byzantine voter can report a forged high-view
+// QC. A TC whose high QC is not itself a correct QC is not correct (and the
+// pacemaker drops such votes before collecting, see prev_view_collector_test).
+// ---------------------------------------------------------------------------
+
+/// A QC for `view` over `block` signed by one validator only: below quorum,
+/// what a lone byzantine voter can make.
+fn forged_qc(view: u64, block_hash: CryptoHash) -> PhaseCertificate {
+    let keys = keys();
+    let set = validator_set(&keys);
+    generic_pc(ViewNumber::new(view), block_hash, &keys[..1], &set)
+}
+
+#[test]
+fn tc_with_a_forged_high_qc_is_not_correct() {
+    let keys = keys();
+    let set = validator_set(&keys);
+    let (tree, _) = steady_block_tree(&set);
+    let honest = generic_pc(ViewNumber::new(VIEW - 3), parent().hash, &keys[..3], &set);
+    let forged = forged_qc(VIEW - 2, block(44).hash);
+    let tc = collected_tc(&keys[..3], &set, VIEW - 1, &[None, None, None], &[Some(forged.clone()), Some(honest), None]);
+    assert!(tc.high_qc.as_ref() == Some(&forged), "fixture: the forged QC is the highest summary");
+    assert!(!tc.is_correct(&tree).unwrap(), "a TC whose high QC is not a correct QC");
+}
+
+/// With the forged-QC TC attached, neither the block above nor the block
+/// below the forged QC is voted on (the TC itself is rejected).
+#[test]
+fn proposal_carrying_a_forged_high_qc_tc_is_rejected() {
+    let keys = keys();
+    let set = validator_set(&keys);
+    let honest = generic_pc(ViewNumber::new(VIEW - 3), parent().hash, &keys[..3], &set);
+    let forged = forged_qc(VIEW - 2, block(44).hash);
+    let tc = collected_tc(&keys[..3], &set, VIEW - 1, &[None, None, None], &[Some(forged), Some(honest), None]);
+    assert!(!child_votes(VIEW - 3, Some(tc.clone())), "justify on the honest QC");
+    assert!(!child_votes(VIEW - 2, Some(tc)), "justify at the forged view");
+}
+
+// ---------------------------------------------------------------------------
+// Tail-fork attempt (unit, both paths): B got votes at VIEW - 1, its QC was
+// withheld. A fresh block without TC(VIEW - 1) is rejected (V1); with a TC
+// whose high tip is B it must be B (V2); B re-proposed under that TC passes.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tail_fork_attempt_fresh_block_rejected_tip_reproposed() {
+    let b = child(VIEW - 2, 45);
+    let fresh = child(VIEW - 2, 46);
+    let keys = keys();
+    let set = validator_set(&keys);
+    let tips = vec![Some(tip(&b, VIEW - 1)); 3];
+    let tc = collected_tc(&keys[..3], &set, VIEW - 1, &tips, &[None, None, None]);
+    assert!(!votes_for_child_of(&parent(), &fresh, None), "fresh block, no TC");
+    assert!(!votes_for_child_of(&parent(), &fresh, Some(tc.clone())), "fresh block under B's TC");
+    assert!(votes_for_child_of(&parent(), &b, Some(tc)), "B re-proposed under its TC");
 }
 
 #[test]

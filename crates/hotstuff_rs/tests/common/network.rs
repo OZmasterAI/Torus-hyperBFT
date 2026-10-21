@@ -66,9 +66,29 @@ pub(crate) struct MessageFilter {
     pub(crate) isolated_after_vote: Option<(VerifyingKey, ViewNumber)>,
     /// Latch of `isolated_after_vote`: set when that vote is sent.
     pub(crate) isolated: bool,
+    /// s134 TC-required phase B: byzantine behaviour and observation. Called on every message
+    /// that passed the drop rules above with `(sender, recipient, message)`; returns the message
+    /// to deliver (possibly rewritten) or `None` to drop it.
+    pub(crate) rewrite: Option<Rewrite>,
 }
 
+/// See [`MessageFilter::rewrite`].
+pub(crate) type Rewrite =
+    Arc<dyn Fn(&VerifyingKey, &VerifyingKey, Message) -> Option<Message> + Send + Sync>;
+
 impl MessageFilter {
+    /// The message to deliver from `sender` to `recipient`, if any: the drop rules of
+    /// [`should_drop`](Self::should_drop), then [`rewrite`](Self::rewrite).
+    fn apply(&mut self, sender: &VerifyingKey, recipient: &VerifyingKey, message: Message) -> Option<Message> {
+        if self.should_drop(sender, recipient, &message) {
+            return None;
+        }
+        match (self.enabled, &self.rewrite) {
+            (true, Some(rewrite)) => rewrite(sender, recipient, message),
+            _ => Some(message),
+        }
+    }
+
     /// Returns `true` if a message to `recipient` should be dropped.
     ///
     /// Only *body-carrying* HotStuff messages are dropped, and only to starved recipients:
@@ -193,11 +213,14 @@ impl Network for NetworkStub {
     fn update_validator_set(&mut self, _: ValidatorSetUpdates) {}
 
     fn send(&mut self, peer: VerifyingKey, message: Message) {
-        if self.filter_enabled.load(Ordering::Relaxed)
-            && self.filter.lock().unwrap().should_drop(&self.my_verifying_key, &peer, &message)
-        {
-            return;
-        }
+        let message = if self.filter_enabled.load(Ordering::Relaxed) {
+            match self.filter.lock().unwrap().apply(&self.my_verifying_key, &peer, message) {
+                Some(message) => message,
+                None => return,
+            }
+        } else {
+            message
+        };
         if let Some(peer_tx) = self.all_peers.get(&peer) {
             deliver(
                 self.my_verifying_key,
@@ -211,15 +234,15 @@ impl Network for NetworkStub {
     fn broadcast(&mut self, message: Message) {
         let active = self.filter_enabled.load(Ordering::Relaxed);
         for (recipient, peer_tx) in &self.all_peers {
-            if active && self.filter.lock().unwrap().should_drop(&self.my_verifying_key, recipient, &message) {
-                continue;
-            }
-            deliver(
-                self.my_verifying_key,
-                peer_tx.clone(),
-                message.clone(),
-                self.body_delay,
-            );
+            let message = if active {
+                match self.filter.lock().unwrap().apply(&self.my_verifying_key, recipient, message.clone()) {
+                    Some(message) => message,
+                    None => continue,
+                }
+            } else {
+                message.clone()
+            };
+            deliver(self.my_verifying_key, peer_tx.clone(), message, self.body_delay);
         }
     }
 
@@ -355,6 +378,17 @@ impl FilterHandle {
     #[allow(dead_code)]
     pub(crate) fn is_isolated(&self) -> bool {
         self.filter.lock().unwrap().isolated
+    }
+
+    /// s134: pass every message through `rewrite` from now on (see [`MessageFilter::rewrite`]).
+    #[allow(dead_code)]
+    pub(crate) fn rewrite(&self, rewrite: Rewrite) {
+        *self.filter.lock().unwrap() = MessageFilter {
+            enabled: true,
+            rewrite: Some(rewrite),
+            ..MessageFilter::default()
+        };
+        self.enabled.store(true, Ordering::Relaxed);
     }
 
     /// Fully heal the network: nothing is dropped and the message hot path takes no lock again.

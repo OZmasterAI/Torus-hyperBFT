@@ -12,7 +12,9 @@ use super::*;
 use crate::hotstuff::header_fast_path_regression_test::{
     signing_keys, steady_block_tree, validator_set, MemKV,
 };
+use crate::hotstuff::types::PhaseCertificate;
 use crate::types::crypto_primitives::SigningKey;
+use crate::types::data_types::CryptoHash;
 
 const CHAIN: ChainID = ChainID::new(0);
 
@@ -161,4 +163,73 @@ fn no_bracha_echo_for_the_previous_view() {
     f.timeout_vote(0, 6);
     f.timeout_vote(1, 6);
     assert_eq!(f.net.timeout_votes_sent(), vec![ViewNumber::new(6)]);
+}
+
+// ---------------------------------------------------------------------------
+// Phase B (phase-A open question 2): a timeout vote binds its highest QC only
+// by the (view, block) summary it signs, so a byzantine voter can report a
+// forged high-view QC. The pacemaker drops such a vote before collecting it;
+// otherwise it would become the TC's high QC and, under V3, block every
+// case-3 proposal backed by that TC.
+//
+// RED-first: on phase A (3e5317ff) the forged vote is collected, TC(5) forms
+// with three votes and carries the forged QC.
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// Deliver a TimeoutVote for `view` from validator `i` reporting `highest_qc`.
+    fn timeout_vote_with_qc(&mut self, i: usize, view: u64, highest_qc: Option<PhaseCertificate>) {
+        let msg = PacemakerMessage::timeout_vote(
+            &Keypair::new(self.keys[i].clone()),
+            CHAIN,
+            ViewNumber::new(view),
+            None,
+            None,
+            highest_qc,
+        );
+        let origin = self.keys[i].verifying_key();
+        self.pacemaker.on_receive_msg(msg, &origin, &mut self.tree).unwrap();
+    }
+}
+
+/// A Generic QC for `view` over `block` signed by `signers`.
+fn qc_signed_by(f: &Fixture, view: u64, block: u8, signers: std::ops::Range<usize>) -> PhaseCertificate {
+    crate::hotstuff::header_fast_path_regression_test::generic_pc(
+        ViewNumber::new(view),
+        CryptoHash::new([block; 32]),
+        &f.keys[signers],
+        f.vss.committed_validator_set(),
+    )
+}
+
+#[test]
+fn a_timeout_vote_with_a_forged_high_qc_is_not_collected() {
+    for current in [5, 6] {
+        let mut f = fixture(5);
+        if current == 6 {
+            f.enter(6); // the previous-view collector (C3) as well
+        }
+        let honest = qc_signed_by(&f, 3, 7, 0..3);
+        let forged = qc_signed_by(&f, 4, 8, 0..1);
+        f.timeout_vote_with_qc(0, 5, Some(forged));
+        f.timeout_vote_with_qc(1, 5, Some(honest.clone()));
+        f.timeout_vote_with_qc(2, 5, None);
+        assert_eq!(f.highest_tc_view(), None, "at view {current}: the forged vote must not count");
+        f.timeout_vote_with_qc(3, 5, None);
+        let tc = f.tree.highest_tc().unwrap().expect("three honest votes form TC(5)");
+        assert!(tc.high_qc.as_ref() == Some(&honest), "at view {current}: the TC's high QC is the honest one");
+        assert!(tc.is_correct(&f.tree).unwrap(), "at view {current}: the TC is correct");
+    }
+}
+
+/// A correct high QC is collected as before.
+#[test]
+fn a_timeout_vote_with_a_correct_high_qc_is_collected() {
+    let mut f = fixture(5);
+    let honest = qc_signed_by(&f, 3, 7, 0..3);
+    f.timeout_vote_with_qc(0, 5, Some(honest.clone()));
+    f.timeout_vote_with_qc(1, 5, None);
+    f.timeout_vote_with_qc(2, 5, None);
+    let tc = f.tree.highest_tc().unwrap().expect("TC(5)");
+    assert!(tc.high_qc.as_ref() == Some(&honest));
 }
