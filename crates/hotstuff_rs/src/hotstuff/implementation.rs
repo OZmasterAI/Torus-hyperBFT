@@ -755,7 +755,7 @@ impl<N: Network> HotStuff<N> {
                 self.broadcast_proposal_as_header(&proposal, false, block_tree);
                 Event::Propose(ProposeEvent {
                     timestamp: SystemTime::now(),
-                    proposal,
+                    proposal: *proposal,
                 })
                 .publish(&self.event_publisher);
                 Ok(())
@@ -1058,13 +1058,13 @@ impl<N: Network> HotStuff<N> {
             if let Some(ref tip) = tc.high_tip {
                 // Case 4: leader has the block — repropose.
                 if let Some(block) = block_tree.block(&tip.block_hash)? {
-                    return Ok(TcProposal::Repropose(Proposal {
+                    return Ok(TcProposal::Repropose(Box::new(Proposal {
                         chain_id: self.config.chain_id,
                         view: self.view_info.view,
                         block,
                         tc: Some(tc.clone()),
                         nec: None,
-                    }));
+                    })));
                 }
 
                 // Case 5: leader lacks the block — initiate RECOVER (Algorithm 7).
@@ -3859,7 +3859,7 @@ mod body_fetch_rotation_tests {
 /// decided for a TC-based view.
 enum TcProposal {
     /// Case 4: the high tip won and its block is held: re-propose it.
-    Repropose(Proposal),
+    Repropose(Box<Proposal>),
     /// Case 5: the high tip won and its block is missing: RECOVER started;
     /// wait for a ProposalResponse or an NEC (leader rule L4).
     Recovering,
