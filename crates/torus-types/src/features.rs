@@ -173,8 +173,12 @@ impl ActivationSchedule {
     /// [`Self::active_at`]: heights 0 and 1 are block 1, so a feature at 0 or
     /// 1 is already on at height 0.
     pub fn next_activation_after(&self, height: u64) -> Option<u64> {
-        let _ = height;
-        None
+        let height = first_block(height);
+        self.heights
+            .values()
+            .map(|at| first_block(*at))
+            .filter(|at| *at > height)
+            .min()
     }
 
     /// Every scheduled feature and its height, in id order.

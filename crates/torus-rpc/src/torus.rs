@@ -1077,11 +1077,41 @@ pub(crate) fn feature_schedule(
     height: u64,
     upgrade: Option<(u32, u64)>,
 ) -> RpcFeatureSchedule {
-    let _ = (schedule, known, upgrade);
+    let builtin = torus_types::features::builtin_activations(chain_id);
+    let feature_bit = |f: torus_types::Feature| format!("{:#x}", f.bit());
+    let next = schedule.next_activation_after(height);
     RpcFeatureSchedule {
         chain_id: hex_u64(chain_id),
         height: hex_u64(height),
-        ..Default::default()
+        active_bits: format!("{:#x}", schedule.active_at(height)),
+        known_bits: format!("{known:#x}"),
+        known_features: torus_types::Feature::ALL
+            .iter()
+            .filter(|f| known & f.bit() != 0)
+            .map(|&f| RpcKnownFeature {
+                name: f.name().to_string(),
+                id: f.id(),
+                bit: feature_bit(f),
+            })
+            .collect(),
+        schedule: schedule
+            .iter()
+            .filter(|(f, _)| known & f.bit() != 0)
+            .map(|(f, at)| RpcScheduledFeature {
+                name: f.name().to_string(),
+                id: f.id(),
+                bit: feature_bit(f),
+                activation_height: hex_u64(at),
+                active: schedule.active_at(height) & f.bit() != 0,
+                built_in: builtin.iter().any(|(b, _)| *b == f),
+            })
+            .collect(),
+        next_activation_height: next.map(hex_u64),
+        blocks_until_activation: next.map(|n| hex_u64(n - height)),
+        upgrade_required: upgrade.map(|(feature, at)| RpcUpgradeRequired {
+            feature,
+            height: hex_u64(at),
+        }),
     }
 }
 

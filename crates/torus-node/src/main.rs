@@ -770,6 +770,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     for (feature, height) in chain_config.activations.iter() {
         info!(feature = feature.name(), id = feature.id(), height, "feature activation scheduled");
     }
+    // P0.0 phase 6: what this binary can execute (an operator compares it with
+    // the network's schedule before an activation height).
+    info!(
+        known_features = ?torus_types::Feature::ALL
+            .iter()
+            .map(|f| f.name())
+            .collect::<Vec<_>>(),
+        known_bits = %format!("{:#x}", torus_types::KNOWN_FEATURES),
+        "features this binary knows (torus_getFeatureSchedule lists the schedule)"
+    );
     // Every native action this node signs or verifies uses this network's
     // EIP-712 domain (genesis `chain_id`, devnet 7778). Set before any
     // component exists; fails if anything already used another id.
@@ -1340,6 +1350,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     rpc_server.set_latest_height_handle(latest_height_shared);
     rpc_server.set_metrics(metrics.clone());
+    // P0.0 phase 6: torus_getFeatureSchedule lists this node's schedule.
+    rpc_server.set_activation_schedule(chain_config.activations.clone());
     // s80 fix 2: all-markets newTrades is off on validators unless
     // TORUS_ALL_MARKET_TRADES=1 (on for --rpc-only unless =0). Read once here.
     let all_market_trades = torus_rpc::streams::all_market_trades_allowed(

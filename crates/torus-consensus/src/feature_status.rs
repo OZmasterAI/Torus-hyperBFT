@@ -58,8 +58,29 @@ impl FeatureMonitor {
         schedule: &ActivationSchedule,
         known: u128,
     ) -> Self {
-        let _ = (metrics, schedule, known);
-        Self { gauges: None }
+        let Some(m) = metrics else {
+            return Self::default();
+        };
+        for (feature, height) in schedule.iter() {
+            m.feature_activation_height
+                .get_or_create(&feature_labels(feature))
+                .set(i64::try_from(height).unwrap_or(i64::MAX));
+        }
+        let active = known_feature_list(known)
+            .map(|f| {
+                let gauge = m.feature_active.get_or_create(&feature_labels(f)).clone();
+                gauge.set(0);
+                (f.bit(), gauge)
+            })
+            .collect();
+        Self {
+            gauges: Some(Gauges {
+                active,
+                next: m.feature_next_activation_height.clone(),
+                until: m.feature_blocks_until_activation.clone(),
+                schedule: schedule.clone(),
+            }),
+        }
     }
 
     /// After block `header` applied (and at boot with the last applied
@@ -67,7 +88,23 @@ impl FeatureMonitor {
     /// node's schedule), and the next activation of this node's schedule
     /// above its height.
     pub(crate) fn after_block(&self, header: &TorusBlockHeader) {
-        let _ = header;
+        let Some(g) = &self.gauges else {
+            return;
+        };
+        for (bit, gauge) in &g.active {
+            gauge.set(i64::from(header.features & bit != 0));
+        }
+        match g.schedule.next_activation_after(header.height) {
+            Some(next) => {
+                g.next.set(i64::try_from(next).unwrap_or(i64::MAX));
+                g.until
+                    .set(i64::try_from(next - header.height).unwrap_or(i64::MAX));
+            }
+            None => {
+                g.next.set(0);
+                g.until.set(-1);
+            }
+        }
     }
 }
 
@@ -83,7 +120,21 @@ pub(crate) fn report_upgrade_required(
     known: u128,
     height: u64,
 ) {
-    let _ = (metrics, site, features, known, height);
+    let Some(m) = metrics else {
+        return;
+    };
+    let Some(feature) = torus_types::features::first_unknown_feature_in(features, known) else {
+        return;
+    };
+    let height = i64::try_from(height).unwrap_or(i64::MAX);
+    if m.upgrade_required.get() == 0 || height < m.upgrade_required_height.get() {
+        m.upgrade_required_height.set(height);
+        m.upgrade_required_feature.set(i64::from(feature));
+    }
+    m.upgrade_required.set(1);
+    m.upgrade_required_refusals
+        .get_or_create(&vec![("site".to_string(), site.to_string())])
+        .inc();
 }
 
 #[cfg(test)]
