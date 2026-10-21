@@ -50,6 +50,16 @@
 #               reused weighted-full genesis. Unset, empty, classic or 0 = the
 #               field stays absent (absent is Classic, so one Classic chain has
 #               one genesis) and OUT is byte-identical to a run without it.
+#   VALIDATOR_STAKES=a,b,c  per-validator stake WEIGHTS (val0,val1,val2;
+#               positive integers): stake_i = weight_i x the devnet base stake
+#               (devnet/genesis.json, 1e24 wei = 1M TRS), so consensus power and
+#               the state hash attestation weight follow a:b:c. For the
+#               one-validator-down baseline (tools/matched-bench/run-cell.sh
+#               KILL_NO_RESTART): 2,2,1 and kill val2 leaves 4/5 > 2/3 of the
+#               power up; with equal stakes a dead validator halts the chain.
+#               Patches only OUT (the validator set this script writes). Unset or
+#               empty = the base stakes and OUT is byte-identical to a run
+#               without the knob.
 #   BENCH_BIN=  bench-throughput binary (default: cargo-bin resolution, which
 #               honours CARGO_TARGET_DIR, then <repo>/target/release).
 set -euo pipefail
@@ -78,6 +88,11 @@ if [ -n "${BOOK_MODE:-}" ]; then
         3|level_authority_chunked) BOOK_MODE_NAME=level_authority_chunked ;;
         *) echo "FATAL: BOOK_MODE must be classic, order_rows, level_authority, level_authority_chunked or 0-3 (got '$BOOK_MODE')" >&2; exit 1 ;;
     esac
+fi
+
+if [ -n "${VALIDATOR_STAKES:-}" ]; then
+    [[ "$VALIDATOR_STAKES" =~ ^[1-9][0-9]{0,5},[1-9][0-9]{0,5},[1-9][0-9]{0,5}$ ]] \
+        || { echo "FATAL: VALIDATOR_STAKES must be three positive integer weights a,b,c (got '$VALIDATOR_STAKES')" >&2; exit 1; }
 fi
 
 BULK_COUNT="${BULK_COUNT:-100000}"
@@ -128,6 +143,16 @@ VALS=$(jq --slurpfile k "$KEYS" '
           else .value | .address = ($a[0] | ascii_downcase) end]' "$REPO/devnet/genesis.json")
 [ "$(jq '[.[].address | select(test("^0x[0-9a-f]{40}$"))] | unique | length' <<<"$VALS")" = 3 ] \
     || { echo "FATAL: bench-validator-keys.json must give 3 distinct 20-byte addresses" >&2; exit 1; }
+# 2b. Optional stake weights: stake = weight x the base stake, as decimal
+#     strings (a 1 followed by zeros, so the product is the weight followed by
+#     those zeros; jq numbers would lose the 25 digits).
+if [ -n "${VALIDATOR_STAKES:-}" ]; then
+    VALS=$(jq --arg w "$VALIDATOR_STAKES" '($w | split(",")) as $w
+        | [to_entries[] | .key as $i | .value
+            | if (.stake | test("^10+$")) then .stake = ($w[$i] + .stake[1:])
+              else error("devnet/genesis.json validator \($i) stake \(.stake) is not 1 followed by zeros") end]' <<<"$VALS") \
+        || { echo "FATAL: VALIDATOR_STAKES=$VALIDATOR_STAKES: stake patch failed" >&2; exit 1; }
+fi
 
 # 3. Weighted accounts + 3-val consensus set (+ optional market count).
 if [ -n "${MARKETS:-}" ]; then
@@ -208,3 +233,6 @@ jq -r '
     "  accounts   = \(.accounts|length)",
     "  markets    = \(.markets|length)",
     "  perm_stakes= \(.permanent_stakes|length)"' "$OUT"
+if [ -n "${VALIDATOR_STAKES:-}" ]; then
+    echo "  validator_stakes = $(jq -r '[.[].stake] | join(" ")' <<<"$VALS") (VALIDATOR_STAKES=$VALIDATOR_STAKES)"
+fi

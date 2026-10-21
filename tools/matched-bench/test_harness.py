@@ -3915,7 +3915,7 @@ class LiqStressHarnessTest(unittest.TestCase):
                 ('DIG_POS=("%s/p.txt")' % tmp, "7 %s/p.txt" % tmp),
             ):
                 script = (
-                    "set -u\nTOOLS_DIR=%s\nOUT=%s\nRPCS=(u0 u1 u2)\nMARKETS=3\n"
+                    "set -u\nTOOLS_DIR=%s\nOUT=%s\nRPCS=(u0 u1 u2)\nLIVE_IDX=(0 1 2)\nMARKETS=3\n"
                     "DIGEST_PAR=2\nRPC_TIMEOUT=5\n%s\n" % (tmp, tmp, pos)
                     + loop
                     + "\n"
@@ -3931,7 +3931,7 @@ class LiqStressHarnessTest(unittest.TestCase):
     def test_vault_is_read_per_node_only_when_enabled(self):
         on = self.fn("liq_stress_on() {", "\n}\n")
         block = self.fn(
-            "if liq_stress_on; then\n    for i in 0 1 2; do\n        rpc ", "\nfi\n"
+            'if liq_stress_on; then\n    for i in "${LIVE_IDX[@]}"; do\n        rpc ', "\nfi\n"
         )
         self.assertIn("torus_getLiquidatorVault", block)
         # After the digests and their quiescence snapshot.
@@ -3941,7 +3941,8 @@ class LiqStressHarnessTest(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="liq-vault-")
         try:
             script = (
-                'log() { echo "$*" >&2; }\nRPCS=(u0 u1 u2)\nOUT=%s\n'
+                # LIVE_IDX: every node (run-cell's default; KILL_NO_RESTART leaves the survivors)
+                'log() { echo "$*" >&2; }\nRPCS=(u0 u1 u2)\nLIVE_IDX=(0 1 2)\nOUT=%s\n'
                 'rpc() { [ "$1" = u1 ] && return 7; echo \'{"result":{"address":"0x74","deficit":"5.0","openPositions":3}}\'; }\n'
                 % tmp
                 + on

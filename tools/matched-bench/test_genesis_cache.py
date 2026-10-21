@@ -47,6 +47,7 @@ PARAMS = {
     "LIQ_THIN": "0",
     "LIQ_THIN_AVAIL": "1000000.0",
     "BOOK_MODE": "",
+    "VALIDATOR_STAKES": "",
 }
 
 

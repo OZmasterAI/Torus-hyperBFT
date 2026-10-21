@@ -3,8 +3,19 @@
 # from the same data dir. This is the crash gate for `TORUS_EXEC_PIPELINE`.
 #
 #   crash-kill.sh <worktree> <idx 1|2> <out-dir> [record=crash-kill.json]
+#   crash-kill.sh norestart <worktree> <idx 1|2> <out-dir> [kill_at_s]
 #   CRASH_KILL_LIB=1 source crash-kill.sh      # functions only (unit tests)
 #   (multi-crash: run-cell.sh runs this once per kill; kill k>=2 -> crash-kill-<k>.json)
+#
+# `norestart` (run-cell.sh KILL_NO_RESTART=val<idx>, the one-validator-down
+# baseline): the same guard and the same pre-kill snapshot, then SIGKILL and
+# NO restart. The node's line in $RUN_DIR/pids is BLANKED (never left holding
+# a dead pid: stop-3val.sh would kill -9 whatever reused it; xargs and
+# stop-3val.sh's read loops skip a blank line). Prints the marker line
+# "kill-no-restart: SIGKILL val<idx> pid <pid> ..." BEFORE the signal (the
+# campaign driver's watch_nodes accepts exactly that pid's death) and writes
+# <out-dir>/kill-norestart.json (with <out-dir>/run-id.json's run_id), which
+# summarize.py reads.
 #
 # Why: with the flush worker attached, block N's state batch + applied-height
 # marker are written by W while E already runs N+1. The applied-height marker is
@@ -114,6 +125,26 @@ crash_kill_list_ok() {
         prev=$at
     done
     return 0
+}
+
+# crash_norestart_quorum_ok <idx 1|2> <w0,w1,w2> — the two validators that
+# stay up after a no-restart kill of val<idx> still hold a consensus quorum.
+# Weights are VALIDATOR_STAKES (gen-3val-genesis.sh: stake = weight x the
+# devnet base stake, so power = weight x 1e6). hotstuff needs power >=
+# floor(2P/3) + 1 (validator_set.rs quorum), the state hash attestation
+# weight*3 > total*2 (staking.rs): for integers both are live*3 > total*2.
+# With equal stakes (1,1,1) the survivors hold exactly 2/3: the chain HALTS
+# at the kill, so the knob refuses it.
+crash_norestart_quorum_ok() {
+    local idx=${1-} w=${2-} total=0 live=0 i=0 x
+    case "$idx" in 1|2) ;; *) return 1 ;; esac
+    [[ "$w" =~ ^[1-9][0-9]{0,5},[1-9][0-9]{0,5},[1-9][0-9]{0,5}$ ]] || return 1
+    for x in ${w//,/ }; do
+        total=$(( total + x ))
+        [ "$i" = "$idx" ] || live=$(( live + x ))
+        i=$(( i + 1 ))
+    done
+    [ $(( live * 3 )) -gt $(( total * 2 )) ]
 }
 
 # crash_seq_name <stem> <k> <ext> — per-kill artifact names. Kill 1 keeps the
@@ -249,12 +280,21 @@ PY
     exit $?
 fi
 
-[ $# -ge 3 ] || { sed -n '2,7p' "$0" >&2; exit 2; }
+NORESTART=0
+if [ "${1-}" = norestart ]; then NORESTART=1; shift; fi
+[ $# -ge 3 ] || { sed -n '2,8p' "$0" >&2; exit 2; }
 WT=$(cd "$1" && pwd) || exit 2
 IDX=$2
 OUT=$3
-REC=${4:-crash-kill.json}
-SEQ=$(crash_record_seq "$REC") || { echo "crash-kill: bad record name '$REC' (crash-kill.json or crash-kill-<k>.json)" >&2; exit 2; }
+if [ "$NORESTART" = 1 ]; then
+    REC=kill-norestart.json; SEQ=1
+    KILL_AT_S=${4:-}   # empty = unknown (a Python None in the record)
+    case "$KILL_AT_S" in '') KILL_AT_S=None ;; *[!0-9]*) echo "crash-kill: bad kill_at_s '$KILL_AT_S'" >&2; exit 2 ;;
+        *) KILL_AT_S=${KILL_AT_S#"${KILL_AT_S%%[!0]*}"}; KILL_AT_S=${KILL_AT_S:-0} ;; esac
+else
+    REC=${4:-crash-kill.json}
+    SEQ=$(crash_record_seq "$REC") || { echo "crash-kill: bad record name '$REC' (crash-kill.json or crash-kill-<k>.json)" >&2; exit 2; }
+fi
 KILL_WAIT=${KILL_WAIT:-15}
 
 # shellcheck source=/dev/null
@@ -281,12 +321,43 @@ PRE_W=$(snap torus_flush_worker_depth)
 PRE_M=$(snap torus_orders_matched_total)
 LOG_BYTES=$(stat -c%s "$LOG" 2>/dev/null || echo 0)
 
-echo "crash-kill: SIGKILL val$IDX pid=$PID (height=$PRE_H exec_queue=$PRE_Q flush_worker=$PRE_W log_bytes=$LOG_BYTES)"
+if [ "$NORESTART" = 1 ]; then
+    # the marker watch_nodes (campaign driver) reads: exactly this pid may die from here on
+    echo "kill-no-restart: SIGKILL val$IDX pid $PID (no restart; height=$PRE_H committed=$PRE_C exec_queue=$PRE_Q flush_worker=$PRE_W log_bytes=$LOG_BYTES)"
+else
+    echo "crash-kill: SIGKILL val$IDX pid=$PID (height=$PRE_H exec_queue=$PRE_Q flush_worker=$PRE_W log_bytes=$LOG_BYTES)"
+fi
 T_KILL=$(date +%s.%N)
 kill -9 "$PID" 2>/dev/null
 for _ in $(seq 1 "$KILL_WAIT"); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
 if kill -0 "$PID" 2>/dev/null; then
     echo "crash-kill: FATAL pid $PID survived SIGKILL" >&2; exit 1
+fi
+
+if [ "$NORESTART" = 1 ]; then
+    T_DEAD=$(date +%s.%N)
+    crash_replace_pid_line "$PIDSF" "$IDX" "" || {
+        echo "crash-kill: FATAL could not blank val$IDX's line in $PIDSF (stop-3val.sh would kill -9 a reused pid)" >&2; exit 1; }
+    # run_id: run-cell.sh's run-id.json for this cell (None without one);
+    # summarize.py applies the exclusion only when it matches the current run.
+    python3 - "$OUT/$REC" "$OUT/run-id.json" <<PY || exit 1
+import json, sys
+try:
+    with open(sys.argv[2]) as f:
+        run_id = json.load(f).get("run_id")
+except (OSError, ValueError, AttributeError):
+    run_id = None
+json.dump({
+ "enabled": True, "mode": "no_restart", "run_id": run_id,
+ "kill_node": "val$IDX", "kill_idx": $IDX, "kill_at_s": $KILL_AT_S,
+ "killed_pid": $PID, "kill_ts": float("$T_KILL"), "dead_ts": float("$T_DEAD"),
+ "pre_kill": {"block_height": $PRE_H, "blocks_committed": $PRE_C,
+              "exec_queue_depth": $PRE_Q, "flush_worker_depth": $PRE_W,
+              "matched": $PRE_M, "log_bytes": $LOG_BYTES},
+}, open(sys.argv[1], "w"), indent=1)
+PY
+    echo "kill-no-restart: val$IDX pid $PID dead (not restarted; its pids line blanked) -> $OUT/$REC"
+    exit 0
 fi
 
 # Same argv as the launch, same data dir, log APPENDED so the pre-crash lines

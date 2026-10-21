@@ -12,7 +12,9 @@ script provisions the keys and proves, while the nodes still run, that every nod
       Writes DIR/val<i>.key (the hex private key of validator index i, mode 0600, DIR 0700): what start-node.sh
       passes as --state-hash-attest-key. Prints "val0=0x.. val1=0x.. val2=0x.." (the addresses).
   state_attest.py scan --rpc URL --rpc URL --rpc URL [--metrics URL x3] [--log FILE x3] --keys FILE
-                       [--wait-s S] --out FILE
+                       [--wait-s S] [--exclude valN] --out FILE
+      (--exclude: run-cell KILL_NO_RESTART, a validator killed without restart; everything below runs over the
+      other nodes and that validator's votes are counted but not required)
       1. the newest retained checkpoint T of every node (torus_getStateHash, no height); T = their minimum;
       2. waits up to S s (default 90) until every node reports a quorumHash for T (the last votes land a few blocks
          after T is durable);
@@ -369,8 +371,9 @@ def advance_of(t, latest_after):
     return max(0, (max(latest_after) - t) // INTERVAL)
 
 
-def judge_rows(out, rows, names, addr_of):
-    """fills out's per-height fields and appends the per-height problems"""
+def judge_rows(out, rows, names, addr_of, excluded=()):
+    """fills out's per-height fields and appends the per-height problems. excluded: validators killed without
+    restart (run-cell KILL_NO_RESTART): their votes stop at the kill, so they are counted, never required"""
     problems = out["problems"]
     common = [r for r in rows if not any("error" in p for p in r["per_node"])]
     out["partial_heights"] = [r["height"] for r in rows if r not in common]
@@ -432,7 +435,7 @@ def judge_rows(out, rows, names, addr_of):
     if table and out["quorum_reached"] == 0:
         problems.append("no compared checkpoint reached an on-chain quorum (are the nodes attesting?)")
     for name, c in out["votes_per_validator"].items():
-        if c < out["quorum_reached"]:
+        if c < out["quorum_reached"] and name not in excluded:
             problems.append("%s voted on %d of the %d quorum checkpoints" % (name, c, out["quorum_reached"]))
     if unknown:
         problems.append("votes from addresses outside the key file: %s" % " ".join(sorted(unknown)))
@@ -469,8 +472,16 @@ def judge_log(name, path, want, problems):
     return lf
 
 
-def scan(rpcs, keys, metrics_urls, logs, wait_s, sleep=2.0, activation=None):
-    names = ["val%d" % i for i in range(len(rpcs))]
+def scan(rpcs, keys, metrics_urls, logs, wait_s, sleep=2.0, activation=None, excluded=()):
+    """excluded: validator names (val<i>) killed without restart (run-cell KILL_NO_RESTART): their RPC, metrics and
+    log are not read and their votes are not required; every check runs over the others (with stakes 2/2/1 and
+    val2 down the survivors still form the > 2/3 quorum). rpcs / metrics_urls / logs stay positional (index =
+    validator); empty excluded = every node, the earlier scan"""
+    keep = [i for i in range(len(rpcs)) if "val%d" % i not in excluded]
+    names = ["val%d" % i for i in keep]
+    rpcs = [rpcs[i] for i in keep]
+    metrics_urls = [metrics_urls[i] for i in keep] if metrics_urls else metrics_urls
+    logs = [logs[i] for i in keep] if logs else logs
     addr_of = {a: "val%d" % i for i, a, _ in keys}
     out = {
         "nodes": names,
@@ -479,6 +490,8 @@ def scan(rpcs, keys, metrics_urls, logs, wait_s, sleep=2.0, activation=None):
         "activation": activation,
         "problems": [],
     }
+    if excluded:
+        out["excluded_nodes"] = sorted(excluded)
     problems = out["problems"]
     latest = []
     for name, rpc in zip(names, rpcs):
@@ -501,7 +514,7 @@ def scan(rpcs, keys, metrics_urls, logs, wait_s, sleep=2.0, activation=None):
             after.append(None if err is not None else r["height"])
         out["latest_after_walk"] = after
         out["advanced_during_scan"] = advance_of(t, after)
-    judge_rows(out, rows, names, addr_of)
+    judge_rows(out, rows, names, addr_of, excluded)
     out["per_node"] = {}
     for i, name in enumerate(names):
         nd = judge_metrics(name, metrics_urls[i], problems) if i < len(metrics_urls or []) else {}
@@ -593,8 +606,9 @@ def compact(full):
         "advanced_during_scan",
         "min_compared",
         "partial_heights",
+        "excluded_nodes",
     )
-    c = {k: full.get(k) for k in keep}
+    c = {k: full.get(k) for k in keep if k != "excluded_nodes" or k in full}
     c["per_node"] = {}
     for n, d in (full.get("per_node") or {}).items():
         lf = d.get("log") or {}
@@ -668,6 +682,14 @@ def main(argv=None):
     s.add_argument("--wait-s", type=float, default=90)
     s.add_argument("--activation", type=int, default=None, help="STATE_HASH_ACTIVATION height (sets the minimum compared window)")
     s.add_argument("--out", required=True)
+    s.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        choices=("val1", "val2"),
+        help="run-cell KILL_NO_RESTART: a validator killed without restart (its --rpc/--metrics/--log are not read, "
+        "its votes not required)",
+    )
     m = sub.add_parser("summary")
     m.add_argument("--dir", required=True)
     a = p.parse_args(argv)
@@ -696,7 +718,15 @@ def main(argv=None):
                 file=sys.stderr,
             )
             return 2
-        out = scan([Rpc(u) for u in a.rpc], keys, a.metrics, a.log, a.wait_s, activation=a.activation)
+        out = scan(
+            [Rpc(u) for u in a.rpc],
+            keys,
+            a.metrics,
+            a.log,
+            a.wait_s,
+            activation=a.activation,
+            excluded=tuple(sorted(set(a.exclude))),
+        )
         with open(a.out, "w") as f:
             json.dump(out, f, indent=1)
         print(line_of(out))

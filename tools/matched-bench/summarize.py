@@ -54,6 +54,77 @@ def genesis_book_mode_digit(v):
 
 GENESIS_BOOK_MODE = genesis_book_mode_digit(A.genesis_book_mode)
 
+# ---------------------------------------------------------------- no-restart kill
+# run-cell.sh KILL_NO_RESTART=val<i> (the one-validator-down baseline):
+# crash-kill.sh norestart SIGKILLed one validator KILL_NO_RESTART_AT_S into the
+# load and never restarted it, and left kill-norestart.json here. That node is
+# not a participant after its kill: its scrapes fail (sampler rows of zeros,
+# scrape_valid=0, dropped below), it has no metrics-after scrape, no digest and
+# no agreement row. Agreement, liveness and the drain are judged over the
+# survivors, and the dead node is recorded as EXCLUDED, never as a
+# disagreement. Absent file (every other cell): None, nothing below changes.
+#
+# The record must belong to THIS run (an OVERWRITE=1 rerun reuses the dir: a
+# stale record would exclude a LIVE validator and let its divergent digest
+# PASS). run-cell.sh writes run-id.json at cell start ({label, run_id,
+# kill_no_restart}) after removing every per-run kill artifact; crash-kill.sh
+# norestart copies run_id into the record. The exclusion is applied only when
+# the record's run_id and kill_node match run-id.json. A record in a run that
+# did not set KILL_NO_RESTART is IGNORED (warned, never excluded); a record
+# that cannot be matched (no run-id.json, another run_id, another node) is not
+# applied and REJECTs the cell (stale kill record).
+def read_run_identity(path):
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return raw if isinstance(raw, dict) and raw.get("run_id") else None
+
+
+def norestart_record(path, run):
+    """-> (record to apply or None, check or None). check (a record exists but
+    is not applied): {"action": "ignored"|"rejected", "reason", "record_run_id",
+    "run_id", "record_kill_node"}."""
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return None, None
+    if not isinstance(raw, dict) or not raw.get("enabled"):
+        return None, None
+    node = raw.get("kill_node")
+    if node not in ("val1", "val2"):
+        sys.exit("summarize.py: %s names kill_node %r (val1 or val2)" % (path, node))
+    rec_id = raw.get("run_id")
+    cur_id = run.get("run_id") if run else None
+    check = {"record_run_id": rec_id, "run_id": cur_id, "record_kill_node": node}
+    if run is None:
+        check.update(action="rejected", reason=(
+            "stale kill record: kill-norestart.json (kill_node %s, run_id %r) has no run-id.json "
+            "beside it to match this run; its exclusion of %s is not applied" % (node, rec_id, node)))
+        return None, check
+    knob = run.get("kill_no_restart") or None
+    if knob is None:
+        check.update(action="ignored", reason=(
+            "kill-norestart.json (kill_node %s, run_id %r) ignored: this run (run_id %r) did not set "
+            "KILL_NO_RESTART; all three validators are judged" % (node, rec_id, cur_id)))
+        return None, check
+    if rec_id != cur_id or node != knob:
+        check.update(action="rejected", reason=(
+            "stale kill record: kill-norestart.json (kill_node %s, run_id %r) does not match this run "
+            "(KILL_NO_RESTART=%s, run_id %r); its exclusion is not applied" % (node, rec_id, knob, cur_id)))
+        return None, check
+    return raw, None
+
+
+RUN_IDENTITY = read_run_identity(os.path.join(OUT, "run-id.json"))
+NORESTART, NORESTART_CHECK = norestart_record(os.path.join(OUT, "kill-norestart.json"), RUN_IDENTITY)
+if NORESTART_CHECK:
+    sys.stderr.write("WARNING summarize.py: %s\n" % NORESTART_CHECK["reason"])
+DEAD_NODE = NORESTART["kill_node"] if NORESTART else None
+LIVE_NODES = tuple(n for n in ("val0", "val1", "val2") if n != DEAD_NODE)
+
 # ---------------------------------------------------------------- load sampler
 rows = {"val0": [], "val1": [], "val2": []}
 with open(os.path.join(OUT, "sampler.csv")) as f:
@@ -62,6 +133,10 @@ with open(os.path.join(OUT, "sampler.csv")) as f:
         try:
             r = {k: (float(v) if k not in ("node",) else v) for k, v in r.items()}
         except (TypeError, ValueError):
+            continue
+        # the killed node's failed scrapes (all zeros) would read as a counter
+        # reset to 0 in every rate below
+        if r["node"] == DEAD_NODE and r.get("scrape_valid", 1.0) == 0:
             continue
         rows[r["node"]].append(r)
 
@@ -979,8 +1054,15 @@ try:
                 agree_rows.append(json.loads(line))
 except (OSError, ValueError) as e:
     agree_rows = []
+if DEAD_NODE:
+    # run-cell.sh writes survivors' rows only; a dead node's row would be ERR
+    agree_rows = [r for r in agree_rows if r.get("node") != DEAD_NODE]
 agreement = {"nodes": agree_rows}
-if len(agree_rows) == 3:
+if DEAD_NODE:
+    agreement["excluded_nodes"] = [DEAD_NODE]
+    agreement["excluded_reason"] = ("killed without restart at bench+%ss (kill-norestart.json): "
+                                    "agreement compares the survivors only" % NORESTART.get("kill_at_s"))
+if len(agree_rows) == len(LIVE_NODES):
     hs = [r["height"] for r in agree_rows]
     agreement["height_spread"] = max(hs) - min(hs)
     agreement["block_hash_equal"] = len({r["block_hash"] for r in agree_rows}) == 1 and agree_rows[0]["block_hash"] != "ERR"
@@ -1437,13 +1519,127 @@ except OSError:
     pass
 
 v0 = funnel.get("val0", {})
-liveness = assess_liveness(rows, t0, td, DEFAULT_STALL_S)
+
+
+# ---------------------------------------------------------------- no-restart kill: before / after
+# Per survivor (and the dead node before its kill), the load window split at
+# the kill: blocks/s, matched/s, consensus timeout views per minute
+# (sampler.csv torus_consensus_timeout_total_total: the 1 Hz node counter of
+# views that ended in a timeout), views per minute (torus_consensus_view) and
+# the order-age p50/p90/p99 (torus_order_age_<stage>_seconds buckets). Per-minute
+# series: sampler.csv, column torus_consensus_timeout_total_total, per node.
+#
+# ONE shared boundary per node: the last sample at or before kill_ts ends
+# 'before' AND starts 'after' (sampler.csv for the counters, the node's own
+# buckets.csv scrape for the order-age histograms). Picking each window's
+# samples independently dropped the increment between the last pre-kill and
+# the first post-kill scrape, i.e. exactly the kill's first timeouts and
+# latency; that increment belongs to 'after'. Each window reports the span it
+# actually sampled (first/last ts, seconds, sample count); a window with < 2
+# samples reports None and a reason, never 0.
+NORESTART_RATES = (("blk_s", "block_height", 1, 3), ("committed_blk_s", "blocks_committed_total", 1, 3),
+                   ("matched_s", "orders_matched_total", 1, 1),
+                   ("timeouts_per_min", "consensus_timeout_total_total", 60, 2),
+                   ("views_per_min", "consensus_view", 60, 1))
+
+
+def sampled_span(tss):
+    """first/last ts, seconds and count of the samples a window actually used."""
+    if not tss:
+        return {"samples": 0, "first_ts": None, "last_ts": None, "span_s": None}
+    return {"samples": len(tss), "first_ts": tss[0], "last_ts": tss[-1],
+            "span_s": round(tss[-1] - tss[0], 3)}
+
+
+def split_at_kill(tss, kill_ts):
+    """sorted sample ts -> {"before": [...], "after": [...]}: the boundary (last
+    ts in [t0, kill_ts]) is the last of 'before' and the first of 'after'.
+    No boundary => 'after' is empty (its baseline is unknown)."""
+    pre = [t for t in tss if t0 <= t <= kill_ts]
+    post = [t for t in tss if kill_ts < t <= t1]
+    return {"before": pre, "after": (pre[-1:] + post) if pre else []}
+
+
+def short_reason(tss, what):
+    if not tss:
+        return "no %s sample at or before the kill inside the load window (no shared boundary)" % what
+    return "%d %s sample(s) in the window: a delta needs >= 2" % (len(tss), what)
+
+
+def norestart_windows(raw):
+    kill_ts = raw.get("kill_ts")
+    if not isinstance(kill_ts, (int, float)):
+        return {"error": "kill-norestart.json has no kill_ts"}
+    per_node = {}
+    for node in ("val0", "val1", "val2"):
+        rs = sorted(rows.get(node) or [], key=lambda r: r["ts"])
+        if not rs:
+            continue
+        by_ts = {r["ts"]: r for r in rs}
+        split = split_at_kill(sorted(by_ts), kill_ts)
+        nb = [b for b in BROWS if b[1] == node]
+        bsplit = split_at_kill(sorted({b[0] for b in nb}), kill_ts)
+        d = {}
+        for wname in ("before", "after"):
+            if node == DEAD_NODE and wname == "after":
+                continue
+            tss = split[wname]
+            sp = sampled_span(tss)
+            w = {"sampled": sp, "span_s": sp["span_s"]}
+            if len(tss) < 2 or not sp["span_s"]:
+                w.update({k: None for k, _, _, _ in NORESTART_RATES})
+                w["reason"] = short_reason(tss, "sampler.csv") if len(tss) < 2 else \
+                    "the window's samples span 0 s"
+            else:
+                a, b = by_ts[tss[0]], by_ts[tss[-1]]
+                for k, col, scale, nd in NORESTART_RATES:
+                    w[k] = round((m(b, col) - m(a, col)) / (b["ts"] - a["ts"]) * scale, nd)
+            bts = bsplit[wname]
+            w["order_age_sampled"] = sampled_span(bts)
+            if len(bts) < 2:
+                w["order_age_ms"] = None
+                w["order_age_reason"] = short_reason(bts, "buckets.csv")
+            else:
+                w["order_age_ms"] = order_age(bucket_deltas(nb, bts[0], bts[-1]), node)
+            d[wname] = w
+        per_node[node] = d
+    return {"windows": {"before": [t0, kill_ts], "after": [kill_ts, t1]},
+            "boundary": "shared: the last sample at or before kill_ts ends 'before' and starts 'after' "
+                        "(per node; sampler.csv and buckets.csv each)",
+            "per_node": per_node}
+
+
+kill_no_restart = None
+if NORESTART:
+    pre = NORESTART.get("pre_kill") or {}
+    kill_no_restart = {
+        "killed_node": DEAD_NODE,
+        "kill_idx": NORESTART.get("kill_idx"),
+        "kill_at_s": NORESTART.get("kill_at_s"),
+        "kill_ts": NORESTART.get("kill_ts"),
+        "dead_ts": NORESTART.get("dead_ts"),
+        "killed_pid": NORESTART.get("killed_pid"),
+        "height_at_kill": pre.get("block_height"),
+        "committed_at_kill": pre.get("blocks_committed"),
+        "pre_kill": pre,
+        "survivors": list(LIVE_NODES),
+        "timeouts_column": "sampler.csv torus_consensus_timeout_total_total (per node, 1 Hz counter)",
+    }
+    kill_no_restart.update(norestart_windows(NORESTART))
+if DEAD_NODE:
+    liveness = assess_liveness(rows, t0, td, DEFAULT_STALL_S, nodes=LIVE_NODES)
+    liveness["excluded_nodes"] = [DEAD_NODE]
+else:
+    liveness = assess_liveness(rows, t0, td, DEFAULT_STALL_S)
 # Keep the runner's historical observation for audit, but a known stall cannot
 # count as a successfully drained performance cell. Agreement stays independent.
 drained = A.drained == "1" and liveness['verdict'] != 'FAIL'
 validity = acceptance(liveness, drained, int(A.bench_rc or -1),
                       agreement.get('agreement_verdict'),
                       dissem.get('dissemination_clean'), crash)
+if NORESTART_CHECK and NORESTART_CHECK["action"] == "rejected":
+    validity["fail_reasons"].append(NORESTART_CHECK["reason"])
+    validity["verdict"], validity["accepted"] = "REJECT", False
 summary = {
     "status": "OK" if validity['accepted'] else "INVALID" if validity['verdict'] == 'REJECT' else "UNVERIFIED",
     "label": A.label, "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -1539,6 +1735,13 @@ summary = {
 }
 if crash_kills:
     summary["crash_kills"] = crash_kills
+if kill_no_restart:
+    summary["kill_no_restart"] = kill_no_restart
+    summary["headline"]["killed_node"] = DEAD_NODE
+    summary["headline"]["kill_at_s"] = kill_no_restart["kill_at_s"]
+    summary["headline"]["height_at_kill"] = kill_no_restart["height_at_kill"]
+if NORESTART_CHECK:
+    summary["kill_record_check"] = NORESTART_CHECK
 with open(os.path.join(OUT, "summary.json"), "w") as f:
     json.dump(summary, f, indent=1)
 h = summary["headline"]
@@ -1552,6 +1755,15 @@ print(f"SUMMARY {A.label}: matched/s avg={h['matched_s_avg']} first120={h['match
       f"drained={summary['timing']['drained']} bench_rc={A.bench_rc}")
 print(f"VALIDITY {A.label}: {validity['verdict']} liveness={liveness['verdict']} "
       f"reasons={validity['fail_reasons'] + validity['unverified_reasons']}")
+if kill_no_restart:
+    _pn = kill_no_restart.get("per_node") or {}
+    print(f"KILL-NO-RESTART {DEAD_NODE}: at bench+{kill_no_restart['kill_at_s']}s height={kill_no_restart['height_at_kill']} "
+          f"survivors={kill_no_restart['survivors']} "
+          + " ".join("%s timeouts/min %s->%s blk/s %s->%s" % (
+              n, (_pn.get(n, {}).get("before") or {}).get("timeouts_per_min"),
+              (_pn.get(n, {}).get("after") or {}).get("timeouts_per_min"),
+              (_pn.get(n, {}).get("before") or {}).get("blk_s"),
+              (_pn.get(n, {}).get("after") or {}).get("blk_s")) for n in kill_no_restart["survivors"]))
 if crash:
     print(f"CRASH val{crash.get('kill_idx')}: verdict={crash['verdict']} "
           f"kill_at={crash.get('kill_at_s')}s down={crash.get('down_s')}s "

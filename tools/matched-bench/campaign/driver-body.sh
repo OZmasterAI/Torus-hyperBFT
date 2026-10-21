@@ -240,6 +240,10 @@ watch_nodes() { # from ozarchy-acc-campaign.sh; restart cells: val1 may be dead 
                     i=$((i+1)); continue
                 fi
             fi
+            # run-cell.sh KILL_NO_RESTART: this exact pid's death is expected once crash-kill.sh norestart logged its marker
+            if ! kill -0 "$p" 2>/dev/null && grep -qF "kill-no-restart: SIGKILL val$i pid $p " "$o/run.log" 2>/dev/null; then
+                i=$((i+1)); continue
+            fi
             if ! kill -0 "$p" 2>/dev/null; then
                 now=$(date '+%F %T.%3N')
                 grep -q '^stopping pid ' "$o/run.log" && { stopwin "$o" "$hp" "$f"; return 0; }
