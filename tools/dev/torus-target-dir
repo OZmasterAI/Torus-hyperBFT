@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# torus-target-dir: print the CARGO_TARGET_DIR a branch should build in, so all
+# branches of one line of work share one cargo target dir (20-35 GB each on 18c).
+#
+# Usage:
+#   export CARGO_TARGET_DIR=$(tools/dev/torus-target-dir)          # current branch
+#   tools/dev/torus-target-dir feat/p00-phase3                     # explicit branch
+#
+# Install on PATH (optional):
+#   ln -s /home/18c/projects/Torus-hyperBFT/tools/dev/torus-target-dir ~/bin/torus-target-dir
+#
+# Mapping: first matching glob in TARGET_MAP wins; otherwise the first path segment
+# after the prefix (feat/foo-bar/x -> foo-bar), sanitised to [a-z0-9._-].
+# main/master and detached HEAD print the default dir ($HOME/.cargo-target).
+# All dirs live under $HOME, so tests can point HOME at a temp dir.
+# The file can be sourced (defines torus_target_dir_for) without running main.
+
+# glob                     dir suffix ($HOME/.cargo-target-<suffix>)
+TARGET_MAP=(
+  'feat/p00-*              p00'
+  'feat/tc-required-*      tc'
+  'fix/tc-*                tc'
+  'perf/h2h-*              h2h'
+  'feat/delist-*           delist'
+  'fix/delist-*            delist'
+)
+
+torus_target_dir_for() {
+  local branch="${1#refs/heads/}" entry glob suffix
+  if [[ -z "$branch" || "$branch" == "HEAD" || "$branch" == "main" || "$branch" == "master" ]]; then
+    printf '%s/.cargo-target\n' "$HOME"
+    return 0
+  fi
+  for entry in "${TARGET_MAP[@]}"; do
+    read -r glob suffix <<<"$entry"
+    # shellcheck disable=SC2053  # glob match is intended
+    if [[ "$branch" == $glob ]]; then
+      printf '%s/.cargo-target-%s\n' "$HOME" "$suffix"
+      return 0
+    fi
+  done
+  if [[ "$branch" == */* ]]; then
+    suffix="${branch#*/}"
+    suffix="${suffix%%/*}"
+  else
+    suffix="$branch"
+  fi
+  suffix="$(printf '%s' "$suffix" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-' | tr -s '-')"
+  suffix="${suffix##[-.]}"
+  suffix="${suffix%%-}"
+  [[ -z "$suffix" || "$suffix" == "." || "$suffix" == ".." ]] && suffix="misc"
+  printf '%s/.cargo-target-%s\n' "$HOME" "$suffix"
+}
+
+torus_target_dir_main() {
+  local branch="${1:-}"
+  case "$branch" in
+    -h|--help) sed -n '2,17p' "${BASH_SOURCE[0]}"; return 0 ;;
+  esac
+  if [[ -z "$branch" ]]; then
+    branch="$(git symbolic-ref -q --short HEAD 2>/dev/null || echo HEAD)"
+  fi
+  torus_target_dir_for "$branch"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  set -uo pipefail
+  torus_target_dir_main "$@"
+fi
