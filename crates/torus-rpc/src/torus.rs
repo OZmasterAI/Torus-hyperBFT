@@ -160,6 +160,12 @@ pub trait TorusApi {
     #[method(name = "getEpoch")]
     async fn get_epoch(&self) -> RpcResult<RpcEpochInfo>;
 
+    /// P0.0 phase 6: this node's feature activation schedule (name, bit,
+    /// height, active at the latest block), the features this binary knows,
+    /// the next activation and whether this node met an `UPGRADE REQUIRED`.
+    #[method(name = "getFeatureSchedule")]
+    async fn get_feature_schedule(&self) -> RpcResult<RpcFeatureSchedule>;
+
     #[method(name = "getDelegations")]
     async fn get_delegations(&self, delegator: String) -> RpcResult<Vec<RpcDelegation>>;
 
@@ -400,15 +406,38 @@ pub(crate) fn validate_known_markets<S: StateBackend>(
         }
     };
     let check = |mid: u64| spec(mid).map(|_| ());
+    // Delist follow-up (node-local early answer): a non-reduce-only order on
+    // a governance-delisted market (`market_delisted_key` row) gets the
+    // executor's rejection text; the executor still decides in consensus.
+    let delisted = |mid: u64| -> Result<bool, String> {
+        state_db
+            .get_cf_raw(CF_NATIVE_MARKETS, &torus_types::market_delisted_key(mid))
+            .map(|row| row.is_some())
+            .map_err(|e| format!("market lookup failed: {e}"))
+    };
+    let reduce_only_rule = |p: &torus_types::PlaceOrderParams, is_delisted: bool| {
+        if is_delisted && !p.reduce_only {
+            Err(torus_types::market_delisted_reason(p.market_id))
+        } else {
+            Ok(())
+        }
+    };
     match action {
-        torus_types::NativeAction::PlaceOrder(p) => check_tick_lot(p, spec(p.market_id)?),
+        torus_types::NativeAction::PlaceOrder(p) => {
+            let s = spec(p.market_id)?;
+            reduce_only_rule(p, delisted(p.market_id)?)?;
+            check_tick_lot(p, s)
+        }
         torus_types::NativeAction::PlaceOrderBatch(orders) => {
             let mut specs = std::collections::BTreeMap::new();
             for p in orders {
-                let s = match specs.entry(p.market_id) {
+                let (s, d) = match specs.entry(p.market_id) {
                     std::collections::btree_map::Entry::Occupied(e) => *e.get(),
-                    std::collections::btree_map::Entry::Vacant(e) => *e.insert(spec(p.market_id)?),
+                    std::collections::btree_map::Entry::Vacant(e) => {
+                        *e.insert((spec(p.market_id)?, delisted(p.market_id)?))
+                    }
                 };
+                reduce_only_rule(p, d)?;
                 check_tick_lot(p, s)?;
             }
             Ok(())
@@ -438,6 +467,63 @@ pub(crate) fn validate_known_markets<S: StateBackend>(
         }
         _ => Ok(()),
     }
+}
+
+/// Delist follow-up (node-local read, `torus_getMarkets`): fills `info`'s
+/// delist fields from market `mid`'s governance rows: the delisted flag
+/// (`market_delisted_key`, value = delist height), the settlement row
+/// (`CF_NATIVE_LIQUIDATION 0x08`: `close_at`, the fixed price), the kept
+/// settlement record once the walk ended (`0x0A`: `close_at` and the close
+/// price stay after the 0x08 row is gone, owner s134), a pending
+/// governance close price (`0x09`) and the oracle-closed marker
+/// (`market_oracle_closed_key`, value = completion height). Point reads, not
+/// charged to the scan budget. `latest`: the node's committed height; a row
+/// without a price is in its grace period while `close_at > latest` (the
+/// settlement step first works on the market AT `close_at`).
+fn fill_delist_view<S: StateBackend>(
+    state: &S,
+    mid: u64,
+    latest: u64,
+    info: &mut RpcMarketInfo,
+) -> Result<(), RpcError> {
+    use torus_core::liquidation as liq;
+    let internal = |what: &str, e: String| RpcError::Internal(format!("{what} of market {mid}: {e}"));
+    let be8 = |v: &[u8]| v.get(..8).and_then(|b| b.try_into().ok()).map(u64::from_be_bytes);
+    let Some(flag) = state
+        .get_cf_raw(CF_NATIVE_MARKETS, &torus_types::market_delisted_key(mid))
+        .map_err(|e| internal("delist flag", e.to_string()))?
+    else {
+        return Ok(());
+    };
+    info.status = "delisted".to_string();
+    info.delisted = true;
+    info.delist_height = be8(&flag).map(hex_u64);
+    let row = liq::delist_settlement(state, mid).map_err(|e| internal("settlement row", e.to_string()))?;
+    let closed = state
+        .get_cf_raw(CF_NATIVE_MARKETS, &torus_types::market_oracle_closed_key(mid))
+        .map_err(|e| internal("oracle-closed marker", e.to_string()))?;
+    info.settlement = match (&row, &closed) {
+        (Some(r), _) if r.price.is_none() && r.close_at > latest => "grace",
+        (None, Some(_)) => "settled",
+        // From close_at (waiting for a price or walking), or the walk done
+        // and the ADL obligations still draining.
+        _ => "settling",
+    }
+    .to_string();
+    if let Some(r) = row {
+        info.close_at = Some(hex_u64(r.close_at));
+        info.close_price = r.price.map(dec_fp);
+    } else if let Some(k) =
+        liq::delist_settled(state, mid).map_err(|e| internal("kept settlement record", e.to_string()))?
+    {
+        info.close_at = Some(hex_u64(k.close_at));
+        info.close_price = Some(dec_fp(k.price));
+    }
+    info.governance_close_price = liq::delist_close_price(state, mid)
+        .map_err(|e| internal("governance close price", e.to_string()))?
+        .map(dec_fp);
+    info.settled_height = closed.as_deref().and_then(be8).map(hex_u64);
+    Ok(())
 }
 
 /// s94 option 2 at intake (node-local, non-consensus): the executor's price
@@ -1060,6 +1146,55 @@ fn book_read_err(e: torus_core::error::CoreError) -> ErrorObjectOwned {
 /// hold, so a user at the cap still sees every resting order.
 const OPEN_ORDERS_LIMIT: usize = OPEN_ORDER_MAX_LIMIT as usize;
 
+/// P0.0 phase 6: the `torus_getFeatureSchedule` reply for `schedule` (this
+/// node's), the features `known` (the node passes `KNOWN_FEATURES`), at the
+/// latest served `height`, with the node's `UPGRADE REQUIRED` state
+/// (`(feature id, height)`).
+pub(crate) fn feature_schedule(
+    schedule: &torus_types::ActivationSchedule,
+    known: u128,
+    chain_id: u64,
+    height: u64,
+    upgrade: Option<(u32, u64)>,
+) -> RpcFeatureSchedule {
+    let builtin = torus_types::features::builtin_activations(chain_id);
+    let feature_bit = |f: torus_types::Feature| format!("{:#x}", f.bit());
+    let next = schedule.next_activation_after(height);
+    RpcFeatureSchedule {
+        chain_id: hex_u64(chain_id),
+        height: hex_u64(height),
+        active_bits: format!("{:#x}", schedule.active_at(height)),
+        known_bits: format!("{known:#x}"),
+        known_features: torus_types::Feature::ALL
+            .iter()
+            .filter(|f| known & f.bit() != 0)
+            .map(|&f| RpcKnownFeature {
+                name: f.name().to_string(),
+                id: f.id(),
+                bit: feature_bit(f),
+            })
+            .collect(),
+        schedule: schedule
+            .iter()
+            .filter(|(f, _)| known & f.bit() != 0)
+            .map(|(f, at)| RpcScheduledFeature {
+                name: f.name().to_string(),
+                id: f.id(),
+                bit: feature_bit(f),
+                activation_height: hex_u64(at),
+                active: schedule.active_at(height) & f.bit() != 0,
+                built_in: builtin.iter().any(|(b, _)| *b == f),
+            })
+            .collect(),
+        next_activation_height: next.map(hex_u64),
+        blocks_until_activation: next.map(|n| hex_u64(n - height)),
+        upgrade_required: upgrade.map(|(feature, at)| RpcUpgradeRequired {
+            feature,
+            height: hex_u64(at),
+        }),
+    }
+}
+
 #[async_trait]
 impl TorusApiServer for RpcState {
     // === 2.9.1: Trading reads ===
@@ -1327,6 +1462,7 @@ impl TorusApiServer for RpcState {
         };
         let mut markets = Vec::new();
         let mut scanned = 0usize;
+        let latest = self.latest_height.load(Relaxed);
         // R24: every market row visited, the ones before `offset` included,
         // is charged to the scan budget (`after` seeks past them instead).
         let mut budget = self.scan_budget();
@@ -1353,14 +1489,23 @@ impl TorusApiServer for RpcState {
                 .map_err(|e| RpcError::Internal(format!("borsh decode market: {e}")))
                 .map_err(ErrorObjectOwned::from)?;
 
-            markets.push(RpcMarketInfo {
+            let mut info = RpcMarketInfo {
                 market_id: hex_u64(mid),
                 base_asset: market.base_asset,
                 quote_asset: market.quote_asset,
                 lot_size: dec_fp(FixedPoint::from_raw(market.lot_size_raw)),
                 tick_size: dec_fp(FixedPoint::from_raw(market.tick_size_raw)),
                 status: "active".to_string(),
-            });
+                delisted: false,
+                delist_height: None,
+                close_at: None,
+                settlement: "none".to_string(),
+                close_price: None,
+                governance_close_price: None,
+                settled_height: None,
+            };
+            fill_delist_view(&self.state, mid, latest, &mut info).map_err(ErrorObjectOwned::from)?;
+            markets.push(info);
 
             if markets.len() >= limit {
                 break;
@@ -1561,6 +1706,24 @@ impl TorusApiServer for RpcState {
             .collect();
 
         Ok(result)
+    }
+
+    async fn get_feature_schedule(&self) -> RpcResult<RpcFeatureSchedule> {
+        let upgrade = self.metrics.as_deref().and_then(|m| {
+            (m.upgrade_required.get() != 0).then(|| {
+                (
+                    u32::try_from(m.upgrade_required_feature.get()).unwrap_or(0),
+                    u64::try_from(m.upgrade_required_height.get()).unwrap_or(0),
+                )
+            })
+        });
+        Ok(feature_schedule(
+            &self.activations,
+            torus_types::KNOWN_FEATURES,
+            self.chain_id,
+            self.latest_height.load(Ordering::Relaxed),
+            upgrade,
+        ))
     }
 
     async fn get_epoch(&self) -> RpcResult<RpcEpochInfo> {
@@ -3185,6 +3348,97 @@ mod tick_lot_ingress_tests {
     }
 }
 
+/// Delist follow-up (node-local, no consensus change): ingress refuses an
+/// order that is not reduce-only on a governance-delisted market (its
+/// `market_delisted_key` row exists) with the executor's text
+/// (`FailureReason::MarketDelisted`), so the client learns it at submit time
+/// instead of from a rejected receipt. Reduce-only orders pass; the executor
+/// still decides in consensus.
+#[cfg(test)]
+mod delist_ingress_tests {
+    use super::*;
+    use torus_types::{MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
+
+    const NOW: u64 = 1_000_000;
+    const S: i128 = FixedPoint::SCALE;
+
+    fn db() -> (tempfile::TempDir, torus_state::StateDb) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = torus_state::StateDb::open(dir.path()).unwrap();
+        (dir, state)
+    }
+
+    fn list(state: &torus_state::StateDb, mid: MarketId) {
+        use borsh::BorshSerialize;
+        let mut row = Vec::new();
+        "BTC".to_string().serialize(&mut row).unwrap();
+        "USD".to_string().serialize(&mut row).unwrap();
+        S.serialize(&mut row).unwrap(); // lot 1
+        S.serialize(&mut row).unwrap(); // tick 1
+        (5 * S).serialize(&mut row).unwrap();
+        state.put_cf_raw(CF_NATIVE_MARKETS, &mid.to_be_bytes(), &row).unwrap();
+    }
+
+    fn delist(state: &torus_state::StateDb, mid: MarketId) {
+        state
+            .put_cf_raw(CF_NATIVE_MARKETS, &torus_types::market_delisted_key(mid), &100u64.to_be_bytes())
+            .unwrap();
+    }
+
+    fn order(mid: MarketId, reduce_only: bool) -> PlaceOrderParams {
+        PlaceOrderParams {
+            market_id: mid,
+            is_buy: true,
+            price: FixedPoint::from_raw(100 * S),
+            quantity: FixedPoint::from_raw(S),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only,
+            client_order_id: None,
+        }
+    }
+
+    #[test]
+    fn non_reduce_only_order_on_delisted_market_is_refused_with_executor_text() {
+        let (_d, state) = db();
+        list(&state, 1);
+        list(&state, 2);
+        delist(&state, 2);
+        let want = "market 2 is delisted: only reduce-only orders";
+        assert_eq!(torus_types::market_delisted_reason(2), want, "the executor's text");
+
+        let e = validate_known_markets(&NativeAction::PlaceOrder(order(2, false)), &state).unwrap_err();
+        assert_eq!(e, want);
+        // Reduce-only orders pass (the wind-down); a listed market is untouched.
+        validate_known_markets(&NativeAction::PlaceOrder(order(2, true)), &state).unwrap();
+        validate_known_markets(&NativeAction::PlaceOrder(order(1, false)), &state).unwrap();
+
+        // A batch is one signed action: one such order refuses all of it.
+        let batch = vec![order(1, false), order(2, true), order(2, false)];
+        let e = validate_known_markets(&NativeAction::PlaceOrderBatch(batch), &state).unwrap_err();
+        assert_eq!(e, want);
+        let batch = vec![order(1, false), order(2, true)];
+        validate_known_markets(&NativeAction::PlaceOrderBatch(batch), &state).unwrap();
+    }
+
+    /// Wired into the submit path (`verify_one_action`), before the signature.
+    #[test]
+    fn submit_path_refuses_it_before_signature_verify() {
+        let (_d, state) = db();
+        list(&state, 3);
+        delist(&state, 3);
+        let key = k256::ecdsa::SigningKey::from_slice(&[9; 32]).unwrap();
+        let sign = |p| {
+            let signed = torus_types::eip712::sign_native_action(NativeAction::PlaceOrder(p), NOW, &key);
+            format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap()))
+        };
+        let r = verify_one_action(&sign(order(3, false)), torus_types::eip712::TORUS_CHAIN_ID, &state, NOW);
+        assert_eq!(r.err().as_deref(), Some("market 3 is delisted: only reduce-only orders"));
+        let r = verify_one_action(&sign(order(3, true)), torus_types::eip712::TORUS_CHAIN_ID, &state, NOW);
+        assert!(r.is_ok(), "{:?}", r.err());
+    }
+}
+
 #[cfg(test)]
 mod order_book_decode_tests {
     //! S444 / S395 RED-first: `torus_getOrderBook` must decode the PRODUCTION
@@ -3786,3 +4040,7 @@ mod shed_peek_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "delist_rpc_tests.rs"]
+mod delist_rpc_tests;

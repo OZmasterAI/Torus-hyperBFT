@@ -2,7 +2,6 @@ use alloy_consensus::transaction::SignerRecoverable;
 use alloy_consensus::{Transaction, TxEnvelope};
 use alloy_primitives::{Address, U256};
 use alloy_rlp::Decodable;
-use revm::context_interface::cfg::gas::calculate_initial_tx_gas;
 use revm::primitives::eip3860::MAX_INITCODE_SIZE;
 use revm::primitives::hardfork::SpecId;
 
@@ -50,12 +49,16 @@ fn extract_gas_price(tx: &TxEnvelope) -> (u128, u128) {
 ///
 /// Checks: RLP decode (no trailing bytes, [`decode_tx_exact`]), tx type, chain ID, gas
 /// limit, initcode size, intrinsic gas, fee floor, signature recovery, nonce, balance.
+///
+/// P0.0 phase 2: `spec` is the EVM spec the tx would run at: the spec of the feature bits
+/// expected at the next height (`Mempool::admission_spec`; best effort, not consensus).
 pub fn validate_evm_tx<S: StateBackend>(
     raw_rlp: &[u8],
     state: &S,
     chain_id: u64,
     block_gas_limit: u64,
     base_fee: u64,
+    spec: SpecId,
 ) -> Result<EvmPoolEntry, MempoolError> {
     let tx = decode_tx_exact(raw_rlp)?;
 
@@ -100,8 +103,8 @@ pub fn validate_evm_tx<S: StateBackend>(
 
     // Fix (b, s104): gas limit must cover the intrinsic gas, else revm skips
     // the tx at execution (CallGasCostMoreThanGasLimit) and the sender's
-    // nonce is stranded. revm computes it, for the spec the executor runs
-    // (CANCUN, torus-evm executor.rs), so the two can never drift apart.
+    // nonce is stranded. revm computes it (`torus_evm::intrinsic_gas_for`, from
+    // Prague with the EIP-7623 floor) at `spec`, the spec the next height runs.
     let is_create = tx.kind().is_create();
     let input = tx.input();
     // EIP-3860 (Shanghai+): revm rejects a create whose initcode is over the
@@ -118,15 +121,8 @@ pub fn validate_evm_tx<S: StateBackend>(
             al.iter().map(|item| item.storage_keys.len() as u64).sum(),
         )
     });
-    let intrinsic = calculate_initial_tx_gas(
-        SpecId::CANCUN,
-        input,
-        is_create,
-        al_accounts,
-        al_storage_keys,
-        0,
-    )
-    .initial_gas;
+    let intrinsic =
+        torus_evm::intrinsic_gas_for(spec, input, is_create, al_accounts, al_storage_keys);
     if gas_limit < intrinsic {
         return Err(MempoolError::IntrinsicGasTooLow {
             need: intrinsic,

@@ -25,6 +25,7 @@ use std::path::Path;
 use hotstuff_rs::block_tree::variables::COMMITTED_VALIDATOR_SET;
 use torus_consensus::RocksKVStore;
 use torus_state::cf::{CF_ACCOUNTS, CF_BLOCK_HEADERS, CF_CONSENSUS_META, CF_STAKING_VALIDATORS};
+use torus_genesis::GenesisDigest;
 use torus_state::{consensus_db_path, NativeDaStore, StateBackend, StateDb};
 use torus_types::book_mode::{self, BookMode};
 
@@ -204,6 +205,219 @@ pub fn node_book_mode(
         chain.describe()
     );
     Ok(chain)
+}
+
+/// State-DB meta key (`cf_consensus_meta`, node-local, not in the running
+/// hash): the [`GenesisDigest`] of the genesis file this data dir is bound to
+/// (P0.0 phase 4), in [`GenesisDigest::encode`]'s form.
+pub const META_GENESIS_DIGEST: &[u8] = b"genesis_file_digest";
+
+/// How boot step 4 bound the genesis file to the data dir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenesisBinding {
+    /// Fresh data dir: genesis seeded, its digest stored.
+    Fresh,
+    /// Initialized data dir without a stored digest (first boot of a build
+    /// with the check): the current file's digest stored, not verified
+    /// against the genesis the dir was initialized with.
+    Legacy,
+    /// The file matches the stored digest.
+    Matched,
+}
+
+/// The stored genesis digest, if any.
+pub fn read_genesis_digest(state: &StateDb) -> Result<Option<GenesisDigest>, String> {
+    state
+        .get_cf_raw(CF_CONSENSUS_META, META_GENESIS_DIGEST)
+        .map_err(|e| format!("read the stored genesis digest: {e}"))?
+        .map(|b| GenesisDigest::decode(&b))
+        .transpose()
+}
+
+fn store_genesis_digest(state: &StateDb, digest: &GenesisDigest) -> Result<(), String> {
+    state
+        .put_cf_raw(CF_CONSENSUS_META, META_GENESIS_DIGEST, &digest.encode())
+        .and_then(|()| state.sync_wal())
+        .map_err(|e| format!("store the genesis digest: {e}"))
+}
+
+/// The refusal for a genesis file whose digest is not the stored one.
+pub fn genesis_changed_error(
+    stored: &GenesisDigest,
+    file: &GenesisDigest,
+    genesis_path: &Path,
+    data_dir: &Path,
+) -> String {
+    let changed = stored.changed_fields(file);
+    let changed = if changed.is_empty() {
+        "no single field identified".to_string()
+    } else {
+        changed.join(", ")
+    };
+    format!(
+        "refusing to start: genesis file {path} differs from the genesis data dir {dir} was \
+         initialized with (stored digest {stored}, file digest {file}); changed: {changed}. \
+         The chain config (activations, timeouts, chain id, ...) is read from this file at every \
+         boot but genesis is applied only once, so an edited file would change consensus \
+         parameters on this node alone. Restore the original genesis file (formatting and key \
+         order may differ), or start from a fresh data dir to run the new genesis.",
+        path = genesis_path.display(),
+        dir = data_dir.display(),
+        stored = stored.digest,
+        file = file.digest,
+    )
+}
+
+/// What boot step 4 does with a genesis file, decided before anything is
+/// written ([`check_genesis_binding`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenesisPlan {
+    /// Fresh data dir: seed genesis, store the digest.
+    Fresh,
+    /// Initialized dir without a stored digest: store the file's.
+    Legacy,
+    /// The file matches the stored digest: nothing to write.
+    Matched,
+}
+
+/// Boot step 4, the read-only half: an initialized data dir with a stored
+/// digest refuses a file that digests differently. Writes nothing, so a
+/// refused start leaves the data dir as it was (Codex review of phase 4:
+/// every boot-time write waits for this check).
+pub fn check_genesis_binding(
+    dbs: &NodeDbs,
+    file_digest: &GenesisDigest,
+    genesis_path: &Path,
+    data_dir: &Path,
+) -> Result<GenesisPlan, String> {
+    let applied = genesis_applied(dbs)?;
+    match read_genesis_digest(&dbs.state)? {
+        // A fresh boot stores the digest before it seeds the genesis, so a
+        // dir with a digest and no genesis crashed in between: still bound.
+        Some(stored) if stored.digest == file_digest.digest => {
+            Ok(if applied { GenesisPlan::Matched } else { GenesisPlan::Fresh })
+        }
+        Some(stored) => Err(genesis_changed_error(&stored, file_digest, genesis_path, data_dir)),
+        None if applied => Ok(GenesisPlan::Legacy),
+        None => Ok(GenesisPlan::Fresh),
+    }
+}
+
+/// Boot step 4, the writing half, after [`check_genesis_binding`] passed.
+pub fn write_genesis_binding(
+    dbs: &NodeDbs,
+    genesis: &torus_genesis::Genesis,
+    file_digest: &GenesisDigest,
+    plan: GenesisPlan,
+) -> Result<GenesisBinding, String> {
+    match plan {
+        GenesisPlan::Matched => Ok(GenesisBinding::Matched),
+        GenesisPlan::Legacy => {
+            store_genesis_digest(&dbs.state, file_digest)?;
+            Ok(GenesisBinding::Legacy)
+        }
+        GenesisPlan::Fresh => {
+            // The binding first, durably (`store_genesis_digest` syncs the
+            // WAL): a crash anywhere in the seeding leaves a dir bound to
+            // this file, never one a later boot takes as Legacy (Codex review
+            // of phase 4, P2). Re-storing the same digest after a crash is a
+            // no-op.
+            store_genesis_digest(&dbs.state, file_digest)?;
+            test_crash_point()?;
+            apply_genesis_if_fresh(dbs, genesis)?;
+            test_crash_point()?;
+            Ok(GenesisBinding::Fresh)
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: the boot "crashes" (returns `Err`) after this many more
+    /// genesis write steps.
+    static CRASH_AFTER_STEPS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test seam: one genesis write step is done (see `CRASH_AFTER_STEPS`).
+fn test_crash_point() -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(n) = CRASH_AFTER_STEPS.get() {
+        if n <= 1 {
+            CRASH_AFTER_STEPS.set(None);
+            return Err("test crash".into());
+        }
+        CRASH_AFTER_STEPS.set(Some(n - 1));
+    }
+    Ok(())
+}
+
+/// Boot step 4 with a genesis file (P0.0 phase 4): a data dir with a stored
+/// digest refuses a file that digests differently (before anything is
+/// written); an initialized one without a stored digest stores the file's
+/// ([`GenesisBinding::Legacy`]); a fresh one stores it and then is seeded
+/// ([`apply_genesis_if_fresh`]). The node runs the two halves around the
+/// retention rule ([`bind_genesis_and_retention`]); tests call this.
+#[cfg(test)]
+pub fn init_genesis(
+    dbs: &NodeDbs,
+    genesis: &torus_genesis::Genesis,
+    file_digest: &GenesisDigest,
+    genesis_path: &Path,
+    data_dir: &Path,
+) -> Result<GenesisBinding, String> {
+    let plan = check_genesis_binding(dbs, file_digest, genesis_path, data_dir)?;
+    write_genesis_binding(dbs, genesis, file_digest, plan)
+}
+
+/// The `--genesis` file as boot step 4 reads it.
+pub struct GenesisFile<'a> {
+    pub genesis: &'a torus_genesis::Genesis,
+    pub digest: &'a GenesisDigest,
+    pub path: &'a Path,
+}
+
+/// Boot steps 3b and 4: the genesis binding check first
+/// ([`check_genesis_binding`], or [`check_no_genesis_file`] without a genesis
+/// file), then the history-retention rule ([`enforce_history_retention`],
+/// which records the retention mode), then the genesis writes
+/// ([`write_genesis_binding`]). A start refused for its genesis writes
+/// nothing (Codex review of phase 4, P2: the retention marker written before
+/// the refusal let the next default start prune an archive dir). `Ok(None)`:
+/// no genesis file.
+pub fn bind_genesis_and_retention(
+    dbs: &NodeDbs,
+    file: Option<GenesisFile<'_>>,
+    retention: Option<u64>,
+    explicit: bool,
+    data_dir: &Path,
+) -> Result<Option<GenesisBinding>, String> {
+    let plan = match &file {
+        Some(f) => Some(check_genesis_binding(dbs, f.digest, f.path, data_dir)?),
+        None => {
+            check_no_genesis_file(dbs, data_dir)?;
+            None
+        }
+    };
+    enforce_history_retention(&dbs.state, retention, explicit, data_dir)?;
+    match (file, plan) {
+        (Some(f), Some(plan)) => write_genesis_binding(dbs, f.genesis, f.digest, plan).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// Boot step 4 without a genesis file: a data dir bound to a genesis file
+/// refuses (the default chain config would replace that genesis' config).
+pub fn check_no_genesis_file(dbs: &NodeDbs, data_dir: &Path) -> Result<(), String> {
+    match read_genesis_digest(&dbs.state)? {
+        Some(stored) => Err(format!(
+            "refusing to start: data dir {dir} was initialized from a genesis file (digest \
+             {digest}) but no --genesis was given; the default chain config would replace that \
+             genesis' config. Start with the same genesis file.",
+            dir = data_dir.display(),
+            digest = stored.digest,
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Open the state DB and the consensus DB under `data_dir`, apply the
@@ -1028,5 +1242,191 @@ mod tests {
         // Past N, never pruned, never ran with retention, defaulted: refused.
         let err = check_retention_upgrade(p(11, 0, false), Some(10), false, d).unwrap_err();
         assert!(err.contains("below 1"), "names the first cutoff: {err}");
+    }
+
+    // ---- P0.0 phase 4: genesis digest binding ----
+
+    const DEVNET_GENESIS: &str = include_str!("../../../devnet/genesis.json");
+
+    /// A genesis file text: parsed genesis + digest, as `run` loads it.
+    fn genesis_file(text: &str) -> (torus_genesis::Genesis, GenesisDigest) {
+        (
+            torus_genesis::Genesis::from_json(text).unwrap(),
+            GenesisDigest::of_json(text).unwrap(),
+        )
+    }
+
+    fn devnet_with(edit: impl FnOnce(&mut serde_json::Value)) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(DEVNET_GENESIS).unwrap();
+        edit(&mut v);
+        serde_json::to_string_pretty(&v).unwrap()
+    }
+
+    fn boot(dir: &Path, text: &str) -> Result<GenesisBinding, String> {
+        let dbs = open_node_dbs(dir).unwrap();
+        let (g, d) = genesis_file(text);
+        init_genesis(&dbs, &g, &d, Path::new("/etc/torus/genesis.json"), dir)
+    }
+
+    fn stored(dir: &Path) -> Option<GenesisDigest> {
+        read_genesis_digest(&StateDb::open(dir).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn fresh_boot_stores_the_genesis_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(boot(dir.path(), DEVNET_GENESIS), Ok(GenesisBinding::Fresh));
+        let dbs = open_node_dbs(dir.path()).unwrap();
+        assert!(genesis_applied(&dbs).unwrap(), "fresh boot seeded genesis");
+        assert_eq!(
+            read_genesis_digest(&dbs.state).unwrap(),
+            Some(GenesisDigest::of_json(DEVNET_GENESIS).unwrap())
+        );
+    }
+
+    #[test]
+    fn reboot_with_the_same_genesis_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        boot(dir.path(), DEVNET_GENESIS).unwrap();
+        assert_eq!(boot(dir.path(), DEVNET_GENESIS), Ok(GenesisBinding::Matched));
+        assert_eq!(boot(dir.path(), DEVNET_GENESIS), Ok(GenesisBinding::Matched));
+    }
+
+    #[test]
+    fn changed_consensus_field_refuses_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        boot(dir.path(), DEVNET_GENESIS).unwrap();
+        let before = stored(dir.path());
+        let edited = devnet_with(|v| {
+            v["consensus"]["activations"] = serde_json::json!({ "running_state_hash": 500 });
+        });
+        let err = boot(dir.path(), &edited).unwrap_err();
+        assert!(
+            err.starts_with("refusing to start: genesis file /etc/torus/genesis.json"),
+            "{err}"
+        );
+        assert!(err.contains("changed: consensus.activations."), "names the field: {err}");
+        assert!(err.contains(&dir.path().display().to_string()), "names the data dir: {err}");
+        let t = devnet_with(|v| {
+            let t = v["consensus"]["timeout_base_ms"].as_u64().unwrap();
+            v["consensus"]["timeout_base_ms"] = (t + 1).into();
+            v["chain_id"] = 9999u64.into();
+        });
+        let err = boot(dir.path(), &t).unwrap_err();
+        assert!(err.contains("changed: chain_id, consensus.timeout_base_ms."), "{err}");
+        assert_eq!(stored(dir.path()), before, "a refused boot rewrote the digest");
+        // The original file still starts.
+        assert_eq!(boot(dir.path(), DEVNET_GENESIS), Ok(GenesisBinding::Matched));
+    }
+
+    #[test]
+    fn formatting_only_change_still_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        boot(dir.path(), DEVNET_GENESIS).unwrap();
+        let v: serde_json::Value = serde_json::from_str(DEVNET_GENESIS).unwrap();
+        let compact = serde_json::to_string(&v).unwrap();
+        assert_ne!(compact, DEVNET_GENESIS);
+        assert_eq!(boot(dir.path(), &compact), Ok(GenesisBinding::Matched));
+        let pretty = serde_json::to_string_pretty(&v).unwrap();
+        let indented = format!("\n\n{}\n", pretty.replace("  ", "\t"));
+        assert_eq!(boot(dir.path(), &indented), Ok(GenesisBinding::Matched));
+    }
+
+    #[test]
+    fn legacy_data_dir_without_a_digest_stores_one_and_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            // What the previous build left: genesis applied, no digest.
+            let dbs = open_node_dbs(dir.path()).unwrap();
+            assert!(apply_genesis_if_fresh(&dbs, &genesis()).unwrap());
+        }
+        assert_eq!(stored(dir.path()), None);
+        assert_eq!(boot(dir.path(), DEVNET_GENESIS), Ok(GenesisBinding::Legacy));
+        assert_eq!(
+            stored(dir.path()),
+            Some(GenesisDigest::of_json(DEVNET_GENESIS).unwrap())
+        );
+        // From now on the dir is bound.
+        assert_eq!(boot(dir.path(), DEVNET_GENESIS), Ok(GenesisBinding::Matched));
+        let edited = devnet_with(|v| v["chain_name"] = "edited".into());
+        assert!(boot(dir.path(), &edited).unwrap_err().contains("changed: chain_name."));
+    }
+
+    /// Codex review of phase 4 (P2): a start refused for a changed genesis
+    /// writes nothing, in particular not the history-retention marker. An
+    /// explicit-retention start with the wrong genesis on an archive dir
+    /// must not let the next default start (which would prune) through.
+    #[test]
+    fn a_changed_genesis_refusal_writes_no_retention_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        boot(dir.path(), DEVNET_GENESIS).unwrap();
+        let dbs = open_node_dbs(dir.path()).unwrap();
+        for h in 0..=50u64 {
+            dbs.state.put_cf_raw(CF_BLOCK_HEADERS, &h.to_be_bytes(), b"header").unwrap();
+        }
+        let marker = |dbs: &NodeDbs| {
+            dbs.state.get_cf_raw(CF_CONSENSUS_META, META_HISTORY_RETENTION).unwrap()
+        };
+        assert_eq!(marker(&dbs), None, "an archive dir");
+        let edited_text = devnet_with(|v| v["chain_name"] = "edited".into());
+        let (edited, edited_digest) = genesis_file(&edited_text);
+        let path = Path::new("/etc/torus/genesis.json");
+        let file = |g, d| Some(GenesisFile { genesis: g, digest: d, path });
+        let err = bind_genesis_and_retention(
+            &dbs,
+            file(&edited, &edited_digest),
+            Some(10),
+            true,
+            dir.path(),
+        )
+        .unwrap_err();
+        assert!(err.contains("changed: chain_name."), "{err}");
+        assert_eq!(marker(&dbs), None, "the refused start recorded the retention mode");
+        // The archive protection still holds for a defaulted start.
+        let (original, digest) = genesis_file(DEVNET_GENESIS);
+        let err = bind_genesis_and_retention(&dbs, file(&original, &digest), Some(10), false, dir.path())
+            .unwrap_err();
+        assert!(err.contains("holds unpruned history"), "{err}");
+        assert_eq!(marker(&dbs), None);
+        // The no-genesis refusal of a bound dir writes nothing either.
+        assert!(bind_genesis_and_retention(&dbs, None, Some(10), true, dir.path()).is_err());
+        assert_eq!(marker(&dbs), None);
+    }
+
+    /// Codex review of phase 4 (P2): a fresh boot that crashes between its
+    /// genesis writes leaves a data dir that is bound to the file it started
+    /// with: a restart with an edited file refuses (it was accepted as a
+    /// legacy dir when the genesis was seeded before the digest was stored),
+    /// and the original file finishes the boot.
+    #[test]
+    fn a_crash_inside_the_fresh_genesis_boot_keeps_the_binding() {
+        let edited = devnet_with(|v| v["chain_name"] = "edited".into());
+        for steps in 1..=2 {
+            let dir = tempfile::tempdir().unwrap();
+            CRASH_AFTER_STEPS.set(Some(steps));
+            assert_eq!(boot(dir.path(), DEVNET_GENESIS), Err("test crash".into()), "{steps}");
+            let err = boot(dir.path(), &edited).expect_err("an edited file after the crash");
+            assert!(err.contains("changed: chain_name."), "crash after {steps} steps: {err}");
+            let done = boot(dir.path(), DEVNET_GENESIS).expect("the original file starts");
+            assert!(
+                matches!(done, GenesisBinding::Fresh | GenesisBinding::Matched),
+                "{steps}: {done:?}"
+            );
+            assert_eq!(boot(dir.path(), DEVNET_GENESIS), Ok(GenesisBinding::Matched));
+            assert!(genesis_applied(&open_node_dbs(dir.path()).unwrap()).unwrap());
+        }
+    }
+
+    #[test]
+    fn no_genesis_file_on_a_bound_dir_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let dbs = open_node_dbs(dir.path()).unwrap();
+            check_no_genesis_file(&dbs, dir.path()).expect("fresh dir without genesis starts");
+        }
+        boot(dir.path(), DEVNET_GENESIS).unwrap();
+        let dbs = open_node_dbs(dir.path()).unwrap();
+        let err = check_no_genesis_file(&dbs, dir.path()).unwrap_err();
+        assert!(err.contains("no --genesis was given"), "{err}");
     }
 }

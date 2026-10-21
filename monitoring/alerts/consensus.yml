@@ -76,3 +76,33 @@ groups:
           description: >
             The consensus timeout rate has exceeded 0.1/s for 5 minutes.
             This may indicate network partitions or Byzantine validators.
+
+      # P0.0 feature activations (docs/node-operator-guide.md, "Feature
+      # activations and upgrades").
+      - alert: UpgradeRequired
+        expr: torus_upgrade_required == 1
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Node needs a newer release (UPGRADE REQUIRED)"
+          description: >
+            A block header carries a feature this binary does not know
+            (feature torus_upgrade_required_feature, from height
+            torus_upgrade_required_height). The node does not vote on,
+            insert or execute that block and stays below it. Install the
+            release that knows the feature and restart with the same data
+            dir and genesis file.
+
+      - alert: FeatureActivationApproaching
+        expr: torus_feature_blocks_until_activation >= 0 and torus_feature_blocks_until_activation < 10000
+        for: 0s
+        labels:
+          severity: warning
+        annotations:
+          summary: "A feature activates in under 10000 blocks"
+          description: >
+            This node's schedule switches a feature on at
+            torus_feature_next_activation_height. Check that every validator
+            and RPC node runs a release with the same schedule
+            (torus_getFeatureSchedule) before that height.

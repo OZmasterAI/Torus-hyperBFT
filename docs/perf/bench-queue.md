@@ -1030,6 +1030,24 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    construction). Headline 43.1k matched/s (Q9 49.7k) = margin exhaustion in both arms: 49.6-50.3k for min 0-100,
    ~0 fills in min 110-120 (13.3% margin rejects, `n9irejchk` WARN); A's growth is unchanged in that tail.
    `cf_block_headers` grows in both arms (0.048 GB at 120 min).**
+9j. **Final head-to-head: hash-on Classic vs mode 3** (owner go s75 via 18c). **One binary** `perf/h2h-combined`
+   `29bfc705` (node md5 `f4f2679f`); every arm `STATE_HASH_ACTIVATION=1 STATE_HASH_ATTEST=1` (attest key on every node,
+   fail-stop on). Deep (8i P1M) and standard shapes, 300 s cells, hsdb-300m load.
+   **Stage 1 (screen, winner per family):** C15 = Classic + L3.1 + L6.1 (`BOOK_WINDOW_COMMIT=1`), 15 s checkpoints;
+   C5 = same at 5 s; CL21 = C15 + `TORUS_SETTLE_STREAMED=1` (L2.1); M15 = mode 3 (genesis `book_mode=level_authority_chunked`)
+   + b1, 15 s; M5 = same at 5 s. Per shape: w1 (C15) + r1 C15 C5 CL21 M15 M5 / r2 reversed, n = 2. Winner by the exec-path
+   merge rule (C5 / C15, CL21 / C15, M5 / M15; deep primary); unresolved -> the 15 s arm; within 1.5 pooled sd -> extend
+   to n = 3. **Stage 2:** best C vs best M, n = 4 per shape in A B B A B A A B, plus a Classic hash-off reference
+   n = 2 per shape (one cell at the start, one at the end).
+   **Stage 1 done s75 (ozarchy-9j, section 123; tools `0f8eedb3`, 22 / 22 cells rc 0 ACCEPT AGREE PASS, md5 ok, state
+   attest ok=1 with h_n equal, quorum 63 / 63 and fail-stop on in every cell, margin rejects 0, no foreign-CPU flag, no
+   rerun): winners C15 and M15.** CL21 fails the exec-thread CPU row: standard 1.0075 [1.0034, 1.0116]; deep 1.052
+   [0.996, 1.110], +13.9 sd, both rounds +4.7 / +5.6%. It gains deep blocks/s 1.086 [1.066, 1.106] and standard p50
+   0.894 (owner exception only, as in section 114). C5 resolves nothing on deep (blocks/s 0.857, p99 1.088, CIs span 1)
+   and has standard p99 1.0134 [1.0011, 1.0258]. M5 ties M15 on deep (each rule row <= 0.5 sd) and loses standard
+   blocks/s 0.920 [0.874, 0.968]. The 100-block checkpoint bound fires first, so 5 s vs 15 s changes the checkpoint
+   count only 1.17-1.63x. Mode 3 / Classic (15 s, standard): matched/s 0.951 [0.949, 0.954], CPU-s per 1M fills 1.136;
+   flush worker busy 0.51 vs 0.13.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 

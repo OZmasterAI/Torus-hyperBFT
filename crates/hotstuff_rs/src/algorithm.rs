@@ -162,8 +162,10 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
         // crash in that window (t15 tight kills; widest during block-sync
         // catch-up jumps) leaves heights the commit walk will never revisit —
         // without this replay the app starves on them forever (the min-height
-        // exec-feed gap: v3 committed 962 / fed 678).
-        match crate::committed_feed::feed_committed_blocks_to_app(
+        // exec-feed gap: v3 committed 962 / fed 678). The boot pass first
+        // lowers a fed frontier left above what the app holds (fail-stop,
+        // s134) so those blocks are re-delivered too.
+        match crate::committed_feed::boot_feed_committed_blocks_to_app(
             &mut self.block_tree,
             &mut self.app,
         ) {

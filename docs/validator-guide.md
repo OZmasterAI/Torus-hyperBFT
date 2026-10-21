@@ -92,6 +92,7 @@ See [monitoring-setup.md](monitoring-setup.md) for setup instructions.
 | `torus_consensus_view` | Advancing | Stuck |
 | `torus_peers_connected` | >= 3 | < 3 |
 | `torus_block_build_seconds` | < 1s p99 | > 2s p99 |
+| `torus_state_hash_unverified` | 0 | 1: no valid running-hash chain, the node submits no state-hash attestations (see [node-operator-guide.md](node-operator-guide.md#running-state-hash-a-hash-unverified-node)) |
 
 ## Jailing
 
@@ -140,7 +141,9 @@ and the settlement. The settlement price is the mark, or the last aggregated pri
 the grace period, unless governance set a close price. Once the settlement is complete (no
 position, no ADL obligation and no settlement row left), every validator ignores that market's
 entries in `SubmitOraclePrices`. The rest of the submission is still stored, so nothing breaks.
-After that, remove the market from the feeder's `[[markets]]` config to save the work. Details:
+The feeder sees this in `torus_getMarkets` (`settlement: "settled"`) and stops publishing the
+market on its own (startup warning; omitted with reason `delist settled`). You can then remove it
+from the feeder's `[[markets]]` config. Details:
 [Configuration Reference](configuration-reference.md#market-delisting-governance).
 
 ## Operational Checklist

@@ -106,6 +106,7 @@ fn block_with_txs(evm_transactions: Vec<Vec<u8>>) -> TorusBlock {
             big_base_fee_per_gas: 1_000_000_000,
             epoch: 0,
             validator_set_hash: B256::ZERO,
+            features: 0,
             sig_attestation: [0u8; 64],
         },
         native_actions: vec![],

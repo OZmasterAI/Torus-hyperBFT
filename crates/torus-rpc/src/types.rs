@@ -343,7 +343,38 @@ pub struct RpcMarketInfo {
     pub quote_asset: String,
     pub lot_size: String,
     pub tick_size: String,
+    /// `"active"`, or `"delisted"` once a governance delist executed.
     pub status: String,
+    /// Delist follow-up (node-local read): a governance delist executed (the
+    /// market is reduce-only, then settled).
+    #[serde(default)]
+    pub delisted: bool,
+    /// The height the delist executed (hex), when delisted.
+    #[serde(default)]
+    pub delist_height: Option<String>,
+    /// The grace end (hex): the settlement row's `close_at`, the first block
+    /// the settlement step works on the market. `null` before the delist;
+    /// kept after the walk (owner s134: the kept settlement record).
+    #[serde(default)]
+    pub close_at: Option<String>,
+    /// `"none"` (not delisted), `"grace"` (reduce-only until `closeAt`),
+    /// `"settling"` (from `closeAt`: waiting for a price, closing positions,
+    /// or draining ADL obligations) or `"settled"` (complete: the oracle is
+    /// closed, prices for it are ignored).
+    #[serde(default)]
+    pub settlement: String,
+    /// The settlement price, once the settlement step fixed it; kept in
+    /// state after the walk completes (owner s134: the kept settlement
+    /// record), so a settled market still shows it.
+    #[serde(default)]
+    pub close_price: Option<String>,
+    /// A governance close price (`SetDelistClosePrice`) waiting to be used
+    /// as the settlement price at the first settlement block.
+    #[serde(default)]
+    pub governance_close_price: Option<String>,
+    /// The height the settlement completed (oracle-closed marker), hex.
+    #[serde(default)]
+    pub settled_height: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -481,6 +512,66 @@ pub struct RpcStateHashVote {
     pub hash: String,
     /// `hash` equals this node's local checkpoint.
     pub matches_local: bool,
+}
+
+/// P0.0 phase 6 (`torus_getFeatureSchedule`): this node's activation schedule
+/// and the features its binary knows. Heights and bitmaps are hex strings.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcFeatureSchedule {
+    pub chain_id: String,
+    /// The latest block this RPC serves; `active` / `activeBits` are read at it.
+    pub height: String,
+    /// The feature bits a header at `height` carries under this schedule.
+    pub active_bits: String,
+    /// The bits of every feature this binary knows (`KNOWN_FEATURES`).
+    pub known_bits: String,
+    /// Every feature this binary knows, in id order.
+    pub known_features: Vec<RpcKnownFeature>,
+    /// Every scheduled feature (genesis `consensus.activations` united with
+    /// this binary's built-in table for the chain id), in id order.
+    pub schedule: Vec<RpcScheduledFeature>,
+    /// The next activation above `height` (`null`: none scheduled).
+    pub next_activation_height: Option<String>,
+    /// Blocks from `height` to `nextActivationHeight` (`null`: none scheduled).
+    pub blocks_until_activation: Option<String>,
+    /// This node met a header with a feature its binary does not know
+    /// (`UPGRADE REQUIRED`; `null`: never since the start).
+    pub upgrade_required: Option<RpcUpgradeRequired>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcKnownFeature {
+    /// The genesis name (`consensus.activations` key).
+    pub name: String,
+    /// The fixed id: the bit position in a header's `features`.
+    pub id: u8,
+    /// `1 << id`, hex.
+    pub bit: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcScheduledFeature {
+    pub name: String,
+    pub id: u8,
+    pub bit: String,
+    /// As configured (0 and 1 both mean block 1).
+    pub activation_height: String,
+    /// On at `height`.
+    pub active: bool,
+    /// This binary's built-in table names it for the chain id (else genesis only).
+    pub built_in: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcUpgradeRequired {
+    /// The lowest unknown feature id at `height`.
+    pub feature: u32,
+    /// The lowest block height met with a feature this binary does not know.
+    pub height: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

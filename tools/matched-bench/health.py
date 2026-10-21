@@ -77,10 +77,11 @@ def committed_height(sample):
     return sample[EXEC_HEIGHT] + sample[EXEC_QUEUE]
 
 
-def height_target(samples):
-    """The highest committed height across the 3 nodes, or None unless every
-    scrape is complete (a target from a partial trio could sit too low)."""
-    if len(samples) != 3 or not all(complete(s, REQUIRED + (EXEC_HEIGHT,)) for s in samples):
+def height_target(samples, n=3):
+    """The highest committed height across the n nodes (3; 2 with --exclude),
+    or None unless every scrape is complete (a target from a partial set could
+    sit too low)."""
+    if len(samples) != n or not all(complete(s, REQUIRED + (EXEC_HEIGHT,)) for s in samples):
         return None
     return int(max(committed_height(s) for s in samples))
 
@@ -98,15 +99,18 @@ def pending(sample, mempool_max=0, exec_queue_max=IDLE_EXEC_QUEUE_MAX):
             sample[FLUSH] > 0)
 
 
-def assess_liveness(rows, lo, hi, stall_s=DEFAULT_STALL_S):
+def assess_liveness(rows, lo, hi, stall_s=DEFAULT_STALL_S, nodes=NODES):
     """Detect *every* observed stall, including ones followed by recovery.
 
     A stall is >=stall_s without a commit while work stays pending. Gaps, missing
     metrics and counter resets cannot be interpreted as evidence of health.
     This is an operational rejection threshold, not a throughput noise filter.
+    nodes: the validators judged (run-cell KILL_NO_RESTART: the survivors; the
+    killed node's scrapes fail from its kill on and say nothing about the chain).
     """
+    judged = nodes
     nodes = {}
-    for node in NODES:
+    for node in judged:
         samples = [r for r in rows.get(node, []) if lo <= r['ts'] <= hi]
         problems, stalls = [], []
         previous = None
@@ -182,10 +186,15 @@ class DrainTracker:
     attest_window_step (block bodies), outside this pure tracker.
 
     min_height: also every node's executed height (EXEC_HEIGHT) >= min_height;
-    a node without the gauge never counts as there."""
+    a node without the gauge never counts as there.
+
+    nodes: the validators observed, in the order of the samples (run-cell
+    KILL_NO_RESTART: the survivors only, --exclude)."""
     def __init__(self, quiet_s, feed_live=False, max_lag=DEFAULT_MAX_LAG,
                  feed_mempool_max=DEFAULT_FEED_MEMPOOL_MAX, min_height=None,
-                 attest_live=False, attest_mempool_max=DEFAULT_ATTEST_MEMPOOL_MAX):
+                 attest_live=False, attest_mempool_max=DEFAULT_ATTEST_MEMPOOL_MAX,
+                 nodes=NODES):
+        self.nodes = tuple(nodes)
         self.quiet_s = quiet_s
         self.min_height = min_height
         self.quiet_keys = ORDER_FLOW if feed_live or attest_live else FLOW
@@ -200,7 +209,7 @@ class DrainTracker:
         self.last_time = None
 
     def observe(self, now, samples):
-        good = len(samples) == 3 and all(complete(s, REQUIRED) for s in samples)
+        good = len(samples) == len(self.nodes) and all(complete(s, REQUIRED) for s in samples)
         reason = 'waiting for quiet counters and empty pending-work gauges'
         if not good:
             reason = 'missing or invalid metrics'
@@ -244,7 +253,7 @@ class DrainTracker:
         """[(node, executed height or None)] below min_height; [] without one."""
         if self.min_height is None:
             return []
-        return [(node, s.get(EXEC_HEIGHT)) for node, s in zip(NODES, samples)
+        return [(node, s.get(EXEC_HEIGHT)) for node, s in zip(self.nodes, samples)
                 if not (complete(s, (EXEC_HEIGHT,)) and s[EXEC_HEIGHT] >= self.min_height)]
 
 
@@ -258,11 +267,11 @@ def percentile(values, p):
     return ordered[max(0, math.ceil(p/100*len(ordered))-1)]
 
 
-def feed_live_rows(elapsed, previous, samples, quiet_elapsed):
+def feed_live_rows(elapsed, previous, samples, quiet_elapsed, nodes=NODES):
     """Per node: exec lag now, and native blocks executed since the previous
     scrape with their mean exec ms (exact per block when chain_blocks == 1)."""
     rows = []
-    for node, prev, s in zip(NODES, previous, samples):
+    for node, prev, s in zip(nodes, previous, samples):
         blocks = ms = None
         if all(k in d for d in (prev, s) for k in (CHAIN_SUM, CHAIN_COUNT)):
             blocks = int(s[CHAIN_COUNT]-prev[CHAIN_COUNT])
@@ -368,14 +377,18 @@ def attest_window_step(tracker, now, samples, result, scan):
 def wait_for_drain(urls, out, timeout_s, quiet_s, feed_live=False, max_lag=DEFAULT_MAX_LAG,
                    feed_mempool_max=DEFAULT_FEED_MEMPOOL_MAX, to_height=None,
                    attest_live=False, attest_mempool_max=DEFAULT_ATTEST_MEMPOOL_MAX,
-                   attest_rpcs=None, scan=None):
+                   attest_rpcs=None, scan=None, nodes=NODES, excluded=()):
     """to_height: None (no height condition), an int, or 'auto' = the
     height_target() of the first complete scrape (the chain at the call).
     attest_live: scan (lo, hi) -> attest_traffic.scan_window result; default:
-    over attest_rpcs."""
+    over attest_rpcs. nodes: the validators behind `urls`, in order (--exclude
+    drops the killed one); excluded: recorded in drain.json when not empty."""
+    nodes = tuple(nodes)
+    if len(nodes) != len(urls):
+        raise ValueError('%d urls for nodes %s' % (len(urls), nodes))
     tracker = DrainTracker(quiet_s, feed_live, max_lag, feed_mempool_max,
                            to_height if isinstance(to_height, int) else None,
-                           attest_live, attest_mempool_max)
+                           attest_live, attest_mempool_max, nodes)
     extra = (CHAIN_SUM, CHAIN_COUNT) if feed_live else ()
     if attest_live:
         extra += (ATTEST_SUBMITTED,)
@@ -391,7 +404,7 @@ def wait_for_drain(urls, out, timeout_s, quiet_s, feed_live=False, max_lag=DEFAU
         extra += (EXEC_HEIGHT,)
     last = None
     window, restarts = None, 0
-    target_by_node, heights = None, {n: None for n in NODES}
+    target_by_node, heights = None, {n: None for n in nodes}
     rows, previous = [], [{} for _ in urls]
     start = time.monotonic()
     result = {'drained': False, 'reason': 'timeout before a complete scrape'}
@@ -400,10 +413,10 @@ def wait_for_drain(urls, out, timeout_s, quiet_s, feed_live=False, max_lag=DEFAU
             samples = list(pool.map(lambda url: fetch(url, extra), urls))
             elapsed = time.monotonic()-start
             if to_height == 'auto' and tracker.min_height is None:
-                tracker.min_height = height_target(samples)
+                tracker.min_height = height_target(samples, len(nodes))
                 if tracker.min_height is not None:
-                    target_by_node = {n: int(committed_height(s)) for n, s in zip(NODES, samples)}
-            for n, s in zip(NODES, samples):
+                    target_by_node = {n: int(committed_height(s)) for n, s in zip(nodes, samples)}
+            for n, s in zip(nodes, samples):
                 if EXEC_HEIGHT in s:
                     heights[n] = int(s[EXEC_HEIGHT])
             result = tracker.observe(elapsed, samples)
@@ -422,12 +435,15 @@ def wait_for_drain(urls, out, timeout_s, quiet_s, feed_live=False, max_lag=DEFAU
                                   **result}, allow_nan=False)+'\n')
             log.flush()
             if feed_live:
-                rows += feed_live_rows(elapsed, previous, samples, result['quiet_elapsed_s'])
+                rows += feed_live_rows(elapsed, previous, samples, result['quiet_elapsed_s'], nodes)
                 previous = samples
             if result['drained']:
                 break
             time.sleep(min(1, max(0, timeout_s-(time.monotonic()-start))))
     result.update(elapsed_s=time.monotonic()-start, quiet_s=quiet_s, timeout_s=timeout_s)
+    if excluded:
+        # run-cell KILL_NO_RESTART: the killed validator is not a drain participant
+        result.update(nodes=list(nodes), excluded_nodes=sorted(excluded))
     target_missed = False
     if to_height is not None:
         target = tracker.min_height
@@ -503,6 +519,9 @@ def main():
     drain.add_argument('--attest-rpc', nargs=3, default=None,
                        help="--attest-live (required): the validators' JSON-RPC URLs; the quiet "
                             'window\'s block bodies are read by action kind (attest_traffic.py)')
+    drain.add_argument('--exclude', action='append', default=[], choices=NODES[1:],
+                       help='run-cell KILL_NO_RESTART: a validator killed without restart; its '
+                            '--urls / --attest-rpc entry is dropped and only the others must drain')
     drain.add_argument('--to-height', type=to_height_arg, default=None,
                        help="also wait until every node executed this height ('auto': the highest "
                             "committed height across the nodes at the first complete scrape); "
@@ -520,9 +539,17 @@ def main():
     if args.attest_live and not args.attest_rpc:
         parser.error('--attest-live needs --attest-rpc (3 URLs): without the block bodies the '
                      'quiet window cannot tell attestations from other native actions')
-    return wait_for_drain(args.urls, args.out, args.timeout, args.quiet, args.feed_live,
+    excluded = sorted(set(args.exclude))
+    if len(excluded) > 1:
+        parser.error('--exclude: at most one validator (two survivors of three)')
+    keep = [i for i, n in enumerate(NODES) if n not in excluded]
+    nodes = tuple(NODES[i] for i in keep)
+    urls = [args.urls[i] for i in keep]
+    attest_rpc = [args.attest_rpc[i] for i in keep] if args.attest_rpc else args.attest_rpc
+    return wait_for_drain(urls, args.out, args.timeout, args.quiet, args.feed_live,
                           args.max_lag, args.feed_mempool_max, args.to_height,
-                          args.attest_live, args.attest_mempool_max, args.attest_rpc)
+                          args.attest_live, args.attest_mempool_max, attest_rpc,
+                          nodes=nodes, excluded=excluded)
 
 
 def to_height_arg(value):

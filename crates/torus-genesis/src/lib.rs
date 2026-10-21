@@ -28,6 +28,9 @@ use torus_types::{
     ChainConfig, FixedPoint, PublicKey, ValidatorInfo, ValidatorSet as TorusValidatorSet,
 };
 
+pub mod digest;
+pub use digest::GenesisDigest;
+
 // ---------------------------------------------------------------------------
 // Error
 // ---------------------------------------------------------------------------
@@ -54,6 +57,9 @@ pub enum GenesisError {
     InvalidFeeSplit(String),
     #[error("invalid evm section: {0}")]
     InvalidEvm(String),
+    /// P0.0: the activation schedule does not merge (alias or built-in conflict).
+    #[error("invalid activations: {0}")]
+    InvalidActivations(String),
     /// R19: two spellings of one canonical key (address case / 0x prefix,
     /// storage slot "0" vs "0x0"). Refused instead of letting HashMap order
     /// pick the value.
@@ -130,6 +136,11 @@ pub struct ConsensusConfig {
     /// refuses the genesis. The node takes its mode from here.
     #[serde(default)]
     pub book_mode: torus_types::book_mode::BookMode,
+    /// P0.0: `{ "<feature_name>": height }`, when each gated feature switches
+    /// on (0 or 1 = from block 1). An unknown name refuses to start;
+    /// `state_hash_activation_height` is the alias of `running_state_hash`.
+    #[serde(default)]
+    pub activations: std::collections::BTreeMap<torus_types::Feature, u64>,
 }
 
 fn default_chain_id() -> u64 {
@@ -391,6 +402,13 @@ impl Genesis {
         Self::from_json(&std::fs::read_to_string(path)?)
     }
 
+    /// P0.0 phase 4: read the file once and return the parsed genesis and
+    /// the digest of the same text ([`GenesisDigest`]).
+    pub fn from_file_with_digest(path: &Path) -> Result<(Self, GenesisDigest), GenesisError> {
+        let text = std::fs::read_to_string(path)?;
+        Ok((Self::from_json(&text)?, GenesisDigest::of_json(&text)?))
+    }
+
     /// Parse a genesis configuration from a JSON string.
     pub fn from_json(json: &str) -> Result<Self, GenesisError> {
         let genesis: Self = serde_json::from_str(json)?;
@@ -401,7 +419,40 @@ impl Genesis {
             ));
         }
         genesis.check_keys_and_hex()?;
+        genesis.activation_schedule()?;
         Ok(genesis)
+    }
+
+    /// P0.0: the activation schedule of this genesis: `consensus.activations`
+    /// plus the old `state_hash_activation_height` (the alias of
+    /// `running_state_hash`), united with the built-in table for `chain_id`.
+    /// Both alias spellings with different heights, or a built-in height that
+    /// differs from the genesis one, refuse to start.
+    pub fn activation_schedule(&self) -> Result<torus_types::ActivationSchedule, GenesisError> {
+        use torus_types::Feature::RunningStateHash;
+        let mut activations = self.consensus.activations.clone();
+        if let Some(alias) = self.consensus.state_hash_activation_height {
+            if alias == 0 {
+                return Err(GenesisError::InvalidActivations(
+                    "state_hash_activation_height must be >= 1".into(),
+                ));
+            }
+            match activations.get(&RunningStateHash) {
+                // 0 and 1 are both block 1.
+                Some(&h) if h.max(1) != alias => {
+                    return Err(GenesisError::InvalidActivations(format!(
+                        "state_hash_activation_height = {alias} but activations.{} = {h}",
+                        RunningStateHash.name()
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    activations.insert(RunningStateHash, alias);
+                }
+            }
+        }
+        torus_types::ActivationSchedule::for_chain(self.chain_id, &activations)
+            .map_err(GenesisError::InvalidActivations)
     }
 
     /// R19: every hex field decodes and every map key is canonical-unique, so
@@ -709,7 +760,13 @@ impl Genesis {
     }
 
     /// Build a [`ChainConfig`] from the genesis parameters.
+    ///
+    /// Panics on an activation schedule that does not merge; `from_json`
+    /// already refused such a genesis (the node does not start).
     pub fn chain_config(&self) -> ChainConfig {
+        let activations = self
+            .activation_schedule()
+            .unwrap_or_else(|e| panic!("genesis not loaded through from_json: {e}"));
         ChainConfig {
             chain_id: self.chain_id,
             chain_name: self.chain_name.clone(),
@@ -746,7 +803,7 @@ impl Genesis {
             // Node-local perf toggle; never sourced from genesis. Enabled per-node
             // via the `--exec-trust-cache` CLI flag.
             exec_trust_cache: false,
-            state_hash_activation_height: self.consensus.state_hash_activation_height,
+            activations,
             book_mode: self.consensus.book_mode,
         }
     }
@@ -1064,15 +1121,78 @@ mod tests {
     fn genesis_state_hash_activation_height_is_chain_config() {
         let genesis = Genesis::from_json(&sample_genesis_json()).unwrap();
         assert_eq!(genesis.consensus.state_hash_activation_height, None);
-        assert_eq!(genesis.chain_config().state_hash_activation_height, None);
+        assert_eq!(genesis.chain_config().state_hash_activation_height(), None);
         let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
         json["consensus"]["state_hash_activation_height"] = serde_json::json!(5000);
         let genesis = Genesis::from_json(&json.to_string()).unwrap();
-        assert_eq!(genesis.chain_config().state_hash_activation_height, Some(5000));
-        let mut config = genesis.chain_config();
-        assert!(config.validate().is_ok());
-        config.state_hash_activation_height = Some(0);
-        assert!(config.validate().is_err(), "height 0 is never executed");
+        assert_eq!(genesis.chain_config().state_hash_activation_height(), Some(5000));
+        assert!(genesis.chain_config().validate().is_ok());
+        // P0.0 phase 3: derived from the schedule only; 0 there is block 1.
+        let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        json["consensus"]["activations"] = serde_json::json!({"running_state_hash": 0});
+        let genesis = Genesis::from_json(&json.to_string()).unwrap();
+        assert_eq!(genesis.chain_config().state_hash_activation_height(), Some(1));
+    }
+
+    /// P0.0: `consensus.activations` names features (an unknown name refuses
+    /// to start) and lands in `ChainConfig.activations`; the old
+    /// `state_hash_activation_height` is the alias of `running_state_hash`
+    /// (both set with different heights refuses; 0 and 1 are the same height).
+    /// RED before phase 1: the alias was not in the schedule and a conflict loaded.
+    #[test]
+    fn genesis_activations_and_the_running_hash_alias() {
+        use torus_types::Feature::RunningStateHash;
+        let with = |f: &dyn Fn(&mut serde_json::Value)| {
+            let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+            f(&mut json);
+            Genesis::from_json(&json.to_string())
+        };
+        let none = with(&|_| {}).unwrap().chain_config();
+        assert_eq!(none.activations, torus_types::ActivationSchedule::default());
+
+        let g = with(&|j| {
+            j["consensus"]["activations"] = serde_json::json!({"running_state_hash": 300})
+        })
+        .unwrap();
+        let config = g.chain_config();
+        assert_eq!(config.activations.height_of(RunningStateHash), Some(300));
+        assert_eq!(config.activations.active_at(299), 0);
+        assert_eq!(config.activations.active_at(300), RunningStateHash.bit());
+        assert_eq!(
+            config.state_hash_activation_height(),
+            Some(300),
+            "derived from the schedule"
+        );
+
+        let err = with(&|j| j["consensus"]["activations"] = serde_json::json!({"warp_drive": 3}))
+            .expect_err("unknown feature name refuses to start");
+        assert!(err.to_string().contains("warp_drive"), "{err}");
+
+        // The alias alone schedules the feature.
+        let g = with(&|j| j["consensus"]["state_hash_activation_height"] = serde_json::json!(40))
+            .unwrap();
+        assert_eq!(
+            g.chain_config().activations.height_of(RunningStateHash),
+            Some(40)
+        );
+        assert_eq!(g.chain_config().state_hash_activation_height(), Some(40));
+
+        // Both, same height: fine; different: refused.
+        let both = |alias: u64, new: u64| {
+            with(&move |j| {
+                j["consensus"]["state_hash_activation_height"] = serde_json::json!(alias);
+                j["consensus"]["activations"] = serde_json::json!({"running_state_hash": new});
+            })
+        };
+        assert!(both(40, 40).is_ok());
+        assert!(both(1, 0).is_ok(), "0 and 1 are both block 1");
+        let err = both(40, 41).expect_err("alias conflict refuses to start");
+        assert!(matches!(err, GenesisError::InvalidActivations(_)), "{err}");
+        // Height 0 through the old field stays refused (it never meant block 1).
+        assert!(
+            with(&|j| j["consensus"]["state_hash_activation_height"] = serde_json::json!(0))
+                .is_err()
+        );
     }
 
     /// Owner s131: the order-book storage mode is CHAIN-WIDE genesis field

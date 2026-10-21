@@ -233,9 +233,11 @@ pub const META_RUNNING_STATE_HASH: &[u8] = b"running_state_hash";
 /// [`META_STATE_HASH_CONFIGURED_ACTIVATION`] (a configuration change resets the chain).
 pub const META_RUNNING_STATE_HASH_ACTIVATION: &[u8] = b"running_state_hash_activation";
 
-/// Key in CF_CONSENSUS_META (node-local copy of the chain config): the CHAIN-WIDE running hash
-/// activation height (genesis `consensus.state_hash_activation_height`), 8 BE. Absent = the
-/// running hash is disabled. Written at boot by `running_hash::configure_activation`.
+/// Key in CF_CONSENSUS_META (node-local copy of what the committed headers say): the CHAIN-WIDE
+/// running hash activation height, the first height whose header carries the `RunningStateHash`
+/// feature bit (P0.0 phase 3), 8 BE. Absent = not hashing (yet). Written by execution through
+/// `running_hash::configure_activation` before the block that changes it, never from the node's
+/// schedule.
 pub const META_STATE_HASH_CONFIGURED_ACTIVATION: &[u8] = b"state_hash_cfg_activation";
 
 /// Key in CF_CONSENSUS_META (node-local): the first height at which this node could not extend

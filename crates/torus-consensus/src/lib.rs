@@ -12,6 +12,7 @@ pub mod app;
 pub mod da_gc;
 pub mod da_gc_worker;
 pub mod exec_pipeline;
+pub(crate) mod feature_status;
 pub mod genesis;
 pub mod kv_store;
 pub mod network;

@@ -101,6 +101,13 @@ pub const DELIST_SETTLE_TAG: u8 = torus_types::DELIST_SETTLE_TAG;
 /// proposal's execution while the settlement price is not fixed, consumed
 /// (deleted) by the settlement step when it fixes the price.
 pub const DELIST_CLOSE_PRICE_TAG: u8 = torus_types::DELIST_CLOSE_PRICE_TAG;
+/// Delist keep-close-price (owner s134): `0x0A ‖ market(8)` -> `close_at(8,
+/// BE) ‖ price raw(16, BE) ‖ settled_height(8, BE)`: a settled market's kept
+/// settlement record ([`DelistSettled`]), written when the walk ends (same
+/// block as the 0x08 delete), never deleted. Not an active settlement: the
+/// 0x08 scans, the ADL drain, the liquidation scan and the oracle stop never
+/// read it.
+pub const DELIST_SETTLED_TAG: u8 = torus_types::DELIST_SETTLED_TAG;
 /// Delist option C: traders of `CF_NATIVE_POSITIONS` one block's settlement
 /// step visits (all settling markets together; the walk is the liquidation
 /// step's C1 walk), and the positions it closes at most. The rest waits for
@@ -899,6 +906,44 @@ pub fn put_delist_settlement<T: StateBackend>(state: &T, s: &DelistSettlement) -
 pub fn delete_delist_settlement<T: StateBackend>(state: &T, m: MarketId) -> Result<(), CoreError> {
     state.delete_cf_raw(CF_NATIVE_LIQUIDATION, &delist_settle_key(m))?;
     Ok(())
+}
+
+/// Delist keep-close-price (owner s134): a settled market's kept record,
+/// written in the block its settlement walk ended. `close_at` and `price`
+/// are the settlement row's; `settled_height` = the block the walk ended
+/// (the 0x08 row was deleted).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DelistSettled {
+    pub market: MarketId,
+    pub close_at: u64,
+    pub price: FixedPoint,
+    pub settled_height: u64,
+}
+
+/// Write `s` (the walk's end).
+pub fn put_delist_settled<T: StateBackend>(state: &T, s: &DelistSettled) -> Result<(), CoreError> {
+    let mut v = Vec::with_capacity(32);
+    v.extend_from_slice(&s.close_at.to_be_bytes());
+    v.extend_from_slice(&s.price.raw().to_be_bytes());
+    v.extend_from_slice(&s.settled_height.to_be_bytes());
+    state.put_cf_raw(CF_NATIVE_LIQUIDATION, &torus_types::delist_settled_key(s.market), &v)?;
+    Ok(())
+}
+
+/// `m`'s kept settlement record, if its settlement walk ended. A row that is
+/// not 32 bytes is a malformed-row error.
+pub fn delist_settled<T: StateBackend>(state: &T, m: MarketId) -> Result<Option<DelistSettled>, CoreError> {
+    let Some(v) = state.get_cf_raw(CF_NATIVE_LIQUIDATION, &torus_types::delist_settled_key(m))? else {
+        return Ok(None);
+    };
+    let bad = || malformed("delist settled record");
+    if v.len() != 32 {
+        return Err(bad());
+    }
+    let close_at = u64::from_be_bytes(v[..8].try_into().map_err(|_| bad())?);
+    let price = FixedPoint::from_raw(i128::from_be_bytes(v[8..24].try_into().map_err(|_| bad())?));
+    let settled_height = u64::from_be_bytes(v[24..32].try_into().map_err(|_| bad())?);
+    Ok(Some(DelistSettled { market: m, close_at, price, settled_height }))
 }
 
 /// `m`'s settlement row, if any.

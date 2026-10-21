@@ -255,6 +255,8 @@ impl BlockValidator {
             beneficiary: block.header.proposer,
             gas_limit: block.header.evm_block_gas_cap(),
             base_fee: block.header.base_fee_per_gas,
+            // P0.0 phase 2: the spec of the executed header's bits.
+            features: block.header.features,
         };
 
         let mut exec_result = match reads {
@@ -385,6 +387,8 @@ impl BlockValidator {
             beneficiary: block.header.proposer,
             gas_limit: block.header.evm_gas_limit,
             base_fee: block.header.base_fee_per_gas,
+            // P0.0 phase 2: the spec of the executed header's bits.
+            features: block.header.features,
         };
 
         let mut exec_result =

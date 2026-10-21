@@ -55,7 +55,7 @@ The binary is at `target/release/torus-node`.
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--genesis` | path | none | Path to genesis.json (required for first run) |
+| `--genesis` | path | none | Path to genesis.json (required for first run; afterwards the same file, see [Genesis](#genesis)) |
 | `--data-dir` | path | `./data` | RocksDB data directory |
 | `--validator-key` | hex | none | **DEPRECATED** Ed25519 signing key (visible in ps/history) |
 | `--keystore` | path | none | Path to encrypted keystore file |
@@ -128,7 +128,172 @@ The `--genesis` flag points to a `genesis.json` file that contains:
 - Initial validator set
 
 Genesis initialization only runs on first start (when the database is empty).
-Subsequent starts skip genesis even if `--genesis` is provided.
+Subsequent starts do not apply it again, but the chain configuration (chain id,
+timeouts, feature activations, ...) is still read from the file at every start.
+
+The data directory is therefore bound to its genesis file: the first start
+stores a digest of the file (`genesis digest stored: this data dir is bound to
+the genesis file`), and a later start whose file differs refuses to start,
+naming the changed fields:
+
+```
+refusing to start: genesis file /etc/torus/genesis.json differs from the genesis data dir /data was initialized with (stored digest 0x.., file digest 0x..); changed: consensus.timeout_base_ms. ...
+```
+
+Only values count: reformatting the file or reordering its keys is fine.
+Restore the original file, or start from a fresh data directory to run a new
+genesis. A data directory created by an older build has no stored digest; its
+first start with this build stores the digest of the file it is given (logged
+as a warning, since it cannot be checked against the original). A bound data
+directory started without `--genesis` refuses to start.
+
+## Running state hash: a hash-unverified node
+
+With the running state hash on (genesis `consensus.activations.running_state_hash`;
+it starts at the first block whose header carries the `RunningStateHash` bit),
+each node chains a hash of its state over every block, and validators started
+with `--state-hash-attest-key` post the hash every 100 blocks so nodes can
+compare them on-chain. A node whose stored chain rows are lost (a data dir
+restored without them, a damaged DB) or that skipped a height cannot extend
+the chain: it is **hash-unverified**. Such a node:
+
+- keeps running, executing and voting (it is not stopped);
+- logs `RUNNING STATE HASH UNVERIFIED` at ERROR level at startup and again
+  every 60 seconds while it lasts;
+- sets the gauge `torus_state_hash_unverified` to 1 (alert on it);
+- submits **no** state-hash attestations, not even for checkpoints it still
+  holds from before the loss, and takes no fail-stop decision on a quorum
+  mismatch (mismatches are still reported).
+
+It stays that way until the chain is valid again: resync the node from a
+fresh data dir, or restore a data dir that has its chain rows.
+Options considered (owner, s134): (a) keep running and only log it; (b) keep
+running and voting, ERROR + gauge, no attestations (chosen); (c) refuse to
+start.
+
+## Feature activations and upgrades
+
+A change to how blocks execute (a **feature**) switches on at a block height
+on every node at once. Each feature has a fixed id `N`; every block header
+carries `features`, a bitmap of the features on at its height (bit `N`).
+Validators refuse a header whose bits differ from their own schedule, and
+execution (crash replay and block sync included) runs each block by its
+header's bits, never by the local schedule or clock. A feature can only be
+used by a binary that knows it; this binary's features are logged at startup
+(`features this binary knows`).
+
+### How an activation is scheduled
+
+A node's schedule is the genesis `consensus.activations` united with the
+table built into the binary for the chain id:
+
+- **New chain (genesis):** `"consensus": {"activations": {"<feature_name>": <height>}}`.
+  Heights 0 and 1 both mean "from block 1"; those bits are in the genesis
+  parent header too, so a node with another genesis set fails block 1. An
+  unknown feature name refuses to start (`invalid activations: ...`). The old
+  field `consensus.state_hash_activation_height` is an alias of
+  `activations.running_state_hash`; both set and different refuses to start.
+- **Running chain (a release):** the genesis file of a running chain cannot
+  change (see "Genesis": the data dir refuses a changed file). A release
+  carries the height in its built-in table (`builtin_activations`,
+  `crates/torus-types/src/features.rs`, one row per chain id). A feature named
+  in both the genesis and the table with different heights refuses to start
+  (`feature <name> is at height <g> in the genesis and at <h> in this
+  binary's built-in table`).
+- Governance-scheduled activations (`ScheduleActivation`) do not exist yet.
+
+### Before the activation height H
+
+1. Install the release on **every** validator and every RPC / full node. A
+   block at H needs a quorum (more than 2/3 of the stake) of validators with
+   the same schedule; with 3 validators that is all of them. Fewer: the chain
+   stalls at H on every node (no fork) until enough validators upgrade, then
+   it continues from H.
+2. Restart normally: same data dir, same genesis file. Nothing is migrated;
+   the node goes on from its applied height.
+3. Check each node:
+   - startup log: `feature activation scheduled feature=<name> id=<N> height=<H>`;
+   - `torus_getFeatureSchedule` (below): the feature is in `knownFeatures` and
+     in `schedule` with `activationHeight` H, the same on every node;
+   - gauges: `torus_feature_activation_height{feature="<name>"}` = H,
+     `torus_feature_blocks_until_activation` counting down
+     (alert `FeatureActivationApproaching` under 10000 blocks).
+
+```
+curl -s -H 'content-type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"torus_getFeatureSchedule","params":[]}' \
+  http://127.0.0.1:8545
+```
+
+The reply (heights and bitmaps are hex):
+
+| Field | Meaning |
+|-------|---------|
+| `chainId`, `height` | The chain id and the latest block this RPC serves; `active` / `activeBits` are read at `height` |
+| `activeBits` | The feature bits a header at `height` carries under this node's schedule |
+| `knownBits`, `knownFeatures[]` | What this binary can execute: `name`, `id`, `bit` |
+| `schedule[]` | Each scheduled feature: `name`, `id`, `bit`, `activationHeight`, `active` (on at `height`), `builtIn` (this binary's table names it; else genesis only) |
+| `nextActivationHeight`, `blocksUntilActivation` | The next activation above `height` (`null`: none) |
+| `upgradeRequired` | `{feature, height}` once this node met a header with a feature it does not know, else `null` |
+
+At H every header carries the bit and `torus_feature_active{feature="<name>"}`
+turns 1 once the node applied H.
+
+### UPGRADE REQUIRED (a node on an old release)
+
+A node that does not know a feature the network switched on cannot take part
+from H on. It:
+
+- refuses to vote on, insert or propose on a header with the unknown bit and
+  logs at ERROR: `UPGRADE REQUIRED: feature <N> at <H> -- refusing a header
+  with a feature this binary does not know` (or `-- refusing to propose on it`);
+  block sync logs `block_sync: UPGRADE REQUIRED -- block at height <H> from
+  <peer> ...` and does not blacklist the upgraded peer;
+- keeps running with its applied and committed heights below H (no fork, no
+  state change);
+- sets `torus_upgrade_required` = 1, `torus_upgrade_required_feature` = N and
+  `torus_upgrade_required_height` = the lowest such height (H); counts
+  `torus_upgrade_required_refusals_total{site}`; `torus_getFeatureSchedule`
+  returns `upgradeRequired: {"feature": N, "height": "0x.."}`. Alert:
+  `UpgradeRequired`.
+
+If a block with an unknown bit is already committed in its data dir (an
+upgraded node downgraded, or a crash after commit), execution stops before it
+(`UPGRADE REQUIRED: feature <N> at <H> -- this binary cannot execute the
+committed block (fail-stop)`), nothing of H is written, and the process exits
+with code 70 (`FATAL: execution pipeline has died`). A supervisor restarting
+the same binary gets the same exit.
+
+**Recovery:** install the release that knows feature N (the network's
+release), restart with the same data dir and genesis file. The node replays
+or syncs on from below H and rejoins; no resync is needed. The gauges reset
+with the restart.
+
+A node that knows the feature but has **another height** for it (the wrong
+release) rejects the headers at the network's H with
+`REJECTED -- header feature bits differ from this node's activation schedule`
+(WARN; no vote, no insertion) and stops there; `torus_upgrade_required` stays
+0. Compare `torus_getFeatureSchedule` with an upgraded node and run the
+network's release. Blocks it already committed execute by their header bits
+(logged at ERROR: `committed header feature bits differ from this node's
+activation schedule -- executing by the header`).
+
+### Genesis file refused (`refusing to start: genesis file ... differs`)
+
+Scheduling a feature by editing the genesis file of a running chain does not
+work: the data dir is bound to the file it was initialized with and refuses a
+changed one, naming the changed fields (`changed: consensus.activations.<name>`).
+Restore the original file (keep a copy of it with each data dir); a new
+activation on a running chain comes with a release (above). Only a new chain
+(fresh data dirs on every node) takes a new genesis.
+
+### Running state hash after an activation
+
+The running state hash is the feature `running_state_hash` (id 0): each node
+starts its hash chain at the first block whose header carries bit 0. A node
+that lost its chain rows keeps running, hash-unverified (see "Running state
+hash: a hash-unverified node", `torus_state_hash_unverified` = 1); recover by
+resyncing from a fresh data dir or restoring a data dir that has its rows.
 
 ### Order-book storage mode (`consensus.book_mode`)
 

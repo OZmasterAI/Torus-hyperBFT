@@ -36,6 +36,7 @@ fn block_cfg() -> BlockEnvCfg {
         beneficiary: Address::with_last_byte(0xFF),
         gas_limit: 30_000_000,
         base_fee: 1_000_000_000,
+        features: 0,
     }
 }
 

@@ -1282,6 +1282,12 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
         Ok(())
     }
 
+    /// Fail-stop boot reconcile: drop the app feed frontier (the app holds no
+    /// committed height at all, see [`committed_feed`](crate::committed_feed)).
+    pub fn delete_app_fed_block_height(&mut self) {
+        self.0.delete(&variables::APP_FED_BLOCK_HEIGHT);
+    }
+
     /* ↓↓↓ Block to Children ↓↓↓ */
 
     pub fn set_children(
@@ -1825,6 +1831,14 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         wb.set_app_fed_block_height(height)?;
         self.write(wb);
         Ok(())
+    }
+
+    /// Fail-stop boot reconcile: durably drop the fed frontier (the next feed
+    /// pass is a first pass again).
+    pub fn reset_app_fed_block_height(&mut self) {
+        let mut wb: BlockTreeWriteBatch<K::WriteBatch> = BlockTreeWriteBatch::new();
+        wb.delete_app_fed_block_height();
+        self.write(wb);
     }
 
     /// Block-tree pruner: prune committed blocks that fell out of the retention

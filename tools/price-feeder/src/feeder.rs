@@ -184,6 +184,7 @@ impl<H: HttpGet + 'static, N: NodeApi, C: Clock> Feeder<H, N, C> {
     fn aggregate_all(
         &self,
         listed: &BTreeSet<MarketId>,
+        closed: &BTreeSet<MarketId>,
         now: u64,
     ) -> (BTreeMap<MarketId, FixedPoint>, BTreeMap<MarketId, Omission>) {
         let rules = rules(&self.cfg);
@@ -191,6 +192,10 @@ impl<H: HttpGet + 'static, N: NodeApi, C: Clock> Feeder<H, N, C> {
         let mut prices = BTreeMap::new();
         let mut omitted = BTreeMap::new();
         for m in &self.cfg.markets {
+            if closed.contains(&m.market_id) {
+                omitted.insert(m.market_id, Omission { reason: "delist settled".into(), sources: 0, weight: 0 });
+                continue;
+            }
             if !listed.contains(&m.market_id) {
                 omitted.insert(m.market_id, Omission { reason: "not listed".into(), sources: 0, weight: 0 });
                 continue;
@@ -260,15 +265,23 @@ impl<H: HttpGet + 'static, N: NodeApi, C: Clock> Feeder<H, N, C> {
                 return CycleReport::new(CycleOutcome::MarketsUnavailable(e));
             }
         };
+        // Delist follow-up: a market whose delist settlement is complete is
+        // dropped (the chain ignores its prices), reported as "delist settled".
+        let mut closed = BTreeSet::new();
         let listed: BTreeSet<MarketId> = self
             .cfg
             .markets
             .iter()
             .filter(|m| {
-                markets
-                    .iter()
-                    .find(|x| x.id == m.market_id)
-                    .is_some_and(|x| check_listing(m.market_id, &m.base_asset, x).is_ok())
+                let Some(x) = markets.iter().find(|x| x.id == m.market_id) else { return false };
+                if check_listing(m.market_id, &m.base_asset, x).is_err() {
+                    return false;
+                }
+                if x.oracle_closed {
+                    closed.insert(m.market_id);
+                    return false;
+                }
+                true
             })
             .map(|m| m.market_id)
             .collect();
@@ -281,7 +294,7 @@ impl<H: HttpGet + 'static, N: NodeApi, C: Clock> Feeder<H, N, C> {
         self.record_venues();
 
         // 4. Aggregate.
-        let (prices, omitted) = self.aggregate_all(&listed, now);
+        let (prices, omitted) = self.aggregate_all(&listed, &closed, now);
         let mut report = CycleReport::new(CycleOutcome::NothingToSend);
         {
             let mut st = self.status.lock().unwrap();
@@ -403,7 +416,7 @@ mod tests {
     }
 
     fn markets(ids: &[(u64, &str)]) -> Vec<MarketInfo> {
-        ids.iter().map(|&(id, b)| MarketInfo { id, base_asset: b.into(), quote_asset: "USD".into() }).collect()
+        ids.iter().map(|&(id, b)| MarketInfo { id, base_asset: b.into(), quote_asset: "USD".into(), oracle_closed: false }).collect()
     }
 
     fn node(status: &str) -> FakeNode {
@@ -570,6 +583,31 @@ mod tests {
         clock.set(T0 + 6_000);
         assert!(matches!(f.run_cycle().await.outcome, CycleOutcome::MarketsUnavailable(_)));
         assert_eq!(n.submitted().len(), 2);
+    }
+
+    /// Delist follow-up: a market whose delist settlement is complete
+    /// (`getMarkets` `settlement: "settled"`) is no longer submitted; the
+    /// others still are. Re-read every cycle like the listing.
+    #[tokio::test]
+    async fn settled_delisted_market_is_not_submitted() {
+        let (http, clock, n) = (Arc::new(FakeHttp::with_fixtures()), FakeClock::new(T0), node("active"));
+        let mut ms = markets(&[(1, "BTC"), (2, "ETH")]);
+        ms[1].oracle_closed = true;
+        n.set_markets(Ok(ms));
+        let mut f = feeder(cfg(""), &n, &http, &clock);
+        let r = f.run_cycle().await;
+        assert_eq!(r.outcome, CycleOutcome::Submitted { ok: 1, failed: 0 }, "{r:?}");
+        assert_eq!(prices(&n.submitted()[0]).iter().map(|p| p.0).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(r.omitted.get(&2).map(String::as_str), Some("delist settled"), "{:?}", r.omitted);
+        assert_eq!(f.status().lock().unwrap().markets[&2].omitted.as_deref(), Some("delist settled"));
+
+        // Only settled markets left: nothing is sent.
+        let mut ms = markets(&[(1, "BTC"), (2, "ETH")]);
+        ms.iter_mut().for_each(|m| m.oracle_closed = true);
+        n.set_markets(Ok(ms));
+        clock.set(T0 + 3_000);
+        assert_eq!(f.run_cycle().await.outcome, CycleOutcome::NothingToSend);
+        assert_eq!(n.submitted().len(), 1);
     }
 
     /// Review L3: a quote's age is the venue's own timestamp when it sends one

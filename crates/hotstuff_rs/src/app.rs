@@ -54,7 +54,7 @@ use crate::{
     hotstuff::types::EquivocationEvidence,
     types::{
         block::Block,
-        data_types::{CryptoHash, Data, ViewNumber},
+        data_types::{BlockHeight, CryptoHash, Data, ViewNumber},
         update_sets::{AppStateUpdates, ValidatorSetUpdates},
     },
 };
@@ -243,6 +243,41 @@ pub trait App<K: KVStore>: Send {
         // Default no-op for backward compatibility.
     }
 
+    /// Fail-stop seam of the commit feed ([`committed_feed`](crate::committed_feed)):
+    /// `true` once the app has halted and refuses committed blocks (e.g.
+    /// torus-consensus after its `exec_failed` latch, where
+    /// [`on_committed_block`](Self::on_committed_block) returns before any
+    /// durable write). The feed then stops: it does not deliver further
+    /// blocks and does not count the block whose callback found it halted as
+    /// delivered, so the durable fed frontier never moves past a block the app
+    /// refused and a restarted app receives it again (before this seam the
+    /// frontier advanced over refused blocks and the restarted app never got
+    /// them: execution froze silently).
+    ///
+    /// Must be monotonic for the life of the app instance (once `true`, stays
+    /// `true`). Called on the algorithm thread before and after every
+    /// delivery: keep it cheap. Default `false`.
+    fn committed_feed_halted(&self) -> bool {
+        false
+    }
+
+    /// Boot reconcile seam of the commit feed: the lowest committed height the
+    /// app does NOT durably hold (it holds every committed height below it and
+    /// needs delivery from it on), or `None` when the app does not track this
+    /// (default).
+    ///
+    /// Called once when the algorithm thread starts, before the boot feed. If
+    /// the durable fed frontier is at or above this height (blocks counted
+    /// delivered that the app never kept: a store left by a binary without
+    /// [`committed_feed_halted`](Self::committed_feed_halted), or a manifest
+    /// lost while the frontier survived), the frontier is lowered to just
+    /// below it and the boot feed re-delivers those blocks from the local
+    /// tree. Under-reporting only causes re-deliveries the at-least-once
+    /// contract already requires the app to skip; it never skips a height.
+    fn committed_feed_resume_height(&self) -> Option<BlockHeight> {
+        None
+    }
+
     /// MonadBFT B3: Called when a speculatively committed block is rolled back
     /// due to leader equivocation.
     ///
@@ -405,4 +440,11 @@ pub enum ValidateBlockResponse {
     /// invalid: the missing data should be fetched and validation retried. During
     /// block-sync this means the serving peer must NOT be blacklisted.
     MissingData,
+
+    /// The block uses a protocol feature this binary does not know (a newer
+    /// release's, torus P0.0 activation gating): this replica cannot insert or
+    /// execute it until it is upgraded, but the block is not invalid. Insertion
+    /// treats it like `Invalid` (not inserted); block sync ends the session
+    /// WITHOUT blacklisting the serving peer (it served a valid block).
+    UnsupportedUpgrade,
 }

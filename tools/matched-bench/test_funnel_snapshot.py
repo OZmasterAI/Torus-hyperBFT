@@ -24,7 +24,7 @@ DEAD = 'http://127.0.0.1:9'
 
 class FunnelSnapshotTests(unittest.TestCase):
     def run_snapshot_pair(self, overrides=None, failed=(), remove_helper=None, attest='0',
-                          rpc=DEAD, window=None):
+                          rpc=DEAD, window=None, live=None):
         """window: a dict, filled with OUT/digest-attest-window.json (or None)."""
         script = Path(__file__).with_name('run-cell.sh').read_text()
         functions = script[script.index('funnel_counters() {\n'):
@@ -36,6 +36,9 @@ class FunnelSnapshotTests(unittest.TestCase):
         before = line('ATTEST_WIN_LO=') + '\n' + line('Q_BEFORE_OK=') + '\n' + line('if Q_BEFORE=')
         after = line('Q_AFTER_OK=') + '\n' + line('if Q_AFTER=') + '\n' + line('ATTEST_WIN_OK=')
         compare = line('if [ "$Q_BEFORE_OK"')
+        # the validators after the load: run-cell's default line, or the KILL_NO_RESTART survivors
+        live_idx = line('LIVE_IDX=(0 1 2)') if live is None else 'LIVE_IDX=(%s)' % ' '.join(map(str, live))
+        live_rpcs = line('LIVE_RPCS=(); for i in')
         with tempfile.TemporaryDirectory() as directory:
             for phase in ('before', 'after'):
                 for node in ('0', '1', '2'):
@@ -49,11 +52,13 @@ METS=(0 1 2)
 RPCS=(%s %s %s)
 SELF_DIR=%s
 OUT=$FIXTURES
+%s
+%s
 scrape_one() {
     cat "$FIXTURES/$PHASE-$1"
     [ ! -e "$FIXTURES/$PHASE-$1.fail" ]
 }
-''' % (attest, rpc, rpc, rpc, Path(__file__).parent) + functions
+''' % (attest, rpc, rpc, rpc, Path(__file__).parent, live_idx, live_rpcs) + functions
             if remove_helper:
                 command += f'\nunset -f {remove_helper}\n'
             command += '\nPHASE=before\n' + before + '\nPHASE=after\n' + after + '\n' + compare
@@ -212,6 +217,14 @@ scrape_one() {
         self.assertEqual(self.run_snapshot_pair(), '1 1 1')
         self.assertEqual(self.run_snapshot_pair(rpc=DEAD, window={}), '1 1 1')
 
+    def test_kill_no_restart_snapshots_the_survivors_only(self):
+        """KILL_NO_RESTART=val2: the dead node's scrape fails for good; the survivors' snapshot decides"""
+        dead = ('before-2', 'after-2')
+        self.assertEqual(self.run_snapshot_pair(failed=dead), '0 0 0')
+        self.assertEqual(self.run_snapshot_pair(failed=dead, live=(0, 1)), '1 1 1')
+        changed = GOOD.replace(COUNTERS[0] + ' 1', COUNTERS[0] + ' 5')
+        self.assertEqual(self.run_snapshot_pair({'after-1': changed}, failed=dead, live=(0, 1)), '0 1 1')
+
     def test_missing_parser_or_snapshot_helper_cannot_prove_quiescence(self):
         for helper in ('funnel_counters', 'funnel_snapshot'):
             with self.subTest(helper=helper):
@@ -225,13 +238,15 @@ class AfterSnapshotTests(unittest.TestCase):
     on the idle chain, so three sequential scrapes can straddle an attestation
     block; re-scrape (bounded) until the native counters agree."""
 
-    def run_after(self, bodies, attest='1'):
+    def run_after(self, bodies, attest='1', live=None):
         """bodies[node] = [body of scrape 1, 2, ...] (the last one repeats)"""
         script = Path(__file__).with_name('run-cell.sh').read_text()
         start = script.index('after_snapshots() {\n')
         function = script[start:script.index('\n}\n', start) + 3]
         mval = next(l for l in script.splitlines() if l.startswith('mval() {'))
         attest_on = next(l for l in script.splitlines() if l.startswith('state_attest_on() {'))
+        live_idx = (next(l for l in script.splitlines() if l.startswith('LIVE_IDX=(0 1 2)')) if live is None
+                    else 'LIVE_IDX=(%s)' % ' '.join(map(str, live)))
         with tempfile.TemporaryDirectory() as directory:
             for node, seq in enumerate(bodies):
                 for n, body in enumerate(seq, 1):
@@ -245,6 +260,7 @@ METS=(0 1 2)
 OUT={out}
 {mval}
 {attest_on}
+{live_idx}
 log() {{ echo "LOG $*"; }}
 sleep() {{ :; }}
 scrape_one() {{
@@ -254,12 +270,13 @@ scrape_one() {{
 }}
 {function}
 after_snapshots
-for i in 0 1 2; do echo "CALLS $i $(cat "$FIXTURES/calls-$i")"; done
+for i in 0 1 2; do echo "CALLS $i $(cat "$FIXTURES/calls-$i" 2>/dev/null || echo 0)"; done
 '''
             result = subprocess.run(['bash', '-c', command],
                                     env={**os.environ, 'FIXTURES': directory},
                                     capture_output=True, text=True, timeout=10, check=True)
-            files = [Path(out, f'metrics-after-val{i}.txt').read_text() for i in range(3)]
+            files = [Path(out, f'metrics-after-val{i}.txt').read_text()
+                     if Path(out, f'metrics-after-val{i}.txt').exists() else None for i in range(3)]
             return result.stdout, files
 
     @staticmethod
@@ -284,6 +301,16 @@ for i in 0 1 2; do echo "CALLS $i $(cat "$FIXTURES/calls-$i")"; done
         self.assertIn('CALLS 2 10', out)
         self.assertIn('LOG WARNING: metrics-after: torus_native_actions_processed_total still apart', out)
         self.assertEqual(files, [b(30), b(33), b(30)])
+
+    def test_kill_no_restart_scrapes_the_survivors_only(self):
+        """KILL_NO_RESTART=val2: no metrics-after file for the dead node, its scrape is never tried, and the
+        attest re-scrape compares the survivors only"""
+        b = self.body
+        out, files = self.run_after([[b(30), b(33)], [b(33)], [b(99)]], live=(0, 1))
+        self.assertIn('CALLS 2 0', out)
+        self.assertIn('CALLS 0 2', out)
+        self.assertEqual(files, [b(33), b(33), None])
+        self.assertNotIn('WARNING', out)
 
     def test_attest_off_is_one_scrape(self):
         b = self.body
