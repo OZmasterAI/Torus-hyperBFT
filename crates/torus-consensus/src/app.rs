@@ -97,6 +97,35 @@ enum CloseKind {
     TestDue,
 }
 
+/// 8k L3.1 vs the running state hash: THE one place the L3.1 gate
+/// ([`ExecutionContext::configure_book_coalesce`]) keys on the hash. With the
+/// hash on, an `h_n` that covers the order-book CF needs that block's book
+/// bytes, which L3.1's node-local windows defer; L6.1 takes the books out of
+/// every non-attest `h_n` from its activation (`book_window`:
+/// [`ChainConfig::book_window_activation`]). So L3.1 may run iff no height is
+/// hashed with books per block: no hash (`hash_activation` `None`), or L6.1
+/// active from the hash's first height on (`book_window <= hash_activation`).
+/// Today L6.1 starts with the hash, so on an L6.1 chain the two are equal.
+/// P0.0 (L6.1's own activation height) switches only here: a later L6.1
+/// activation keeps L3.1 off for the whole run (conservative, boot-time);
+/// turning it on from that height is a per-height rule P0.0 adds here.
+/// `Some(reason)`: blocked.
+fn l31_hash_blocker(
+    hash_activation: Option<u64>,
+    book_window: Option<u64>,
+) -> Option<&'static str> {
+    match (hash_activation, book_window) {
+        (None, _) => None,
+        (Some(hash), Some(window)) if window <= hash => None,
+        (Some(_), Some(_)) => Some(
+            "the running state hash is configured (genesis state_hash_activation_height) and L6.1 (book_window_commit) starts after it",
+        ),
+        (Some(_), None) => Some(
+            "the running state hash is configured (genesis state_hash_activation_height) without L6.1 (book_window_commit)",
+        ),
+    }
+}
+
 /// L6.1 (genesis `consensus.book_window_commit`): window-committed books
 /// need the Classic book mode. Row modes (`TORUS_BOOK_ROWS` 1 / 2 / 3) write
 /// per-order and level rows to the same CF every block, which the L6.1 digest
@@ -3540,13 +3569,14 @@ impl ExecutionContext {
     /// Otherwise warns once with the reason and stays off. Requested by
     /// default since s131 (perf doc section 110): unset / empty / `1` /
     /// `true`; `0` / `false` turn it off without a log line. L6.1
-    /// (`book_window`: genesis `book_window_commit`) allows it with the hash
-    /// on.
+    /// (`book_window`: its activation height,
+    /// [`ChainConfig::book_window_activation`]) allows it with the hash on;
+    /// the rule is [`l31_hash_blocker`].
     fn configure_book_coalesce(
         &mut self,
         requested: bool,
         hash_activation: Option<u64>,
-        book_window: bool,
+        book_window: Option<u64>,
     ) {
         self.configure_book_coalesce_with(
             requested,
@@ -3563,7 +3593,7 @@ impl ExecutionContext {
         &mut self,
         requested: bool,
         hash_activation: Option<u64>,
-        book_window: bool,
+        book_window: Option<u64>,
         book_blocker: Option<&'static str>,
     ) {
         self.book_coalesce = false;
@@ -3578,10 +3608,8 @@ impl ExecutionContext {
             // coalesced blobs (added only at the close; ~155 MB at P1M), so
             // the cap would be silently blind to them.
             Some("a checkpoint byte cap is set (TORUS_CHECKPOINT_MAX_BYTES): it cannot count the coalesced book blobs")
-        } else if hash_activation.is_some() && !book_window {
-            // L6.1 (`book_window`) takes the book bytes out of every
-            // non-attest h_n, so node-local windows cannot fork it.
-            Some("the running state hash is configured (genesis state_hash_activation_height) without L6.1 (book_window_commit)")
+        } else if let Some(reason) = l31_hash_blocker(hash_activation, book_window) {
+            Some(reason)
         } else {
             book_blocker
         };
@@ -7193,7 +7221,7 @@ impl TorusApp {
         exec_ctx.configure_book_coalesce(
             crate::exec_pipeline::book_coalesce_requested(),
             config.state_hash_activation_height,
-            config.book_window_commit,
+            config.book_window_activation(),
         );
         // s124: the epoch fast path only changes which blocks take the
         // pipelined path, so it needs W.
@@ -37962,6 +37990,9 @@ mod crash_recovery_tests {
         /// b0: `(S, full CF dump)` each time the durable marker moved (as
         /// `roots`), recorded only while [`P2_DUMP_DURABLE`] is set.
         dumps: Vec<(u64, Vec<CfDump>)>,
+        /// 8k L3.1: `configure_book_coalesce` turned L3.1 on for the run's
+        /// last context (every context of a run has the same inputs).
+        book_coalesce: bool,
     }
 
     thread_local! {
@@ -38219,6 +38250,7 @@ mod crash_recovery_tests {
         let metrics = Arc::new(torus_telemetry::Metrics::new());
         let what = format!("pipelined={pipelined} {mode:?} reference={reference} {fault:?}");
         let gate = crate::exec_pipeline::WorkerGate::new();
+        let book_coalesce_on = std::cell::Cell::new(false);
         let new_ctx = |attach: bool| {
             let mut ctx = make_exec_ctx(&config, &db);
             // `None`: Classic without the resident holder (the per-block
@@ -38244,8 +38276,9 @@ mod crash_recovery_tests {
             ctx.configure_book_coalesce(
                 P2_BOOK_COALESCE.get(),
                 config.state_hash_activation_height,
-                config.book_window_commit,
+                config.book_window_activation(),
             );
+            book_coalesce_on.set(ctx.book_coalesce);
             ctx.test_l61_skip_full_save = P2_L61_SKIP_FULL.get();
             ctx.test_coalesce_skip = P2_COALESCE_SKIP.get();
             if let Some(seed) = P2_CKPT_RANDOM.get() {
@@ -38520,6 +38553,7 @@ mod crash_recovery_tests {
             cloid_checked,
             r_db_checked,
             dumps,
+            book_coalesce: book_coalesce_on.get(),
         }
     }
 
@@ -39053,7 +39087,7 @@ mod crash_recovery_tests {
             ctx.configure_book_coalesce(
                 true,
                 torus_state::running_hash::read_configured_activation(db),
-                torus_state::running_hash::read_book_window(db).is_some(),
+                torus_state::running_hash::read_book_window(db),
             );
             assert!(ctx.book_coalesce, "L3.1 on");
             ctx
@@ -39150,14 +39184,14 @@ mod crash_recovery_tests {
             (false, None, false),
             (true, None, true),
         ] {
-            ctx.configure_book_coalesce(requested, hash, false);
+            ctx.configure_book_coalesce(requested, hash, None);
             assert_eq!(
                 ctx.book_coalesce, on,
                 "requested {requested}, hash {hash:?}"
             );
         }
         ctx.checkpoint = None;
-        ctx.configure_book_coalesce(true, None, false);
+        ctx.configure_book_coalesce(true, None, None);
         assert!(!ctx.book_coalesce, "no checkpoint interval");
         // A byte cap cannot count the coalesced blobs: it keeps L3.1 off.
         for cap in [1, 256 << 20] {
@@ -39166,7 +39200,7 @@ mod crash_recovery_tests {
                     max_bytes: Some(cap),
                     ..base
                 });
-                ctx.configure_book_coalesce(true, None, false);
+                ctx.configure_book_coalesce(true, None, None);
                 assert!(!ctx.book_coalesce, "byte cap {cap}");
             }
         }
@@ -39266,7 +39300,7 @@ mod crash_recovery_tests {
             ctx.checkpoint = ckpt;
             ctx.book_coalesce = true;
             let logs =
-                capture_logs(|| ctx.configure_book_coalesce_with(default, hash, false, book));
+                capture_logs(|| ctx.configure_book_coalesce_with(default, hash, None, book));
             assert!(!ctx.book_coalesce, "{reason}: stays off");
             assert_eq!(warns(&logs), 1, "{reason}: one warning\n{logs}");
             assert!(logs.contains(reason), "{reason}: named\n{logs}");
@@ -39277,7 +39311,7 @@ mod crash_recovery_tests {
         for ckpt in [ckpt_every(5), ckpt_never()] {
             ctx.checkpoint = Some(ckpt);
             let logs =
-                capture_logs(|| ctx.configure_book_coalesce_with(default, None, false, classic));
+                capture_logs(|| ctx.configure_book_coalesce_with(default, None, None, classic));
             assert!(ctx.book_coalesce, "preconditions hold: on by default");
             assert_eq!(warns(&logs), 0, "{logs}");
             assert_eq!(
@@ -39290,7 +39324,7 @@ mod crash_recovery_tests {
         for v in ["0", "false"] {
             let requested = crate::exec_pipeline::parse_book_coalesce(Some(v));
             let logs =
-                capture_logs(|| ctx.configure_book_coalesce_with(requested, None, false, classic));
+                capture_logs(|| ctx.configure_book_coalesce_with(requested, None, None, classic));
             assert!(!ctx.book_coalesce, "{v}: off");
             assert!(!logs.contains("TORUS_BOOK_COALESCE"), "{v}: silent\n{logs}");
         }
@@ -39869,15 +39903,41 @@ mod crash_recovery_tests {
         let (config, db) = p2_fixture();
         let mut ctx = make_exec_ctx(&config, &db);
         ctx.checkpoint = Some(ckpt_every(5));
+        // `window`: L6.1's activation height (`book_window_activation`).
         for (hash, window, on) in [
-            (Some(1), false, false),
-            (Some(1), true, true),
-            (Some(500), true, true),
-            (None, true, true),
-            (None, false, true),
+            (Some(1), None, false),
+            (Some(1), Some(1), true),
+            (Some(500), Some(500), true),
+            // P0.0 shapes: L6.1 after the hash leaves hashed heights with
+            // per-block books, so L3.1 stays off; from the hash on, on.
+            (Some(1), Some(500), false),
+            (Some(500), Some(1), true),
+            (None, Some(1), true),
+            (None, None, true),
         ] {
             ctx.configure_book_coalesce(true, hash, window);
-            assert_eq!(ctx.book_coalesce, on, "hash {hash:?}, L6.1 {window}");
+            assert_eq!(ctx.book_coalesce, on, "hash {hash:?}, L6.1 {window:?}");
+            assert_eq!(
+                l31_hash_blocker(hash, window).is_none(),
+                on,
+                "{hash:?} {window:?}"
+            );
+        }
+        // The production inputs: the gate reads L6.1's activation from the
+        // chain config, which today is the hash activation iff L6.1 is on
+        // (P0.0 changes `book_window_activation`, and so this gate).
+        for (hash, commit, on) in [
+            (Some(7), true, true),
+            (Some(7), false, false),
+            (None, false, true),
+        ] {
+            let mut c = config.clone();
+            c.state_hash_activation_height = hash;
+            c.book_window_commit = commit;
+            let window = c.book_window_activation();
+            assert_eq!(window, if commit { hash } else { None });
+            ctx.configure_book_coalesce(true, c.state_hash_activation_height, window);
+            assert_eq!(ctx.book_coalesce, on, "hash {hash:?}, commit {commit}");
         }
         assert!(check_book_window_mode(true, BookMode::Classic).is_ok());
         for mode in [
@@ -40252,6 +40312,12 @@ mod crash_recovery_tests {
                 coalesce,
                 fast,
                 &fault,
+            );
+            // Review nit (s131): the L3.1 cells really run L3.1 under L6.1
+            // with the hash on (not a fallback to the per-block encode).
+            assert_eq!(
+                run.book_coalesce, coalesce,
+                "{what}: L3.1 on iff requested"
             );
             assert_eq!(l31_divergence(&golden, &run), None, "{what}");
             assert_eq!(golden.hash, run.hash, "{what}: running hash");

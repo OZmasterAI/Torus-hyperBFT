@@ -91,6 +91,10 @@ the debt into the closing layer exactly as L3.1 does (those bytes are never hash
   the same CF, which this rule would drop.
 * All nodes agree because it is in genesis, like the activation height. When P0.0 lands it becomes
   `activations.book_window_commit` (height = the hash activation).
+* The L3.1 gate keys on the hash in one place, `l31_hash_blocker(hash_activation, book_window_activation)` (app.rs):
+  L3.1 runs iff no hash or L6.1 is active from the hash's first height. Its input is
+  `ChainConfig::book_window_activation()`, so P0.0 switches it there; an L6.1 activation after the hash keeps L3.1 off
+  for the run (a per-height rule is P0.0's to add).
 
 ## 6. Cost (estimates)
 
