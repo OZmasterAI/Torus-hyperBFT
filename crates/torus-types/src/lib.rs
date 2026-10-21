@@ -592,8 +592,9 @@ pub struct TorusBlockHeader {
     /// Validator set hash for this epoch.
     pub validator_set_hash: B256,
     /// P0.0: the bitmap of the [`Feature`]s active at this height
-    /// (`ActivationSchedule::active_at`; bit = feature id). Hashed, so it is in
-    /// every block hash and checked against each voter's own schedule
+    /// (`ActivationSchedule::active_at`; bit = feature id). Hashed (appended to
+    /// the canonical bytes when non-zero, so a header without bits keeps its
+    /// pre-P0.0 hash) and checked against each voter's own schedule
     /// (`check_parent_link`); execution reads the bits from here.
     #[serde(default)]
     pub features: u128,
@@ -634,7 +635,12 @@ impl TorusBlockHeader {
         buf.extend_from_slice(&self.epoch.to_be_bytes());
         buf.extend_from_slice(self.validator_set_hash.as_slice());
         // P0.0: the feature bits are agreed per block (`check_parent_link`).
-        buf.extend_from_slice(&self.features.to_be_bytes());
+        // Appended only when a feature is active, so a header without bits keeps
+        // its pre-P0.0 bytes and block hash. Every other field is fixed-width:
+        // the length tells the two encodings apart.
+        if self.features != 0 {
+            buf.extend_from_slice(&self.features.to_be_bytes());
+        }
         buf
     }
 
@@ -2660,12 +2666,18 @@ mod tests {
         let mut b = a.clone();
         b.features = 1;
         assert_ne!(a.canonical_header_bytes(), b.canonical_header_bytes());
+        // No bits: the pre-P0.0 encoding (and block hash); bits: 16 BE bytes appended.
+        let base = a.canonical_header_bytes();
+        assert_eq!(base.len(), 8 + 32 + 8 + 20 + 32 + 256 + 8 + 16 + 8 * 4 + 4 + 4 + 8 * 3 + 32);
+        assert_eq!(b.canonical_header_bytes(), [&base[..], &1u128.to_be_bytes()[..]].concat());
         let mut c = a.clone();
         c.features = 1 << 127;
         assert_ne!(b.canonical_header_bytes(), c.canonical_header_bytes());
-        let wire: TorusBlockHeader = bincode::deserialize(&bincode::serialize(&c).unwrap()).unwrap();
+        let wire: TorusBlockHeader =
+            bincode::deserialize(&bincode::serialize(&c).unwrap()).unwrap();
         assert_eq!(wire.features, 1 << 127);
-        let json: TorusBlockHeader = serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
+        let json: TorusBlockHeader =
+            serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
         assert_eq!(json.features, 1 << 127);
     }
 
