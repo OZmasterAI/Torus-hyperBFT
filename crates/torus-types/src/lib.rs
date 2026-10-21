@@ -1645,6 +1645,23 @@ pub const DELIST_SETTLE_TAG: u8 = 0x08;
 /// governance close price (`0x09 ‖ market(8)` -> price raw (16, BE)).
 pub const DELIST_CLOSE_PRICE_TAG: u8 = 0x09;
 
+/// Delist keep-close-price (owner s134): the `CF_NATIVE_LIQUIDATION` tag of
+/// a settled market's kept settlement record (`0x0A ‖ market(8)` ->
+/// `close_at(8, BE) ‖ price raw(16, BE) ‖ settled_height(8, BE)`), written in
+/// the block the settlement walk ends (the block that deletes the `0x08`
+/// row). Never deleted, never read by consensus: the close price and close
+/// height stay queryable after the settlement. 0x0A, not 0x08: no prefix scan
+/// of active settlement rows sees it.
+pub const DELIST_SETTLED_TAG: u8 = 0x0A;
+
+/// The key of `market_id`'s kept settlement record (`0x0A ‖ market`).
+pub fn delist_settled_key(market_id: MarketId) -> [u8; 9] {
+    let mut k = [0u8; 9];
+    k[0] = DELIST_SETTLED_TAG;
+    k[1..].copy_from_slice(&market_id.to_be_bytes());
+    k
+}
+
 /// The key of `market_id`'s delist settlement row (`0x08 ‖ market`).
 pub fn delist_settlement_key(market_id: MarketId) -> [u8; 9] {
     let mut k = [0u8; 9];

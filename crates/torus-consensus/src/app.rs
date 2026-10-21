@@ -28181,6 +28181,48 @@ mod crash_recovery_tests {
         assert_eq!(pm.get_native_balance(&s).unwrap().available, px(10_000_000 + 100));
     }
 
+    /// Keep-close-price (owner s134): `liq_fixture_db` with ORACLE_MARKET
+    /// delisted at height 0 and its settlement row due at 8.
+    fn delist_keep_fixture() -> (ChainConfig, StateDb) {
+        use torus_core::liquidation::{self as liq, DelistSettlement};
+        let (config, db) = liq_fixture_db(10, 1_000_000);
+        db.put_cf_raw(
+            torus_state::cf::CF_NATIVE_MARKETS,
+            &torus_types::market_delisted_key(ORACLE_MARKET),
+            &0u64.to_be_bytes(),
+        )
+        .unwrap();
+        let row = DelistSettlement { market: ORACLE_MARKET, close_at: 8, price: None, cursor: None };
+        liq::put_delist_settlement(&db, &row).unwrap();
+        (config, db)
+    }
+
+    /// Keep-close-price (owner s134): the settlement completes at block 8
+    /// (inside the replayed range 5..=10) and writes the kept record
+    /// `0x0A ‖ market` = (close_at 8, price 990, settled at 8) in the same
+    /// atomic batch that deletes the settlement row. Serial, pipelined
+    /// (parked) and crash replay: the same record, dumps and native root.
+    #[test]
+    fn delist_kept_close_price_serial_pipelined_and_replay_are_identical() {
+        use torus_core::liquidation::{self as liq, DelistSettled};
+        let mut rounds = vec![vec![oracle_sub(61, 1, 990), oracle_sub(62, 1, 990), oracle_sub(63, 1, 990)]];
+        rounds.extend(std::iter::repeat_n(Vec::new(), 9)); // 2..=10
+        let blocks = liq_blocks(rounds);
+        let (serial, root_s, db_s) = run_fixture(OracleRun::Serial, &blocks, delist_keep_fixture);
+        let (piped, root_p, db_p) = run_fixture(OracleRun::PipelinedParked, &blocks, delist_keep_fixture);
+        let (replay, root_r, db_r) = run_fixture(OracleRun::Replay, &blocks, delist_keep_fixture);
+        let want = DelistSettled { market: ORACLE_MARKET, close_at: 8, price: px(990), settled_height: 8 };
+        for (what, db) in [("serial", &db_s), ("pipelined", &db_p), ("replay", &db_r)] {
+            assert_eq!(liq::delist_settlement(db, ORACLE_MARKET).unwrap(), None, "{what}: settled");
+            assert_eq!(liq::delist_settled(db, ORACLE_MARKET).unwrap(), Some(want), "{what}: kept record");
+            assert_eq!(signed_pos_of(db, &oracle_addr(71)), FixedPoint::ZERO, "{what}");
+        }
+        assert_dumps_equal(&serial, &piped, "delist keep: serial vs pipelined (parked)");
+        assert_dumps_equal(&serial, &replay, "delist keep: serial vs crash replay");
+        assert_eq!(root_s, root_p);
+        assert_eq!(root_s, root_r);
+    }
+
     /// adl-budget P2: T (71) and 13 accounts (seeds 80..=92) long 10 @ 1,000,
     /// collateral 50 each, against S (72, short 140, rich).
     fn adl_e2e_fixture() -> (ChainConfig, StateDb) {
