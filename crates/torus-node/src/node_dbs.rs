@@ -265,10 +265,32 @@ pub fn write_genesis_binding(
         }
         GenesisPlan::Fresh => {
             apply_genesis_if_fresh(dbs, genesis)?;
+            test_crash_point()?;
             store_genesis_digest(&dbs.state, file_digest)?;
+            test_crash_point()?;
             Ok(GenesisBinding::Fresh)
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: the boot "crashes" (returns `Err`) after this many more
+    /// genesis write steps.
+    static CRASH_AFTER_STEPS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test seam: one genesis write step is done (see `CRASH_AFTER_STEPS`).
+fn test_crash_point() -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(n) = CRASH_AFTER_STEPS.get() {
+        if n <= 1 {
+            CRASH_AFTER_STEPS.set(None);
+            return Err("test crash".into());
+        }
+        CRASH_AFTER_STEPS.set(Some(n - 1));
+    }
+    Ok(())
 }
 
 /// Boot step 4 with a genesis file (P0.0 phase 4): an initialized data dir
@@ -1202,6 +1224,30 @@ mod tests {
         // The no-genesis refusal of a bound dir writes nothing either.
         assert!(bind_genesis_and_retention(&dbs, None, Some(10), true, dir.path()).is_err());
         assert_eq!(marker(&dbs), None);
+    }
+
+    /// Codex review of phase 4 (P2): a fresh boot that crashes between its
+    /// genesis writes leaves a data dir that is bound to the file it started
+    /// with: a restart with an edited file refuses (it was accepted as a
+    /// legacy dir when the genesis was seeded before the digest was stored),
+    /// and the original file finishes the boot.
+    #[test]
+    fn a_crash_inside_the_fresh_genesis_boot_keeps_the_binding() {
+        let edited = devnet_with(|v| v["chain_name"] = "edited".into());
+        for steps in 1..=2 {
+            let dir = tempfile::tempdir().unwrap();
+            CRASH_AFTER_STEPS.set(Some(steps));
+            assert_eq!(boot(dir.path(), DEVNET_GENESIS), Err("test crash".into()), "{steps}");
+            let err = boot(dir.path(), &edited).expect_err("an edited file after the crash");
+            assert!(err.contains("changed: chain_name."), "crash after {steps} steps: {err}");
+            let done = boot(dir.path(), DEVNET_GENESIS).expect("the original file starts");
+            assert!(
+                matches!(done, GenesisBinding::Fresh | GenesisBinding::Matched),
+                "{steps}: {done:?}"
+            );
+            assert_eq!(boot(dir.path(), DEVNET_GENESIS), Ok(GenesisBinding::Matched));
+            assert!(genesis_applied(&open_node_dbs(dir.path()).unwrap()).unwrap());
+        }
     }
 
     #[test]
