@@ -59,6 +59,49 @@ pub struct TimeoutCertificate {
     pub voter_metadata: Vec<(Option<CryptoHash>, Option<(ViewNumber, CryptoHash)>)>,
 }
 
+impl TimeoutCertificate {
+    /// Whether `high_tip`, `high_qc` and `high_tip_is_winner` agree with the
+    /// per-voter metadata of the positions that carry a signature (the
+    /// signatures over that metadata are checked by the caller,
+    /// [`is_correctly_signed`](Certificate::is_correctly_signed)):
+    ///
+    /// - `high_tip` is a tip hash some signer signed, and is present iff any
+    ///   signer signed one;
+    /// - `high_qc` is the highest `(view, block)` QC summary any signer
+    ///   signed, and is present iff any signer signed one;
+    /// - `high_tip_is_winner` is the collector's rule over the two.
+    ///
+    /// A timeout vote signs only its tip's block hash, not the tip's other
+    /// fields (`TipInfo::view` above all), so this cannot check that
+    /// `high_tip` is the highest signed tip, nor its view.
+    fn summaries_are_signed(&self) -> bool {
+        let signed = || {
+            self.signatures
+                .iter()
+                .enumerate()
+                .filter(|(_, signature)| signature.is_some())
+                .filter_map(|(idx, _)| self.voter_metadata.get(idx))
+        };
+        let tip_ok = match &self.high_tip {
+            Some(tip) => signed().any(|(hash, _)| *hash == Some(tip.block_hash)),
+            None => signed().all(|(hash, _)| hash.is_none()),
+        };
+        let max_qc = signed().filter_map(|(_, qc)| *qc).map(|(view, _)| view).max();
+        let qc_ok = match &self.high_qc {
+            Some(qc) => {
+                max_qc == Some(qc.view) && signed().any(|(_, summary)| *summary == Some((qc.view, qc.block)))
+            }
+            None => max_qc.is_none(),
+        };
+        let winner = match (&self.high_tip, &self.high_qc) {
+            (Some(tip), Some(qc)) => tip.view > qc.view,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        tip_ok && qc_ok && winner == self.high_tip_is_winner
+    }
+}
+
 impl Certificate for TimeoutCertificate {
     type Vote = TimeoutVote;
 
@@ -87,6 +130,11 @@ impl Certificate for TimeoutCertificate {
     fn is_correctly_signed(&self, validator_set: &ValidatorSet) -> bool {
         // Check whether the size of the signature set is the same as the size of the validator set.
         if self.signatures.len() != validator_set.len() {
+            return false;
+        }
+
+        // The summaries the protocol acts on must be what the signers signed.
+        if !self.summaries_are_signed() {
             return false;
         }
 
