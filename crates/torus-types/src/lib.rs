@@ -2676,6 +2676,10 @@ mod tests {
         let wire: TorusBlockHeader =
             bincode::deserialize(&bincode::serialize(&c).unwrap()).unwrap();
         assert_eq!(wire.features, 1 << 127);
+        // No bits too: the field is always on the bincode wire (never skipped).
+        let wire: TorusBlockHeader =
+            bincode::deserialize(&bincode::serialize(&a).unwrap()).unwrap();
+        assert_eq!(wire.canonical_header_bytes(), base);
         let json: TorusBlockHeader =
             serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
         assert_eq!(json.features, 1 << 127);

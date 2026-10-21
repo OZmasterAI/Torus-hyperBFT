@@ -129,6 +129,14 @@ Each phase lands on its own branch with RED-first tests and full gates; each one
    `TorusBlockHeader.features` in the canonical bytes, genesis parent header bits, proposer bits,
    `check_parent_link` rule (vote and insertion), unknown bit -> no vote / no proposal, execution and crash
    replay: unknown bit -> fail-stop `UPGRADE REQUIRED`, known bits != own schedule -> execute by the header + ERROR.
+   Built s134 on `feat/p00-activation-gating` (RED 7f2b4be2, GREEN f08b7388, 924c7646). Choices: `features` is
+   appended to `canonical_header_bytes` only when non-zero (a header without bits keeps its pre-P0.0 hash; the
+   item 7 option 0 golden stays valid); `ChainConfig.state_hash_activation_height` is derived from the schedule
+   (the old field 0 is refused); the built-in table is empty for every chain id; an unknown bit is `Invalid` at
+   insertion too, so block sync of an old binary stops at H. The item 7 option 0 golden
+   (`crates/torus-consensus/tests/fixtures/item7_opt0_golden.json`) was regenerated for the stored header JSON,
+   which now carries `"features"`: only the dump digests and the final `cf_block_headers` digest changed (with
+   zero bits left out of the JSON the old golden passed).
 2. **Execution reads the bits** (~1 d): executor context `features`, EVM `SpecId` from the bits,
    mempool / RPC admission with the expected bits for tip+1.
 3. **Running-hash migration** (~0.5-1 d): `configure_activation` checks the header bit from the start height;
