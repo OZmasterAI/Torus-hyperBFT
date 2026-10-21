@@ -1155,25 +1155,57 @@ fn governance_close_price_after_the_price_is_fixed_fails() {
     }
 }
 
-/// 1c (owner rule: before or at `close_at`): a market still waiting for a
-/// price after `close_at` cannot get one from governance; the first oracle
-/// price settles it.
+/// 1c (owner s134, loosened rule): the close price may execute while the
+/// market is delisted and its settlement price is not fixed, also after
+/// `close_at` while the settlement waits because no price exists. No oracle
+/// price ever: the row waits at `close_at`; a governance price executing
+/// later is accepted and the same block's walk closes at it. Once the price
+/// is fixed (here: settled) a later close price fails, writing nothing.
 #[test]
-fn governance_close_price_after_close_at_fails_even_while_waiting() {
+fn governance_close_price_after_close_at_is_accepted_while_waiting() {
+    let (_d, db) = setup(&[13, 14]);
+    set_grace(&db, 5);
+    open_pair(&db, M, 14, 13, 2, 100);
+    delist_m(&db);
+    for h in [H + 5, H + 6] {
+        let (_, s) = block(&db, h, 1, &[]);
+        assert!(!s[0].success, "waiting at {h}: {s:?}");
+    }
+    assert_eq!(row(&db).map(|r| (r.close_at, r.price)), Some((H + 5, None)), "still waiting");
+    submit_passed(&db, 2, "Close BTC at 130", close_price(M, 130));
+    let (gov, s) = execute_at(&db, H + 7);
+    assert_eq!(status(&db, 2), ProposalStatus::Executed, "{gov:?}");
+    assert!(s.iter().all(|r| r.success), "{s:?}");
+    assert_eq!(net_oi(&db, M), (FixedPoint::ZERO, 0));
+    assert_eq!(bal(&db, &addr(14)).available, fp(FUND + 60), "long 2 @100 closed at 130");
+    assert_eq!(bal(&db, &addr(13)).available, fp(FUND - 60));
+    assert_eq!(close_row(&db, M), None, "consumed with the settlement");
+    assert_eq!(row(&db), None, "settled");
+    submit_passed(&db, 3, "Close BTC at 90", close_price(M, 90));
+    let (gov, _) = execute_at(&db, H + 8);
+    assert_eq!(status(&db, 3), ProposalStatus::Failed, "{gov:?}");
+    failed_with(&gov, "too late");
+    assert_eq!(close_row(&db, M), None, "nothing written");
+    assert_eq!(bal(&db, &addr(14)).available, fp(FUND + 60), "unchanged");
+}
+
+/// 1c (loosened rule): a waiting settlement after `close_at` takes the
+/// governance price ahead of a mark that appears in the same block.
+#[test]
+fn governance_close_price_after_close_at_wins_over_a_late_mark() {
     let (_d, db) = setup(&[13, 14]);
     set_grace(&db, 5);
     open_pair(&db, M, 14, 13, 2, 100);
     delist_m(&db);
     let (_, s) = block(&db, H + 5, 1, &[]);
     assert!(!s[0].success, "waiting: {s:?}");
-    submit_passed(&db, 2, "Close BTC at 130", close_price(M, 130));
-    let (gov, _) = execute_at(&db, H + 6);
-    assert_eq!(status(&db, 2), ProposalStatus::Failed, "{gov:?}");
-    failed_with(&gov, "too late");
-    assert_eq!(close_row(&db, M), None);
-    set_mark(&db, M, 95, H + 7);
-    block(&db, H + 7, 1, &[]);
-    assert_eq!(bal(&db, &addr(14)).available, fp(FUND - 10), "closed at the oracle 95");
+    submit_passed(&db, 2, "Close BTC at 120", close_price(M, 120));
+    set_mark(&db, M, 95, H + 9);
+    let (gov, s) = execute_at(&db, H + 9);
+    assert_eq!(status(&db, 2), ProposalStatus::Executed, "{gov:?}");
+    assert!(s.iter().all(|r| r.success), "{s:?}");
+    assert_eq!(bal(&db, &addr(14)).available, fp(FUND + 40), "closed at 120, not the mark 95");
+    assert_eq!(row(&db), None);
 }
 
 /// 1c: submission rejects a price <= 0 and a market without a row; at
