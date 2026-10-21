@@ -564,6 +564,17 @@ impl<N: Network> BlockSyncClient<N> {
                 "block_sync: block inserted, blocks_synced={}",
                 self.pending_sync.as_ref().unwrap().blocks_synced
             );
+        } else if matches!(validation, ValidateBlockResponse::UnsupportedUpgrade) {
+            // P0.0: the peer served a block with a protocol feature this binary does not
+            // know. The block is valid for upgraded nodes: this node must upgrade, the peer
+            // is not at fault (no blacklist). Sync cannot pass this height until then.
+            log::error!(
+                "block_sync: UPGRADE REQUIRED -- block at height {} uses a feature this binary \
+                 does not know; NOT blacklisting the peer, ending the sync session",
+                block.height.int()
+            );
+            self.end_session();
+            return Ok(true);
         } else if should_blacklist {
             log::warn!("block_sync: block failed app validation (invalid), blacklisting peer");
             self.block_sync_client_state

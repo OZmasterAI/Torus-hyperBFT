@@ -3267,8 +3267,7 @@ fn insertion_link_response(
         Ok(BlockDataCheck::Held) => None,
         Ok(BlockDataCheck::Missing) => Some(ValidateBlockResponse::MissingData),
         Ok(BlockDataCheck::Invalid) => Some(ValidateBlockResponse::Invalid),
-        // RED stub (P0.0 phase 1 review P2): still Invalid.
-        Err(_) => Some(ValidateBlockResponse::Invalid),
+        Err(UpgradeRequired { .. }) => Some(ValidateBlockResponse::UnsupportedUpgrade),
     }
 }
 
