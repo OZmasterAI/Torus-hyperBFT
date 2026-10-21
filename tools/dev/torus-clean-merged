@@ -105,6 +105,16 @@ add_row() { # path bytes verdict reason
   if [[ "$3" == REMOVE ]]; then TOTAL=$(( TOTAL + $2 )); fi
 }
 
+# recent_write <dir>: prints a reason if anything at any depth was modified in the
+# last IDLE_MIN minutes, or if the full scan could not finish (treated as recent).
+recent_write() {
+  local hit rc
+  hit="$(timeout 300 find "$1" -mmin "-$IDLE_MIN" -print -quit 2>/dev/null)"; rc=$?
+  if [[ -n "$hit" ]]; then echo "written in the last $IDLE_MIN min"
+  elif (( rc == 124 )); then echo "idle check timed out"
+  fi
+}
+
 is_merged() { git -C "$REPO" merge-base --is-ancestor "$1" origin/main 2>/dev/null; }
 
 check_worktree() { # path head branch locked
@@ -157,8 +167,8 @@ check_targets() {
     elif u="$(target_env_in_use "$t")"; then reason="$u"
     elif u="$(path_in_use "$t")"; then reason="$u"
     elif [[ -n "${dir_unmerged[$t]:-}" ]]; then reason="unmerged: ${dir_unmerged[$t]% }"
-    elif (( IDLE_MIN > 0 )) && [[ -n "$(find "$t" -maxdepth 3 -mmin "-$IDLE_MIN" -print -quit 2>/dev/null)" ]]; then
-      reason="written in the last $IDLE_MIN min"
+    elif (( IDLE_MIN > 0 )); then
+      reason="$(recent_write "$t")"
     fi
     size="$(size_of "$t")"
     if [[ -n "$reason" ]]; then add_row "$t" "$size" KEEP "$reason"; continue; fi

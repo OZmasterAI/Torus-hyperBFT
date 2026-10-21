@@ -3,8 +3,19 @@
 # branches of one line of work share one cargo target dir (20-35 GB each on 18c).
 #
 # Usage:
+#   tools/dev/torus-target-dir --cargo nextest run ...   # SAFE way to build/test (see below)
 #   export CARGO_TARGET_DIR=$(tools/dev/torus-target-dir)          # current branch
 #   tools/dev/torus-target-dir feat/p00-phase3                     # explicit branch
+#
+# WARNING (memory bd0f09b4, s127): two worktrees sharing one target dir can make cargo
+# run the OTHER worktree's binaries. Dep-info paths are workspace-relative, so an
+# artifact built by worktree B after an edit in worktree A looks fresh to A.
+# `--cargo <args>` runs cargo safely in a shared dir. It takes an exclusive flock on
+# <dir>/.torus-build.lock and records the owning worktree in <dir>/.torus-owner. When
+# the owner changes, it touches every tracked file of the current worktree first, so
+# workspace crates rebuild (registry deps stay cached), then runs
+# `CARGO_TARGET_DIR=<dir> ${TORUS_CARGO:-cargo} <args>`.
+# Print mode without a branch warns on stderr when another worktree maps to the same dir.
 #
 # Install on PATH (optional):
 #   ln -s /home/18c/projects/Torus-hyperBFT/tools/dev/torus-target-dir ~/bin/torus-target-dir
@@ -52,15 +63,58 @@ torus_target_dir_for() {
   printf '%s/.cargo-target-%s\n' "$HOME" "$suffix"
 }
 
-torus_target_dir_main() {
-  local branch="${1:-}"
-  case "$branch" in
-    -h|--help) sed -n '2,17p' "${BASH_SOURCE[0]}"; return 0 ;;
-  esac
-  if [[ -z "$branch" ]]; then
-    branch="$(git symbolic-ref -q --short HEAD 2>/dev/null || echo HEAD)"
+current_branch() { git symbolic-ref -q --short HEAD 2>/dev/null || echo HEAD; }
+
+# Warn (stderr) if another registered worktree maps to the same dir.
+warn_if_shared() {
+  local dir="$1" top line wt br
+  top="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) wt="${line#worktree }" ;;
+      "branch "*)
+        br="${line#branch refs/heads/}"
+        if [[ "$wt" != "$top" && "$(torus_target_dir_for "$br")" == "$dir" ]]; then
+          printf 'torus-target-dir: WARNING %s is shared with worktree %s (%s); build with `torus-target-dir --cargo ...` or plain cargo may run its binaries\n' \
+            "$dir" "$wt" "$br" >&2
+        fi ;;
+    esac
+  done < <(git worktree list --porcelain 2>/dev/null)
+}
+
+# --cargo: run cargo in the shared dir under a lock, invalidating on owner change.
+torus_cargo() {
+  local top dir owner=""
+  top="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "torus-target-dir --cargo: not in a git worktree" >&2; return 2; }
+  dir="$(torus_target_dir_for "$(current_branch)")"
+  mkdir -p -- "$dir" || return 2
+  exec 9>>"$dir/.torus-build.lock" || return 2
+  if ! flock -n 9; then
+    echo "torus-target-dir: waiting for $dir/.torus-build.lock (another worktree is building)" >&2
+    flock 9 || return 2
   fi
-  torus_target_dir_for "$branch"
+  [[ -f "$dir/.torus-owner" ]] && owner="$(cat "$dir/.torus-owner")"
+  if [[ "$owner" != "$top" ]]; then
+    echo "torus-target-dir: $dir last built by ${owner:-unknown}; touching $top sources so workspace crates rebuild" >&2
+    (cd "$top" && git ls-files -z | xargs -0 -r touch -c --) || return 2
+    printf '%s\n' "$top" >"$dir/.torus-owner"
+  fi
+  CARGO_TARGET_DIR="$dir" "${TORUS_CARGO:-cargo}" "$@"
+}
+
+torus_target_dir_main() {
+  local branch="${1:-}" dir
+  case "$branch" in
+    -h|--help) sed -n '2,29p' "${BASH_SOURCE[0]}"; return 0 ;;
+    --cargo) shift; torus_cargo "$@"; return ;;
+  esac
+  if [[ -z "$branch" ]]; then   # current worktree: warn if its dir is shared
+    dir="$(torus_target_dir_for "$(current_branch)")"
+    warn_if_shared "$dir"
+  else
+    dir="$(torus_target_dir_for "$branch")"
+  fi
+  printf '%s\n' "$dir"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

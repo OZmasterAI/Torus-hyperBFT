@@ -124,6 +124,42 @@ OUT2="$(TORUS_REPO="$REPO" "$TCM" --no-fetch 2>&1)"
 echo "$OUT2" | awk -v p="$HOME/.cargo-target-h2h" '$1==p' | grep -q 'KEEP.*written in the last' \
   && ok "idle guard keeps fresh target" || bad "idle guard keeps fresh target"
 
+# idle guard sees writes at any depth (cargo writes .fingerprint/x/y, incremental/...)
+mkdir -p "$HOME/.cargo-target-deep/debug/incremental/a/b/c" "$HOME/.cargo-target-stale/debug/deps"
+echo x >"$HOME/.cargo-target-stale/debug/deps/old.rlib"
+find "$HOME/.cargo-target-deep" "$HOME/.cargo-target-stale" -exec touch -h -d '3 hours ago' {} +
+echo fresh >"$HOME/.cargo-target-deep/debug/incremental/a/b/c/fresh.bin"
+touch -d '3 hours ago' "$HOME/.cargo-target-deep/debug/incremental/a/b/c" "$HOME/.cargo-target-deep/debug/incremental/a/b"
+OUT3="$(TORUS_REPO="$REPO" "$TCM" --no-fetch 2>&1)"
+r3() { echo "$OUT3" | awk -v p="$1" '$1==p {print $3}'; }
+check_eq "idle guard: deep fresh file -> KEEP" "$(r3 "$HOME/.cargo-target-deep")" KEEP
+check_eq "idle guard: all old -> REMOVE"       "$(r3 "$HOME/.cargo-target-stale")" REMOVE
+
+# --cargo: shared dir is locked and invalidated when the owning worktree changes
+mkwt pa feat/p00-share-a
+mkwt pb feat/p00-share-b
+FAKE="$TMP/fake-cargo"
+printf '#!/bin/sh\necho "fake-cargo $CARGO_TARGET_DIR $*"\n' >"$FAKE"; chmod +x "$FAKE"
+WARN="$(cd "$WT/pa" && "$TTD" 2>&1 >/dev/null)"
+[[ "$WARN" == *WARNING*"$WT/pb"* ]] && ok "print mode warns about sharing worktree" || bad "print mode warns" "$WARN"
+C1="$(cd "$WT/pa" && TORUS_CARGO="$FAKE" "$TTD" --cargo build -p x 2>&1)"
+[[ "$C1" == *touching* && "$C1" == *"fake-cargo $HOME/.cargo-target-p00 build -p x"* ]] \
+  && ok "--cargo first run touches + runs cargo in shared dir" || bad "--cargo first run" "$C1"
+check_eq "--cargo owner recorded" "$(cat "$HOME/.cargo-target-p00/.torus-owner")" "$WT/pa"
+C2="$(cd "$WT/pa" && TORUS_CARGO="$FAKE" "$TTD" --cargo test 2>&1)"
+[[ "$C2" != *touching* ]] && ok "--cargo same owner: no touch" || bad "--cargo same owner" "$C2"
+touch -d '1 hour ago' "$WT/pb/f"
+C3="$(cd "$WT/pb" && TORUS_CARGO="$FAKE" "$TTD" --cargo test 2>&1)"
+[[ "$C3" == *touching* && -n "$(find "$WT/pb/f" -mmin -1)" ]] \
+  && ok "--cargo owner switch touches sources" || bad "--cargo owner switch" "$C3"
+check_eq "--cargo owner switched" "$(cat "$HOME/.cargo-target-p00/.torus-owner")" "$WT/pb"
+(cd "$WT/pa" && exec flock "$HOME/.cargo-target-p00/.torus-build.lock" sleep 2) &
+LOCKPID=$!
+sleep 0.5
+C4="$(cd "$WT/pb" && TORUS_CARGO="$FAKE" "$TTD" --cargo test 2>&1)"
+[[ "$C4" == *waiting* && "$C4" == *fake-cargo* ]] && ok "--cargo waits on the build lock" || bad "--cargo lock" "$C4"
+wait "$LOCKPID"
+
 # ---------------------------------------------------------------- safe_rm guard
 mkdir -p "$TMP/elsewhere" "$HOME/projects/wt/a/b"
 GUARD="$(HOME="$HOME" bash -c "source '$TCM'; safe_rm '$TMP/elsewhere'; echo rc=\$?" 2>&1)"
