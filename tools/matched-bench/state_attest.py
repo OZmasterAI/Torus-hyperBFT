@@ -469,7 +469,48 @@ def judge_log(name, path, want, problems):
     return lf
 
 
-def scan(rpcs, keys, metrics_urls, logs, wait_s, sleep=2.0, activation=None):
+def holes_of(rows, t):
+    """common heights below the newest t where some node reports no on-chain quorum"""
+    return [
+        r["height"]
+        for r in rows
+        if r["height"] != t
+        and not any("error" in p for p in r["per_node"])
+        and any(p["quorum"] is None for p in r["per_node"])
+    ]
+
+
+def heal_holes(out, rpcs, rows, t, hole_wait_s, sleep=2.0):
+    """A validator whose attestation did not land re-signs it with a fresh nonce once the nonce window passed
+    (state_hash.rs DEFAULT_RESUBMIT_AFTER_MS = NONCE_WINDOW_MS + 5 s = 65 s); e.g. the bench oracle feed signs with
+    the same validator key and a same-millisecond nonce gets the attestation skipped as a replay (9j2 smoke,
+    checkpoint 3000). So a hole below the newest checkpoint is re-read until it heals or hole_wait_s passes; a hole
+    still open then stays a failure (judge_rows), and a hole pruned or unreadable while waiting stays open."""
+    holes = holes_of(rows, t)
+    out["holes_initial"] = list(holes)
+    out["hole_wait_s"] = 0.0
+    out["holes_healed"] = []
+    if not holes or hole_wait_s <= 0:
+        return
+    by_h = {r["height"]: r for r in rows}
+    t0 = time.monotonic()
+    while holes and time.monotonic() - t0 < hole_wait_s:
+        time.sleep(sleep)
+        for h in list(holes):
+            per = []
+            for rpc in rpcs:
+                r, err = state_hash(rpc, h)
+                per.append(r if err is None else {"error": err})
+            if any("error" in p for p in per):
+                continue  # keep the earlier read: a pruned / unreadable hole stays open
+            by_h[h]["per_node"] = per
+            if all(p["quorum"] is not None for p in per):
+                holes.remove(h)
+                out["holes_healed"].append(h)
+    out["hole_wait_s"] = round(time.monotonic() - t0, 1)
+
+
+def scan(rpcs, keys, metrics_urls, logs, wait_s, sleep=2.0, activation=None, hole_wait_s=0.0):
     names = ["val%d" % i for i in range(len(rpcs))]
     addr_of = {a: "val%d" % i for i, a, _ in keys}
     out = {
@@ -493,6 +534,7 @@ def scan(rpcs, keys, metrics_urls, logs, wait_s, sleep=2.0, activation=None):
     if t is not None and None not in latest:
         out["quorum_wait_s"], out["quorum_wait_done"] = wait_quorum(rpcs, t, wait_s, sleep)
         rows = read_rows(rpcs, t)
+        heal_holes(out, rpcs, rows, t, hole_wait_s, sleep)
         # the chain keeps committing during the wait and the walk: re-read every node's newest checkpoint so the
         # minimum window accounts for what retention pruned under the walk (9g-hn smoke: 63 of 64)
         after = []
@@ -666,6 +708,7 @@ def main(argv=None):
     s.add_argument("--log", action="append", default=[])
     s.add_argument("--keys", required=True)
     s.add_argument("--wait-s", type=float, default=90)
+    s.add_argument("--hole-wait-s", type=float, default=0, help="re-read checkpoints below the newest that lack a quorum for up to this long (attestation resubmit window)")
     s.add_argument("--activation", type=int, default=None, help="STATE_HASH_ACTIVATION height (sets the minimum compared window)")
     s.add_argument("--out", required=True)
     m = sub.add_parser("summary")
@@ -696,7 +739,7 @@ def main(argv=None):
                 file=sys.stderr,
             )
             return 2
-        out = scan([Rpc(u) for u in a.rpc], keys, a.metrics, a.log, a.wait_s, activation=a.activation)
+        out = scan([Rpc(u) for u in a.rpc], keys, a.metrics, a.log, a.wait_s, activation=a.activation, hole_wait_s=a.hole_wait_s)
         with open(a.out, "w") as f:
             json.dump(out, f, indent=1)
         print(line_of(out))
