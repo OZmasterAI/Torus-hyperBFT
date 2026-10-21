@@ -933,6 +933,10 @@ case "$ORACLE_FEED" in
             || { echo "FATAL: ORACLE_INTERVAL_MS must be an integer in 1..9999 (got '$ORACLE_INTERVAL_MS')" >&2; exit 2; }
         [ -s "$ORACLE_KEYS" ] || { echo "FATAL: ORACLE_FEED=1 needs the validator key file $ORACLE_KEYS" >&2; exit 1; }
         "$BENCH" oracle-feed --help >/dev/null 2>&1 || { echo "FATAL: ORACLE_FEED=1 but $BENCH has no oracle-feed subcommand" >&2; exit 1; }
+        # s134: a feed with --signer (default separate) signs with its own oracle signers, read from
+        # bench-oracle-signer-keys.json next to ORACLE_KEYS (an older binary has no --signer: validator key)
+        "$BENCH" oracle-feed --help 2>/dev/null | grep -q -- --signer && ! [ -s "$(dirname "$ORACLE_KEYS")/bench-oracle-signer-keys.json" ] \
+            && { echo "FATAL: ORACLE_FEED=1: $BENCH oracle-feed signs with separate oracle signers but $(dirname "$ORACLE_KEYS")/bench-oracle-signer-keys.json is missing" >&2; exit 1; }
         [ "$ORACLE_WALK_BP" = 0 ] || "$BENCH" oracle-feed --help 2>/dev/null | grep -q -- --walk-bp \
             || { echo "FATAL: ORACLE_WALK_BP=$ORACLE_WALK_BP but $BENCH oracle-feed has no --walk-bp" >&2; exit 1; }
         [ "$ORACLE_SHOCK_BP" = 0 ] || "$BENCH" oracle-feed --help 2>/dev/null | grep -q -- --shock-bp \

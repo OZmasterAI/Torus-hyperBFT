@@ -414,6 +414,16 @@ enum Command {
         /// `{"validators":[{"index":0,"address":"0x..","private_key":"0x.."},..]}`.
         #[arg(long, default_value = "devnet/wsl/bench-validator-keys.json")]
         validator_keys: std::path::PathBuf,
+        /// Who signs the prices: `separate` (default, as production) registers
+        /// signer i for validator i with SetOracleSigner at startup and signs
+        /// with it, keeping the validator key's nonces free for state-hash
+        /// attestations; `validator` signs with the validator key (pre-s134).
+        #[arg(long, value_enum, default_value = "separate")]
+        signer: oracle_feed::SignerMode,
+        /// `--signer separate` key file, same format as --validator-keys
+        /// (default: bench-oracle-signer-keys.json next to --validator-keys).
+        #[arg(long)]
+        oracle_signer_keys: Option<std::path::PathBuf>,
         /// Feed markets 1..=N (the ids `consensus --markets N` trades).
         #[arg(long)]
         markets: u64,
@@ -4815,6 +4825,8 @@ async fn main() {
         Command::OracleFeed {
             rpc_urls,
             validator_keys,
+            signer,
+            oracle_signer_keys,
             markets,
             price,
             walk_bp,
@@ -4826,6 +4838,8 @@ async fn main() {
             let args = oracle_feed::FeedArgs {
                 rpc_urls: &rpc_urls,
                 validator_keys: &validator_keys,
+                signer,
+                oracle_signer_keys: oracle_signer_keys.as_deref(),
                 markets,
                 price,
                 walk_bp,

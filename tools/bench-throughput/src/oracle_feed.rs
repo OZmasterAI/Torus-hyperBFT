@@ -10,9 +10,20 @@
 //! what a production feeder sends. `--walk-bp N` (item 6 step 0.5) moves every
 //! market's price `±N` bp per round around `--price` ([`PriceWalk`]); 0 (the
 //! default) is the fixed price.
+//!
+//! Signers (s134): as in production, each validator reports through its own
+//! hot oracle signer (`--signer separate`, the default). At startup the feed
+//! registers signer i for validator i with `SetOracleSigner` (signed by the
+//! validator key, proof of possession signed by the signer key) and waits until
+//! the node lists it; every `SubmitOraclePrices` is then signed by the signer
+//! key. The validator key's native nonces (a per-(sender, nonce) replay set)
+//! thus stay free for state-hash attestations: with one shared key a
+//! same-millisecond nonce dropped an attestation for 65 s. `--signer validator`
+//! is the old behaviour (the validator key signs the prices; the chain still
+//! accepts direct validator submissions).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::Address;
@@ -20,7 +31,7 @@ use k256::ecdsa::SigningKey;
 use serde::{Deserialize, Serialize};
 use torus_price_feeder::node::{NodeApi, RpcNode};
 use torus_price_feeder::submit::{build_submissions, sign, NonceGen};
-use torus_types::{FixedPoint, MarketId, SignedNativeAction};
+use torus_types::{FixedPoint, MarketId, NativeAction, SignedNativeAction};
 
 /// How often the stats line is printed and `--stats-file` rewritten.
 const STATS_EVERY: Duration = Duration::from_secs(10);
@@ -73,6 +84,132 @@ fn parse_validator_keys(raw: &str) -> Result<Vec<ValidatorKey>, String> {
         return Err("validator indices must be exactly 0..n".into());
     }
     Ok(keys)
+}
+
+/// Who signs the `SubmitOraclePrices` actions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum SignerMode {
+    /// Each validator's own hot oracle signer (production layout), registered
+    /// at startup with `SetOracleSigner`.
+    Separate,
+    /// The validator key itself (pre-s134 behaviour).
+    Validator,
+}
+
+/// The signer key file next to `validator_keys`
+/// (`devnet/wsl/bench-oracle-signer-keys.json`), used when
+/// `--oracle-signer-keys` is not given.
+pub fn default_signer_keys_path(validator_keys: &Path) -> PathBuf {
+    validator_keys.with_file_name("bench-oracle-signer-keys.json")
+}
+
+/// One validator's reporting identity: `key` signs its price submissions
+/// (`signer` is that key's address; equal to `validator` in
+/// [`SignerMode::Validator`]).
+pub struct Reporter {
+    pub index: usize,
+    pub validator: Address,
+    pub signer: Address,
+    pub key: SigningKey,
+}
+
+/// Pair validator i with signer i. Separate mode refuses a signer that is a
+/// validator address or serves two validators (the chain would reject both).
+pub fn reporters(
+    validators: &[ValidatorKey],
+    signers: Option<Vec<ValidatorKey>>,
+) -> Result<Vec<Reporter>, String> {
+    let Some(signers) = signers else {
+        return Ok(validators
+            .iter()
+            .map(|v| Reporter { index: v.index, validator: v.address, signer: v.address, key: v.key.clone() })
+            .collect());
+    };
+    if signers.len() != validators.len() {
+        return Err(format!("{} oracle signer keys but {} validator keys", signers.len(), validators.len()));
+    }
+    let vals: BTreeSet<Address> = validators.iter().map(|v| v.address).collect();
+    let mut seen = BTreeSet::new();
+    validators
+        .iter()
+        .zip(signers)
+        .map(|(v, s)| {
+            if vals.contains(&s.address) {
+                return Err(format!("oracle signer {} ({:#x}) is a validator address", s.index, s.address));
+            }
+            if !seen.insert(s.address) {
+                return Err(format!("oracle signer {:#x} is listed twice", s.address));
+            }
+            Ok(Reporter { index: v.index, validator: v.address, signer: s.address, key: s.key })
+        })
+        .collect()
+}
+
+/// `SetOracleSigner` registering `signer` for `validator`, signed by the
+/// validator key; the proof of possession is signed by the signer key with the
+/// same nonce (as `torus-wallet set-oracle-signer`).
+pub fn set_oracle_signer_action(validator: &SigningKey, signer: &SigningKey, nonce: u64) -> SignedNativeAction {
+    let v = crate::key_address(validator);
+    let action = NativeAction::SetOracleSigner {
+        signer: crate::key_address(signer),
+        proof: Some(torus_types::eip712::sign_oracle_signer_proof(&v, nonce, signer)),
+    };
+    torus_types::eip712::sign_native_action(action, nonce, validator)
+}
+
+/// Register every reporter's signer on its own node (`nodes[i]` for validator
+/// i) and wait until `torus_getValidators` lists it. An already-registered
+/// signer sends nothing; a missing one is (re)sent every `resend` (a dropped
+/// action, e.g. a nonce collision with an attestation, is retried). Err after
+/// `timeout`.
+pub async fn register_signers<N: NodeApi>(
+    nodes: &[N],
+    validators: &[ValidatorKey],
+    reps: &[Reporter],
+    poll: Duration,
+    resend: Duration,
+    timeout: Duration,
+) -> Result<(), String> {
+    let start = Instant::now();
+    let mut nonces = vec![NonceGen::default(); reps.len()];
+    let mut last_sent: Vec<Option<Instant>> = vec![None; reps.len()];
+    let mut done = vec![false; reps.len()];
+    loop {
+        for (i, r) in reps.iter().enumerate() {
+            if done[i] {
+                continue;
+            }
+            let listed = match nodes[i].validators().await {
+                Ok(vs) => vs.iter().find(|v| v.address == r.validator).map(|v| v.oracle_signer),
+                Err(e) => {
+                    eprintln!("[oracle-feed] WARN: val{} torus_getValidators: {e}", r.index);
+                    None
+                }
+            };
+            if listed == Some(Some(r.signer)) {
+                println!("[oracle-feed] val{} {:#x}: oracle signer {:#x} registered", r.index, r.validator, r.signer);
+                done[i] = true;
+                continue;
+            }
+            if last_sent[i].is_none_or(|t| t.elapsed() >= resend) {
+                let a = set_oracle_signer_action(&validators[i].key, &r.key, nonces[i].next(now_ms()));
+                match nodes[i].submit(&a).await {
+                    Ok(h) => println!("[oracle-feed] val{} SetOracleSigner {:#x} sent ({h})", r.index, r.signer),
+                    Err(e) => eprintln!("[oracle-feed] WARN: val{} SetOracleSigner: {e}", r.index),
+                }
+                last_sent[i] = Some(Instant::now());
+            }
+        }
+        if done.iter().all(|d| *d) {
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            let missing: Vec<String> =
+                reps.iter().zip(&done).filter(|(_, d)| !**d).map(|(r, _)| format!("val{}", r.index)).collect();
+            return Err(format!("oracle signer not registered after {:?}: {}", timeout, missing.join(", ")));
+        }
+        tokio::time::sleep(poll).await;
+    }
 }
 
 /// The same fixed price (whole TRS) for every market.
@@ -200,6 +337,8 @@ pub fn round(
 pub struct ValidatorStats {
     pub index: usize,
     pub address: String,
+    /// The address that signs this validator's submissions.
+    pub signer: String,
     pub sent: u64,
     pub accepted: u64,
     pub rejected: u64,
@@ -221,10 +360,15 @@ pub struct Stats {
 }
 
 impl Stats {
-    pub fn new(keys: &[ValidatorKey], markets: usize) -> Self {
-        let per_validator = keys
+    pub fn new(reps: &[Reporter], markets: usize) -> Self {
+        let per_validator = reps
             .iter()
-            .map(|k| ValidatorStats { index: k.index, address: format!("{:#x}", k.address), ..Default::default() })
+            .map(|r| ValidatorStats {
+                index: r.index,
+                address: format!("{:#x}", r.validator),
+                signer: format!("{:#x}", r.signer),
+                ..Default::default()
+            })
             .collect();
         Self { markets, per_validator, ..Default::default() }
     }
@@ -321,6 +465,9 @@ async fn listed_markets(node: &RpcNode, n: u64) -> Result<BTreeSet<MarketId>, St
 pub struct FeedArgs<'a> {
     pub rpc_urls: &'a str,
     pub validator_keys: &'a Path,
+    pub signer: SignerMode,
+    /// Separate mode's signer key file (None = [`default_signer_keys_path`]).
+    pub oracle_signer_keys: Option<&'a Path>,
     pub markets: u64,
     pub price: u64,
     /// [`PriceWalk`] step per round in basis points (0 = fixed `price`).
@@ -343,15 +490,27 @@ pub async fn run(a: FeedArgs<'_>) -> Result<(), String> {
     if a.markets == 0 || a.price == 0 || a.interval_ms == 0 {
         return Err("--markets, --price and --interval-ms must be > 0".into());
     }
+    let signer_keys = match a.signer {
+        SignerMode::Validator => None,
+        SignerMode::Separate => {
+            let p = a.oracle_signer_keys.map(Path::to_path_buf).unwrap_or_else(|| default_signer_keys_path(a.validator_keys));
+            Some(load_validator_keys(&p)?)
+        }
+    };
+    let reps = reporters(&keys, signer_keys)?;
     let nodes: Vec<RpcNode> = urls.iter().map(|u| RpcNode::new(u)).collect::<Result<_, _>>()?;
+    if a.signer == SignerMode::Separate {
+        register_signers(&nodes, &keys, &reps, Duration::from_millis(500), Duration::from_secs(5), Duration::from_secs(60))
+            .await?;
+    }
     let listed = listed_markets(&nodes[0], a.markets).await?;
     let mut walk = PriceWalk::new(&listed, a.price, a.walk_bp)?.with_shock(a.shock_bp, a.shock_round)?;
     let probe_market = *listed.first().expect("non-empty");
     let probe_client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().map_err(|e| e.to_string())?;
-    let mut nonces = vec![NonceGen::default(); keys.len()];
-    let mut stats = Stats::new(&keys, listed.len());
-    for k in &keys {
-        println!("[oracle-feed] val{} {:#x} -> {}", k.index, k.address, urls[k.index]);
+    let mut nonces = vec![NonceGen::default(); reps.len()];
+    let mut stats = Stats::new(&reps, listed.len());
+    for r in &reps {
+        println!("[oracle-feed] val{} {:#x} signer {:#x} -> {}", r.index, r.validator, r.signer, urls[r.index]);
     }
     println!(
         "[oracle-feed] {} markets at {} TRS (walk ±{} bp/round, bound ±{} bp), {} chunk(s)/validator every {} ms",
@@ -401,8 +560,8 @@ pub async fn run(a: FeedArgs<'_>) -> Result<(), String> {
             );
         }
         let mut set = tokio::task::JoinSet::new();
-        for (i, k) in keys.iter().enumerate() {
-            let signed = round(&prices, &listed, &k.key, &mut nonces[i], now);
+        for (i, r) in reps.iter().enumerate() {
+            let signed = round(&prices, &listed, &r.key, &mut nonces[i], now);
             let node = nodes[i].clone();
             set.spawn(async move {
                 let mut out = Vec::with_capacity(signed.len());
@@ -759,5 +918,197 @@ mod tests {
             assert_eq!(p.usable(), Some(want), "market {id}");
             assert_eq!(p.num_reporters, 3, "market {id}");
         }
+    }
+
+    fn put_validators(db: &StateDb, keys: &[SigningKey]) {
+        for k in keys {
+            let a = crate::key_address(k);
+            StakingManager::new(db.clone())
+                .put_validator(&a, &ValidatorState {
+                    address: a,
+                    pubkey: [0; 32],
+                    commission_bps: 0,
+                    self_stake: MIN_SELF_DELEGATION,
+                    total_delegated: U256::ZERO,
+                    status: ValidatorStatus::Active,
+                    jailed_until: None,
+                    last_commission_change_block: None,
+                    oracle_signer: None,
+                })
+                .unwrap();
+        }
+    }
+
+    fn vkeys(keys: &[SigningKey]) -> Vec<ValidatorKey> {
+        keys.iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorKey { index: i, address: crate::key_address(k), key: k.clone() })
+            .collect()
+    }
+
+    /// s134: the repo's signer file loads, pairs 1:1 with the validator file,
+    /// and no signer is a validator address.
+    #[test]
+    fn bench_signer_key_file_pairs_with_the_validator_file() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../devnet/wsl");
+        let vals = load_validator_keys(&dir.join("bench-validator-keys.json")).unwrap();
+        let path = default_signer_keys_path(&dir.join("bench-validator-keys.json"));
+        assert_eq!(path, dir.join("bench-oracle-signer-keys.json"));
+        let reps = reporters(&vals, Some(load_validator_keys(&path).unwrap())).unwrap();
+        assert_eq!(reps.len(), 3);
+        for (r, v) in reps.iter().zip(&vals) {
+            assert_eq!(r.validator, v.address);
+            assert_ne!(r.signer, v.address);
+            assert_eq!(crate::key_address(&r.key), r.signer, "submissions are signed by the signer key");
+        }
+    }
+
+    #[test]
+    fn reporters_modes_and_refusals() {
+        let vals = vkeys(&[key(1), key(2)]);
+        let same = reporters(&vals, None).unwrap();
+        assert!(same.iter().all(|r| r.signer == r.validator && crate::key_address(&r.key) == r.validator));
+        let sep = reporters(&vals, Some(vkeys(&[key(3), key(4)]))).unwrap();
+        assert_eq!(sep.iter().map(|r| r.signer).collect::<Vec<_>>(), vec![crate::key_address(&key(3)), crate::key_address(&key(4))]);
+        assert!(reporters(&vals, Some(vkeys(&[key(3)]))).err().unwrap().contains("1 oracle signer keys but 2"));
+        assert!(reporters(&vals, Some(vkeys(&[key(3), key(1)]))).err().unwrap().contains("is a validator"));
+        assert!(reporters(&vals, Some(vkeys(&[key(3), key(3)]))).err().unwrap().contains("twice"));
+    }
+
+    /// s134: the startup `SetOracleSigner` passes mempool validate (sender =
+    /// the validator) and exec; afterwards the signer-signed rounds recover to
+    /// the SIGNER (not the validator key), exec accepts them and every mark is
+    /// fresh with 3 reporters. Before registration the same rounds are refused.
+    #[test]
+    fn signer_rounds_pass_the_node_after_set_oracle_signer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let vals: Vec<SigningKey> = (1..=3).map(key).collect();
+        let signers: Vec<SigningKey> = (11..=13).map(key).collect();
+        put_validators(&db, &vals);
+        let m = markets(300);
+        for id in &m {
+            db.put_cf_raw(CF_NATIVE_MARKETS, &id.to_be_bytes(), b"listed").unwrap();
+        }
+        let prices = market_prices(&m, 30_000);
+        let block_s = 1_700_000_000u64;
+        let now = block_s * 1_000 - 1_000;
+        let ctx_at = |h: u64, ts: u64| {
+            NativeExecContext::new(db.clone(), h, ts, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO)
+        };
+        let wire = |s: &SignedNativeAction| -> SignedNativeAction {
+            serde_json::from_slice(&hex::decode(hex::encode(serde_json::to_vec(s).unwrap())).unwrap()).unwrap()
+        };
+
+        let mut ctx = ctx_at(4, block_s - 1);
+        let early = round(&prices, &m, &signers[0], &mut NonceGen::default(), now - 2_000);
+        let sender = wire(&early[0]).validate(now, TORUS_CHAIN_ID).unwrap();
+        let r = NativeExecutor::execute(&mut ctx, &sender, &early[0].action);
+        assert!(!r.success, "an unregistered signer must be refused");
+
+        for (v, s) in vals.iter().zip(&signers) {
+            let a = wire(&set_oracle_signer_action(v, s, now - 500));
+            let sender = a.validate(now, TORUS_CHAIN_ID).unwrap();
+            assert_eq!(sender, crate::key_address(v), "SetOracleSigner is signed by the validator key");
+            let r = NativeExecutor::execute(&mut ctx, &sender, &a.action);
+            assert!(r.success, "{:?}", r.error);
+        }
+
+        let mut ctx = ctx_at(5, block_s);
+        for (v, s) in vals.iter().zip(&signers) {
+            for sig in round(&prices, &m, s, &mut NonceGen::default(), now) {
+                let decoded = wire(&sig);
+                let sender = decoded.validate(now, TORUS_CHAIN_ID).unwrap();
+                assert_eq!(sender, crate::key_address(s));
+                assert_ne!(sender, crate::key_address(v));
+                let r = NativeExecutor::execute(&mut ctx, &sender, &decoded.action);
+                assert!(r.success, "{:?}", r.error);
+            }
+        }
+        let mut next = ctx_at(6, block_s + 1);
+        let agg = NativeExecutor::begin_block_oracle(&mut next);
+        assert!(next.fatal_error.is_none(), "{:?}", next.fatal_error);
+        assert_eq!(agg.len(), 300);
+        assert!(agg.iter().all(|r| r.success));
+        let want = FixedPoint::from_raw(30_000 * FixedPoint::SCALE);
+        for id in [1, 300] {
+            let p = next.oracle.get_price(id, next.timestamp).unwrap();
+            assert_eq!(p.usable(), Some(want), "market {id}");
+            assert_eq!(p.num_reporters, 3, "market {id}");
+        }
+    }
+
+    /// A node double: `validators()` lists the signer once a SetOracleSigner
+    /// with a valid validator signature and proof arrived; the first
+    /// `drop_first` submissions are dropped (e.g. a nonce collision).
+    #[derive(Clone, Default)]
+    struct RegNode {
+        inner: std::sync::Arc<std::sync::Mutex<(Vec<(Address, Option<Address>)>, usize, usize)>>,
+    }
+
+    impl RegNode {
+        fn new(validator: Address, signer: Option<Address>, drop_first: usize) -> Self {
+            Self { inner: std::sync::Arc::new(std::sync::Mutex::new((vec![(validator, signer)], drop_first, 0))) }
+        }
+        fn submits(&self) -> usize {
+            self.inner.lock().unwrap().2
+        }
+    }
+
+    impl NodeApi for RegNode {
+        async fn listed_markets(&self) -> Result<Vec<torus_price_feeder::node::MarketInfo>, String> {
+            Ok(vec![])
+        }
+        async fn validators(&self) -> Result<Vec<torus_price_feeder::node::ValidatorInfo>, String> {
+            let g = self.inner.lock().unwrap();
+            Ok(g.0
+                .iter()
+                .map(|(a, s)| torus_price_feeder::node::ValidatorInfo {
+                    address: *a,
+                    status: "active".into(),
+                    oracle_signer: *s,
+                })
+                .collect())
+        }
+        async fn submit(&self, signed: &SignedNativeAction) -> Result<String, String> {
+            let mut g = self.inner.lock().unwrap();
+            g.2 += 1;
+            if g.1 > 0 {
+                g.1 -= 1;
+                return Ok("0xdropped".into());
+            }
+            let sender = signed.validate(signed.nonce, TORUS_CHAIN_ID).map_err(|e| e.to_string())?;
+            let NativeAction::SetOracleSigner { signer, proof: Some(p) } = &signed.action else {
+                return Err("not a SetOracleSigner with proof".into());
+            };
+            let proven = torus_types::eip712::recover_oracle_signer_proof(&sender, p).map_err(|e| e.to_string())?;
+            if proven != *signer {
+                return Err("bad proof".into());
+            }
+            let row = g.0.iter_mut().find(|(a, _)| *a == sender).ok_or("not a validator")?;
+            row.1 = Some(*signer);
+            Ok("0xok".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn register_signers_sends_resends_and_skips_registered() {
+        let vals = vkeys(&[key(1), key(2), key(3)]);
+        let reps = reporters(&vals, Some(vkeys(&[key(11), key(12), key(13)]))).unwrap();
+        let nodes = vec![
+            RegNode::new(vals[0].address, None, 0),
+            RegNode::new(vals[1].address, None, 1), // first send dropped -> resent
+            RegNode::new(vals[2].address, Some(reps[2].signer), 0), // already registered
+        ];
+        let ms = Duration::from_millis;
+        register_signers(&nodes, &vals, &reps, ms(5), ms(20), Duration::from_secs(5)).await.unwrap();
+        assert_eq!(nodes.iter().map(RegNode::submits).collect::<Vec<_>>(), vec![1, 2, 0]);
+        for (n, r) in nodes.iter().zip(&reps) {
+            assert_eq!(n.validators().await.unwrap()[0].oracle_signer, Some(r.signer));
+        }
+
+        let stuck = vec![RegNode::new(vals[0].address, None, usize::MAX)];
+        let e = register_signers(&stuck, &vals[..1], &reps[..1], ms(5), ms(20), ms(100)).await.err().unwrap();
+        assert!(e.contains("not registered") && e.contains("val0"), "{e}");
     }
 }

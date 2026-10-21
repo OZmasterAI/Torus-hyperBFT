@@ -1376,9 +1376,19 @@ check live and proves agreement value for value:
   run-cell.sh, `devnet/wsl/bench-validator-keys.json`, and a `<worktree>/devnet/wsl/start-node.sh`
   that reads `STATE_HASH_ATTEST_KEY_DIR` (else FATAL: a worktree older than this knob).
 - **Keys.** `state_attest.py keys` writes validator i's secp256k1 account key from
-  `bench-validator-keys.json` (the address `gen-3val-genesis.sh` registers it under, which the
-  oracle feed also signs with) to `$DATA_ROOT/run/attest-keys/val<i>.key` (0600, the node refuses
+  `bench-validator-keys.json` (the address `gen-3val-genesis.sh` registers it under; since s134
+  the oracle feed no longer signs prices with it) to `$DATA_ROOT/run/attest-keys/val<i>.key` (0600, the node refuses
   group/other access). No genesis change: the genesis key is unaffected.
+- **Oracle feed signers (s134).** With `ORACLE_FEED=1` the feed (`oracle-feed --signer
+  separate`, the default) signs prices with validator i's own hot oracle signer from
+  `devnet/wsl/bench-oracle-signer-keys.json` (next to the validator key file), as production
+  does. At feed start it registers each signer once with `SetOracleSigner` (signed by the
+  validator key, proof of possession by the signer key) and waits up to 60 s until
+  `torus_getValidators` lists it. The validator key's native nonces then belong to the
+  attestations alone: with a shared key, a price submission in the same millisecond took the
+  nonce and the attestation was dropped until its 65 s resubmit. No genesis change.
+  `--signer validator` (CLI only) is the old shared-key feed. Pre-flight: a binary with
+  `--signer` and no signer key file is FATAL.
 - **Nodes.** `STATE_HASH_ATTEST_KEY_DIR` makes `start-node.sh` append
   `--state-hash-attest-key=<dir>/val<i>.key` (launch and crash restart alike); after launch every
   node's argv must carry it. `TORUS_STATE_HASH_FAILSTOP=1` is exported before `EXTRA_ENV` (an

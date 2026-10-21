@@ -1,0 +1,20 @@
+{
+  "note": "TEST-ONLY keys, publicly known, never use on a real network. Hot oracle signers of the 3 matched-bench devnet validators, as in production (tools/price-feeder/README.md): `bench-throughput oracle-feed` registers signer i for validator i with SetOracleSigner (signed by the validator key from bench-validator-keys.json, proof of possession signed by this key) and then signs every SubmitOraclePrices with this key, so the validator key's native nonces stay free for state-hash attestations. Derived from the hardhat/anvil dev mnemonic 'test test test test test test test test test test test junk' at m/44'/60'/0'/0/103, /104, /105 (cast wallet private-key --mnemonic-index 103..105). index i = signer of validator i. Not a genesis input: the genesis does not change.",
+  "validators": [
+    {
+      "index": 0,
+      "address": "0xc4c81d5c1851702d27d602aa8ff830a7689f17cc",
+      "private_key": "0x360e8f096c6aaec3c922df1a82a7b954b69b42bdc20a6b71b2f50438c13d2ec5"
+    },
+    {
+      "index": 1,
+      "address": "0x9c79357189d6af261691ecf48de9a6bbf30438fc",
+      "private_key": "0x956840865a0d252ee192c683c48befc5d8432aa7b334be6cb79133cfacfcda1a"
+    },
+    {
+      "index": 2,
+      "address": "0xd96eb0f2e106ea7c0a939e9c460a17ace65fecff",
+      "private_key": "0x9dece36dc7cb98e2e521e85efa7417d68744f00ab93caf70ec39dc3d6b16d916"
+    }
+  ]
+}
