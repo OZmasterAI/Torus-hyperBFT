@@ -1,0 +1,194 @@
+# Dead-leader skip: design
+
+Status: design only, s134, base main 42c408e4. Derived from code; nothing measured yet (the one-validator-down
+baseline on archy will be the "before").
+Paths under `crates/hotstuff_rs/src/` unless stated: **PM** pacemaker/implementation.rs, **HS**
+hotstuff/implementation.rs, **HT** hotstuff/types.rs, **RO** hotstuff/roles.rs, **VS** types/validator_set.rs;
+**TT** crates/torus-types/src/lib.rs, **APP** crates/torus-consensus/src/app.rs, **EP**
+crates/torus-economics/src/epoch_plan.rs.
+
+## 1. Today
+
+**Leader selection.**
+- leader(v) is IWRR over (v, committed validator set) (PM:1066-1123).
+- Reputation weighting exists but is off: the kill switch defaults to false (PM:1125-1147) and genesis
+  `reputation_leader_selection` is false (TT:1780-1785).
+- Even switched on, it would not skip a dead leader: its 2,500 bps floor keeps a dead node at 25% of its weight
+  (HT:694-704), and its inputs are local events (PM:363-375, block_tree/accessors/internal.rs:365-382), which caused
+  the B3 stall.
+
+**What a dead leader(v) costs.**
+- Votes for v-1 go to leader(v) and to the backup leader(v+1) (HS:1197-1220, RO:131-163). QC(v-1) still forms and
+  replicas enter v on AdvanceView (PM:192-215, :529-537). No block is lost.
+- Nobody proposes in v. Each replica waits for its deadline, broadcasts a TimeoutVote and enters v+1 (PM:153-180).
+- Deadline schedule: absolute per epoch, one slot = `timeout_base_ms` = 1200 ms (TT:1754-1756, :1808-1810;
+  torus-node main.rs:1141; PM:894-928), rebased when more than 2 slots ahead (PM:599-615; test PM:1658-1674). At
+  61 ms views the time left on entry alternates between ~1.2 s and ~2.34 s, so the dead-view time T averages
+  ~1.8 s. The stall multiplier is 1 on entering v because QC(v-1) exists (PM:805-817); view v+1 gets x2
+  (PM:617-635), which costs nothing while leader(v+1) is live.
+- The s75 leader-skip (HS:1809-1858) only pulls a leader that is behind forward, on NewViews from more than f power.
+  It never skips a dead leader.
+- Nothing removes a dead validator: `DowntimeTracker` (torus-consensus/src/slashing.rs:231-295) has no caller.
+
+**Arithmetic.** t = 61 ms live view time (1/16.4 s, one block per view), s = the dead leader's share of views:
+blocks/s = (1-s) / ((1-s)·t + s·T).
+- 4 equal stakes, s = 1/4: 1.51 blk/s (2.17 at T = 1.2 s, 1.19 at 2.34 s), i.e. -87% to -93%.
+- Bench 2/2/1: stakes are weight x 1M TRS (`VALIDATOR_STAKES`, tools/harness-kill-no-restart), power is whole TRS
+  (crates/torus-genesis/src/lib.rs:376-382), so powers 2M/2M/1M. IWRR runs [A,B,C] while view mod 5M < 3M and
+  [A,B] after (PM:1088-1118): the stake-1 node leads 1 view in 3 for the first ~50 h. Predicted 1.04 blk/s
+  (0.81-1.51), -91% to -95%.
+- TC-required adds 0.5-1 RTT per dead view (tc-required doc §5).
+- matched/s: orders wait out the dead view and ride the next block, so matched/s falls less than blocks/s unless
+  blocks hit their caps; p99 order latency grows by about T. Only the bench will tell.
+
+## 2. Options
+
+Blocks/s derived for LAN, 4 equal stakes.
+
+| Option | One-down | All-up | Safety / agreement on leader(v) | Complexity |
+|---|---|---|---|---|
+| (a1) base 1200 -> 500 ms | ~3.2 | s68 A/B at 500 ms: -6.5% matched/s, 7x timeouts; WAN premature | unchanged / unchanged | trivial |
+| (a2) ~250 ms timeout only for a leader whose last slot missed | ~6.9 | ~unchanged | timers only / unchanged | low |
+| (b0) switch B3 reputation on | ~4.7 (floor) | stall risk | **diverges** (local inputs) | rejected |
+| (b1) exclusion set in the validator set, computed by execution in the epoch plan | ~all-up after 1-2 epochs | unchanged | voting power kept / via validator-set update (CVS/PVS) | medium |
+| (b2) same set, derived per block in hotstuff_rs from the justify chain | ~all-up after ~3 slots | unchanged | same / mid-epoch updates in the consensus core | medium-high |
+| (c1) leader per k views | same as today unless the term ends on a TC (needs agreement on TCs) | — | — | medium |
+| (c2) skip on >f "no proposal" NewViews | ~(a2) plus one message round | — | unchanged | medium |
+| (d) b1 + a2 | ~all-up; the transient runs at ~6.9 | unchanged | as b1 | medium+ |
+
+Other chains (from memory and public docs; unsure where noted):
+- **HotStuff-2:** round-robin; a crashed leader costs one timeout per rotation; no reputation in the paper as far as
+  known.
+- **HyperBFT** (closed source): docs describe peer jailing — validators vote to jail a slow or unresponsive peer; a
+  quorum of jail votes stops it voting and proposing; the validator unjails itself under on-chain rate limits.
+  Unknown whether the leader schedule itself skips.
+- **CometBFT:** weighted round-robin by proposer priority; an offline proposer costs `timeout_propose` (~3 s default,
+  as recalled) plus a new round. Cosmos `x/slashing` jails low signers (removed from the set), `MsgUnjail` brings them
+  back. Closest to b1, but also removes voting power.
+- **Aptos (LeaderReputation V2):** seeded weighted-random leader from committed history (weights: active 1000,
+  inactive 10, failed 1 when the failure rate > 10%), history read at round - `exclude_round` (40). Governance raised
+  `exclude_round` 20 -> 40 because a ~30-deep pipeline under load made validators disagree on the leader. Lesson:
+  "committed state at v-D" diverges whenever commits lag more than D views (our S470 wedge lagged tens to hundreds of
+  views), so leader(v) should change only through validator-set updates.
+- **MonadBFT:** stake-weighted pseudorandom leader schedule per epoch, fixed one epoch ahead; no reputation mechanism
+  found; a failed leader costs one timeout and the next leader carries the TC.
+
+## 3. Recommendation: (b1) leader exclusion through the epoch plan
+
+### Rules
+
+Execution keeps per-validator state in hashed META rows (new prefix `leader_stats:`): `miss_run`, exclusion count
+`j`, `excluded_at`.
+
+- **A1 Attribution.** When executing committed block B with parent P (APP:9993 receives the full Block): every view
+  strictly between P.justify.view and B.justify.view is a miss for leader(m); B.justify.view is a success for its
+  leader; leader(m) = `select_leader` (PM:1066) over the installed set, exclusions included (EP `epoch_vset:current`);
+  gaps touching a validator-set-update block (Prepare to Decide) are not attributed; a success sets `miss_run` = 0 and
+  `j` = 0.
+- **A2 Exclude.** Executing boundary H writes the plan for H+L (EP:1-16): exclude every X with `miss_run` >= K = 3,
+  most misses first then by key, while eligible power stays >= quorum (VS:153-165).
+- **A3 Re-admit.** X returns in the plan when a committed QC from the last L heights carries X's signature
+  (`SignatureSet`, types/data_types.rs:328) AND X has been excluded for >= L·2^j heights (j capped at 6).
+- **A4 Apply.** Consensus at H+L reads the plan (APP:8938-8967, :8993-9029) and emits the exclusion delta with the
+  validator-set update. hotstuff_rs `ValidatorSet` gains a sorted `leader_excluded` set; `select_leader` runs IWRR
+  over eligible members at their own powers and falls back to all members if eligible power < quorum. Unchanged:
+  voting power, quorums, `is_phase_voter`, and the schedule when the set is empty. Leader hints (APP:1373, :1496) use
+  the same set.
+
+### Determinism
+
+Inputs are committed blocks only (justify views and signatures) and the app state their execution writes. Each
+replica derives the boundary update from its own plan row, exactly as epoch rotation does today (EP:1-16), resting on
+deterministic execution. The running hash covers the new rows when on. leader(v) stays a pure function of
+(v, validator set state).
+
+### Fit with TC-required
+
+leader(v) changes only through a validator-set update. During the transition `is_proposer` accepts the CVS or PVS
+leader (RO:74-82) and tips verify under leader(view) in the committed or previous set (TC doc F2). V1-V4 and L1-L4
+are unchanged: exclusion changes who leads, not which certificate a leader needs. Once the dead node is excluded
+there are no dead-leader views, so the TC wait disappears from the one-down case. Backup aggregator, NewView routing
+and leader-skip all call `select_leader`, so they stay consistent.
+
+### Recovered validator
+
+On restart it votes again; the first committed QC carrying its signature satisfies A3, and it is re-admitted at the
+next applied plan once the 2^j floor has passed. Caveat: the collector stops at quorum (HT:374-388); with 2/2/1 the
+stake-1 vote is never needed, so it lands in a QC only when it beats A or B (question 3).
+
+### Abuse resistance
+
+No replica takes exclusions from a proposer; each uses the plan its own execution wrote. Framing honest X requires
+its view to end with no committed certificate: the QC is aggregated by leader(m+1) and backup leader(m+2), so both
+would have to be byzantine; orphaning by a later leader is closed by V1/V3 plus tip signing (TC doc §4); and it must
+happen for K slots in a row. With fixed IWRR neighbours a byzantine pair right after X could repeat this (needs
+n >= 7); bounded because excluded power <= total - quorum, X keeps its voting power and returns via A3, and liveness
+is no worse than today. A byzantine X can still waste its own slots, as today; A3's 2^j floor makes repeats cheaper.
+
+### Transient
+
+After 3 misses (~6 s), the rest of the epoch plus one more: L to 2L heights, ~100-200 s at the bench's degraded
+~1 blk/s and ~6-12 s at full speed. Levers: (a2), a shorter window W, or b2.
+
+### P0.0
+
+The hotstuff_rs `ValidatorSet` and update encodings are genesis-bound; P0.0 bits live on the app header and cannot
+gate hotstuff_rs formats (same as TC doc §3). A1-A3 are execution logic and can be gated by a P0.0 feature if they
+land after genesis.
+
+## 4. Test plan
+
+- **Unit (hotstuff_rs):** `select_leader` never returns an excluded validator; empty set = identical schedule to
+  today; closed-form vs reference test extended to exclusions; quorum fallback; round-trip encode/decode of the set and
+  its update; `is_proposer` while an exclusion update is pending or decided.
+- **Unit (execution):** A1 gaps, successes and the skip rule around validator-set updates; property test: two
+  executors fed the same random chains write identical rows; A2 cap and ordering; A3 evidence, the 2^j floor and its
+  reset; crash replay gives the same plan; framing cases (one withholding aggregator: no exclusion; two adjacent
+  byzantine aggregators: within the cap).
+- **Multi-node:** `one_down_liveness_test` with 2/2/1 (exclusion within 2L, no timeouts on the dead node's slots
+  afterwards); 4 equal stakes, one down at each rotation position; restarted node re-admitted and proposing; dead node
+  never re-admitted; `epoch_boundary_rejoin_test` and `multiple_validator_set_updates_test` with exclusions; TC tip
+  checks across an exclusion update.
+- **Mutations** (each must fail a test): attribute from local state; drop the cap; re-admit without evidence;
+  `select_leader` ignores exclusions; skip the gap rule around validator-set updates.
+
+## 5. Bench plan
+
+- Before: the one-down baseline on main (archy, after 9j): `VALIDATOR_STAKES=2,2,1`, `KILL_NO_RESTART=val2`,
+  `KILL_NO_RESTART_AT_S=120`, `BENCH_RPCS=0,1`, oracle feed off, 600 s, plus the all-up arm.
+- After: the same cells on the branch, ABBA, 3 runs each.
+- Report for three windows (pre-kill, kill to exclusion update, post-exclusion): blocks/s, matched/s, timeout views
+  per minute, p50/p99 order latency, kill-to-exclusion time (s and heights).
+- Pass: post-exclusion blocks/s >= 90% of all-up; all-up within noise; no new stalls.
+- Optional: a re-admission cell (needs a delayed-restart knob) and a WAN netem cell.
+
+## 6. Phases
+
+| Phase | Work | Estimate |
+|---|---|---|
+| 1 | hotstuff_rs set and update encoding, `select_leader` filter, leader hints, unit tests | 1.5-2 d |
+| 2 | Execution A1-A3, stats rows, plan and boundary update, determinism test | 2.5-3 d |
+| 3 | Multi-node and mutation tests | 1.5-2 d |
+| 4 | Bench before/after and report | 1 d |
+| 5 (optional) | (a2) if the transient matters | 1-1.5 d |
+
+Codex torus review after each phase. Total 6.5-8 days. Proposed order: start after TC phase B merges; land phase 1
+before TC phase C, since F2 checks leader(view).
+
+## 7. Open questions for the owner
+
+1. Transient: keep W = L (recommended start), a shorter W, or b2? A shorter W needs execution to have applied h-W at
+   every W boundary, so execution lag can stall proposals (`TORUS_PROPOSER_EXEC_WATERMARK` is off by default,
+   HS:464-489).
+2. K = 3 and the j cap of 6: constants or genesis parameters?
+3. Re-admission evidence: QC signatures only, also committed oracle submissions, or an explicit rejoin action (unjail
+   style) for low-power or distant validators?
+4. IWRR coarseness: normalize powers before genesis (gcd, or smooth WRR)? Consensus-visible; changes the bench's dead
+   share from 1/3 to 1/5.
+5. Delete B3 reputation once this lands?
+6. Excluded validators lose only proposer rewards. Acceptable? Wire `DowntimeTracker` jailing separately?
+7. A per-epoch seeded rotation order, to stop fixed-neighbour framing at n >= 7?
+8. Add (a2) now, or only if the bench shows the transient matters?
+
+Sources: Aptos consensus_config.rs (LeaderReputation defaults); Aptos governance proposal 12 (exclude_round 20->40);
+Hyperliquid staking docs (jailing); Monad docs (MonadBFT); Chorus One, Monad architecture.
