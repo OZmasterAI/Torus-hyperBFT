@@ -10,9 +10,11 @@
 //! - From `close_at`, the block step [`NativeExecutor::run_delist_settlements`]
 //!   (after `process_governance`) settles it:
 //!   1. the settlement price is chosen ONCE, at the first settlement block,
-//!      and stored in the row: the usable oracle mark (block-start table),
-//!      else the last aggregated oracle price (stale but > 0), else none: the
-//!      row waits (an error result, retried every block);
+//!      and stored in the row: the governance close price (owner s134, 1c:
+//!      `SetDelistClosePrice`, executed before or at `close_at`; consumed
+//!      here), else the usable oracle mark (block-start table), else the
+//!      last aggregated oracle price (stale but > 0, no age cap), else none:
+//!      the row waits (an error result, retried every block);
 //!   2. every resting order and pending stop in the market is cancelled and
 //!      refunded (each settlement block: reduce-only orders placed between
 //!      settlement blocks never survive one);
@@ -33,6 +35,10 @@
 //!      per block, across all settling markets (ascending market id). A cut
 //!      walk stores the last visited trader as the cursor; the next block
 //!      continues there. The row is deleted when the walk reaches the end.
+//!   5. Owner s134, 3b: when the row is gone and the vault and both ADL
+//!      escrows are flat in the market (here, or after the ADL drain), the
+//!      oracle-closed marker is written: its oracle entries are ignored and
+//!      it is no longer aggregated.
 //!
 //! Every write goes through the block's state (one atomic batch per block).
 //! A storage error, or any error of the pass, fail-stops the node like the
@@ -105,21 +111,59 @@ impl NativeExecutor {
         }
     }
 
-    /// The settlement price of `m` for a row that has none yet: the usable
-    /// mark, else the last aggregated oracle price when > 0 (stale), else
-    /// `None` (wait).
+    /// The settlement price of `m` for a row that has none yet: the
+    /// governance close price (owner s134, 1c), else the usable mark, else
+    /// the last aggregated oracle price when > 0 (stale, no age cap), else
+    /// `None` (wait). The flag is `true` for the governance close price.
     fn delist_settlement_price<T: StateBackend>(
         ctx: &NativeExecContext<T>,
         m: MarketId,
-    ) -> Result<Option<FixedPoint>, CoreError> {
+    ) -> Result<Option<(FixedPoint, bool)>, CoreError> {
+        if let Some(p) = liq::delist_close_price(&ctx.state, m)? {
+            return Ok(Some((p, true)));
+        }
         if let Some(mark) = AccountReader::of(ctx).mark(m) {
-            return Ok(Some(mark));
+            return Ok(Some((mark, false)));
         }
         Ok(ctx
             .oracle
             .get_price_opt(m, ctx.timestamp)?
             .map(|p| p.price)
-            .filter(|p| *p > FixedPoint::ZERO))
+            .filter(|p| *p > FixedPoint::ZERO)
+            .map(|p| (p, false)))
+    }
+
+    /// Owner s134, 3b: when delisted `m`'s settlement is complete (no
+    /// settlement row, and the liquidator vault and both ADL escrows hold no
+    /// position in it, so no ADL obligation is left), write its oracle-closed
+    /// marker ([`torus_types::market_oracle_closed_key`], value = height) and
+    /// add it to the block's set: from the next block its oracle entries are
+    /// ignored and it is not aggregated. Called where completion can happen:
+    /// the walk's end (here) and the ADL drain of a delisted market. Already
+    /// closed, not delisted or not complete: nothing.
+    pub(super) fn close_oracle_if_settled<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        m: MarketId,
+    ) -> Result<(), CoreError> {
+        if ctx.oracle_closed_markets.contains(&m) || !ctx.delisted_markets.contains(&m) {
+            return Ok(());
+        }
+        if liq::delist_settlement(&ctx.state, m)?.is_some() {
+            return Ok(());
+        }
+        for a in [LIQUIDATOR_VAULT, liq::ADL_ESCROW_LONG, liq::ADL_ESCROW_SHORT] {
+            if ctx.positions.get_position(&a, m)?.is_some() {
+                return Ok(());
+            }
+        }
+        ctx.state.put_cf_raw(
+            torus_state::cf::CF_NATIVE_MARKETS,
+            &torus_types::market_oracle_closed_key(m),
+            &ctx.block_height.to_be_bytes(),
+        )?;
+        ctx.oracle_closed_markets.insert(m);
+        tracing::info!(market = m, height = ctx.block_height, "delist settlement complete: oracle closed");
+        Ok(())
     }
 
     fn delist_settlement_pass<T: StateBackend>(
@@ -141,8 +185,14 @@ impl NativeExecutor {
             let price = match row.price {
                 Some(p) => p,
                 None => match Self::delist_settlement_price(ctx, m)? {
-                    Some(p) => {
-                        tracing::info!(market = m, price = %p, height = ctx.block_height, "delist settlement: price fixed");
+                    Some((p, governance)) => {
+                        // Owner s134, 1c: a governance close price is
+                        // consumed here; from now on the price never changes
+                        // (later close-price proposals fail as too late).
+                        if governance {
+                            liq::delete_delist_close_price(&ctx.state, m)?;
+                        }
+                        tracing::info!(market = m, price = %p, governance, height = ctx.block_height, "delist settlement: price fixed");
                         p
                     }
                     None => {
@@ -194,6 +244,7 @@ impl NativeExecutor {
                 liq::delete_delist_settlement(&ctx.state, m)?;
                 let vault = ctx.positions.get_position(&LIQUIDATOR_VAULT, m)?;
                 tracing::info!(market = m, height = ctx.block_height, vault_residual = ?vault.map(|p| (p.is_long, p.size)), "delist settlement: market settled");
+                Self::close_oracle_if_settled(ctx, m)?;
             } else {
                 row.price = Some(price);
                 row.cursor = last;

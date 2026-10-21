@@ -1609,6 +1609,22 @@ fn verify_phases(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Delist decisions (owner s134, 1c): the close-price action hash is
+    /// typed (its own type hash first), so it differs from every older
+    /// action's hash over the same fields, and it binds the price.
+    #[test]
+    fn delist_close_price_action_hash_is_typed() {
+        let p = FixedPoint::from_raw(5);
+        let h = hash_proposal_action(&ProposalAction::SetDelistClosePrice { market_id: 1, price: p });
+        let mut untyped = Vec::new();
+        untyped.extend_from_slice(&encode_u64(1));
+        untyped.extend_from_slice(&encode_i128(5));
+        assert_ne!(h, keccak256(&untyped), "typed, not the bare fields");
+        assert_ne!(h, hash_proposal_action(&ProposalAction::DelistMarket { market_id: 1 }));
+        let other = ProposalAction::SetDelistClosePrice { market_id: 1, price: FixedPoint::from_raw(6) };
+        assert_ne!(h, hash_proposal_action(&other), "price bound");
+    }
     use crate::{OrderType, SessionData, SessionScope, TimeInForce};
 
     fn test_key() -> SigningKey {

@@ -5536,6 +5536,12 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// executed in this block is added by `process_governance`). Only
     /// reduce-only orders are placed there.
     pub delisted_markets: HashSet<MarketId>,
+    /// Delist decisions (owner s134, 3b): delisted markets whose settlement
+    /// is complete (their `market_oracle_closed_key` rows, read in the same
+    /// scan; a market completed in this block is added by the step that
+    /// wrote the row). Their oracle submission entries are ignored and the
+    /// block-start aggregation skips them.
+    pub oracle_closed_markets: HashSet<MarketId>,
     /// Item 6 C2: the block's mark table, filled by `begin_block_oracle`
     /// (`None` before it, or when it failed: marks read the oracle).
     block_marks: Option<BlockMarks>,
@@ -6180,13 +6186,13 @@ impl<T: StateBackend> NativeExecContext<T> {
         // Item 3 (F2, F8, D11): margin configs from the market listings. A read
         // error is a node fault (fatal, like the book load).
         let margin_configs_timer = std::time::Instant::now();
-        let (margin_configs, delisted_markets) = match Self::load_margin_configs(&state) {
+        let (margin_configs, delisted_markets, oracle_closed_markets) = match Self::load_margin_configs(&state) {
             Ok(m) => m,
             Err(e) => {
                 if load_error.is_none() {
                     load_error = Some(format!("margin configs: {e}"));
                 }
-                (HashMap::default(), HashSet::default())
+                (HashMap::default(), HashSet::default(), HashSet::default())
             }
         };
         load_timings.margin_configs_ns = margin_configs_timer.elapsed().as_nanos();
@@ -6201,6 +6207,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             dirty_books: HashSet::default(),
             margin_configs,
             delisted_markets,
+            oracle_closed_markets,
             block_marks: None,
             prev_marks: None,
             sums: None,
@@ -7176,12 +7183,17 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// Pre-testnet P1: the same scan collects the delisted markets (9-byte
     /// [`torus_types::market_delisted_key`] rows).
     #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity)]
     fn load_margin_configs(
         state: &T,
-    ) -> Result<(HashMap<MarketId, MarketMarginConfig>, HashSet<MarketId>), torus_state::error::StateError> {
+    ) -> Result<
+        (HashMap<MarketId, MarketMarginConfig>, HashSet<MarketId>, HashSet<MarketId>),
+        torus_state::error::StateError,
+    > {
         use torus_state::cf::CF_NATIVE_MARKETS;
         let mut configs = HashMap::default();
         let mut delisted = HashSet::default();
+        let mut oracle_closed = HashSet::default();
         for (k, v) in state.iterate_cf(CF_NATIVE_MARKETS, None)? {
             let Ok(id) = <[u8; 8]>::try_from(&k[..k.len().min(8)]) else { continue };
             let m = u64::from_be_bytes(id);
@@ -7191,9 +7203,11 @@ impl<T: StateBackend> NativeExecContext<T> {
                 }
             } else if k[..] == torus_types::market_delisted_key(m)[..] {
                 delisted.insert(m);
+            } else if k[..] == torus_types::market_oracle_closed_key(m)[..] {
+                oracle_closed.insert(m);
             }
         }
-        Ok((configs, delisted))
+        Ok((configs, delisted, oracle_closed))
     }
 
     /// Durable global-order-id counter row. Lives in `CF_NATIVE_MARKETS` — a
@@ -13790,8 +13804,15 @@ impl NativeExecutor {
         // Review M1(b): newest sample wins per (market, validator), whatever
         // the in-block order: a sample not newer than the stored one is
         // skipped (an equal one keeps the first in canonical order).
+        // Delist decisions (owner s134, 3b): an entry for a market whose
+        // delist settlement is complete is ignored (validated above like any
+        // entry, never written); the other entries are kept, so a feeder
+        // still publishing the market loses nothing.
         let mut newer = Vec::with_capacity(prices.len());
         for &(market_id, price) in prices {
+            if ctx.oracle_closed_markets.contains(&market_id) {
+                continue;
+            }
             match ctx.oracle.stored_sample_ms(market_id, &reporter) {
                 Ok(Some(stored)) if stored >= sample_ms => {}
                 Ok(_) => newer.push((market_id, price)),
@@ -14377,7 +14398,10 @@ impl NativeExecutor {
         ctx: &NativeExecContext<T>,
     ) -> Result<(Vec<MarketId>, Vec<(Address, FixedPoint)>), String> {
         ctx.oracle.prune_submissions(ctx.timestamp).map_err(|e| e.to_string())?;
-        let markets = ctx.governance.listed_market_ids().map_err(|e| e.to_string())?;
+        // Delist decisions (owner s134, 3b): a market whose delist settlement
+        // is complete is no longer aggregated (its last aggregate ages out).
+        let mut markets = ctx.governance.listed_market_ids().map_err(|e| e.to_string())?;
+        markets.retain(|m| !ctx.oracle_closed_markets.contains(m));
         let stakes = ctx
             .staking
             .all_validators()

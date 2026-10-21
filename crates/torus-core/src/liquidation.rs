@@ -95,7 +95,12 @@ pub const ADL_OBLIGATION_TAG: u8 = 0x07;
 /// [‖ price raw(16, BE) [‖ cursor(20)]]`: a governance-delisted market's
 /// settlement ([`DelistSettlement`]). Written when the delist executes,
 /// deleted when the last position is closed.
-pub const DELIST_SETTLE_TAG: u8 = 0x08;
+pub const DELIST_SETTLE_TAG: u8 = torus_types::DELIST_SETTLE_TAG;
+/// Delist decisions (owner s134, 1c): `0x09 ‖ market(8)` -> price raw (16,
+/// BE): a governance close price (`SetDelistClosePrice`), written by the
+/// proposal's execution while the settlement price is not fixed, consumed
+/// (deleted) by the settlement step when it fixes the price.
+pub const DELIST_CLOSE_PRICE_TAG: u8 = torus_types::DELIST_CLOSE_PRICE_TAG;
 /// Delist option C: traders of `CF_NATIVE_POSITIONS` one block's settlement
 /// step visits (all settling markets together; the walk is the liquidation
 /// step's C1 walk), and the positions it closes at most. The rest waits for
@@ -839,10 +844,27 @@ pub struct DelistSettlement {
 
 /// The key of `m`'s settlement row.
 pub fn delist_settle_key(m: MarketId) -> [u8; 9] {
-    let mut k = [0u8; 9];
-    k[0] = DELIST_SETTLE_TAG;
-    k[1..].copy_from_slice(&m.to_be_bytes());
-    k
+    torus_types::delist_settlement_key(m)
+}
+
+/// Delist decisions (owner s134, 1c): `m`'s governance close price, if one
+/// is stored. A row that is not 16 bytes is a malformed-row error.
+pub fn delist_close_price<T: StateBackend>(state: &T, m: MarketId) -> Result<Option<FixedPoint>, CoreError> {
+    state
+        .get_cf_raw(CF_NATIVE_LIQUIDATION, &torus_types::delist_close_price_key(m))?
+        .map(|v| {
+            <[u8; 16]>::try_from(v.as_slice())
+                .map(|b| FixedPoint::from_raw(i128::from_be_bytes(b)))
+                .map_err(|_| malformed("delist close price"))
+        })
+        .transpose()
+}
+
+/// Delete `m`'s governance close price (consumed when the settlement price
+/// is fixed). No row: no-op.
+pub fn delete_delist_close_price<T: StateBackend>(state: &T, m: MarketId) -> Result<(), CoreError> {
+    state.delete_cf_raw(CF_NATIVE_LIQUIDATION, &torus_types::delist_close_price_key(m))?;
+    Ok(())
 }
 
 fn decode_delist_settlement(k: &[u8], v: &[u8]) -> Result<DelistSettlement, CoreError> {
