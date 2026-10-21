@@ -937,6 +937,15 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    `torus_commit_feed_{decode,evm,manifest,enqueue}_seconds`, `torus_exec_dispatch_send_seconds` (blocked on the exec
    channel), `torus_commit_event_handler_seconds`. Verdict: which step carries B's extra ~+30 ms per view, and is it
    B0 (b0) or only B (b1)?
+   **Done s73 (ozarchy-9f, section 118; O `bd09feb7` node `f1a096ce`, B0 `cc123463` `62b8dc82`, B `feebce0f` `b7ab3c48`,
+   per-arm bench builds, tools frozen from main `913613eb`; 7 / 7 cells valid, 0 CHECK FAIL, no foreign-CPU rerun):
+   8z's gap did NOT reproduce, it reversed. Native blocks/s O 8.03 / B0 9.40 / B 11.64, B / O 1.449 [1.051, 1.997]
+   (8z: 0.746); `qc_to_advance` O 40.6 / B0 34.8 / B 28.2 ms per view (8z: 21.1 -> 30.6). `commit_feed_app` (decode +
+   manifest persist + `enqueue_for_execution` incl. the blocking exec send, 8-13 ms per block) is 94-96% of it in every
+   arm; the other 14 steps sum to 1.6-1.7 ms per view in all three; `qc_to_advance` per 1k fills is flat (1.373 / 1.358 /
+   1.363). No step carries a size-independent excess, so neither b0 nor b1 owns one here. B's one per-fill cost:
+   matched/s 0.980 [0.973, 0.988]. O itself fell 14.4 -> 8.0 blocks/s vs 8z with the same env: the cadence equilibrium
+   moves with the binary (medium-low). Next: 8z's exact nodes `74598d33` / `f19d9385` + 9f's, one bench client.**
 9g. **L6.1: Classic final form with the running state hash on** (owner s131; after 9f; ~1 h 30). L3.1 needs the hash
    off (9e: deep blocks/s 3.50 -> 15.23). L6.1 (genesis `consensus.book_window_commit`, default off) hashes the
    order-book CF only at %100 heights, where every book is written and hashed, so h_n no longer depends on node-local
