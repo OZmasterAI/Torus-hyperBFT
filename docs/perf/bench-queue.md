@@ -912,6 +912,15 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    says on). Warm-up, then A B B A (n = 2), 300 s cells. Report: matched/s, native blocks/s, fills per block, block
    p50 / p99, timeouts per 1k blocks, exec on-CPU ms per 1k fills, CPU-s per 1M fills, save_order_books ms per block,
    the window-close spike (`torus_exec_book_coalesce_close_seconds`), RSS; A next to 9d's N as a check (same defaults).
+   **Done s73 (ozarchy-9e, section 117; `e1106362` node `135bc411`, tools frozen from main `82fcd826`, 5 / 5 cells
+   valid, no foreign-CPU rerun; deviation: `e1106362` lacks main's L2.2 default-on `89655e95`, so
+   `TORUS_SETTLE_NO_MERGE=1` was set by env on both arms (owner + 18c) = main `82fcd826`'s defaults; l22chk proves the
+   flag + 0 fallbacks, not the count of no-merge flushes): the gain holds. B / A matched/s 1.137 [1.116, 1.157]
+   (234.9k -> 267.0k), blocks/s 4.35 [4.21, 4.50] (3.50 -> 15.23; 8y 3.42 -> 15.76), fills / blk 64.4k -> 16.4k, p50 / p99
+   191 / 1,456 -> 13 / 723 ms, timeouts 3.78 -> 0.11 per 1k blocks, exec on-CPU per 1k fills 0.766 [0.747, 0.785], CPU-s
+   per 1M 0.949 [0.918, 0.981], save_order_books 56.4 -> 0.71 ms / blk, RSS 6.5 -> 4.7 GB. Window close mean 68 ms,
+   p99 ~155 ms, 3 of 285 closes in 128-256 ms, ~48 closes per 300 s, 300 books each. A vs 9d N: matched/s 1.0095,
+   CPU-s 0.994, exec on-CPU 0.995 (A reproduces N). Watch: flush worker per 1k fills 1.33 [0.73, 2.42].**
 9f. **b1 Classic gap: qc_to_advance sub-timers + b0 / b1 bisect** (owner s131; after 9e; ~45 min). Sections 111 / 111.8:
    Classic on b1 runs 0.746x native blocks/s at equal per-fill cost; the gap is consensus-side (`qc_to_advance` 21.1 ->
    30.6 ms per view, ~+30 ms per view independent of block size); a clean rebuild was byte-identical (not a build
