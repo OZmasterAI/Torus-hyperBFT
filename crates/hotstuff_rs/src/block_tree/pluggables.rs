@@ -226,17 +226,16 @@ pub trait KVGet {
     /* ↓↓↓ Committed Validator Set ↓↓↓ */
 
     fn committed_validator_set(&self) -> Result<ValidatorSet, KVGetError> {
-        let committed_validator_set_bytes = ValidatorSetBytes::deserialize(
-            &mut &*self.get(&variables::COMMITTED_VALIDATOR_SET).ok_or(
+        let committed_validator_set_bytes =
+            ValidatorSetBytes::decode(&self.get(&variables::COMMITTED_VALIDATOR_SET).ok_or(
                 KVGetError::ValueExpectedButNotFound {
                     key: Key::CommittedValidatorSet,
                 },
-            )?,
-        )
-        .map_err(|err| KVGetError::DeserializeValueError {
-            key: Key::CommittedValidatorSet,
-            source: err,
-        })?;
+            )?)
+            .map_err(|err| KVGetError::DeserializeValueError {
+                key: Key::CommittedValidatorSet,
+                source: err,
+            })?;
         ValidatorSet::try_from(committed_validator_set_bytes).map_err(|err| {
             KVGetError::Ed25519DalekError {
                 key: Key::CommittedValidatorSet,
@@ -366,17 +365,16 @@ pub trait KVGet {
     /* ↓↓↓ Previous Validator Set ↓↓↓ */
 
     fn previous_validator_set(&self) -> Result<ValidatorSet, KVGetError> {
-        let previous_validator_set_bytes = ValidatorSetBytes::deserialize(
-            &mut &*self.get(&variables::PREVIOUS_VALIDATOR_SET).ok_or(
+        let previous_validator_set_bytes =
+            ValidatorSetBytes::decode(&self.get(&variables::PREVIOUS_VALIDATOR_SET).ok_or(
                 KVGetError::ValueExpectedButNotFound {
                     key: Key::CommittedValidatorSet,
                 },
-            )?,
-        )
-        .map_err(|err| KVGetError::DeserializeValueError {
-            key: Key::CommittedValidatorSet,
-            source: err,
-        })?;
+            )?)
+            .map_err(|err| KVGetError::DeserializeValueError {
+                key: Key::CommittedValidatorSet,
+                source: err,
+            })?;
         ValidatorSet::try_from(previous_validator_set_bytes).map_err(|err| {
             KVGetError::Ed25519DalekError {
                 key: Key::CommittedValidatorSet,

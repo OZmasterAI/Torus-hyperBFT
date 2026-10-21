@@ -235,6 +235,12 @@
 //! To meet these requirements, Pacemaker's leader selection implementation
 //! ([`select_leader`](implementation::select_leader)) uses the Interleaved Weighted Round-Robin
 //! ([Interleaved WRR](https://en.wikipedia.org/wiki/Weighted_round_robin#Interleaved_WRR)) algorithm.
+//!
+//! Dead-leader skip: validators in the validator set's
+//! [leader-excluded](crate::types::validator_set::ValidatorSet#leader-exclusion) set are skipped
+//! (IWRR over the eligible validators at their own powers) while the eligible power reaches a quorum;
+//! below that, selection runs over all validators. The set changes only through validator-set
+//! updates, so `leader(view)` stays a pure function of (view, validator set).
 
 pub mod messages;
 
