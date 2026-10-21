@@ -175,6 +175,22 @@ land after genesis.
 Codex torus review after each phase. Total 6.5-8 days. Proposed order: start after TC phase B merges; land phase 1
 before TC phase C, since F2 checks leader(view).
 
+## 7a. Decisions (owner s134)
+
+- **Approach: (b1) leader exclusion through the epoch plan — CHOSEN.** Not chosen: (a1) shorter base timeout (all-up
+  regression, WAN risk), (b0) B3 reputation (diverges on local inputs), (b2) per-block exclusion in hotstuff_rs (more
+  complex; revisit if the transient matters), (c1)/(c2) rotation changes (little gain or needs TC agreement).
+- **Transient (Q1): accept W = L** (exclusion lands 1-2 epochs after the 3rd miss). (a2) short timeout for a leader
+  that missed its last slot is the follow-up if the one-down bench shows the transient matters; (b2) stays the
+  heavier alternative.
+- **Parameters (Q2): genesis parameters** with defaults K = 3 and j cap = 6, range-checked at genesis validation
+  (later governance-adjustable). Not chosen: hard-coded constants (each change needs a release + P0.0 activation).
+- **Jailing (Q6): not part of b1.** b1 only removes leader slots; voting power and quorum math are unchanged.
+  Jailing (removing voting power, HyperBFT / Cosmos style) is a separate design, to land **before mainnet or as a
+  testnet upgrade so it can be tested live** (via P0.0 activation if after genesis), together with the staking /
+  rewards / unjail rules. Reason to want it: with 4 validators two dead halt the chain; jailing the first restores
+  the margin.
+
 ## 7. Open questions for the owner
 
 1. Transient: keep W = L (recommended start), a shorter W, or b2? A shorter W needs execution to have applied h-W at
