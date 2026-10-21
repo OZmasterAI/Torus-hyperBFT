@@ -25,6 +25,7 @@ use std::path::Path;
 use hotstuff_rs::block_tree::variables::COMMITTED_VALIDATOR_SET;
 use torus_consensus::RocksKVStore;
 use torus_state::cf::{CF_ACCOUNTS, CF_BLOCK_HEADERS, CF_CONSENSUS_META, CF_STAKING_VALIDATORS};
+use torus_genesis::GenesisDigest;
 use torus_state::{consensus_db_path, NativeDaStore, StateBackend, StateDb};
 
 /// The node's state DB and consensus DB, opened and checked.
@@ -154,6 +155,90 @@ pub fn apply_genesis_if_fresh(
     hotstuff_rs::replica::Replica::initialize(dbs.kv_store(), app_state, vs_state);
     tracing::info!("consensus replica initialized with genesis validator set");
     Ok(true)
+}
+
+/// State-DB meta key (`cf_consensus_meta`, node-local, not in the running
+/// hash): the [`GenesisDigest`] of the genesis file this data dir is bound to
+/// (P0.0 phase 4), in [`GenesisDigest::encode`]'s form.
+pub const META_GENESIS_DIGEST: &[u8] = b"genesis_file_digest";
+
+/// How boot step 4 bound the genesis file to the data dir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenesisBinding {
+    /// Fresh data dir: genesis seeded, its digest stored.
+    Fresh,
+    /// Initialized data dir without a stored digest (first boot of a build
+    /// with the check): the current file's digest stored, not verified
+    /// against the genesis the dir was initialized with.
+    Legacy,
+    /// The file matches the stored digest.
+    Matched,
+}
+
+/// The stored genesis digest, if any.
+pub fn read_genesis_digest(state: &StateDb) -> Result<Option<GenesisDigest>, String> {
+    state
+        .get_cf_raw(CF_CONSENSUS_META, META_GENESIS_DIGEST)
+        .map_err(|e| format!("read the stored genesis digest: {e}"))?
+        .map(|b| GenesisDigest::decode(&b))
+        .transpose()
+}
+
+fn store_genesis_digest(state: &StateDb, digest: &GenesisDigest) -> Result<(), String> {
+    state
+        .put_cf_raw(CF_CONSENSUS_META, META_GENESIS_DIGEST, &digest.encode())
+        .and_then(|()| state.sync_wal())
+        .map_err(|e| format!("store the genesis digest: {e}"))
+}
+
+/// The refusal for a genesis file whose digest is not the stored one.
+pub fn genesis_changed_error(
+    stored: &GenesisDigest,
+    file: &GenesisDigest,
+    genesis_path: &Path,
+    data_dir: &Path,
+) -> String {
+    let changed = stored.changed_fields(file);
+    let changed = if changed.is_empty() {
+        "no single field identified".to_string()
+    } else {
+        changed.join(", ")
+    };
+    format!(
+        "refusing to start: genesis file {path} differs from the genesis data dir {dir} was \
+         initialized with (stored digest {stored}, file digest {file}); changed: {changed}. \
+         The chain config (activations, timeouts, chain id, ...) is read from this file at every \
+         boot but genesis is applied only once, so an edited file would change consensus \
+         parameters on this node alone. Restore the original genesis file (formatting and key \
+         order may differ), or start from a fresh data dir to run the new genesis.",
+        path = genesis_path.display(),
+        dir = data_dir.display(),
+        stored = stored.digest,
+        file = file.digest,
+    )
+}
+
+/// Boot step 4 with a genesis file (P0.0 phase 4): an initialized data dir
+/// with a stored digest refuses a file that digests differently (before
+/// anything is written); one without a stored digest stores the file's
+/// ([`GenesisBinding::Legacy`]); a fresh one is seeded
+/// ([`apply_genesis_if_fresh`]) and then stores it.
+pub fn init_genesis(
+    dbs: &NodeDbs,
+    genesis: &torus_genesis::Genesis,
+    _file_digest: &GenesisDigest,
+    _genesis_path: &Path,
+    _data_dir: &Path,
+) -> Result<GenesisBinding, String> {
+    // RED: today's behaviour, nothing bound.
+    apply_genesis_if_fresh(dbs, genesis)?;
+    Ok(GenesisBinding::Fresh)
+}
+
+/// Boot step 4 without a genesis file: a data dir bound to a genesis file
+/// refuses (the default chain config would replace that genesis' config).
+pub fn check_no_genesis_file(_dbs: &NodeDbs, _data_dir: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 /// Open the state DB and the consensus DB under `data_dir`, apply the
@@ -871,5 +956,126 @@ mod tests {
         // Past N, never pruned, never ran with retention, defaulted: refused.
         let err = check_retention_upgrade(p(11, 0, false), Some(10), false, d).unwrap_err();
         assert!(err.contains("below 1"), "names the first cutoff: {err}");
+    }
+
+    // ---- P0.0 phase 4: genesis digest binding ----
+
+    const DEVNET_GENESIS: &str = include_str!("../../../devnet/genesis.json");
+
+    /// A genesis file text: parsed genesis + digest, as `run` loads it.
+    fn genesis_file(text: &str) -> (torus_genesis::Genesis, GenesisDigest) {
+        (
+            torus_genesis::Genesis::from_json(text).unwrap(),
+            GenesisDigest::of_json(text).unwrap(),
+        )
+    }
+
+    fn devnet_with(edit: impl FnOnce(&mut serde_json::Value)) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(DEVNET_GENESIS).unwrap();
+        edit(&mut v);
+        serde_json::to_string_pretty(&v).unwrap()
+    }
+
+    fn boot(dir: &Path, text: &str) -> Result<GenesisBinding, String> {
+        let dbs = open_node_dbs(dir).unwrap();
+        let (g, d) = genesis_file(text);
+        init_genesis(&dbs, &g, &d, Path::new("/etc/torus/genesis.json"), dir)
+    }
+
+    fn stored(dir: &Path) -> Option<GenesisDigest> {
+        read_genesis_digest(&StateDb::open(dir).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn fresh_boot_stores_the_genesis_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(boot(dir.path(), DEVNET_GENESIS), Ok(GenesisBinding::Fresh));
+        let dbs = open_node_dbs(dir.path()).unwrap();
+        assert!(genesis_applied(&dbs).unwrap(), "fresh boot seeded genesis");
+        assert_eq!(
+            read_genesis_digest(&dbs.state).unwrap(),
+            Some(GenesisDigest::of_json(DEVNET_GENESIS).unwrap())
+        );
+    }
+
+    #[test]
+    fn reboot_with_the_same_genesis_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        boot(dir.path(), DEVNET_GENESIS).unwrap();
+        assert_eq!(boot(dir.path(), DEVNET_GENESIS), Ok(GenesisBinding::Matched));
+        assert_eq!(boot(dir.path(), DEVNET_GENESIS), Ok(GenesisBinding::Matched));
+    }
+
+    #[test]
+    fn changed_consensus_field_refuses_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        boot(dir.path(), DEVNET_GENESIS).unwrap();
+        let before = stored(dir.path());
+        let edited = devnet_with(|v| {
+            v["consensus"]["activations"] = serde_json::json!({ "running_state_hash": 500 });
+        });
+        let err = boot(dir.path(), &edited).unwrap_err();
+        assert!(
+            err.starts_with("refusing to start: genesis file /etc/torus/genesis.json"),
+            "{err}"
+        );
+        assert!(err.contains("changed: consensus.activations."), "names the field: {err}");
+        assert!(err.contains(&dir.path().display().to_string()), "names the data dir: {err}");
+        let t = devnet_with(|v| {
+            let t = v["consensus"]["timeout_base_ms"].as_u64().unwrap();
+            v["consensus"]["timeout_base_ms"] = (t + 1).into();
+            v["chain_id"] = 9999u64.into();
+        });
+        let err = boot(dir.path(), &t).unwrap_err();
+        assert!(err.contains("changed: chain_id, consensus.timeout_base_ms."), "{err}");
+        assert_eq!(stored(dir.path()), before, "a refused boot rewrote the digest");
+        // The original file still starts.
+        assert_eq!(boot(dir.path(), DEVNET_GENESIS), Ok(GenesisBinding::Matched));
+    }
+
+    #[test]
+    fn formatting_only_change_still_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        boot(dir.path(), DEVNET_GENESIS).unwrap();
+        let v: serde_json::Value = serde_json::from_str(DEVNET_GENESIS).unwrap();
+        let compact = serde_json::to_string(&v).unwrap();
+        assert_ne!(compact, DEVNET_GENESIS);
+        assert_eq!(boot(dir.path(), &compact), Ok(GenesisBinding::Matched));
+        let pretty = serde_json::to_string_pretty(&v).unwrap();
+        let indented = format!("\n\n{}\n", pretty.replace("  ", "\t"));
+        assert_eq!(boot(dir.path(), &indented), Ok(GenesisBinding::Matched));
+    }
+
+    #[test]
+    fn legacy_data_dir_without_a_digest_stores_one_and_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            // What the previous build left: genesis applied, no digest.
+            let dbs = open_node_dbs(dir.path()).unwrap();
+            assert!(apply_genesis_if_fresh(&dbs, &genesis()).unwrap());
+        }
+        assert_eq!(stored(dir.path()), None);
+        assert_eq!(boot(dir.path(), DEVNET_GENESIS), Ok(GenesisBinding::Legacy));
+        assert_eq!(
+            stored(dir.path()),
+            Some(GenesisDigest::of_json(DEVNET_GENESIS).unwrap())
+        );
+        // From now on the dir is bound.
+        assert_eq!(boot(dir.path(), DEVNET_GENESIS), Ok(GenesisBinding::Matched));
+        let edited = devnet_with(|v| v["chain_name"] = "edited".into());
+        assert!(boot(dir.path(), &edited).unwrap_err().contains("changed: chain_name."));
+    }
+
+    #[test]
+    fn no_genesis_file_on_a_bound_dir_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let dbs = open_node_dbs(dir.path()).unwrap();
+            check_no_genesis_file(&dbs, dir.path()).expect("fresh dir without genesis starts");
+        }
+        boot(dir.path(), DEVNET_GENESIS).unwrap();
+        let dbs = open_node_dbs(dir.path()).unwrap();
+        let err = check_no_genesis_file(&dbs, dir.path()).unwrap_err();
+        assert!(err.contains("no --genesis was given"), "{err}");
     }
 }

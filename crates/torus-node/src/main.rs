@@ -633,8 +633,11 @@ fn read_passphrase_stdin() -> String {
 
 /// R19: load the genesis file; a malformed or ambiguous genesis refuses to
 /// start, naming the file.
-fn load_genesis(path: &std::path::Path) -> Result<Genesis, String> {
-    Genesis::from_file(path)
+/// Also returns the file's digest (P0.0 phase 4, `torus_genesis::digest`).
+fn load_genesis(
+    path: &std::path::Path,
+) -> Result<(Genesis, torus_genesis::GenesisDigest), String> {
+    Genesis::from_file_with_digest(path)
         .map_err(|e| format!("refusing to start: genesis {}: {e}", path.display()))
 }
 
@@ -725,15 +728,32 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Genesis initialization
     let mut chain_config = if let Some(genesis_path) = &cli.genesis {
-        let genesis = load_genesis(genesis_path)?;
+        let (genesis, file_digest) = load_genesis(genesis_path)?;
         let config = genesis.chain_config();
 
         // Only initialize on first run (see `node_dbs::genesis_applied`).
+        // P0.0 phase 4: the data dir is bound to this file's digest; a
+        // changed file refuses to start.
         info!(genesis = %genesis_path.display(), "genesis file");
-        node_dbs::apply_genesis_if_fresh(&dbs, &genesis)?;
+        let digest = file_digest.digest;
+        match node_dbs::init_genesis(&dbs, &genesis, &file_digest, genesis_path, &cli.data_dir)? {
+            node_dbs::GenesisBinding::Fresh => {
+                info!(%digest, "genesis digest stored: this data dir is bound to the genesis file")
+            }
+            node_dbs::GenesisBinding::Legacy => warn!(
+                %digest,
+                "genesis digest stored for an existing data dir that had none (first boot of a \
+                 build with the genesis check); it is not verified against the genesis the dir \
+                 was initialized with. Later boots refuse a changed genesis file"
+            ),
+            node_dbs::GenesisBinding::Matched => {
+                info!(%digest, "genesis file matches the stored genesis digest")
+            }
+        }
 
         config
     } else {
+        node_dbs::check_no_genesis_file(&dbs, &cli.data_dir)?;
         info!("no genesis file provided, using default chain config");
         default_chain_config()
     };

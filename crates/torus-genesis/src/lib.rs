@@ -28,6 +28,9 @@ use torus_types::{
     ChainConfig, FixedPoint, PublicKey, ValidatorInfo, ValidatorSet as TorusValidatorSet,
 };
 
+pub mod digest;
+pub use digest::GenesisDigest;
+
 // ---------------------------------------------------------------------------
 // Error
 // ---------------------------------------------------------------------------
@@ -391,6 +394,13 @@ impl Genesis {
     /// Parse a genesis configuration from a JSON file.
     pub fn from_file(path: &Path) -> Result<Self, GenesisError> {
         Self::from_json(&std::fs::read_to_string(path)?)
+    }
+
+    /// P0.0 phase 4: read the file once and return the parsed genesis and
+    /// the digest of the same text ([`GenesisDigest`]).
+    pub fn from_file_with_digest(path: &Path) -> Result<(Self, GenesisDigest), GenesisError> {
+        let text = std::fs::read_to_string(path)?;
+        Ok((Self::from_json(&text)?, GenesisDigest::of_json(&text)?))
     }
 
     /// Parse a genesis configuration from a JSON string.
