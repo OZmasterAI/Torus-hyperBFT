@@ -6647,6 +6647,12 @@ pub struct TorusApp {
     /// with an I/O error, as a failed RocksDB read does.
     #[cfg(test)]
     test_applied_read_fault: bool,
+    /// Fail-stop feed test seam (`failstop_feed_tests`): when non-zero, the
+    /// commit callback of the first block at or above this hotstuff height
+    /// finds the fail-stop latched, as when the execution thread latches just
+    /// before it (shared, so a test can arm it on a running node).
+    #[cfg(test)]
+    test_failstop_at: Arc<AtomicU64>,
     pending_slashes: Vec<PendingSlash>,
     pending_proposals: std::collections::HashMap<u64, PendingProposal>,
     /// Item 7 step 1: EVM txs drained into our own proposals, by height, until a block commits
@@ -6747,6 +6753,9 @@ pub struct TorusApp {
     exec_hole_last_log: Option<std::time::Instant>,
     /// Regime-B. Retry attempts against the current hole (for the operator log).
     exec_hole_retries: u64,
+    /// Fail-stop feed watchdog (s134): last time the "head-of-line height never
+    /// delivered" error fired (throttle, see [`Self::drain_exec_queue`]).
+    exec_feed_gap_last_log: Option<std::time::Instant>,
     /// Package D rank 1: queued + in-flight exec channel depth — a local
     /// mirror of the `exec_queue_depth` gauge (inc before the exec send, dec
     /// on the exec thread after a block executes) readable with
@@ -7899,6 +7908,8 @@ impl TorusApp {
             test_now_secs: None,
             #[cfg(test)]
             test_applied_read_fault: false,
+            #[cfg(test)]
+            test_failstop_at: Arc::new(AtomicU64::new(0)),
             pending_slashes: Vec::new(),
             pending_proposals: std::collections::HashMap::new(),
             own_evm_proposed: std::collections::BTreeMap::new(),
@@ -7934,6 +7945,7 @@ impl TorusApp {
             exec_hole_since: None,
             exec_hole_last_log: None,
             exec_hole_retries: 0,
+            exec_feed_gap_last_log: None,
             exec_queue_len,
             exec_prepared_height: None,
             exec_prepared_durable: DurableRows::default(),
@@ -9993,6 +10005,13 @@ impl App<RocksKVStore> for TorusApp {
     fn on_committed_block(&mut self, block: &Block, _committed_hash: CryptoHash) {
         let _commit_span =
             ObserveOnDrop::new(self.metrics.clone(), |m| &m.on_committed_block_seconds);
+        #[cfg(test)]
+        {
+            let at = self.test_failstop_at.load(Ordering::SeqCst);
+            if at != 0 && block.height.int() >= at {
+                self.exec_failed.store(true, Ordering::SeqCst);
+            }
+        }
         // T1.5 FAIL-STOP: once the execution pipeline is dead, do NOT advance
         // height/view or accept further finalization — consensus finalizing
         // while state is frozen is exactly the zombie-advance this latch stops.
@@ -10233,6 +10252,34 @@ impl App<RocksKVStore> for TorusApp {
             return;
         }
         self.drain_exec_queue();
+    }
+
+    /// s134: the commit feed stops at a fail-stopped app instead of counting
+    /// the blocks [`Self::on_committed_block`] refuses (it returns before any
+    /// durable write once `exec_failed` is latched) as delivered.
+    fn committed_feed_halted(&self) -> bool {
+        self.is_exec_failed()
+    }
+
+    /// s134 boot safety net: the hotstuff height of the first committed block
+    /// this app does not durably hold. It holds every Torus height up to its
+    /// header frontier or its applied height, whichever is higher, plus the
+    /// commit-manifest rows contiguous above it (committed, not yet
+    /// dispatched); Torus height `t` sits at hotstuff height `t - 1`. `None`
+    /// (no lowering) when the applied marker cannot be read.
+    fn committed_feed_resume_height(&self) -> Option<hotstuff_rs::types::data_types::BlockHeight> {
+        let applied = self.applied_height().ok()?.unwrap_or(0);
+        let mut held = find_last_committed_height(&self.state_db)
+            .unwrap_or(0)
+            .max(applied);
+        for h in manifest_heights_above(&self.manifest_db, held) {
+            if h != held + 1 {
+                break;
+            }
+            held = h;
+        }
+        crate::da_gc::hotstuff_height_of(held.checked_add(1)?)
+            .map(hotstuff_rs::types::data_types::BlockHeight::new)
     }
 }
 
@@ -10648,6 +10695,7 @@ impl TorusApp {
                     );
                     continue;
                 }
+                self.note_feed_gap(next);
                 return;
             };
             let DeferredExecBlock {
@@ -11140,6 +11188,38 @@ impl TorusApp {
         }
     }
 
+    /// Fail-stop feed watchdog (s134): the head-of-line height `next` is
+    /// neither buffered nor in the commit manifest. Normally it just has not
+    /// committed yet. But the feed delivers strictly in ascending order, so a
+    /// LATER height already buffered means `next` was counted delivered without
+    /// this app keeping it (before the fix: blocks a fail-stopped app refused);
+    /// it will never arrive on the live path and execution is frozen. Log it
+    /// loudly (throttled) instead of stalling silently; a restart re-delivers
+    /// it (hotstuff's boot pass lowers the fed frontier to
+    /// [`App::committed_feed_resume_height`]).
+    fn note_feed_gap(&mut self, next: u64) {
+        let Some((&queued, _)) = self.deferred_exec.range(next..).next() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if self
+            .exec_feed_gap_last_log
+            .is_some_and(|t| now.duration_since(t) < EXEC_HOLE_LOG_INTERVAL)
+        {
+            return;
+        }
+        self.exec_feed_gap_last_log = Some(now);
+        tracing::error!(
+            height = next,
+            queued_from = queued,
+            queued = self.deferred_exec.len(),
+            "execution FROZEN: committed height {} never reached this app (no commit manifest) \
+             while later committed heights are queued — the commit feed counted it delivered; it \
+             will not arrive on the live path. Restart the node: the boot feed re-delivers it",
+            next,
+        );
+    }
+
     /// Regime-B. Clear the hole clock/log/retry counters once the head-of-line
     /// hole heals (a buffered block successfully dispatched).
     fn clear_exec_hole_state(&mut self) {
@@ -11150,6 +11230,10 @@ impl TorusApp {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "failstop_feed_tests.rs"]
+mod failstop_feed_tests;
 
 /// Parent of the scratch DB dirs opened by `TorusApp::stub` and the test
 /// fixtures: `<tmp>/torus-consensus-test-dbs/<owner>/`, one `<owner>` dir per
