@@ -147,6 +147,11 @@ fn schedstat() -> (u64, u64) {
 fn one(ladder: &[(Address, NativeAction)], storm: &[(Address, NativeAction)]) -> Sample {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = StateDb::open(dir.path()).expect("open db");
+    // Pre-testnet P0 (main d78ea41b): orders need a listed market.
+    for m in 1..=MARKETS {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed")
+            .unwrap();
+    }
     let pm = PositionManager::new(db.clone());
     for n in 0..TRADERS {
         pm.put_native_balance(

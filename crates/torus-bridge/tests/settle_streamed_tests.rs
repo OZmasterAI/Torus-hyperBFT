@@ -540,6 +540,16 @@ fn seed_aliases(db: &StateDb) {
     }
 }
 
+/// Pre-testnet P0 (main d78ea41b, merged in h2h): orders need a listed
+/// market (placeholder rows, tick / lot 1, as the old implicit book; as
+/// `settle_no_merge_tests.rs`).
+fn list_markets(db: &StateDb) {
+    for m in 1..=64u64 {
+        db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed")
+            .unwrap();
+    }
+}
+
 /// One run's settings.
 #[derive(Clone, Copy, Debug)]
 struct Run {
@@ -579,6 +589,7 @@ fn arm(fault: &LastBlockFault, f: &mut Faults, probe: &mut SettleStreamProbe) {
 fn run(blocks: &[Block], r: Run, fault: &LastBlockFault) -> (RunOut, RunStats) {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = StateDb::open(dir.path()).expect("open db");
+    list_markets(&db);
     for n in 1..=TRADERS as u8 {
         let bal = NativeBalance {
             available: fp(1_000_000),
@@ -1296,6 +1307,7 @@ fn only_markets(batch: &[(Address, NativeAction)], max: MarketId) -> Vec<(Addres
 fn reused_ctx_run(blocks: &[Block], cap: usize, record_fills: bool, market: MarketId) -> ReusedOut {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = StateDb::open(dir.path()).expect("open db");
+    list_markets(&db);
     for n in 1..=TRADERS as u8 {
         let bal = NativeBalance {
             available: fp(1_000_000),
