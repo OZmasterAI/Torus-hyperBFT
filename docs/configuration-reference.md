@@ -94,7 +94,7 @@ which governance can change (see the two "EVM blocks" sections below).
 | `fee_treasury_bps` | u16 | 4500 | Fee to treasury (basis points) |
 | `fee_dev_pool_bps` | u16 | 4500 | Fee to dev pool (basis points) |
 | `state_hash_activation_height` | u64 or none | none | First height of the running state hash. Genesis key `consensus.state_hash_activation_height` (absent = off; 0 is refused). |
-| `book_mode` | string | `classic` | Order-book storage mode (owner s131), chain-wide and fixed for the chain's life. Genesis key `consensus.book_mode`: `"classic"`, `"order_rows"`, `"level_authority"`, `"level_authority_chunked"`, or the numbers 0-3; absent = `classic`; anything else refuses the genesis. Every node runs this mode: `TORUS_BOOK_ROWS` may only repeat it (deprecated), and a data dir whose `__book_mode__` marker names another mode refuses to start. Mode 3 = `"level_authority_chunked"`. |
+| `book_mode` | string | `classic` | Order-book storage mode (owner s131), chain-wide and fixed for the chain's life. Genesis key `consensus.book_mode`: `"classic"`, `"order_rows"`, `"level_authority"`, `"level_authority_chunked"`, or the numbers 0-3; absent = `classic`; anything else refuses the genesis. Every node runs this mode: `TORUS_BOOK_ROWS` may only repeat it (deprecated), and a data dir whose `__book_mode__` marker names another mode refuses to start. Mode 3 = `"level_authority_chunked"`. `"classic"` and an absent field are the same chain (generators leave it out). Upgrading a pre-s131 data dir: a node that ran with `TORUS_BOOK_ROWS=1`-`3` refuses to start until the genesis file names that mode (see the upgrade table in `docs/node-operator-guide.md`, Order-book storage mode). |
 
 ## EVM blocks (item 7 step 1)
 

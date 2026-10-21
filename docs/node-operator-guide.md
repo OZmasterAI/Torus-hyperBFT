@@ -160,6 +160,31 @@ Any other value refuses the genesis. At startup the node logs
 
 A restart without `--genesis` takes the mode from the marker.
 
+Classic is the absent field: write `"classic"` or leave `book_mode` out, the
+node runs the same chain either way. The bench and devnet generators leave it
+out (one Classic chain, one genesis file).
+
+#### Upgrading an existing data dir
+
+Before s131 each node took its mode from `TORUS_BOOK_ROWS` (unset = Classic),
+and wrote the `__book_mode__` marker on its first book save. A data dir from
+that build keeps working as follows when the node is upgraded:
+
+| Data dir | Genesis file at restart | `TORUS_BOOK_ROWS` | Result |
+|----------|------------------------|-------------------|--------|
+| Classic (marker classic, or no marker yet) | no `book_mode` (or `"classic"`) | unset or `0` | Starts in Classic. Nothing to do; unset the variable. |
+| Mode M != Classic (ran with `TORUS_BOOK_ROWS=M`) | no `book_mode` | `M` or unset | **Refuses to start** (the variable disagrees with the genesis, or the marker names mode M while the genesis says Classic). Fix: add `"book_mode": "<name of M>"` to `consensus` in the genesis file, the same file on every node of the chain, then unset the variable. |
+| Mode M | `book_mode` = M | unset or `M` | Starts in mode M (a deprecation warning while the variable is set). |
+| Mode M | `book_mode` = another mode | any | **Refuses to start** (marker mismatch). The mode of an existing chain cannot change: a new mode needs a new chain (fresh data dirs). |
+| No marker (genesis applied, no block yet) | `book_mode` = X | unset or `X` | Starts in X; the first block writes the marker. |
+| any | restart without `--genesis` | unset or the marker's mode | Starts in the marker's mode (Classic without a marker). |
+
+Adding `book_mode` to the genesis file of a running chain changes no state:
+the field is read at every start, the genesis state is never re-applied, and
+it is not part of any hash. It only has to match the marker. Every node of a
+chain must use the same value: two genesis files that differ only in
+`book_mode` start fine and fork at the first block that saves a book.
+
 ## Data Directory
 
 The `--data-dir` directory contains:
