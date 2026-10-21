@@ -456,7 +456,7 @@ mod review {
         let net = RecordingNetwork::default();
         let (tx, events) = std::sync::mpsc::channel();
         let hotstuff = HotStuff::new(
-            HotStuffConfiguration { chain_id: CHAIN_ID, keypair: Keypair::new(key), tc_required: false },
+            HotStuffConfiguration { chain_id: CHAIN_ID, keypair: Keypair::new(key) },
             ViewInfo::new(view, Instant::now() + Duration::from_secs(3600)),
             SenderHandle::new(net.clone()),
             ValidatorSetUpdateHandle::new(net.clone()),

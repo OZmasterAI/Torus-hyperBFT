@@ -73,7 +73,7 @@ fn strict_cluster_commits_with_some_down(powers: &[u64], down: &[usize]) {
         .enumerate()
         .filter(|(i, _)| !down.contains(i))
         .map(|(_, (kp, net))| {
-            Node::new_with_tc_required(kp, net, init_as.clone(), vs_updates.clone(), MAX_VIEW_TIME)
+            Node::new_with_max_view_time(kp, net, init_as.clone(), vs_updates.clone(), MAX_VIEW_TIME)
         })
         .collect();
     for node in nodes.iter_mut() {

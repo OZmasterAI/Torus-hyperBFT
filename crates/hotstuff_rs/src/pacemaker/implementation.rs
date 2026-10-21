@@ -276,7 +276,18 @@ impl<N: Network> Pacemaker<N> {
 
         // 2. Check whether the `TimeoutVote` is cryptographically correct.
         // MonadBFT: accept timeout votes for ALL views (not just epoch-change views).
-        if timeout_vote.is_correct(origin) {
+        //
+        // TC-required phase B: the vote's highest QC must be a correct QC. The vote signs only its
+        // (view, block) summary, so a byzantine voter could otherwise make a forged high-view QC the
+        // TC's high QC, which `TimeoutCertificate::is_correct` rejects and VALIDPROPOSAL V3 could not
+        // be met under: one such vote in the quorum would cost the next leader its view. Such a
+        // vote is dropped (neither echoed nor collected), so the TC forms from the honest votes.
+        let vote_ok = timeout_vote.is_correct(origin)
+            && match &timeout_vote.highest_qc {
+                Some(qc) => qc.is_correct(block_tree)?,
+                None => true,
+            };
+        if vote_ok {
             // MonadBFT Bracha amplification: accumulate voting power per view.
             if timeout_vote.view >= self.view_info.view {
                 // Deduplicate: skip if this voter already contributed to this view.

@@ -110,18 +110,29 @@ impl Certificate for TimeoutCertificate {
     /// During the speculation phase, i.e., when the new validator set has been committed, but the old
     /// validator set is still active, a TC is correct if it is correctly signed by a quorum from either
     /// of the two validator sets.
+    ///
+    /// TC-required phase B: the TC's `high_qc` must itself be a correct QC. A timeout vote binds its
+    /// highest QC only by the `(view, block)` summary it signs, so without this check one byzantine
+    /// voter could make a forged high-view QC the TC's high QC, and VALIDPROPOSAL V3 would then
+    /// reject every case-3 proposal backed by that TC. Honest collectors drop such votes
+    /// (`Pacemaker::on_receive_timeout_vote`); this rejects a TC built by anyone else.
     fn is_correct<K: KVStore>(
         &self,
         block_tree: &BlockTreeSingleton<K>,
     ) -> Result<bool, BlockTreeError> {
         let validator_set_state = block_tree.validator_set_state()?;
-        if validator_set_state.update_decided() {
-            Ok(self.is_correctly_signed(validator_set_state.committed_validator_set()))
+        let signed = if validator_set_state.update_decided() {
+            self.is_correctly_signed(validator_set_state.committed_validator_set())
         } else {
-            Ok(
-                self.is_correctly_signed(validator_set_state.committed_validator_set())
-                    || self.is_correctly_signed(validator_set_state.previous_validator_set()),
-            )
+            self.is_correctly_signed(validator_set_state.committed_validator_set())
+                || self.is_correctly_signed(validator_set_state.previous_validator_set())
+        };
+        if !signed {
+            return Ok(false);
+        }
+        match &self.high_qc {
+            Some(high_qc) => high_qc.is_correct(block_tree),
+            None => Ok(true),
         }
     }
 

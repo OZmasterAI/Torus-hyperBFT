@@ -292,13 +292,6 @@ impl<N: Network> HotStuff<N> {
         self.round_skip = on;
     }
 
-    /// Test-only override of the VALIDPROPOSAL V1 switch
-    /// ([`HotStuffConfiguration::tc_required`]).
-    #[cfg(test)]
-    pub(crate) fn set_tc_required(&mut self, on: bool) {
-        self.config.tc_required = on;
-    }
-
     /// s74 rejoin view sync: the checked future-view header that asks the
     /// pacemaker to skip to its view. Taken once.
     pub(crate) fn take_view_skip(&mut self) -> Option<(ProposalHeader, VerifyingKey)> {
@@ -1029,7 +1022,7 @@ impl<N: Network> HotStuff<N> {
         block_tree: &BlockTreeSingleton<K>,
     ) {
         // TC-required phase A: every leader proposal is backed by QC(v-1) or
-        // TC(v-1) (VALIDPROPOSAL V1), even while validators stay lax.
+        // TC(v-1) (VALIDPROPOSAL V1, which validators enforce from phase B).
         debug_assert!(
             carries_required_certificate(proposal.view, &proposal.block.justify, proposal.tc.as_ref()),
             "leader proposal for view {} justifies on view {} without TC(v-1)",
@@ -1378,7 +1371,6 @@ impl<N: Network> HotStuff<N> {
             &proposal.block.justify,
             proposal.tc.as_ref(),
             proposal.nec.as_ref(),
-            self.config.tc_required,
             block_tree,
         )? {
             log::warn!(
@@ -2292,7 +2284,6 @@ impl<N: Network> HotStuff<N> {
             &header.justify,
             header.tc.as_ref(),
             header.nec.as_ref(),
-            self.config.tc_required,
             block_tree,
         )? {
             log::warn!(
@@ -3911,12 +3902,6 @@ pub(crate) struct HotStuffConfiguration {
 
     /// The keypair with which the HotStuff implementation should sign `PhaseVote`s.
     pub(crate) keypair: Keypair,
-
-    /// VALIDPROPOSAL rule V1 (docs/plans/tc-required-and-tip-signing.md):
-    /// reject a proposal whose justify is not for the previous view unless it
-    /// carries a TC for it. Phase A: a test-only switch (default off); leaders
-    /// already attach the TC either way.
-    pub(crate) tc_required: bool,
 }
 
 /// The different ways a call to a method of the `HotStuff` struct can fail.
@@ -4557,8 +4542,10 @@ mod sync_recovery_tests {
             let origin = proposer_for(header_view, &keys, &vss, &tree);
             let mut hotstuff = hotstuff_at(ViewNumber::new(3), keys[0].clone(), vss);
             let missing = CryptoHash::new([94; 32]);
+            // Justify on header_view - 1: VALIDPROPOSAL V1 (TC-required phase B)
+            // rejects an older justify without a TC before the safety checks.
             let block = Block::new(BlockHeight::new(1),
-                generic_pc(ViewNumber::new(1), missing, &keys, &set),
+                generic_pc(header_view - 1, missing, &keys, &set),
                 CryptoHash::new([95; 32]), Data::new(vec![]));
             let mut app = RecoveryApp { calls: 0, valid: true, reject_below: 0 };
             hotstuff.on_receive_msg(recovery_header(&block, header_view).into(),
@@ -4889,7 +4876,7 @@ mod s63_body_fetch_tests {
         let me = local.verifying_key();
         let net = TargetNet::default();
         let mut hotstuff = HotStuff::new(
-            HotStuffConfiguration { chain_id: ChainID::new(0), keypair: Keypair::new(local), tc_required: false },
+            HotStuffConfiguration { chain_id: ChainID::new(0), keypair: Keypair::new(local) },
             ViewInfo::new(view, Instant::now() + Duration::from_secs(3600)),
             SenderHandle::new(net.clone()),
             ValidatorSetUpdateHandle::new(net.clone()),
@@ -5530,7 +5517,7 @@ mod header_resend_tests {
         let me = keys.iter().find(|key| key.verifying_key() == leader).unwrap().clone();
         let net = DirectNet::default();
         let mut hotstuff = HotStuff::new(
-            HotStuffConfiguration { chain_id: ChainID::new(0), keypair: Keypair::new(me), tc_required: false },
+            HotStuffConfiguration { chain_id: ChainID::new(0), keypair: Keypair::new(me) },
             ViewInfo::new(view, Instant::now() + Duration::from_secs(3600)),
             SenderHandle::new(net.clone()),
             ValidatorSetUpdateHandle::new(net.clone()),
@@ -5625,7 +5612,7 @@ mod header_resend_tests {
         let me = keys.iter().find(|key| key.verifying_key() != leader).unwrap().clone();
         let net = DirectNet::default();
         let mut follower = HotStuff::new(
-            HotStuffConfiguration { chain_id: ChainID::new(0), keypair: Keypair::new(me), tc_required: false },
+            HotStuffConfiguration { chain_id: ChainID::new(0), keypair: Keypair::new(me) },
             ViewInfo::new(ViewNumber::new(VIEW), Instant::now() + Duration::from_secs(3600)),
             SenderHandle::new(net.clone()),
             ValidatorSetUpdateHandle::new(net.clone()),

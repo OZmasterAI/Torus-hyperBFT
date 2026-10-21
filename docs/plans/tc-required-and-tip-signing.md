@@ -1,6 +1,7 @@
 # TC required (option B) and tip signing: design
 
-Status: design only (owner decision s134: option B). Pre-genesis. Base: main 28ba931e.
+Status: owner decision s134: option B. Pre-genesis. Base: main 28ba931e. Phase A built (feat/tc-required-phase-a);
+phase B built (feat/tc-required-phase-b: V1 and V3 always on, high-QC verification, §2 amendments below).
 Paths (under `crates/hotstuff_rs/src/`): **PM** = pacemaker/implementation.rs, **PT** = pacemaker/types.rs,
 **PMsg** = pacemaker/messages.rs, **HS** = hotstuff/implementation.rs, **HT** = hotstuff/types.rs,
 **HM** = hotstuff/messages.rs, **RX** = networking/receiving.rs.
@@ -34,14 +35,30 @@ Paths (under `crates/hotstuff_rs/src/`): **PM** = pacemaker/implementation.rs, *
 
 ### Validator rule (VALIDPROPOSAL)
 
-All of this lives in `valid_proposal_certificates`, which gains a `justify` argument. A proposal or header for view
-v with block B is valid only if:
+All of this lives in `valid_proposal_certificates`, which gains a `justify` argument. Phase B enforces it on every
+replica (the phase-A test-only switch `tc_required` is gone). A proposal or header for view v with block B is valid
+only if:
 
 - **V1.** `B.justify.view == v-1`, or B.justify is the genesis PC, or a TC with `tc.view == v-1` is attached
   (existing check HT:476).
 - **V2.** TC attached, no NEC, `high_tip_is_winner` => B is `tc.high_tip` (existing check HT:479-484).
-- **V3 (new).** TC attached, no NEC, high_qc wins with `tc.high_qc = q` => `B.justify.view >= q.view`. Without V3,
-  a valid TC still lets a leader drop the high_qc block.
+- **V3 (new).** TC attached, no NEC, high_qc wins with `tc.high_qc = q` => `B.justify.view >= q.view` **or B is
+  q's block** (`extends_tc_high_qc`). Without V3, a valid TC still lets a leader drop the high_qc block.
+  - *Amendment (phase B).* A validator-set-update re-proposal (invariants.rs:686-697) re-proposes the block that
+    `highest_pc` certifies, and that block justifies below `q.view` when `q` is that very PC. The rule as first
+    written rejected it, so the update could never finish through a timeout view.
+- **High QC verified (phase B).** A timeout vote signs only its highest QC's `(view, block)` summary (PMsg:140-157),
+  so one byzantine voter could make a forged high-view QC the TC's `high_qc`, and under V3 no honest leader could
+  then propose. Two checks, both consistent with `summaries_are_signed` (which requires `high_qc` to be the highest
+  signed summary):
+  - the pacemaker drops a timeout vote whose `highest_qc` is not a correct QC (`is_correct` under the committed or
+    previous set, as for any PC) before echoing or collecting it, so an honest collector forms the TC from honest
+    votes only;
+  - `TimeoutCertificate::is_correct` requires `high_qc` to be a correct QC, so a TC built by anyone else around a
+    forged vote is rejected everywhere (proposals, AdvanceView, a vote's `highest_tc`).
+  - Rejected alternative: the TC builder taking the highest *verified* QC. A verifier only sees the signed summaries,
+    so it cannot tell a skipped forged QC from a skipped real one; allowing a non-highest `high_qc` would let a
+    byzantine builder pick a lower QC and evade V3.
 - **V4.** NEC rules are unchanged (HT:465-472).
 
 Nudges are exempt: they carry no new block, and `safe_nudge` already requires `justify.view == v-1` unless the phase
@@ -49,10 +66,13 @@ is Commit (block_tree/invariants.rs:439).
 
 ### Leader rule (on entering v as leader)
 
-- **L1.** If `highest_pc.view == v-1`, propose as today. Happy path, no wait.
+- **L1.** If `highest_pc.view == v-1`, propose as today. Happy path, no wait. The genesis PC also counts, but only
+  without TC(v-1): a held TC goes through L2 so its winning tip or high QC is kept (phase-A review P2).
 - **L2.** Else, if `highest_tc.view == v-1`, propose via `create_proposal_based_on_tc` and attach the TC in every case
   (`finish_leader_proposal` takes `tc: Option`). In case 3, first apply `tc.high_qc` (as PM:487-489 does); if its
-  block is missing, defer and fetch it (HS:806-815).
+  block is missing, defer and fetch it (HS:806-815). A re-proposed tip (case 4, or case 5 after a ProposalResponse,
+  which the leader validates and inserts first) keeps its own `has_validator_set_updates` flag, so validators vote
+  Prepare on a validator-set update (phase-A review P1).
 - **L3.** Otherwise enter a new `awaiting_tc` state, a sibling of `proposal_deferred`, retried every loop pass via
   `has_deferred_proposal` (algorithm.rs:208-211), which re-checks L1 and L2.
 - **L4.** Case 5 never falls through. It waits for a ProposalResponse (reproposal with TC, HS:1938-1957) or an NEC
@@ -182,6 +202,14 @@ recommended.
 - `multiple_validator_set_updates_test` and `epoch_boundary_rejoin_test` with timeouts.
 - Update the stateright models (`stateright_lockstep_backoff.rs`, `stateright_rejoin_leader_sync.rs`).
 
+Phase B built the V1/V3 unit cases, the forged-high-QC cases (TC and collector), and in
+`tests/tc_required_byzantine_test.rs`: the byzantine leader that drops the TC, the tail-fork attempt, a byzantine
+voter with a forged high QC, a leader restart while awaiting TC(v-1), and a validator-set update through timeout views
+(5 validators, one down); `tests/tc_required_strict_test.rs` runs 4 nodes with each key down in turn. The
+multi-node tail-fork case checks that the fresh block without TC is rejected; that B is then re-proposed needs the TC
+to carry B as its high tip, which the header path does not set before F5 (phase C), so phase B checks it on the
+validator paths only (`tail_fork_attempt_fresh_block_rejected_tip_reproposed`).
+
 **Mutation checks** (each must fail at least one test): revert V1 to `Ok(true)`; drop V3; unsign `tip.view`; skip
 the F2 hash recompute; skip the leader-signature check; drop the domain tag; drop `prev_collector` (expect the
 one-down wedge); restore the case-5 fall-through.
@@ -203,7 +231,7 @@ matched-bench (`tools/matched-bench`), main vs branch, same genesis, 3 runs each
 | Phase | Work | Estimate |
 |---|---|---|
 | A | `prev_collector`, filter and buffer changes (C1-C4); `awaiting_tc`; attach TC in every case; no case-5 fall-through; apply high_qc. Validator rule stays lax; assert every timeout-view proposal carries a TC. | 2-3 d |
-| B | Turn on V1 and V3; liveness and byzantine tests; mutation set. | 1-1.5 d |
+| B | Turn on V1 and V3 (V3 amended, high QC verified); liveness and byzantine tests; mutation set. Built. | 1-1.5 d |
 | C | F1-F5, domain tags, tests. | 2-2.5 d |
 | D | Bench cells and report. | 1 d |
 

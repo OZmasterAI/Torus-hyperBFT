@@ -313,7 +313,6 @@ fn transition_discards_wrong_set_locally_collected_decide_pc() {
     let config = HotStuffConfiguration {
         chain_id: CHAIN_ID,
         keypair: local_keypair,
-        tc_required: false,
     };
     let view_info = ViewInfo::new(view, Instant::now() + Duration::from_secs(3600));
 

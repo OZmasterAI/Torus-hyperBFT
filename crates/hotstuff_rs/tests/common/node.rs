@@ -69,7 +69,7 @@ pub(crate) struct Node {
     kv_store: MemDB,
     /// Proposals this node made that break VALIDPROPOSAL V1: the block does
     /// not justify on the previous view (nor on the genesis PC) and no TC for
-    /// the previous view is attached. Phase A: always 0.
+    /// the previous view is attached. Always 0 for an honest leader.
     tc_less_proposals: Arc<AtomicU64>,
 }
 
@@ -119,7 +119,6 @@ impl Node {
             WedgeOptions::default(),
             DEFAULT_EPOCH_LENGTH,
             None,
-            false,
         )
     }
 
@@ -148,7 +147,6 @@ impl Node {
             wedge_options,
             DEFAULT_EPOCH_LENGTH,
             None,
-            false,
         )
     }
 
@@ -180,7 +178,6 @@ impl Node {
             WedgeOptions::default(),
             DEFAULT_EPOCH_LENGTH,
             None,
-            false,
         )
     }
 
@@ -208,34 +205,6 @@ impl Node {
             WedgeOptions::default(),
             epoch_length,
             kv_store,
-            false,
-        )
-    }
-
-    /// Phase A of docs/plans/tc-required-and-tip-signing.md: like
-    /// [`new_with_max_view_time`](Self::new_with_max_view_time), with the
-    /// test-only VALIDPROPOSAL V1 switch on (`tc_required`): the replica
-    /// rejects a proposal whose justify is not for the previous view unless it
-    /// carries a TC for that view.
-    #[allow(dead_code)]
-    pub(crate) fn new_with_tc_required(
-        keypair: SigningKey,
-        network_stub: NetworkStub,
-        init_as_updates: AppStateUpdates,
-        init_vs_updates: ValidatorSetUpdates,
-        max_view_time: Duration,
-    ) -> Node {
-        Self::build(
-            keypair,
-            network_stub,
-            init_as_updates,
-            init_vs_updates,
-            max_view_time,
-            true,
-            WedgeOptions::default(),
-            DEFAULT_EPOCH_LENGTH,
-            None,
-            true,
         )
     }
 
@@ -254,7 +223,6 @@ impl Node {
         wedge_options: WedgeOptions,
         epoch_length: u32,
         kv_store: Option<MemDB>,
-        tc_required: bool,
     ) -> Node {
         let kv_store = kv_store.unwrap_or_else(|| {
             let kv_store = MemDB::new();
@@ -293,7 +261,6 @@ impl Node {
             .max_view_time(max_view_time)
             // S470: commit-lag deadline backoff cap. 0 (the default) = today's schedule.
             .commit_lag_cap(wedge_options.commit_lag_cap)
-            .tc_required(tc_required)
             .log_events(false)
             .build();
 
@@ -429,7 +396,7 @@ impl Node {
             .expect("should have been able to get the highest view entered from the block tree")
     }
 
-    /// Phase A test hook: how many of this node's proposals lacked the
+    /// Test hook (TC-required phase A): how many of this node's proposals lacked the
     /// certificate VALIDPROPOSAL V1 asks for (see [`Node::tc_less_proposals`]).
     #[allow(dead_code)]
     pub(crate) fn tc_less_proposals(&self) -> u64 {
@@ -442,7 +409,7 @@ impl Node {
     }
 }
 
-/// Phase A test hook: count proposals for view v whose block neither
+/// Test hook (TC-required phase A): count proposals for view v whose block neither
 /// justifies on v - 1 (or the genesis PC) nor carries a TC for v - 1. Restated
 /// here independently of the library's own predicate.
 fn propose_handler(tc_less: Arc<AtomicU64>) -> impl Fn(&ProposeEvent) + Send + 'static {

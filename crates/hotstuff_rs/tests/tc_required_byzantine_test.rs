@@ -248,7 +248,9 @@ fn byzantine_leader_drops_the_tc(interrupt: Interrupt) {
     cluster.start(&[]);
     cluster.wait_for_commits(BYZANTINE_LEADER_TARGET, "a byzantine leader strips its TCs");
 
-    let log = log.lock().unwrap();
+    // Take the log out first: a failed assertion must not poison the mutex
+    // the replicas' network threads still use while the cluster shuts down.
+    let log = std::mem::take(&mut *log.lock().unwrap());
     assert!(!log.stripped.is_empty(), "scenario: the byzantine leader never had a TC to strip");
     let voted_for_stripped: Vec<_> = log
         .honest_votes

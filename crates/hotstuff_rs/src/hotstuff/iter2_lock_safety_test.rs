@@ -245,7 +245,6 @@ fn hotstuff_at(
     let config = HotStuffConfiguration {
         chain_id: CHAIN_ID,
         keypair: Keypair::new(local),
-        tc_required: false,
     };
     let view_info = ViewInfo::new(view, Instant::now() + Duration::from_secs(3600));
     HotStuff::new(
