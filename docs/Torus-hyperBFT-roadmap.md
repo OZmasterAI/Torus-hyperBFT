@@ -36,7 +36,7 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
 - **Governance Delist / UpdateMarketParams have no executor effect (P1):** in progress on `fix/pretestnet-p0-p1` (s131).
 - **P0.0 activation-height gating:** not started; only `state_hash_activation_height` exists. Tracked in P0.0.
 - **Liquidator-vault deficit (P5):** monitoring is done. Owner s131 (as decided s99): for the testnet, seed the liquidator vault with capital in the genesis, with ADL as the backstop once the vault runs dry; an HLP-style deposit vault before mainnet. Still open: the seed amount. Tracked in P5.
-- **Aliased opaque position rows in the parallel settle:** answer "can they exist?" first, then fix before the testnet genesis. Tracked in Pre-testnet decisions.
+- **Aliased opaque position rows in the parallel settle:** answered s132 (they cannot exist on a fresh genesis); reject-on-load fix on `fix/aliased-rows-reject` (2026-10-21), not merged yet. Tracked in Pre-testnet decisions.
 - **EVM proposer concentration (Q12):** decided s131: keep N = 11 for the testnet (coprime to 3 / 4 validators); revisit before mainnet. Tracked in Pre-testnet decisions.
 - **Retention default (prune by default or not):** decided s131: prune by default, N = 100,000 blocks, archive nodes opt out with `--archive` (RH4 GC worker + compaction filter merged, perf doc sections 103 and 112). Still open: which testnet node runs as the archive node; revisit N if the trial testnet's catch-up or disk numbers say so. Tracked in Pre-testnet decisions.
 - **Book storage mode for the genesis (Classic vs mode 3):** bench 8p / 8s and owner decision. Tracked in Pre-testnet decisions and `docs/perf/bench-queue.md`.
@@ -467,6 +467,16 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
   code, any writer). If nothing can create them, reject or normalize them on load so the case cannot happen;
   otherwise fix the merge so the parallel settle equals the serial one. Either way it changes consensus results for
   such rows, so it lands **after Phase 5 step 2 merges** (same code) and **before the testnet genesis**.
+  **Answer (s132): they cannot exist on a fresh genesis.** The only writer of the positions CF is
+  `PositionManager::put_position` / `delete_position`, keyed from the row's own fields; genesis writes no position
+  rows; there are no migrations, state imports or state sync (snapshots restore a node's own checkpoint); the EVM
+  side only reads. **Fix (2026-10-21, branch `fix/aliased-rows-reject`, off main 9f8fb795):** reject on load.
+  `torus_core::position::decode_position_row` refuses a row whose key is not `position_key` of its own trader and
+  market (`CoreError::Borsh`, a local fault: the block fail-stops, R02, like an undecodable row) in every load
+  (`get_position`, the typed own-pending read, `positions_for_trader`, EVM `getPosition`, the sums delta);
+  `PositionCache::update_in_place` errors instead of filing a fill under another key. Serial, parallel and L2.2
+  settles now stop alike; per-market settle caches are disjoint by construction. Branched from main, not from Phase 5
+  step 2 (unmerged): step 2's alias check stays correct but becomes unreachable through loads.
 - **EVM block proposer concentration (s128; item 7 option 0 plan, section 85 Q12 r1).** Leaders rotate by view; with
   equal stake, an EVM interval N that is a multiple of the validator count (N = 11 with 11 validators, the default N
   with an 11-validator testnet; N = 33 / 66 with 3) gives ONE validator every EVM block until a timeout shifts the

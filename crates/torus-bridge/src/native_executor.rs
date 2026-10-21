@@ -2626,14 +2626,14 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
         }
         let changes =
             self.positions.state().resident_changes(torus_state::cf::CF_NATIVE_POSITIONS, trader.as_slice())?;
-        // A row that does not decode: `None` (the caller builds).
-        let decode = |row: &Option<Vec<u8>>| -> Option<Option<torus_core::position::Position>> {
-            use borsh::BorshDeserialize;
-            row.as_deref().map_or(Some(None), |r| torus_core::position::Position::try_from_slice(r).ok().map(Some))
+        // A row that does not decode, or names another key (pre-testnet
+        // aliased rows): `None` (the caller builds, which refuses it).
+        let decode = |key: &[u8], row: &Option<Vec<u8>>| -> Option<Option<torus_core::position::Position>> {
+            row.as_deref().map_or(Some(None), |r| torus_core::position::decode_position_row(key, r).ok().map(Some))
         };
         let changes = changes
             .iter()
-            .map(|c| Some((decode(&c.resident)?, decode(&c.current)?)))
+            .map(|c| Some((decode(&c.key, &c.resident)?, decode(&c.key, &c.current)?)))
             .collect::<Option<Vec<_>>>()?;
         sums_with_changes(base, &changes, table, |m| self.tiers(m))
     }

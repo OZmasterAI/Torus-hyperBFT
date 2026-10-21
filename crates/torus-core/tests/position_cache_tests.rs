@@ -572,16 +572,20 @@ fn cached_fill_read_error_caches_nothing_and_dirty_hits_keep_updates() {
     assert!(pm.get_position(&trader, 2).unwrap().is_none());
 }
 
-/// A stored row whose fields name another key (never written by
-/// `put_position`; only a corrupt or hand-written row) keeps the classic
-/// semantics through the cache: every fill re-reads the row under its key
-/// and writes the result under the key its fields name.
+/// Pre-testnet "aliased opaque position rows": a stored row whose fields
+/// name another key (never written by `put_position`, which keys a row from
+/// its own fields; only a corrupt or hand-written row). Before the fix every
+/// read decoded it and the cache filed fills under the key its fields name,
+/// so two markets' caches could hold one key (the parallel settle's merge
+/// then dropped an update). Now every load refuses it as a local fault
+/// (`CoreError::Borsh`, the node fail-stops, R02), caches nothing and
+/// writes nothing; a plain row still loads.
 #[test]
-fn row_with_mismatched_fields_matches_the_classic_path() {
+fn rows_naming_another_key_are_refused_on_load() {
     use torus_core::position::Position;
-    let row = Position {
-        trader: addr(2),
-        market_id: 9,
+    let row = |trader: Address, market_id: MarketId| Position {
+        trader,
+        market_id,
         is_long: true,
         size: fp(5),
         entry_price: fp(100),
@@ -590,30 +594,39 @@ fn row_with_mismatched_fields_matches_the_classic_path() {
         isolated_margin: FixedPoint::ZERO,
         margin_type: MarginType::Cross,
     };
-    let fills: Vec<FillSpec> = vec![
-        (1, 4, true, 1, 100),
-        (1, 4, true, 2, 105),
-        (1, 4, false, 1, 110),
-    ];
-    let (_d1, reference) = setup();
-    let (_d2, cached) = setup();
-    for pm in [&reference, &cached] {
+    // (key trader, key market, the row's fields): another market, another
+    // trader, both.
+    let cases = [(1u8, 4, row(addr(1), 9)), (1, 4, row(addr(2), 4)), (1, 4, row(addr(2), 9))];
+    for (t, m, stored) in cases {
+        let label = format!("key ({t}, {m}) holding ({}, {})", stored.trader, stored.market_id);
+        let (_d, pm) = setup();
+        let key = position_key(&addr(t), m);
         pm.state()
-            .put_cf_raw(
-                CF_NATIVE_POSITIONS,
-                &position_key(&addr(1), 4),
-                &borsh::to_vec(&row).unwrap(),
-            )
+            .put_cf_raw(CF_NATIVE_POSITIONS, &key, &borsh::to_vec(&stored).unwrap())
             .unwrap();
+        // A plain row of another market loads as before.
+        pm.put_position(&row(addr(t), 7)).unwrap();
+        let before = dump_cf(&pm, CF_NATIVE_POSITIONS);
+        let refused = |e: torus_core::error::CoreError| {
+            assert!(e.is_local_fault(), "{label}: {e}");
+            assert!(e.to_string().starts_with("borsh error: position row"), "{label}: {e}");
+        };
+        refused(pm.get_position(&addr(t), m).unwrap_err());
+        refused(pm.get_position_typed(None, &addr(t), m).unwrap_err());
+        refused(pm.positions_for_trader(&addr(t)).unwrap_err());
+        refused(pm.apply_fill(&addr(t), m, true, fp(1), fp(100), MarginType::Cross).unwrap_err());
+        let mut cache = PositionCache::new();
+        refused(cache.load(&pm, &addr(t), m).unwrap_err());
+        refused(
+            pm.apply_fill_cached(&mut cache, &addr(t), m, true, fp(1), fp(100), MarginType::Cross)
+                .unwrap_err(),
+        );
+        assert!(cache.is_empty(), "{label}: nothing cached");
+        let plain = pm.get_position(&addr(t), 7).unwrap().expect("the plain row");
+        assert_eq!((plain.trader, plain.market_id, plain.size), (addr(t), 7, fp(5)), "{label}");
+        cache.flush_all(&pm).unwrap();
+        assert_eq!(dump_cf(&pm, CF_NATIVE_POSITIONS), before, "{label}: nothing written");
     }
-    run_reference(&reference, &fills);
-    run_cached(&cached, &fills);
-    assert_eq!(
-        dump_cf(&cached, CF_NATIVE_POSITIONS).len(),
-        2,
-        "K untouched, K' written"
-    );
-    assert_state_identical(&cached, &reference);
 }
 
 // ============================================================================
@@ -874,19 +887,18 @@ fn flush_with_runs_fails_at_the_same_write() {
 }
 
 // ============================================================================
-// 8k L2.2 Codex P1: aliased opaque rows make the per-market caches overlap
+// 8k L2.2 Codex P1: per-market caches that overlap
 // ============================================================================
 
-/// Codex's probe (review of dbe14b21): stored rows whose fields name another
-/// market (an "opaque" row; `put_position` never writes one) make two
-/// per-market caches hold the same key. Trader 1's row under key (1, 1) says
-/// market 2, so market 1's cache loads (1, 1) and files the fill under
-/// (1, 2); market 2's cache loads (1, 2) too. Without `collision` the row
-/// under (1, 2) names market 3 (market 2's cache dirties (1, 3) and keeps
-/// (1, 2) clean: the merge's later clean row wins); with it, the row is a
-/// plain market-2 row and both caches dirty (1, 2). `extra` plain traders
+/// Codex's probe (review of dbe14b21) used stored rows whose fields name
+/// another market; those are refused on load since the pre-testnet fix
+/// ([`rows_naming_another_key_are_refused_on_load`]). The overlap they made
+/// is rebuilt through the cache API: market 1's cache fills trader 1 in
+/// market 1 and also `set`s trader 1's market-2 row (dirty (1, 2)); market
+/// 2's cache reads (1, 2) clean and fills (1, 3) without `collision` (the
+/// merge's later clean row wins), or fills (1, 2) (both caches dirty it). `extra` plain traders
 /// per market make the sort non-trivial.
-fn aliased_runs(pm: &PositionManager<Recorder>, collision: bool, extra: u8) -> Vec<PositionCache> {
+fn overlapping_runs(pm: &PositionManager<Recorder>, collision: bool, extra: u8) -> Vec<PositionCache> {
     use torus_core::position::Position;
     let alias = addr(1);
     let row = |market_id: MarketId, size: i64| Position {
@@ -900,22 +912,25 @@ fn aliased_runs(pm: &PositionManager<Recorder>, collision: bool, extra: u8) -> V
         isolated_margin: FixedPoint::ZERO,
         margin_type: MarginType::Cross,
     };
-    for (key_market, payload_market, size) in [(1, 2, 2), (2, if collision { 2 } else { 3 }, 4)] {
-        pm.state()
-            .put_cf_raw(
-                CF_NATIVE_POSITIONS,
-                &position_key(&alias, key_market),
-                &borsh::to_vec(&row(payload_market, size)).unwrap(),
-            )
-            .unwrap();
-    }
+    pm.put_position(&row(2, 4)).unwrap();
     pm.state().log.lock().unwrap().clear();
     [1u64, 2]
         .into_iter()
         .map(|m| {
             let mut c = PositionCache::new();
-            pm.apply_fill_cached(&mut c, &alias, m, true, fp(1), fp(100), MarginType::Cross)
+            // Market 2 without `collision`: a clean read of (1, 2), the fill
+            // under (1, 3).
+            let fill_market = if m == 2 && !collision {
+                assert!(c.load(pm, &alias, 2).unwrap().is_some());
+                3
+            } else {
+                m
+            };
+            pm.apply_fill_cached(&mut c, &alias, fill_market, true, fp(1), fp(100), MarginType::Cross)
                 .unwrap();
+            if m == 1 {
+                c.set(row(2, 3));
+            }
             for i in 2..2 + extra {
                 pm.apply_fill_cached(&mut c, &addr(i), m, true, fp(1), fp(100), MarginType::Cross)
                     .unwrap();
@@ -931,7 +946,7 @@ type AliasOut = (Vec<Write>, Vec<(Vec<u8>, Vec<u8>)>, Option<RunsFlush>);
 /// Flag off (merge in market order + flush_all) or on (flush_with_runs).
 fn flush_aliased(on: bool, collision: bool, extra: u8) -> AliasOut {
     let (_d, pm) = Recorder::new();
-    let mut runs = aliased_runs(&pm, collision, extra);
+    let mut runs = overlapping_runs(&pm, collision, extra);
     let mut batch = PositionCache::new();
     let path = if on {
         Some(batch.flush_with_runs(&mut runs, &pm).unwrap())
@@ -952,7 +967,7 @@ fn flush_aliased(on: bool, collision: bool, extra: u8) -> AliasOut {
 /// overlapping caches the flag-on flush must write exactly what merge +
 /// flush_all writes (whatever that reference does), and say it merged.
 #[test]
-fn aliased_rows_across_runs_flush_like_merge_then_flush_all() {
+fn overlapping_runs_flush_like_merge_then_flush_all() {
     for collision in [false, true] {
         for extra in [0u8, 50] {
             let label = format!("collision {collision}, extra {extra}");

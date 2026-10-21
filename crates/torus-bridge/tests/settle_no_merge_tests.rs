@@ -364,16 +364,26 @@ fn db_dump(db: &StateDb) -> Vec<(String, Vec<u8>, Vec<u8>)> {
     out
 }
 
+/// One stored "opaque" position row: (trader, key market, row market, size).
+type AliasRow = (u8, MarketId, MarketId, i64);
+
+/// Rows to store raw and the block (0-based) before which they appear.
+type Aliases<'a> = Option<(&'a [AliasRow], usize)>;
+
 /// Codex P1 (review of dbe14b21): stored "opaque" position rows whose
 /// fields name another market than their key, so two markets' pass-A caches
 /// hold the same key. Trader 5: key (5, 1) says market 2, key (5, 2) says
 /// market 3 (market 2's cache keeps (5, 2) CLEAN while market 1's dirties
 /// it). Trader 6: key (6, 1) says market 2 and (6, 2) is a plain market-2
 /// row (both caches dirty (6, 2)). (trader, key market, row market, size).
-const ALIASES: [(u8, MarketId, MarketId, i64); 4] = [(5, 1, 2, 2), (5, 2, 3, 4), (6, 1, 2, 2), (6, 2, 2, 4)];
+const ALIASES: [AliasRow; 4] = [(5, 1, 2, 2), (5, 2, 3, 4), (6, 1, 2, 2), (6, 2, 2, 4)];
 
-fn seed_aliases(db: &StateDb) {
-    for (t, key_market, market_id, size) in ALIASES {
+/// Pre-testnet "aliased opaque position rows": one row, under key (5, 1),
+/// naming market 2.
+const ONE_ALIAS: [AliasRow; 1] = [(5, 1, 2, 2)];
+
+fn seed_aliases(db: &StateDb, rows: &[AliasRow]) {
+    for &(t, key_market, market_id, size) in rows {
         let row = Position {
             trader: addr(t),
             market_id,
@@ -399,16 +409,18 @@ fn seed_aliases(db: &StateDb) {
 /// parallel settle with the pass-A cap pinned. A block that goes fatal is
 /// never flushed and ends the run.
 fn run(blocks: &[Block], cap: usize, record_fills: bool, fault: &LastBlockFault) -> (RunOut, RunStats) {
-    run_seeded(blocks, cap, record_fills, fault, false)
+    run_seeded(blocks, cap, record_fills, fault, None, true)
 }
 
-/// [`run`], with the [`ALIASES`] rows stored first when `aliases`.
+/// [`run`], with `aliases`' rows stored raw before their block, on the
+/// forced parallel settle (`parallel`) or the sequential one.
 fn run_seeded(
     blocks: &[Block],
     cap: usize,
     record_fills: bool,
     fault: &LastBlockFault,
-    aliases: bool,
+    aliases: Aliases<'_>,
+    parallel: bool,
 ) -> (RunOut, RunStats) {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = StateDb::open(dir.path()).expect("open db");
@@ -426,15 +438,17 @@ fn run_seeded(
             .put_native_balance(&addr(n), &bal)
             .unwrap();
     }
-    if aliases {
-        seed_aliases(&db);
-    }
     let mut stats = RunStats::default();
     let mut out = Vec::new();
     let flushes_before = settle_no_merge_flushes_on_this_thread();
     let fallbacks_before = settle_no_merge_fallbacks_on_this_thread();
     for (h, block) in blocks.iter().enumerate() {
         let last = h + 1 == blocks.len();
+        if let Some((rows, before)) = aliases {
+            if before == h {
+                seed_aliases(&db, rows);
+            }
+        }
         let rec = Recorder {
             inner: NativeStateOverlay::new(db.clone()),
             log: Arc::default(),
@@ -466,7 +480,7 @@ fn run_seeded(
         let mut calls = Vec::new();
         for batch in block {
             let pass_a = ctx.phase_accum.settle_pass_a_ns;
-            let r = NativeExecutor::execute_batch_settle_workers(&mut ctx, batch, true, Some(cap));
+            let r = NativeExecutor::execute_batch_settle_workers(&mut ctx, batch, parallel, Some(cap));
             if ctx.phase_accum.settle_pass_a_ns > pass_a {
                 stats.parallel_calls += 1;
             }
@@ -480,7 +494,9 @@ fn run_seeded(
                 .iter()
                 .filter(|w| w.0 == CF_NATIVE_POSITIONS && w.2.is_none())
                 .count();
-            let fatal = ctx.fatal_error.clone();
+            // The block's fail-stop as the committer sees it
+            // (`take_fatal_error`): `fatal_error`, else a reader fault (R02).
+            let fatal = ctx.fatal_error.clone().or_else(|| ctx.reader_fault.get().cloned());
             calls.push(CallOut {
                 writes,
                 results: r.results.iter().map(row).collect(),
@@ -494,7 +510,7 @@ fn run_seeded(
             }
         }
         stats.fallbacks += ctx.phase_accum.settle_fallbacks;
-        let fatal = ctx.fatal_error.is_some();
+        let fatal = ctx.fatal_error.is_some() || ctx.reader_fault.get().is_some();
         if !fatal {
             ctx.save_order_books();
         }
@@ -536,7 +552,7 @@ fn assert_no_merge_equivalent(
     fault: &dyn Fn(&RunOut) -> LastBlockFault,
     what: &str,
 ) -> Vec<RunStats> {
-    assert_no_merge_equivalent_seeded(blocks, fault, what, false)
+    assert_no_merge_equivalent_seeded(blocks, fault, what, None)
         .into_iter()
         .map(|(off, on)| {
             assert_eq!(on.no_merge_fallbacks, 0, "{what}: per-market caches are disjoint ({on:?})");
@@ -550,7 +566,7 @@ fn assert_no_merge_equivalent_seeded(
     blocks: &[Block],
     fault: &dyn Fn(&RunOut) -> LastBlockFault,
     what: &str,
-    aliases: bool,
+    aliases: Aliases<'_>,
 ) -> Vec<(RunStats, RunStats)> {
     let mut all = Vec::new();
     for record_fills in [true, false] {
@@ -558,13 +574,13 @@ fn assert_no_merge_equivalent_seeded(
             let label = format!("{what}, cap {cap}, record_fills {record_fills}");
             // The fault is chosen from a fault-free flag-off run.
             let (clean, _) = with_settle_no_merge(false, || {
-                run_seeded(blocks, cap, record_fills, &LastBlockFault::None, aliases)
+                run_seeded(blocks, cap, record_fills, &LastBlockFault::None, aliases, true)
             });
             let fault = fault(&clean);
             let (off, off_stats) =
-                with_settle_no_merge(false, || run_seeded(blocks, cap, record_fills, &fault, aliases));
+                with_settle_no_merge(false, || run_seeded(blocks, cap, record_fills, &fault, aliases, true));
             let (on, on_stats) =
-                with_settle_no_merge(true, || run_seeded(blocks, cap, record_fills, &fault, aliases));
+                with_settle_no_merge(true, || run_seeded(blocks, cap, record_fills, &fault, aliases, true));
             assert_eq!(
                 (off_stats.no_merge_flushes, off_stats.no_merge_fallbacks),
                 (0, 0),
@@ -601,7 +617,7 @@ fn assert_no_merge_equivalent_seeded(
             }
             assert_eq!(off, on, "{label}: run diverged");
             let env_on = parse_settle_no_merge(std::env::var("TORUS_SETTLE_NO_MERGE").ok().as_deref());
-            let (plain, _) = run_seeded(blocks, cap, record_fills, &fault, aliases);
+            let (plain, _) = run_seeded(blocks, cap, record_fills, &fault, aliases, true);
             assert_eq!(
                 if env_on { &on } else { &off },
                 &plain,
@@ -696,18 +712,167 @@ fn settle_no_merge_identical_with_fatal_flush_failure() {
     );
 }
 
-/// Codex P1 (review of dbe14b21): aliased opaque rows put the same key in
-/// two markets' pass-A caches (clean in one, dirty in the other; or dirty in
-/// both). The flag-on flush must detect the overlap and fall back to merge +
-/// flush_all, so every write, result and the state root equal flag off
-/// (whatever the reference merge does with the alias: not fixed here), and
-/// the fallback is counted.
+/// Two blocks on markets 1 and 2 (makers 1 and 2 rest asks at 101 and bids
+/// at 99; traders 3 and 4 cross both markets in every call, so every call
+/// before the alias block runs the parallel settle with fills). Block 1
+/// also rests trader 5's asks at 100 on both markets when `maker`. Block 2:
+/// trader 3 buys at 100 on both markets (filling trader 5's asks: trader 5
+/// is the maker) when `maker`, else trader 5 buys at 101 on both markets
+/// (trader 5 is the taker).
+fn alias_blocks(maker: bool) -> Vec<Block> {
+    let gtc = TimeInForce::GTC;
+    let ioc = TimeInForce::IOC;
+    let mut ladder = Vec::new();
+    for m in [1, 2] {
+        ladder.push(place(addr(m as u8), order(m, false, fp(101), fp(50), gtc)));
+        ladder.push(place(addr(m as u8), order(m, true, fp(99), fp(50), gtc)));
+    }
+    let cross = |out: &mut Vec<(Address, NativeAction)>| {
+        for m in [1, 2] {
+            out.push(place(addr(3), order(m, true, fp(101), fp(1), ioc)));
+            out.push(place(addr(4), order(m, false, fp(99), fp(1), ioc)));
+        }
+    };
+    cross(&mut ladder);
+    if maker {
+        for m in [1, 2] {
+            ladder.push(place(addr(5), order(m, false, fp(100), fp(2), gtc)));
+        }
+    }
+    let mut second = Vec::new();
+    cross(&mut second);
+    let mut hit = Vec::new();
+    for m in [1, 2] {
+        if maker {
+            hit.push(place(addr(3), order(m, true, fp(100), fp(1), ioc)));
+        } else {
+            hit.push(place(addr(5), order(m, true, fp(101), fp(1), ioc)));
+        }
+        hit.push(place(addr(4), order(m, false, fp(99), fp(1), ioc)));
+    }
+    let mut tail = Vec::new();
+    cross(&mut tail);
+    vec![[ladder, second], [hit, tail]]
+}
+
+/// Results, fills and fatal per call, the DB and the state root: what the
+/// settle mode must not change (the reads and write order may).
+type Outcome = (Vec<Vec<(Vec<ResultRow>, Vec<TradeFill>, Option<String>)>>, Vec<(String, Vec<u8>, Vec<u8>)>, B256);
+
+fn outcome(run: &RunOut) -> Outcome {
+    let calls = run
+        .blocks
+        .iter()
+        .map(|b| b.calls.iter().map(|c| (c.results.clone(), c.fills.clone(), c.fatal.clone())).collect())
+        .collect();
+    (calls, run.db_dump.clone(), run.state_root)
+}
+
+/// Trader `t`'s stored position rows at the end: (key market, the row's
+/// market, its size).
+fn trader_rows(run: &RunOut, t: u8) -> Vec<(MarketId, MarketId, FixedPoint)> {
+    use borsh::BorshDeserialize;
+    run.db_dump
+        .iter()
+        .filter(|(cf, k, _)| cf == CF_NATIVE_POSITIONS && k.len() == 28 && k.starts_with(addr(t).as_slice()))
+        .map(|(_, k, v)| {
+            let p = Position::try_from_slice(v).expect("a position row");
+            (MarketId::from_be_bytes(k[20..].try_into().unwrap()), p.market_id, p.size)
+        })
+        .collect()
+}
+
+/// The block's fatal error (its last call's), if any.
+fn last_fatal(run: &RunOut) -> Option<String> {
+    run.blocks.last().and_then(|b| b.calls.last()).and_then(|c| c.fatal.clone())
+}
+
+/// Pre-testnet "aliased opaque position rows" (roadmap, found s128): a
+/// stored row whose fields name another market than its key, (5, 1)
+/// holding a market-2 position. RED on main: the parallel settle's
+/// per-market caches both file trader 5's fills under (5, 2) and the merge
+/// keeps market 2's, so market 1's update is lost; the sequential settle
+/// keeps both. The fix refuses the row on load: every settle mode stops the
+/// block alike.
+#[test]
+fn serial_and_parallel_settle_agree_on_an_aliased_row() {
+    for maker in [false, true] {
+        // Taker: the row is there from the start. Maker: it appears before
+        // block 2 (trader 5's asks rested in block 1 with no position).
+        let aliases: Aliases<'_> = Some((&ONE_ALIAS, if maker { 1 } else { 0 }));
+        let blocks = alias_blocks(maker);
+        for cap in [1usize, 2, 8] {
+            let label = format!("maker {maker}, cap {cap}");
+            let (serial, _) = run_seeded(&blocks, cap, true, &LastBlockFault::None, aliases, false);
+            let (parallel, stats) = run_seeded(&blocks, cap, true, &LastBlockFault::None, aliases, true);
+            assert!(stats.parallel_calls >= 2, "{label}: the parallel settle ran ({stats:?})");
+            assert_eq!(
+                trader_rows(&serial, 5),
+                trader_rows(&parallel, 5),
+                "{label}: trader 5's rows (key market, row market, size), serial vs parallel settle"
+            );
+            assert_eq!(outcome(&serial), outcome(&parallel), "{label}: serial vs parallel settle");
+        }
+    }
+}
+
+/// The fix's failure mode: an aliased row is corrupt state (no writer makes
+/// one), refused on load as a local fault, so the node fail-stops the block
+/// (R02) before its flush, in every settle mode and with the trader as
+/// taker or maker. The row stays as stored.
+#[test]
+fn an_aliased_position_row_fail_stops_the_block() {
+    for maker in [false, true] {
+        let aliases: Aliases<'_> = Some((&ONE_ALIAS, if maker { 1 } else { 0 }));
+        let blocks = alias_blocks(maker);
+        for parallel in [false, true] {
+            let label = format!("maker {maker}, parallel {parallel}");
+            let (run, _) = run_seeded(&blocks, 2, true, &LastBlockFault::None, aliases, parallel);
+            assert_eq!(run.blocks.len(), 2, "{label}");
+            let fatal = last_fatal(&run);
+            assert!(
+                fatal.as_deref().is_some_and(|f| f.contains("borsh error: position row")),
+                "{label}: the block fail-stops on the aliased row: {fatal:?}"
+            );
+            // Block 2 never flushed: the DB is block 1's plus the stored row.
+            let (first, _) = run_seeded(&blocks[..1], 2, true, &LastBlockFault::None, None, parallel);
+            let key = position_key(&addr(5), 1).to_vec();
+            let is_alias = |(cf, k, _): &(String, Vec<u8>, Vec<u8>)| cf == CF_NATIVE_POSITIONS && *k == key;
+            let alias = run.db_dump.iter().find(|r| is_alias(r)).expect("the aliased row").clone();
+            let mut want: Vec<_> = first.db_dump.into_iter().filter(|r| !is_alias(r)).chain([alias]).collect();
+            want.sort();
+            let mut got = run.db_dump.clone();
+            got.sort();
+            assert!(got == want, "{label}: block 2 was flushed");
+            assert_eq!(
+                trader_rows(&run, 5).first(),
+                Some(&(1, 2, fp(2))),
+                "{label}: the aliased row is kept as stored"
+            );
+        }
+    }
+}
+
+/// Codex P1 (review of dbe14b21), after the pre-testnet fix: the
+/// [`ALIASES`] rows (clean in one market's cache and dirty in another's, or
+/// dirty in both, before the fix) are refused on load, so no pass-A cache
+/// ever holds a foreign market's key: flag on and off stop the block alike
+/// and the flag-on flush never falls back to the merge.
 #[test]
 fn settle_no_merge_identical_with_aliased_opaque_rows() {
-    let blocks = stream(0x0A11_A5ED_8C22, 6, 6, 400);
-    let stats = assert_no_merge_equivalent_seeded(&blocks, &|_| LastBlockFault::None, "aliases", true);
-    for (off, on) in stats {
-        assert_eq!(off.fallbacks, 0, "{off:?}");
-        assert!(on.no_merge_fallbacks > 0, "the overlap was detected: {on:?}");
+    for maker in [false, true] {
+        let blocks = alias_blocks(maker);
+        let aliases: Aliases<'_> = Some((&ALIASES, if maker { 1 } else { 0 }));
+        let stats = assert_no_merge_equivalent_seeded(&blocks, &|_| LastBlockFault::None, "aliases", aliases);
+        for (off, on) in stats {
+            assert_eq!(off.fallbacks, on.fallbacks, "{off:?} {on:?}");
+            assert_eq!(on.no_merge_fallbacks, 0, "no overlap left: {on:?}");
+        }
+        let (run, _) = run_seeded(&blocks, 2, true, &LastBlockFault::None, aliases, true);
+        let fatal = last_fatal(&run);
+        assert!(
+            fatal.as_deref().is_some_and(|f| f.contains("borsh error: position row")),
+            "maker {maker}: {fatal:?}"
+        );
     }
 }

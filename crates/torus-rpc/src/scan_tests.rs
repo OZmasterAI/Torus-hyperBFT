@@ -249,6 +249,59 @@ async fn open_interest_stops_at_the_scan_budget() {
     assert_eq!(examined(&s), 1002, "every position row, once");
 }
 
+/// Pre-testnet aliased rows: a row at `addr(MAKER) ‖ 1` that names
+/// `addr(MAKER + 1)` and market 2 (no `put_position` writes it).
+fn seed_aliased_row(state: &StateDb) {
+    let row = position(addr(MAKER + 1), 2, true, 1);
+    state
+        .put_cf_raw(
+            CF_NATIVE_POSITIONS,
+            &torus_core::position::position_key(&addr(MAKER), 1),
+            &borsh::to_vec(&row).unwrap(),
+        )
+        .unwrap();
+}
+
+/// The RPC scans refuse a position row naming another key as the consensus
+/// loads do (`decode_position_row`): the read fails (`Internal`) instead of
+/// counting the row in market 1's open interest or listing it as
+/// `addr(MAKER)`'s position.
+#[tokio::test]
+async fn rpc_position_scans_refuse_aliased_rows() {
+    let (_d, state) = db();
+    let pm = PositionManager::new(state.clone());
+    pm.put_position(&position(addr(MAKER + 2), 1, false, 3))
+        .unwrap();
+    seed_aliased_row(&state);
+
+    let e = open_interest(&state, 1, &mut ScanBudget::new(100)).unwrap_err();
+    assert!(
+        matches!(&e, RpcError::Internal(m) if m.contains("names trader")),
+        "open interest: {e:?}"
+    );
+    let e = trader_positions(&state, &addr(MAKER), &mut ScanBudget::new(100)).unwrap_err();
+    assert!(
+        matches!(&e, RpcError::Internal(m) if m.contains("names trader")),
+        "trader positions: {e:?}"
+    );
+
+    // Through the handler: an error, not 1.0 long in market 1.
+    let s = server(&state, 100);
+    s.state()
+        .get_open_interest("0x1".into())
+        .await
+        .expect_err("an aliased row fails the read");
+    // Rows of other traders / markets do not involve it.
+    assert_eq!(
+        trader_positions(&state, &addr(MAKER + 2), &mut ScanBudget::new(100))
+            .unwrap()
+            .len(),
+        1
+    );
+    let (long, short) = open_interest(&state, 2, &mut ScanBudget::new(100)).unwrap();
+    assert_eq!((long, short), (FixedPoint::ZERO, FixedPoint::ZERO));
+}
+
 // ---------------------------------------------------------------------------
 // getUserLimits / getOpenOrders / getOrderByCloid
 // ---------------------------------------------------------------------------

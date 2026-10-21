@@ -21,7 +21,7 @@ use torus_types::{Address, Cloid, FixedPoint, MarketId, OrderId, U256};
 use crate::error::CoreError;
 use crate::lockbox::{wei_to_fp_floor, WEI_PER_NATIVE_UNIT};
 use crate::position::{
-    borsh_read_address, borsh_read_fp, borsh_write_address, borsh_write_fp, NativeBalance, Position,
+    borsh_read_address, borsh_read_fp, borsh_write_address, borsh_write_fp, NativeBalance,
 };
 
 // ============================================================================
@@ -642,9 +642,8 @@ fn read_position(
 ) -> Result<Vec<u8>, CoreError> {
     let key = crate::position::position_key(trader, market_id);
     let pos = match state_db.get_cf_raw(CF_NATIVE_POSITIONS, &key)? {
-        Some(data) => {
-            Position::try_from_slice(&data).map_err(|e| CoreError::Borsh(e.to_string()))?
-        }
+        // Pre-testnet: a row naming another key is refused, as every load.
+        Some(data) => crate::position::decode_position_row(&key, &data)?,
         None => {
             // No position — return zeros
             let mut out = Vec::with_capacity(160);
@@ -2027,6 +2026,7 @@ pub fn write_order_book_snapshot(
 #[cfg(test)]
 mod r02_oracle_price_tests {
     use super::*;
+    use crate::position::Position;
     use torus_state::{AtomicWriteOp, StateError};
 
     #[derive(Clone)]
@@ -2139,6 +2139,37 @@ mod r02_oracle_price_tests {
         assert_eq!(&healthy[64..96], &[0u8; 32]);
         let e = read_position(&FailingRead, &trader, 1, 1_000).expect_err("position read failed");
         assert!(matches!(e, CoreError::State(_)), "{e}");
+    }
+
+    /// Pre-testnet "aliased opaque position rows": getPosition refuses a
+    /// stored row whose fields name another key (as every position load
+    /// does), a local fault, instead of answering with another market's
+    /// position.
+    #[test]
+    fn get_position_refuses_a_row_naming_another_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let trader = Address::new([7; 20]);
+        let row = Position {
+            trader,
+            market_id: 2,
+            is_long: true,
+            size: FixedPoint::ONE,
+            entry_price: FixedPoint::ONE,
+            cost_basis: FixedPoint::ONE,
+            realized_pnl: FixedPoint::ZERO,
+            isolated_margin: FixedPoint::ZERO,
+            margin_type: crate::position::MarginType::Cross,
+        };
+        db.put_cf_raw(
+            CF_NATIVE_POSITIONS,
+            &crate::position::position_key(&trader, 1),
+            &borsh::to_vec(&row).unwrap(),
+        )
+        .unwrap();
+        let e = read_position(&db, &trader, 1, 1_000).expect_err("aliased row");
+        assert!(matches!(e, CoreError::Borsh(_)) && e.is_local_fault(), "{e}");
+        assert!(e.to_string().starts_with("borsh error: position row"), "{e}");
     }
 }
 
