@@ -365,10 +365,11 @@ fn byzantine_voter_with_a_forged_high_qc_cannot_block_case_3() {
 
 /// Phase C (§6 "byzantine voter with a forged tip: the TC still forms"): the
 /// byzantine validator `byz` stays silent as leader and sends every timeout
-/// vote with a forged tip, a header for the view before the vote's over a
-/// block nobody has, signed by itself (not that view's leader), re-signed so
-/// the vote itself is correct. The views byz leads time out, and their tip
-/// view (the previous view) is above every honest high QC. Without F4 the forged tip wins every TC it is in
+/// vote with a forged tip for the vote's own view: a block hash its header
+/// fields do not hash to (F2 recompute), signed by byz (the view's leader in
+/// the views it leads, which are the ones that time out; a non-leader in the
+/// others), re-signed so the vote itself is correct. Its view is above every
+/// honest high QC. Without F4 the forged tip wins every TC it is in
 /// and the next leader must run a recovery (ProposalRequest / NERequest) for
 /// a block nobody has; with F4 honest replicas drop the vote, so no TC carries
 /// the forged tip and nobody recovers it.
@@ -378,13 +379,13 @@ fn byzantine_voter_with_a_forged_tip_cannot_block_the_tc() {
     let byz_index = cluster.leader(5);
     let byz_key = cluster.keypairs[byz_index].clone();
     let byz = byz_key.verifying_key();
-    let vs = cluster.validator_set();
     let forged = Arc::new(Mutex::new(0u64));
     let recoveries = Arc::new(Mutex::new(0u64));
     let justify = PhaseCertificate::genesis_pc();
     let data_hash = CryptoHash::new([0xDD; 32]);
     let height = hotstuff_rs::types::data_types::BlockHeight::new(0);
-    let forged_block = hotstuff_rs::types::block::Block::hash(height, &justify, &data_hash);
+    // Not `Block::hash(height, &justify, &data_hash)`: the fields do not hash to it.
+    let forged_block = CryptoHash::new([0xDE; 32]);
 
     let forged_in = forged.clone();
     let recoveries_in = recoveries.clone();
@@ -405,11 +406,7 @@ fn byzantine_voter_with_a_forged_tip_cannot_block_the_tc() {
         match message {
             Message::ProgressMessage(ProgressMessage::HotStuffMessage(HotStuffMessage::ProposalHeader(_))) => None,
             Message::ProgressMessage(ProgressMessage::PacemakerMessage(PacemakerMessage::TimeoutVote(mut vote))) => {
-                let tip_view = ViewNumber::new(vote.view.int().saturating_sub(1));
-                if select_leader(tip_view, &vs) == byz {
-                    // A tip byz signs for a view it leads would be a real header.
-                    return Some(PacemakerMessage::TimeoutVote(vote).into());
-                }
+                let tip_view = vote.view;
                 vote.local_tip = Some(TipInfo {
                     block_hash: forged_block,
                     block_height: height,
