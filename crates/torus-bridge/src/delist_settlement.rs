@@ -35,7 +35,13 @@
 //!   4. Bounded: at most `scan` traders visited and `close` positions closed
 //!      per block, across all settling markets (ascending market id). A cut
 //!      walk stores the last visited trader as the cursor; the next block
-//!      continues there. The row is deleted when the walk reaches the end.
+//!      continues there. The row is deleted when the walk reaches the end,
+//!      and in the same block the kept record `0x0A ‖ market` (owner s134:
+//!      `close_at`, the settlement price, the walk's end height) is written:
+//!      the close price and height stay in state after the settlement. It is
+//!      never deleted and no consensus step reads it (not an active
+//!      settlement: the 0x08 scans, the oracle stop and the ADL drain only
+//!      look at the 0x08 row and the positions).
 //!   5. Owner s134, 3b: when the row is gone and the vault and both ADL
 //!      escrows are flat in the market (here, or after the ADL drain), the
 //!      oracle-closed marker is written: its oracle entries are ignored and
@@ -46,7 +52,7 @@
 //! liquidation step (`fatal_error`).
 
 use super::*;
-use torus_core::liquidation::{self as liq, DelistSettlement, LIQUIDATOR_VAULT};
+use torus_core::liquidation::{self as liq, DelistSettled, DelistSettlement, LIQUIDATOR_VAULT};
 
 impl NativeExecutor {
     /// Delist option C: the per-block settlement step (after
@@ -243,6 +249,10 @@ impl NativeExecutor {
             let done = !cut && traders.len() < limit;
             if done {
                 liq::delete_delist_settlement(&ctx.state, m)?;
+                liq::put_delist_settled(
+                    &ctx.state,
+                    &DelistSettled { market: m, close_at: row.close_at, price, settled_height: ctx.block_height },
+                )?;
                 let vault = ctx.positions.get_position(&LIQUIDATOR_VAULT, m)?;
                 tracing::info!(market = m, height = ctx.block_height, vault_residual = ?vault.map(|p| (p.is_long, p.size)), "delist settlement: market settled");
                 Self::close_oracle_if_settled(ctx, m)?;

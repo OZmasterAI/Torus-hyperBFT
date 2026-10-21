@@ -353,8 +353,8 @@ pub struct RpcMarketInfo {
     #[serde(default)]
     pub delist_height: Option<String>,
     /// The grace end (hex): the settlement row's `close_at`, the first block
-    /// the settlement step works on the market. `null` before the delist and
-    /// once the settlement row is gone (walk complete).
+    /// the settlement step works on the market. `null` before the delist;
+    /// kept after the walk (owner s134: the kept settlement record).
     #[serde(default)]
     pub close_at: Option<String>,
     /// `"none"` (not delisted), `"grace"` (reduce-only until `closeAt`),
@@ -363,8 +363,9 @@ pub struct RpcMarketInfo {
     /// closed, prices for it are ignored).
     #[serde(default)]
     pub settlement: String,
-    /// The settlement price, once the settlement step fixed it (while the
-    /// settlement row exists; not kept in state after the walk completes).
+    /// The settlement price, once the settlement step fixed it; kept in
+    /// state after the walk completes (owner s134: the kept settlement
+    /// record), so a settled market still shows it.
     #[serde(default)]
     pub close_price: Option<String>,
     /// A governance close price (`SetDelistClosePrice`) waiting to be used

@@ -770,10 +770,14 @@ fn settlement_resident_lifecycle_equals_classic() {
         if h == E + 10 {
             assert_eq!(net_oi(db, M), (FixedPoint::ZERO, 0), "settled");
             assert_eq!(row(db), None);
+        }
+        // E + 6's tail (full budgets) ends the walk: the kept record from then
+        // on, unchanged; none before.
+        if h >= E + 6 {
             assert_eq!(
                 kept(db),
-                Some(DelistSettled { market: M, close_at: E + 5, price: fp(110), settled_height: E + 10 }),
-                "kept record written with the walk's end"
+                Some(DelistSettled { market: M, close_at: E + 5, price: fp(110), settled_height: E + 6 }),
+                "h {h}: kept record written with the walk's end"
             );
         } else {
             assert_eq!(kept(db), None, "h {h}: no kept record before the walk ends");

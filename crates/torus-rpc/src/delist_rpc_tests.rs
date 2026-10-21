@@ -2,7 +2,8 @@
 //! reports each market's governance delist and its settlement: the delist
 //! height (flag row value), the grace end (`close_at` of the settlement row),
 //! the settlement status (`none` / `grace` / `settling` / `settled`), the
-//! fixed close price once the settlement step chose it, a governance close
+//! fixed close price once the settlement step chose it (and, with the grace
+//! end, after the walk from the kept record `0x0A`, owner s134), a governance close
 //! price waiting to be consumed, and the height the settlement completed
 //! (oracle-closed marker).
 
