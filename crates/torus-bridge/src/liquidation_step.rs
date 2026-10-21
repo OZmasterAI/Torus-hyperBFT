@@ -544,7 +544,7 @@ impl NativeExecutor {
     /// holds the decoded records with R attached (traders the block wrote are
     /// looked up through the overlay); else the walk itself (one seek per
     /// trader).
-    fn liq_traders_after<T: StateBackend>(
+    pub(super) fn liq_traders_after<T: StateBackend>(
         ctx: &NativeExecContext<T>,
         after: Option<Address>,
         limit: usize,

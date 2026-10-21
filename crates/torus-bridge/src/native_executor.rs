@@ -431,6 +431,11 @@ impl BalanceCache {
 #[path = "liquidation_step.rs"]
 mod liquidation_step;
 
+// Delist option C (s131): the settlement of a governance-delisted market
+// (child module: sees the private cancel helpers and `AccountReader`).
+#[path = "delist_settlement.rs"]
+mod delist_settlement;
+
 #[path = "users.rs"]
 mod users;
 use users::Users;
@@ -14662,6 +14667,7 @@ impl NativeExecutor {
             Some(ExecutionPayload::MarketDelist { market_id }) => {
                 ctx.delisted_markets.insert(market_id);
                 Self::cancel_market_orders_and_stops(ctx, market_id);
+                Self::schedule_delist_settlement(ctx, market_id);
             }
             Some(ExecutionPayload::MarketParamsUpdate { market_id, .. }) => {
                 let row = match ctx

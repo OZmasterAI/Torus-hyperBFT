@@ -750,6 +750,37 @@ fn big_lane_and_corewriter_param_changes_are_range_checked_and_execute_into_fee_
     }
 }
 
+/// Delist option C: the grace period N (`delist_grace_blocks`, 0..=302,400
+/// blocks, default 43,200) is a ParameterChange key executed into its own
+/// CF_FEE_CONFIG row; out of range or not a number is refused at
+/// submission. RED before: the key was not modifiable.
+#[test]
+fn delist_grace_param_change_is_range_checked_and_executes_into_fee_config() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    let k = torus_types::DELIST_GRACE_PARAM;
+    for bad in ["302401", "-1", "x"] {
+        let payload = ExecutionPayload::ParameterChange {
+            param_key: k.into(),
+            new_value: bad.into(),
+        };
+        let r = gov.submit_proposal(addr(2), "P".into(), "D".into(), Some(payload), 0);
+        assert!(
+            matches!(&r, Err(EconomicsError::InvalidParameterValue { key: kk, .. }) if kk == k),
+            "{k} = {bad}: {r:?}"
+        );
+    }
+    for (block, value) in [(0, "0"), (200, "100")] {
+        pass_param(&gov, k, value, &[2], block);
+        let data = gov.state().get_cf_raw(CF_FEE_CONFIG, k.as_bytes()).unwrap().unwrap();
+        assert_eq!(data, value.as_bytes());
+    }
+    assert_eq!(torus_types::delist_grace_blocks(None), 43_200);
+    assert_eq!(torus_types::delist_grace_blocks(Some(b"0")), 0);
+    assert_eq!(torus_types::delist_grace_blocks(Some(b"302401")), 43_200);
+}
+
 #[test]
 fn execute_treasury_spend() {
     let (_dir, gov, staking) = setup();

@@ -91,6 +91,17 @@ pub const PENDING_TAG: u8 = 0x06;
 /// still owes for `trader`'s position taken at block `height` at `price`
 /// (per account: H1's clamp).
 pub const ADL_OBLIGATION_TAG: u8 = 0x07;
+/// Delist option C (owner, s131): `0x08 ‖ market(8)` -> `close_at(8, BE)
+/// [‖ price raw(16, BE) [‖ cursor(20)]]`: a governance-delisted market's
+/// settlement ([`DelistSettlement`]). Written when the delist executes,
+/// deleted when the last position is closed.
+pub const DELIST_SETTLE_TAG: u8 = 0x08;
+/// Delist option C: traders of `CF_NATIVE_POSITIONS` one block's settlement
+/// step visits (all settling markets together; the walk is the liquidation
+/// step's C1 walk), and the positions it closes at most. The rest waits for
+/// the next block behind the market's persisted cursor.
+pub const DELIST_SETTLE_SCAN_PER_BLOCK: usize = 2_048;
+pub const DELIST_SETTLE_CLOSE_PER_BLOCK: usize = 256;
 
 // ============================================================================
 // Pure parts
@@ -807,4 +818,85 @@ pub fn put_cursor<T: StateBackend>(state: &T, c: Option<Address>) -> Result<(), 
         None => state.delete_cf_raw(CF_NATIVE_LIQUIDATION, &CURSOR_KEY)?,
     }
     Ok(())
+}
+
+// ============================================================================
+// Delist option C: the settlement rows (0x08)
+// ============================================================================
+
+/// One delisted market's settlement row. `price: None` = the grace period
+/// (nothing closes before `close_at`); `Some(p)` = settling: every remaining
+/// position closes at `p`, chosen once at the first settlement block, so the
+/// positions closed over several blocks all close at one price. `cursor` =
+/// the last trader the walk visited (`None`: from the start).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DelistSettlement {
+    pub market: MarketId,
+    pub close_at: u64,
+    pub price: Option<FixedPoint>,
+    pub cursor: Option<Address>,
+}
+
+/// The key of `m`'s settlement row.
+pub fn delist_settle_key(m: MarketId) -> [u8; 9] {
+    let mut k = [0u8; 9];
+    k[0] = DELIST_SETTLE_TAG;
+    k[1..].copy_from_slice(&m.to_be_bytes());
+    k
+}
+
+fn decode_delist_settlement(k: &[u8], v: &[u8]) -> Result<DelistSettlement, CoreError> {
+    let bad = || malformed("delist settlement");
+    if k.len() != 9 || !matches!(v.len(), 8 | 24 | 44) {
+        return Err(bad());
+    }
+    let market = MarketId::from_be_bytes(k[1..9].try_into().map_err(|_| bad())?);
+    let close_at = u64::from_be_bytes(v[..8].try_into().map_err(|_| bad())?);
+    let price = (v.len() >= 24)
+        .then(|| v[8..24].try_into().map(|b| FixedPoint::from_raw(i128::from_be_bytes(b))))
+        .transpose()
+        .map_err(|_| bad())?;
+    let cursor = (v.len() == 44).then(|| Address::from_slice(&v[24..44]));
+    Ok(DelistSettlement { market, close_at, price, cursor })
+}
+
+/// Write `s` (a cursor needs a price: it is dropped without one).
+pub fn put_delist_settlement<T: StateBackend>(state: &T, s: &DelistSettlement) -> Result<(), CoreError> {
+    let mut v = s.close_at.to_be_bytes().to_vec();
+    if let Some(p) = s.price {
+        v.extend_from_slice(&p.raw().to_be_bytes());
+        if let Some(c) = s.cursor {
+            v.extend_from_slice(c.as_slice());
+        }
+    }
+    state.put_cf_raw(CF_NATIVE_LIQUIDATION, &delist_settle_key(s.market), &v)?;
+    Ok(())
+}
+
+/// Delete `m`'s settlement row (the market is settled).
+pub fn delete_delist_settlement<T: StateBackend>(state: &T, m: MarketId) -> Result<(), CoreError> {
+    state.delete_cf_raw(CF_NATIVE_LIQUIDATION, &delist_settle_key(m))?;
+    Ok(())
+}
+
+/// `m`'s settlement row, if any.
+pub fn delist_settlement<T: StateBackend>(state: &T, m: MarketId) -> Result<Option<DelistSettlement>, CoreError> {
+    let k = delist_settle_key(m);
+    state.get_cf_raw(CF_NATIVE_LIQUIDATION, &k)?.map(|v| decode_delist_settlement(&k, &v)).transpose()
+}
+
+/// Every settlement row, ascending market (one prefix scan; one row per
+/// delisted market not yet settled).
+pub fn delist_settlements<T: StateBackend>(state: &T) -> Result<Vec<DelistSettlement>, CoreError> {
+    state
+        .iterate_cf(CF_NATIVE_LIQUIDATION, Some(&[DELIST_SETTLE_TAG]))?
+        .iter()
+        .map(|(k, v)| decode_delist_settlement(k, v))
+        .collect()
+}
+
+/// Whether some settlement row is due at `height` (`close_at <= height`):
+/// the settlement step must run even in a block with no other native work.
+pub fn delist_settlement_due<T: StateBackend>(state: &T, height: u64) -> Result<bool, CoreError> {
+    Ok(delist_settlements(state)?.iter().any(|s| s.close_at <= height))
 }

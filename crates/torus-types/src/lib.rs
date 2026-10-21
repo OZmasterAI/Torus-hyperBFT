@@ -821,6 +821,26 @@ pub const EVM_BIG_BLOCK_GAS_LIMIT_RANGE: std::ops::RangeInclusive<u64> = 1_000_0
 pub const CORE_WRITER_ORDER_DELAY_PARAM: &str = "core_writer_order_delay";
 pub const CORE_WRITER_ORDER_DELAY_RANGE: std::ops::RangeInclusive<u64> = 1..=100;
 
+/// Delist option C (owner, s131): the governance key (`CF_FEE_CONFIG`, a
+/// decimal string, `ParameterChange`) of the grace period N, in blocks: a
+/// governance delist executed at height H leaves the market reduce-only until
+/// H + N, then every remaining position in it is force-closed at the oracle
+/// mark. N is read once, when the delist executes (a later change does not
+/// move a running grace period). 0 = force-close in the delist's own block.
+pub const DELIST_GRACE_PARAM: &str = "delist_grace_blocks";
+/// N when the key is absent or invalid: 24 h at the 2 s target block time
+/// (the governance timelock's default).
+pub const DELIST_GRACE_DEFAULT_BLOCKS: u64 = 43_200;
+/// Valid governance values: 0 .. 7 days at 2 s blocks.
+pub const DELIST_GRACE_BLOCKS_RANGE: std::ops::RangeInclusive<u64> = 0..=302_400;
+
+/// The grace period in force for a stored [`DELIST_GRACE_PARAM`] value: the
+/// value when it is a decimal in [`DELIST_GRACE_BLOCKS_RANGE`], else the
+/// default.
+pub fn delist_grace_blocks(stored: Option<&[u8]>) -> u64 {
+    gov_u64_in(stored, &DELIST_GRACE_BLOCKS_RANGE).unwrap_or(DELIST_GRACE_DEFAULT_BLOCKS)
+}
+
 /// Item 7 step 2: a valid M is 0 (off) or inside [`EVM_BIG_BLOCK_INTERVAL_RANGE`].
 pub fn evm_big_block_interval_ok(m: u64) -> bool {
     m == 0 || EVM_BIG_BLOCK_INTERVAL_RANGE.contains(&m)
