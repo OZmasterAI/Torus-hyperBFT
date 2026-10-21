@@ -4062,16 +4062,30 @@ class DetachTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.d, "data")))
 
     def _detach(self, name, script, extra_env=None):
+        """Start SCRIPT through detach.sh in unit bench-NAME. HOME is a temp dir without projects/wt, so the unit
+        takes no build lock (detach.sh: "No $HOME/projects/wt: no lock"; DetachBuildLockTest covers the lock):
+        under the real ~/projects/wt/.cargo-heavy.lock a builder holding it made these tests wait out the 20 s
+        deadline, fail, and leave the unit queued on the lock. The unit is stopped on cleanup either way."""
         log = os.path.join(self.d, "out.log")
+        home = os.path.join(self.d, "home")
+        os.makedirs(home, exist_ok=True)
+        unit = "bench-%s.service" % re.sub(r"[^A-Za-z0-9_.-]", "-", name)
+        self.addCleanup(
+            subprocess.run,
+            ["systemctl", "--user", "stop", unit],
+            capture_output=True,
+            timeout=30,
+        )
         r = subprocess.run(
             ["bash", DETACH_SH, name, log, "bash", "-c", script],
             capture_output=True,
             text=True,
             timeout=30,
-            env=dict(os.environ, DETACH_PROBE="carried", **(extra_env or {})),
+            env=dict(os.environ, HOME=home, DETACH_PROBE="carried", **(extra_env or {})),
             cwd=self.d,
         )
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("holds the build lock", r.stdout, "the test unit must not queue on the shared build lock")
         deadline = time.time() + 20
         text = None
         while time.time() < deadline:
@@ -4095,10 +4109,7 @@ class DetachTest(unittest.TestCase):
         )
         kv = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
         self.assertTrue(kv["CG"].endswith("/bench-%s.service" % name), kv["CG"])
-        if kv["PARENT"] == "flock":  # build lock holder (~/projects/wt exists)
-            self.assertEqual(kv["GRANDPARENT"], "systemd")
-        else:
-            self.assertEqual(kv["PARENT"], "systemd")
+        self.assertEqual(kv["PARENT"], "systemd")  # no build lock (_detach): no flock in between
         self.assertEqual(
             kv["PROBE"], "carried", "caller's exported env must carry over"
         )
