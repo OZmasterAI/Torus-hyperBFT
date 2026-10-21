@@ -7346,6 +7346,7 @@ dependencies = [
  "alloy-consensus",
  "alloy-primitives",
  "alloy-rlp",
+ "alloy-sol-types",
  "bincode",
  "borsh 1.6.1",
  "ed25519-dalek",
