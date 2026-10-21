@@ -18,7 +18,9 @@ script provisions the keys and proves, while the nodes still run, that every nod
          after T is durable);
       3. reads torus_getStateHash(h) on every node for h = T, T-100, ... while a node still retains h (at most
          64 heights): localHash (= that node's h_n at h), the on-chain votes (validator, hash, matchesLocal) and the
-         on-chain quorumHash;
+         on-chain quorumHash; then re-reads every node's newest checkpoint: the chain keeps committing, so retention
+         may prune the oldest heights under the walk, and the minimum compared window (with --activation) is
+         min(RETAIN - advanced, (T - activation) // 100), advanced = (max newest after the walk - T) // 100;
       4. per node: its metrics (torus_state_hash_attestations_submitted_total, mismatch, no_quorum, height,
          unverified) and log lines (attest key enabled + its address, fail-stop on=, attestations submitted / not
          admitted, STATE HASH MISMATCH, FAIL-STOP, no-quorum).
@@ -344,14 +346,27 @@ def row_view(r, names, addr_of):
     return entry, voters, vote_diff, q_diff
 
 
-def min_window(t, activation):
-    """checkpoints every node must still serve at newest common t: min(RETAIN, (t - activation) // INTERVAL), >= 1
-    (activation unknown: 1, the window is not checked)"""
+def min_window(t, activation, advanced=0):
+    """checkpoints every node must still serve at newest common t: min(RETAIN - advanced, (t - activation) //
+    INTERVAL), >= 1 (activation unknown: 1, the window is not checked). advanced = advance_of(): a node at newest
+    checkpoint L retains L - (RETAIN-1)*INTERVAL .. L (the checkpoint at L deletes L - RETAIN*INTERVAL,
+    crates/torus-state/src/running_hash.rs), so the walk down from t can only reach the heights the most advanced
+    node still retains when the walk ends"""
     if t is None:
         return 0
     if activation is None:
         return 1
-    return max(1, min(RETAIN, (t - activation) // INTERVAL))
+    return max(1, min(RETAIN - advanced, (t - activation) // INTERVAL))
+
+
+def advance_of(t, latest_after):
+    """checkpoints the most advanced node is past the walk's start t, read after the walk (every node's latest
+    re-read once it ended; it also covers nodes already apart when t was read): the oldest heights below t that
+    node has pruned are legitimately out of the window. An unreadable node gives no proof of an advance: 0 (the
+    full window stays required)"""
+    if t is None or not latest_after or None in latest_after:
+        return 0
+    return max(0, (max(latest_after) - t) // INTERVAL)
 
 
 def judge_rows(out, rows, names, addr_of):
@@ -391,7 +406,7 @@ def judge_rows(out, rows, names, addr_of):
     )
     if out.get("newest_common") is not None and not table:
         problems.append("no checkpoint every node retains (latest per node %s)" % out["latest_per_node"])
-    want = min_window(out.get("newest_common"), out.get("activation"))
+    want = min_window(out.get("newest_common"), out.get("activation"), out.get("advanced_during_scan") or 0)
     out["min_compared"] = want
     if table and len(table) < want:
         problems.append(
@@ -478,6 +493,14 @@ def scan(rpcs, keys, metrics_urls, logs, wait_s, sleep=2.0, activation=None):
     if t is not None and None not in latest:
         out["quorum_wait_s"], out["quorum_wait_done"] = wait_quorum(rpcs, t, wait_s, sleep)
         rows = read_rows(rpcs, t)
+        # the chain keeps committing during the wait and the walk: re-read every node's newest checkpoint so the
+        # minimum window accounts for what retention pruned under the walk (9g-hn smoke: 63 of 64)
+        after = []
+        for rpc in rpcs:
+            r, err = state_hash(rpc, None)
+            after.append(None if err is not None else r["height"])
+        out["latest_after_walk"] = after
+        out["advanced_during_scan"] = advance_of(t, after)
     judge_rows(out, rows, names, addr_of)
     out["per_node"] = {}
     for i, name in enumerate(names):
@@ -566,6 +589,9 @@ def compact(full):
         "votes_per_validator",
         "validators",
         "latest_per_node",
+        "latest_after_walk",
+        "advanced_during_scan",
+        "min_compared",
         "partial_heights",
     )
     c = {k: full.get(k) for k in keep}

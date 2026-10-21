@@ -191,6 +191,16 @@ python3 tools/matched-bench/test_harness.py
    logs a WARNING with each node's executed height; the digest quiescence
    check then decides. This step can take `DRAIN_TIMEOUT` +
    `FEED_STOP_SETTLE_MAX_S`.
+   With `STATE_HASH_ATTEST=1` every validator signs one `AttestStateHash` per
+   100-block checkpoint for as long as idle blocks commit, so the native
+   counter and mempool never go quiet and cannot be paused: every drain (and
+   the `feed-stop-settle/` re-drain) adds `--attest-live --attest-mempool-max 6`
+   (order counters quiet, native mempool <= 2 checkpoints x 3 validators on top
+   of any feed footprint); `drain.json .attest_live` records the native-counter
+   and submitted-attestation deltas over the final quiet window. The digest
+   quiescence snapshot then compares the order counters only (attestations
+   write consensus vote rows the digest does not read), and `metrics-after`
+   is re-scraped (<= 10 x 1 s) until the three native counters agree.
    **Liquidation stress** (all off by default; default cells unchanged):
    `LIQ_THIN=N` sets `available` to `LIQ_THIN_AVAIL` (default 1,000,000 TRS)
    for genesis notes `bulk-test 60` .. `bulk-test 60+N-1` before the genesis

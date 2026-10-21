@@ -379,6 +379,11 @@
 #                or quorum differs, a missing quorum, a node that did not
 #                attest or whose fail-stop is off, a MISMATCH / FAIL-STOP line,
 #                an unreadable node) = validity REJECT and the cell FAILS.
+#                The attestations keep moving the native counter and mempool
+#                on the idle chain after the load: the drains run with
+#                health.py --attest-live, the digest quiescence snapshot leaves
+#                the native counter out, and metrics-after is re-scraped until
+#                the three native counters agree (section 7/8 comments).
 #   PRELOAD=N    bench queue 8f: after node ready (and fresh oracle marks)
 #                and BEFORE the metrics-before snapshot, the samplers and the
 #                load, `bench-throughput preload` places N non-crossing resting
@@ -1795,8 +1800,20 @@ if [ "$ORACLE_FEED_DRAIN" = 1 ]; then
     FEED_DRAIN_ARGS=(--feed-live --feed-mempool-max $(( 6 * ((MARKETS + 255) / 256) )) --max-lag "$ORACLE_FEED_DRAIN_MAX_LAG")
     log "feed-live drain: ${FEED_DRAIN_ARGS[*]} (order counters quiet, exec lag <= $ORACLE_FEED_DRAIN_MAX_LAG; the feed's actions may move)"
 fi
+# STATE_HASH_ATTEST=1: every validator signs one AttestStateHash per 100-block
+# checkpoint for as long as the chain commits, and idle blocks keep committing
+# after the load, so torus_native_actions_processed_total and the native mempool
+# never go quiet (9g-hn smoke 2026-10-21: drained=0 after 780 s). Unlike the
+# oracle feed they cannot be paused (the node submits them), so every drain
+# below tolerates them (health.py --attest-live: order counters quiet, native
+# mempool <= 2 checkpoints x 3 validators of attestations).
+ATTEST_DRAIN_ARGS=()
+if state_attest_on; then
+    ATTEST_DRAIN_ARGS=(--attest-live --attest-mempool-max 6)
+    log "attest-live drain: ${ATTEST_DRAIN_ARGS[*]} (order counters quiet; the validators' AttestStateHash actions may move the native counter and mempool)"
+fi
 if python3 "$TOOLS_DIR/health.py" drain --out "$OUT" --timeout "$DRAIN_TIMEOUT" --quiet "$QUIET_S" \
-    --urls "${DRAIN_URLS[@]}" "${FEED_DRAIN_ARGS[@]}" \
+    --urls "${DRAIN_URLS[@]}" "${FEED_DRAIN_ARGS[@]}" ${ATTEST_DRAIN_ARGS[@]+"${ATTEST_DRAIN_ARGS[@]}"} \
     >>"$OUT/run.log" 2>&1; then DRAINED=1; fi
 T_DRAIN=$(date +%s)
 log "drained=$DRAINED after $((T_DRAIN - T_BENCH1))s (evidence: drain.json and drain-samples.jsonl)"
@@ -1811,7 +1828,7 @@ if [ "$ORACLE_FEED_DRAIN" = 1 ]; then
     mkdir -p "$OUT/feed-stop-settle"
     SETTLED=0
     python3 "$TOOLS_DIR/health.py" drain --out "$OUT/feed-stop-settle" --timeout "$FEED_STOP_SETTLE_MAX_S" --quiet "$QUIET_S" \
-        --to-height auto --urls "${DRAIN_URLS[@]}" >>"$OUT/run.log" 2>&1
+        --to-height auto --urls "${DRAIN_URLS[@]}" ${ATTEST_DRAIN_ARGS[@]+"${ATTEST_DRAIN_ARGS[@]}"} >>"$OUT/run.log" 2>&1
     SETTLE_RC=$?
     [ "$SETTLE_RC" = 0 ] && SETTLED=1
     SETTLE_JSON="$OUT/feed-stop-settle/drain.json"
@@ -1829,7 +1846,24 @@ stop_sampler || die "metrics sampler failed (see sampler.log)"
 kill "$CPU_PID" 2>/dev/null; CPU_PID=""
 
 # ---------------------------------------------------------------- 8. after-snapshots + agreement
-for i in 0 1 2; do scrape_one "${METS[$i]}" > "$OUT/metrics-after-val$i.txt"; done
+# metrics-after-val<i>.txt: one sequential scrape per node; agreement.jsonl
+# takes the funnel counters from them and summarize.py requires them equal.
+# STATE_HASH_ATTEST=1: attestations keep landing on the idle chain, so the
+# three scrapes can straddle an attestation block (native counter +1..3 on some
+# nodes only): re-scrape, at most 10 times 1 s apart, until the three native
+# counters agree; still apart is logged and left to summarize.py, as before.
+after_snapshots() {
+    local try i n
+    for try in 1 2 3 4 5 6 7 8 9 10; do
+        for i in 0 1 2; do scrape_one "${METS[$i]}" > "$OUT/metrics-after-val$i.txt"; done
+        state_attest_on || return 0
+        n=$(for i in 0 1 2; do mval torus_native_actions_processed_total < "$OUT/metrics-after-val$i.txt"; done | sort -u | wc -l)
+        [ "$n" = 1 ] && return 0
+        [ "$try" = 10 ] || sleep 1
+    done
+    log "WARNING: metrics-after: torus_native_actions_processed_total still apart after 10 scrapes ($(for i in 0 1 2; do printf 'val%s=%s ' "$i" "$(mval torus_native_actions_processed_total < "$OUT/metrics-after-val$i.txt")"; done)); summarize.py decides"
+}
+after_snapshots
 mapfile -t PIDS_NOW < "$RUN_DIR/pids"; schedstat_snapshot after "${PIDS_NOW[@]}"
 schedstat_json "$OUT/schedstat.raw" "$OUT/schedstat.json" || log "WARNING: schedstat.json not written"
 rpc() { # $1=url $2=method $3=params-json
@@ -1898,10 +1932,21 @@ DIG_ACCTS=$(grep -c . "$OUT/digest-accounts.txt")
 if [ ${#DIG_POS[@]} -gt 0 ]; then DIG_POS_ACCTS=$(grep -c . "${DIG_POS[0]}"); else DIG_POS_ACCTS=0; fi
 funnel_counters() {
     # Missing/failed metrics are unavailable evidence, never fabricated zeros.
+    # STATE_HASH_ATTEST=1: the validators' AttestStateHash actions keep landing
+    # on the idle chain (one per validator per checkpoint, ~4 s at 25 blk/s), so
+    # the native counter moves through any digest window. They write only the
+    # consensus vote rows (staking.rs record_state_hash_attestation ->
+    # CF_STATE_HASH_VOTES) and the validator's nonce, none of which the digest
+    # reads (books, open interest, the load accounts' balances and positions):
+    # the native counter is left out and the order counters must hold.
+    local attest=0
+    [ "${STATE_HASH_ATTEST:-0}" = 1 ] && attest=1
     python3 -c '
 import math, re, sys
 wanted = ("torus_orders_placed_accepted_total", "torus_orders_matched_total",
           "torus_native_actions_processed_total", "torus_orders_resting_total")
+if sys.argv[1] == "1":
+    wanted = tuple(w for w in wanted if w != "torus_native_actions_processed_total")
 values = {}
 for line in sys.stdin:
     fields = line.split()
@@ -1913,7 +1958,7 @@ if not all(name in values and
            re.fullmatch(r"[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?", values[name]) and
            math.isfinite(float(values[name])) for name in wanted):
     sys.exit(1)
-print(",".join(values[name] for name in wanted))'
+print(",".join(values[name] for name in wanted))' "$attest"
 }
 funnel_snapshot() {
     local i metrics row snapshot=""

@@ -379,6 +379,134 @@ class FeedLiveHttpTest(unittest.TestCase):
             thread.join()
 
 
+ATTEST_SUBMITTED = 'torus_state_hash_attestations_submitted_total'
+
+
+def attest(t, commits=100, mempool=None, flow=1000, every=4):
+    """STATE_HASH_ATTEST=1 after the load (9g-hn smoke 2026-10-21): idle blocks
+    keep committing, each node attests every 100-block checkpoint (~4 s), so
+    torus_native_actions_processed_total gains +3 every `every` samples and the
+    native mempool holds 0..3 attestations; order counters stay put."""
+    s = sample(commits + t, mempool=(t % 4) if mempool is None else mempool, exec_queue=t % 3,
+               flow=flow)
+    s[FLOW[2]] = 5000 + 3*(t // every)
+    s[ATTEST_SUBMITTED] = 10 + t // every
+    return s
+
+
+class AttestLiveDrainTest(unittest.TestCase):
+    """--attest-live: the validators' own AttestStateHash actions move the
+    native counter and mempool forever; only the order counters must be quiet
+    and the native mempool within the attestations' footprint."""
+
+    def test_attestations_drain_only_in_attest_live_mode(self):
+        live, legacy = DrainTracker(10, attest_live=True), DrainTracker(10)
+        results = []
+        for t in range(40):
+            nodes = [attest(t) for _ in NODES]
+            self.assertFalse(legacy.observe(t, nodes)['drained'], t)
+            results.append(live.observe(t, nodes)['drained'])
+        self.assertTrue(any(results))
+        self.assertFalse(any(results[:10]))
+
+    def test_moving_order_counters_never_drain_in_attest_live_mode(self):
+        for key in ('torus_orders_placed_accepted_total', 'torus_orders_matched_total',
+                    'torus_orders_resting_total'):
+            tracker = DrainTracker(10, attest_live=True)
+            for t in range(40):
+                nodes = [attest(t) for _ in NODES]
+                nodes[t % 3][key] = 1000 + t
+                self.assertFalse(tracker.observe(t, nodes)['drained'], (key, t))
+
+    def test_mempool_above_the_attest_footprint_or_pending_work_restarts_the_window(self):
+        for fault in ('mempool', 'flush', 'trade_writer', 'exec_queue'):
+            tracker = DrainTracker(10, attest_live=True, attest_mempool_max=6)
+            for t in range(40):
+                nodes = [attest(t) for _ in NODES]
+                if t % 5 == 0:
+                    if fault == 'mempool':
+                        nodes[1][MEMPOOL] = 7
+                    elif fault == 'flush':
+                        nodes[1][FLUSH] = 1
+                    elif fault == 'trade_writer':
+                        nodes[1][TRADE_WRITER] = 1
+                    else:
+                        nodes[1][EXEC_QUEUE] = 3
+                self.assertFalse(tracker.observe(t, nodes)['drained'], (fault, t))
+
+    def test_attest_live_still_needs_commit_progress_on_every_node(self):
+        tracker = DrainTracker(10, attest_live=True)
+        for t in range(40):
+            nodes = [attest(t) for _ in NODES]
+            nodes[2][COMMITTED] = 100
+            self.assertFalse(tracker.observe(t, nodes)['drained'])
+
+    def test_feed_and_attest_live_add_their_mempool_footprints(self):
+        both = DrainTracker(10, feed_live=True, feed_mempool_max=6, attest_live=True,
+                            attest_mempool_max=6)
+        feed_only = DrainTracker(10, feed_live=True, feed_mempool_max=6)
+        for t in range(12):
+            nodes = [attest(t, mempool=10) for _ in NODES]
+            r_both, r_feed = both.observe(t, nodes), feed_only.observe(t, nodes)
+        self.assertTrue(r_both['drained'])
+        self.assertFalse(r_feed['drained'])
+
+    def test_counter_reset_of_the_native_counter_is_still_a_reset(self):
+        tracker = DrainTracker(10, attest_live=True)
+        for t in range(10):
+            tracker.observe(t, [attest(t) for _ in NODES])
+        nodes = [attest(10) for _ in NODES]
+        nodes[0][FLOW[2]] = 0
+        self.assertEqual(tracker.observe(10, nodes)['reason'], 'counter reset')
+
+
+class AttestLiveHttpTest(unittest.TestCase):
+    def test_cli_drains_with_attestations_and_records_their_traffic(self):
+        class Metrics(BaseHTTPRequestHandler):
+            ticks = {}
+            def log_message(self, *_args):
+                pass
+            def do_GET(self):
+                t = self.ticks[self.path] = self.ticks.get(self.path, 0) + 1
+                body = ''.join(f'{k} {v}\n' for k, v in attest(t, every=2).items()).encode()
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(body)
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Metrics)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                command = ['python3', str(Path(__file__).with_name('health.py')), 'drain',
+                           '--out', directory, '--timeout', '8', '--quiet', '3', '--urls',
+                           *[f'http://127.0.0.1:{server.server_port}/{n}' for n in NODES]]
+                legacy = subprocess.run(command, capture_output=True, text=True, timeout=30)
+                self.assertEqual(legacy.returncode, 1, legacy.stderr)
+                self.assertNotIn('attest_live', json.loads((Path(directory)/'drain.json').read_text()))
+                live = subprocess.run(command + ['--attest-live', '--attest-mempool-max', '6'],
+                                      capture_output=True, text=True, timeout=30)
+                self.assertEqual(live.returncode, 0, live.stderr)
+                drain = json.loads((Path(directory)/'drain.json').read_text())
+                self.assertTrue(drain['drained'])
+                info = drain['attest_live']
+                self.assertEqual(info['attest_mempool_max'], 6)
+                # the quiet window moved the native counter (attestations only)
+                self.assertEqual(len(info['native_actions_delta']), 3)
+                self.assertTrue(all(d > 0 for d in info['native_actions_delta']), info)
+                self.assertGreater(info['attestations_submitted_delta'], 0)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_negative_attest_mempool_max_is_a_usage_error(self):
+        r = subprocess.run(['python3', str(Path(__file__).with_name('health.py')), 'drain',
+                            '--out', '/nonexistent', '--timeout', '1', '--attest-live',
+                            '--attest-mempool-max', '-1', '--urls', 'a', 'b', 'c'],
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 2)
+
+
 def hsample(height, queue=1, commits=None, flow=1000):
     """sample() plus the executed height (torus_block_height, set by the exec
     thread after each block); commits default to the height."""

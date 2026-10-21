@@ -34,6 +34,20 @@ ORDER_FLOW = tuple(k for k in FLOW if k != 'torus_native_actions_processed_total
 CHAIN_SUM, CHAIN_COUNT = 'torus_exec_chain_seconds_sum', 'torus_exec_chain_seconds_count'
 DEFAULT_MAX_LAG = 2
 DEFAULT_FEED_MEMPOOL_MAX = 6  # 2 rounds x 3 validators x 1 chunk (<= 256 markets)
+# --attest-live (run-cell STATE_HASH_ATTEST=1): every validator signs one
+# AttestStateHash per 100-block checkpoint for as long as the chain commits
+# (crates/torus-consensus/src/state_hash.rs submit_attestations), and idle
+# blocks keep committing after the load, so torus_native_actions_processed_total
+# (app.rs: every replay-guard-passing native action of an executed block) and
+# the native mempool never go quiet. No metric counts EXECUTED attestations:
+# torus_state_hash_attestations_submitted_total counts this node's mempool
+# admissions (resubmissions included) at admission time, so subtracting it from
+# the processed counter is not exact at any one instant. As for --feed-live, the
+# quiet keys are the order counters and the native mempool may hold up to
+# --attest-mempool-max entries. The traffic over the quiet window is recorded
+# (drain.json .attest_live) as evidence that only attestations moved.
+ATTEST_SUBMITTED = 'torus_state_hash_attestations_submitted_total'
+DEFAULT_ATTEST_MEMPOOL_MAX = 6  # 2 checkpoints x 3 validators
 FEED_LIVE_COLUMNS = ('elapsed_s', 'node', 'committed', 'exec_lag', 'mempool',
                      'chain_blocks', 'chain_ms', 'quiet_elapsed_s')
 # --to-height (s64, run-cell's paused-feed settle): the executed height. The exec
@@ -145,14 +159,22 @@ class DrainTracker:
     hold up to feed_mempool_max entries and the exec lag (torus_exec_queue_depth:
     committed blocks not yet executed) must stay <= max_lag on every sample.
 
+    attest_live: as feed_live for the validators' AttestStateHash traffic: only
+    the order counters must be quiet and the native mempool may hold up to
+    attest_mempool_max entries (added to the feed's footprint when both run);
+    the exec queue keeps its bound (idle, or max_lag with feed_live).
+
     min_height: also every node's executed height (EXEC_HEIGHT) >= min_height;
     a node without the gauge never counts as there."""
     def __init__(self, quiet_s, feed_live=False, max_lag=DEFAULT_MAX_LAG,
-                 feed_mempool_max=DEFAULT_FEED_MEMPOOL_MAX, min_height=None):
+                 feed_mempool_max=DEFAULT_FEED_MEMPOOL_MAX, min_height=None,
+                 attest_live=False, attest_mempool_max=DEFAULT_ATTEST_MEMPOOL_MAX):
         self.quiet_s = quiet_s
         self.min_height = min_height
-        self.quiet_keys = ORDER_FLOW if feed_live else FLOW
-        self.limits = (feed_mempool_max, max_lag) if feed_live else (0, IDLE_EXEC_QUEUE_MAX)
+        self.quiet_keys = ORDER_FLOW if feed_live or attest_live else FLOW
+        self.limits = ((feed_mempool_max if feed_live else 0) +
+                       (attest_mempool_max if attest_live else 0),
+                       max_lag if feed_live else IDLE_EXEC_QUEUE_MAX)
         self.base = None
         self.previous = None
         self.since = None
@@ -266,15 +288,33 @@ def fetch(url, extra=()):
         return {}
 
 
+def attest_live_summary(base, last, attest_mempool_max):
+    """drain.json .attest_live: the attestations' footprint bound, and what the
+    native counter and the submitted attestations (summed over the nodes) moved
+    over the final quiet window (base = its first samples; None = no window)."""
+    def delta(key):
+        if base is None or last is None or not all(key in d for d in base + last):
+            return None
+        return [int(s[key]-b[key]) for s, b in zip(last, base)]
+    native, submitted = delta(FLOW[2]), delta(ATTEST_SUBMITTED)
+    return {'attest_mempool_max': attest_mempool_max, 'native_actions_delta': native,
+            'attestations_submitted_delta': sum(submitted) if submitted is not None else None}
+
+
 def wait_for_drain(urls, out, timeout_s, quiet_s, feed_live=False, max_lag=DEFAULT_MAX_LAG,
-                   feed_mempool_max=DEFAULT_FEED_MEMPOOL_MAX, to_height=None):
+                   feed_mempool_max=DEFAULT_FEED_MEMPOOL_MAX, to_height=None,
+                   attest_live=False, attest_mempool_max=DEFAULT_ATTEST_MEMPOOL_MAX):
     """to_height: None (no height condition), an int, or 'auto' = the
     height_target() of the first complete scrape (the chain at the call)."""
     tracker = DrainTracker(quiet_s, feed_live, max_lag, feed_mempool_max,
-                           to_height if isinstance(to_height, int) else None)
+                           to_height if isinstance(to_height, int) else None,
+                           attest_live, attest_mempool_max)
     extra = (CHAIN_SUM, CHAIN_COUNT) if feed_live else ()
+    if attest_live:
+        extra += (ATTEST_SUBMITTED,)
     if to_height is not None:
         extra += (EXEC_HEIGHT,)
+    last = None
     target_by_node, heights = None, {n: None for n in NODES}
     rows, previous = [], [{} for _ in urls]
     start = time.monotonic()
@@ -291,6 +331,7 @@ def wait_for_drain(urls, out, timeout_s, quiet_s, feed_live=False, max_lag=DEFAU
                 if EXEC_HEIGHT in s:
                     heights[n] = int(s[EXEC_HEIGHT])
             result = tracker.observe(elapsed, samples)
+            last = samples
             if to_height == 'auto' and tracker.min_height is None:
                 result = dict(result, drained=False,
                               reason='height target not recorded yet: no complete scrape')
@@ -324,6 +365,9 @@ def wait_for_drain(urls, out, timeout_s, quiet_s, feed_live=False, max_lag=DEFAU
                                      for k in FEED_LIVE_COLUMNS) + '\n' for r in rows)
         result['feed_live'] = dict(feed_live_summary(rows, tracker.since), max_lag_bound=max_lag,
                                    feed_mempool_max=feed_mempool_max)
+    if attest_live:
+        result['attest_live'] = attest_live_summary(
+            tracker.base if result['drained'] else None, last, attest_mempool_max)
     (out/'drain.json').write_text(json.dumps(result, indent=2)+'\n')
     print(json.dumps(result))
     return 0 if result['drained'] else TARGET_MISSED_RC if target_missed else 1
@@ -368,6 +412,12 @@ def main():
                        help='--feed-live: max torus_exec_queue_depth on every sample')
     drain.add_argument('--feed-mempool-max', type=int, default=DEFAULT_FEED_MEMPOOL_MAX,
                        help="--feed-live: max native mempool size (the feed's own entries)")
+    drain.add_argument('--attest-live', action='store_true',
+                       help='STATE_HASH_ATTEST=1: tolerate the validators\' AttestStateHash traffic '
+                            '(see ATTEST_SUBMITTED)')
+    drain.add_argument('--attest-mempool-max', type=int, default=DEFAULT_ATTEST_MEMPOOL_MAX,
+                       help='--attest-live: max native mempool size from attestations '
+                            '(added to --feed-mempool-max with --feed-live)')
     drain.add_argument('--to-height', type=to_height_arg, default=None,
                        help="also wait until every node executed this height ('auto': the highest "
                             "committed height across the nodes at the first complete scrape); "
@@ -380,10 +430,11 @@ def main():
         return 0 if data.get('validity', {}).get('accepted') is True else 2
     if not math.isfinite(args.timeout) or not math.isfinite(args.quiet) or min(args.timeout, args.quiet) <= 0:
         parser.error('timeout and quiet must be positive finite seconds')
-    if min(args.max_lag, args.feed_mempool_max) < 0:
-        parser.error('max-lag and feed-mempool-max must be >= 0')
+    if min(args.max_lag, args.feed_mempool_max, args.attest_mempool_max) < 0:
+        parser.error('max-lag, feed-mempool-max and attest-mempool-max must be >= 0')
     return wait_for_drain(args.urls, args.out, args.timeout, args.quiet, args.feed_live,
-                          args.max_lag, args.feed_mempool_max, args.to_height)
+                          args.max_lag, args.feed_mempool_max, args.to_height,
+                          args.attest_live, args.attest_mempool_max)
 
 
 def to_height_arg(value):

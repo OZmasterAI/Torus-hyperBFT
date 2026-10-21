@@ -32,6 +32,8 @@ class Node:
     def __init__(self, checkpoints, metrics):
         self.checkpoints = checkpoints
         self.metrics = metrics
+        self.on_call = None  # on_call(height or None) before each torus_getStateHash reply
+        self.fail_heights = set()  # heights answered with an RPC error although retained
 
 
 def make_handler(node):
@@ -54,13 +56,15 @@ def make_handler(node):
             req = json.loads(self.rfile.read(int(self.headers["content-length"])))
             assert req["method"] == "torus_getStateHash", req
             params = req.get("params") or []
+            if node.on_call is not None:
+                node.on_call(params[0] if params else None)
             hs = sorted(node.checkpoints)
             h = (
                 params[0]
                 if params and params[0] is not None
                 else (hs[-1] if hs else None)
             )
-            if h not in node.checkpoints:
+            if h not in node.checkpoints or h in node.fail_heights:
                 out = {
                     "jsonrpc": "2.0",
                     "id": req["id"],
@@ -430,6 +434,86 @@ class StateAttestTest(unittest.TestCase):
         out = self.run_scan(self.three(), activation=1)
         self.assertTrue(out["ok"], out["problems"])
         self.assertEqual((out["compared"], out["min_compared"]), (12, 11))
+
+    # bug 2 (9g-hn smoke 2026-10-21): the chain keeps committing during the scan, so every node's newest
+    # checkpoint advances and RETAIN prunes the oldest one before the newest-first walk reaches it
+    def advancing(self, at, steps=1, lo=200, hi=6500):
+        """3 nodes retaining lo..hi (64 checkpoints at the defaults); the first walk read of height `at` on any
+        node advances every node by `steps` checkpoints (adds the new newest, prunes to RETAIN)"""
+        nodes = self.three(lo=lo, hi=hi)
+        lock = threading.Lock()
+        fired = []
+
+        def advance(h):
+            with lock:
+                if h != at or fired:
+                    return
+                fired.append(h)
+                for n in nodes:
+                    for _ in range(steps):
+                        top = max(n.checkpoints) + 100
+                        n.checkpoints[top] = self.checkpoints(lo=top, hi=top)[top]
+                        n.checkpoints.pop(top - 100 * sa.RETAIN)
+        for n in nodes:
+            n.on_call = advance
+        return nodes
+
+    def test_chain_advancing_during_the_walk_prunes_the_oldest_ok(self):
+        nodes = self.advancing(at=3000)
+        out = self.run_scan(nodes, activation=1)
+        self.assertTrue(out["ok"], out["problems"])
+        self.assertEqual(out["compared"], 63)
+        self.assertEqual(out["heights"], [300, 6500])
+        self.assertEqual(out["latest_after_walk"], [6600, 6600, 6600])
+        self.assertEqual((out["advanced_during_scan"], out["min_compared"]), (1, 63))
+
+    def test_chain_advancing_two_checkpoints_ok(self):
+        out = self.run_scan(self.advancing(at=3000, steps=2), activation=1)
+        self.assertTrue(out["ok"], out["problems"])
+        self.assertEqual((out["compared"], out["min_compared"]), (62, 62))
+
+    def test_nodes_apart_at_scan_start_window_is_the_common_retained_one(self):
+        """val0 already one checkpoint ahead when T is read: it retains 300..6600, T = 6500 -> 63 common"""
+        nodes = self.three(lo=200, hi=6500)
+        nodes[0].checkpoints = self.checkpoints(lo=300, hi=6600)
+        out = self.run_scan(nodes, activation=1)
+        self.assertTrue(out["ok"], out["problems"])
+        self.assertEqual((out["compared"], out["min_compared"], out["advanced_during_scan"]), (63, 63, 1))
+
+    def test_mid_window_rpc_failure_on_an_advancing_chain_fails(self):
+        nodes = self.advancing(at=5000)
+        nodes[1].fail_heights = {3000}
+        out = self.run_scan(nodes, activation=1)
+        self.assertFalse(out["ok"])
+        self.assertEqual((out["compared"], out["min_compared"]), (35, 63))
+        self.assertEqual(out["partial_heights"], [3000])
+        self.assertTrue(any(p.startswith("compared only 35 checkpoint(s), want >= 63") for p in out["problems"]), out["problems"])
+
+    def test_rpc_failure_just_above_the_pruned_bottom_fails(self):
+        """the advance explains exactly one missing checkpoint (200), not a failure at 300 as well"""
+        nodes = self.advancing(at=3000)
+        nodes[2].fail_heights = {300}
+        out = self.run_scan(nodes, activation=1)
+        self.assertFalse(out["ok"])
+        self.assertEqual((out["compared"], out["min_compared"]), (62, 63))
+
+    def test_latest_unreadable_after_the_walk_keeps_the_full_window(self):
+        """no proof of an advance (latest unreadable after the walk): the window is not shortened"""
+        nodes = self.advancing(at=3000)
+        calls = {"n": 0}
+        inner = nodes[0].on_call
+
+        def hook(h):
+            inner(h)
+            if h is None:
+                calls["n"] += 1
+                if calls["n"] == 2:  # the post-walk latest read
+                    nodes[0].fail_heights = set(nodes[0].checkpoints)
+        nodes[0].on_call = hook
+        out = self.run_scan(nodes, activation=1)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["latest_after_walk"][0], None)
+        self.assertEqual((out["advanced_during_scan"], out["min_compared"]), (0, 64))
 
     def test_unreachable_node_fails(self):
         nodes = self.three()
