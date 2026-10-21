@@ -230,7 +230,7 @@ fn l3_proposes_with_the_tc_as_soon_as_it_arrives() {
     let p = l.proposals();
     assert_eq!(p.len(), 1, "proposes on the retry that sees TC(v-1)");
     assert_eq!(tc_view(&p[0]), Some(VIEW - 1));
-    assert_eq!(p[0].block.justify, qc(3, &h()));
+    assert!(p[0].block.justify == qc(3, &h()));
     assert!(!l.hotstuff.has_deferred_proposal());
 }
 
@@ -260,8 +260,8 @@ fn case3_applies_the_tc_high_qc_and_attaches_the_tc() {
     let p = l.proposals();
     assert_eq!(p.len(), 1);
     assert_eq!(tc_view(&p[0]), Some(VIEW - 1), "case 3 must attach the TC");
-    assert_eq!(p[0].block.justify, qc(3, &h()), "case 3 extends tc.high_qc");
-    assert_eq!(l.tree.highest_pc().unwrap(), qc(3, &h()), "tc.high_qc applied");
+    assert!(p[0].block.justify == qc(3, &h()), "case 3 extends tc.high_qc");
+    assert!(l.tree.highest_pc().unwrap() == qc(3, &h()), "tc.high_qc applied");
 }
 
 #[test]
@@ -276,7 +276,7 @@ fn case3_with_the_high_qc_block_missing_defers_then_attaches_the_tc() {
     let p = l.proposals();
     assert_eq!(p.len(), 1);
     assert_eq!(tc_view(&p[0]), Some(VIEW - 1), "the retried proposal keeps the TC");
-    assert_eq!(p[0].block.justify, qc(3, &h()));
+    assert!(p[0].block.justify == qc(3, &h()));
 }
 
 /// A TC whose high QC is not a correct certificate (only its view and block
@@ -291,7 +291,7 @@ fn case3_does_not_apply_an_incorrect_high_qc() {
     let p = l.proposals();
     assert_eq!(p.len(), 1);
     assert_eq!(tc_view(&p[0]), Some(VIEW - 1));
-    assert_eq!(p[0].block.justify, qc(2, &g()), "the forged high QC is ignored");
+    assert!(p[0].block.justify == qc(2, &g()), "the forged high QC is ignored");
 }
 
 // L2 case 4 ------------------------------------------------------------------
@@ -304,7 +304,7 @@ fn case4_reproposes_the_tip_with_the_tc() {
     l.enter();
     let p = l.proposals();
     assert_eq!(p.len(), 1);
-    assert_eq!(p[0].block.hash, x.hash);
+    assert!(p[0].block.hash == x.hash);
     assert_eq!(tc_view(&p[0]), Some(VIEW - 1));
 }
 
@@ -333,7 +333,7 @@ fn case5_waits_for_the_tip_instead_of_a_fresh_proposal() {
         .unwrap();
     let p = l.proposals();
     assert_eq!(p.len(), 1, "exactly one proposal in the view");
-    assert_eq!(p[0].block.hash, x.hash);
+    assert!(p[0].block.hash == x.hash);
     assert_eq!(tc_view(&p[0]), Some(VIEW - 1));
 }
 
@@ -351,6 +351,6 @@ fn vsu_reproposal_waits_for_the_tc_then_attaches_it() {
     l.retry();
     let p = l.proposals();
     assert_eq!(p.len(), 1);
-    assert_eq!(p[0].block.hash, h().hash);
+    assert!(p[0].block.hash == h().hash);
     assert_eq!(tc_view(&p[0]), Some(VIEW - 1));
 }
