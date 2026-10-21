@@ -8158,8 +8158,14 @@ impl TorusApp {
         // keeps running and voting, reports it (ERROR + gauge) and never
         // attests until the chain is valid again.
         state_hash.report_at_boot(&state_db, metrics.as_deref());
-        // P0.0 phase 6: the feature gauges from the last applied header.
-        exec_ctx.features.after_block(&last_header);
+        // P0.0 phase 6: the feature gauges from the last applied header (a
+        // clean restart replays nothing and gets genesis back: read the
+        // durable applied-height header instead).
+        exec_ctx.features.after_block(&Self::feature_gauge_header(
+            &state_db,
+            &exec_ctx,
+            &last_header,
+        ));
 
         // The proposer identity, resolved from the replayed state before the
         // execution thread starts.
@@ -9008,6 +9014,32 @@ impl TorusApp {
     /// caller parks execution at `h` and lets the live heal loop + block-sync
     /// backfill get a bounded window to re-deliver and heal it, fail-stopping only
     /// if the budget expires — instead of latching the fail-stop pre-network.
+    /// P0.0 phase 6 (Codex P2): the header the boot feature gauges report.
+    /// `replayed` (from [`Self::replay_committed`]) when replay executed a
+    /// block; otherwise (a clean restart: applied == committed, nothing
+    /// replayed, genesis returned) the durable header at the applied height.
+    /// Genesis only when nothing has applied (or that header cannot be read).
+    fn feature_gauge_header(
+        state_db: &StateDb,
+        exec_ctx: &ExecutionContext,
+        replayed: &TorusBlockHeader,
+    ) -> TorusBlockHeader {
+        if replayed.height > 0 {
+            return replayed.clone();
+        }
+        match exec_ctx.applied_height() {
+            Ok(Some(applied)) if applied > 0 => load_replay_header(state_db, applied)
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        applied,
+                        "feature gauges: applied-height header unreadable, reporting from genesis"
+                    );
+                    replayed.clone()
+                }),
+            _ => replayed.clone(),
+        }
+    }
+
     fn replay_committed(
         state_db: &StateDb,
         exec_ctx: &ExecutionContext,
@@ -26250,8 +26282,7 @@ mod crash_recovery_tests {
             rsh.name()
         );
         // (activation height, applied height, active, next, until)
-        for (at, applied, on, next, until) in
-            [(2u64, 4u64, 1.0, 0.0, -1.0), (6, 2, 0.0, 6.0, 4.0)]
+        for (at, applied, on, next, until) in [(2u64, 4u64, 1.0, 0.0, -1.0), (6, 2, 0.0, 6.0, 4.0)]
         {
             let (mut config, db) = make_test_config_and_db();
             config.activations = rsh_at(at);
