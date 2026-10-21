@@ -131,16 +131,18 @@ def write_keys(keys_path, d):
 
 # ------------------------------------------------------------------ rpc / metrics / logs
 class Rpc:
-    def __init__(self, url, timeout=10):
+    def __init__(self, url, timeout=10, attempts=3):
         self.url = url
         self.timeout = timeout
+        self.attempts = attempts
 
     def call(self, method, params):
         """(result, None) or (None, error text)"""
         body = json.dumps(
             {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         ).encode()
-        for attempt in range(3):
+        err = "no attempt made"
+        for attempt in range(self.attempts):
             try:
                 req = urllib.request.Request(
                     self.url, body, {"content-type": "application/json"}
@@ -149,7 +151,8 @@ class Rpc:
                     reply = json.load(r)
             except RPC_ERRORS as e:
                 err = "%s: %s" % (type(e).__name__, e)
-                time.sleep(0.5 * (attempt + 1))
+                if attempt + 1 < self.attempts:
+                    time.sleep(0.5 * (attempt + 1))
                 continue
             if "error" in reply:
                 e = reply["error"] or {}
@@ -157,7 +160,8 @@ class Rpc:
                     isinstance(e, dict) and e.get("code") == -32005
                 ):  # per-IP rate limit: retry
                     err = "rate limited: %s" % e.get("message")
-                    time.sleep(1.0 * (attempt + 1))
+                    if attempt + 1 < self.attempts:
+                        time.sleep(1.0 * (attempt + 1))
                     continue
                 return None, "rpc error: %s" % (
                     e.get("message") if isinstance(e, dict) else e
@@ -480,31 +484,66 @@ def holes_of(rows, t):
     ]
 
 
+def read_is_clean(per):
+    """a hole's read that carries no evidence of disagreement: every node answered, the same h_n everywhere, every
+    vote equal to the reading node's h_n, and any quorum hash equal to it (only 'no quorum yet' may differ)"""
+    if any("error" in p for p in per):
+        return False
+    if len({p["local"] for p in per}) != 1:
+        return False
+    for p in per:
+        if any(vh != p["local"] or not matches for vh, matches in p["votes"].values()):
+            return False
+        if p["quorum"] is not None and p["quorum"] != p["local"]:
+            return False
+    return True
+
+
 def heal_holes(out, rpcs, rows, t, hole_wait_s, sleep=2.0):
     """A validator whose attestation did not land re-signs it with a fresh nonce once the nonce window passed
     (state_hash.rs DEFAULT_RESUBMIT_AFTER_MS = NONCE_WINDOW_MS + 5 s = 65 s); e.g. the bench oracle feed signs with
     the same validator key and a same-millisecond nonce gets the attestation skipped as a replay (9j2 smoke,
-    checkpoint 3000). So a hole below the newest checkpoint is re-read until it heals or hole_wait_s passes; a hole
-    still open then stays a failure (judge_rows), and a hole pruned or unreadable while waiting stays open."""
+    checkpoint 3000). So a PLAIN hole (below the newest checkpoint, no quorum yet, otherwise clean) is re-read
+    until it heals or hole_wait_s passes. Evidence is never erased (Codex P1): a hole whose initial read shows a
+    hash / vote / quorum mismatch is not retried, and a retry that shows one replaces the row and ends the retries,
+    so judge_rows fails the cell either way. A hole still open, pruned or unreadable stays a failure. The budget is
+    an absolute deadline checked before every request, with each request's timeout capped to what is left and no
+    in-call retries (Codex P2)."""
     holes = holes_of(rows, t)
     out["holes_initial"] = list(holes)
     out["hole_wait_s"] = 0.0
     out["holes_healed"] = []
+    out["holes_not_retried"] = []
     if not holes or hole_wait_s <= 0:
         return
     by_h = {r["height"]: r for r in rows}
+    for h in list(holes):
+        if not read_is_clean(by_h[h]["per_node"]):
+            holes.remove(h)
+            out["holes_not_retried"].append(h)
     t0 = time.monotonic()
-    while holes and time.monotonic() - t0 < hole_wait_s:
-        time.sleep(sleep)
+    deadline = t0 + hole_wait_s
+    while holes and time.monotonic() < deadline:
+        time.sleep(max(0.0, min(sleep, deadline - time.monotonic())))
         for h in list(holes):
             per = []
             for rpc in rpcs:
-                r, err = state_hash(rpc, h)
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    per.append({"error": "hole wait budget spent"})
+                    continue
+                bounded = Rpc(rpc.url, timeout=min(rpc.timeout, left), attempts=1)
+                r, err = state_hash(bounded, h)
                 per.append(r if err is None else {"error": err})
             if any("error" in p for p in per):
-                continue  # keep the earlier read: a pruned / unreadable hole stays open
-            by_h[h]["per_node"] = per
+                continue  # keep the earlier read: a pruned / unreadable / out-of-budget hole stays open
+            if not read_is_clean(per):
+                by_h[h]["per_node"] = per  # the mismatch is the evidence judge_rows must see
+                holes.remove(h)
+                out["holes_not_retried"].append(h)
+                continue
             if all(p["quorum"] is not None for p in per):
+                by_h[h]["per_node"] = per
                 holes.remove(h)
                 out["holes_healed"].append(h)
     out["hole_wait_s"] = round(time.monotonic() - t0, 1)
