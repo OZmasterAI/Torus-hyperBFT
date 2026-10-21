@@ -89,21 +89,33 @@ python3 tools/matched-bench/test_harness.py
    Since plan 9.13 (`feat/compiled-defaults`) the node's compiled defaults equal
    these values except `TORUS_COMMIT_LAG_BACKOFF_CAP` (genesis-sourced, default
    0); the other exports are kept so older binaries run the same configuration.
-   **Book mode is NOT pinned (s131).** From the r2 merge to s131 this env
-   carried `TORUS_BOOK_ROWS=3`, so a cell was mode 3 unless the campaign
-   overrode it (one bench-8y Classic smoke silently ran mode 3). A cell now runs
-   the node default, Classic (the testnet genesis mode); a mode-3 arm must set
-   `EXTRA_ENV='TORUS_BOOK_ROWS=3'` (or the arm's `env` in a driver spec), `=2`
-   for mode 2, `=1` for OrderRows.
+   **Book mode is NOT pinned (s131), and it is a genesis field.** From the r2
+   merge to s131 this env carried `TORUS_BOOK_ROWS=3`, so a cell was mode 3
+   unless the campaign overrode it (one bench-8y Classic smoke silently ran
+   mode 3). Since s131 the node takes its book mode from the genesis field
+   `consensus.book_mode` and refuses to start when `TORUS_BOOK_ROWS` disagrees.
+   A cell runs Classic (field absent) unless `EXTRA_ENV` names a mode:
+   `TORUS_BOOK_ROWS=3` (existing specs and driver arm `env`s keep working:
+   run-cell.sh writes the mode into this cell's genesis via
+   `gen-3val-genesis.sh BOOK_MODE=`, and the variable still reaches the nodes,
+   which accept it because it agrees, with a deprecation warning), or
+   `BOOK_MODE=level_authority_chunked` (or `3`; genesis only, no node env).
+   `=2` / `level_authority` for mode 2, `=1` / `order_rows` for OrderRows.
+   Both set and different, or a value that is not a mode, fails at preflight
+   (exit 2). The genesis cache keys on the mode. The cell refuses a genesis
+   whose mode is not the one it asked for and logs
+   `genesis consensus.book_mode=<name> (<source>)`.
    After the env is final, run.log gets one audit line per cell:
    `cell=<label> book_mode=classic|mode1|mode2|mode3 TORUS_BOOK_ROWS='...'
    TORUS_BOOK_FAST_ENCODE='...' TORUS_SETTLE_NO_MERGE='...'
    TORUS_EVM_FAST_PATH='...' TORUS_BOOK_COALESCE='...'
    TORUS_CHECKPOINT_INTERVAL_MS='...'`, each value `unset (default)`,
-   `empty (default)` or the value (book mode parsed like the node:
-   trimmed `1`/`2`/`3`, anything else Classic). summary.json records the same
-   as `cell.book_mode` and `cell.node_flags` (both `null` when the cell has no
-   recorded node env). Check A/B arms against this line before analysis.
+   `empty (default)` or the value; `book_mode=` is the cell genesis' mode.
+   summary.json records `genesis.book_mode` (the genesis name) and
+   `cell.book_mode` (the label, written by run-cell.sh after summarize.py and
+   kept by resummarize.sh) and `cell.node_flags` (`null` when the cell has no
+   recorded node env; older cells keep the env-derived `cell.book_mode`).
+   Check A/B arms against this line before analysis.
    Verifies via `/proc/<pid>/environ` that all 3 nodes got the same env.
    `BLOCK_CAP=N` (block-cap-raise sweep) exports the coherent proposer-local
    bundle between the two: `TORUS_NATIVE_TOTAL_BLOCK_CAP=N`,

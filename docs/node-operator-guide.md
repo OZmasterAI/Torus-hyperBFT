@@ -130,6 +130,36 @@ The `--genesis` flag points to a `genesis.json` file that contains:
 Genesis initialization only runs on first start (when the database is empty).
 Subsequent starts skip genesis even if `--genesis` is provided.
 
+### Order-book storage mode (`consensus.book_mode`)
+
+The order-book storage mode is a genesis field, fixed for the chain's life
+(owner s131). Modes other than Classic change the state format, so every
+node of a chain must run the same mode; taking it from genesis makes a fleet
+that shares a genesis agree by construction.
+
+```json
+"consensus": { "...": "...", "book_mode": "level_authority_chunked" }
+```
+
+| Value | Number | Mode |
+|-------|--------|------|
+| `"classic"` (or absent) | `0` | Whole-book blob per market. Default: every existing genesis, including the testnet's. |
+| `"order_rows"` | `1` | C4 per-order rows. |
+| `"level_authority"` | `2` | 3c level rows + node-local order rows. |
+| `"level_authority_chunked"` | `3` | Mode 2 with the chunked level hash ("mode 3"). |
+
+Any other value refuses the genesis. At startup the node logs
+`book mode: <mode> (genesis consensus.book_mode)` and refuses to start when:
+
+- `TORUS_BOOK_ROWS` is set and names another mode, or is not `0`-`3`.
+  The variable is deprecated: unset it. If it repeats the genesis mode the
+  node starts with a deprecation warning.
+- the data dir's `__book_mode__` marker (written when genesis is applied and
+  on the first block) names another mode: the data dir belongs to another
+  chain, or the genesis file changed after it was applied.
+
+A restart without `--genesis` takes the mode from the marker.
+
 ## Data Directory
 
 The `--data-dir` directory contains:

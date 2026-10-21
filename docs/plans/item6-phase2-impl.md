@@ -810,7 +810,10 @@ instead. `run-cell.sh` `RECORD_ENV` stays explicit (older binaries).
 - `chain_config.commit_lag_backoff_cap: 8`. Owner, via 18c s108 (2026-10-09): stays out of the
   compiled defaults, set in the testnet genesis instead (the S470 value the benches run by env).
 - No book mode in genesis; the testnet runs Classic (the compiled default). Owner, via 18c s107,
-  above.
+  above. **s131 update:** the book mode is now the genesis field `consensus.book_mode`
+  (`feat/book-mode-genesis`; absent = Classic, so the testnet genesis stays Classic unchanged;
+  `"level_authority_chunked"` = mode 3). The node refuses a disagreeing `TORUS_BOOK_ROWS` or DB
+  marker, which closes the mixed-fleet-on-a-fresh-DB gap above. Picking mode 3 = setting the field.
 
 ### 9.14 P2-1 gate missed: accept and continue (18c s104 / ozarchy s31, 2026-10-08)
 

@@ -526,15 +526,19 @@ fn explicit_zero_interval_keeps_the_per_block_flush() {
     assert_graceful_stop(&mut node, libc::SIGTERM, "SIGTERM");
 }
 
-/// A deferred book mode (`TORUS_BOOK_ROWS=3`, the bench `RECORD_ENV`) cannot
-/// run with checkpoints (owner s109, task 1.2). With the interval unset the
+/// A deferred book mode (genesis `consensus.book_mode` = mode 3) cannot run
+/// with checkpoints (owner s109, task 1.2). With the interval unset the
 /// compiled default yields (per-block flush, a warning) instead of refusing
 /// to start; an explicit interval still refuses.
 #[test]
 fn env_unset_interval_yields_to_a_deferred_book_mode() {
     let work = tempfile::tempdir().unwrap();
     let genesis = write_genesis(work.path());
-    let mut node = Node::start_env(work.path(), &genesis, "a", &[("TORUS_BOOK_ROWS", "3")]);
+    let mut g: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&genesis).unwrap()).unwrap();
+    g["consensus"]["book_mode"] = serde_json::json!("level_authority_chunked");
+    std::fs::write(&genesis, serde_json::to_vec_pretty(&g).unwrap()).unwrap();
+    let mut node = Node::start(work.path(), &genesis, "a");
     node.wait_executed_above(MIN_BLOCKS);
     let log = node.log_text();
     assert!(

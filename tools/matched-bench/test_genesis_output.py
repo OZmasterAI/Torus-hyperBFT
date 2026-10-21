@@ -59,7 +59,7 @@ for i in $(seq "$3" $(( $3 + $5 - 1 ))); do printf '%s 0x%040x\\n' "$i" "$i"; do
         environment = dict(os.environ)
         for name in ('BASE', 'BIN', 'OUT', 'FORCE', 'MARKETS', 'TIMEOUT_BASE_MS',
                      'BULK_OFFSET', 'BULK_COUNT', 'NATIVE_AVAIL', 'EVM_WEI',
-                     'EVM_BLOCK_INTERVAL', 'STATE_HASH_ACTIVATION'):
+                     'EVM_BLOCK_INTERVAL', 'STATE_HASH_ACTIVATION', 'BOOK_MODE'):
             environment.pop(name, None)
         environment.update(OUT=str(self.output), BENCH_BIN=str(self.binary), MARKETS='3',
                            FORCE='1' if force else '0', BULK_OFFSET='60', BULK_COUNT='2',
@@ -266,6 +266,54 @@ for i in $(seq "$3" $(( $3 + $5 - 1 ))); do printf '%s 0x%040x\\n' "$i" "$i"; do
         types = (source / 'crates/torus-types/src/lib.rs').read_text()
         self.assertIn('pub const EVM_BLOCK_INTERVAL_RANGE: std::ops::RangeInclusive<u64> = 2..=100;', types)
         self.assertIn('pub const DEFAULT_EVM_BLOCK_INTERVAL: u64 = 11;', types)
+
+    # ---- BOOK_MODE (owner s131): the order-book storage mode is the genesis
+    # field `.consensus.book_mode` (absent = classic); the node takes its mode
+    # from genesis. Names and 0-3 both accepted, written as the name.
+
+    BOOK_MODES = (('classic', 'classic'), ('0', 'classic'), ('order_rows', 'order_rows'),
+                  ('1', 'order_rows'), ('level_authority', 'level_authority'), ('2', 'level_authority'),
+                  ('level_authority_chunked', 'level_authority_chunked'), ('3', 'level_authority_chunked'))
+
+    def test_book_mode_sets_the_final_genesis_only(self):
+        for value, name in self.BOOK_MODES:
+            with self.subTest(value=value):
+                result = self.run_script(BOOK_MODE=value)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                full = json.loads(self.full.read_text())
+                final = json.loads(self.output.read_text())
+                self.assertEqual(final['consensus'], {**self.base['consensus'], 'book_mode': name})
+                self.assertNotIn('book_mode', full['consensus'], 'the reused weighted base is never patched')
+                self.assertIn('book_mode  = %s' % name, result.stdout)
+
+    def test_unset_book_mode_leaves_the_genesis_byte_identical(self):
+        unset = self.generate(BOOK_MODE=None)[1]
+        unset_bytes = self.output.read_bytes()
+        self.assertNotIn('book_mode', unset['consensus'])
+        result = self.run_script(BOOK_MODE='')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_bytes(), unset_bytes)
+        self.assertIn('book_mode  = absent (classic)', result.stdout)
+
+    def test_no_stale_book_mode_between_runs(self):
+        self.assertEqual(self.generate(BOOK_MODE='3')[1]['consensus']['book_mode'], 'level_authority_chunked')
+        self.assertNotIn('book_mode', self.generate()[1]['consensus'])
+
+    def test_bad_book_mode_is_refused_before_anything_is_written(self):
+        for value in ('4', 'mode3', 'Classic', ' 3', '-1', 'x'):
+            with self.subTest(value=value):
+                if self.output.exists():
+                    self.output.unlink()
+                result = self.run_script(BOOK_MODE=value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('BOOK_MODE must be classic, order_rows, level_authority, level_authority_chunked or 0-3', result.stderr)
+                self.assertFalse(self.output.exists(), 'refused before any genesis is written')
+
+    def test_book_mode_names_match_the_node(self):
+        source = Path(__file__).resolve().parents[2]
+        types = (source / 'crates/torus-types/src/book_mode.rs').read_text()
+        for _, name in self.BOOK_MODES:
+            self.assertIn('=> "%s"' % name, types)
 
 
 if __name__ == '__main__':
