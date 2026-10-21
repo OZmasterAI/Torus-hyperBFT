@@ -1130,6 +1130,7 @@ impl<N: Network> HotStuff<N> {
                 // Step 3: Store recovery state for async completion.
                 let high_tip_qc_view = tip.block_justify.view;
                 self.recovery_state = RecoveryState::Recovering {
+                    recovered: None,
                     tc: tc.clone(),
                     ne_collector: NECollector::new(
                         self.view_info.view,
@@ -1989,26 +1990,65 @@ impl<N: Network> HotStuff<N> {
             return Ok(());
         }
 
-        // The header must carry the tip's validator-set-update flag (validators
-        // vote Prepare on it), which only the app can tell for a block this
-        // leader did not hold: validate and insert it first, as the
-        // full-proposal path does. Without its parent the block cannot be
-        // validated yet; stay in recovery (another response or an NEC may
-        // still complete the view).
-        let block = &resp.proposal.block;
+        self.complete_recovery(resp.proposal.block, Instant::now(), block_tree, app)
+    }
+
+    /// Re-propose the recovered tip `block` (checked against the TC's high
+    /// tip, correct and safe) under the recovery's TC (case 4 equivalent).
+    ///
+    /// The header must carry the tip's validator-set-update flag (validators
+    /// vote Prepare on it), which only the app can tell for a block this
+    /// leader did not hold: validate and insert it first, as the
+    /// full-proposal path does, and apply its justify (commits, validator-set
+    /// updates): the leader's own loopback header finds the block in the tree
+    /// and skips the body path that would otherwise do it (Codex phase-B
+    /// review P2). If the block cannot be validated yet (`MissingData`, or its
+    /// parent is missing) it is kept and retried on the s63 `MissingData`
+    /// cadence ([`tick_missing_data_retries`](Self::tick_missing_data_retries)),
+    /// staying in recovery meanwhile (another response or an NEC may still
+    /// complete the view). `first_seen` is when the block first arrived.
+    fn complete_recovery<K: KVStore>(
+        &mut self,
+        block: Block,
+        first_seen: Instant,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<(), HotStuffError> {
         if !block_tree.contains(&block.hash) {
             let parent = (!block.justify.is_genesis_pc()).then_some(block.justify.block);
-            if parent.is_some_and(|parent| !block_tree.contains(&parent)) {
-                return Ok(());
-            }
-            let request = ValidateBlockRequest::new(block, block_tree.app_view(parent.as_ref())?);
-            let ValidateBlockResponse::Valid { app_state_updates, validator_set_updates } = app.validate_block(request)
-            else {
+            let validated = if parent.is_some_and(|parent| !block_tree.contains(&parent)) {
+                None
+            } else {
+                let request = ValidateBlockRequest::new(&block, block_tree.app_view(parent.as_ref())?);
+                match app.validate_block(request) {
+                    ValidateBlockResponse::Valid { app_state_updates, validator_set_updates } => {
+                        Some((app_state_updates, validator_set_updates))
+                    }
+                    ValidateBlockResponse::Invalid => {
+                        if let RecoveryState::Recovering { recovered, .. } = &mut self.recovery_state {
+                            *recovered = None;
+                        }
+                        return Ok(());
+                    }
+                    ValidateBlockResponse::MissingData => None,
+                }
+            };
+            let Some((app_state_updates, validator_set_updates)) = validated else {
+                if let RecoveryState::Recovering { recovered, .. } = &mut self.recovery_state {
+                    let now = Instant::now();
+                    *recovered = Some((block, first_seen, now));
+                }
                 return Ok(());
             };
-            block_tree.insert(block, app_state_updates.as_ref(), validator_set_updates.as_ref())?;
+            block_tree.insert(&block, app_state_updates.as_ref(), validator_set_updates.as_ref())?;
             Event::InsertBlock(InsertBlockEvent { timestamp: SystemTime::now(), block: block.clone() })
                 .publish(&self.event_publisher);
+            let update_result = block_tree
+                .update(&block.justify, &self.event_publisher)
+                .unwrap_or(UpdateResult { validator_set_updates: None, committed_block_hashes: vec![] });
+            self.process_update_result(update_result, block_tree, app);
+            let validator_set_state = block_tree.validator_set_state()?;
+            let _ = self.phase_vote_collectors.update_validator_sets(&validator_set_state);
         }
         let has_validator_set_updates = block_tree.validator_set_updates_status(&block.hash)?.contains_updates();
 
@@ -2023,7 +2063,7 @@ impl<N: Network> HotStuff<N> {
         let proposal = Proposal {
             chain_id: self.config.chain_id,
             view: self.view_info.view,
-            block: resp.proposal.block,
+            block,
             tc: Some(tc),
             nec: None,
         };
@@ -2035,6 +2075,44 @@ impl<N: Network> HotStuff<N> {
         .publish(&self.event_publisher);
 
         Ok(())
+    }
+
+    /// Whether a recovered tip waits for re-validation ([`complete_recovery`](Self::complete_recovery)).
+    fn has_recovered_block_retry(&self) -> bool {
+        matches!(self.recovery_state, RecoveryState::Recovering { recovered: Some(_), .. })
+    }
+
+    /// Re-validate a recovered tip kept by [`complete_recovery`](Self::complete_recovery), on the
+    /// s63 `MissingData` cadence; after [`MISSING_DATA_RETRY_DEADLINE`] it is dropped (the view
+    /// times out, as without a response).
+    fn retry_recovered_block<K: KVStore>(
+        &mut self,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+        now: Instant,
+    ) -> Result<(), HotStuffError> {
+        let RecoveryState::Recovering { recovered, .. } = &mut self.recovery_state else {
+            return Ok(());
+        };
+        let Some((_, first_seen, last_try)) = recovered else {
+            return Ok(());
+        };
+        if now.duration_since(*last_try) < MISSING_DATA_RETRY_INTERVAL {
+            return Ok(());
+        }
+        let first_seen = *first_seen;
+        let Some((block, ..)) = recovered.take() else {
+            return Ok(());
+        };
+        if now.duration_since(first_seen) >= MISSING_DATA_RETRY_DEADLINE {
+            log::warn!(
+                "recovered tip {} still not insertable after {:?}; awaiting another response or an NEC",
+                crate::logging::block_prefix(&block.hash),
+                MISSING_DATA_RETRY_DEADLINE
+            );
+            return Ok(());
+        }
+        self.complete_recovery(block, first_seen, block_tree, app)
     }
 
     /// PROCESSNEREQUST: On receiving an NERequest, check if we voted for the
@@ -3333,7 +3411,7 @@ impl<N: Network> HotStuff<N> {
     }
 
     pub(crate) fn has_missing_data_retries(&self) -> bool {
-        !self.missing_data_retries.is_empty()
+        !self.missing_data_retries.is_empty() || self.has_recovered_block_retry()
     }
 
     /// s63: re-validate parked `MissingData` bodies (see
@@ -3349,7 +3427,7 @@ impl<N: Network> HotStuff<N> {
         block_tree: &mut BlockTreeSingleton<K>,
         app: &mut impl App<K>,
     ) -> Result<(), HotStuffError> {
-        if self.missing_data_retries.is_empty() {
+        if !self.has_missing_data_retries() {
             return Ok(());
         }
         self.tick_missing_data_retries_at(block_tree, app, Instant::now())
@@ -3420,7 +3498,8 @@ impl<N: Network> HotStuff<N> {
         if inserted_any {
             self.drain_deferred_bodies(block_tree, app)?;
         }
-        Ok(())
+        // A recovered tip that validated MissingData (Codex phase-B review P2).
+        self.retry_recovered_block(block_tree, app, now)
     }
 
     /// S426: send a by-hash `BlockDataRequest` for an unknown justify block to the
@@ -3978,6 +4057,11 @@ pub(crate) enum RecoveryState {
     Recovering {
         tc: crate::pacemaker::types::TimeoutCertificate,
         ne_collector: NECollector,
+        /// The tip from a checked ProposalResponse that could not be inserted yet (its
+        /// validation returned `MissingData`, or its parent is missing), with the s63 retry
+        /// clock `(first_seen, last_try)`. Re-validated by
+        /// [`HotStuff::tick_missing_data_retries`]; dropped with the recovery when the view ends.
+        recovered: Option<(Block, Instant, Instant)>,
     },
 }
 
