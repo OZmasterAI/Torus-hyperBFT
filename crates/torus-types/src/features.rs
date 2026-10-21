@@ -47,6 +47,13 @@ impl Feature {
         1u128 << (self as u8)
     }
 
+    /// A test-only feature (cargo feature `test-features`): never in
+    /// [`KNOWN_FEATURES`], refused in a node's schedule
+    /// ([`ActivationSchedule::for_chain`]). RED stub.
+    pub const fn is_test_only(self) -> bool {
+        false
+    }
+
     /// The genesis name (`consensus.activations` key).
     pub const fn name(self) -> &'static str {
         match self {
@@ -199,10 +206,9 @@ mod tests {
     fn ids_are_fixed_and_known_features_is_their_union() {
         assert_eq!(Feature::RunningStateHash.id(), 0);
         assert_eq!(Feature::RunningStateHash.bit(), 1);
-        #[cfg(not(feature = "test-features"))]
+        // Test-only features are never in this binary's set (Codex review
+        // of phase 5, P2): see `known_features_never_hold_a_test_feature`.
         assert_eq!(KNOWN_FEATURES, 1);
-        #[cfg(feature = "test-features")]
-        assert_eq!(KNOWN_FEATURES, 1 | (1 << 127));
         assert_eq!(first_unknown_feature_in(0b11, 0b01), Some(1));
         assert_eq!(first_unknown_feature_in(0b01, 0b01), None);
         assert_eq!(unknown_features(0b101), 0b100);
@@ -212,6 +218,40 @@ mod tests {
             let json = serde_json::to_string(f).unwrap();
             assert_eq!(json, format!("\"{}\"", f.name()));
         }
+    }
+
+    /// Codex review of phase 5 (P2): a build with the cargo feature
+    /// `test-features` (a workspace `--all-features` build of the node does
+    /// this) must not count the test feature as one it can execute: its rule
+    /// exists in test code only, so such a binary would apply the bit without
+    /// its transition. `KNOWN_FEATURES` holds no test feature, and a genesis /
+    /// built-in schedule naming one refuses to start; tests inject the bit
+    /// through the known set they pass (`AppOptions::known_features`).
+    /// RED before the fix (with `--features test-features`): bit 127 known,
+    /// a genesis `test_state_rule` accepted.
+    #[test]
+    fn known_features_never_hold_a_test_feature() {
+        for f in Feature::ALL {
+            assert_eq!(
+                KNOWN_FEATURES & f.bit() != 0,
+                !f.is_test_only(),
+                "{}: known iff not test-only",
+                f.name()
+            );
+        }
+        assert_eq!(KNOWN_FEATURES & (1 << 127), 0, "bit 127 is reserved for tests");
+        #[cfg(feature = "test-features")]
+        {
+            assert!(Feature::TestStateRule.is_test_only());
+            assert_eq!(first_unknown_feature(Feature::TestStateRule.bit()), Some(127));
+            let genesis: BTreeMap<_, _> = [(Feature::TestStateRule, 5)].into_iter().collect();
+            let err = ActivationSchedule::for_chain(crate::eip712::TORUS_CHAIN_ID, &genesis)
+                .expect_err("a test-only feature in a node schedule refuses to start");
+            assert!(err.contains("test_state_rule"), "{err}");
+            // Tests build their schedules with `merge`.
+            assert!(ActivationSchedule::merge(&genesis, &[]).is_ok());
+        }
+        assert!(!Feature::RunningStateHash.is_test_only());
     }
 
     /// RED before P0.0 phase 1: `active_at` returned 0 for every height.
