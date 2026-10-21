@@ -195,12 +195,12 @@ impl LeaderSet {
         state: &T,
         slot: &'a mut Option<LeaderSet>,
     ) -> Result<Option<&'a LeaderSet>, LeaderSkipError> {
-        let Some(members_raw) = torus_economics::epoch_plan::installed_set_raw(state).map_err(fault)?
+        let Some(members_raw) =
+            torus_economics::epoch_plan::installed_set_raw(state).map_err(fault)?
         else {
             return Ok(None);
         };
-        let excluded_raw =
-            leader_stats::installed_leader_exclusions_raw(state).map_err(fault)?;
+        let excluded_raw = leader_stats::installed_leader_exclusions_raw(state).map_err(fault)?;
         let mut key = (members_raw.len() as u64).to_be_bytes().to_vec();
         key.extend_from_slice(&members_raw);
         key.extend_from_slice(excluded_raw.as_deref().unwrap_or_default());
@@ -271,7 +271,7 @@ pub fn block_leader_rows<T: StateBackend, E: StateBackend>(
 mod tests {
     use super::*;
     use alloy_primitives::Address;
-    use hotstuff_rs::types::data_types::{BlockHeight, ChainID, CryptoHash, SignatureSet};
+    use hotstuff_rs::types::data_types::{ChainID, CryptoHash, SignatureSet};
     use torus_economics::StakingManager;
     use torus_state::StateDb;
     use torus_types::{PublicKey, ValidatorInfo};
@@ -341,8 +341,6 @@ mod tests {
     /// The evidence of a PC: view, phase class and the signature bitmap.
     #[test]
     fn evidence_of_a_justify_qc() {
-        let mut sigs = SignatureSet::new(4);
-        let _ = &mut sigs;
         let pc = PhaseCertificate {
             chain_id: ChainID::new(0),
             view: ViewNumber::new(9),
@@ -360,7 +358,6 @@ mod tests {
             LeaderEvidence::of(&PhaseCertificate::genesis_pc()).phase,
             QC_GENESIS
         );
-        let _ = BlockHeight::new(0);
     }
 
     /// A1: every view strictly between the cursor and the QC view is a miss for its leader
@@ -413,13 +410,17 @@ mod tests {
         set_cursor(&db, 15, true);
         let b = attribute(&db, &ev(18, QC_GENERIC, vec![true; 4]), &cache).unwrap();
         assert!(b.misses.is_empty() && b.success.is_none());
-        assert_eq!(b.signers.len(), 4, "signatures of the first generic QC count");
-        assert_eq!(b.cursor.unwrap().skip_next, false);
+        assert_eq!(
+            b.signers.len(),
+            4,
+            "signatures of the first generic QC count"
+        );
+        assert!(!b.cursor.unwrap().skip_next);
 
         let (_d2, fresh) = db_with_set();
         let g = attribute(&fresh, &ev(0, QC_GENESIS, vec![]), &cache).unwrap();
         assert!(g.misses.is_empty() && g.success.is_none());
-        assert_eq!(g.cursor.unwrap().skip_next, true, "boot views are no slots");
+        assert!(g.cursor.unwrap().skip_next, "boot views are no slots");
         let first = attribute(&fresh, &ev(7, QC_GENERIC, vec![true; 4]), &cache).unwrap();
         assert!(first.misses.is_empty(), "no cursor: no gap");
         assert_eq!(first.success, Some(leader(7)));
@@ -435,7 +436,10 @@ mod tests {
         assert_eq!(a.misses.len() as u64, MAX_ATTRIBUTED_GAP);
         assert_eq!(a.misses.last(), Some(&leader(to - 1)));
         assert_eq!(a.misses.first(), Some(&leader(to - MAX_ATTRIBUTED_GAP)));
-        assert!(a.signers.is_empty(), "a bitmap of the wrong length maps nobody");
+        assert!(
+            a.signers.is_empty(),
+            "a bitmap of the wrong length maps nobody"
+        );
     }
 
     /// leader(v) honours the INSTALLED exclusions: an excluded validator is never a missed or
@@ -446,7 +450,10 @@ mod tests {
         let x = leader(11);
         let excl = leader_stats::ExcludedMember {
             address: x,
-            pubkey: (1..=4u8).find(|n| addr(*n) == x).map(|n| vk(n).to_bytes()).unwrap(),
+            pubkey: (1..=4u8)
+                .find(|n| addr(*n) == x)
+                .map(|n| vk(n).to_bytes())
+                .unwrap(),
         };
         db.put_cf_raw(
             CF_CONSENSUS_META,
@@ -475,7 +482,8 @@ mod tests {
         let rows = block_leader_rows(&db, &db, 5, 4, &cache).unwrap();
         assert!(rows.contains(&(leader_qc_key(5), None)), "{rows:?}");
         assert!(
-            rows.iter().any(|(k, v)| k == b"leader_stats:cursor" && v.is_some()),
+            rows.iter()
+                .any(|(k, v)| k == b"leader_stats:cursor" && v.is_some()),
             "{rows:?}"
         );
     }

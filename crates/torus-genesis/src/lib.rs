@@ -1212,12 +1212,14 @@ mod tests {
         assert_eq!(genesis.consensus.leader_miss_threshold, 3);
         assert_eq!(genesis.consensus.leader_exclusion_cap, 6);
         let config = genesis.chain_config();
-        assert_eq!((config.leader_miss_threshold, config.leader_exclusion_cap), (3, 6));
+        assert_eq!(
+            (config.leader_miss_threshold, config.leader_exclusion_cap),
+            (3, 6)
+        );
         assert!(config.validate().is_ok());
 
         let with = |k: serde_json::Value, cap: serde_json::Value| {
-            let mut json: serde_json::Value =
-                serde_json::from_str(&sample_genesis_json()).unwrap();
+            let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
             json["consensus"]["leader_miss_threshold"] = k;
             json["consensus"]["leader_exclusion_cap"] = cap;
             Genesis::from_json(&json.to_string())
