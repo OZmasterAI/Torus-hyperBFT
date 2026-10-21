@@ -60,6 +60,7 @@ The binary is at `target/release/torus-node`.
 | `--validator-key` | hex | none | **DEPRECATED** Ed25519 signing key (visible in ps/history) |
 | `--keystore` | path | none | Path to encrypted keystore file |
 | `--passphrase-file` | path | none | Path to passphrase file for automated deployments |
+| `--state-hash-attest-key` | path | none | Validators, running state hash on: file (hex, mode 0600) with the validator's secp256k1 **account** key, i.e. the registered validator address, not the Ed25519 consensus key. The node then signs and submits `AttestStateHash` for every durable checkpoint (every 100 blocks) and resubmits a vote that is not on chain after 65 s. A key whose address is not an Active validator submits nothing; check the `addr=` startup line. Unset: the node never attests but still checks. Keep it separate from the price feeder's oracle signer (same-account nonces collide). See [State Hash Attestations](validator-guide.md#state-hash-attestations---state-hash-attest-key) |
 | `--restore-from-snapshot` | path | none | Restore database from a snapshot before starting |
 | `--p2p-listen` | multiaddr | `/ip4/0.0.0.0/udp/30333/quic-v1` | libp2p listen address |
 | `--p2p-peers` | string | none | Comma-separated bootstrap peer multiaddrs |

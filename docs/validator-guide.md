@@ -145,6 +145,56 @@ market on its own (startup warning; omitted with reason `delist settled`). You c
 from the feeder's `[[markets]]` config. Details:
 [Configuration Reference](configuration-reference.md#market-delisting-governance).
 
+## State Hash Attestations (`--state-hash-attest-key`)
+
+When the genesis enables the running state hash (`consensus.state_hash_activation_height`), every
+node hashes its state and keeps a checkpoint every 100 blocks. Validators attest each durable
+checkpoint on chain with an `AttestStateHash` native action; a hash backed by > 2/3 of the
+stake is the quorum hash, and every node compares it with its own checkpoint.
+
+`--state-hash-attest-key <file>` gives the node the key that signs these attestations:
+
+- **It is the validator's account key.** That is the secp256k1 key of the EVM address the
+  validator is registered under (the address of `torus_registerValidator`, the one
+  `torus_getValidators` lists). It is not the Ed25519 consensus key of `--keystore`.
+- **The address must be the registered validator address, and that validator must be Active.**
+  The node checks this before every submission. With any other key, or while the validator is
+  not Active, the node submits nothing. It logs nothing either; the chain would reject the
+  attestations. At startup the node logs `running state hash: automatic AttestStateHash enabled`
+  with `addr=`. Check that this address is your validator address.
+- **File format:** 64 hex characters, optional `0x`, mode 0600 or stricter. The node refuses a
+  file that group or other can read. It is a file, not a value, so the key never shows in `ps`.
+- **It is separate from the oracle signer.** The price feeder signs `SubmitOraclePrices` with
+  its own hot oracle signer, registered with `torus-wallet set-oracle-signer`
+  (`tools/price-feeder/README.md`). Never use the validator account key for oracle submissions.
+  The chain's native replay protection is a set of (sender, nonce) pairs, not a counter
+  (nonces are milliseconds, valid for ±60 s). If two actions from the same account carry the
+  same millisecond nonce, only one gets in. An attestation that loses this race is lost until
+  the node resubmits it (see below).
+
+**Without the flag** the node never attests. It still hashes, still checks every vote and the
+quorum hash against its own checkpoints (metrics `torus_state_hash_mismatch_total`,
+`torus_state_hash_no_quorum_total`), and can still fail-stop with
+`TORUS_STATE_HASH_FAILSTOP=1`. But its stake does not count toward any quorum. On a small
+validator set (3 validators need all 3) a missing attester means no quorum hash at all.
+
+**Resubmit after 65 s.** The node signs each attestation with nonce = now (ms; strictly
+increasing per node) and submits it to its own mempool. If the vote is not on chain yet, the
+node signs it again with a fresh nonce, but only once the previous signature can no longer
+land: 60 s nonce window + 5 s clock-skew margin = 65 s (`DEFAULT_RESUBMIT_AFTER_MS`). An
+attestation that is dropped or not admitted is therefore missing for about 65 s, not lost.
+Log lines: `state hash attestation submitted` (`resubmission=true` on a retry), `state hash
+attestation not admitted (retried after the resubmit window)`. Metric:
+`torus_state_hash_attestations_submitted_total`.
+
+**Hash-unverified.** A node becomes hash-unverified when it cannot extend a valid running-hash
+chain: its database has no stored hash for the previous height. This happens when it was
+upgraded or started above the activation height without a chain, or when a height was skipped
+after a failed flush. The state is sticky. The node stops hashing and checkpointing, never
+attests (even with the flag), and makes no fail-stop decisions. It still records and reports
+mismatches. Metric `torus_state_hash_unverified` = 1. A hash-unverified node keeps following
+the chain. To attest again it needs a data dir with a valid running-hash chain (resync).
+
 ## Operational Checklist
 
 - [ ] Keystore file backed up securely
@@ -154,6 +204,9 @@ from the feeder's `[[markets]]` config. Details:
 - [ ] Alerting rules configured (see `monitoring/alerts/`)
 - [ ] Disk space monitored (consider `--retention-blocks` for non-archive nodes)
 - [ ] Node time synchronized (NTP)
+- [ ] Running state hash on: `--state-hash-attest-key` points at the validator ACCOUNT key
+      (0600), the startup `addr=` equals the registered validator address, and the price
+      feeder uses its own oracle signer, not this key
 - [ ] Stop grace period longer than `TORUS_SHUTDOWN_TIMEOUT_SECS` (default
       60 s), e.g. 75 s: Docker `stop -t 75` / Compose `stop_grace_period`,
       Kubernetes `terminationGracePeriodSeconds`, systemd `TimeoutStopSec`.
