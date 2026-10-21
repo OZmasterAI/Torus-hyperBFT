@@ -1434,6 +1434,15 @@ fn reputation_leader_selection_disabled_by_default() {
     assert!(!reputation_leader_selection_enabled());
 }
 
+/// TC phase C review P2: F2 picks a tip's leader with today's reputation, not the tip view's, so
+/// reputation-weighted selection cannot run together with the tip checks. A replica refuses it.
+#[test]
+fn reputation_leader_selection_is_refused_with_tip_checks() {
+    let refused = check_leader_selection_mode(true).expect_err("reputation-weighted selection must be refused");
+    assert!(refused.contains("reputation"), "the error names the setting: {refused}");
+    assert!(check_leader_selection_mode(false).is_ok(), "plain IWRR is accepted");
+}
+
 /// Tests if the number of times each validator is selected as a leader is proportional to its power.
 #[test]
 fn select_leader_fairness_test() {

@@ -442,3 +442,94 @@ fn own_timeout_vote_reports_a_valid_tip() {
     });
     assert!(reported);
 }
+
+// ---------------------------------------------------------------------------
+// TC phase C review (docs/plans/tc-required-and-tip-signing.md §4): the
+// validator-set update window. The previous set is the seed validators 1..4,
+// the committed set replaces 4 by 5; the local replica is 4 (previous set
+// only). While the update is undecided, a view's one fresh proposer is the
+// previous set's leader up to the update view and the committed set's after
+// it (`ValidatorSetState::fresh_proposer_set`).
+//
+// RED-first: on the review skeleton (92105bb2) both tests fail: F4 collects
+// the vote carrying X, and the timeout blames the committed set's leader.
+// ---------------------------------------------------------------------------
+
+fn window_sets() -> (ValidatorSet, ValidatorSet) {
+    (validator_set(&signing_keys(&[1, 2, 3, 4])), validator_set(&signing_keys(&[1, 2, 3, 5])))
+}
+
+/// The first view from `from` whose leaders in the two sets differ.
+fn window_split_view(from: u64) -> u64 {
+    let (old, new) = window_sets();
+    (from..from + 64)
+        .find(|v| select_leader(ViewNumber::new(*v), &old) != select_leader(ViewNumber::new(*v), &new))
+        .unwrap()
+}
+
+/// A window fixture at `init_view` (update committed, undecided, update view `update_view`).
+fn window_fixture(init_view: u64, update_view: u64) -> Fixture {
+    let (old, new) = window_sets();
+    let vss = ValidatorSetState::new(new, old, Some(crate::types::data_types::BlockHeight::new(0)), false)
+        .with_update_view(Some(ViewNumber::new(update_view)));
+    let mut tree = BlockTreeSingleton::new(MemKV::default());
+    tree.initialize(&crate::types::update_sets::AppStateUpdates::new(), &vss).unwrap();
+    let keys = signing_keys(&[1, 2, 3, 4]);
+    let config = PacemakerConfiguration {
+        chain_id: CHAIN,
+        keypair: Keypair::new(keys[3].clone()),
+        epoch_length: EpochLength::new(100_000),
+        max_view_time: Duration::from_millis(500),
+        backoff_factor: 2,
+        backoff_cap: 8,
+        commit_lag_cap: 0,
+    };
+    let net = RecordingNetwork::default();
+    let pacemaker =
+        Pacemaker::new(config, SenderHandle::new(net.clone()), ViewNumber::new(init_view), &vss, None).unwrap();
+    Fixture { keys, vss, tree, pacemaker, net }
+}
+
+/// After the update view, X (signed by the previous set's leader of v) is not a tip: a timeout
+/// vote reporting it is dropped, so TC(v) forms from the votes reporting B (the committed set's
+/// leader's block) and names B.
+#[test]
+fn window_timeout_vote_reporting_the_previous_sets_tip_after_the_update_view_is_not_collected() {
+    let (old, new) = window_sets();
+    let v = window_split_view(2);
+    let mut f = window_fixture(v, 1);
+    let tip_b = f.tip_signed_by(7, v, &select_leader(ViewNumber::new(v), &new));
+    let tip_x = f.tip_signed_by(8, v, &select_leader(ViewNumber::new(v), &old));
+    f.timeout_vote_with_tip(0, v, Some(tip_x));
+    f.timeout_vote_with_tip(1, v, Some(tip_b.clone()));
+    f.timeout_vote_with_tip(2, v, Some(tip_b.clone()));
+    assert_eq!(f.highest_tc_view(), None, "the vote reporting X must not count");
+    f.timeout_vote_with_tip(3, v, None);
+    let tc = f.tree.highest_tc().unwrap().expect("three votes without X form TC(v)");
+    assert!(tc.high_tip.as_ref() == Some(&tip_b), "TC(v) names B");
+    assert!(tc.is_correct(&f.tree).unwrap());
+}
+
+/// The timeout of a view is recorded against that view's fresh proposer (reputation
+/// bookkeeping): the previous set's leader up to the update view, the committed set's after it.
+#[test]
+fn window_timeout_blames_the_views_fresh_proposer() {
+    let (old, new) = window_sets();
+    let early = window_split_view(1);
+    let late = window_split_view(early + 1);
+    for (view, update_view, blamed, spared) in [
+        (early, early, &old, &new),
+        (late, early, &new, &old),
+    ] {
+        let mut f = window_fixture(view, update_view);
+        for i in 0..3 {
+            f.timeout_vote(i, view);
+        }
+        assert_eq!(f.highest_tc_view(), Some(view), "fixture: TC({view}) forms");
+        let reputation = f.tree.leader_reputation().unwrap();
+        let blamed = select_leader(ViewNumber::new(view), blamed);
+        let spared = select_leader(ViewNumber::new(view), spared);
+        assert!(reputation.score_bps(&blamed) < 10_000, "view {view}: its fresh proposer is blamed");
+        assert_eq!(reputation.score_bps(&spared), 10_000, "view {view}: the other set's leader is not");
+    }
+}

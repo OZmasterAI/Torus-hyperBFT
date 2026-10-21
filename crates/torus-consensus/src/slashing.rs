@@ -336,6 +336,58 @@ mod tests {
         }
     }
 
+    // ---- The signed bytes are hotstuff_rs's phase-vote bytes ----
+
+    /// A phase vote signed as hotstuff_rs signs it (`types::signing::phase_vote_bytes`: domain tag
+    /// then borsh `(chain_id, view, block, phase)`) verifies through the detector's message, for
+    /// every phase; two conflicting real votes give verifiable evidence (TC phase C review nit:
+    /// the old untagged big-endian layout never matched a real vote).
+    #[test]
+    fn real_hotstuff_phase_vote_signatures_verify() {
+        use ed25519_dalek::Signer;
+        use hotstuff_rs::hotstuff::types::Phase;
+        use hotstuff_rs::types::data_types::{ChainID, CryptoHash, ViewNumber};
+        use hotstuff_rs::types::signing::phase_vote_bytes;
+
+        let (sk, vk) = make_keypair(9);
+        let real = |block_hash: [u8; 32], phase: Phase, byte: u8| {
+            let bytes = phase_vote_bytes(ChainID::new(TORUS_CHAIN_ID), ViewNumber::new(10), &CryptoHash::new(block_hash), phase);
+            ObservedPhaseVote {
+                chain_id: TORUS_CHAIN_ID,
+                view: 10,
+                block_hash,
+                phase: byte,
+                signer: vk.to_bytes(),
+                signature: sk.sign(&bytes).to_bytes(),
+            }
+        };
+        let phases = [(Phase::Generic, 0), (Phase::Prepare, 1), (Phase::Precommit, 2), (Phase::Commit, 3), (Phase::Decide, 4)];
+        for (phase, byte) in phases {
+            let vote = real([0xAA; 32], phase, byte);
+            let signature = EdSignature::from_bytes(&vote.signature);
+            assert!(vk.verify(&vote.signed_message(), &signature).is_ok(), "phase byte {byte}");
+            let mut detector = DoubleSignDetector::new(TORUS_CHAIN_ID, 100);
+            assert!(detector.record_vote(&vote).is_none());
+            let evidence = detector
+                .record_vote(&real([0xBB; 32], phase, byte))
+                .expect("two real conflicting votes are a double sign");
+            assert!(evidence.verify(), "phase byte {byte}: evidence verifies");
+        }
+    }
+
+    /// A phase byte that is no hotstuff_rs phase signs nothing a vote could match.
+    #[test]
+    fn unknown_phase_byte_never_verifies() {
+        let (sk, _) = make_keypair(9);
+        let mut vote = sign_vote(&sk, TORUS_CHAIN_ID, 10, [0xAA; 32], 0);
+        vote.phase = 5;
+        let mut detector = DoubleSignDetector::new(TORUS_CHAIN_ID, 100);
+        assert!(detector.record_vote(&vote).is_none());
+        let mut other = vote.clone();
+        other.block_hash = [0xBB; 32];
+        assert!(detector.record_vote(&other).is_none(), "nothing stored, no evidence");
+    }
+
     // ---- Double-Sign Detection ----
 
     #[test]
