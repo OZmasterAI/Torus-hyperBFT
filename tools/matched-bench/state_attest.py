@@ -45,6 +45,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 
@@ -499,6 +500,22 @@ def read_is_clean(per):
     return True
 
 
+def state_hash_by(rpc, height, deadline):
+    """state_hash() bounded by an absolute wall-clock deadline: the socket timeout only bounds inactivity, so a
+    trickled reply could run past it (Codex P2 on ce13b9d8); a reply not complete by the deadline is an error."""
+    box = {}
+
+    def run():
+        box["v"] = state_hash(rpc, height)
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    th.join(max(0.0, deadline - time.monotonic()))
+    if th.is_alive() or "v" not in box or time.monotonic() > deadline:
+        return None, "hole wait deadline passed during the request"
+    return box["v"]
+
+
 def heal_holes(out, rpcs, rows, t, hole_wait_s, sleep=2.0):
     """A validator whose attestation did not land re-signs it with a fresh nonce once the nonce window passed
     (state_hash.rs DEFAULT_RESUBMIT_AFTER_MS = NONCE_WINDOW_MS + 5 s = 65 s); e.g. the bench oracle feed signs with
@@ -532,8 +549,7 @@ def heal_holes(out, rpcs, rows, t, hole_wait_s, sleep=2.0):
                 if left <= 0:
                     per.append({"error": "hole wait budget spent"})
                     continue
-                bounded = Rpc(rpc.url, timeout=min(rpc.timeout, left), attempts=1)
-                r, err = state_hash(bounded, h)
+                r, err = state_hash_by(Rpc(rpc.url, timeout=min(rpc.timeout, left), attempts=1), h, deadline)
                 per.append(r if err is None else {"error": err})
             # an unreadable node keeps its earlier (readable) answer, so a mismatch another node shows in this
             # retry is never dropped because a peer errored (Codex P1 on 3ea3ddfd)
@@ -545,7 +561,7 @@ def heal_holes(out, rpcs, rows, t, hole_wait_s, sleep=2.0):
                 continue
             if any("error" in p for p in per):
                 continue  # a pruned / unreadable / out-of-budget node: the hole stays open, never healed
-            if all(p["quorum"] is not None for p in per):
+            if all(p["quorum"] is not None for p in per) and time.monotonic() <= deadline:
                 by_h[h]["per_node"] = per
                 holes.remove(h)
                 out["holes_healed"].append(h)

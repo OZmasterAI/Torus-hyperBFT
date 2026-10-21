@@ -651,6 +651,29 @@ class StateAttestTest(unittest.TestCase):
         self.assertEqual(sorted(out["holes_initial"]), [300, 500, 700, 900])
         self.assertLessEqual(out["hole_wait_s"], 1.6)  # one in-flight request may finish past the deadline
 
+    def test_late_reply_past_the_deadline_never_heals(self):
+        """Codex P2 probe on ce13b9d8: a reply that arrives after the absolute deadline (socket timeouts only bound
+        inactivity) must not heal a hole even if it carries a quorum"""
+        nodes = self.three()
+        self.hole(nodes, 700, self.addrs[:2])
+        reads = {"n": 0}
+
+        def late_quorum(h):
+            if h != 700:
+                return
+            reads["n"] += 1
+            if reads["n"] > 1:  # every retry: the quorum is there, but the reply comes after the budget
+                for n in nodes:
+                    local = n.checkpoints[700][0]
+                    n.checkpoints[700] = (local, {a: local for a in self.addrs}, local)
+                time.sleep(1.5)
+
+        nodes[0].on_call = late_quorum
+        out = self.run_scan(nodes, hole_wait_s=0.5)
+        self.assertEqual(out["holes_healed"], [])
+        self.assertLessEqual(out["hole_wait_s"], 1.0)
+        self.assertFalse(out["ok"])
+
     def test_no_hole_wait_by_default(self):
         nodes = self.three()
         self.hole(nodes, 700, self.addrs[:2])
