@@ -18864,6 +18864,196 @@ trend. Deep B's blocks/s spread (15.61 / 17.18) is the widest replicate spread, 
   `ozarchy-9g-tools/{9g-chain.sh,ozarchy-9g-{deep,std}-campaign.sh,spec-{deep,std}.json,g9-contention.py}`; build
   `ozarchy-9g-stage/build/`.
 
+## 121. Step 9i, 100k retention disk soak: archive vs prune-by-default: one binary main `b452b4af` (RH4 prune-by-default merged), A = `TORUS_RETENTION_BLOCKS=0` (archive) vs B = nothing set (code default N = 100,000, GC window 100,128 dispatched blocks), Q9 shape (300 markets, Classic, 15 s checkpoints, paced to 250 actions/s), 7,200 s load + >= 660 s quiet idle, fresh data dirs, A then B, n = 1 per arm (campaign ozarchy-9i, archy, 2026-10-21)
+
+**Pass. At the shipped default N = 100,000, B holds both DBs flat once past the window, and A grows at the Q9 rate.
+B's first GC delete came at height 100,464-100,465 (13:01:37, load minute 63.4, 17 s after height 100,000). Before it,
+B's SST grew like A's: 0.0231 GB/min in `consensus-db` and 0.0205 in the state DB per node (load minutes 5-63.4).
+From 10 min after it to the bench end (minutes 73.4-120) B's SST grew 0.0012 and 0.0002 GB/min, against A's 0.0201
+and 0.0175 over the same minutes (6% and 1% of A). A's pre-window slopes, 0.0219 / 0.0204 GB/min, match Q9's arm A
+(0.0222 / 0.0203, section 88). At the bench end A holds 2.49 + 2.39 GB of SST per node, B 1.59 + 1.44 GB, about the
+100,000 blocks of bodies the window keeps. matched/s, blocks/s and commit latency are equal (B / A 0.9998, 0.9987,
+p50 1.006, p99 1.000), but the load is paced, so that is equal by construction. The headline 43.1k matched/s (vs Q9's
+49.7k) is not a slowdown: both arms ran 49.6-50.3k matched/s for minutes 0-100, then the senders ran out of margin
+(13.3% of orders margin-rejected, ~0 fills in minutes 110-120). The disk result does not depend on that tail: A's
+SST slope in minutes 100-120 is the same as before.**
+
+Question (bench queue 9i, 18c s75): Q9 proved the DA body GC at N = 1,000. Does the shipped default N = 100,000 hold
+`consensus-db` and the state DB flat past the window, against archive, with throughput, block rate and commit latency
+unchanged? B must also reach height 100,000 at least 45 min before its load ends.
+
+### 121.1 Setup
+
+* Spec: `docs/perf/bench-queue.md` entry 9i. One build of main `b452b4af` (worktree `wt/9i-b452b4af`, target
+  `~/.cargo-target-9i`), node md5 `cf0f7a053e4183a2ad8b24a10d317090` on 3 / 3 nodes in both cells (`cell-step`
+  records from `node-environ-trie.txt` and `summary.json`), bench md5 `98de03f9`.
+* Arms: **A** = `TORUS_RETENTION_BLOCKS=0` via `EXTRA_ENV` (`--retention-blocks=0`; log `history retention off:
+  archive node` and `DA body GC off`). **B** = nothing set (log `history retention: default, keeping the last 100000
+  blocks`, `block-tree pruner enabled ... retention_blocks=100000`, GC on the `torus-da-gc` worker). Both:
+  `TORUS_PARALLEL_CANCEL_ALL=8 TORUS_EPOCH_FAST_PATH=1 TORUS_HASH_ONLY_PUSH_THRESHOLD=524288 TORUS_SHARD_CUSTODY=0`,
+  running state hash off.
+* Load (`n9iloadchk`): 300 markets, `--rate-total 250`, 5,000 senders, batch 400, cross 0.5, cancel 0.05, band 5,
+  open-order budget 900, `MAX_IN_FLIGHT` 4, commit tail, cloid share 0, oracle on, no EVM load, 7,200 s. Then the
+  drain with `QUIET_S=660`: idle 912 s (A) and 969 s (B), 0 actions processed on every node (funnel), ~26 empty
+  blocks/s.
+* 9i sampler (`ozarchy-9i-tools/9i-sampler.py`, 60 s per node, 52 columns: Q9's columns plus GC worker and pruner
+  counters): `du -sb`, SST and WAL bytes of each DB, fds, pending compaction, L0, GC and pruner counters, per-CF
+  sizes from the RocksDB `LOG` Compaction Stats (one dump per 10 min). 1 Hz sidecar `9i-timeline.tsv`: time of
+  height 100,000 and of the first non-zero `torus_da_bodies_gc_deleted_total`.
+* Order: A 09:37:35-11:37:57 (load), B 11:58:13-13:58:36. Smokes before: `ozarchy-9isa-300m-smoke-s0` (A),
+  `ozarchy-9isb-300m-smoke-s0` (B).
+
+### 121.2 Validity
+
+* 2 / 2 cells rc 0, ACCEPT / AGREE / PASS, `cells.tsv` 2 rows 0 bad, no CELL-FLAG, no rerun. All CHECK lines OK
+  except `n9irejchk` WARN in both cells (below).
+* `retention=` audit field: `archive` (A), `100000(default)` (B); `n9iretchk` OK on 3 / 3 nodes each.
+* `n9itlchk` (B): height 100,000 at 13:01:20 (100,018 in that 1 Hz sample), 3,436 s before the bench end on every node
+  (>= 2,700 s required); B averaged 26.29 native blocks/s (>= 22.1 required). First delete at height >= 100,128.
+* `n9iidlechk` OK (660 s quiet, load stopped, oracle paused, nodes running). `n9isampchk`: 137 (A) / 138 (B) rows per
+  node, 52 columns.
+* Each node log has one fail-stop hit, the config line `running state hash fail-stop ... on=false`; 0 `panicked` or
+  hash mismatch lines; `panic_or_failstop_lines` 0 on every node in `run.log`.
+* **`n9irejchk` WARN, both arms:** margin rejects 13.29% of orders (62.4M per node, equal in A and B). Q9 had 0 in 60
+  min; 9i ran 120 min. 10 min windows (funnel, node mean): matched/s 49,594-50,261 and 0 rejects in minutes 0-100
+  in both arms, then 21,549 / 21,565 matched/s with 36.9k rejects/s in minutes 100-110, and 1.7 / 1.8 matched/s with
+  64.9k / 65.0k rejects/s in minutes 110-120. Blocks kept coming at 26.0-26.3/s with full action counts (placed +
+  rejected ~65k/s), so bodies kept landing. A's SST slope in minutes 100-120 (0.0217 / 0.0178 GB/min) equals its
+  slope in 73.4-100 (0.0203 / 0.0188), so the tail does not bias the growth test.
+* No foreign-CPU check was run (no contention sampler); the campaign's HOST lines show no builds or analysis before
+  either cell, load 0.9-1.0. At a paced load the throughput rows are set by the offered rate anyway.
+
+### 121.3 Growth per arm (GB = 10^9 bytes; mean of 3 nodes, [min, max] where they differ; `9i.txt`)
+
+`du` includes the live WAL, which swings 0.07-2.15 GB per DB as memtables flush, so SST bytes are the growth measure
+(as in section 88). Fits are least squares per node. "Pre" = load minutes 5-63.4 (B's first delete), "post" =
+minutes 73.4-120 (10 min after it, compaction settled), same minutes for A.
+
+| quantity | A consensus-db | A state DB | B consensus-db | B state DB |
+|---|---|---|---|---|
+| **SST GB/min, pre** | 0.0219 [0.0217, 0.0221] | 0.0204 | **0.0231** [0.0228, 0.0233] | **0.0205** |
+| **SST GB/min, post** | 0.0201 [0.0198, 0.0206] | 0.0175 | **0.0012** [0.0005, 0.0023] | **0.0002** |
+| SST GB/min, post from the first delete (63.4-120) | 0.0200 | 0.0175 | 0.0016 [0.0010, 0.0020] | 0.0002 |
+| du GB/min, pre / post | 0.0183 / 0.0243 | 0.0211 / 0.0241 | 0.0205 / 0.0047 | 0.0209 / 0.0126 |
+| WAL GB/min, post | 0.0042 | 0.0065 | 0.0035 | 0.0123 |
+| SST GB/min, idle (bench end + 2 min to drain end) | 0.0008 | 0.0000 | -0.0087 [-0.0246, -0.0007] | -0.0167 |
+| SST GB at 10 / 30 / 60 min | 0.21 / 0.70 / 1.30 | 0.33 / 0.71 / 1.28 | 0.22 / 0.70 / 1.36 | 0.34 / 0.74 / 1.32 |
+| SST GB at first delete / 90 min / bench end / idle end | 1.38 / 1.89 / 2.49 / 2.52 | 1.38 / 1.78 / 2.39 / 2.39 | 1.45 / 1.58 / 1.59 / 1.51 | 1.42 / 1.39 / 1.44 / 1.14 |
+| SST GB min / max, post | 1.57 / 2.63 | 1.51 / 2.39 | 1.54 / 1.71 [1.65, 1.83] | 1.34 / 1.50 |
+| du GB at bench end / idle end | 3.92 / 4.12 | 3.78 / 3.91 | 3.31 / 3.42 | 3.07 / 2.88 |
+| per-CF size, LOG dump, val0, min 70 / 120 / idle | `cf_native_pending` 1.37 / 2.31 / 2.34 | `cf_block_bodies` 1.34 / 2.19 / 2.21; `cf_block_headers` 0.028 / 0.048 / 0.048 | `cf_native_pending` 1.47 / 1.50 / 1.29 | `cf_block_bodies` 1.28 / 1.23 / 1.08; `cf_block_headers` 0.028 / 0.048 / 0.048 |
+| pending compaction bytes max | 0.36-0.45 GB | 0 | 0.49-0.54 GB | 0.19-0.20 GB |
+| L0 files max | 3-4 | 4 | 3-4 | 4 |
+| SST files at bench end / max | 47-50 / 51-52 | 124 / 153 | 32-34 / 36-38 | 88-89 / 120-121 |
+
+| per node | A | B |
+|---|---|---|
+| total data dir du (sampler) at bench end / idle end / max | 7.71 [7.65, 7.79] / 8.03 / 8.60 | 6.37 [6.23, 6.53] / 6.30 / 6.97 |
+| open fds start / bench end / max (sampler) | 74 / 259-267 / 285-295 | 74 / 208-212 / 240-248 |
+| deleted-but-open fds, max over the cell | 0 | 0 |
+| block height at bench end / drain end | 190,057-190,059 / 213,620-213,627 | 189,840-189,841 / 214,891-214,892 |
+| data dir after shutdown (`9i-disk.txt`, val0 / val1 / val2) | 5.72 / 8.12 / 8.01 GB | 2.63 / 3.32 / 2.34 GB |
+
+* **B, after the window:** `cf_native_pending` stays at 1.46-1.52 GB and `cf_block_bodies` at 1.22-1.23 GB (val0 LOG
+  dumps, minutes 80-120), against A's 1.58 -> 2.31 and 1.49 -> 2.19 GB. `consensus-db` SST rose to 1.65-1.83 GB just
+  after the first deletes and came back to 1.56-1.61 by the bench end: deletes reach disk only at compaction. The post
+  fit (+0.0012 GB/min, ~0.06 GB over 47 min) is within that swing.
+* **B's level** is the window, not a leak: 100,000 blocks at ~26.3 blk/s is ~63 min of load, and A's SST at minute
+  63.4 is 1.38 + 1.38 GB; B holds 1.59 + 1.44 GB at the bench end.
+* **B's du fit after the window is positive** (+0.0047 / +0.0126 GB/min). That is WAL: the state WAL fit is +0.0123
+  GB/min while the state SST fit is +0.0002, and the WAL is a sawtooth between 0.51 and 2.15 GB. Over 47 minutes the
+  du fit follows where the sawtooth starts and ends; SST is the measure.
+* **Idle:** A grows only WAL (+0.0048 / +0.0026 GB/min), as in Q9. B's SST shrinks (-0.0087 / -0.0167 GB/min): empty
+  blocks add no bodies while the GC keeps deleting the old ones, then compaction reclaims them.
+* **`cf_block_headers` is not pruned in this window:** it grows the same in both arms (0.0477 vs 0.0480 GB at 120
+  min, ~0.0004 GB/min). Headers are about 1% of A's SST growth.
+* **Post-shutdown sizes differ per node because of the WAL.** The launcher's note (val0 0.4 GB vs val1 3.4 GB) does
+  not match `9i-disk.txt` / `data-du.txt`, which give 2.34-3.32 GB (B) and 5.72-8.12 GB (A). The state-DB SST bytes
+  in `data-du.txt` agree across nodes (A 2.39-2.41 GB, B 1.12-1.14 GB); the WAL left at shutdown does not (A 0.69 /
+  1.51 / 1.51 GB, B 0 / 0.50 / 0 GB). Whether a node flushed its memtables before exit decides the rest. The sampler
+  rows, taken while the nodes ran, agree across nodes to within 0.3 GB of du and 0.01-0.2 GB of SST.
+
+### 121.4 B's GC window and worker (metrics-after = drain end; sampler; 1 Hz timeline)
+
+| quantity | val0 | val1 | val2 |
+|---|---|---|---|
+| height 100,000 reached (1 Hz) | 13:01:20 | 13:01:20 | 13:01:20 |
+| first non-zero delete: height, time, count | 100,465, 13:01:37, 6 | 100,465, 13:01:37, 6 | 100,464, 13:01:37, 6 |
+| GC passes (`torus_da_gc_seconds_count`) | 215,653 | 215,653 | 215,652 |
+| held passes (`reason="dispatch_behind"`) | 5,282 | 4,626 | 3,904 |
+| bodies deleted (`torus_da_bodies_gc_deleted_total`) | 1,106,462 | 1,106,462 | 1,106,392 |
+| GC seconds sum, mean / p99 per pass | 70.76 s, 0.33 / 1.92 ms | 71.32 s, 0.33 / 1.97 ms | 76.63 s, 0.36 / 2.05 ms |
+| slow passes (>= 50 ms) | 5 | 4 | 3 |
+| handoff seconds sum (consensus thread side) | 0.881 s (0.004 ms / pass) | 0.860 s | 0.869 s |
+| lag heights / queue depth max (sampler) | 2 / 1 | 1 / 0 | 5 / 4 |
+| coalesced heights, fence kept | 0, 0 | 0, 0 | 0, 0 |
+| block-tree pruner: blocks removed, files dropped, cutoff | 114,253, 40, 114,253 | 114,254, 40, 114,254 | 114,254, 40, 114,254 |
+
+* The GC worker ran one pass per dispatched block from the start and deleted nothing until the window was full.
+  Deletes then tracked the load: 859,052 at the bench end and 1,099,037 at the drain end in the 60 s sampler
+  (val0), 1,125,923 at the last 1 Hz sample before shutdown. Counters read at different times; all rise
+  monotonically.
+* The 12 slow-pass warn lines (3 nodes) show 56.6-118.0 ms passes at heights 15,819-153,328, each with
+  `rows_deleted` 0 or 1, so they are not delete cost; two heights (58,304 and 153,328) are slow on two nodes at once,
+  which points at a shared I/O stall rather than the pass itself. They run on the `torus-da-gc` worker; the consensus thread pays the handoff, 0.004 ms per pass.
+  Q9's 0.18 ms per block was the GC on the consensus thread (before the worker); the two figures are not the same
+  quantity.
+
+### 121.5 Standard table (load window; node mean; `9i.txt`)
+
+| arm | matched/s | matched/s first 120 s | placed/s | native blk/s | fills / native blk | block p50 / p99 ms | order-to-commit p50 / p99 ms | CPU-s / 1M fills | consensus-thread ms / blk (est) | timeouts / no_proposal | margin rejects per node |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| A | 43,094.3 | 50,686.7 | 56,375.9 | 26.324 | 1,628.2 | 8.22 / 479.8 | 157.7 / 562.8 | 36.92 | 3.19 | 0 / 0 | 62,425,769 |
+| B | 43,087.4 | 50,548.4 | 56,369.6 | 26.290 | 1,630.2 | 8.27 / 479.8 | 157.3 / 563.2 | 37.24 | 3.18 | 0 / 0 | 62,413,043 |
+| B / A | 0.9998 | 0.9973 | 0.9999 | 0.9987 | 1.0012 | 1.006 / 1.000 | 0.998 / 1.001 | 1.009 | 0.997 | | |
+
+Block p50 / p99: `torus_commit_interval_seconds` histogram, order-to-commit: `torus_order_age_commit_seconds`, both
+load-window deltas from `buckets.csv`, interpolated, node mean (section 88's method). The averages include the
+margin-starved minutes 100-120 in both arms. Against Q9 arm A (section 88.3, 60 min, no rejects): matched/s over
+minutes 0-100 here 49.6-50.3k vs 49,750; native blk/s 26.32 vs 26.50; block p50 / p99 8.22 / 479.8 vs 8.37 / 479.4
+ms; order-to-commit 157.7 / 562.8 vs 159.1 / 582.1 ms. CPU-s per 1M fills (36.9 vs Q9's 44.1) is not comparable: the
+reject-only tail adds block work with no fills.
+
+### 121.6 Rule and call
+
+| rule (bench queue 9i) | measured | met? |
+|---|---|---|
+| B holds `consensus-db` flat past the window | SST +0.0012 GB/min (A +0.0201), `cf_native_pending` 1.46-1.52 GB | yes |
+| B holds the state DB flat past the window | SST +0.0002 GB/min (A +0.0175), `cf_block_bodies` 1.22-1.23 GB | yes |
+| A grows at about the Q9 rate | SST 0.0219 / 0.0204 GB/min (Q9 0.0222 / 0.0203) | yes |
+| B >= 45 min past height 100,000 | 3,436 s (57.3 min), 26.29 blk/s | yes |
+| matched/s, blocks/s, commit p50 / p99 within noise | 0.9998, 0.9987, 1.006 / 1.000 (paced: equal by construction) | yes, uninformative |
+
+**Confidence: high for the disk result, low for anything about throughput.** **What n = 1 per arm can show:** the
+growth result. The post-window slopes differ 17x (`consensus-db`) and ~90x (state DB), on 3 nodes x ~47 points
+each, with the nodes within 0.002 GB/min of each other. A reproduces Q9's slopes on another day and binary. No
+plausible noise covers that. It also shows that the default prunes on its own (no env, no flag), that the window opens
+where the code says (first delete 17 s after height 100,000, at height >= 100,128 dispatched), and that nothing broke
+(agreement, 0 timeouts, 0 deleted-open fds). **What it cannot show:** a CI on block rate or latency, or any
+throughput cost of the GC or the pruner at saturation, because the load is paced below capacity. Nor does it cover
+custody on (`cf_native_shards` empty) or retention behaviour over many windows: one window passed, and 120 min shows
+one plateau, not its long-run stability.
+
+### 121.7 Next
+
+* A paced soak longer than ~100 min at 250 actions/s runs the senders out of margin. For a multi-window soak, lower
+  the rate (Q9's estimate: ~290M fills per node to depletion; here ~49.7k matched/s for 100 min) or add a margin
+  top-up to the bench.
+* Owner / 18c: `cf_block_headers` grows in both arms (~0.024 GB per hour at this block rate). Small, but nothing bounds
+  it in this run; say whether headers are meant to outlive the retention window.
+* Optional: a paired unpaced A/B (600 s cells, n >= 3, B started past height 100,128, e.g. from a snapshot) if the
+  GC worker's cost at saturation needs a CI.
+
+### 121.8 Data
+
+* Cells: `~/bench-results-matched/ozarchy-9i-300m-r1-{A,B}` (`summary.json`, `buckets.csv`, `funnel-val<i>.csv`,
+  `metrics-after-val<i>.txt`, `9i-timeline.tsv`, `9i-disk.txt`, `data-du.txt`, `val<i>.log.gz`). Sampler:
+  `ozarchy-9i-run/9i-samples/ozarchy-9i-300m-r1-{A,B}.tsv`. Campaign: `ozarchy-9i-run/campaign/` (`campaign.log`,
+  `campaign.done`, `cells.tsv`, `cell-step/`), `ozarchy-9i-run/handoff.json`. Tools: `ozarchy-9i-tools/`
+  (`9i-spec.json`, drivers, `9i-checks.sh`, `9i-sampler.py`, `9i-timeline.py`).
+* Analysis: `ozarchy-9i-tools/analyst/9i-analyse.py` (adapted from `q9-analyse.py`; pre / post-window fits around
+  the 1 Hz first delete, 10 min funnel windows, GC worker and pruner counters) -> `9i.txt`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
