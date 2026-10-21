@@ -44694,8 +44694,8 @@ mod crash_recovery_tests {
     /// checkpoints. Nodes in mode 3 with the hash active from height 1 and
     /// different checkpoint timing (serial; per block; every 5; never by time;
     /// a seeded random 1-in-4 policy; drained and W-gated; and two cells with
-    /// mid-window fail-stops whose lost windows replay from the last
-    /// checkpoint) agree on the chained `h_n` at EVERY height 1..=300
+    /// mid-window fail-stops at 18, 99, 138 and 258 whose lost windows replay
+    /// from the last checkpoint) agree on the chained `h_n` at EVERY height 1..=300
     /// (recomputed from each node's captured write sets), on the stored
     /// running hash and on the attest-height checkpoint rows 100 / 200 / 300.
     /// The L6.1 window rule does not apply to mode 3 (refused by genesis
@@ -44739,10 +44739,12 @@ mod crash_recovery_tests {
             println!("b1 h2h golden: book-CF entries hashed at {off_attest} non-attest heights");
             assert!(off_attest >= 100, "books hashed per block in mode 3: {off_attest}");
         }
-        // Mid-window fail-stops (not checkpoint heights under every-5; 98 / 199
-        // just below an attest height): the window's blocks above the durable
-        // marker are lost and replayed from the last checkpoint.
-        let crash_at: [u64; 4] = [47, 98, 163, 199];
+        // Mid-window fail-stops at heights carrying signed deep-maker batches
+        // (the NoncePut fault needs a consumed nonce): 3-4 blocks past an
+        // every-5 checkpoint, 99 just below the attest height 100. The
+        // window's blocks above the durable marker are lost and replayed
+        // from the last checkpoint.
+        let crash_at: [u64; 4] = [18, 99, 138, 258];
         let mut crash_blocks = b1_blocks();
         for h in crash_at {
             crash_blocks[h as usize - 1].fatal = true;
