@@ -190,6 +190,89 @@ pub fn open_node_dbs(data_dir: &Path) -> Result<NodeDbs, String> {
     Ok(NodeDbs { state, consensus })
 }
 
+/// State-DB meta key (`cf_consensus_meta`, ASCII like every state meta key):
+/// this data dir last started with history retention on. Written at every
+/// start with retention on (before any pruner runs), deleted at every archive
+/// start. Covers a pruning dir whose tip crossed N before the first pruner
+/// pass saved a cutoff (claude-review P1, s131).
+pub const META_HISTORY_RETENTION: &[u8] = b"history_retention_on";
+
+/// What the archive-upgrade rule reads from a data dir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionProbe {
+    /// Highest committed header in the state DB (0 = fresh dir).
+    pub tip: u64,
+    /// The saved state-pruner cutoff (0 = never pruned).
+    pub pruned_up_to: u64,
+    /// [`META_HISTORY_RETENTION`] is set: the last start ran with retention on.
+    pub ran_with_retention: bool,
+}
+
+/// Read the [`RetentionProbe`] of a state DB.
+pub fn probe_retention(state: &StateDb) -> Result<RetentionProbe, String> {
+    Ok(RetentionProbe {
+        tip: torus_rpc::find_latest_height(state),
+        pruned_up_to: torus_state::read_pruned_up_to(state)
+            .map_err(|e| format!("read the saved prune cutoff: {e}"))?,
+        ran_with_retention: state
+            .get_cf_raw(CF_CONSENSUS_META, META_HISTORY_RETENTION)
+            .map_err(|e| format!("probe {}: {e}", String::from_utf8_lossy(META_HISTORY_RETENTION)))?
+            .is_some(),
+    })
+}
+
+/// The archive-upgrade rule (claude-review P1, s131). Prune by default made a
+/// flagless start keep the last N blocks; on an existing archive data dir the
+/// first state-pruner pass would delete every block below `tip - N`, the
+/// block tree would follow, and old DA bodies would stay for good (the DA GC
+/// starts as on a fresh store): irreversible, and nobody chose it. So a start
+/// with the DEFAULT retention (`explicit == false`) on a dir that has no saved
+/// prune cutoff, never ran with retention, and whose tip is past N refuses,
+/// naming both opt-outs. `--archive` / `--retention-blocks N` (or the config
+/// keys) are an explicit choice and always start. `Err` is the refusal.
+pub fn check_retention_upgrade(
+    p: RetentionProbe,
+    retention: Option<u64>,
+    explicit: bool,
+    data_dir: &Path,
+) -> Result<(), String> {
+    let Some(n) = retention else {
+        return Ok(());
+    };
+    if explicit || p.pruned_up_to > 0 || p.ran_with_retention || p.tip <= n {
+        return Ok(());
+    }
+    let cut = p.tip - n;
+    Err(format!(
+        "refusing to start: data dir {dir} holds unpruned history up to height {tip} (no prune \
+         cutoff saved, never run with history retention), and this build prunes by default \
+         (keep the last {n} blocks): the first pruner pass would delete every block below \
+         {cut}, irreversibly. Choose explicitly: --archive (or `archive = true` in the config \
+         file) keeps every block, as before; --retention-blocks N (or `retention-blocks = N`) \
+         keeps the last N blocks (--retention-blocks {n} accepts the default). See \
+         docs/pruning-guide.md, \"Upgrading an archive node\".",
+        dir = data_dir.display(),
+        tip = p.tip,
+    ))
+}
+
+/// Boot step 3b: apply [`check_retention_upgrade`] to the state DB, then
+/// record the retention mode ([`META_HISTORY_RETENTION`]: set with retention
+/// on, deleted for an archive start) before any pruner runs.
+pub fn enforce_history_retention(
+    state: &StateDb,
+    retention: Option<u64>,
+    explicit: bool,
+    data_dir: &Path,
+) -> Result<(), String> {
+    check_retention_upgrade(probe_retention(state)?, retention, explicit, data_dir)?;
+    match retention {
+        Some(_) => state.put_cf_raw(CF_CONSENSUS_META, META_HISTORY_RETENTION, &[1]),
+        None => state.delete_cf_raw(CF_CONSENSUS_META, META_HISTORY_RETENTION),
+    }
+    .map_err(|e| format!("record the history-retention mode: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,5 +678,121 @@ mod tests {
             let err = check_layout(probe, d).expect_err(&format!("{probe:?} must refuse"));
             assert!(err.starts_with("refusing to start"), "{err}");
         }
+    }
+
+    // ---- Archive-upgrade rule (claude-review P1, s131) ----
+
+    /// A state DB with headers, bodies and receipts at heights 0..=tip, all
+    /// applied: what an archive node's data dir holds.
+    fn history_db(dir: &Path, tip: u64) -> StateDb {
+        use torus_state::cf::{CF_BLOCK_BODIES, META_NATIVE_APPLIED_HEIGHT};
+        let db = StateDb::open(dir).unwrap();
+        for h in 0..=tip {
+            let k = h.to_be_bytes();
+            db.put_cf_raw(CF_BLOCK_HEADERS, &k, b"header").unwrap();
+            db.put_cf_raw(CF_BLOCK_BODIES, &k, b"body").unwrap();
+        }
+        db.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &tip.to_be_bytes())
+            .unwrap();
+        db
+    }
+
+    fn body_exists(db: &StateDb, h: u64) -> bool {
+        db.get_cf_raw(torus_state::cf::CF_BLOCK_BODIES, &h.to_be_bytes())
+            .unwrap()
+            .is_some()
+    }
+
+    /// An archive data dir (no prune cutoff saved, never run with retention)
+    /// whose tip is past N, restarted on the prune-by-default build with no
+    /// flag: refused, naming both opt-outs, and nothing is written or pruned.
+    #[test]
+    fn archive_data_dir_past_n_without_a_flag_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = history_db(dir.path(), 20);
+        let err = enforce_history_retention(&db, Some(10), false, dir.path())
+            .expect_err("an archive data dir past N must be refused");
+        assert!(err.starts_with("refusing to start"), "{err}");
+        assert!(err.contains("--archive"), "{err}");
+        assert!(err.contains("--retention-blocks"), "{err}");
+        assert!(err.contains("archive = true"), "{err}");
+        assert!(err.contains(&dir.path().display().to_string()), "{err}");
+        assert!(
+            db.get_cf_raw(CF_CONSENSUS_META, META_HISTORY_RETENTION).unwrap().is_none(),
+            "a refused start records nothing"
+        );
+        assert!(body_exists(&db, 0));
+    }
+
+    /// The same dir with `--archive` (retention `None`) starts and stays an
+    /// archive dir: no retention marker, so a later flagless start is still
+    /// refused.
+    #[test]
+    fn archive_data_dir_with_archive_flag_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = history_db(dir.path(), 20);
+        enforce_history_retention(&db, None, true, dir.path()).expect("--archive starts");
+        assert!(db.get_cf_raw(CF_CONSENSUS_META, META_HISTORY_RETENTION).unwrap().is_none());
+        assert!(enforce_history_retention(&db, Some(10), false, dir.path()).is_err());
+    }
+
+    /// The same dir with an explicit `--retention-blocks N` starts, records
+    /// the marker, and the state pruner then prunes below tip - N.
+    #[test]
+    fn archive_data_dir_with_explicit_retention_starts_and_prunes() {
+        use std::sync::atomic::AtomicU64;
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let db = history_db(dir.path(), 20);
+        enforce_history_retention(&db, Some(10), true, dir.path())
+            .expect("an explicit --retention-blocks N starts");
+        assert!(db.get_cf_raw(CF_CONSENSUS_META, META_HISTORY_RETENTION).unwrap().is_some());
+        let config = torus_state::PrunerConfig {
+            retention_blocks: 10,
+            prune_interval_blocks: 1,
+            ..torus_state::PrunerConfig::default()
+        };
+        let mut pruner = torus_state::StatePruner::new(db.clone(), config, Arc::new(AtomicU64::new(0)));
+        pruner.maybe_prune(20).unwrap();
+        assert_eq!(pruner.pruned_height(), 10);
+        assert!(!body_exists(&db, 0), "pruned below tip - N");
+        assert!(body_exists(&db, 10));
+        // Restart with no flag: the cutoff (and the marker) say it already prunes.
+        enforce_history_retention(&db, Some(10), false, dir.path())
+            .expect("a pruning data dir restarts on the default");
+    }
+
+    /// A data dir that already ran with retention on starts on the default
+    /// even before its first prune pass saved a cutoff (tip just crossed N).
+    #[test]
+    fn data_dir_that_ran_with_retention_restarts_on_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = history_db(dir.path(), 5);
+        enforce_history_retention(&db, Some(10), false, dir.path()).expect("tip below N");
+        assert!(db.get_cf_raw(CF_CONSENSUS_META, META_HISTORY_RETENTION).unwrap().is_some());
+        drop(db);
+        let db = history_db(dir.path(), 20);
+        enforce_history_retention(&db, Some(10), false, dir.path())
+            .expect("the marker says this dir already ran with retention on");
+    }
+
+    #[test]
+    fn retention_upgrade_rule_table() {
+        let d = Path::new("/data");
+        let p = |tip, pruned_up_to, ran_with_retention| RetentionProbe {
+            tip,
+            pruned_up_to,
+            ran_with_retention,
+        };
+        // Fresh / short chains, archive, explicit retention, already pruning.
+        assert_eq!(check_retention_upgrade(p(0, 0, false), Some(10), false, d), Ok(()));
+        assert_eq!(check_retention_upgrade(p(10, 0, false), Some(10), false, d), Ok(()));
+        assert_eq!(check_retention_upgrade(p(50, 0, false), None, false, d), Ok(()));
+        assert_eq!(check_retention_upgrade(p(50, 0, false), Some(10), true, d), Ok(()));
+        assert_eq!(check_retention_upgrade(p(50, 7, false), Some(10), false, d), Ok(()));
+        assert_eq!(check_retention_upgrade(p(50, 0, true), Some(10), false, d), Ok(()));
+        // Past N, never pruned, never ran with retention, defaulted: refused.
+        let err = check_retention_upgrade(p(11, 0, false), Some(10), false, d).unwrap_err();
+        assert!(err.contains("below 1"), "names the first cutoff: {err}");
     }
 }

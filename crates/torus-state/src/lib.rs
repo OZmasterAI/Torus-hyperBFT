@@ -54,7 +54,9 @@ pub use native_da::{
 };
 pub use overlay::StateOverlay;
 pub use prune_filter::{PruneCutoff, PruneMode, PRUNE_MODE_ENV};
-pub use pruner::{dir_size_bytes, read_trades_pruned_height, PrunerConfig, StatePruner};
+pub use pruner::{
+    dir_size_bytes, read_pruned_up_to, read_trades_pruned_height, PrunerConfig, StatePruner,
+};
 pub use read_view::ReadView;
 pub use resident_rows::{ResidentChange, ResidentDelta, ResidentRow, ResidentRowIter, ResidentRows, ResidentSource};
 pub use retention::RetentionStats;

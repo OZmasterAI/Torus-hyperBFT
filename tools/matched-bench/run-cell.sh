@@ -522,8 +522,9 @@ RECORD_ENV=(
 
 # Per-cell audit of the node settings whose default is not obvious from the
 # cell (s131): the book mode and the flags whose compiled default changed.
-# Logged as "cell=<label> book_mode=<m> K='v' ..." after the node env is final;
-# summarize.py records the same as summary.json cell.book_mode / cell.node_flags.
+# Logged as "cell=<label> book_mode=<m> retention=<r> K='v' ..." after the node
+# env is final; summarize.py records the same as summary.json cell.book_mode /
+# cell.retention / cell.node_flags.
 # The order is fixed so two arms' lines diff cleanly.
 NODE_FLAGS_AUDIT=(
     TORUS_BOOK_ROWS
@@ -533,6 +534,24 @@ NODE_FLAGS_AUDIT=(
     TORUS_BOOK_COALESCE
     TORUS_CHECKPOINT_INTERVAL_MS
 )
+# retention: the cell's effective history retention (claude-review P2, s131).
+# Since prune by default (merge/rh4-prune-default) a node without
+# --retention-blocks keeps the last 100,000 blocks: state pruner, block tree
+# and the RH4 DA body GC worker all run. devnet/wsl/start-node.sh passes
+# --retention-blocks=V when TORUS_RETENTION_BLOCKS=V is non-empty (digits only,
+# else it refuses), and the node reads 0 as archive. So: unset / empty ->
+# '100000(default)', 0 -> 'archive', N -> N, else 'invalid'. An archive arm (or
+# any comparison with a pre-merge, archive baseline such as 9a / 9d) needs
+# EXTRA_ENV='TORUS_RETENTION_BLOCKS=0'. A binary from before the merge reads
+# unset as archive: the line states the merged default, not that binary's.
+cell_retention() {
+    local v=${TORUS_RETENTION_BLOCKS-}
+    case "$v" in
+        '') echo '100000(default)' ;;
+        *[!0-9]*) echo invalid ;;
+        *) v=${v#"${v%%[!0]*}"}; echo "${v:-archive}" ;;
+    esac
+}
 # book_mode: mirrors torus_bridge::native_executor::parse_book_rows_mode —
 # trimmed "1"/"2"/"3" -> mode1/mode2/mode3, anything else (incl. unset and
 # empty) -> classic. Flags: unset -> 'unset (default)', empty -> 'empty
@@ -544,6 +563,7 @@ node_flags_line() {
     v=${v%"${v##*[![:space:]]}"}
     case "$v" in 1|2|3) mode="mode$v" ;; *) mode=classic ;; esac
     printf 'book_mode=%s' "$mode"
+    printf ' retention=%s' "$(cell_retention)"
     for k in "${NODE_FLAGS_AUDIT[@]}"; do
         if [ -z "${!k+x}" ]; then printf " %s='unset (default)'" "$k"
         elif [ -z "${!k}" ]; then printf " %s='empty (default)'" "$k"

@@ -276,8 +276,11 @@ fn decode_hex_key(hex_str: &str) -> Result<[u8; 32], Box<dyn std::error::Error>>
     Ok(arr)
 }
 
+/// The `--config` TOML file. Unknown keys are an error (claude-review P2,
+/// s131): a misspelled `archive` / `retention-blocks` would otherwise leave the
+/// node on the pruning default without a word.
 #[derive(Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct ConfigFile {
     genesis: Option<PathBuf>,
     data_dir: Option<PathBuf>,
@@ -303,7 +306,12 @@ fn load_config_file(path: &PathBuf) -> Result<ConfigFile, Box<dyn std::error::Er
     Ok(config)
 }
 
-fn apply_config_defaults(cli: &mut Cli, cfg: ConfigFile) {
+/// Fill unset command-line options from the config file: the command line
+/// always wins. History retention (`archive` / `retention-blocks`) is one
+/// setting: either flag on the command line decides it and both file keys are
+/// ignored; otherwise the file decides, and both keys set there is an error
+/// naming them (`archive = true` with `retention-blocks`).
+fn apply_config_defaults(cli: &mut Cli, cfg: ConfigFile) -> Result<(), String> {
     if cli.genesis.is_none() {
         cli.genesis = cfg.genesis;
     }
@@ -349,15 +357,23 @@ fn apply_config_defaults(cli: &mut Cli, cfg: ConfigFile) {
     if cfg.rpc_only.unwrap_or(false) && !cli.rpc_only {
         cli.rpc_only = true;
     }
-    if cfg.archive.unwrap_or(false) && !cli.archive {
-        cli.archive = true;
-    }
-    if cli.retention_blocks.is_none() {
+    if !cli.archive && cli.retention_blocks.is_none() {
+        let file_archive = cfg.archive.unwrap_or(false);
+        if file_archive && cfg.retention_blocks.is_some() {
+            return Err(
+                "config file: cannot set both `archive = true` and `retention-blocks = N` \
+                 (`retention-blocks = 0` is the same as `archive = true`); a command-line \
+                 --archive or --retention-blocks overrides both"
+                    .into(),
+            );
+        }
+        cli.archive = file_archive;
         cli.retention_blocks = cfg.retention_blocks;
     }
     if cli.trade_retention_blocks.is_none() {
         cli.trade_retention_blocks = cfg.trade_retention_blocks;
     }
+    Ok(())
 }
 
 /// History retention of a node started without `--archive` or
@@ -371,6 +387,9 @@ const DEFAULT_RETENTION_BLOCKS: u64 = 100_000;
 /// RH4 DA body GC), `None` keeps everything (an archive node). `--archive`, or
 /// `--retention-blocks 0`, is the archive node; an explicit
 /// `--retention-blocks N` is N; neither is [`DEFAULT_RETENTION_BLOCKS`].
+///
+/// Precedence (s131): the command line over the config file, for both keys
+/// ([`apply_config_defaults`]).
 fn history_retention(cli: &Cli) -> Result<Option<u64>, String> {
     if cli.archive && cli.retention_blocks.is_some() {
         return Err("cannot set both --archive and --retention-blocks".into());
@@ -383,6 +402,13 @@ fn history_retention(cli: &Cli) -> Result<Option<u64>, String> {
         Some(n) => Some(n),
         None => Some(DEFAULT_RETENTION_BLOCKS),
     })
+}
+
+/// Whether the history retention was chosen (`--archive`, `--retention-blocks`
+/// or their config-file keys) rather than defaulted: the archive-upgrade rule
+/// (`node_dbs::check_retention_upgrade`) refuses only a defaulted one.
+fn retention_is_explicit(cli: &Cli) -> bool {
+    cli.archive || cli.retention_blocks.is_some()
 }
 
 /// The hotstuff block-tree window for a history retention: clamped to >= 1000
@@ -402,7 +428,9 @@ fn block_tree_window(retention: Option<u64>) -> Option<u64> {
 fn pruner_config(cli: &Cli) -> Result<Option<PrunerConfig>, String> {
     let retention = history_retention(cli)?;
     if cli.archive && cli.trade_retention_blocks.is_some() {
-        return Err("cannot set both --archive and --trade-retention-blocks".into());
+        return Err("cannot set both --archive and --trade-retention-blocks (or `archive = true` \
+                    and `trade-retention-blocks` in the config file)"
+            .into());
     }
     if retention.is_none() && cli.trade_retention_blocks.is_none() {
         return Ok(None);
@@ -529,12 +557,12 @@ async fn main() {
 
     // Load config file if specified (CLI flags take precedence)
     if let Some(config_path) = cli.config.clone() {
-        match load_config_file(&config_path) {
-            Ok(cfg) => apply_config_defaults(&mut cli, cfg),
-            Err(e) => {
-                eprintln!("Error loading config: {e}");
-                std::process::exit(1);
-            }
+        if let Err(e) = load_config_file(&config_path)
+            .map_err(|e| e.to_string())
+            .and_then(|cfg| apply_config_defaults(&mut cli, cfg))
+        {
+            eprintln!("Error loading config: {e}");
+            std::process::exit(1);
         }
     }
 
@@ -681,6 +709,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         consensus_db = %torus_state::consensus_db_path(&cli.data_dir).display(),
         "state database and consensus database (HotStuff + DA store) opened"
     );
+    // 3b. Archive-upgrade rule (claude-review P1, s131): a defaulted retention
+    // on an unpruned data dir past N refuses before any pruner exists.
+    node_dbs::enforce_history_retention(
+        &state_db,
+        retention,
+        retention_is_explicit(&cli),
+        &cli.data_dir,
+    )?;
 
     // 4. Genesis initialization
     let mut chain_config = if let Some(genesis_path) = &cli.genesis {
@@ -2605,7 +2641,7 @@ mod tests {
 
         let cfg: ConfigFile = toml::from_str("archive = true").unwrap();
         let mut c = cli(&[]);
-        apply_config_defaults(&mut c, cfg);
+        apply_config_defaults(&mut c, cfg).unwrap();
         assert_eq!(history_retention(&c), Ok(None));
         assert!(pruner_config(&c).unwrap().is_none());
 
@@ -2652,11 +2688,11 @@ mod tests {
         // Config file, and the command line over the file.
         let cfg: ConfigFile = toml::from_str("retention-blocks = 7000").unwrap();
         let mut c = cli(&[]);
-        apply_config_defaults(&mut c, cfg);
+        apply_config_defaults(&mut c, cfg).unwrap();
         assert_eq!(history_retention(&c), Ok(Some(7000)));
         let cfg: ConfigFile = toml::from_str("retention-blocks = 7000").unwrap();
         let mut c = cli(&["--retention-blocks", "0"]);
-        apply_config_defaults(&mut c, cfg);
+        apply_config_defaults(&mut c, cfg).unwrap();
         assert_eq!(history_retention(&c), Ok(None));
     }
 
@@ -2727,14 +2763,100 @@ mod tests {
     fn trade_retention_blocks_from_config_file() {
         let cfg: ConfigFile = toml::from_str("trade-retention-blocks = 7000").unwrap();
         let mut c = cli(&[]);
-        apply_config_defaults(&mut c, cfg);
+        apply_config_defaults(&mut c, cfg).unwrap();
         assert_eq!(c.trade_retention_blocks, Some(7000));
 
         // The command line wins over the file.
         let cfg: ConfigFile = toml::from_str("trade-retention-blocks = 7000").unwrap();
         let mut c = cli(&["--trade-retention-blocks", "9"]);
-        apply_config_defaults(&mut c, cfg);
+        apply_config_defaults(&mut c, cfg).unwrap();
         assert_eq!(c.trade_retention_blocks, Some(9));
+    }
+
+    /// claude-review P2 (s131): a misspelled key (e.g. `archiv`, `retention_blocks`)
+    /// must not parse: it would silently leave the node on the pruning default.
+    #[test]
+    fn unknown_config_key_is_an_error() {
+        for text in [
+            "archiv = true",
+            "retention_blocks = 5000",
+            "retention-block = 5000",
+            "genesis = \"g.json\"\nunknown-key = 1",
+        ] {
+            assert!(toml::from_str::<ConfigFile>(text).is_err(), "{text:?} parsed");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("torus.toml");
+        std::fs::write(&path, "archive = true\nretension-blocks = 5\n").unwrap();
+        let err = load_config_file(&path).err().expect("unknown key").to_string();
+        assert!(err.contains("retension-blocks"), "names the key: {err}");
+        // Every documented key still parses (README / configuration reference).
+        let all = "genesis = \"g.json\"\ndata-dir = \"./data\"\nkeystore = \"k.json\"\n\
+                   passphrase-file = \"p\"\nvalidator-key = \"00\"\np2p-listen = \"/ip4/0.0.0.0/udp/1/quic-v1\"\n\
+                   p2p-peers = \"\"\nrpc-addr = \"0.0.0.0:8545\"\nlog-level = \"info\"\n\
+                   metrics-addr = \"0.0.0.0:9090\"\nrpc-only = false\narchive = false\n\
+                   retention-blocks = 5\ntrade-retention-blocks = 6\n";
+        toml::from_str::<ConfigFile>(all).expect("every documented key parses");
+    }
+
+    /// claude-review P2 (s131): the command line wins over the file for both
+    /// history-retention keys; both keys in the file is an error naming the
+    /// file keys; both flags on the command line an error naming the flags.
+    #[test]
+    fn retention_precedence_command_line_over_file() {
+        let file = |t: &str| -> ConfigFile { toml::from_str(t).unwrap() };
+        // --archive over file retention-blocks.
+        let mut c = cli(&["--archive"]);
+        apply_config_defaults(&mut c, file("retention-blocks = 5000")).unwrap();
+        assert_eq!(history_retention(&c), Ok(None));
+        // --retention-blocks N over file archive = true.
+        let mut c = cli(&["--retention-blocks", "5000"]);
+        apply_config_defaults(&mut c, file("archive = true")).unwrap();
+        assert_eq!(history_retention(&c), Ok(Some(5000)));
+        // --retention-blocks 0 over file retention-blocks.
+        let mut c = cli(&["--retention-blocks", "0"]);
+        apply_config_defaults(&mut c, file("retention-blocks = 5000")).unwrap();
+        assert_eq!(history_retention(&c), Ok(None));
+        // File only: each key applies.
+        let mut c = cli(&[]);
+        apply_config_defaults(&mut c, file("archive = true")).unwrap();
+        assert_eq!(history_retention(&c), Ok(None));
+        let mut c = cli(&[]);
+        apply_config_defaults(&mut c, file("archive = false\nretention-blocks = 7")).unwrap();
+        assert_eq!(history_retention(&c), Ok(Some(7)));
+        // Both in the file: the error names the file keys.
+        let mut c = cli(&[]);
+        let e = apply_config_defaults(&mut c, file("archive = true\nretention-blocks = 7"))
+            .unwrap_err();
+        assert!(e.contains("archive = true") && e.contains("retention-blocks ="), "{e}");
+        // ...unless the command line decides.
+        let mut c = cli(&["--archive"]);
+        apply_config_defaults(&mut c, file("archive = true\nretention-blocks = 7")).unwrap();
+        assert_eq!(history_retention(&c), Ok(None));
+        // Both flags: the error names the flags.
+        let e = history_retention(&cli(&["--archive", "--retention-blocks", "5"])).unwrap_err();
+        assert!(e.contains("--archive") && e.contains("--retention-blocks"), "{e}");
+        // Archive with trade retention: the error names the file keys as well.
+        let mut c = cli(&[]);
+        apply_config_defaults(&mut c, file("archive = true\ntrade-retention-blocks = 9")).unwrap();
+        let e = pruner_config(&c).unwrap_err();
+        assert!(e.contains("`archive = true`") && e.contains("`trade-retention-blocks`"), "{e}");
+    }
+
+    /// The archive-upgrade rule refuses only a defaulted retention: an
+    /// explicit flag or file key (archive or N) is the operator's choice.
+    #[test]
+    fn retention_is_explicit_only_when_set() {
+        assert!(!retention_is_explicit(&cli(&[])));
+        assert!(!retention_is_explicit(&cli(&["--rpc-only"])));
+        assert!(retention_is_explicit(&cli(&["--archive"])));
+        assert!(retention_is_explicit(&cli(&["--retention-blocks", "100000"])));
+        let mut c = cli(&[]);
+        apply_config_defaults(&mut c, toml::from_str("retention-blocks = 9").unwrap()).unwrap();
+        assert!(retention_is_explicit(&c));
+        let mut c = cli(&[]);
+        apply_config_defaults(&mut c, toml::from_str("archive = true").unwrap()).unwrap();
+        assert!(retention_is_explicit(&c));
     }
 
     #[test]

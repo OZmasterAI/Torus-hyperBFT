@@ -83,7 +83,7 @@ Then run:
 ./target/release/torus-node --config torus.toml
 ```
 
-CLI flags always override config file values.
+CLI flags always override config file values (for history retention, either `--archive` or `--retention-blocks` overrides both file keys). Unknown keys are an error.
 
 ## Local Devnet
 

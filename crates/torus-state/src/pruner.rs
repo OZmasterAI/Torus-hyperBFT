@@ -621,6 +621,13 @@ pub(crate) fn read_prune_meta(db: &StateDb) -> Result<u64, StateError> {
     }
 }
 
+/// The persisted state-pruner cutoff (bodies / receipts below it are
+/// pruned): 0 if the data dir was never pruned. The node's archive-upgrade
+/// check reads it before the pruner exists (`torus-node`, s131).
+pub fn read_pruned_up_to(db: &StateDb) -> Result<u64, StateError> {
+    read_prune_meta(db)
+}
+
 /// Write the pruned-up-to height to the database.
 fn write_prune_meta(db: &StateDb, height: u64) -> Result<(), StateError> {
     db.put_cf_raw(CF_BLOCK_HEADERS, PRUNE_META_KEY, &height.to_be_bytes())
