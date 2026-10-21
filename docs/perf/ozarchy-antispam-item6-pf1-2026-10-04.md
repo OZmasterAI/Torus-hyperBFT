@@ -19054,6 +19054,146 @@ one plateau, not its long-run stability.
 * Analysis: `ozarchy-9i-tools/analyst/9i-analyse.py` (adapted from `q9-analyse.py`; pre / post-window fits around
   the 1 Hz first delete, 10 min funnel windows, GC worker and pruner counters) -> `9i.txt`.
 
+## 122. Step 9g-hn, h_n value-for-value check: section 120's B with on-chain state hash attestation on: one binary `perf/l61-window-books` `53a6d83c` (node `43f04f6a`), arm B = `STATE_HASH_ACTIVATION=1 BOOK_WINDOW_COMMIT=1 STATE_HASH_ATTEST=1`, `TORUS_SETTLE_NO_MERGE=1`, Classic, 15 s checkpoints, deep (8i P1M) and standard shapes, w1 (120 s) + r1 (300 s) per shape, n = 1 (campaign ozarchy-9ghn, archy, 2026-10-21)
+
+**Closes section 120's gap: h_n agrees value for value. In all 4 cells, every node's h_n is equal at every
+checkpoint compared (213 in total: deep 55 + 63, standard 32 + 63), every checkpoint reached on-chain quorum with all
+3 validators voting, and fail-stop was on with 0 mismatch / fail-stop / no-quorum lines. The attest-live drain did
+not accept with load pending in any cell: over each final quiet window the native counter moved by exactly 3 per
+checkpoint crossed (attestations only), and no order, cancel or rejection counter moved from drain start to digest
+end. Throughput columns are context only (single cells, not an A/B against section 120).**
+
+Question (bench queue 9g, follow-up): section 120 showed equal hash entry counts and heights, but the harness gave no
+`--state-hash-attest-key`, so 0 attestations were submitted and the on-chain comparison never ran. Here every
+validator signs an `AttestStateHash` per 100-block checkpoint and runs with `TORUS_STATE_HASH_FAILSTOP=1`. Does every
+node's h_n agree, is quorum reached on every checkpoint, and do the fail-stop checks hold?
+
+### 122.1 Setup
+
+* Binary: section 120's build, `ozarchy-9g-stage/m/release/torus-node` md5 `43f04f6ab10b0d8da37073260d31e6ec` (3 / 3
+  nodes, all 4 cells, per-cell CHECK and `node-environ-trie.txt`), bench `c4aa84fb`.
+* Arm B = section 120's B plus `STATE_HASH_ATTEST=1` (run-cell: attest keys in `run/attest-keys`, `--state-hash-attest-key`
+  on every node's argv, `TORUS_STATE_HASH_FAILSTOP=1`). Load as in section 120: 300 markets, rate 76,000, 5,000
+  senders, batch 400, cloid share 0, `MAX_IN_FLIGHT` 4, commit tail; deep = 1M preload, standard = 100k accounts.
+* Tools: main `54ffec29` + `fix/harness-attest-drain` `b4856e8d` (`health.py --attest-live`, scan-time advance in
+  `state_attest.py`), frozen with md5s in `ozarchy-9ghn-tools/FROZEN-PATCH.txt`. Deep then standard, chained
+  (`9ghn-chain.sh`), 15:11-15:40, exit 0.
+* **Harness story.** The first standard smoke on plain `54ffec29` tools
+  (`ozarchy-9ghn-std-smoke-s0-failed-54ffec29`, rc 2, REJECT) failed for harness reasons only:
+  * the drain never went quiet (780 s timeout), because the validators' `AttestStateHash` actions keep moving the
+    native counter and mempool on the idle chain;
+  * `state_attest` compared 63 checkpoints and wanted >= 64, because the chain advanced during the scan and the
+    oldest retained checkpoint was pruned under the walk.
+  * Its h_n still agreed on all 63 checkpoints (16,700..22,900, quorum 63 / 63, votes 63 / 63 / 63).
+  * `b4856e8d` fixes both. The re-smoke (`ozarchy-9ghn-std-smoke-s0`) passed.
+
+### 122.2 Validity
+
+* 4 / 4 cells rc 0, ACCEPT / AGREE / PASS, digest quiescent, 0 panic or fail-stop lines in `summary.json`. No CELL-FLAG,
+  no rerun (`campaign.log`: "RERUN PASS: nothing queued").
+* Startup lines in all 12 node logs (`val<i>.log.gz`, ANSI stripped): `automatic AttestStateHash enabled` with 3 distinct
+  addresses (val0 `0x8c32...d43d`, val1 `0x9586...f746`, val2 `0x0e99...4584`, equal to `state-attest.json`
+  `.validators`); `TORUS_STATE_HASH_FAILSTOP on=true`; `activation=Some(1)`; L6.1 `on=Some(1)`; L3.1 coalesced save ON.
+  0 `STATE HASH MISMATCH`, `FAIL-STOP`, `panicked`, `diverged`, `hash-unverified` or ` ERROR ` lines.
+* FOREIGN CPU rule (`contention-main.tsv`, 30 s rows in the load window): foreign total 0.075-0.086 core mean, max
+  0.138; largest single process claude 0.021 / 0.039 (deep r1-B). No flag.
+
+### 122.3 h_n per cell (`state-attest.json`, `summary.json` `.state_attest`)
+
+| cell | compared (range) | h_n equal | quorum | votes val0 / val1 / val2 | submitted (metric) | mismatch / no_quorum / unverified | fail-stop on |
+|---|---|---|---|---|---|---|---|
+| deep w1 | 55 (100..5,500) | yes, 0 differ | 55 / 55 | 55 / 55 / 55 | 56 / 56 / 56 | 0 / 0 / 0 | true x3 |
+| deep r1-B | 63 (2,000..8,200) | yes, 0 differ | 63 / 63 | 63 / 63 / 63 | 83 / 83 / 83 | 0 / 0 / 0 | true x3 |
+| std w1 | 32 (100..3,200) | yes, 0 differ | 32 / 32 | 32 / 32 / 32 | 33 / 33 / 33 | 0 / 0 / 0 | true x3 |
+| std r1-B | 63 (100..6,300) | yes, 0 differ | 63 / 63 | 63 / 63 / 63 | 64 / 65 / 64 | 0 / 0 / 0 | true x3 |
+
+* Every compared row holds 3 identical `h_n` values, `has_quorum` true and all 3 validators in `votes`. `problems` and
+  `partial_heights` are empty, and the compared count is >= `min_compared` (54 / 63 / 31 / 62).
+* Deep r1-B compares 2,000..8,200 because each node keeps only its last 64 checkpoints
+  (`STATE_HASH_CHECKPOINT_RETAIN`). Checkpoints 100..1,900 were pruned before the scan, so no value-for-value row exists
+  for them. They are covered by the in-node check: each node compares its h_n with the on-chain quorum, and mismatch
+  stays 0 with fail-stop on.
+* `submitted` exceeds the votes compared by one: the newest checkpoint, past the scan. In deep r1-B it exceeds them by
+  20: the newest checkpoint plus the 19 pruned ones. std r1-B val1's 65 includes 1 `resubmission=true` (log). The log counts match the metric, except
+  that deep r1-B val1 / val2 log 84: the logs run on to node stop, after the scan.
+
+### 122.4 Attest-live drain: no load pending (Codex review of `b4856e8d`)
+
+The `--attest-live` drain lets the native mempool hold up to 6 entries, and it ignores the native counter. It could
+therefore accept with load actions still pending. Method, per cell and node:
+
+* (a) the final quiet window in `drain-samples.jsonl` (from the sample where `quiet_elapsed_s` last reset to 0, to the
+  end): the native counter step, against 3 x the %100 heights crossed (committed + the height offset from
+  `metrics-1hz`), with `attestations_submitted` and the mempool;
+* (b) `metrics-1hz` from drain start through digest end: every step of `torus_native_actions_processed_total`, and
+  the deltas of placed / matched / resting / `exec_cancel_all` / `exec_by_id_actions` / `exec_action_rejections`;
+* (c) the whole run at metrics-after (drain end): native = bench submitted + oracle accepted + preload actions +
+  3 x checkpoints executed.
+
+run-cell's digest before / after funnel snapshot is not written to disk (a shell variable, with the native counter
+dropped in attest mode); (b) covers the digest window instead.
+
+| cell | drain s (samples) | quiet window heights | %100 crossed | native step / node | submitted step / node | mempool max in window / at end | (b) native steps drain start -> digest end | load counters (b) | (c) native at drain end |
+|---|---|---|---|---|---|---|---|---|---|
+| deep w1 | 23.1 (24) | 3,327 -> 3,596 | 2 | 6 / 6 / 6 | 2 | 0 / 0 | 27 = 9 x 3 (h 2,970 -> 3,868, 9 checkpoints) | all 0 | 176,161 = 174,473 + 468 + 1,112 + 3 x 36 |
+| deep r1-B | 16.1 (17) | 6,034 -> 6,298 | 2 | 6 / 6 / 6 | 2 | 0 / 0 | 6 + 8 x 3 (val0, h 5,876 -> 6,641) | all 0 | 425,213 = 422,898 + 1,014 + 1,112 + 3 x 63 |
+| std w1 | 10.1 (11) | 2,552 -> 2,820 | 3 | 9 / 9 / 9 | 3 | 0 / 0 | 15 = 5 x 3 (h 2,546 -> 3,089) | all 0 | 180,647 = 180,167 + 396 + 3 x 28 |
+| std r1-B | 10.1 (11) | 5,570 -> 5,834 | 3 | 9 / 9 / 9 | 3 | 3 / 0 | 18 = 6 x 3 (h 5,563 -> 6,163) | all 0 | 436,880 = 435,758 + 948 + 3 x 58 |
+
+* (a) holds in every cell: the quiet-window native step is exactly 3 per checkpoint crossed on every node.
+  `drain.json .attest_live` agrees: `native_actions_delta` 6 / 6 / 6 (deep) and 9 / 9 / 9 (standard), and
+  `attestations_submitted_delta` (summed over nodes) 6 and 9. The native mempool is 0 on all nodes at the last sample.
+  The 3 in std r1-B's window are checkpoint 5,800's attestations: in the mempool at h 5,804, executed as +3 by h
+  5,834 (the last sample).
+* (b) After drain start, every native step lands a few blocks after a %100 height and comes in threes, with one
+  exception: deep r1-B's first second. There, +6 native executed at h 5,876 -> 5,899, with no checkpoint crossed, on
+  all 3 nodes. They were the 6 mempool entries present at the first drain sample (the oracle feed was SIGSTOPped 1 s
+  earlier).
+  * 6 is one oracle round (1,014 actions / 169 rounds).
+  * No order, cancel, by-id or rejection counter moved.
+  * They executed 9 samples before the quiet window began.
+  * So they are not a load action, and the drain did not accept with them pending.
+  * deep w1 had the same kind of +9 one second before the drain (h 2,955 -> 2,970), outside it.
+* (c) The whole-run counts reconcile exactly in all 4 cells. Every executed native action is a bench action, an oracle
+  submission, a preload batch (deep) or one of 3 attestations per checkpoint.
+* **Cleared for all 4 cells: no cell drained with load actions pending, and nothing but attestations executed inside
+  a quiet window or a digest window.**
+
+### 122.5 Per cell (context only; node mean; p50 / p99 as section 120.3)
+
+| cell | matched/s | native blk/s | block p50 / p99 ms | timeouts | drain s (run.log) |
+|---|---|---|---|---|---|
+| deep w1 (120 s) | 268,604 | 14.496 | 12.6 / 751 | 2 | 25 |
+| deep r1-B | 261,299 | 15.267 | 13.3 / 725 | 5 | 19 |
+| std w1 (120 s) | 275,457 | 16.341 | 13.3 / 600 | 0 | 12 |
+| std r1-B | 269,396 | 16.271 | 13.4 / 625 | 0 | 12 |
+
+These are single cells. They are in the range of section 120's B: deep r1 / r2 268.4k / 265.4k matched/s, 15.6 / 17.2
+blk/s; standard 272.4k / 270.4k, 16.5 / 16.7 blk/s. This run does not measure the cost of attestation: there is no
+paired arm and n = 1.
+
+### 122.6 Verdict and limits
+
+* **h_n agrees value for value, with quorum on every checkpoint and fail-stop on (high confidence).** 213 / 213
+  compared checkpoints have 3 equal h_n, quorum with 3 / 3 votes, 0 mismatch, 0 no-quorum and 0 fail-stop lines. This
+  holds on both shapes, at load and through the idle tail.
+* Limits:
+  * Only the last 64 checkpoints are retained, so deep r1-B's first 19 checkpoints have only the in-node check (0
+    mismatch).
+  * n = 1 per shape.
+  * The digest-window check reads 1 Hz series, not run-cell's own before / after snapshot, which is not saved.
+
+### 122.7 Data
+
+* Cells: `~/bench-results-matched/ozarchy-9ghn-{deep,std}-{w1,r1-B}` (`state-attest.json`, `summary.json`,
+  `drain.json`, `drain-samples.jsonl`, `metrics-1hz.txt.gz`, `metrics-after-val<i>.txt`, `run.log`, `val<i>.log.gz`).
+  Failed smoke: `ozarchy-9ghn-std-smoke-s0-failed-54ffec29`; passing smoke: `ozarchy-9ghn-std-smoke-s0`.
+* Campaign: `ozarchy-9ghn-run/` (`handoff.json`, `campaign.log`, `campaign.done`, `contention-main.tsv`,
+  `{deep,std}/cells.tsv`). Tools: `ozarchy-9ghn-tools/` (`FROZEN-PATCH.txt`, `attest-drain-b4856e8d.patch`,
+  `9ghn-chain.sh`, drivers, `9ghn-checks.sh`).
+* Analysis: `ozarchy-9ghn-tools/analyst/` `cells_table.py` -> `cells_table.jsonl`, `drain_check.py` ->
+  `drain_check.json`, `logscan.py` -> `9ghn-logscan.txt`, and `9ghn-foreign.txt` (section 120's `g9-foreign.py`).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
