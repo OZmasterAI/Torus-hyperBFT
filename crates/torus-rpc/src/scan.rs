@@ -22,7 +22,7 @@ use torus_core::book_reader::{
 use torus_core::book_rows::{ROW_TAG_LEVEL, ROW_TAG_ORDER, ROW_TAG_STOP};
 use torus_core::error::CoreError;
 use torus_core::order_book::{Order, OrderBook};
-use torus_core::position::Position;
+use torus_core::position::{decode_position_row, Position};
 use torus_economics::governance::{Proposal, ProposalStatus};
 use torus_economics::types::ValidatorState;
 use torus_economics::EconomicsError;
@@ -785,7 +785,9 @@ pub(crate) fn classic_blob(
 
 /// `torus_getOpenInterest`: long and short size of market `mid`. Position
 /// rows are keyed `trader ‖ market` with no market index, so every row is
-/// read (follow-up: a per-market aggregate or holder index in state).
+/// read (follow-up: a per-market aggregate or holder index in state). A
+/// market-`mid` row that does not decode or names another trader / market
+/// fails the read (`Internal`, the `CoreError` text).
 pub(crate) fn open_interest(
     state: &StateDb,
     mid: MarketId,
@@ -803,8 +805,9 @@ pub(crate) fn open_interest(
             if k.len() != 28 || k[20..28] != want {
                 return Ok(GO);
             }
-            let pos = Position::try_from_slice(v)
-                .map_err(|e| internal(format!("borsh decode position: {e}")))?;
+            // Pre-testnet aliased rows: a row naming another trader / market
+            // fails the read, as it fail-stops a consensus load.
+            let pos = decode_position_row(k, v).map_err(core)?;
             if pos.is_long {
                 long += pos.size;
             } else {
@@ -879,7 +882,8 @@ pub(crate) fn proposal(
 }
 
 /// `trader`'s positions (`PositionManager::positions_for_trader`), each row
-/// charged before it is decoded.
+/// charged before it is decoded. A row that does not decode or names another
+/// trader / market fails the read (`Internal`, the `CoreError` text).
 pub(crate) fn trader_positions(
     state: &StateDb,
     trader: &Address,
@@ -892,10 +896,10 @@ pub(crate) fn trader_positions(
         CF_NATIVE_POSITIONS,
         trader.as_slice(),
         b,
-        |_, v, _| {
-            let p =
-                Position::try_from_slice(v).map_err(|e| core(CoreError::Borsh(e.to_string())))?;
-            out.push(p);
+        |k, v, _| {
+            // A row naming another trader / market fails the read
+            // (`decode_position_row`), as it fail-stops a consensus load.
+            out.push(decode_position_row(k, v).map_err(core)?);
             Ok(GO)
         },
     ))?;
