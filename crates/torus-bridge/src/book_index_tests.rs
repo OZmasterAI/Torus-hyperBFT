@@ -151,6 +151,11 @@ fn stash_and_check(mut ctx: NativeExecContext, holder: &mut ResidentBooks, what:
 fn batch_move_keeps_indexes_consistent() {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
+    // Pre-testnet P0: orders need a listed market (placeholder rows,
+    // tick / lot 1, as the old implicit book).
+    for m in 1..=512u64 {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+    }
     let mut holder = ResidentBooks::default();
     let mut ctx = ctx_at(&db, 1, &mut holder);
     seed(&mut ctx);
@@ -179,6 +184,11 @@ fn batch_move_keeps_indexes_consistent() {
 fn insert_and_replace_book_keep_indexes_consistent() {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
+    // Pre-testnet P0: orders need a listed market (placeholder rows,
+    // tick / lot 1, as the old implicit book).
+    for m in 1..=512u64 {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+    }
     let mut holder = ResidentBooks::default();
     let mut ctx = ctx_at(&db, 1, &mut holder);
     seed(&mut ctx);
@@ -205,6 +215,11 @@ fn insert_and_replace_book_keep_indexes_consistent() {
 fn take_and_set_books_keep_indexes_consistent() {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
+    // Pre-testnet P0: orders need a listed market (placeholder rows,
+    // tick / lot 1, as the old implicit book).
+    for m in 1..=512u64 {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+    }
     let mut holder = ResidentBooks::default();
     let mut a = ctx_at(&db, 1, &mut holder);
     seed(&mut a);
@@ -217,6 +232,11 @@ fn take_and_set_books_keep_indexes_consistent() {
 
     let dir2 = tempfile::tempdir().unwrap();
     let db2 = StateDb::open(dir2.path()).unwrap();
+    // Pre-testnet P0: orders need a listed market (placeholder rows,
+    // tick / lot 1, as the old implicit book).
+    for m in 1..=512u64 {
+        db2.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+    }
     let mut holder = ResidentBooks::default();
     let mut b = ctx_at(&db2, 1, &mut holder);
     // b's own book and both indexes, then every book replaced.
@@ -239,6 +259,11 @@ fn take_and_set_books_keep_indexes_consistent() {
 fn order_book_mut_feeds_indexes() {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
+    // Pre-testnet P0: orders need a listed market (placeholder rows,
+    // tick / lot 1, as the old implicit book).
+    for m in 1..=512u64 {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+    }
     let mut holder = ResidentBooks::default();
     let mut ctx = ctx_at(&db, 1, &mut holder);
     seed(&mut ctx);
@@ -315,6 +340,11 @@ fn loaded_book_is_indexed(via: Via, op: Op) {
     let what = format!("{via:?} {op:?} loaded");
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
+    // Pre-testnet P0: orders need a listed market (placeholder rows,
+    // tick / lot 1, as the old implicit book).
+    for m in 1..=512u64 {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+    }
     let mut holder = ResidentBooks::default();
     let mut ctx = ctx_at(&db, 1, &mut holder);
     seed(&mut ctx);
@@ -347,6 +377,11 @@ fn stale_copy_is_indexed(via: Via, op: Op) {
     let what = format!("{via:?} {op:?} copy");
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
+    // Pre-testnet P0: orders need a listed market (placeholder rows,
+    // tick / lot 1, as the old implicit book).
+    for m in 1..=512u64 {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+    }
     let mut holder = ResidentBooks::default();
     let mut ctx = ctx_at(&db, 1, &mut holder);
     seed(&mut ctx);
@@ -424,12 +459,22 @@ fn drained_logs_roundtrip_is_indexed(via: Via, leak: Leak) {
     let what = format!("{via:?} {leak:?} roundtrip");
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
+    // Pre-testnet P0: orders need a listed market (placeholder rows,
+    // tick / lot 1, as the old implicit book).
+    for m in 1..=512u64 {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+    }
     let mut holder = ResidentBooks::default();
     let mut ctx = ctx_at(&db, 1, &mut holder);
     seed(&mut ctx);
 
     let dir_b = tempfile::tempdir().unwrap();
     let db_b = StateDb::open(dir_b.path()).unwrap();
+    // Pre-testnet P0: orders need a listed market (placeholder rows,
+    // tick / lot 1, as the old implicit book).
+    for m in 1..=512u64 {
+        db_b.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+    }
     let mut holder_b = ResidentBooks::default();
     let mut other = ctx_at(&db_b, 1, &mut holder_b);
     seed(&mut other);

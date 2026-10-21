@@ -19,6 +19,11 @@ use torus_types::FixedPoint;
 fn open_test_db() -> (tempfile::TempDir, StateDb) {
     let dir = tempfile::tempdir().expect("create temp dir");
     let db = StateDb::open(dir.path()).expect("open db");
+    // Pre-testnet P0: actions need a listed market (placeholder rows).
+    for m in [1u64, 7] {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed")
+            .unwrap();
+    }
     // Item 7 step 2: CoreWriter order delay K = 1 (these rows are filed under block 2).
     db.put_cf_raw(
         torus_state::cf::CF_FEE_CONFIG,

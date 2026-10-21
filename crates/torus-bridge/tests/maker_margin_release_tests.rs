@@ -35,6 +35,13 @@ use torus_types::{
 fn open_test_db() -> (tempfile::TempDir, StateDb) {
     let dir = tempfile::tempdir().expect("create temp dir");
     let db = StateDb::open(dir.path()).expect("open db");
+    // Pre-testnet P0: orders need a listed market (no implicit books).
+    // Placeholder rows: tick / lot 1 and no margin config, as the old
+    // implicit book had.
+    for m in 1..=64u64 {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed")
+            .expect("list market");
+    }
     (dir, db)
 }
 
@@ -680,7 +687,9 @@ fn cancel_all_integer_margin_matches_legacy_on_deep_compacted_book() {
 
 #[test]
 fn cancel_all_integer_margin_real_state_matches_legacy() {
-    for market in [Some(1), Some(2), Some(3), Some(999), None] {
+    // Market 64: listed, no book (pre-testnet P0: an unlisted market is
+    // rejected, `unknown_market_tests`).
+    for market in [Some(1), Some(2), Some(3), Some(64), None] {
         for clamp in [false, true] {
             let (_actual_dir, mut actual) = cancel_integer_fixture(clamp);
             let (_expected_dir, mut expected) = cancel_integer_fixture(clamp);
@@ -706,7 +715,7 @@ fn cancel_all_integer_margin_real_state_matches_legacy() {
                     reference.gas_used
                 )
             );
-            if clamp && market != Some(999) {
+            if clamp && market != Some(64) {
                 assert_bal(
                     &actual,
                     &sender,

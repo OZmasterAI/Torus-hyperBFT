@@ -144,6 +144,11 @@ fn run(s: &Scenario, mode: Mode, fast: bool) -> RunFingerprint {
     with_fast_sell_top_ups(fast, || {
         let dir = tempfile::tempdir().expect("temp dir");
         let db = StateDb::open(dir.path()).expect("open db");
+        // Pre-testnet P0: orders need a listed market (placeholder rows,
+        // tick / lot 1, as the old implicit book).
+        for m in 1..=64u64 {
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+        }
         let mut ctx =
             NativeExecContext::new(db, 1, 1000, 0, 100, 10, addr(99), addr(100), addr(101));
         let metrics = Arc::new(Metrics::new());

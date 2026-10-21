@@ -301,6 +301,9 @@ and changed meaning.
   SLOAD: `evm_db_read_fault_fail_stops_block` has a flag-on run), not at a root compute; W's EVM trie step reads the
   hashed mirror and trie CFs, and its own failure marks the trie stale (F4, task 2.3), it does not fail-stop. By design;
   listed for the G4 review.
+  **Accepted (owner s131):** a W trie-step failure marks the trie stale and rebuilds; it does not fail-stop. A
+  fail-stop on that failure remains an option if we need it later (e.g. if stale-trie rebuilds hide a real storage
+  fault in production): it would latch `exec_failed` in W's trie step instead of marking the trie stale.
 
 ## 3. Shape of the fast-path EVM section
 

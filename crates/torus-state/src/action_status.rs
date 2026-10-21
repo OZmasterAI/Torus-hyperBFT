@@ -140,6 +140,14 @@ pub enum FailureReason {
     /// one of its trader's open orders (resting or pending stop, any
     /// market). Not an HL `*Rejected` status: recorded `Failed`.
     DuplicateCloid = 15,
+    /// Pre-testnet P0: an action naming a market that has no
+    /// `CF_NATIVE_MARKETS` row (never listed at genesis or by governance):
+    /// rejected in consensus with the RPC's text, `unknown market_id N`. Not
+    /// an HL `*Rejected` status: recorded `Failed`.
+    UnknownMarket = 16,
+    /// Pre-testnet P1: a placement that is not reduce-only on a market that
+    /// governance delisted (reduce-only wind-down). Recorded `Failed`.
+    MarketDelisted = 17,
 }
 
 impl FailureReason {
@@ -161,6 +169,8 @@ impl FailureReason {
             13 => Self::FokCancel,
             14 => Self::BadTriggerPx,
             15 => Self::DuplicateCloid,
+            16 => Self::UnknownMarket,
+            17 => Self::MarketDelisted,
             _ => Self::Other,
         }
     }
@@ -184,6 +194,8 @@ impl FailureReason {
             Self::FokCancel => "fok_cancel",
             Self::BadTriggerPx => "bad_trigger_px",
             Self::DuplicateCloid => "duplicate_cloid",
+            Self::UnknownMarket => "unknown_market",
+            Self::MarketDelisted => "market_delisted",
         }
     }
 
@@ -1140,6 +1152,8 @@ mod tests {
             (FailureReason::FokCancel, 13, "fok_cancel"),
             (FailureReason::BadTriggerPx, 14, "bad_trigger_px"),
             (FailureReason::DuplicateCloid, 15, "duplicate_cloid"),
+            (FailureReason::UnknownMarket, 16, "unknown_market"),
+            (FailureReason::MarketDelisted, 17, "market_delisted"),
         ];
         for (reason, code, name) in all {
             assert_eq!(reason as u8, code, "{name}");

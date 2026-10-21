@@ -74,6 +74,11 @@ fn setup_blocks() -> Vec<Vec<(Address, NativeAction)>> {
     vec![block]
 }
 
+/// Pre-testnet P0: a market with no `CF_NATIVE_MARKETS` row (the fixtures
+/// list 1..=1024): its cancel-all is rejected (`UnknownMarket`) and is not
+/// part of a run.
+const UNKNOWN_MARKET: MarketId = 9_999;
+
 /// Mixed blocks: runs of cancel-alls (None / Some(m) / unknown market /
 /// duplicates / orderless senders) interleaved with places (which must not
 /// break a run) and broken by CancelOrder, ModifyOrder and a transfer.
@@ -98,7 +103,7 @@ fn mixed_blocks(seed: u64, resting: &[(Address, u128)]) -> Vec<Vec<(Address, Nat
             let action = match rng.below(20) {
                 0..=3 => cancel_all(None),
                 4 => cancel_all(Some(m)),
-                5 => cancel_all(Some(77)),
+                5 => cancel_all(Some(UNKNOWN_MARKET)),
                 6 => {
                     s = owner;
                     NativeAction::CancelOrder { order_id: id }
@@ -166,6 +171,11 @@ fn new_ctx(dir: &tempfile::TempDir, mode: BookMode) -> NativeExecContext {
 /// cancel-all scans every book (row 23).
 fn new_ctx_with(dir: &tempfile::TempDir, mode: BookMode, resident: bool) -> NativeExecContext {
     let db = StateDb::open(dir.path()).expect("open db");
+    // Pre-testnet P0: orders need a listed market (placeholder rows,
+    // tick / lot 1, as the old implicit book).
+    for m in 1..=1024u64 {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+    }
     let mut holder = ResidentBooks::default();
     let ctx = NativeExecContext::new_with_mode(
         db,
@@ -510,14 +520,16 @@ fn cancel_all_counters_count_visited_and_hit_books() {
                 (addr(2), cancel_all(None)),
                 (addr(3), cancel_all(Some(4))),
                 (addr(1), cancel_all(None)),
-                (addr(3), cancel_all(Some(77))),
+                (addr(3), cancel_all(Some(UNKNOWN_MARKET))),
             ];
             NativeExecutor::execute_batch_cancel_mode(&mut ctx, &block, batch);
             let a = ctx.phase_accum;
             let what = format!("{mode:?} batch={batch}");
-            assert_eq!(a.cancel_alls, 5, "{what}");
-            // 2 + 1 + 0 + 0 + 0: addr(3) has nothing in market 4 (and market
-            // 77 has no book); the repeat finds its sender's entry pruned.
+            // Pre-testnet P0: the cancel-all of `UNKNOWN_MARKET` (not listed) is
+            // rejected before it reaches the book pass, so it is not counted.
+            assert_eq!(a.cancel_alls, 4, "{what}");
+            // 2 + 1 + 0 + 0: addr(3) has nothing in market 4; the repeat
+            // finds its sender's entry pruned.
             assert_eq!(a.cancel_all_books_visited, 3, "{what}");
             // addr(1): markets 1 and 2; addr(2): its stop in 3; the repeat
             // finds nothing left.
@@ -694,14 +706,16 @@ fn non_resident_cancel_all_keeps_the_full_scan() {
                 (addr(2), cancel_all(None)),
                 (addr(3), cancel_all(Some(4))),
                 (addr(1), cancel_all(None)),
-                (addr(3), cancel_all(Some(77))),
+                (addr(3), cancel_all(Some(UNKNOWN_MARKET))),
             ];
             let r = NativeExecutor::execute_batch_cancel_mode(&mut ctx, &block, batch);
-            assert!(r.results.iter().all(|r| r.success), "{:?}", r.results);
+            // Pre-testnet P0: the last one names a market that is not listed.
+            assert!(r.results[..4].iter().all(|r| r.success), "{:?}", r.results);
+            assert_eq!(r.results[4].reason, FailureReason::UnknownMarket, "{:?}", r.results);
             let a = ctx.phase_accum;
             let what = format!("{mode:?} batch={batch}");
-            assert_eq!(a.cancel_alls, 5, "{what}");
-            assert_eq!(a.cancel_all_books_visited, 13, "{what}: every book");
+            assert_eq!(a.cancel_alls, 4, "{what}");
+            assert_eq!(a.cancel_all_books_visited, 4 + 4 + 1 + 4, "{what}: every book");
             assert_eq!(a.cancel_all_books_hit, 3, "{what}");
             assert!(ctx.trader_index().0.is_none(), "{what}: index built");
             assert_eq!(ctx.cancel_index_size(), (0, 0), "{what}");
@@ -909,7 +923,7 @@ fn index_blocks(
             let mut action = match rng.below(24) {
                 0..=3 => cancel_all(None),
                 4 | 5 => cancel_all(Some(m)),
-                6 => cancel_all(Some(77)),
+                6 => cancel_all(Some(UNKNOWN_MARKET)),
                 7 | 17 => {
                     s = owner;
                     NativeAction::CancelOrder { order_id: id }
@@ -1620,7 +1634,7 @@ fn parallel_cancel_all_of_stop_only_senders_matches_serial() {
         (addr(4), cancel_all(Some(3))),
         (addr(5), cancel_all(None)),
         (addr(7), cancel_all(None)),
-        (addr(6), cancel_all(Some(77))),
+        (addr(6), cancel_all(Some(UNKNOWN_MARKET))),
     ];
     let blocks = vec![setup, block];
     for mode in [
@@ -1635,7 +1649,9 @@ fn parallel_cancel_all_of_stop_only_senders_matches_serial() {
             "{mode:?}: {} of {placed} stops left",
             serial.pending_stops
         );
-        assert!(serial.results[1].iter().all(|r| r.1), "{mode:?}");
+        // Pre-testnet P0: all but the last (a market that is not listed).
+        let (last, rest) = serial.results[1].split_last().unwrap();
+        assert!(rest.iter().all(|r| r.1) && !last.1, "{mode:?}");
         for workers in [2, 4] {
             let what = format!("{mode:?} workers={workers}");
             let (par, par_obs) = run_par(&blocks, mode, workers);
@@ -1659,19 +1675,21 @@ fn parallel_cancel_all_counts_visited_and_hit_books() {
             (addr(2), cancel_all(None)),
             (addr(3), cancel_all(Some(4))),
             (addr(1), cancel_all(None)),
-            (addr(3), cancel_all(Some(77))),
+            (addr(3), cancel_all(Some(UNKNOWN_MARKET))),
         ];
         let r = NativeExecutor::execute_batch_cancel_mode(&mut ctx, &block, true);
         let what = format!("{mode:?}");
+        // Pre-testnet P0: the last one names a market that is not listed.
         assert!(
-            r.results.iter().all(|r| r.success),
+            r.results[..4].iter().all(|r| r.success),
             "{what}: {:?}",
             r.results
         );
+        assert_eq!(r.results[4].reason, FailureReason::UnknownMarket, "{what}");
         assert!(ctx.fatal_error.is_none(), "{what}: {:?}", ctx.fatal_error);
         assert_eq!(ctx.test_cancel_all_parallel_runs, 1, "{what}");
         let a = ctx.phase_accum;
-        assert_eq!(a.cancel_alls, 5, "{what}");
+        assert_eq!(a.cancel_alls, 4, "{what}");
         assert_eq!(a.cancel_all_books_visited, 3, "{what}");
         assert_eq!(a.cancel_all_books_hit, 3, "{what}");
         let mut dirty: Vec<_> = ctx.dirty_books.iter().copied().collect();

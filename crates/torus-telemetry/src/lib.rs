@@ -403,6 +403,11 @@ pub struct Metrics {
     /// Post-engine tail on the exec thread: core-writer drain, governance,
     /// fee distribution and the epoch boundary.
     pub exec_post_engine_tail_seconds: Histogram,
+    /// The liquidation step inside the post-engine tail, on the exec thread:
+    /// the whole `run_liquidations` call (the pass, its node-local telemetry
+    /// reads and the optional value-sum walk), one observation per native
+    /// block. `torus_liquidation_step_seconds` times the pass alone.
+    pub exec_liquidation_step_seconds: Histogram,
     /// The residual: engine wall clock minus (phase1 + margin + match +
     /// settle + tail). Whatever this holds is the next thing to instrument.
     pub exec_engine_untimed_seconds: Histogram,
@@ -563,6 +568,24 @@ pub struct Metrics {
     /// Consensus thread: whole `on_committed_block` hook (manifest persist,
     /// durable block persist, mempool prune, exec dispatch).
     pub on_committed_block_seconds: Histogram,
+    /// T5.3: the commit-manifest put inside `on_committed_block` (section 106:
+    /// the in-window commit-hook stall, waiting behind the checkpoint batch
+    /// while the manifest lived in the state DB).
+    pub commit_manifest_seconds: Histogram,
+    /// T5.3: one background manifest prune pass (pruner thread, at most 1/s):
+    /// state-DB WAL fsync, then the delete of the dispatched heights' manifests
+    /// in the consensus DB. Not observed with the manifest in the state DB (its
+    /// prune rides the commit-persist batch).
+    pub commit_manifest_prune_seconds: Histogram,
+    /// T5.3: how long the exec thread waits, before executing a block, for its
+    /// header + body write on the commit-persist writer thread (that write keeps
+    /// the `torus_commit_persist_*` timers, now observed on the writer).
+    pub exec_commit_persist_wait_seconds: Histogram,
+    /// T5.3: the whole `on_commit_block` event handler (event-bus thread:
+    /// height lookup, mempool prune, header read, WS notify).
+    pub on_commit_block_handler_seconds: Histogram,
+    /// T5.3: the handler's applied-marker read + `prune_committed_txs`.
+    pub commit_handler_prune_seconds: Histogram,
     /// Consensus thread: `remove_committed_native` (mempool write-lock + prune)
     /// inside the commit dispatch.
     pub mempool_remove_committed_seconds: Histogram,
@@ -736,6 +759,18 @@ pub struct Metrics {
     /// Item 6 Phase 3: since-checkpoint layer bytes (keys + values, a
     /// tombstone counts its key) per checkpoint.
     pub exec_checkpoint_layer_bytes: Histogram,
+    /// 8k L3.1 (`TORUS_BOOK_COALESCE`): Classic books whose per-block
+    /// whole-book encode was skipped (summed over pipelined blocks; each is
+    /// encoded once at its window's close instead). 0 with the flag off.
+    pub exec_book_coalesce_skipped: Counter,
+    /// 8k L3.1: exec-thread wall time of one window close's coalesced book
+    /// encode (every unsaved book encoded from the resident holder and put
+    /// into the closing layer), one observation per close with at least one
+    /// unsaved book. The spike E pays once per window.
+    pub exec_book_coalesce_close_seconds: Histogram,
+    /// 8k L3.1: books encoded per window close (same observations as
+    /// `exec_book_coalesce_close_seconds`).
+    pub exec_book_coalesce_close_books: Histogram,
     /// Item 6 Phase 3: the layer was still shared when the exec thread took
     /// it back to merge (deep copy instead; expected 0).
     pub exec_checkpoint_layer_shared: Counter,
@@ -787,6 +822,13 @@ pub struct Metrics {
     /// Item 6 Phase 3: flush-worker wall time per checkpoint job (the one
     /// batch: build, root, write, EVM resync).
     pub flush_worker_checkpoint_seconds: Histogram,
+    /// T5.3: the checkpoint's state-DB `write` alone (WAL + memtable), one
+    /// observation per checkpoint.
+    pub exec_checkpoint_db_write_seconds: Histogram,
+    /// T5.3: wall clock (unix ms) at which the latest checkpoint DB write
+    /// started / ended, to cut in-window intervals without a /proc sampler.
+    pub exec_checkpoint_db_write_start_ms: Gauge,
+    pub exec_checkpoint_db_write_end_ms: Gauge,
     /// Item 7 option 0 (task 4.2): the flush worker's EVM trie step (the
     /// hashed mirror and trie nodes of a fast-path EVM block at interval 0,
     /// of a checkpoint window holding one otherwise), inside
@@ -1950,6 +1992,13 @@ impl Metrics {
             exec_post_engine_tail_seconds.clone(),
         );
 
+        let exec_liquidation_step_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 16));
+        registry.register(
+            "torus_exec_liquidation_step_seconds",
+            "Exec sub-phase: the liquidation step (whole run_liquidations call, inside the post-engine tail)",
+            exec_liquidation_step_seconds.clone(),
+        );
+
         let exec_engine_untimed_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_exec_engine_untimed_seconds",
@@ -2308,6 +2357,36 @@ impl Metrics {
             "Consensus thread: whole on_committed_block hook (persist + prune + dispatch)",
             on_committed_block_seconds.clone(),
         );
+        let commit_manifest_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_commit_manifest_seconds",
+            "Consensus thread: commit-manifest put inside on_committed_block (T5.3)",
+            commit_manifest_seconds.clone(),
+        );
+        let commit_manifest_prune_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_commit_manifest_prune_seconds",
+            "Pruner thread: state-WAL fsync + commit-manifest delete in the consensus DB, per pass (T5.3)",
+            commit_manifest_prune_seconds.clone(),
+        );
+        let exec_commit_persist_wait_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 16));
+        registry.register(
+            "torus_exec_commit_persist_wait_seconds",
+            "Exec thread: wait for the block's off-thread header + body write before executing it (T5.3)",
+            exec_commit_persist_wait_seconds.clone(),
+        );
+        let on_commit_block_handler_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_on_commit_block_handler_seconds",
+            "Event-bus thread: whole on_commit_block handler (T5.3)",
+            on_commit_block_handler_seconds.clone(),
+        );
+        let commit_handler_prune_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_commit_handler_prune_seconds",
+            "Event-bus thread: applied-marker read + prune_committed_txs in on_commit_block (T5.3)",
+            commit_handler_prune_seconds.clone(),
+        );
         let mempool_remove_committed_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
         registry.register(
             "torus_mempool_remove_committed_seconds",
@@ -2580,6 +2659,24 @@ impl Metrics {
             "Item 6 Phase 3: since-checkpoint layer bytes per checkpoint",
             exec_checkpoint_layer_bytes.clone(),
         );
+        let exec_book_coalesce_skipped = Counter::default();
+        registry.register(
+            "torus_exec_book_coalesce_skipped",
+            "8k L3.1: Classic books whose per-block encode was skipped (encoded once at the window close)",
+            exec_book_coalesce_skipped.clone(),
+        );
+        let exec_book_coalesce_close_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 16));
+        registry.register(
+            "torus_exec_book_coalesce_close_seconds",
+            "8k L3.1: exec-thread time of one window close's coalesced book encode",
+            exec_book_coalesce_close_seconds.clone(),
+        );
+        let exec_book_coalesce_close_books = Histogram::new(exponential_buckets(1.0, 2.0, 14));
+        registry.register(
+            "torus_exec_book_coalesce_close_books",
+            "8k L3.1: books encoded per window close",
+            exec_book_coalesce_close_books.clone(),
+        );
         let exec_checkpoint_layer_shared = Counter::default();
         registry.register(
             "torus_exec_checkpoint_layer_shared",
@@ -2647,6 +2744,24 @@ impl Metrics {
             "torus_flush_worker_checkpoint_seconds",
             "Item 6 Phase 3: flush worker wall time per checkpoint job",
             flush_worker_checkpoint_seconds.clone(),
+        );
+        let exec_checkpoint_db_write_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 16));
+        registry.register(
+            "torus_exec_checkpoint_db_write_seconds",
+            "T5.3: the checkpoint's state-DB write alone (WAL + memtable)",
+            exec_checkpoint_db_write_seconds.clone(),
+        );
+        let exec_checkpoint_db_write_start_ms = Gauge::default();
+        registry.register(
+            "torus_exec_checkpoint_db_write_start_ms",
+            "T5.3: unix ms at which the latest checkpoint DB write started",
+            exec_checkpoint_db_write_start_ms.clone(),
+        );
+        let exec_checkpoint_db_write_end_ms = Gauge::default();
+        registry.register(
+            "torus_exec_checkpoint_db_write_end_ms",
+            "T5.3: unix ms at which the latest checkpoint DB write ended",
+            exec_checkpoint_db_write_end_ms.clone(),
         );
         let flush_worker_evm_trie_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
         registry.register(
@@ -3117,6 +3232,7 @@ impl Metrics {
             exec_cache_flush_seconds,
             exec_settle_no_merge_fallbacks,
             exec_post_engine_tail_seconds,
+            exec_liquidation_step_seconds,
             exec_engine_untimed_seconds,
             exec_save_books_seconds,
             exec_flush_seconds,
@@ -3170,6 +3286,11 @@ impl Metrics {
             validate_block_da_wait_seconds,
             validate_block_attest_lookup_seconds,
             on_committed_block_seconds,
+            commit_manifest_seconds,
+            commit_manifest_prune_seconds,
+            exec_commit_persist_wait_seconds,
+            on_commit_block_handler_seconds,
+            commit_handler_prune_seconds,
             mempool_remove_committed_seconds,
             da_bodies_gc_deleted,
             da_gc_seconds,
@@ -3210,6 +3331,9 @@ impl Metrics {
             exec_checkpoints,
             exec_checkpoint_wait_seconds,
             exec_checkpoint_layer_bytes,
+            exec_book_coalesce_skipped,
+            exec_book_coalesce_close_seconds,
+            exec_book_coalesce_close_books,
             exec_checkpoint_layer_shared,
             exec_checkpoint_settle_wait_seconds,
             exec_checkpoint_deferred_join_seconds,
@@ -3221,6 +3345,9 @@ impl Metrics {
             exec_checkpoint_read_views_live,
             exec_checkpoint_oldest_live_age_blocks,
             flush_worker_checkpoint_seconds,
+            exec_checkpoint_db_write_seconds,
+            exec_checkpoint_db_write_start_ms,
+            exec_checkpoint_db_write_end_ms,
             flush_worker_evm_trie_seconds,
             order_age_admit_seconds,
             order_age_commit_seconds,
@@ -3460,11 +3587,15 @@ pub enum OrderRejectReason {
     Other,
     /// s114 cloid: the order's cloid is live for its trader (any market).
     DuplicateCloid,
+    /// Pre-testnet P0: the order names a market that is not listed.
+    UnknownMarket,
+    /// Pre-testnet P1: a non-reduce-only order on a delisted market.
+    MarketDelisted,
 }
 
 impl OrderRejectReason {
     /// Number of reasons (labels).
-    pub const COUNT: usize = 17;
+    pub const COUNT: usize = 19;
 
     /// Every reason in discriminant order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -3485,6 +3616,8 @@ impl OrderRejectReason {
         Self::Fill,
         Self::Other,
         Self::DuplicateCloid,
+        Self::UnknownMarket,
+        Self::MarketDelisted,
     ];
 
     /// The label value (the `FailureReason` names of torus-state where one
@@ -3508,6 +3641,8 @@ impl OrderRejectReason {
             Self::Fill => "fill",
             Self::Other => "other",
             Self::DuplicateCloid => "duplicate_cloid",
+            Self::UnknownMarket => "unknown_market",
+            Self::MarketDelisted => "market_delisted",
         }
     }
 }
@@ -3847,6 +3982,11 @@ mod tests {
             "torus_validate_block_da_wait_seconds",
             "torus_validate_block_attest_lookup_seconds",
             "torus_on_committed_block_seconds",
+            "torus_commit_manifest_seconds",
+            "torus_commit_manifest_prune_seconds",
+            "torus_exec_commit_persist_wait_seconds",
+            "torus_on_commit_block_handler_seconds",
+            "torus_commit_handler_prune_seconds",
             "torus_mempool_remove_committed_seconds",
             "torus_da_bodies_gc_deleted_total",
             "torus_da_gc_seconds",
@@ -3938,6 +4078,9 @@ mod tests {
             "torus_exec_checkpoint_wait_seconds",
             "torus_exec_checkpoint_layer_bytes",
             "torus_exec_checkpoint_layer_shared",
+            "torus_exec_book_coalesce_skipped",
+            "torus_exec_book_coalesce_close_seconds",
+            "torus_exec_book_coalesce_close_books",
             "torus_exec_checkpoint_settle_wait_seconds",
             "torus_exec_checkpoint_deferred_join_seconds",
             "torus_exec_checkpoint_deferred_read_waits",
@@ -3948,6 +4091,9 @@ mod tests {
             "torus_exec_checkpoint_read_views_live",
             "torus_exec_checkpoint_oldest_live_age_blocks",
             "torus_flush_worker_checkpoint_seconds",
+            "torus_exec_checkpoint_db_write_seconds",
+            "torus_exec_checkpoint_db_write_start_ms",
+            "torus_exec_checkpoint_db_write_end_ms",
             "torus_exec_save_books_drain_seconds",
             "torus_exec_save_books_write_seconds",
             "torus_exec_native_blocks",
@@ -3999,6 +4145,7 @@ mod tests {
             "torus_exec_settle_pass_b_seconds",
             "torus_exec_cache_flush_seconds",
             "torus_exec_post_engine_tail_seconds",
+            "torus_exec_liquidation_step_seconds",
             "torus_exec_engine_untimed_seconds",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");

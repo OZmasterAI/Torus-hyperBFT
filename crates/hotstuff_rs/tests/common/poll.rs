@@ -42,3 +42,65 @@ pub(crate) fn wait_until<C, D>(
         thread::sleep(poll_interval);
     }
 }
+
+/// One observation of a scenario being set up: see [`wait_for_scenario`].
+pub(crate) enum Scenario {
+    /// The state the test wants has been reached.
+    Reached,
+    /// Not there yet; the cluster may still get there.
+    Pending,
+    /// The run went past the state without reaching it and can never reach it (e.g. a node left
+    /// the view whose vote the test meant to catch). The caller may start a fresh run.
+    Missed,
+}
+
+/// Poll `observe` until it reports [`Scenario::Reached`] (returns `true`) or
+/// [`Scenario::Missed`] (returns `false`). Panics if `progress` (a counter that grows while the
+/// cluster moves: views entered, certificates, commits) stays the same for `stall`, or if `ceiling`
+/// elapses in total.
+///
+/// Unlike [`wait_until`]'s single deadline, a slow but moving cluster (a loaded host) is not
+/// failed early, while a cluster that stops moving still fails within `stall`.
+pub(crate) fn wait_for_scenario<O, P, D>(
+    ceiling: Duration,
+    stall: Duration,
+    poll_interval: Duration,
+    context: &str,
+    mut observe: O,
+    mut progress: P,
+    mut describe: D,
+) -> bool
+where
+    O: FnMut() -> Scenario,
+    P: FnMut() -> u64,
+    D: FnMut() -> String,
+{
+    let start = Instant::now();
+    let (mut last, mut last_change) = (progress(), start);
+    loop {
+        match observe() {
+            Scenario::Reached => return true,
+            Scenario::Missed => return false,
+            Scenario::Pending => {}
+        }
+        let now = Instant::now();
+        let p = progress();
+        if p != last {
+            (last, last_change) = (p, now);
+        }
+        if now - last_change >= stall || now - start >= ceiling {
+            panic!(
+                "wait_for_scenario: {} after {:?} (no progress for {:?}; stall bound {:?}, ceiling \
+                 {:?}) waiting for: {}\n  last observed state: {}",
+                if now - start >= ceiling { "ceiling hit" } else { "stalled" },
+                now - start,
+                now - last_change,
+                stall,
+                ceiling,
+                context,
+                describe(),
+            );
+        }
+        thread::sleep(poll_interval);
+    }
+}

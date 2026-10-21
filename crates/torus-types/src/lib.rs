@@ -1568,6 +1568,19 @@ pub struct OracleSubmission {
 // Market Types
 // ============================================================================
 
+/// Pre-testnet P1: the `CF_NATIVE_MARKETS` key of a delisted market's flag
+/// row: the 8-byte big-endian market id followed by `b'D'`. Nine bytes, so
+/// every market-row scan (8-byte keys only) skips it. Value: the delist
+/// height (8 bytes BE). Written by a governance delist in the proposal's
+/// atomic write and never deleted; the market row itself stays (positions,
+/// marks and liquidation keep working, orders are reduce-only).
+pub fn market_delisted_key(market_id: MarketId) -> [u8; 9] {
+    let mut key = [0u8; 9];
+    key[..8].copy_from_slice(&market_id.to_be_bytes());
+    key[8] = b'D';
+    key
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MarketParams {
     pub tick_size: FixedPoint,

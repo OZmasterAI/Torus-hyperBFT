@@ -115,6 +115,10 @@ pub enum ProposalType {
     ValidatorRegistration,
     /// Unlock permanently staked tokens via governance supermajority (80%).
     PermanentUnlock,
+    /// Pre-testnet P1: delist a market (reduce-only wind-down).
+    MarketDelist,
+    /// Pre-testnet P1: change a listed market's tick, lot and max leverage.
+    MarketParamsUpdate,
 }
 
 impl BorshSerialize for ProposalType {
@@ -126,6 +130,8 @@ impl BorshSerialize for ProposalType {
             Self::TextProposal => 3,
             Self::ValidatorRegistration => 4,
             Self::PermanentUnlock => 5,
+            Self::MarketDelist => 6,
+            Self::MarketParamsUpdate => 7,
         };
         writer.write_all(&[disc])
     }
@@ -142,6 +148,8 @@ impl BorshDeserialize for ProposalType {
             3 => Ok(Self::TextProposal),
             4 => Ok(Self::ValidatorRegistration),
             5 => Ok(Self::PermanentUnlock),
+            6 => Ok(Self::MarketDelist),
+            7 => Ok(Self::MarketParamsUpdate),
             x => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid ProposalType discriminant: {x}"),
@@ -232,6 +240,19 @@ pub enum ExecutionPayload {
     ValidatorRegistration { candidate: Address },
     /// Unlock permanently staked tokens via governance supermajority vote.
     PermanentUnlock { staker: Address, amount: U256 },
+    /// Pre-testnet P1: delist `market_id`. Execution writes its delisted
+    /// flag row ([`torus_types::market_delisted_key`]); the executor then
+    /// cancels the market's resting orders and stops (refunding their
+    /// margin) and accepts only reduce-only orders there. Positions stay.
+    MarketDelist { market_id: u64 },
+    /// Pre-testnet P1: rewrite `market_id`'s row with a new lot, tick and
+    /// initial margin (names kept), in the proposal's atomic write.
+    MarketParamsUpdate {
+        market_id: u64,
+        lot_size: FixedPoint,
+        tick_size: FixedPoint,
+        initial_margin: FixedPoint,
+    },
 }
 
 impl BorshSerialize for ExecutionPayload {
@@ -279,6 +300,22 @@ impl BorshSerialize for ExecutionPayload {
                 writer.write_all(&[4u8])?;
                 borsh_write_address(staker, writer)?;
                 borsh_write_u256(amount, writer)?;
+            }
+            Self::MarketDelist { market_id } => {
+                writer.write_all(&[5u8])?;
+                BorshSerialize::serialize(market_id, writer)?;
+            }
+            Self::MarketParamsUpdate {
+                market_id,
+                lot_size,
+                tick_size,
+                initial_margin,
+            } => {
+                writer.write_all(&[6u8])?;
+                BorshSerialize::serialize(market_id, writer)?;
+                BorshSerialize::serialize(&lot_size.raw(), writer)?;
+                BorshSerialize::serialize(&tick_size.raw(), writer)?;
+                BorshSerialize::serialize(&initial_margin.raw(), writer)?;
             }
         }
         Ok(())
@@ -332,6 +369,21 @@ impl BorshDeserialize for ExecutionPayload {
                 let staker = borsh_read_address(reader)?;
                 let amount = borsh_read_u256(reader)?;
                 Ok(Self::PermanentUnlock { staker, amount })
+            }
+            5 => Ok(Self::MarketDelist {
+                market_id: u64::deserialize_reader(reader)?,
+            }),
+            6 => {
+                let market_id = u64::deserialize_reader(reader)?;
+                let lot_size = FixedPoint::from_raw(i128::deserialize_reader(reader)?);
+                let tick_size = FixedPoint::from_raw(i128::deserialize_reader(reader)?);
+                let initial_margin = FixedPoint::from_raw(i128::deserialize_reader(reader)?);
+                Ok(Self::MarketParamsUpdate {
+                    market_id,
+                    lot_size,
+                    tick_size,
+                    initial_margin,
+                })
             }
             x => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -881,6 +933,24 @@ impl<T: StateBackend> GovernanceManager<T> {
             }
         }
 
+        // Pre-testnet P1: a delist / params update names a listed market that
+        // is not delisted (re-checked at execution).
+        match &execution_payload {
+            Some(ExecutionPayload::MarketDelist { market_id }) => {
+                self.require_tradable_market(*market_id)?;
+            }
+            Some(ExecutionPayload::MarketParamsUpdate {
+                market_id,
+                tick_size,
+                lot_size,
+                ..
+            }) => {
+                self.require_tradable_market(*market_id)?;
+                Self::validate_tick_lot(*tick_size, *lot_size)?;
+            }
+            _ => {}
+        }
+
         // Derive proposal type from payload.
         let proposal_type = match &execution_payload {
             Some(ExecutionPayload::ParameterChange { .. }) => ProposalType::ParameterChange,
@@ -890,6 +960,8 @@ impl<T: StateBackend> GovernanceManager<T> {
                 ProposalType::ValidatorRegistration
             }
             Some(ExecutionPayload::PermanentUnlock { .. }) => ProposalType::PermanentUnlock,
+            Some(ExecutionPayload::MarketDelist { .. }) => ProposalType::MarketDelist,
+            Some(ExecutionPayload::MarketParamsUpdate { .. }) => ProposalType::MarketParamsUpdate,
             None => ProposalType::TextProposal,
         };
 
@@ -1373,6 +1445,44 @@ impl<T: StateBackend> GovernanceManager<T> {
                 let staking = crate::staking::StakingManager::new(self.state.clone());
                 staking.stage_governance_unlock_permanent_stake(*staker, *amount)?
             }
+            ExecutionPayload::MarketDelist { market_id } => {
+                // Pre-testnet P1: the flag row; the executor's per-block
+                // governance step does the book wind-down after this write.
+                self.require_tradable_market(*market_id)?;
+                vec![(
+                    CF_NATIVE_MARKETS,
+                    torus_types::market_delisted_key(*market_id).to_vec(),
+                    Some(current_block.to_be_bytes().to_vec()),
+                )]
+            }
+            ExecutionPayload::MarketParamsUpdate {
+                market_id,
+                lot_size,
+                tick_size,
+                initial_margin,
+            } => {
+                // Pre-testnet P1: validated again here (the market may have
+                // been delisted during the vote), then one row write.
+                self.require_tradable_market(*market_id)?;
+                Self::validate_tick_lot(*tick_size, *lot_size)?;
+                let row = self
+                    .state
+                    .get_cf_raw(CF_NATIVE_MARKETS, &market_id.to_be_bytes())?
+                    .ok_or(EconomicsError::MarketNotListed(*market_id))?;
+                let (base, quote, _, _, _) =
+                    <(String, String, i128, i128, i128)>::try_from_slice(&row)
+                        .map_err(|_| EconomicsError::MarketRowUndecodable(*market_id))?;
+                let data = borsh::to_vec(&(
+                    base,
+                    quote,
+                    lot_size.raw(),
+                    tick_size.raw(),
+                    initial_margin.raw(),
+                ))
+                .map_err(|e| EconomicsError::Borsh(e.to_string()))?;
+                tracing::debug!(market_id, "market params update staged");
+                vec![(CF_NATIVE_MARKETS, market_id.to_be_bytes().to_vec(), Some(data))]
+            }
         };
         Ok(writes)
     }
@@ -1687,6 +1797,27 @@ impl<T: StateBackend> GovernanceManager<T> {
             .is_some())
     }
 
+    /// Pre-testnet P1: whether `market_id` was delisted by governance (its
+    /// [`torus_types::market_delisted_key`] row exists).
+    pub fn market_delisted(&self, market_id: u64) -> Result<bool> {
+        Ok(self
+            .state
+            .get_cf_raw(CF_NATIVE_MARKETS, &torus_types::market_delisted_key(market_id))?
+            .is_some())
+    }
+
+    /// Pre-testnet P1: `market_id` is listed and not delisted (the target of
+    /// a delist or a params update).
+    fn require_tradable_market(&self, market_id: u64) -> Result<()> {
+        if !self.market_exists(market_id)? {
+            return Err(EconomicsError::MarketNotListed(market_id));
+        }
+        if self.market_delisted(market_id)? {
+            return Err(EconomicsError::MarketDelisted(market_id));
+        }
+        Ok(())
+    }
+
     /// Listed market ids: the 8-byte big-endian keys of CF_NATIVE_MARKETS,
     /// ascending. Metadata rows (`__book_mode__`, `__next_global_order_id__`)
     /// have other key lengths and are skipped.
@@ -1768,6 +1899,9 @@ fn is_execution_failure(e: &EconomicsError) -> bool {
             | EconomicsError::InsufficientTreasury { .. }
             | EconomicsError::MarketIdInUse(_)
             | EconomicsError::MarketListingNotPositive { .. }
+            | EconomicsError::MarketNotListed(_)
+            | EconomicsError::MarketDelisted(_)
+            | EconomicsError::MarketRowUndecodable(_)
             | EconomicsError::PermanentStakeNotFound(_)
             | EconomicsError::PermanentUnlockExceedsStake { .. }
     )
