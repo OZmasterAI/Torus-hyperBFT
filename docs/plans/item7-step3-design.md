@@ -9,7 +9,7 @@ adversarial reviews: Codex (`reviews/codex-item7-step3-adv.md`, needs-attention:
 finding is verified in code and handled; section 10 maps each one to the change. Owner direction s127 is in: the RPC
 freshness pick no longer checkpoints at each EVM height (Q6 conflict), T comes after option 0 with a new size and
 explicit capacity semantics, and option S is measured (Q12, section 6.2) instead of dismissed.
-Builds on step 1 (main) and step 2 (`feat/item7-step2` `c567b1b3`, not merged, waits on archy's Q7). The block in
+Builds on step 1 (main) and step 2 (`feat/item7-step2` `c567b1b3`; step 2 merged to main in `cfa35ed1`, s127). The block in
 `item7-evm-lanes.md` 47-63 (owner s122) frames step 3 as HL style or C, both "after EVM reads / writes go through the
 overlay", both after item 6 Phase 5. Anchors are main `dcee5cac` unless marked `@ c567b1b3`; the Q6 design is
 `q6-checkpoint-slicing.md` at `0f50b54b` (branch `perf/q6-ckpt-slicing`). "(estimate)" marks numbers not measured;
