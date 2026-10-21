@@ -189,6 +189,23 @@ fn encode_string(s: &str) -> [u8; 32] {
     keccak256(s.as_bytes()).0
 }
 
+/// EIP-712 `encodeType` of the nested struct `MarketParams` (appended to the
+/// type string of every struct that references it).
+macro_rules! market_params_type {
+    () => {
+        "MarketParams(int128 tickSize,int128 lotSize,uint32 maxLeverage,\
+         uint32 maintenanceMarginBps,uint32 maxFundingRateBps)"
+    };
+}
+
+/// EIP-712 `encodeType` of the nested struct `MarketListing`.
+macro_rules! market_listing_type {
+    () => {
+        "MarketListing(string baseAsset,string quoteAsset,int128 tickSize,int128 lotSize,\
+         uint32 maxLeverage,uint32 maintenanceMarginBps)"
+    };
+}
+
 // ============================================================================
 // Domain Separator
 // ============================================================================
@@ -711,8 +728,13 @@ fn hash_rotate_validator_key(new_pubkey: &PublicKey, nonce: u64) -> B256 {
 
 // ---------- admin ----------
 
+/// s134 P1: `params` is the nested struct `MarketParams` (hashed with its own
+/// type hash), so the type string appends `MarketParams(...)` per EIP-712.
 fn hash_update_market_params(market_id: MarketId, params: &MarketParams, nonce: u64) -> B256 {
-    let th = keccak256("UpdateMarketParams(uint64 marketId,bytes32 paramsHash,uint64 nonce)");
+    let th = keccak256(concat!(
+        "UpdateMarketParams(uint64 marketId,MarketParams params,uint64 nonce)",
+        market_params_type!()
+    ));
     let ph = hash_market_params(params);
     let mut buf = Vec::with_capacity(4 * 32);
     buf.extend_from_slice(&th.0);
@@ -722,8 +744,12 @@ fn hash_update_market_params(market_id: MarketId, params: &MarketParams, nonce: 
     keccak256(&buf)
 }
 
+/// s134 P1: `listing` is the nested struct `MarketListing` (own type hash).
 fn hash_list_market(listing: &MarketListing, nonce: u64) -> B256 {
-    let th = keccak256("ListMarket(bytes32 listingHash,uint64 nonce)");
+    let th = keccak256(concat!(
+        "ListMarket(MarketListing listing,uint64 nonce)",
+        market_listing_type!()
+    ));
     let lh = hash_market_listing(listing);
     let mut buf = Vec::with_capacity(3 * 32);
     buf.extend_from_slice(&th.0);
@@ -774,38 +800,61 @@ fn hash_revoke_session(pubkey: &[u8; 32], nonce: u64) -> B256 {
 
 // ---------- nested-type helpers ----------
 
+/// `SubmitProposal.actionHash`: the EIP-712 `hashStruct` of the variant's own
+/// struct, `keccak(typeHash || encodeData)`. `ProposalAction` is an enum, which
+/// EIP-712 cannot express, so each variant is a struct named `Proposal<Variant>`
+/// and the parent field is `bytes32 actionHash`.
+///
+/// s134 P1 (Codex): the variants used to hash their bare fields with no type
+/// hash, so `ValidatorRegistration(0x..01)` and `DelistMarket(1)` had the same
+/// action hash and a signed proposal could be swapped for the other. The type
+/// hash binds the variant; tests: `tests/eip712_reference.rs`.
 fn hash_proposal_action(action: &ProposalAction) -> B256 {
+    let mut buf = Vec::with_capacity(3 * 32);
     match action {
         ProposalAction::UpdateMarketParams { market_id, params } => {
-            let mut buf = Vec::with_capacity(2 * 32);
+            buf.extend_from_slice(&keccak256(concat!(
+                "ProposalUpdateMarketParams(uint64 marketId,MarketParams params)",
+                market_params_type!()
+            )).0);
             buf.extend_from_slice(&encode_u64(*market_id));
             buf.extend_from_slice(&hash_market_params(params).0);
-            keccak256(&buf)
         }
-        ProposalAction::ListMarket(listing) => hash_market_listing(listing),
-        ProposalAction::DelistMarket { market_id } => keccak256(encode_u64(*market_id)),
+        ProposalAction::ListMarket(listing) => {
+            buf.extend_from_slice(&keccak256(concat!(
+                "ProposalListMarket(MarketListing listing)",
+                market_listing_type!()
+            )).0);
+            buf.extend_from_slice(&hash_market_listing(listing).0);
+        }
+        ProposalAction::DelistMarket { market_id } => {
+            buf.extend_from_slice(&keccak256("ProposalDelistMarket(uint64 marketId)").0);
+            buf.extend_from_slice(&encode_u64(*market_id));
+        }
         ProposalAction::ParameterChange { key, value } => {
-            let mut buf = Vec::with_capacity(2 * 32);
+            buf.extend_from_slice(&keccak256("ProposalParameterChange(string key,string value)").0);
             buf.extend_from_slice(&encode_string(key));
             buf.extend_from_slice(&encode_string(value));
-            keccak256(&buf)
         }
-        ProposalAction::ValidatorRegistration { candidate } => keccak256(encode_address(candidate)),
-        // Delist decisions (owner s134, 1c): typed (the older variants hash
-        // their fields only), so it cannot share a preimage with them.
+        ProposalAction::ValidatorRegistration { candidate } => {
+            buf.extend_from_slice(&keccak256("ProposalValidatorRegistration(address candidate)").0);
+            buf.extend_from_slice(&encode_address(candidate));
+        }
         ProposalAction::SetDelistClosePrice { market_id, price } => {
-            let th = keccak256("SetDelistClosePrice(uint64 marketId,int128 price)");
-            let mut buf = Vec::with_capacity(3 * 32);
-            buf.extend_from_slice(&th.0);
+            buf.extend_from_slice(
+                &keccak256("ProposalSetDelistClosePrice(uint64 marketId,int128 price)").0,
+            );
             buf.extend_from_slice(&encode_u64(*market_id));
             buf.extend_from_slice(&encode_i128(price.raw()));
-            keccak256(&buf)
         }
     }
+    keccak256(&buf)
 }
 
+/// EIP-712 `hashStruct(MarketParams)` (s134 P1: typed).
 fn hash_market_params(p: &MarketParams) -> B256 {
-    let mut buf = Vec::with_capacity(5 * 32);
+    let mut buf = Vec::with_capacity(6 * 32);
+    buf.extend_from_slice(&keccak256(market_params_type!()).0);
     buf.extend_from_slice(&encode_i128(p.tick_size.raw()));
     buf.extend_from_slice(&encode_i128(p.lot_size.raw()));
     buf.extend_from_slice(&encode_u64(p.max_leverage as u64));
@@ -814,8 +863,10 @@ fn hash_market_params(p: &MarketParams) -> B256 {
     keccak256(&buf)
 }
 
+/// EIP-712 `hashStruct(MarketListing)` (s134 P1: typed).
 fn hash_market_listing(l: &MarketListing) -> B256 {
-    let mut buf = Vec::with_capacity(6 * 32);
+    let mut buf = Vec::with_capacity(7 * 32);
+    buf.extend_from_slice(&keccak256(market_listing_type!()).0);
     buf.extend_from_slice(&encode_string(&l.base_asset));
     buf.extend_from_slice(&encode_string(&l.quote_asset));
     buf.extend_from_slice(&encode_i128(l.tick_size.raw()));
