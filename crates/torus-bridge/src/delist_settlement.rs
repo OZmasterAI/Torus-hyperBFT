@@ -26,7 +26,9 @@
 //!      vault ([`liq::settle_flat_deficit`], D9). The vault and the ADL
 //!      escrows are not walked: the vault is the counterparty and ends
 //!      holding exactly minus the escrows' positions (flat without ADL rows),
-//!      which the ADL drain closes against it.
+//!      which the ADL drain closes against it at the obligations' stored
+//!      prices (a governance-delisted market needs no fresh mark there:
+//!      settled at a stale price, its oracle may never return).
 //!   4. Bounded: at most `scan` traders visited and `close` positions closed
 //!      per block, across all settling markets (ascending market id). A cut
 //!      walk stores the last visited trader as the cursor; the next block
