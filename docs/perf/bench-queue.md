@@ -972,6 +972,18 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    full-save spike (`exec_save_books_seconds` at %100 heights), hash cost per block (flush `state_hash_seconds` and
    entries), RSS; and confirm every node's h_n agrees (no hash mismatch / fail-stop lines). Pass: B within noise of A;
    B clearly beats C on the deep book.
+   **Done s75 (ozarchy-9g, section 120; one binary `53a6d83c` node `43f04f6a`, 14 / 14 cells rc 0 ACCEPT / AGREE /
+   PASS, startup lines re-checked on 42 / 42 nodes, 0 mismatch / fail-stop / panic lines, no foreign-CPU rerun; tools
+   from main `9f8fb795` + the branch's `genesis_cache.py`, two drivers chained, fresh standard genesis at 100k
+   accounts): **passes the queue rule.** Deep B / A matched/s 0.997 [0.867, 1.147], blocks/s 16.39 vs 16.37, p50 13 vs
+   13 ms, every step <= 1.5 sd. Deep B / C matched/s 1.167 [1.129, 1.207], blocks/s 3.40 -> 16.39 (4.82x), p50 204 ->
+   13 ms, exec on-CPU per 1k fills 0.767 [0.686, 0.857], CPU-s 0.908, save_order_books 58.4 -> 1.30 ms per block, hash
+   59.6 -> 2.41 ms per hashed block (flush worker), RSS -32%. Exec-path rule B / A: standard exec on-CPU per 1k fills
+   1.0086 [1.0074, 1.0099] (CI above 1, +0.9%; the price of hash on vs off, not of L6.1; B beats C on every row);
+   deep 1.015 [0.84, 1.22] unresolved; blocks/s, p50, p99 CIs span 1. Window-close histogram empty in B by design;
+   B's %100 save (~59-64 ms deep, 32-128 ms buckets, one per %100 height) replaces A's close (67 ms). h_n not compared
+   value for value (no attest key, 0 attestations): equal hash entries and heights on 3 / 3 nodes in all 8 hash-on
+   cells.**
 9h. **L2.1 microbench on a quiet host (one-off, owner s131)** (next free gap; ~30 min; NOT a node bench: an in-process
    `cargo test --release` microbench). 18c's numbers are too noisy (load ~100). Binaries/branches: `perf/l21-streamed-settle`
    at `0323b755` (before wake-up batching) and `39f8c7f3` (batched wake-ups, merged with main be1c378d), built in a separate

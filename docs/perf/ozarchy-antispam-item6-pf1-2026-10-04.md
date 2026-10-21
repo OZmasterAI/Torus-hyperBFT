@@ -18627,6 +18627,243 @@ pass B 4.36 / 5.20 / 5.12. P17 off 54.67, on 49.94, pass B 4.15 / 6.06.
   `exe-md5.txt`, `raw/p<n>-<block>.log`, `contention-main.tsv`); driver and parser
   `ozarchy-9h-tools/{9h-campaign.sh,9h-parse.py,build-9h.sh,h9-contention.py}`.
 
+## 120. Step 9g, L6.1 window-committed books with the running state hash on: one binary `perf/l61-window-books` `53a6d83c` (L3.1 merge `e1106362` + L6.1), every arm `TORUS_SETTLE_NO_MERGE=1` by env, A = hash off, L3.1 on vs B = `STATE_HASH_ACTIVATION=1 BOOK_WINDOW_COMMIT=1` (genesis), L3.1 on vs C = `STATE_HASH_ACTIVATION=1`, `TORUS_BOOK_COALESCE=0`, Classic, 15 s checkpoints, no EVM load, deep (8i P1M) and standard shapes, A B C C B A per shape, 300 s cells, n = 2 (campaign ozarchy-9g, archy, 2026-10-21)
+
+**L6.1 passes the queue rule. On the deep book, B (hash on + L6.1 + L3.1) runs at A's speed (hash off + L3.1):
+matched/s 0.997 [0.867, 1.147], native blocks/s 16.39 vs 16.37 (1.000), block p50 13 ms in both, p99 608 vs 619 ms.
+Every B - A step is within 1.5 pooled sd. B clearly beats C (hash on, L3.1 off): matched/s 1.167 [1.129, 1.207]
+(228.7k -> 266.9k), blocks/s 3.40 -> 16.39 (4.82x), p50 204 -> 13 ms (0.065 [0.055, 0.076]), exec-thread on-CPU per
+1k fills 0.767 [0.686, 0.857], CPU-s per 1M fills 0.908 [0.868, 0.950], save_order_books 58.4 -> 1.30 ms per block,
+hash 59.6 -> 2.41 ms per hashed block (flush worker), RSS mean 6.6 -> 4.5 GB. Every B - C step is 12-401 pooled sd.
+Standard: B / C blocks/s 1.097 [1.037, 1.161], exec on-CPU 0.933 [0.883, 0.986]. Under the exec-path merge rule, B / A
+fails one row on standard: exec-thread on-CPU per 1k fills 1.0086 [1.0074, 1.0099] (+0.9%, 1.8 sd, the two rounds
+1.0085 / 1.0087). Blocks/s, p50 and p99 CIs span 1 on both shapes. On deep the same row is 1.015 [0.84, 1.22]
+(not resolved). This is the cost of the hash being on vs off, not a regression against today's hash-on path (C).
+The %100 full save in B (~59-64 ms on deep, 32-128 ms buckets) takes the place of A's window close (67 ms mean):
+about the same size, at the same heights.**
+
+Question (bench queue step 9g, owner s131): L3.1 needs the running state hash off (section 117, 9e: deep blocks/s
+3.50 -> 15.23). L6.1 (genesis `consensus.book_window_commit`) hashes the order-book CF only at %100 heights, where every
+book is written and hashed. h_n then no longer depends on node-local checkpoint windows, and L3.1 can run with the hash
+on. Pass: B within noise of A; B clearly beats C on the deep book.
+
+### 120.1 Setup
+
+* Spec: `docs/perf/bench-queue.md` entry 9g.
+* Binary: one build of `perf/l61-window-books` `53a6d83c` (L3.1 merge `e1106362` + L6.1; L3.3, option 0, exec-hash on),
+  worktree `wt/9g-53a6d83c`, fresh target `~/.cargo-target-9g`, plain `release --locked`, one package at a time, clang
+  + mold. Node md5 `43f04f6ab10b0d8da37073260d31e6ec` on 3 / 3 nodes in all 14 cells (re-checked from
+  `node-environ-trie.txt` against `ozarchy-9g-stage/build/md5s.txt`); bench `c4aa84fb`, flood `dd59d50d`. The branch
+  predates main's L2.2 default-on, so every arm sets `TORUS_SETTLE_NO_MERGE=1`.
+* Arms (node env + genesis): **A** = `TORUS_BOOK_COALESCE` unset (L3.1 on), no `state_hash_activation` (hash off);
+  this is 9e's B. **B** = L3.1 on, genesis `STATE_HASH_ACTIVATION=1 BOOK_WINDOW_COMMIT=1`. **C** =
+  `TORUS_BOOK_COALESCE=0` (kill switch), genesis `STATE_HASH_ACTIVATION=1`, no book window commit (today's hash-on
+  baseline). `STATE_HASH_ACTIVATION` and `BOOK_WINDOW_COMMIT` are run-cell genesis knobs; the node reads neither.
+* Shapes: **deep** = 8i P1M, 1M-account genesis root `a644d0a7` (`BULK_COUNT=PRELOAD=1000000`). **standard** = 100,000
+  bulk accounts, no preload. Load on every `cell=` / `bench:` line: 300 markets, rate 76,000, 5,000 senders, batch 400,
+  cloid share 0, `MAX_IN_FLIGHT` 4, commit tail. Classic (`book_mode=classic`, `TORUS_BOOK_ROWS` unset), 15 s
+  checkpoints (code default), no byte cap, custody 0, no EVM load.
+* Order per shape: w1 (A, 120 s, warm-up gate), then A B C C B A at 300 s, n = 2 per arm. Deep 06:50-08:01, standard
+  08:01-08:43.
+* **Deviations from the launcher template:**
+  * `genesis_cache.py` is frozen from the branch, not main. The rest of the tools are frozen from main `9f8fb795`
+    (`ozarchy-9g-tools/{deep,standard}/tools/matched-bench`). The branch file keys the genesis on
+    `BOOK_WINDOW_COMMIT`; without it B and C would share one genesis. Three distinct cache keys per shape
+    (`ozarchy-9g-run/{deep,std}/genesis-cache/`). The harness worktree is the branch worktree (its `run-cell.sh` and
+    `gen-3val-genesis.sh` carry `BOOK_WINDOW_COMMIT`).
+  * Two drivers (deep, then standard only if deep exits 0) are chained in one unit (`9g-chain.sh`).
+  * The standard genesis was built fresh by main's `testnet/gen-weighted-genesis.sh` at `BULK_COUNT` 100000
+    (29,325,623 bytes). The older z2 standard file came from another base and generator, so it was not reused.
+* Cells: `~/bench-results-matched/ozarchy-9g-{deep,std}-{w1,r1-A,r1-B,r1-C,r2-C,r2-B,r2-A}`. Smokes (60 s):
+  `ozarchy-9g-deep-smoke-s0` (B), `ozarchy-9g-deepc-smoke-s0` (C), `ozarchy-9g-std-smoke-s0` (B). The first deep smoke
+  attempt failed two wrong check expects and is kept as `ozarchy-9g-deep-smoke-s0.attempt1-checkfail`.
+
+### 120.2 Validity
+
+* 14 / 14 cells rc 0, ACCEPT / AGREE / PASS, 0 panic or fail-stop lines in `summary.json`. Both end passes: 7 cells, 0
+  failed. No CELL-FLAG, no rerun.
+* Startup lines, re-checked by hand in all 42 node logs (`val<i>.log.gz`, ANSI stripped; the per-cell checks did not
+  grep them):
+  * B: `activation=Some(1)`, `L6.1 window-committed books (chain config) on=Some(1)` and `L3.1 coalesced Classic book
+    save ON`, on 3 / 3 nodes in all 4 cells.
+  * C: `activation=Some(1)`, with no L6.1 line and no ON line.
+  * A (incl. w1): `activation=None`, with no L6.1 line and the ON line present.
+  * run.log genesis block: `state_hash_activation = 1` in B and C, `= off` in A; `book_window_commit = on (L6.1)` in
+    B only.
+  * `node-env-all.txt`: `TORUS_SETTLE_NO_MERGE=1` on 3 / 3 everywhere; `TORUS_BOOK_COALESCE=0` on 3 / 3 in C, absent
+    in A and B.
+* Hash and failure lines: each of the 42 logs has exactly one hit, the config line `running state hash fail-stop
+  (TORUS_STATE_HASH_FAILSTOP) on=false`. There are 0 `STATE HASH MISMATCH`, `diverged`, `hash-unverified`,
+  `FAIL-STOP`, `panicked` or ` ERROR ` lines.
+* h_n agreement, as far as the artifacts show it:
+  * In all 8 hash-on cells, `torus_state_hash_entries_total` and `torus_state_hash_height` are identical on the 3 nodes
+    at metrics-after (e.g. deep r1-B 56,290,122 entries at 6200, r1-C 46,465,540 at 2600, std r2-B 56,980,464 at 5900).
+    `torus_state_hash_unverified` and `_no_quorum` are 0 on every node, and block hash and state digest AGREE.
+  * **Limit:** `torus_state_hash_attestations_submitted` is 0 on every node (the harness gives no
+    `--state-hash-attest-key`), so the on-chain quorum comparison never ran, and fail-stop was off. No artifact holds
+    the h_n values themselves. Equal entry counts at the same height are necessary for equal h_n, not sufficient.
+* FOREIGN CPU rule (`contention-main.tsv`, 30 s samples whose midpoint lies in the `t_bench0`-`t_bench1` window, per
+  process): no foreign or nice >= 10 process averaged over 0.1 core or peaked over 0.5 core in any of the 14 cells.
+  The largest are claude 0.053 avg / 0.088 max in deep w1 and 0.020 / 0.074 in std r1-B. Foreign total per window is
+  0.028-0.105 core. No rerun.
+
+### 120.3 Per cell (run order; node mean)
+
+Block p50 / p99: `torus_commit_interval_seconds` histogram in `buckets.csv`, load-window delta, interpolated in the
+bucket, node mean (as in sections 116-117). `phase-val<i>.csv` holds 1 Hz cumulative counters, not per-block rows, so it
+cannot give a block p99.
+
+| cell | arm | matched/s | native blk/s | fills/blk | exec block ms | block p50 / p99 ms | CPU-s / 1M | exec on-CPU ms / 1k fills | save_order_books ms / blk | hash ms / native blk | timeouts | RSS mean / max MB |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| deep w1 | A | 268,159 | 15.415 | 15,054 | | 12 / 725 | 22.74 | 2.406 | 0.63 | 0 | 2 | 4,552 / 5,435 |
+| deep r1 | A | 266,160 | 16.442 | 15,242 | 52.0 | 14 / 581 | 23.47 | 2.425 | 0.68 | 0 | 2 | 4,502 / 5,633 |
+| deep r1 | B | 268,360 | 15.606 | 16,138 | 54.8 | 13 / 676 | 23.45 | 2.425 | 1.32 | 2.52 | 1 | 4,559 / 5,576 |
+| deep r1 | C | 230,549 | 3.396 | 65,052 | 276.7 | 204 / 1,497 | 25.92 | 3.189 | 58.16 | 78.61 | 4 | 6,689 / 8,252 |
+| deep r2 | C | 226,837 | 3.403 | 63,414 | 271.7 | 204 / 1,528 | 26.04 | 3.209 | 58.68 | 80.21 | 2 | 6,592 / 7,995 |
+| deep r2 | B | 265,428 | 17.182 | 14,570 | 51.2 | 13 / 541 | 23.73 | 2.484 | 1.27 | 2.42 | 4 | 4,416 / 5,442 |
+| deep r2 | A | 269,100 | 16.300 | 15,516 | 52.2 | 13 / 657 | 23.10 | 2.411 | 0.68 | 0 | 0 | 4,520 / 5,329 |
+| std w1 | A | 278,775 | 16.301 | 14,947 | | 14 / 583 | 21.73 | 2.315 | 0.57 | 0 | 0 | 3,477 / 4,225 |
+| std r1 | A | 274,209 | 16.799 | 15,464 | 50.3 | 14 / 562 | 22.31 | 2.348 | 0.63 | 0 | 0 | 3,405 / 4,249 |
+| std r1 | B | 272,422 | 16.493 | 15,448 | 51.0 | 14 / 561 | 22.64 | 2.368 | 0.68 | 1.87 | 0 | 3,408 / 4,454 |
+| std r1 | C | 268,373 | 15.096 | 16,411 | 57.1 | 14 / 658 | 23.08 | 2.527 | 3.06 | 5.97 | 0 | 3,573 / 4,347 |
+| std r2 | C | 267,506 | 15.192 | 16,365 | 57.3 | 14 / 667 | 23.41 | 2.527 | 3.09 | 5.94 | 1 | 3,588 / 4,657 |
+| std r2 | B | 270,399 | 16.746 | 15,226 | 49.4 | 13 / 599 | 22.61 | 2.348 | 0.67 | 1.80 | 0 | 3,450 / 4,257 |
+| std r2 | A | 273,121 | 16.851 | 15,241 | 49.5 | 14 / 554 | 22.39 | 2.328 | 0.63 | 0 | 0 | 3,510 / 4,125 |
+
+Drift: A's matched/s is flat across each shape's campaign (deep w1 / r1 / r2 268.2k / 266.2k / 269.1k; standard r1 /
+r2 274.2k / 273.1k). In standard every arm's r2 is 0.3-0.7% below its r1; the A B C C B A order cancels a linear
+trend. Deep B's blocks/s spread (15.61 / 17.18) is the widest replicate spread, and it drives the wide blocks/s CIs.
+
+### 120.4 Arm means and ratios (ratio = geomean of the 2 per-round ratios, 95% t CI, 1 df; step / pooled sd over the 3 arms)
+
+**Deep (8i P1M)**
+
+| metric | A | B | C | B / A [95% CI] | B - A / sd | B / C [95% CI] | B - C / sd | C / A [95% CI] |
+|---|---|---|---|---|---|---|---|---|
+| matched/s | 267,630 | 266,894 | 228,693 | 0.997 [0.867, 1.147] | -0.3 | **1.167 [1.129, 1.207]** | +16.8 | 0.855 [0.719, 1.016] |
+| native blocks/s | 16.371 | 16.394 | 3.399 | 1.000 [0.51, 1.95] | +0.0 | **4.82 [2.65, 8.76]** | +20.1 | 0.208 [0.194, 0.222] |
+| fills per native block | 15,379 | 15,354 | 64,233 | 0.997 | -0.0 | 0.239 [0.147, 0.389] | -52 | 4.18 |
+| block p50 ms | 13 | 13 | 204 | 0.998 [0.71, 1.40] | -0.1 | **0.065 [0.055, 0.076]** | -401 | 15.4 [9.4, 25.4] |
+| block p99 ms | 619 | 608 | 1,513 | 0.979 [0.11, 8.79] | -0.2 | 0.400 [0.085, 1.87] | -14.0 | 2.45 [1.28, 4.69] |
+| timeouts per 1k native blocks | 0.20 (2 / 9,921) | 0.50 (5 / 9,919) | 2.91 (6 / 2,060) | | +0.3 | | -2.9 | |
+| **exec-thread on-CPU ms per 1k fills** | 2.418 | 2.454 | 3.199 | 1.015 [0.841, 1.225] | +1.4 | **0.767 [0.686, 0.857]** | -28.8 | 1.323 [1.225, 1.428] |
+| CPU-s per 1M fills | 23.28 | 23.59 | 25.98 | 1.013 [0.849, 1.209] | +1.5 | **0.908 [0.868, 0.950]** | -12.2 | 1.116 [0.978, 1.273] |
+| exec block ms | 52.1 | 53.0 | 274.2 | 1.017 [0.64, 1.60] | +0.4 | 0.193 [0.141, 0.265] | -88 | 5.27 |
+| save_order_books ms per native block | 0.68 | 1.30 | 58.42 | 1.907 [1.562, 2.329] | +2.9 | 0.0222 [0.016, 0.030] | -265 | 85.9 |
+| hash ms per native block (flush `state_hash_seconds`) | 0 | 2.47 | 79.41 | | | 0.031 [0.021, 0.045] | -118 | |
+| hash ms per hashed block | 0 | 2.41 | 59.61 | | | 0.041 [0.029, 0.056] | -122 | |
+| hash entries per hashed block | 0 | 10,207 | 27,708 | | | 0.368 [0.215, 0.631] | -51 | |
+| L3.1 window closes per node (mean ms) | 51.0 (67.0) | 0 | 0 | | | | | |
+| skipped book encodes per native block | 119.2 | 117.5 | 0 | 0.986 [0.908, 1.072] | -1.1 | | | |
+| save_order_books calls > 32 ms per node | 0 | 54.2 | 980.5 | | | 0.055 [0.030, 0.101] | -411 | |
+| RSS mean / max MB | 4,511 / 5,481 | 4,487 / 5,509 | 6,641 / 8,123 | 0.995 [0.79, 1.25] (mean) | -0.3 | **0.676 [0.605, 0.754]** (mean) | -30.4 | 1.472 [1.309, 1.655] |
+
+**Standard (100,000 accounts)**
+
+| metric | A | B | C | B / A [95% CI] | B - A / sd | B / C [95% CI] | B - C / sd | C / A [95% CI] |
+|---|---|---|---|---|---|---|---|---|
+| matched/s | 273,665 | 271,411 | 267,939 | 0.992 [0.970, 1.014] | -2.2 | 1.013 [0.986, 1.041] | +3.5 | 0.979 [0.975, 0.984] |
+| native blocks/s | 16.825 | 16.619 | 15.144 | 0.988 [0.915, 1.067] | -1.8 | **1.097 [1.037, 1.161]** | +13.1 | 0.900 [0.882, 0.919] |
+| fills per native block | 15,352 | 15,337 | 16,388 | 0.999 | -0.1 | 0.936 | -8.1 | 1.067 |
+| block p50 ms | 14 | 14 | 14 | 0.987 [0.78, 1.26] | -0.8 | 0.961 [0.75, 1.22] | -2.7 | 1.028 [1.027, 1.029] |
+| block p99 ms | 558 | 580 | 663 | 1.039 [0.63, 1.72] | +1.4 | 0.875 [0.62, 1.23] | -5.1 | 1.188 [1.004, 1.406] |
+| timeouts per 1k native blocks | 0 (0 / 10,179) | 0 (0 / 10,088) | 0.11 (1 / 9,162) | | | | | |
+| **exec-thread on-CPU ms per 1k fills** | 2.338 | 2.358 | 2.527 | **1.0086 [1.0074, 1.0099]** | +1.8 | **0.933 [0.883, 0.986]** | -14.7 | 1.081 [1.022, 1.144] |
+| CPU-s per 1M fills | 22.35 | 22.62 | 23.25 | 1.012 [0.980, 1.045] | +2.0 | 0.973 [0.882, 1.074] | -4.5 | 1.040 [0.973, 1.112] |
+| exec block ms | 49.9 | 50.2 | 57.2 | 1.006 [0.90, 1.12] | +0.4 | 0.877 [0.70, 1.10] | -9.8 | 1.147 [1.023, 1.286] |
+| save_order_books ms per native block | 0.63 | 0.67 | 3.08 | 1.071 [1.041, 1.103] | +3.3 | 0.219 [0.188, 0.255] | -175 | 4.89 |
+| hash ms per native block (flush `state_hash_seconds`) | 0 | 1.84 | 5.96 | | | | -146 | |
+| hash ms per hashed block | 0 | 1.80 | 5.84 | | | 0.309 [0.250, 0.381] | -145 | |
+| hash entries per hashed block | 0 | 10,298 | 11,026 | | | | -9.9 | |
+| L3.1 window closes per node (mean ms) | 51.0 (4.9) | 0 | 0 | | | | | |
+| skipped book encodes per native block | 121.6 | 118.3 | 0 | | -6.0 | | | |
+| save_order_books calls > 32 ms per node | 0 | 0.2 | 1.2 | | | | | |
+| RSS mean / max MB | 3,458 / 4,187 | 3,429 / 4,355 | 3,580 / 4,502 | 0.992 [0.88, 1.11] (mean) | -0.6 | 0.958 [0.910, 1.009] (mean) | -3.2 | 1.036 [0.876, 1.224] |
+
+**Window close and the %100 full save (load window, node mean):**
+
+* `torus_exec_book_coalesce_close_seconds` has samples only in A. Deep: 51.0 closes per node per cell, mean 65.9 /
+  68.1 ms, p99 180 / 212 ms. Standard: 51.0 closes, mean 4.8 / 5.0 ms, p99 18 / 27 ms. 51 per 300 s = one per 100
+  blocks: as in section 117, the 100-block checkpoint bound fires before 15 s at these block rates.
+* In B the histogram is empty **by design**, not by failure. At each %100 height L6.1 has already written every book
+  (`book_window_full` clears the unsaved set before the upkeep), so the close finds nothing owed and observes nothing.
+  B's window cost is therefore read from `torus_exec_book_coalesce_skipped_total` (deep 117.5 skipped encodes per
+  block vs A's 119.2: coalescing works as in A) and from the %100 save inside `exec_save_books_seconds`.
+* %100 full save, B deep: 54.2 save calls over 32 ms per node (r1: 35.0 in 32-64 ms, 16.3 in 64-128 ms, 0.3 in 128-256;
+  r2: 37.0 / 19.3 / 0.3), against 47.0 / 52.3 %100 heights per node in the window. That is one slow save per %100
+  height and none elsewhere (A: 0 calls over 32 ms). Size: B's save_order_books per block exceeds A's by 0.64 / 0.59
+  ms (r1 / r2). Over 100 blocks this is ~64 / ~59 ms per %100 save, assuming B's other saves cost as much as A's.
+  Standard: ~0.04 ms per block -> ~4 ms per %100 save, under 32 ms in all but 0.2 calls per node.
+* The 1 Hz `metrics-1hz` series cannot resolve single %100 saves: block rate swings between ~4 and ~50 per second,
+  so there is no per-call baseline. The bucket counts and the per-block step are the measure used here.
+* C has no %100 spike of its own. Every block writes and hashes the dirty books: deep 980.5 save calls over 32 ms per
+  node, about every block.
+
+### 120.5 Verdict
+
+* **Pass rule: B within noise of A (deep: high confidence; standard: medium).**
+  * Deep: every headline B - A step is within 1.5 pooled sd, and every CI spans 1: matched/s -0.3%, blocks/s 1.000,
+    p50 equal, p99 -2.1%, exec on-CPU +1.5%, CPU-s +1.3%. Deep timeouts 0.50 vs 0.20 per 1k blocks (5 vs 2 events,
+    0.3 sd).
+  * Standard: matched/s -0.8% (-2.2 sd, CI [0.970, 1.014]) and blocks/s -1.2% (-1.8 sd, CI [0.915, 1.067]) lean to A
+    but are not resolved at n = 2.
+* **Pass rule: B clearly beats C on the deep book (high confidence).**
+  * matched/s +16.7% [12.9, 20.7], blocks/s 4.82x, p50 204 -> 13 ms, p99 0.40x (CI spans 1 at 1 df; 14 sd), timeouts
+    2.91 -> 0.50 per 1k blocks, exec on-CPU per fill -23%, CPU-s per 1M -9%, RSS -32%. Each step is 12-401 pooled sd
+    and both rounds agree.
+  * Standard: blocks/s +9.7% [3.7, 16.1], exec on-CPU -6.7% [1.4, 11.7], p99 -12.5% (not resolved), matched/s +1.3%
+    (not resolved).
+* **Exec-path merge rule, B / A.**
+  * Standard fails the CPU row. Exec-thread on-CPU per 1k fills is 1.0086 [1.0074, 1.0099]: a CI above 1. It is +0.02
+    ms per 1k fills, about +0.31 ms per block. The CI is narrow because the two rounds agree to 0.0002 (1 df), and
+    the step is 1.8 pooled sd.
+  * Deep: 1.015 [0.84, 1.22], not resolved.
+  * Blocks/s, p50 and p99 CIs span 1 on both shapes; timeouts are 0 vs 0 on standard and 5 vs 2 events on deep.
+  * B / A compares the hash on vs off, so this row prices the running state hash, not L6.1. Against today's
+    hash-on path (C), B passes every row on both shapes (exec on-CPU 0.767 deep, 0.933 standard; blocks/s, p50,
+    CPU-s at or below C).
+  * Whether a +0.9% exec-thread cost for hash on is acceptable is the owner's call, not this rule's (the rule was
+    written for exec-path code changes).
+* **Mechanism, sized.**
+  * The hash itself runs on the flush worker (`exec_pipeline.rs` `digest_on_worker` observes `state_hash_seconds`),
+    not on the exec thread. Its 2.41 ms per hashed block in B (deep) and 1.80 (standard) is not in exec on-CPU.
+  * In C it is 59.6 ms per hashed block on deep with 27.7k entries per hashed block, against 10.2k in B. L6.1 cuts the
+    hashed entries 2.7x on deep and the hash time 25x, because B skips the book CF on 99 of 100 blocks.
+  * B's exec-thread extra on standard (+0.31 ms per block) is not explained by its save step (~+0.04 ms per block,
+    ~13%), and A's own close (4.9 ms per 100 blocks, ~0.05 ms per block) offsets that. Writing the hash-on write set
+    on the exec thread is a candidate this run does not time.
+  * On deep, B's %100 save (~59-64 ms) stands where A's window close (67 ms mean; on the exec thread, section 117)
+    stands. Same work, same heights, so the save step (+0.62 ms per block) and the close it replaces net to about
+    zero. The +1.5% exec on-CPU step (1.4 sd) stays unattributed and within noise.
+  * B vs C is section 117's mechanism with the hash on: C writes 300 dirty books every block (58.4 ms per block,
+    274 ms exec blocks). B writes each book once per 100 blocks.
+* **Against the references (other binary and campaign):**
+  * Deep A reproduces 9e's B (section 117, L3.1 on, hash off): matched/s 267.6k vs 267.0k, blocks/s 16.37 vs 15.23,
+    p50 13 vs 13 ms, exec on-CPU 2.418 vs 2.416, CPU-s 23.28 vs 23.30, save_order_books 0.68 vs 0.71 ms, close mean
+    67.0 vs 68 ms.
+  * Deep C sits near 9e's A (L3.1 off, hash off): matched/s 228.7k vs 234.9k (-2.6%), blocks/s 3.40 vs 3.50, p50 204
+    vs 191 ms, exec on-CPU 3.199 vs 3.156, save 58.4 vs 56.4 ms. With L3.1 off, the hash on the flush worker costs
+    the deep book little; the book write on the exec thread is the bound.
+
+### 120.6 Limits and data
+
+* n = 2 per arm, 1 df: the blocks/s (deep), p99 and RSS CIs are wide; deep B's blocks/s replicates differ by 10%.
+  Timeout counts are small (2 / 5 / 6 events on deep).
+* h_n was not compared value for value: no attestation key in the harness (0 attestations submitted), fail-stop off.
+  The evidence is equal hash entry counts and heights on 3 / 3 nodes, 0 mismatch / divergence / unverified lines,
+  and block hash and state digest AGREE. A cell with `--state-hash-attest-key` on every validator would make the
+  on-chain quorum check run.
+* The %100 save size is an estimate: the per-block save step x 100, cross-checked by the histogram bucket counts. No
+  per-height save timer exists.
+* Sections 117 / 116 are another binary and campaign; their columns are indicative only.
+* Analysis: `~/bench-results-matched/ozarchy-9g-tools/analyst/g9-analyse.py` (adapted from `9e-analyse.py`; three
+  arms, hash and close rows, save-books bucket tail), outputs `9g-deep.txt` and `9g-std.txt`. Contention:
+  `g9-foreign.py` -> `9g-foreign.txt`. Log scan: `9g-logscan.txt`.
+* Campaign: `~/bench-results-matched/ozarchy-9g-run/` (`campaign.log`, `campaign.done`, `handoff.json`,
+  `contention-main.tsv`, `{deep,std}/cells.tsv`, `{deep,std}/genesis-cache/`); drivers and specs
+  `ozarchy-9g-tools/{9g-chain.sh,ozarchy-9g-{deep,std}-campaign.sh,spec-{deep,std}.json,g9-contention.py}`; build
+  `ozarchy-9g-stage/build/`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
