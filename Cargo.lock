@@ -7145,6 +7145,7 @@ dependencies = [
  "tokio",
  "torus-core",
  "torus-economics",
+ "torus-evm",
  "torus-state",
  "torus-telemetry",
  "torus-types",

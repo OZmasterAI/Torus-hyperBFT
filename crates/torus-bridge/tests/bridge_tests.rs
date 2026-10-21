@@ -379,6 +379,104 @@ fn proposer_and_genesis_header_carry_the_scheduled_feature_bits() {
     );
 }
 
+/// Prague with `RunningStateHash` (id 0): a stand-in for a future spec
+/// feature (this binary's built-in rule has no upgrade).
+const PRAGUE_WITH_BIT_0: torus_evm::EvmSpecRule = torus_evm::EvmSpecRule {
+    base: torus_evm::SpecId::CANCUN,
+    upgrades: &[(
+        torus_types::Feature::RunningStateHash,
+        torus_evm::SpecId::PRAGUE,
+    )],
+};
+
+/// A signed call with 1000 nonzero calldata bytes at gas limit 50000: valid
+/// under Cancun (intrinsic 37000), invalid from Prague (EIP-7623 floor 61000).
+fn build_signed_floor_tx(sk: &SigningKey, nonce: u64, max_fee_per_gas: u128) -> Vec<u8> {
+    let tx = TxEip1559 {
+        chain_id: TORUS_CHAIN_ID,
+        nonce,
+        gas_limit: 50_000,
+        max_fee_per_gas,
+        max_priority_fee_per_gas: 0,
+        to: TxKind::Call(Address::new([0xBB; 20])),
+        value: U256::ZERO,
+        access_list: Default::default(),
+        input: Bytes::from(vec![0xffu8; 1000]),
+    };
+    use alloy_consensus::SignableTransaction;
+    let sig_hash = tx.signature_hash();
+    let sig = sign_prehash(sk, sig_hash);
+    encode_envelope(alloy_consensus::TxEnvelope::Eip1559(tx.into_signed(sig)))
+}
+
+/// P0.0 phase 2: execution runs at the spec of the executed header's bits.
+/// The validator has no schedule of its own: the same block validates under
+/// Cancun without the bit and fails (strict) / skips the tx (catch-up, the
+/// committed path) under Prague with it. The proposer executes at the bits it
+/// stamps. RED before phase 2: every path ran at Cancun.
+#[test]
+fn execution_runs_at_the_spec_of_the_header_bits() {
+    use torus_types::{ActivationSchedule, Feature};
+    let rsh = Feature::RunningStateHash.bit();
+    let mut h = TestHarness::new();
+    h.executor = EvmExecutor::with_spec_rule(TORUS_CHAIN_ID, PRAGUE_WITH_BIT_0);
+    let sk = test_signing_key(7);
+    let alice = signing_key_address(&sk);
+    h.db.put_account(&alice, &test_account(U256::from(10u128.pow(19))))
+        .unwrap();
+    let tx = build_signed_floor_tx(&sk, 0, h.parent_header.base_fee_per_gas as u128);
+    let proposer = Address::with_last_byte(0xFF);
+
+    let proposed = h.propose(vec![tx.clone()], proposer);
+    assert_eq!(proposed.block.header.features, 0);
+    assert_eq!(proposed.block.header.evm_tx_count, 1, "bits 0: Cancun");
+    h.validator
+        .validate_block(&proposed.block, &h.db, &h.executor)
+        .expect("bits 0: valid at Cancun");
+
+    let mut with_bit = proposed.block.clone();
+    with_bit.header.features = rsh;
+    assert!(
+        h.validator
+            .validate_block(&with_bit, &h.db, &h.executor)
+            .is_err(),
+        "header bit: Prague, the floor tx is invalid"
+    );
+    let catchup = h
+        .validator
+        .validate_block_for_catchup(
+            &with_bit,
+            torus_bridge::EvmReads::Db(&h.db),
+            &h.executor,
+            torus_bridge::RootMode::Skip,
+        )
+        .unwrap();
+    assert!(catchup.receipts.is_empty(), "committed path skips it");
+    let overlay = torus_state::StateOverlay::new(h.db.clone());
+    assert!(
+        h.validator
+            .validate_block_with_overlay(
+                &with_bit,
+                &overlay,
+                &h.db,
+                &Default::default(),
+                &h.executor
+            )
+            .is_err(),
+        "overlay path: Prague"
+    );
+
+    let from_1 = ActivationSchedule::merge(&[(Feature::RunningStateHash, 1)].into_iter().collect(), &[])
+        .unwrap();
+    let b = BlockProposer::new(TORUS_CHAIN_ID, 100, 4, Address::ZERO, Address::ZERO)
+        .with_activations(from_1)
+        .build_block(&h.db, &h.executor, &h.parent_header, vec![tx], 1_000_000, proposer)
+        .unwrap()
+        .block;
+    assert_eq!(b.header.features, rsh);
+    assert_eq!(b.header.evm_tx_count, 0, "the proposer runs at the bits it stamps");
+}
+
 // 5. Multi-block chain — state carries forward
 #[test]
 fn multi_block_chain() {

@@ -144,6 +144,7 @@ fn evm_block(db: &StateDb, number: u64, txs: Vec<TxEnv>) -> Vec<bool> {
         beneficiary: BENEFICIARY,
         gas_limit: 30_000_000,
         base_fee: 0,
+        features: 0,
     };
     let result = EvmExecutor::new(TORUS_CHAIN_ID)
         .execute_block(db, &cfg, txs, false)
@@ -323,6 +324,7 @@ fn deposit_in_errored_evm_block_credits_nothing_next_block() {
         beneficiary: BENEFICIARY,
         gas_limit: 100_000,
         base_fee: 0,
+        features: 0,
     };
     let mut dep = deposit(ALICE, wei(300), 0);
     dep.gas_limit = 100_000;
@@ -359,6 +361,7 @@ fn replayed_deposit_block_credits_native_exactly_once() {
         beneficiary: BENEFICIARY,
         gas_limit: 30_000_000,
         base_fee: 0,
+        features: 0,
     };
     // First execution: result dropped (crash before the bundle commit).
     let crashed = EvmExecutor::new(TORUS_CHAIN_ID)

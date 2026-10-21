@@ -505,6 +505,7 @@ fn run_tx(db: &StateDb, code: &[u8], data: &[u8], reps: u64) -> (u64, Vec<f64>, 
         beneficiary: Address::with_last_byte(0xFE),
         gas_limit: E2E_GAS,
         base_fee: 0,
+        features: 0,
     };
     let mut ms = Vec::new();
     let mut gas = 0;

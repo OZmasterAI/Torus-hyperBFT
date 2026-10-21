@@ -21,6 +21,8 @@ tokio = { workspace = true }
 torus-telemetry = { workspace = true }
 # Fix (b): intrinsic gas / EIP-3860 initcode limit computed by revm itself.
 revm = { workspace = true }
+# P0.0 phase 2: the EVM spec of the next height (`EvmSpecRule`, `intrinsic_gas_for`).
+torus-evm = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

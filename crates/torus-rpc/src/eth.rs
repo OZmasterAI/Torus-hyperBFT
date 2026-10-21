@@ -275,6 +275,7 @@ fn block_env_from_header(header: &TorusBlockHeader) -> BlockEnvCfg {
         beneficiary: header.proposer,
         gas_limit: header.evm_gas_limit,
         base_fee: header.base_fee_per_gas,
+        features: 0,
     }
 }
 
@@ -1231,7 +1232,10 @@ impl EthApiServer for RpcState {
         // the cap's tx with only the limit changed (same defaulted nonce).
         let mut lo: u64 = result
             .gas_used
-            .max(torus_evm::intrinsic_gas(&tx_env))
+            .max(torus_evm::intrinsic_gas(
+                &tx_env,
+                self.executor.spec_at(block_env.features),
+            ))
             .max(21_000)
             - 1;
         while lo + 1 < hi {

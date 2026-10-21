@@ -1635,6 +1635,10 @@ struct ExecutionContext {
     /// every native context in `mode` with the resident holder attached.
     #[cfg(test)]
     test_book_mode: Option<torus_bridge::native_executor::BookMode>,
+    /// Test-only (P0.0 phase 2): `(height, ctx.features)` of every native
+    /// context the pipeline built, in execution order.
+    #[cfg(test)]
+    test_exec_features: std::sync::Mutex<Vec<(u64, u128)>>,
     /// Test-only: with `test_book_mode` set, build the contexts WITHOUT the
     /// resident holder (the per-block reload, `TORUS_RESIDENT_BOOKS=0`).
     #[cfg(test)]
@@ -5506,6 +5510,11 @@ impl ExecutionContext {
             ctx.metrics = self.metrics.clone();
             ctx.evm_fee_window = fee_window;
             ctx.evm_gas = evm_gas;
+            #[cfg(test)]
+            self.test_exec_features
+                .lock()
+                .unwrap()
+                .push((torus_block.header.height, ctx.features));
             // Plan 9.8: the test-only reference paths (bridge feature
             // `test-reference-paths`, enabled by this crate's dev-dependency).
             #[cfg(test)]
@@ -7722,6 +7731,8 @@ impl TorusApp {
             test_ckpt_due: None,
             #[cfg(test)]
             test_book_mode: None,
+            #[cfg(test)]
+            test_exec_features: Default::default(),
             #[cfg(test)]
             test_no_resident: false,
             #[cfg(test)]
@@ -16973,6 +16984,8 @@ mod crash_recovery_tests {
             #[cfg(test)]
             test_book_mode: None,
             #[cfg(test)]
+            test_exec_features: Default::default(),
+            #[cfg(test)]
             test_no_resident: false,
             #[cfg(test)]
             test_no_resident_rows: false,
@@ -25730,6 +25743,87 @@ mod crash_recovery_tests {
                 assert_eq!(ctx.exec_failed.load(Ordering::SeqCst), fails, "{what}");
                 let applied = if fails { 1 } else { 3 };
                 assert_eq!(read_native_applied_height(&db), Some(applied), "{what}");
+            }
+        }
+    }
+
+    /// P0.0 phase 2: a call with 1000 nonzero calldata bytes at gas limit 50000
+    /// from `key`: valid under Cancun (intrinsic 37000), invalid from Prague
+    /// (EIP-7623 floor 61000).
+    fn floor_tx(key: &k256::ecdsa::SigningKey, nonce: u64) -> Vec<u8> {
+        let to = alloy_primitives::TxKind::Call(Address::repeat_byte(0x42));
+        signed_eip1559_gas(key, nonce, to, vec![0xff; 1000], U256::ZERO, 50_000)
+    }
+
+    /// P0.0 phase 2: execution and crash replay run each committed block at
+    /// its stored header's bits, not at this node's schedule: the native
+    /// context gets the header's `features`, and the EVM runs at the spec of
+    /// those bits (here a rule moving to Prague with bit 0, under which the
+    /// floor tx is skipped). Both ways: a node without the feature executes a
+    /// header carrying it, and a node scheduling it executes a header without
+    /// it, by the header. RED before phase 2: the native context saw 0 and
+    /// the EVM ran at Cancun whatever the header said.
+    #[test]
+    fn execution_and_replay_run_at_the_header_bits_not_the_local_schedule() {
+        const PRAGUE_WITH_BIT_0: torus_evm::EvmSpecRule = torus_evm::EvmSpecRule {
+            base: torus_evm::SpecId::CANCUN,
+            upgrades: &[(
+                torus_types::Feature::RunningStateHash,
+                torus_evm::SpecId::PRAGUE,
+            )],
+        };
+        let rsh = torus_types::Feature::RunningStateHash.bit();
+        let key = k256::ecdsa::SigningKey::from_slice(&[83u8; 32]).unwrap();
+        let sender = {
+            let pubkey = key.verifying_key().to_encoded_point(false);
+            Address::from_slice(&alloy_primitives::keccak256(&pubkey.as_bytes()[1..])[12..])
+        };
+        for (own, bits) in [
+            (torus_types::ActivationSchedule::default(), rsh),
+            (rsh_at(2), 0),
+        ] {
+            for replay in [false, true] {
+                let what = format!("own {own:?}, header bits {bits:#x}, replay={replay}");
+                let (mut config, db) = make_test_config_and_db();
+                config.activations = own.clone();
+                db.put_account(
+                    &sender,
+                    &revm::state::AccountInfo {
+                        balance: U256::from(10u128.pow(18)),
+                        nonce: 0,
+                        code_hash: KECCAK_EMPTY_CODE,
+                        code: None,
+                        account_id: None,
+                    },
+                )
+                .unwrap();
+                let mut ctx = make_exec_ctx(&config, &db);
+                ctx.evm_executor = EvmExecutor::with_spec_rule(config.chain_id, PRAGUE_WITH_BIT_0);
+                let mut blocks = vec![make_block(1, vec![]), make_block(2, vec![])];
+                blocks[1].evm_transactions = vec![floor_tx(&key, 0)];
+                blocks[1].header.evm_tx_count = 1;
+                blocks[1].header.features = bits;
+                link_blocks(&mut blocks);
+                if replay {
+                    for b in &blocks {
+                        persist_committed_block_durably(&db, b);
+                    }
+                    let (last, parked) = TorusApp::replay_committed(&db, &ctx);
+                    assert_eq!(parked, None, "{what}");
+                    assert_eq!(last.height, 2, "{what}");
+                } else {
+                    for b in &blocks {
+                        let durable = persist_committed_block_durably(&db, b);
+                        ctx.execute_committed_block_with(b, vec![], durable);
+                    }
+                }
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}");
+                let seen = ctx.test_exec_features.lock().unwrap().clone();
+                assert_eq!(seen.last(), Some(&(2, bits)), "{what}: native ctx bits");
+                drop(ctx);
+                let nonce = db.get_account(&sender).unwrap().map_or(0, |a| a.nonce);
+                let included = bits & rsh == 0;
+                assert_eq!(nonce, u64::from(included), "{what}: EVM spec of the header bits");
             }
         }
     }

@@ -101,6 +101,7 @@ impl BlockProposer {
             beneficiary: proposer,
             gas_limit,
             base_fee: next_base_fee,
+            features: 0,
         };
 
         // 4. Execute EVM transactions (skip invalid — don't abort block for one bad tx).

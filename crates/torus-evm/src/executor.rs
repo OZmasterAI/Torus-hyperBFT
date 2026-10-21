@@ -70,23 +70,72 @@ impl<CTX> Inspector<CTX> for NativeJournalInspector {
     }
 }
 
+/// P0.0 phase 2 (docs/plans/p00-activation-height-gating.md): the EVM spec as
+/// a function of a block's feature bits. `base` runs with no upgrade active;
+/// each `(feature, spec)` raises the spec from the height the feature switches
+/// on (the highest active one wins). Execution takes the bits from the header
+/// of the block it runs (`BlockEnvCfg::features`), never from node config, so
+/// replay runs each height at the spec it was agreed under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EvmSpecRule {
+    /// The spec with no upgrade active.
+    pub base: SpecId,
+    /// Spec upgrades, each gated by a feature.
+    pub upgrades: &'static [(torus_types::Feature, SpecId)],
+}
+
+impl EvmSpecRule {
+    /// The spec a block with `features` runs at.
+    pub fn spec(&self, features: u128) -> SpecId {
+        let _ = features;
+        self.base
+    }
+}
+
+/// The spec rule built into this binary: Cancun, no upgrade scheduled. A
+/// release that moves the EVM to a later spec adds a feature and a row here.
+pub const BUILTIN_EVM_SPEC_RULE: EvmSpecRule = EvmSpecRule {
+    base: SpecId::CANCUN,
+    upgrades: &[],
+};
+
 /// The EVM spec every execution here runs at (blocks, eth_call,
 /// eth_estimateGas).
 const EVM_SPEC: SpecId = SpecId::CANCUN;
 
-/// Least gas limit revm accepts for `tx` before execution, at the spec the
-/// executor runs: the intrinsic gas (21000 / 53000 base, calldata, access
-/// list, authorizations) and, from Prague, the EIP-7623 calldata floor.
-/// The same computation as revm's `validate_initial_tx_gas`, so a limit
-/// below it fails with `EvmError::IntrinsicGasTooLow` and one at or above
-/// it never does.
-pub fn intrinsic_gas(tx: &TxEnv) -> u64 {
-    let gas = revm::interpreter::instructions::calculate_initial_tx_gas_for_tx(tx, EVM_SPEC);
-    if EVM_SPEC.is_enabled_in(SpecId::PRAGUE) {
+/// Least gas limit revm accepts for `tx` before execution at `spec`: the
+/// intrinsic gas (21000 / 53000 base, calldata, access list, authorizations)
+/// and, from Prague, the EIP-7623 calldata floor. The same computation as
+/// revm's `validate_initial_tx_gas`, so a limit below it fails with
+/// `EvmError::IntrinsicGasTooLow` and one at or above it never does.
+pub fn intrinsic_gas(tx: &TxEnv, spec: SpecId) -> u64 {
+    let gas = revm::interpreter::instructions::calculate_initial_tx_gas_for_tx(tx, spec);
+    if spec.is_enabled_in(SpecId::PRAGUE) {
         gas.initial_gas.max(gas.floor_gas)
     } else {
         gas.initial_gas
     }
+}
+
+/// [`intrinsic_gas`] from a tx's parts (mempool admission: `input`, create or
+/// call, access-list accounts and storage keys; no authorizations).
+pub fn intrinsic_gas_for(
+    spec: SpecId,
+    input: &[u8],
+    is_create: bool,
+    access_list_accounts: u64,
+    access_list_storage_keys: u64,
+) -> u64 {
+    let _ = spec;
+    revm::context_interface::cfg::gas::calculate_initial_tx_gas(
+        EVM_SPEC,
+        input,
+        is_create,
+        access_list_accounts,
+        access_list_storage_keys,
+        0,
+    )
+    .initial_gas
 }
 
 /// Default block gas limit (30M).
@@ -100,6 +149,9 @@ pub struct BlockEnvCfg {
     pub beneficiary: Address,
     pub gas_limit: u64,
     pub base_fee: u64,
+    /// P0.0 phase 2: the feature bits of the block's header (`features`); the
+    /// spec the block runs at is the executor's [`EvmSpecRule`] of them.
+    pub features: u128,
 }
 
 impl Default for BlockEnvCfg {
@@ -110,6 +162,7 @@ impl Default for BlockEnvCfg {
             beneficiary: Address::ZERO,
             gas_limit: DEFAULT_BLOCK_GAS_LIMIT,
             base_fee: 0,
+            features: 0,
         }
     }
 }
@@ -192,12 +245,28 @@ pub struct CoreWriterOrigin {
 /// as a [`BundleState`] for the caller to commit.
 pub struct EvmExecutor {
     chain_id: u64,
+    /// P0.0 phase 2: block feature bits -> spec ([`BUILTIN_EVM_SPEC_RULE`]).
+    spec_rule: EvmSpecRule,
 }
 
 impl EvmExecutor {
-    /// Create an executor for the given chain ID.
+    /// Create an executor for the given chain ID, at this binary's spec rule.
     pub fn new(chain_id: u64) -> Self {
-        Self { chain_id }
+        Self::with_spec_rule(chain_id, BUILTIN_EVM_SPEC_RULE)
+    }
+
+    /// [`Self::new`] with another spec rule (tests of a spec switch; a node
+    /// always runs [`BUILTIN_EVM_SPEC_RULE`]).
+    pub fn with_spec_rule(chain_id: u64, spec_rule: EvmSpecRule) -> Self {
+        Self {
+            chain_id,
+            spec_rule,
+        }
+    }
+
+    /// The spec a block with feature bits `features` runs at.
+    pub fn spec_at(&self, features: u128) -> SpecId {
+        self.spec_rule.spec(features)
     }
 
     /// Execute a single transaction against the given state.
@@ -785,6 +854,71 @@ fn map_evm_err<DB: core::fmt::Debug>(err: EVMError<DB, InvalidTransaction>) -> E
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rule that moves to Prague with `RunningStateHash` (id 0): a stand-in
+    /// for a future spec feature (the built-in rule has no upgrade).
+    const PRAGUE_WITH_BIT_0: EvmSpecRule = EvmSpecRule {
+        base: SpecId::CANCUN,
+        upgrades: &[(torus_types::Feature::RunningStateHash, SpecId::PRAGUE)],
+    };
+
+    /// P0.0 phase 2: the spec is a function of the bits, and the bits are the
+    /// schedule's at each height, so the spec switches exactly at the
+    /// activation height. RED before phase 2: the spec never left the base.
+    #[test]
+    fn evm_spec_switches_exactly_at_the_activation_height() {
+        let schedule = torus_types::ActivationSchedule::merge(
+            &[(torus_types::Feature::RunningStateHash, 5)].into_iter().collect(),
+            &[],
+        )
+        .unwrap();
+        let rule = PRAGUE_WITH_BIT_0;
+        for (height, want) in [
+            (1, SpecId::CANCUN),
+            (4, SpecId::CANCUN),
+            (5, SpecId::PRAGUE),
+            (6, SpecId::PRAGUE),
+            (u64::MAX, SpecId::PRAGUE),
+        ] {
+            assert_eq!(rule.spec(schedule.active_at(height)), want, "height {height}");
+        }
+        // The highest active upgrade wins; other bits do not matter.
+        let two = EvmSpecRule {
+            base: SpecId::SHANGHAI,
+            upgrades: &[
+                (torus_types::Feature::RunningStateHash, SpecId::PRAGUE),
+                (torus_types::Feature::RunningStateHash, SpecId::CANCUN),
+            ],
+        };
+        assert_eq!(two.spec(0), SpecId::SHANGHAI);
+        assert_eq!(two.spec(1), SpecId::PRAGUE);
+        assert_eq!(two.spec(1 << 9), SpecId::SHANGHAI);
+        // This binary: Cancun at every bitmap.
+        for bits in [0, 1, u128::MAX] {
+            assert_eq!(BUILTIN_EVM_SPEC_RULE.spec(bits), SpecId::CANCUN, "{bits:#x}");
+            assert_eq!(EvmExecutor::new(TORUS_CHAIN_ID).spec_at(bits), SpecId::CANCUN);
+        }
+        let ex = EvmExecutor::with_spec_rule(TORUS_CHAIN_ID, rule);
+        assert_eq!(ex.spec_at(0), SpecId::CANCUN);
+        assert_eq!(ex.spec_at(1), SpecId::PRAGUE);
+    }
+
+    /// The intrinsic gas follows the spec: from Prague the EIP-7623 calldata
+    /// floor (1000 nonzero bytes: 21000 + 40 * 1000 = 61000, Cancun 37000).
+    #[test]
+    fn intrinsic_gas_follows_the_spec() {
+        let input = vec![0xffu8; 1000];
+        let tx = TxEnv {
+            data: input.clone().into(),
+            kind: revm::primitives::TxKind::Call(Address::repeat_byte(0xbb)),
+            ..Default::default()
+        };
+        assert_eq!(intrinsic_gas(&tx, SpecId::CANCUN), 37_000);
+        assert_eq!(intrinsic_gas(&tx, SpecId::PRAGUE), 61_000);
+        assert_eq!(intrinsic_gas_for(SpecId::CANCUN, &input, false, 0, 0), 37_000);
+        assert_eq!(intrinsic_gas_for(SpecId::PRAGUE, &input, false, 0, 0), 61_000);
+        assert_eq!(intrinsic_gas_for(SpecId::PRAGUE, &[], false, 1, 2), 21_000 + 2400 + 3800);
+    }
 
     #[test]
     fn calc_effective_gas_price_legacy() {
