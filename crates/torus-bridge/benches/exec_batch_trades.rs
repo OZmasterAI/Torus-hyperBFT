@@ -64,11 +64,9 @@ fn bench_trades(c: &mut Criterion, name: &str, defer: bool) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = StateDb::open(dir.path()).expect("open db");
     // Pre-testnet P0 (main d78ea41b): orders on an unlisted market are
-    // rejected (`UnknownMarket`), so list the bench market(s) first.
-    for m in [MARKET] {
-        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed")
-            .unwrap();
-    }
+    // rejected (`UnknownMarket`), so list the bench market first.
+    db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &MARKET.to_be_bytes(), b"listed")
+        .unwrap();
 
     // Fund senders once, directly in RocksDB (overlay writes are never
     // flushed, so the DB stays clean across iterations).
