@@ -438,7 +438,6 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    use borsh::BorshSerialize;
 
     use crate::block_tree::accessors::internal::{BlockTreeSingleton, BlockTreeWriteBatch};
     use crate::block_tree::pluggables::{KVGet, KVStore, WriteBatch};
@@ -550,7 +549,7 @@ mod tests {
         set: &ValidatorSet,
     ) -> PhaseCertificate {
         let v = ViewNumber::new(view);
-        let message = (CHAIN_ID, v, block, Phase::Generic).try_to_vec().unwrap();
+        let message = crate::types::signing::phase_vote_bytes(CHAIN_ID, v, &block, Phase::Generic);
         let mut signatures = SignatureSet::new(set.len());
         for sk in signers {
             let vk: VerifyingKey = sk.verifying_key();
@@ -649,6 +648,7 @@ mod tests {
             block_justify: h7.justify.clone(),
             block_data_hash: h7.data_hash,
             view: ViewNumber::new(900),
+            leader_signature: crate::types::data_types::SignatureBytes::new([0; 64]),
         };
         bt.set_local_tip(&tip).unwrap();
         let tc = TimeoutCertificate {

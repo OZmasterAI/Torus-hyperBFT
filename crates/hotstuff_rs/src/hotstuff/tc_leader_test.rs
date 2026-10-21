@@ -16,7 +16,6 @@
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use borsh::BorshSerialize;
 
 use crate::app::{
     App, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest, ValidateBlockResponse,
@@ -36,7 +35,10 @@ use crate::pacemaker::types::{TimeoutCertificate, TimeoutVoteCollector, TipInfo}
 use crate::types::block::Block;
 use crate::types::crypto_primitives::{Keypair, SigningKey};
 use crate::types::data_types::{BlockHeight, ChainID, CryptoHash, Data, SignatureSet, ViewNumber};
+use crate::pacemaker::select_leader;
+use crate::test_keys::key_of;
 use crate::types::signed_messages::Collector;
+use crate::types::signing::{phase_vote_bytes, sign_proposal_header};
 use crate::types::validator_set::ValidatorSet;
 
 const CHAIN_ID: ChainID = ChainID::new(0);
@@ -82,7 +84,7 @@ fn qc(view: u64, block: &Block) -> PhaseCertificate {
 /// A quorum-signed PC of `phase` (as the collector forms it).
 fn pc_with_phase(view: u64, block: &Block, phase: Phase) -> PhaseCertificate {
     let set = set();
-    let message = (CHAIN_ID, ViewNumber::new(view), block.hash, phase).try_to_vec().unwrap();
+    let message = phase_vote_bytes(CHAIN_ID, ViewNumber::new(view), &block.hash, phase);
     let mut signatures = SignatureSet::new(set.len());
     for key in &keys()[..3] {
         let pos = set.position(&key.verifying_key()).unwrap();
@@ -96,13 +98,18 @@ fn h() -> Block {
     Block::new(BlockHeight::new(1), qc(2, &g()), CryptoHash::new([51; 32]), Data::new(vec![]))
 }
 
+/// The tip of a voter that voted for `block` proposed at `view` by
+/// leader(`view`) (F2: a signed header).
 fn tip(block: &Block, view: u64) -> TipInfo {
+    let view = ViewNumber::new(view);
+    let leader = key_of(&select_leader(view, &set()));
     TipInfo {
         block_hash: block.hash,
         block_height: block.height,
         block_justify: block.justify.clone(),
         block_data_hash: block.data_hash,
-        view: ViewNumber::new(view),
+        view,
+        leader_signature: sign_proposal_header(&leader, CHAIN_ID, view, &block.hash),
     }
 }
 
@@ -325,7 +332,7 @@ fn case5_waits_for_the_tip_instead_of_a_fresh_proposal() {
     let response = ProposalResponse {
         chain_id: CHAIN_ID,
         view: ViewNumber::new(VIEW),
-        proposal: Proposal { chain_id: CHAIN_ID, view: ViewNumber::new(VIEW), block: x.clone(), tc: Some(the_tc), nec: None },
+        block: x.clone(),
     };
     let origin = keys()[0].verifying_key();
     l.hotstuff
@@ -530,7 +537,7 @@ mod review {
         let response = ProposalResponse {
             chain_id: CHAIN_ID,
             view: ViewNumber::new(VIEW),
-            proposal: Proposal { chain_id: CHAIN_ID, view: ViewNumber::new(VIEW), block: x.clone(), tc: Some(the_tc), nec: None },
+            block: x.clone(),
         };
         let origin = keys()[0].verifying_key();
         l.hotstuff
@@ -566,11 +573,11 @@ mod review {
         }
     }
 
-    fn response_for(x: &Block, the_tc: &TimeoutCertificate) -> ProposalResponse {
+    fn response_for(x: &Block, _the_tc: &TimeoutCertificate) -> ProposalResponse {
         ProposalResponse {
             chain_id: CHAIN_ID,
             view: ViewNumber::new(VIEW),
-            proposal: Proposal { chain_id: CHAIN_ID, view: ViewNumber::new(VIEW), block: x.clone(), tc: Some(the_tc.clone()), nec: None },
+            block: x.clone(),
         }
     }
 

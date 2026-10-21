@@ -616,6 +616,7 @@ mod poller_routes_tests {
             tc: None,
             nec: None,
             has_validator_set_updates: false,
+            leader_signature: crate::types::data_types::SignatureBytes::new([0; 64]),
         }
         .into()
     }
@@ -714,6 +715,7 @@ mod progress_message_buffer_tests {
             tc: None,
             nec: None,
             has_validator_set_updates: false,
+            leader_signature: crate::types::data_types::SignatureBytes::new([0; 64]),
         }.into()
     }
 
@@ -867,6 +869,7 @@ mod genesis_body_filter_tests {
                 chain_id: ChainID::new(0), view: ViewNumber::new(1), block_hash: parent.hash,
                 height: parent.height, data_hash: parent.data_hash, justify: parent.justify.clone(),
                 tc: None, nec: None, has_validator_set_updates: false,
+                leader_signature: crate::types::data_types::SignatureBytes::new([0; 64]),
             }));
             for msg in [response(forged_hash), response(wrong_height), response(non_genesis), wrong_request, wrong_header] {
                 assert!(!is_chain_neutral_genesis_body(&msg));

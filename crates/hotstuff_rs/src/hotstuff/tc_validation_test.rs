@@ -20,8 +20,6 @@
 
 use std::sync::mpsc::Receiver;
 
-use borsh::BorshSerialize;
-
 use crate::app::{
     App, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest, ValidateBlockResponse,
 };
@@ -35,7 +33,10 @@ use crate::hotstuff::implementation::HotStuff;
 use crate::hotstuff::messages::{BlockDataResponse, HotStuffMessage, Proposal, ProposalHeader};
 use crate::hotstuff::types::{NoEndorsementCertificate, PhaseCertificate};
 use crate::pacemaker::messages::PacemakerMessage;
+use crate::pacemaker::select_leader;
 use crate::pacemaker::types::{TimeoutCertificate, TimeoutVoteCollector, TipInfo};
+use crate::test_keys::{key_of, signed_by, tip_signed_by};
+use crate::types::signing::no_endorsement_bytes;
 use crate::types::block::Block;
 use crate::types::crypto_primitives::{Keypair, SigningKey, VerifyingKey};
 use crate::types::data_types::{
@@ -70,13 +71,26 @@ fn block(tag: u8) -> Block {
     Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(), CryptoHash::new([tag; 32]), Data::new(vec![]))
 }
 
+/// The tip of a voter that voted for `block` proposed at `view` by
+/// leader(`view`) (F2: a signed header).
 fn tip(block: &Block, view: u64) -> TipInfo {
-    TipInfo {
-        block_hash: block.hash,
-        block_height: block.height,
-        block_justify: block.justify.clone(),
-        block_data_hash: block.data_hash,
+    let leader = select_leader(ViewNumber::new(view), &validator_set(&keys()));
+    tip_signed_by(header_of(block, view), &leader)
+}
+
+/// The unsigned header announcing `block` at `view` (sign it before sending).
+fn header_of(block: &Block, view: u64) -> ProposalHeader {
+    ProposalHeader {
+        chain_id: CHAIN_ID,
         view: ViewNumber::new(view),
+        block_hash: block.hash,
+        height: block.height,
+        data_hash: block.data_hash,
+        justify: block.justify.clone(),
+        tc: None,
+        nec: None,
+        has_validator_set_updates: false,
+        leader_signature: SignatureBytes::new([0; 64]),
     }
 }
 
@@ -120,7 +134,7 @@ fn reproposal_tc(tip_block: &Block) -> TimeoutCertificate {
 fn nec(view: u64, high_tip_qc_view: u64) -> NoEndorsementCertificate {
     let keys = keys();
     let set = validator_set(&keys);
-    let message = (ViewNumber::new(view), ViewNumber::new(high_tip_qc_view)).try_to_vec().unwrap();
+    let message = no_endorsement_bytes(CHAIN_ID, ViewNumber::new(view), ViewNumber::new(high_tip_qc_view));
     let mut signatures = SignatureSet::new(set.len());
     for key in &keys[..3] {
         let pos = set.position(&key.verifying_key()).unwrap();
@@ -171,18 +185,8 @@ fn header_path_votes_on(
     tc: Option<TimeoutCertificate>,
     nec: Option<NoEndorsementCertificate>,
 ) -> bool {
-    let header = ProposalHeader {
-        chain_id: CHAIN_ID,
-        view: ViewNumber::new(VIEW),
-        block_hash: block.hash,
-        height: block.height,
-        data_hash: block.data_hash,
-        justify: block.justify.clone(),
-        tc,
-        nec,
-        has_validator_set_updates: false,
-    };
     let leader = r.leader;
+    let header = signed_by(ProposalHeader { tc, nec, ..header_of(block, VIEW) }, &leader);
     r.hotstuff
         .on_receive_msg(HotStuffMessage::ProposalHeader(header), &leader, &mut r.tree, &mut ValidApp)
         .unwrap();
@@ -205,8 +209,8 @@ fn full_path_votes_on(
     tc: Option<TimeoutCertificate>,
     nec: Option<NoEndorsementCertificate>,
 ) -> bool {
-    let proposal = Proposal { chain_id: CHAIN_ID, view: ViewNumber::new(VIEW), block: block.clone(), tc, nec };
     let leader = r.leader;
+    let proposal = Proposal::signed(&key_of(&leader), CHAIN_ID, ViewNumber::new(VIEW), block.clone(), tc, nec);
     r.hotstuff
         .on_receive_msg(HotStuffMessage::Proposal(proposal), &leader, &mut r.tree, &mut ValidApp)
         .unwrap();
@@ -471,17 +475,7 @@ fn header_path_checks_the_tc_against_the_header_view() {
         let mut r = replica();
         let vss = r.tree.validator_set_state().unwrap();
         let leader = proposer_for(ViewNumber::new(header_view), &keys, &vss, &r.tree);
-        let header = ProposalHeader {
-            chain_id: CHAIN_ID,
-            view: ViewNumber::new(header_view),
-            block_hash: b.hash,
-            height: b.height,
-            data_hash: b.data_hash,
-            justify: b.justify.clone(),
-            tc: Some(tc),
-            nec: None,
-            has_validator_set_updates: false,
-        };
+        let header = signed_by(ProposalHeader { tc: Some(tc), ..header_of(&b, header_view) }, &leader);
         r.hotstuff
             .on_receive_msg(HotStuffMessage::ProposalHeader(header), &leader, &mut r.tree, &mut ValidApp)
             .unwrap();
@@ -497,7 +491,7 @@ fn header_path_checks_the_tc_against_the_header_view() {
 
 /// An NEC signed by `signers` of `set`, for `view` over `high_tip_qc_view`.
 fn nec_signed_by(signers: &[SigningKey], set: &ValidatorSet, view: u64, high_tip_qc_view: u64) -> NoEndorsementCertificate {
-    let message = (ViewNumber::new(view), ViewNumber::new(high_tip_qc_view)).try_to_vec().unwrap();
+    let message = no_endorsement_bytes(CHAIN_ID, ViewNumber::new(view), ViewNumber::new(high_tip_qc_view));
     let mut signatures = SignatureSet::new(set.len());
     for key in signers {
         let pos = set.position(&key.verifying_key()).unwrap();
@@ -537,13 +531,13 @@ fn nec_from_either_active_set_is_valid_during_a_validator_set_change() {
     let from_other = nec_signed_by(&other_keys[..3], &other_set, VIEW, 1);
 
     let transition = tree(false);
-    assert!(valid_nec(&from_new, &transition).unwrap(), "committed-set NEC (what the leader collects)");
-    assert!(valid_nec(&from_old, &transition).unwrap(), "previous-set NEC");
-    assert!(!valid_nec(&from_other, &transition).unwrap(), "NEC from neither set");
+    assert!(valid_nec(&from_new, CHAIN_ID, &transition).unwrap(), "committed-set NEC (what the leader collects)");
+    assert!(valid_nec(&from_old, CHAIN_ID, &transition).unwrap(), "previous-set NEC");
+    assert!(!valid_nec(&from_other, CHAIN_ID, &transition).unwrap(), "NEC from neither set");
 
     let decided = tree(true);
-    assert!(valid_nec(&from_new, &decided).unwrap(), "committed-set NEC after the update is decided");
-    assert!(!valid_nec(&from_old, &decided).unwrap(), "previous-set NEC after the update is decided");
+    assert!(valid_nec(&from_new, CHAIN_ID, &decided).unwrap(), "committed-set NEC after the update is decided");
+    assert!(!valid_nec(&from_old, CHAIN_ID, &decided).unwrap(), "previous-set NEC after the update is decided");
 }
 
 // ---------------------------------------------------------------------------

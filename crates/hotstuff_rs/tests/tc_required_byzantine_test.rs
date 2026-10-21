@@ -16,7 +16,6 @@ use std::{
     time::Duration,
 };
 
-use borsh::BorshSerialize;
 use ed25519_dalek::Signer;
 
 use hotstuff_rs::{
@@ -299,17 +298,10 @@ fn tail_fork_attempt_fresh_block_without_tc_is_rejected() {
 // Byzantine voter with a forged high QC (phase-A open question 2).
 // ---------------------------------------------------------------------------
 
-/// The bytes a TimeoutVote signs (hotstuff_rs `TimeoutVote::build_message_bytes`).
+/// The bytes a TimeoutVote signs.
 fn timeout_vote_bytes(vote: &hotstuff_rs::pacemaker::messages::TimeoutVote) -> Vec<u8> {
-    let mut bytes = (vote.chain_id, vote.view).try_to_vec().unwrap();
-    if let Some(tip) = &vote.local_tip {
-        bytes.extend_from_slice(&tip.block_hash.bytes());
-    }
-    if let Some(qc) = &vote.highest_qc {
-        bytes.extend_from_slice(&qc.view.int().to_be_bytes());
-        bytes.extend_from_slice(&qc.block.bytes());
-    }
-    bytes
+    let (tip, qc) = vote.signed_summaries();
+    hotstuff_rs::types::signing::timeout_vote_bytes(vote.chain_id, vote.view, tip, qc)
 }
 
 /// The byzantine validator `byz` stays silent as leader (so the view after

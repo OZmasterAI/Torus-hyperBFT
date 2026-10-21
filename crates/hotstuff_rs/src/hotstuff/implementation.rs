@@ -8,7 +8,6 @@
 //!
 //! Main type: [`HotStuff`].
 
-use borsh::BorshSerialize;
 use std::{
     collections::{HashSet, VecDeque},
     sync::mpsc::Sender,
@@ -800,13 +799,7 @@ impl<N: Network> HotStuff<N> {
                 .block(&block_hash)?
                 .ok_or(BlockTreeError::BlockExpectedButNotFound { block: block_hash })?;
 
-            let proposal = Proposal {
-                chain_id: self.config.chain_id,
-                view: self.view_info.view,
-                block,
-                tc,
-                nec: None,
-            };
+            let proposal = Proposal::signed(&self.config.keypair.0, self.config.chain_id, self.view_info.view, block, tc, None);
 
             self.broadcast_proposal_as_header(&proposal, true, block_tree);
 
@@ -954,13 +947,7 @@ impl<N: Network> HotStuff<N> {
             self.process_update_result(update_result, block_tree, app);
             None
         };
-        let proposal = Proposal {
-            chain_id: self.config.chain_id,
-            view: self.view_info.view,
-            block,
-            tc,
-            nec: None,
-        };
+        let proposal = Proposal::signed(&self.config.keypair.0, self.config.chain_id, self.view_info.view, block, tc, None);
         self.broadcast_proposal_as_header(&proposal, has_validator_set_updates, block_tree);
         let own_header = deferred
             .is_some()
@@ -1064,13 +1051,14 @@ impl<N: Network> HotStuff<N> {
             if let Some(ref tip) = tc.high_tip {
                 // Case 4: leader has the block — repropose.
                 if let Some(block) = block_tree.block(&tip.block_hash)? {
-                    return Ok(TcProposal::Repropose(Box::new(Proposal {
-                        chain_id: self.config.chain_id,
-                        view: self.view_info.view,
+                    return Ok(TcProposal::Repropose(Box::new(Proposal::signed(
+                        &self.config.keypair.0,
+                        self.config.chain_id,
+                        self.view_info.view,
                         block,
-                        tc: Some(tc.clone()),
-                        nec: None,
-                    })));
+                        Some(tc.clone()),
+                        None,
+                    ))));
                 }
 
                 // Case 5: leader lacks the block — initiate RECOVER (Algorithm 7).
@@ -1133,6 +1121,7 @@ impl<N: Network> HotStuff<N> {
                     recovered: None,
                     tc: tc.clone(),
                     ne_collector: NECollector::new(
+                        self.config.chain_id,
                         self.view_info.view,
                         high_tip_qc_view,
                         validator_set,
@@ -1367,6 +1356,7 @@ impl<N: Network> HotStuff<N> {
         // A valid NEC makes the proposal fresh regardless of tc.high_tip_is_winner.
         // The header-first path runs the same check.
         if !valid_proposal_certificates(
+            self.config.chain_id,
             self.view_info.view,
             &proposal.block.hash,
             &proposal.block.justify,
@@ -1524,14 +1514,7 @@ impl<N: Network> HotStuff<N> {
                 // For fresh proposals: tip is the proposal itself.
                 // For reproposals: tip is tc.high_tip (paper Alg 6, line 15).
                 if !proposal.is_reproposal() && vote_phase == Phase::Generic {
-                    use crate::pacemaker::types::TipInfo;
-                    let tip = TipInfo {
-                        block_hash: proposal.block.hash,
-                        block_height: proposal.block.height,
-                        block_justify: proposal.block.justify.clone(),
-                        block_data_hash: proposal.block.data_hash,
-                        view: self.view_info.view,
-                    };
+                    let tip = crate::pacemaker::types::TipInfo::from_proposal(&proposal);
                     block_tree.set_local_tip(&tip)?;
                 } else if proposal.is_reproposal() {
                     // Reproposal: set local_tip to tc.high_tip per paper GetTip().
@@ -1635,6 +1618,7 @@ impl<N: Network> HotStuff<N> {
                     block_justify: nudge.justify.clone(),
                     block_data_hash: block.data_hash,
                     view: self.view_info.view,
+                    leader_signature: crate::types::data_types::SignatureBytes::new([0; 64]),
                 };
                 block_tree.set_local_tip(&tip)?;
             }
@@ -1937,13 +1921,7 @@ impl<N: Network> HotStuff<N> {
                 let response = ProposalResponse {
                     chain_id: req.chain_id,
                     view: req.view,
-                    proposal: Proposal {
-                        chain_id: req.chain_id,
-                        view: req.view,
-                        block,
-                        tc: Some(req.tc.clone()),
-                        nec: None,
-                    },
+                    block,
                 };
                 self.sender_handle
                     .send::<HotStuffMessage>(*origin, response.into());
@@ -1973,7 +1951,7 @@ impl<N: Network> HotStuff<N> {
         // Verify the block matches what the TC expects.
         if let RecoveryState::Recovering { ref tc, .. } = self.recovery_state {
             if let Some(ref tip) = tc.high_tip {
-                if resp.proposal.block.hash != tip.block_hash {
+                if resp.block.hash != tip.block_hash {
                     return Ok(());
                 }
             } else {
@@ -1983,14 +1961,14 @@ impl<N: Network> HotStuff<N> {
 
         // Validate the block before reproposing: check hash/justify correctness
         // and safety invariants (safe_pc, block justify type).
-        if !resp.proposal.block.is_correct(block_tree)? {
+        if !resp.block.is_correct(block_tree)? {
             return Ok(());
         }
-        if !safe_block(&resp.proposal.block, block_tree, self.config.chain_id)? {
+        if !safe_block(&resp.block, block_tree, self.config.chain_id)? {
             return Ok(());
         }
 
-        self.complete_recovery(resp.proposal.block, Instant::now(), block_tree, app)
+        self.complete_recovery(resp.block, Instant::now(), block_tree, app)
     }
 
     /// Re-propose the recovered tip `block` (checked against the TC's high
@@ -2060,13 +2038,14 @@ impl<N: Network> HotStuff<N> {
         };
         self.recovery_state = RecoveryState::None;
 
-        let proposal = Proposal {
-            chain_id: self.config.chain_id,
-            view: self.view_info.view,
+        let proposal = Proposal::signed(
+            &self.config.keypair.0,
+            self.config.chain_id,
+            self.view_info.view,
             block,
-            tc: Some(tc),
-            nec: None,
-        };
+            Some(tc),
+            None,
+        );
         self.broadcast_proposal_as_header(&proposal, has_validator_set_updates, block_tree);
         Event::Propose(ProposeEvent {
             timestamp: SystemTime::now(),
@@ -2151,7 +2130,8 @@ impl<N: Network> HotStuff<N> {
         // Sign (view, high_tip_qc_view) and send NE.
         if let Some(ref tip) = req.tc.high_tip {
             let high_tip_qc_view = tip.block_justify.view;
-            let ne_message_bytes = (req.view, high_tip_qc_view).try_to_vec().unwrap();
+            let ne_message_bytes =
+                crate::types::signing::no_endorsement_bytes(self.config.chain_id, req.view, high_tip_qc_view);
             let signature = self.config.keypair.sign(&ne_message_bytes);
 
             let ne = NEMessage {
@@ -2252,13 +2232,14 @@ impl<N: Network> HotStuff<N> {
 
             let block = Block::new(child_height, high_tip_qc, data_hash, data);
 
-            let proposal = Proposal {
-                chain_id: self.config.chain_id,
-                view: self.view_info.view,
+            let proposal = Proposal::signed(
+                &self.config.keypair.0,
+                self.config.chain_id,
+                self.view_info.view,
                 block,
-                tc: Some(tc),
-                nec: Some(nec),
-            };
+                Some(tc),
+                Some(nec),
+            );
             debug_assert!(
                 carries_required_certificate(proposal.view, &proposal.block.justify, proposal.tc.as_ref()),
                 "NEC proposal without TC(v-1)",
@@ -2357,6 +2338,7 @@ impl<N: Network> HotStuff<N> {
         // The TC/NEC the header carries: the same check as the full-proposal
         // path (re-proposals and NEC proposals travel header-first).
         if !valid_proposal_certificates(
+            self.config.chain_id,
             header.view,
             &header.block_hash,
             &header.justify,
@@ -4092,12 +4074,11 @@ mod sync_recovery_tests {
         }
     }
 
+    /// The header announcing `block` at `view`, signed by leader(`view`) of
+    /// the four seed validators.
     fn recovery_header(block: &Block, view: ViewNumber) -> ProposalHeader {
-        ProposalHeader {
-            chain_id: ChainID::new(0), view, block_hash: block.hash, height: block.height,
-            data_hash: block.data_hash, justify: block.justify.clone(),
-            tc: None, nec: None, has_validator_set_updates: false,
-        }
+        let leader = crate::pacemaker::select_leader(view, &validator_set(&signing_keys(&[1, 2, 3, 4])));
+        crate::test_keys::unsigned_header(ChainID::new(0), block, view).signed(&crate::test_keys::key_of(&leader))
     }
 
     /// s74 rejoin view sync: a replica at `local_view` and leader(`future_view`)'s
@@ -4717,11 +4698,7 @@ mod sync_recovery_tests {
         let mut hotstuff = hotstuff_at(view, keys[0].clone(), vss);
         let good = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
             CryptoHash::new([9; 32]), Data::new(vec![]));
-        let header = ProposalHeader {
-            chain_id: hotstuff.config.chain_id, view, block_hash: good.hash,
-            height: good.height, data_hash: good.data_hash, justify: good.justify.clone(),
-            tc: None, nec: None, has_validator_set_updates: false,
-        };
+        let header = crate::test_keys::signed_by(crate::test_keys::unsigned_header(hotstuff.config.chain_id, &good, view), &origin);
         let mut app = RecoveryApp { calls: 0, valid: true, reject_below: 0 };
         hotstuff.on_receive_msg(header.into(), &origin, &mut tree, &mut app).unwrap();
         for field in 0..3 {
@@ -4763,11 +4740,10 @@ mod sync_recovery_tests {
             let block = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
                 CryptoHash::new([9; 32]), Data::new(vec![]));
             let body = HotStuffMessage::BlockDataResponse(BlockDataResponse { view, block: block.clone() });
-            let header = HotStuffMessage::ProposalHeader(ProposalHeader {
-                chain_id: chain, view, block_hash: block.hash, height: block.height,
-                data_hash: block.data_hash, justify: block.justify.clone(),
-                tc: None, nec: None, has_validator_set_updates: false,
-            });
+            let header = HotStuffMessage::ProposalHeader(crate::test_keys::signed_by(
+                crate::test_keys::unsigned_header(chain, &block, view),
+                &origin,
+            ));
             let messages = if push_first { [body, header] } else { [header, body] };
             let (tx, rx) = std::sync::mpsc::channel();
             let mut receiver = ProgressMessageStub::new(rx, BufferSize::new(1024 * 1024));
@@ -4969,11 +4945,7 @@ mod s63_body_fetch_tests {
         );
         let block = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
             CryptoHash::new([71; 32]), Data::new(vec![]));
-        let header = ProposalHeader {
-            chain_id: ChainID::new(0), view, block_hash: block.hash, height: block.height,
-            data_hash: block.data_hash, justify: block.justify.clone(),
-            tc: None, nec: None, has_validator_set_updates: false,
-        };
+        let header = crate::test_keys::signed_by(crate::test_keys::unsigned_header(ChainID::new(0), &block, view), &origin);
         let mut app = ScriptedApp { calls: 0, missing_left: 0, invalid: false };
         hotstuff.on_receive_msg(header.into(), &origin, &mut tree, &mut app).unwrap();
         assert_eq!(net.take(), vec![origin], "initial request goes to the proposer");
@@ -5243,10 +5215,9 @@ mod s63_body_fetch_tests {
             CryptoHash::new([41; 32]), Data::new(vec![]));
         let child = Block::new(BlockHeight::new(1), generic_pc(v1, parent.hash, &keys, &set),
             CryptoHash::new([42; 32]), Data::new(vec![]));
-        let header = |block: &Block, view| ProposalHeader {
-            chain_id: ChainID::new(0), view, block_hash: block.hash, height: block.height,
-            data_hash: block.data_hash, justify: block.justify.clone(),
-            tc: None, nec: None, has_validator_set_updates: false,
+        let header = |block: &Block, view: ViewNumber| {
+            let origin = if view == v1 { o1 } else { o2 };
+            crate::test_keys::signed_by(crate::test_keys::unsigned_header(ChainID::new(0), block, view), &origin)
         };
         hotstuff.on_receive_msg(header(&parent, v1).into(), &o1, &mut tree, app).unwrap();
         assert_eq!(tree.highest_view_voted().unwrap(), None, "s84: no vote before the body");
@@ -5349,11 +5320,7 @@ mod vote_after_body_tests {
             let hotstuff = hotstuff_at(view, local, vss);
             let block = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
                 CryptoHash::new([51; 32]), Data::new(vec![]));
-            let header = ProposalHeader {
-                chain_id: ChainID::new(0), view, block_hash: block.hash, height: block.height,
-                data_hash: block.data_hash, justify: block.justify.clone(),
-                tc: None, nec: None, has_validator_set_updates: false,
-            };
+            let header = crate::test_keys::signed_by(crate::test_keys::unsigned_header(ChainID::new(0), &block, view), &origin);
             let app = CheckApp { checks: checks.iter().copied().collect(), check_calls: 0, validate };
             Follower { hotstuff, tree, app, block, header, origin, view }
         }
@@ -5477,13 +5444,14 @@ mod vote_after_body_tests {
     }
 
     fn full_proposal(f: &Follower) -> HotStuffMessage {
-        HotStuffMessage::Proposal(Proposal {
-            chain_id: ChainID::new(0),
-            view: f.view,
-            block: f.block.clone(),
-            tc: None,
-            nec: None,
-        })
+        HotStuffMessage::Proposal(Proposal::signed(
+            &crate::test_keys::key_of(&f.origin),
+            ChainID::new(0),
+            f.view,
+            f.block.clone(),
+            None,
+            None,
+        ))
     }
 
     /// T0b (rebase s87): the full-proposal path validates and inserts first,
@@ -5611,7 +5579,7 @@ mod header_resend_tests {
         hotstuff.set_header_resend_interval(interval);
         let block = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
             CryptoHash::new([97; 32]), Data::new(vec![]));
-        let proposal = Proposal { chain_id: ChainID::new(0), view, block, tc: None, nec: None };
+        let proposal = Proposal::signed(&hotstuff.config.keypair.0, ChainID::new(0), view, block, None, None);
         let start = Instant::now();
         hotstuff.broadcast_proposal_as_header(&proposal, false, &tree);
         let header = ProposalHeader::from_proposal(&proposal, false);

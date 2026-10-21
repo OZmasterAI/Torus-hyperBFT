@@ -1889,7 +1889,6 @@ mod fatal_violation_wiring_tests {
 
     #[test]
     fn known_sync_bodies_still_apply_terminal_certificate() {
-        use borsh::BorshSerialize;
         use crate::hotstuff::types::Phase;
         use crate::types::crypto_primitives::Keypair;
         use crate::types::data_types::{SignatureSet, ViewNumber};
@@ -1902,7 +1901,7 @@ mod fatal_violation_wiring_tests {
         let certify = |view: u64, hash| {
             let view = ViewNumber::new(view);
             let mut signatures = SignatureSet::new(1);
-            let message = (CHAIN_ID, view, hash, Phase::Generic).try_to_vec().unwrap();
+            let message = crate::types::signing::phase_vote_bytes(CHAIN_ID, view, &hash, Phase::Generic);
             signatures.set(0, Some(Keypair::new(key.clone()).sign(&message)));
             PhaseCertificate { chain_id: CHAIN_ID, view, block: hash, phase: Phase::Generic, signatures }
         };

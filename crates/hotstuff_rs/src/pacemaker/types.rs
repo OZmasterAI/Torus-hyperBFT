@@ -9,7 +9,10 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use ed25519_dalek::Verifier;
 
-use crate::hotstuff::types::PhaseCertificate;
+use crate::hotstuff::{
+    messages::{Proposal, ProposalHeader},
+    types::PhaseCertificate,
+};
 
 use crate::{
     block_tree::{
@@ -20,11 +23,13 @@ use crate::{
     types::{
         data_types::*,
         signed_messages::{Certificate, Collector},
+        signing::{timeout_vote_bytes, QcSummary, TipSummary},
         validator_set::*,
     },
 };
 
-/// Compact representation of a block header for timeout messages (MonadBFT).
+/// A replica's tip: the signed header of the latest fresh proposal it voted for (MonadBFT;
+/// docs/plans/tc-required-and-tip-signing.md §3 F2).
 #[derive(Clone, BorshSerialize, BorshDeserialize, PartialEq, Eq)]
 pub struct TipInfo {
     pub block_hash: CryptoHash,
@@ -32,7 +37,53 @@ pub struct TipInfo {
     pub block_justify: PhaseCertificate,
     pub block_data_hash: CryptoHash,
     pub view: ViewNumber,
+    /// leader(`view`)'s signature over [`proposal_header_bytes`]`(chain_id, view, block_hash)`.
+    pub leader_signature: SignatureBytes,
 }
+
+impl TipInfo {
+    /// The tip `header` describes, carrying its leader signature.
+    pub fn from_header(header: &ProposalHeader) -> TipInfo {
+        TipInfo {
+            block_hash: header.block_hash,
+            block_height: header.height,
+            block_justify: header.justify.clone(),
+            block_data_hash: header.data_hash,
+            view: header.view,
+            leader_signature: header.leader_signature,
+        }
+    }
+
+    /// The tip `proposal` describes, carrying its leader signature.
+    pub fn from_proposal(proposal: &Proposal) -> TipInfo {
+        TipInfo {
+            block_hash: proposal.block.hash,
+            block_height: proposal.block.height,
+            block_justify: proposal.block.justify.clone(),
+            block_data_hash: proposal.block.data_hash,
+            view: proposal.view,
+            leader_signature: proposal.leader_signature,
+        }
+    }
+
+    /// What a timeout vote signs about this tip (F3).
+    pub fn summary(&self) -> TipSummary {
+        (self.block_hash, self.view)
+    }
+
+    /// F2: whether this tip is a real header of chain `chain_id`. Phase-C skeleton: not checked yet.
+    pub fn is_correct<K: KVStore>(
+        &self,
+        _chain_id: ChainID,
+        _block_tree: &BlockTreeSingleton<K>,
+    ) -> Result<bool, BlockTreeError> {
+        Ok(true)
+    }
+}
+
+/// What one signer of a [`TimeoutCertificate`] signed besides `(chain_id, view)`: its tip's
+/// `(hash, view)` and its highest QC's `(view, block)` ([`timeout_vote_bytes`]).
+pub type VoterMetadata = (Option<TipSummary>, Option<QcSummary>);
 
 /// Cryptographic proof that at least a quorum of validators have sent a [`TimeoutVote`] for the same
 /// view.
@@ -51,12 +102,10 @@ pub struct TimeoutCertificate {
     pub high_qc: Option<PhaseCertificate>,
     pub high_tip_is_winner: bool,
 
-    /// Per-voter signed metadata for TC signature verification.
-    /// Each entry corresponds to the same position as in `signatures`:
-    /// (optional local_tip block hash, optional (highest_qc view, highest_qc block hash)).
-    /// This enables TC verification to reconstruct per-voter message bytes.
-    #[allow(clippy::type_complexity)]
-    pub voter_metadata: Vec<(Option<CryptoHash>, Option<(ViewNumber, CryptoHash)>)>,
+    /// Per-voter signed metadata for TC signature verification, at the same positions as
+    /// `signatures`: what each signer signed about its tip and its highest QC. This enables TC
+    /// verification to reconstruct per-voter message bytes.
+    pub voter_metadata: Vec<VoterMetadata>,
 }
 
 impl TimeoutCertificate {
@@ -83,8 +132,8 @@ impl TimeoutCertificate {
                 .filter_map(|(idx, _)| self.voter_metadata.get(idx))
         };
         let tip_ok = match &self.high_tip {
-            Some(tip) => signed().any(|(hash, _)| *hash == Some(tip.block_hash)),
-            None => signed().all(|(hash, _)| hash.is_none()),
+            Some(tip) => signed().any(|(summary, _)| summary.is_some_and(|(hash, _)| hash == tip.block_hash)),
+            None => signed().all(|(summary, _)| summary.is_none()),
         };
         let max_qc = signed().filter_map(|(_, qc)| *qc).map(|(view, _)| view).max();
         let qc_ok = match &self.high_qc {
@@ -151,8 +200,6 @@ impl Certificate for TimeoutCertificate {
             return false;
         }
 
-        let base_msg = (self.chain_id, self.view).try_to_vec().unwrap();
-
         // Check whether every signature is correct and tally up their powers.
         let mut total_power: TotalPower = TotalPower::new(0);
         for (idx, (signature, (_signer, power))) in self
@@ -165,21 +212,8 @@ impl Certificate for TimeoutCertificate {
                 if let Ok(signature) = Signature::from_slice(&signature.bytes()) {
                     // Reconstruct the per-voter message bytes including their
                     // local_tip and highest_qc metadata (bound by their signature).
-                    let msg = if idx < self.voter_metadata.len() {
-                        let (ref tip_hash, ref qc_summary) = self.voter_metadata[idx];
-                        let mut m = base_msg.clone();
-                        if let Some(ref hash) = tip_hash {
-                            m.extend_from_slice(&hash.bytes());
-                        }
-                        if let Some((qc_view, ref qc_block)) = qc_summary {
-                            m.extend_from_slice(&qc_view.int().to_be_bytes());
-                            m.extend_from_slice(&qc_block.bytes());
-                        }
-                        m
-                    } else {
-                        // Backward compatibility: no voter_metadata, use base message.
-                        base_msg.clone()
-                    };
+                    let (tip, qc) = self.voter_metadata.get(idx).copied().unwrap_or((None, None));
+                    let msg = timeout_vote_bytes(self.chain_id, self.view, tip, qc);
 
                     if _signer.verify(&msg, &signature).is_ok() {
                         total_power += power;
@@ -210,10 +244,8 @@ pub(crate) struct TimeoutVoteCollector {
     signature_set: SignatureSet,
     high_tip: Option<TipInfo>,
     high_qc: Option<PhaseCertificate>,
-    /// Per-voter metadata: (optional local_tip hash, optional (highest_qc view, highest_qc block)).
-    /// Indexed by validator position, enables TC signature verification.
-    #[allow(clippy::type_complexity)]
-    voter_metadata: Vec<(Option<CryptoHash>, Option<(ViewNumber, CryptoHash)>)>,
+    /// Per-voter signed metadata, indexed by validator position: enables TC signature verification.
+    voter_metadata: Vec<VoterMetadata>,
 }
 
 impl Collector for TimeoutVoteCollector {
@@ -269,10 +301,8 @@ impl Collector for TimeoutVoteCollector {
                 self.signature_set_power += *self.validator_set.power(signer).unwrap();
 
                 // Store per-voter signed metadata for TC signature verification.
-                let tip_hash = vote.local_tip.as_ref().map(|t| t.block_hash);
-                let qc_summary = vote.highest_qc.as_ref().map(|q| (q.view, q.block));
                 if pos < self.voter_metadata.len() {
-                    self.voter_metadata[pos] = (tip_hash, qc_summary);
+                    self.voter_metadata[pos] = vote.signed_summaries();
                 }
 
                 // MonadBFT: track high_tip and high_qc

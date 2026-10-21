@@ -3277,7 +3277,7 @@ fn tee_proposal_datum(shared: &SharedState, msg: &hotstuff_rs::networking::messa
     let block = match msg {
         Message::ProgressMessage(ProgressMessage::HotStuffMessage(m)) => match m {
             HotStuffMessage::Proposal(p) => &p.block,
-            HotStuffMessage::ProposalResponse(r) => &r.proposal.block,
+            HotStuffMessage::ProposalResponse(r) => &r.block,
             HotStuffMessage::BlockDataResponse(r) => &r.block,
             _ => return,
         },
@@ -3866,6 +3866,7 @@ mod tests {
             block: Block::new(BlockHeight::new(3), PhaseCertificate::genesis_pc(),
                 CryptoHash::new([2; 32]), Data::new(vec![Datum::new(vec![9, 8, 7])])),
             tc: None, nec: None,
+            leader_signature: hotstuff_rs::types::data_types::SignatureBytes::new([0; 64]),
         };
         let hash = proposal.block.hash.bytes();
         let messages = [
@@ -3985,6 +3986,7 @@ mod tests {
             block,
             tc: None,
             nec: None,
+            leader_signature: hotstuff_rs::types::data_types::SignatureBytes::new([0; 64]),
         })
         .into();
         assert!(enqueue_inbound(&shared, test_vk(1), msg));
@@ -4027,6 +4029,7 @@ mod tests {
                 ),
                 tc: None,
                 nec: None,
+                leader_signature: hotstuff_rs::types::data_types::SignatureBytes::new([0; 64]),
             })
             .into();
         let advance_view: hotstuff_rs::networking::messages::Message =

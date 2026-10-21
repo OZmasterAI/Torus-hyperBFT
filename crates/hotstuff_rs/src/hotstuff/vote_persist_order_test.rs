@@ -21,7 +21,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use borsh::BorshSerialize;
 
 use crate::app::{
     App, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest, ValidateBlockResponse,
@@ -34,7 +33,7 @@ use crate::hotstuff::header_fast_path_regression_test::{
 };
 use crate::hotstuff::implementation::{HotStuff, HotStuffConfiguration};
 use crate::hotstuff::messages::{
-    BlockDataResponse, HotStuffMessage, Nudge, Proposal, ProposalHeader,
+    BlockDataResponse, HotStuffMessage, Nudge, Proposal,
 };
 use crate::hotstuff::types::{Phase, PhaseCertificate};
 use crate::networking::messages::{Message, ProgressMessage};
@@ -216,7 +215,7 @@ pub(crate) fn pc(
     signers: &[SigningKey],
     set: &ValidatorSet,
 ) -> PhaseCertificate {
-    let message = (CHAIN_ID, view, block, phase).try_to_vec().unwrap();
+    let message = crate::types::signing::phase_vote_bytes(CHAIN_ID, view, &block, phase);
     let mut signatures = SignatureSet::new(set.len());
     for sk in signers {
         let pos = set.position(&sk.verifying_key()).expect("signer in set");
@@ -303,18 +302,8 @@ fn assert_persist_before_send(log: &OrderLog, path: &str) {
 #[test]
 fn header_path_persists_vote_state_before_sending_vote() {
     let mut f = fixture();
-    let header = ProposalHeader {
-        chain_id: CHAIN_ID,
-        view: f.view,
-        block_hash: f.b2.hash,
-        height: f.b2.height,
-        data_hash: f.b2.data_hash,
-        justify: f.b2.justify.clone(),
-        tc: None,
-        nec: None,
-        has_validator_set_updates: false,
-    };
     let proposer = proposer_for(f.view, &f.keys, &f.vss, &f.block_tree);
+    let header = crate::test_keys::signed_by(crate::test_keys::unsigned_header(CHAIN_ID, &f.b2, f.view), &proposer);
     let mut hotstuff = replica(&f.keys[0], &f.vss, &f.log, f.view);
     hotstuff
         .on_receive_msg(
@@ -340,14 +329,8 @@ fn header_path_persists_vote_state_before_sending_vote() {
 #[test]
 fn proposal_path_persists_vote_state_before_sending_vote() {
     let mut f = fixture();
-    let proposal = Proposal {
-        chain_id: CHAIN_ID,
-        view: f.view,
-        block: f.b2.clone(),
-        tc: None,
-        nec: None,
-    };
     let proposer = proposer_for(f.view, &f.keys, &f.vss, &f.block_tree);
+    let proposal = Proposal::signed(&crate::test_keys::key_of(&proposer), CHAIN_ID, f.view, f.b2.clone(), None, None);
     let mut hotstuff = replica(&f.keys[0], &f.vss, &f.log, f.view);
     hotstuff
         .on_receive_msg(
