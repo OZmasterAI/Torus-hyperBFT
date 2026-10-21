@@ -468,6 +468,7 @@ fn default_chain_config() -> ChainConfig {
         reputation_leader_selection: false,
         exec_trust_cache: false,
         state_hash_activation_height: None,
+        book_mode: Default::default(),
     }
 }
 
@@ -718,20 +719,32 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         &cli.data_dir,
     )?;
 
-    // 4. Genesis initialization
+    // 4. Genesis initialization. s131: the order-book storage mode is the
+    // genesis' (`consensus.book_mode`); `TORUS_BOOK_ROWS` may only repeat it,
+    // and a DB marker naming another mode refuses to start, checked before
+    // genesis is applied. Without `--genesis` the DB marker gives the mode.
+    let book_rows_env = std::env::var(torus_types::book_mode::BOOK_ROWS_ENV).ok();
     let mut chain_config = if let Some(genesis_path) = &cli.genesis {
         let genesis = load_genesis(genesis_path)?;
-        let config = genesis.chain_config();
+        let mut config = genesis.chain_config();
+        info!(genesis = %genesis_path.display(), "genesis file");
+        config.book_mode =
+            node_dbs::node_book_mode(&dbs.state, Some(config.book_mode), book_rows_env.as_deref())?;
 
         // Only initialize on first run (see `node_dbs::genesis_applied`).
-        info!(genesis = %genesis_path.display(), "genesis file");
         node_dbs::apply_genesis_if_fresh(&dbs, &genesis)?;
 
         config
     } else {
         info!("no genesis file provided, using default chain config");
-        default_chain_config()
+        let mut config = default_chain_config();
+        config.book_mode = node_dbs::node_book_mode(&dbs.state, None, book_rows_env.as_deref())?;
+        config
     };
+    // Every execution context of this process (consensus, RPC reads, the
+    // checkpoint layer) runs this mode; fails if anything already used another.
+    torus_types::book_mode::set_process_book_mode(chain_config.book_mode)
+        .map_err(|e| format!("refusing to start: {e}"))?;
 
     info!(
         chain_id = chain_config.chain_id,

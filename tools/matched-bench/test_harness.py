@@ -2092,6 +2092,42 @@ class CheckpointRewindBoundTest(unittest.TestCase):
             self.assertEqual(c["max_rewind_beyond_exec_queue"], 2, env)
             self.assertEqual(c["verdict"], "FAIL", env)
 
+    def test_genesis_book_mode_decides_the_checkpoint_default(self):
+        """s131 review P1: the book mode is the genesis consensus.book_mode.
+        A BOOK_MODE=-only mode-3 cell sets no TORUS_BOOK_ROWS on the nodes,
+        so the summarizer must take the mode from --genesis-book-mode: mode
+        2/3 turn the 15 s default off (bound 2, not 202), and the genesis
+        wins over a node env that says otherwise. Empty = legacy env."""
+        self.crash(gap=4 + 3, queue=4)
+        cases = (
+            # (genesis mode, node env TORUS_BOOK_ROWS, interval, label)
+            ("level_authority_chunked", None, None, "mode3"),
+            ("3", None, None, "mode3"),
+            ("level_authority", None, None, "mode2"),
+            ("order_rows", None, 15.0, "mode1"),
+            ("classic", "3", 15.0, "classic"),
+            ("0", None, 15.0, "classic"),
+            ("", "3", None, "mode3"),      # legacy cell: the node env
+            ("", None, 15.0, "classic"),
+        )
+        for mode, rows, want, label in cases:
+            with self.subTest(mode=mode, rows=rows):
+                kw = {} if rows is None else {"TORUS_BOOK_ROWS": rows}
+                extra = self.env(**kw) + (["--genesis-book-mode", mode] if mode else [])
+                s, _ = run_summarize(self.d, extra=extra)
+                c = s["crash"]
+                self.assertEqual(c["checkpoint_interval_s"], want)
+                self.assertEqual(c["max_rewind_beyond_exec_queue"], 2 if want is None else 202)
+                self.assertEqual(c["verdict"], "FAIL" if want is None else "PASS", c["fail_reasons"])
+                self.assertEqual(s["cell"]["book_mode"], label)
+
+    def test_bad_genesis_book_mode_is_refused(self):
+        for mode in ("mode3", "Classic", "4", "x"):
+            with self.subTest(mode=mode):
+                with self.assertRaises(AssertionError) as cm:
+                    run_summarize(self.d, extra=self.env() + ["--genesis-book-mode", mode])
+                self.assertIn("is not a book mode", str(cm.exception))
+
     def test_interval_parse_matches_the_node(self):
         """TORUS_CHECKPOINT_INTERVAL_MS parses like the node's
         exec_pipeline::parse_checkpoint_interval: blank after trim -> the 15 s
@@ -4554,22 +4590,27 @@ class EvmBlockIntervalKnobTest(unittest.TestCase):
             _stat(WEIGHTED_FULL), self.real_full, "the real worktree was touched"
         )
 
-    def write_generator(self, stale_n, bulk="$BULK_COUNT"):
+    def write_generator(self, stale_n, bulk="$BULK_COUNT", stale_book_mode=""):
         """A generator that records the EVM_BLOCK_INTERVAL it was given and
         writes a MARKETS-market genesis with that N (or with `stale_n`, the
         hand-patched weighted base case, when the knob is unset), funding
         `bulk` "bulk-test N" senders (default: the BULK_COUNT it was handed,
-        which run-cell.sh checks after the genesis step)."""
+        which run-cell.sh checks after the genesis step). BOOK_MODE (s131) ->
+        .consensus.book_mode, else `stale_book_mode` (empty = absent); the
+        BOOK_MODE it was given goes to <seen>.book-mode."""
         with open(self.gen, "w") as f:
             f.write(
                 "#!/usr/bin/env bash\n"
                 "printf '%%s\\n' \"${EVM_BLOCK_INTERVAL-<unset>}\" >> '%s'\n"
+                "printf '%%s\\n' \"${BOOK_MODE-<unset>}\" >> '%s.book-mode'\n"
                 "n=${EVM_BLOCK_INTERVAL:-%s}\n"
-                "jq -n --argjson m \"$MARKETS\" --arg n \"$n\" --argjson b \"%s\" '{markets: [range($m)],"
+                "bm=${BOOK_MODE:-%s}\n"
+                "jq -n --argjson m \"$MARKETS\" --arg n \"$n\" --arg bm \"$bm\" --argjson b \"%s\" '{markets: [range($m)],"
                 " native_balances: [range($b) | {note: \"bulk-test \\(. + 60)\"}],"
-                " consensus: {timeout_base_ms: 500}, evm: ({chain_id: 7778}"
+                " consensus: ({timeout_base_ms: 500} + (if $bm == \"\" then {} else {book_mode: $bm} end)),"
+                " evm: ({chain_id: 7778}"
                 " + (if $n == \"\" then {} else {block_interval: ($n|tonumber)} end))}' > \"$OUT\"\n"
-                % (self.seen, stale_n, bulk)
+                % (self.seen, self.seen, stale_n, stale_book_mode, bulk)
             )
         os.chmod(self.gen, 0o755)
 
@@ -5735,9 +5776,17 @@ AUDITED_FLAGS = (
     "TORUS_CHECKPOINT_INTERVAL_MS",
 )
 
-# (TORUS_BOOK_ROWS value or None = unset, book mode the node runs). Mirrors
-# torus_bridge::native_executor::parse_book_rows_mode: trimmed "1"/"2"/"3",
-# anything else (including unset and empty) is Classic.
+# (TORUS_BOOK_ROWS value or None = unset, book mode summarize.py derives from
+# the node env when run-cell.sh recorded no genesis mode: legacy cells). The
+# old lenient parse: trimmed "1"/"2"/"3", anything else is Classic.
+# (genesis consensus.book_mode, the cell= line / summary.json cell.book_mode label)
+GENESIS_BOOK_MODES = (
+    ("classic", "classic"),
+    ("order_rows", "mode1"),
+    ("level_authority", "mode2"),
+    ("level_authority_chunked", "mode3"),
+)
+
 BOOK_MODE_CASES = (
     (None, "classic"),
     ("", "classic"),
@@ -5888,17 +5937,20 @@ class BookModeNotPinnedTest(unittest.TestCase):
         j = src.index("node_flags_line() {")
         return src[i : src.index("\n}\n", j) + 3]
 
-    def test_bash_book_mode_mirrors_the_node_parse(self):
+    def test_bash_book_mode_label_comes_from_the_genesis_mode(self):
+        """s131 genesis book mode: the label is the cell genesis'
+        consensus.book_mode (node_flags_line's argument), never the env."""
         fn = self.node_flags_fn()
-        for v, mode in BOOK_MODE_CASES:
-            with self.subTest(v=v):
-                env = {k: x for k, x in os.environ.items() if not k.startswith("TORUS_")}
-                if v is not None:
-                    env["TORUS_BOOK_ROWS"] = v
-                r = subprocess.run(["bash", "-c", fn + "\nnode_flags_line"],
-                                   capture_output=True, text=True, timeout=10, env=env)
-                self.assertEqual(r.returncode, 0, r.stderr)
-                self.assertTrue(r.stdout.startswith("book_mode=%s " % mode), (v, r.stdout))
+        for name, label in GENESIS_BOOK_MODES:
+            for v in (None, "", "3", "x"):
+                with self.subTest(name=name, v=v):
+                    env = {k: x for k, x in os.environ.items() if not k.startswith("TORUS_")}
+                    if v is not None:
+                        env["TORUS_BOOK_ROWS"] = v
+                    r = subprocess.run(["bash", "-c", fn + "\nnode_flags_line " + name],
+                                       capture_output=True, text=True, timeout=10, env=env)
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.assertTrue(r.stdout.startswith("book_mode=%s " % label), (name, v, r.stdout))
 
     def test_summary_records_book_mode_and_flags(self):
         d = tempfile.mkdtemp(prefix="book-mode-sum-")
@@ -5926,6 +5978,213 @@ class BookModeNotPinnedTest(unittest.TestCase):
         s, _ = run_summarize(d)
         self.assertIsNone(s["cell"]["book_mode"])
         self.assertIsNone(s["cell"]["node_flags"])
+
+
+class BookModeGenesisTest(unittest.TestCase):
+    """s131: the book mode is the genesis field consensus.book_mode, and the
+    node refuses a TORUS_BOOK_ROWS that disagrees with it. run-cell.sh lifts
+    the mode out of EXTRA_ENV (TORUS_BOOK_ROWS=N, the existing campaign specs,
+    or BOOK_MODE=<name|0-3>) into the cell genesis (gen-3val-genesis.sh
+    BOOK_MODE), checks the genesis carries it, and labels the cell from the
+    genesis. TORUS_BOOK_ROWS still reaches the nodes (it agrees: the node only
+    warns). Sandbox copy whose launch fails, so the cell stops right after the
+    node env is logged."""
+
+    tearDown = EvmBlockIntervalKnobTest.tearDown
+    write_generator = EvmBlockIntervalKnobTest.write_generator
+    run_cell = EvmBlockIntervalKnobTest.run_cell
+    generator_saw = EvmBlockIntervalKnobTest.generator_saw
+    flags_line = staticmethod(BookModeNotPinnedTest.flags_line)
+
+    # The sandbox's summarize.py (the one TOOLS_DIR resolves to): new = knows
+    # --genesis-book-mode (this harness), old = a pre-s131 copy.
+    NEW_SUMMARIZER = (
+        "import argparse\nap = argparse.ArgumentParser()\n"
+        "ap.add_argument('--genesis-book-mode', default='')\nap.parse_args()\n"
+    )
+    OLD_SUMMARIZER = "import argparse\nap = argparse.ArgumentParser()\nap.parse_args()\n"
+
+    def setUp(self):
+        EvmBlockIntervalKnobTest.setUp(self)
+        self.write_summarizer(self.NEW_SUMMARIZER)
+
+    def write_summarizer(self, body):
+        with open(os.path.join(self.wt, "tools", "matched-bench", "summarize.py"), "w") as f:
+            f.write(body)
+
+    def book_mode_seen(self):
+        try:
+            with open(self.seen + ".book-mode") as f:
+                return f.read().splitlines()
+        except OSError:
+            return []
+
+    def genesis(self):
+        with open(os.path.join(self.wt, "devnet", "wsl", "genesis-3val.json")) as f:
+            return json.load(f)
+
+    @staticmethod
+    def node_env(log):
+        line = [l for l in log.splitlines() if "node env: " in l][0]
+        return json.loads(line.split("node env: ", 1)[1])
+
+    def test_torus_book_rows_3_writes_mode_3_into_the_cell_genesis(self):
+        r, log = self.run_cell("TORUS_X=1 TORUS_BOOK_ROWS=3")
+        out = r.stdout + r.stderr + log
+        self.assertEqual(self.book_mode_seen(), ["level_authority_chunked"], out)
+        self.assertEqual(self.genesis()["consensus"]["book_mode"], "level_authority_chunked")
+        self.assertIn("genesis consensus.book_mode=level_authority_chunked (TORUS_BOOK_ROWS=3)", log)
+        lines = self.flags_line(log)
+        self.assertEqual(len(lines), 1, out)
+        self.assertIn("cell=knob-x book_mode=mode3", lines[0])
+        # the existing specs' env still reaches the nodes: it agrees with genesis
+        self.assertEqual(self.node_env(log).get("TORUS_BOOK_ROWS"), "3")
+        self.assertIn("launch-3val.sh failed", log)
+
+    def test_book_mode_knob_sets_the_genesis_without_a_node_env(self):
+        for v in ("level_authority_chunked", "3"):
+            with self.subTest(v=v):
+                r, log = self.run_cell("TORUS_X=1 BOOK_MODE=%s" % v)
+                out = r.stdout + r.stderr + log
+                self.assertEqual(self.book_mode_seen()[-1], "level_authority_chunked", out)
+                self.assertEqual(self.genesis()["consensus"]["book_mode"], "level_authority_chunked")
+                self.assertIn("genesis consensus.book_mode=level_authority_chunked (BOOK_MODE=%s)" % v, log)
+                self.assertIn("cell=knob-x book_mode=mode3", self.flags_line(log)[0])
+                self.assertNotIn("TORUS_BOOK_ROWS", self.node_env(log))
+                self.assertIn("launch-3val.sh failed", log)
+
+    def test_every_mode_reaches_the_genesis_and_the_label(self):
+        for (name, label), n in zip(GENESIS_BOOK_MODES, range(4)):
+            with self.subTest(name=name):
+                r, log = self.run_cell("TORUS_BOOK_ROWS=%d" % n)
+                # Classic is the absent field: the generator gets an empty BOOK_MODE
+                want = "" if name == "classic" else name
+                self.assertEqual(self.book_mode_seen()[-1], want, r.stdout + r.stderr + log)
+                self.assertIn("cell=knob-x book_mode=%s" % label, self.flags_line(log)[0])
+
+    def test_no_knob_is_classic_and_the_genesis_has_no_field(self):
+        # ambient values must not leak into the cell
+        r, log = self.run_cell("TORUS_X=1", TORUS_BOOK_ROWS="3", BOOK_MODE="3")
+        out = r.stdout + r.stderr + log
+        self.assertEqual(self.book_mode_seen(), [""], out)
+        self.assertNotIn("book_mode", self.genesis()["consensus"])
+        self.assertIn("genesis consensus.book_mode=classic (absent: classic)", log)
+        self.assertIn("cell=knob-x book_mode=classic", self.flags_line(log)[0])
+        self.assertIn("launch-3val.sh failed", log)
+
+    def test_explicit_classic_is_the_absent_field(self):
+        """Review rec (b): an explicit Classic (BOOK_MODE=classic / 0,
+        TORUS_BOOK_ROWS=0) builds the same genesis as no knob, the field
+        absent, so one Classic chain has one genesis md5 and cache entry."""
+        for kv in ("BOOK_MODE=classic", "BOOK_MODE=0", "TORUS_BOOK_ROWS=0"):
+            with self.subTest(kv=kv):
+                r, log = self.run_cell("TORUS_X=1 " + kv)
+                out = r.stdout + r.stderr + log
+                self.assertEqual(self.book_mode_seen()[-1], "", out)
+                self.assertNotIn("book_mode", self.genesis()["consensus"])
+                self.assertIn("genesis consensus.book_mode=classic (%s)" % kv, log)
+                self.assertIn("cell=knob-x book_mode=classic", self.flags_line(log)[0])
+                self.assertIn("launch-3val.sh failed", log)
+
+    def test_book_mode_only_cell_with_an_older_summarizer_fails_preflight(self):
+        """Review P1: a summarizer without --genesis-book-mode reads the mode
+        from TORUS_BOOK_ROWS only, so a BOOK_MODE=-only non-Classic cell would
+        be scored as Classic: refused before anything runs. With the env set
+        (it reaches the nodes and the summarizer) or Classic, it runs."""
+        self.write_summarizer(self.OLD_SUMMARIZER)
+        r, log = self.run_cell("TORUS_X=1 BOOK_MODE=3")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr + log)
+        self.assertIn("needs a summarizer that accepts --genesis-book-mode", r.stderr)
+        self.assertEqual(self.book_mode_seen(), [])
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "results")))
+        for kv in ("TORUS_BOOK_ROWS=3", "BOOK_MODE=3 TORUS_BOOK_ROWS=3", "BOOK_MODE=classic", ""):
+            with self.subTest(kv=kv):
+                r, log = self.run_cell("TORUS_X=1 " + kv)
+                self.assertIn("launch-3val.sh failed", log, r.stdout + r.stderr + log)
+
+    def test_summarizer_is_handed_the_genesis_mode(self):
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        i = src.index('python3 "$TOOLS_DIR/summarize.py" \\')
+        call = src[i : src.index('| tee -a "$OUT/run.log"', i)]
+        self.assertIn('"${SUMMARIZE_BOOK_ARGS[@]}"', call)
+        before = src[src.rindex("SUMMARIZE_BOOK_ARGS=(", 0, i) : i]
+        self.assertIn('--genesis-book-mode "$GEN_BOOK_MODE_GOT"', before)
+        # the check runs in preflight, before the results dir exists
+        self.assertLess(src.index("summarizer_has_genesis_book_mode; then"), src.index('mkdir -p "$OUT"'))
+
+    def test_empty_torus_book_rows_is_classic(self):
+        r, log = self.run_cell("TORUS_BOOK_ROWS=")
+        self.assertEqual(self.book_mode_seen(), [""], r.stdout + r.stderr + log)
+        self.assertIn("cell=knob-x book_mode=classic", self.flags_line(log)[0])
+
+    def test_agreeing_knobs_run_and_disagreeing_ones_fail_preflight(self):
+        r, log = self.run_cell("BOOK_MODE=level_authority_chunked TORUS_BOOK_ROWS=3")
+        self.assertIn("cell=knob-x book_mode=mode3", self.flags_line(log)[0], r.stdout + r.stderr + log)
+        shutil.rmtree(os.path.join(self.tmp, "results"))
+        os.remove(self.seen + ".book-mode")
+        r, _ = self.run_cell("BOOK_MODE=3 TORUS_BOOK_ROWS=0")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("BOOK_MODE=3 and TORUS_BOOK_ROWS=0 name different book modes", r.stderr)
+        self.assertEqual(self.book_mode_seen(), [])
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "results")))
+
+    def test_bad_values_fail_preflight(self):
+        for kv in ("TORUS_BOOK_ROWS=x", "TORUS_BOOK_ROWS=4", "TORUS_BOOK_ROWS=03",
+                   "BOOK_MODE=mode3", "BOOK_MODE=", "BOOK_MODE=Classic", "BOOK_MODE=4"):
+            with self.subTest(kv=kv):
+                r, _ = self.run_cell("TORUS_X=1 " + kv)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("is not a book mode", r.stderr)
+                self.assertEqual(self.book_mode_seen(), [])
+                self.assertFalse(os.path.exists(os.path.join(self.tmp, "results")))
+
+    def test_a_genesis_whose_mode_is_not_the_cells_fails(self):
+        """The generator ignored BOOK_MODE (an older gen-3val-genesis.sh) or a
+        hand-patched weighted-full genesis carries a mode: the cell refuses."""
+        self.write_generator("", stale_book_mode="level_authority_chunked")
+        r, log = self.run_cell("")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        fatal = [l for l in log.splitlines() if "FATAL" in l]
+        self.assertEqual(len(fatal), 1, log)
+        self.assertIn("consensus.book_mode=level_authority_chunked", fatal[0])
+        self.assertIn("wanted classic", fatal[0])
+        self.assertNotIn("launch-3val.sh failed", log)
+
+    def test_record_genesis_book_mode_patches_the_summary(self):
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        i = src.index("record_genesis_book_mode() {")
+        fn = src[i : src.index("\n}\n", i) + 3]
+        d = tempfile.mkdtemp(prefix="book-mode-rec-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        p = os.path.join(d, "summary.json")
+        for name, label in GENESIS_BOOK_MODES:
+            with self.subTest(name=name):
+                with open(p, "w") as f:
+                    json.dump({"genesis": {"md5": "ab"}, "cell": {"book_mode": "classic", "x": 1}}, f)
+                r = subprocess.run(["bash", "-c", fn + '\nrecord_genesis_book_mode "$1" "$2"', "_", p, name],
+                                   capture_output=True, text=True, timeout=10)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                with open(p) as f:
+                    self.assertEqual(json.load(f), {"genesis": {"md5": "ab", "book_mode": name},
+                                                    "cell": {"book_mode": label, "x": 1}})
+                self.assertEqual(sorted(os.listdir(d)), ["summary.json"], "no temp file left")
+
+    def test_book_mode_is_recorded_after_summarize_and_kept_by_resummarize(self):
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        rec = src.index('record_genesis_book_mode "$OUT/summary.json" "$GEN_BOOK_MODE_GOT"')
+        self.assertLess(src.index('python3 "$TOOLS_DIR/summarize.py"'), rec)
+        self.assertLess(rec, src.index('log "done -> $OUT/summary.json"'))
+        self.assertIn('--param BOOK_MODE="$GEN_BOOK_MODE"', src)
+        head = src[: src.index("set -uo pipefail")]
+        self.assertIn("BOOK_MODE=", head)
+        with open(os.path.join(HERE, "resummarize.sh")) as f:
+            resum = f.read()
+        self.assertIn(".genesis.book_mode", resum)
+        self.assertIn('--genesis-book-mode "$BOOK_MODE"', resum)
+
 
 if __name__ == "__main__":
     if not os.path.exists(DIGEST_SH):

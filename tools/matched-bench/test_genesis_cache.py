@@ -46,6 +46,7 @@ PARAMS = {
     "EVM_BLOCK_INTERVAL": "",
     "LIQ_THIN": "0",
     "LIQ_THIN_AVAIL": "1000000.0",
+    "BOOK_MODE": "",
 }
 
 
@@ -355,10 +356,10 @@ class CacheTest(unittest.TestCase):
 FAKE_GEN = r"""#!/bin/bash
 # fake gen-3val-genesis.sh: counts its calls, writes a MARKETS-market genesis with BULK_COUNT bulk rows
 echo call >> "$GEN_CALLS"
-python3 - "$OUT" "$MARKETS" "$BULK_COUNT" "${TIMEOUT_BASE_MS:-500}" <<'PY'
+python3 - "$OUT" "$MARKETS" "$BULK_COUNT" "${TIMEOUT_BASE_MS:-500}" "${BOOK_MODE:-}" <<'PY'
 import json, sys
-out, m, n, t = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
-g = {"consensus": {"timeout_base_ms": t}, "evm": {"chain_id": 7},
+out, m, n, t, bm = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+g = {"consensus": dict({"timeout_base_ms": t}, **({"book_mode": bm} if bm else {})), "evm": {"chain_id": 7},
      "markets": [{"market_id": i} for i in range(1, m + 1)],
      "native_balances": [{"address": "0x%040x" % (60 + i), "note": "bulk-test %d" % (60 + i)} for i in range(n)]}
 json.dump(g, open(out, "w"))
@@ -378,7 +379,9 @@ class RunCellReuseTest(unittest.TestCase):
         self.repo = repo
         tools = os.path.join(repo, "tools", "matched-bench")
         os.makedirs(tools)
-        for f in ("run-cell.sh", "genesis_cache.py", "log-scans.sh"):
+        # summarize.py + health.py: run-cell.sh asks the summarizer (--help) whether
+        # it scores the genesis book mode, at preflight
+        for f in ("run-cell.sh", "genesis_cache.py", "log-scans.sh", "summarize.py", "health.py"):
             shutil.copy2(os.path.join(HERE, f), tools)
         self.script = os.path.join(tools, "run-cell.sh")
         for rel in (
@@ -430,7 +433,7 @@ class RunCellReuseTest(unittest.TestCase):
         self.cache = os.path.join(self.tmp, "run", "genesis-cache")
         self.n = 0
 
-    def run_cell(self, markets="3", **env):
+    def run_cell(self, markets="3", extra_env=None, **env):
         self.n += 1
         label = "reuse-%d" % self.n
         e = {
@@ -462,8 +465,11 @@ class RunCellReuseTest(unittest.TestCase):
             GENESIS_CACHE_DIR=self.cache,
         )
         e.update(env)
+        argv = [self.script, self.repo, label, markets]
+        if extra_env is not None:
+            argv += ["60", "1000", extra_env]
         r = subprocess.run(
-            [self.script, self.repo, label, markets],
+            argv,
             capture_output=True,
             text=True,
             timeout=120,
@@ -536,6 +542,34 @@ class RunCellReuseTest(unittest.TestCase):
             self.calls_n(), 2, "a FORCE=1 entry is reused by later FORCE=1 cells"
         )
         self.assertIn("genesis reused (key ", log3)
+
+    def test_book_mode_is_a_key_input_and_reused_from_the_entry(self):
+        """s131: the genesis book mode (EXTRA_ENV TORUS_BOOK_ROWS / BOOK_MODE)
+        keys the entry; a reused mode-3 cell logs and checks the mode from
+        the entry, and a Classic cell never reuses a mode-3 genesis."""
+        log1 = self.run_cell(extra_env="TORUS_BOOK_ROWS=3")
+        self.assertEqual(self.calls_n(), 1)
+        self.assertIn("genesis consensus.book_mode=level_authority_chunked (TORUS_BOOK_ROWS=3)", log1)
+        self.assertIn("book_mode=mode3", log1)
+        log2 = self.run_cell(extra_env="TORUS_BOOK_ROWS=3")
+        self.assertEqual(self.calls_n(), 1, "the generator must not run on a reuse:\n" + log2)
+        self.assertIn("genesis reused (key ", log2)
+        self.assertIn("genesis consensus.book_mode=level_authority_chunked (TORUS_BOOK_ROWS=3)", log2)
+        self.assertIn("book_mode=mode3", log2)
+        log3 = self.run_cell(extra_env="")
+        self.assertEqual(self.calls_n(), 2, "a Classic cell builds its own genesis")
+        self.assertIn("genesis consensus.book_mode=classic (absent: classic)", log3)
+        self.assertIn("book_mode=classic", log3)
+        log4 = self.run_cell(extra_env="BOOK_MODE=level_authority_chunked")
+        self.assertEqual(self.calls_n(), 2, "same genesis mode, same entry")
+        self.assertIn("genesis reused (key ", log4)
+        self.assertIn("genesis consensus.book_mode=level_authority_chunked (BOOK_MODE=level_authority_chunked)", log4)
+        # an explicit Classic is the absent field: the no-knob entry, reused
+        for kv in ("BOOK_MODE=classic", "TORUS_BOOK_ROWS=0"):
+            log5 = self.run_cell(extra_env=kv)
+            self.assertEqual(self.calls_n(), 2, kv + " reuses the Classic entry:\n" + log5)
+            self.assertIn("genesis reused (key ", log5)
+            self.assertIn("genesis consensus.book_mode=classic (%s)" % kv, log5)
 
     def test_no_cache_dir_builds_every_cell(self):
         for _ in range(2):

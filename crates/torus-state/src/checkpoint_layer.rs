@@ -44,8 +44,8 @@ pub const DEFERRED_CFS: [&str; 2] = [
 /// whole-book blobs: ~77% of a block's state bytes, ~199 x ~44 KB per
 /// block at 300 markets, results doc 41.1), so the exec thread no longer
 /// waits at block start for their copy into L. On only if `flag` trims to
-/// `1`, the book mode is Classic (`book_rows` is not 1 / 2 / 3, as
-/// `parse_book_rows_mode` in torus-bridge) and resident books are on
+/// `1`, the book mode is Classic (`book_mode`: the process's mode, i.e. the
+/// chain's genesis `consensus.book_mode` on a node) and resident books are on
 /// (`resident_books` is not 0, as `parse_resident_books_toggle`). There a
 /// native block never reads the book CF through L: the Classic save only
 /// writes whole blobs and the books stay in memory between blocks. Modes
@@ -60,11 +60,11 @@ pub const DEFERRED_CFS: [&str; 2] = [
 /// what a read returns or what a checkpoint writes.
 pub(crate) fn parse_defer_books(
     flag: Option<&str>,
-    book_rows: Option<&str>,
+    book_mode: torus_types::book_mode::BookMode,
     resident_books: Option<&str>,
 ) -> bool {
     let on = flag.map(str::trim) == Some("1");
-    let classic = !matches!(book_rows.map(str::trim), Some("1" | "2" | "3"));
+    let classic = book_mode.is_classic();
     let resident = !matches!(resident_books.map(str::trim), Some("0"));
     on && classic && resident
 }
@@ -89,7 +89,7 @@ pub(crate) fn is_deferred_slot(i: usize) -> bool {
         let flag = var("TORUS_CKPT_DEFER_BOOKS");
         let defer_books = parse_defer_books(
             flag.as_deref(),
-            var("TORUS_BOOK_ROWS").as_deref(),
+            torus_types::book_mode::process_book_mode(),
             var("TORUS_RESIDENT_BOOKS").as_deref(),
         );
         if flag.is_some() {
@@ -963,8 +963,8 @@ mod tests {
             .unwrap()
     }
 
-    /// The gate is on only for a trimmed `1`, in Classic (`TORUS_BOOK_ROWS`
-    /// not 1 / 2 / 3, as `parse_book_rows_mode`) with resident books
+    /// The gate is on only for a trimmed `1`, in Classic (the legacy
+    /// `TORUS_BOOK_ROWS` spelling not 1 / 2 / 3) with resident books
     /// (`TORUS_RESIDENT_BOOKS` not 0, as `parse_resident_books_toggle`).
     /// All unset is off (today's table).
     #[test]
@@ -983,7 +983,8 @@ mod tests {
             (Some(""), None, None, false),
             (Some("true"), None, None, false),
             (Some("11"), None, None, false),
-            // Book mode: only 1 / 2 / 3 leave Classic.
+            // Book mode (legacy env spelling, parsed below): only 1 / 2 / 3
+            // leave Classic.
             (Some("1"), Some("0"), None, true),
             (Some("1"), Some(""), None, true),
             (Some("1"), Some("4"), None, true),
@@ -1001,7 +1002,11 @@ mod tests {
         ];
         for &(flag, rows, resident, want) in cases {
             assert_eq!(
-                parse_defer_books(flag, rows, resident),
+                parse_defer_books(
+                    flag,
+                    torus_types::book_mode::parse_book_rows_legacy(rows),
+                    resident
+                ),
                 want,
                 "flag {flag:?}, TORUS_BOOK_ROWS {rows:?}, TORUS_RESIDENT_BOOKS {resident:?}"
             );

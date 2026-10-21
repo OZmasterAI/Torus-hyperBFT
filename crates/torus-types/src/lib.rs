@@ -6,6 +6,7 @@ pub use alloy_primitives::{Address, Bloom, Bytes, B256, U256};
 
 use serde::{Deserialize, Serialize};
 
+pub mod book_mode;
 pub mod eip1559;
 pub mod eip712;
 
@@ -1743,6 +1744,12 @@ pub struct ChainConfig {
     /// upgrade. `None` (any genesis without the field) = running hash disabled.
     #[serde(default)]
     pub state_hash_activation_height: Option<u64>,
+    /// Order-book storage mode (owner s131; genesis `consensus.book_mode`).
+    /// CHAIN-WIDE and fixed for the chain's life: modes 1-3 change the state
+    /// format, so every node of a chain takes its mode from here (the node
+    /// env `TORUS_BOOK_ROWS` may only repeat it). Absent = Classic.
+    #[serde(default, skip_serializing_if = "book_mode::BookMode::is_classic")]
+    pub book_mode: book_mode::BookMode,
 }
 
 fn default_timeout_base_ms() -> u64 {

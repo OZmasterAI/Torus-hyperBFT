@@ -14,6 +14,8 @@ STATE_ATTEST=$(jq -c '.state_attest // empty' "$D/summary.json")
 EVM_N=$(jq -r '.genesis.evm_block_interval // empty' "$D/summary.json")
 # ... nor .genesis.bulk_count (BULK_COUNT, bench queue 8f; run-cell.sh records it after summarize.py).
 BULK_N=$(jq -r '.genesis.bulk_count // empty' "$D/summary.json")
+# ... nor .genesis.book_mode / .cell.book_mode (s131; run-cell.sh records them after summarize.py).
+BOOK_MODE=$(jq -r '.genesis.book_mode // empty' "$D/summary.json")
 python3 "$T/summarize.py" --out "$D" --label "$(j .label)" --worktree "$(j .worktree)" --commit "$(j .commit)" \
   --dirty "$(j .dirty_files)" --markets "$(j .cell.markets)" --dur "$(j .cell.duration_s)" --rate "$(j .cell.rate_total)" \
   --senders "$(j .cell.senders)" --t-bench0 "$(j .timing.t_bench0)" --t-bench1 "$(j .timing.t_bench1)" \
@@ -35,7 +37,8 @@ python3 "$T/summarize.py" --out "$D" --label "$(j .label)" --worktree "$(j .work
   --drain-timeout "$(j '.timing.drain_timeout_s // ""')" \
   --digest-quiescent "$(j 'if .agreement.state_digest_quiescent == false then "0" else "1" end')" \
   --digest-secs "$(j '(.agreement.state_digest_seconds_per_node // [])|map(tostring)|join(" ")')" \
-  --digest-heights "$(j '(.agreement.state_digest_heights // [])|map(tostring)|join(" ")')"
+  --digest-heights "$(j '(.agreement.state_digest_heights // [])|map(tostring)|join(" ")')" \
+  ${BOOK_MODE:+--genesis-book-mode "$BOOK_MODE"}
 if [ -n "$EVM_N" ]; then
     tmp="$D/summary.json.evm-n.tmp"
     jq --argjson n "$EVM_N" '.genesis.evm_block_interval = $n' "$D/summary.json" > "$tmp" && mv -f "$tmp" "$D/summary.json"
@@ -43,6 +46,13 @@ fi
 if [ -n "$BULK_N" ]; then
     tmp="$D/summary.json.bulk-count.tmp"
     jq --argjson n "$BULK_N" '.genesis.bulk_count = $n' "$D/summary.json" > "$tmp" && mv -f "$tmp" "$D/summary.json"
+fi
+if [ -n "$BOOK_MODE" ]; then
+    case "$BOOK_MODE" in
+        order_rows) label=mode1 ;; level_authority) label=mode2 ;; level_authority_chunked) label=mode3 ;; *) label=classic ;;
+    esac
+    tmp="$D/summary.json.book-mode.tmp"
+    jq --arg n "$BOOK_MODE" --arg l "$label" '.genesis.book_mode = $n | .cell.book_mode = $l' "$D/summary.json" > "$tmp" && mv -f "$tmp" "$D/summary.json"
 fi
 # PRELOAD cells: .preload (and its REJECT fold) is re-derived from preload-cell.json + preload.json.
 if [ -f "$D/preload-cell.json" ]; then

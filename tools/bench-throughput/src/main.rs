@@ -1658,8 +1658,14 @@ fn run_matching_engine(
     let state_db = StateDb::open(dir.path()).unwrap();
 
     let genesis = Genesis::from_file(std::path::Path::new(genesis_path)).unwrap();
-    let _state_root = genesis.initialize(&state_db).unwrap();
     let chain_config = genesis.chain_config();
+    // s131: the order-book storage mode is the genesis' (`consensus.book_mode`),
+    // as on the node: every native context of this process runs it, not the
+    // legacy `TORUS_BOOK_ROWS` fallback. Set before anything reads it.
+    torus_types::book_mode::set_process_book_mode(chain_config.book_mode)
+        .unwrap_or_else(|e| panic!("book mode: {e}"));
+    println!("Book mode: {} (genesis consensus.book_mode)", chain_config.book_mode.describe());
+    let _state_root = genesis.initialize(&state_db).unwrap();
 
     println!("=== Matching Engine Benchmark ===");
     println!(

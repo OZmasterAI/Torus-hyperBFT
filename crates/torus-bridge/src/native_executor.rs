@@ -3181,18 +3181,17 @@ mod parallel_engine_toggle_tests {
 // ############################ CONSENSUS WARNING ############################
 // `CF_NATIVE_ORDER_BOOKS` is one of the 6 native-state-root CFs. Each mode
 // stores DIFFERENT keys/values, so THE MODE CHANGES THE STATE-ROOT FORMAT:
-//   - every validator in a fleet MUST run the same TORUS_BOOK_ROWS value —
-//     a mixed fleet forks at the first block that touches any book;
+//   - every validator in a fleet MUST run the same mode — a mixed fleet
+//     forks at the first block that touches any book. Since s131 the mode
+//     is the genesis field `consensus.book_mode` (`torus_types::book_mode`),
+//     so a fleet sharing a genesis agrees by construction: the node refuses
+//     to start when `TORUS_BOOK_ROWS` disagrees with it or the DB's
+//     `__book_mode__` marker names another mode;
 //   - flipping the mode on an existing chain REQUIRES a fresh genesis —
 //     there is no migration, and load refuses to start (fail-stop via
 //     ctx.fatal_error) when the CF's on-disk content OR the node-local
 //     `__book_mode__` marker does not match the configured mode.
-// Default (unset/other) = Classic = byte-identical persistence to today.
-// Classic stays the default (plan 9.13, 18c s107 after an adversarial review):
-// genesis carries no book mode, so a compiled default flip would fork a
-// mixed-binary fleet on the same fresh genesis (the `__book_mode__` marker only
-// catches a mismatch against a DB that already has history). Mode 3 as the
-// default needs the book mode in genesis first.
+// Genesis field absent = Classic = byte-identical persistence to before.
 // ###########################################################################
 //
 // Row schema: see `torus_core::book_rows` (frozen key/value layouts; level
@@ -3206,79 +3205,33 @@ mod parallel_engine_toggle_tests {
 // assignment: same determinism, different bytes — part of the batched 3c
 // preimage round, never to be back-ported alone.)
 
-/// Consensus-visible book persistence mode (see the warning above).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BookMode {
-    /// Whole-book borsh blob per market (8-byte key) — exact-today default.
-    Classic,
-    /// C4 per-order rows in the root CF (`TORUS_BOOK_ROWS=1`).
-    OrderRows,
-    /// 3c level rows in the root CF + node-local order rows (`TORUS_BOOK_ROWS=2`).
-    LevelAuthority,
-    /// Mode 2's layout with the CHUNKED, depth-independent `level_hash`
-    /// preimage (`TORUS_BOOK_ROWS=3`). Consensus-visible; fresh genesis.
-    LevelAuthorityChunked,
-}
+/// Consensus-visible book persistence mode (see the warning above). Since
+/// s131 a CHAIN-WIDE genesis field (`consensus.book_mode`,
+/// `torus_types::book_mode`); re-exported here for the existing paths.
+pub use torus_types::book_mode::BookMode;
 
-impl BookMode {
-    /// One-byte discriminant persisted in the `__book_mode__` marker row.
-    fn marker_byte(self) -> u8 {
-        match self {
-            BookMode::Classic => 0,
-            BookMode::OrderRows => 1,
-            BookMode::LevelAuthority => 2,
-            BookMode::LevelAuthorityChunked => 3,
-        }
-    }
-
-    /// Both level-authority variants share the row layout, loader, saver and
-    /// boot verify; they differ only in the `level_hash` preimage.
-    fn is_level_authority(self) -> bool {
-        matches!(
-            self,
-            BookMode::LevelAuthority | BookMode::LevelAuthorityChunked
-        )
-    }
-
-    /// True for the chunked-digest variant (mode 3).
-    fn level_hash_chunked(self) -> bool {
-        matches!(self, BookMode::LevelAuthorityChunked)
-    }
-
-    fn describe(self) -> &'static str {
-        match self {
-            BookMode::Classic => "classic (whole-book blobs)",
-            BookMode::OrderRows => "order rows (TORUS_BOOK_ROWS=1)",
-            BookMode::LevelAuthority => "level authority (TORUS_BOOK_ROWS=2)",
-            BookMode::LevelAuthorityChunked => {
-                "level authority, chunked level hash (TORUS_BOOK_ROWS=3)"
-            }
-        }
-    }
-}
-
-/// Runtime mode: `TORUS_BOOK_ROWS=1` → OrderRows, `=2` → LevelAuthority,
-/// `=3` → LevelAuthorityChunked; anything else (INCLUDING UNSET) → Classic —
-/// byte-identical state root to today. Read once per process. Fleet-uniform,
-/// fresh genesis to change.
+/// Runtime mode: the process's book mode (`torus_types::book_mode`): the
+/// node sets it at startup from its chain config (genesis
+/// `consensus.book_mode`, checked against `TORUS_BOOK_ROWS` and the DB
+/// marker); a process that never sets one (tests, offline tools) falls back
+/// to the legacy `TORUS_BOOK_ROWS` parse (unset = Classic). Read once.
 fn book_mode() -> BookMode {
-    static MODE: std::sync::OnceLock<BookMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| parse_book_rows_mode(std::env::var("TORUS_BOOK_ROWS").ok()))
+    torus_types::book_mode::process_book_mode()
 }
 
-/// The process's configured book mode (`TORUS_BOOK_ROWS`, read once), for
-/// node-start checks outside this crate (item 6 Phase 3: the checkpoint
-/// interval refuses the deferred modes 2/3).
+/// The process's book mode (see [`book_mode`]), for node-start checks
+/// outside this crate.
 pub fn configured_book_mode() -> BookMode {
     book_mode()
 }
 
 /// 8k L3.1 (`TORUS_BOOK_COALESCE`): why this process's book settings cannot
-/// coalesce the Classic save (`None`: they can). It needs Classic books
-/// (`TORUS_BOOK_ROWS` unset / 0), resident books (`TORUS_RESIDENT_BOOKS` not
-/// 0: the holder is where the unsaved books live) and the untouched-block
-/// advance (`TORUS_RESIDENT_ADVANCE_UNTOUCHED` not 0: without it every empty
-/// block makes the next one rebuild, which fail-stops with unsaved books).
+/// coalesce the Classic save (`None`: they can). It needs Classic books (the
+/// chain's book mode, genesis `consensus.book_mode`), resident books
+/// (`TORUS_RESIDENT_BOOKS` not 0: the holder is where the unsaved books live)
+/// and the untouched-block advance (`TORUS_RESIDENT_ADVANCE_UNTOUCHED` not 0:
+/// without it every empty block makes the next one rebuild, which
+/// fail-stops with unsaved books).
 pub fn book_coalesce_blocker() -> Option<&'static str> {
     book_coalesce_blocker_for(
         book_mode(),
@@ -3296,7 +3249,7 @@ pub fn book_coalesce_blocker_for(
     advance_untouched: bool,
 ) -> Option<&'static str> {
     if mode != BookMode::Classic {
-        Some("book mode is not Classic (TORUS_BOOK_ROWS)")
+        Some("book mode is not Classic (genesis consensus.book_mode)")
     } else if !resident {
         Some("resident books are off (TORUS_RESIDENT_BOOKS=0)")
     } else if !advance_untouched {
@@ -3306,14 +3259,31 @@ pub fn book_coalesce_blocker_for(
     }
 }
 
-/// Pure parse of the `TORUS_BOOK_ROWS` value (same trim/strictness as C4).
+/// Legacy lenient parse of a `TORUS_BOOK_ROWS` value (the pre-genesis
+/// runtime parse; now only the fallback of a process without a chain mode).
+#[cfg(test)]
 fn parse_book_rows_mode(v: Option<String>) -> BookMode {
-    match v.as_deref().map(str::trim) {
-        Some("1") => BookMode::OrderRows,
-        Some("2") => BookMode::LevelAuthority,
-        Some("3") => BookMode::LevelAuthorityChunked,
-        _ => BookMode::Classic,
-    }
+    torus_types::book_mode::parse_book_rows_legacy(v.as_deref())
+}
+
+/// The `__book_mode__` marker byte in `state` (`None` = no row yet, or a
+/// row that is not 1 byte, as the boot check reads it). Node startup checks
+/// it against the genesis mode before anything executes.
+pub fn read_book_mode_marker<T: StateBackend>(state: &T) -> Result<Option<u8>, String> {
+    NativeExecContext::<T>::load_book_mode_marker(state)
+        .map_err(|e| format!("book-mode marker read: {e}"))
+}
+
+/// Write the `__book_mode__` marker for `mode` (node: when genesis is
+/// applied, so the DB names the chain's mode before the first block).
+pub fn write_book_mode_marker<T: StateBackend>(state: &T, mode: BookMode) -> Result<(), String> {
+    state
+        .put_cf_raw(
+            torus_state::cf::CF_NATIVE_MARKETS,
+            NativeExecContext::<T>::BOOK_MODE_MARKER_KEY,
+            &[mode.marker_byte()],
+        )
+        .map_err(|e| format!("book-mode marker write: {e}"))
 }
 
 /// Default `TORUS_LEVEL_HASH_CACHE` budget in whole MB, applied when the env
@@ -5908,8 +5878,8 @@ pub struct SaveTimings {
 
 impl<T: StateBackend> NativeExecContext<T> {
     /// Create a new execution context from a state backend and block metadata.
-    /// Book persistence mode comes from the `TORUS_BOOK_ROWS` env toggle
-    /// (default OFF = classic whole-book blobs).
+    /// Book persistence mode = the process's mode ([`book_mode`]: the chain's
+    /// genesis mode on a node; default Classic).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         state: T,
@@ -5968,10 +5938,10 @@ impl<T: StateBackend> NativeExecContext<T> {
         )
     }
 
-    /// rank8 live-node entry: every mode from env (`TORUS_BOOK_ROWS`,
-    /// `TORUS_RESIDENT_BOOKS`). The caller owns the cross-block holder; with
-    /// `TORUS_RESIDENT_BOOKS=0` this is exactly [`Self::new`] and the
-    /// holder is never touched.
+    /// rank8 live-node entry: the chain's book mode (`mode`, from the chain
+    /// config: genesis `consensus.book_mode`) and the resident holder per
+    /// `TORUS_RESIDENT_BOOKS`. The caller owns the cross-block holder; with
+    /// `TORUS_RESIDENT_BOOKS=0` the holder is never touched.
     #[allow(clippy::too_many_arguments)]
     pub fn new_env(
         state: T,
@@ -5983,6 +5953,7 @@ impl<T: StateBackend> NativeExecContext<T> {
         proposer: Address,
         treasury_address: Address,
         dev_pool_address: Address,
+        mode: BookMode,
         resident: &mut ResidentBooks,
     ) -> Self {
         let use_resident = resident_books_enabled();
@@ -5996,7 +5967,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             proposer,
             treasury_address,
             dev_pool_address,
-            book_mode(),
+            mode,
             if use_resident { Some(resident) } else { None },
         )
     }
@@ -6169,7 +6140,8 @@ impl<T: StateBackend> NativeExecContext<T> {
                 if load_error.is_none() {
                     load_error = Some(format!(
                         "book-mode marker mismatch: DB was written under mode {byte} but \
-                         this node runs {} — TORUS_BOOK_ROWS must match the DB's history \
+                         this node runs {} — the chain's genesis consensus.book_mode (which \
+                         TORUS_BOOK_ROWS may only repeat) must match the DB's history \
                          (fleet-uniform; changing it needs a fresh genesis)",
                         book_mode.describe()
                     ));

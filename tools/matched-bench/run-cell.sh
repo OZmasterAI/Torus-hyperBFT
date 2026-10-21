@@ -292,6 +292,29 @@
 #                EVM load's cadence check and records it as
 #                summary.json .genesis.evm_block_interval. An ambient
 #                EVM_BLOCK_INTERVAL is ignored: only EXTRA_ENV sets it.
+#   EXTRA_ENV='TORUS_BOOK_ROWS=N' or 'BOOK_MODE=<mode>'  the order-book storage
+#                mode of this cell (owner s131). A genesis field
+#                (.consensus.book_mode, chain-wide): the node takes its mode
+#                from genesis and refuses to start when TORUS_BOOK_ROWS
+#                disagrees. So the mode is lifted out of EXTRA_ENV and handed
+#                to gen-3val-genesis.sh (BOOK_MODE, this cell's genesis only).
+#                TORUS_BOOK_ROWS=0|1|2|3 (the existing campaign specs; empty =
+#                classic) still reaches the nodes too, where it agrees with the
+#                genesis (deprecation warning only); BOOK_MODE=classic |
+#                order_rows | level_authority | level_authority_chunked | 0-3
+#                sets the genesis only. Both set and different, or a value that
+#                is not a mode = FATAL at preflight. Neither = classic, the field
+#                absent (genesis byte-identical); an explicit classic / 0 is the
+#                same genesis (and genesis-cache entry): Classic is never
+#                written. summarize.py scores the genesis mode
+#                (--genesis-book-mode: label, crash-gate checkpoint default); a
+#                BOOK_MODE=-only non-Classic cell refuses at preflight with a
+#                summarizer that lacks it. The cell refuses a genesis
+#                whose mode is not the one it asked for, logs it ("genesis
+#                consensus.book_mode=..."), labels the cell= line book_mode=
+#                classic|mode1|mode2|mode3 from it and records summary.json
+#                .genesis.book_mode and .cell.book_mode. Ambient values are
+#                ignored: only EXTRA_ENV sets the mode.
 #   BULK_COUNT=N  genesis-funded bulk senders "bulk-test 60".."bulk-test
 #                60+N-1" (testnet/gen-weighted-genesis.sh; default 100000 =
 #                every cell before bench queue 8f). Handed to
@@ -525,9 +548,10 @@ RUN_DIR="$DATA_ROOT/run"
 # 'TORUS_PARALLEL_SETTLE=0').
 # NO book mode here (s131, bench 8y / perf doc section 110): from the r2 merge
 # (3bf5a313) to s131 this list pinned TORUS_BOOK_ROWS=3, so a cell ran mode 3
-# unless its campaign overrode it, and one 8y Classic smoke silently did. A
-# cell now runs the node default (Classic, the testnet genesis mode) unless
-# EXTRA_ENV sets TORUS_BOOK_ROWS (=3 for a mode-3 arm, =2 mode 2, =1 OrderRows);
+# unless its campaign overrode it, and one 8y Classic smoke silently did. The
+# book mode is now the genesis field consensus.book_mode (s131): a cell runs
+# Classic (field absent) unless EXTRA_ENV sets TORUS_BOOK_ROWS (=3 for a mode-3
+# arm, =2 mode 2, =1 OrderRows) or BOOK_MODE, which go into the cell genesis;
 # the cell=... book_mode=... line and summary.json cell.book_mode record it.
 # TORUS_PARALLEL_BUCKET_HASH: 4 -> 8 after the r5 root-and-save-workers sweep
 # (+10.8 % n=3 vs n=3, agreement clean); 8 is ALSO the compiled default now
@@ -581,16 +605,19 @@ cell_retention() {
         *) v=${v#"${v%%[!0]*}"}; echo "${v:-archive}" ;;
     esac
 }
-# book_mode: mirrors torus_bridge::native_executor::parse_book_rows_mode —
-# trimmed "1"/"2"/"3" -> mode1/mode2/mode3, anything else (incl. unset and
-# empty) -> classic. Flags: unset -> 'unset (default)', empty -> 'empty
-# (default)' (every audited flag reads empty as its default), else the value.
+# node_flags_line <genesis book mode>: book_mode= is the cell genesis'
+# consensus.book_mode (what every node runs; s131), classic / order_rows /
+# level_authority / level_authority_chunked -> classic/mode1/mode2/mode3.
+# Flags: unset -> 'unset (default)', empty -> 'empty (default)' (every audited
+# flag reads empty as its default), else the value.
 node_flags_line() {
-    local v k mode
-    v=${TORUS_BOOK_ROWS-}
-    v=${v#"${v%%[![:space:]]*}"}
-    v=${v%"${v##*[![:space:]]}"}
-    case "$v" in 1|2|3) mode="mode$v" ;; *) mode=classic ;; esac
+    local k mode
+    case "$1" in
+        order_rows) mode=mode1 ;;
+        level_authority) mode=mode2 ;;
+        level_authority_chunked) mode=mode3 ;;
+        *) mode=classic ;;
+    esac
     printf 'book_mode=%s' "$mode"
     printf ' retention=%s' "$(cell_retention)"
     for k in "${NODE_FLAGS_AUDIT[@]}"; do
@@ -768,6 +795,40 @@ if [ "$GEN_EVM_BLOCK_INTERVAL_SET" = 1 ]; then
     [[ "$GEN_EVM_BLOCK_INTERVAL" =~ ^[1-9][0-9]{0,2}$ ]] && [ "$GEN_EVM_BLOCK_INTERVAL" -ge 2 ] && [ "$GEN_EVM_BLOCK_INTERVAL" -le 100 ] \
         || { echo "FATAL: EVM_BLOCK_INTERVAL must be an integer in 2..=100 (torus_types::EVM_BLOCK_INTERVAL_RANGE) (got '$GEN_EVM_BLOCK_INTERVAL')" >&2; exit 2; }
 fi
+# Book mode (s131): the genesis field consensus.book_mode, from EXTRA_ENV
+# TORUS_BOOK_ROWS (the node's strict values 0-3, empty = classic) or BOOK_MODE
+# (a name or 0-3); checked here so a bad or conflicting mode fails before
+# anything is staged. GEN_BOOK_MODE = the genesis name, empty = field absent.
+book_mode_name() { # <value> -> the genesis name; rc 1 if not a mode
+    case "$1" in
+        0|classic) echo classic ;;
+        1|order_rows) echo order_rows ;;
+        2|level_authority) echo level_authority ;;
+        3|level_authority_chunked) echo level_authority_chunked ;;
+        *) return 1 ;;
+    esac
+}
+GEN_BOOK_MODE=""; GEN_BOOK_MODE_SRC=""; BM_ROWS=""; BM_KNOB=""; BM_KNOB_SET=0
+for kv in $EXTRA_ENV; do case $kv in TORUS_BOOK_ROWS=*) BM_ROWS=${kv#*=} ;; BOOK_MODE=*) BM_KNOB=${kv#*=}; BM_KNOB_SET=1 ;; esac; done
+if [ -n "$BM_ROWS" ]; then
+    case "$BM_ROWS" in
+        [0-3]) GEN_BOOK_MODE=$(book_mode_name "$BM_ROWS"); GEN_BOOK_MODE_SRC="TORUS_BOOK_ROWS=$BM_ROWS" ;;
+        *) echo "FATAL: TORUS_BOOK_ROWS=$BM_ROWS in EXTRA_ENV is not a book mode (0, 1, 2 or 3; empty = classic)" >&2; exit 2 ;;
+    esac
+fi
+if [ "$BM_KNOB_SET" = 1 ]; then
+    BM_NAME=$(book_mode_name "$BM_KNOB") \
+        || { echo "FATAL: BOOK_MODE=$BM_KNOB in EXTRA_ENV is not a book mode (classic, order_rows, level_authority, level_authority_chunked or 0-3)" >&2; exit 2; }
+    if [ -n "$GEN_BOOK_MODE" ] && [ "$BM_NAME" != "$GEN_BOOK_MODE" ]; then
+        echo "FATAL: BOOK_MODE=$BM_KNOB and TORUS_BOOK_ROWS=$BM_ROWS name different book modes ($BM_NAME vs $GEN_BOOK_MODE): the nodes would refuse to start" >&2
+        exit 2
+    fi
+    GEN_BOOK_MODE=$BM_NAME
+    GEN_BOOK_MODE_SRC="BOOK_MODE=$BM_KNOB${GEN_BOOK_MODE_SRC:+, $GEN_BOOK_MODE_SRC}"
+fi
+# Classic is the absent field: an explicit classic / 0 builds (and caches) the
+# same genesis as no knob, so one Classic chain has one genesis md5.
+if [ "$GEN_BOOK_MODE" = classic ]; then GEN_BOOK_MODE=""; fi
 for v in EXPECT_NODE_MD5 EXPECT_BENCH_MD5; do
     [[ -z "${!v}" || "${!v}" =~ ^[0-9a-f]{8,32}$ ]] || { echo "FATAL: $v must be 8-32 lowercase hex chars of an md5 (got '${!v}')" >&2; exit 2; }
 done
@@ -927,6 +988,16 @@ summarizer_has_liq_opts() {
     case "$h" in *--liq-thin-avail*) return 0 ;; esac
     return 1
 }
+# summarizer_has_genesis_book_mode: the selected summarize.py accepts
+# --genesis-book-mode (s131), so it scores the cell's book mode (label and the
+# crash gate's checkpoint default) from the genesis. An older one reads only
+# the node env TORUS_BOOK_ROWS.
+summarizer_has_genesis_book_mode() {
+    local h
+    h=$(python3 "$TOOLS_DIR/summarize.py" --help 2>/dev/null) || return 1
+    case "$h" in *--genesis-book-mode*) return 0 ;; esac
+    return 1
+}
 # digest_has_position_accounts: the selected digest-node.sh digests the
 # position accounts it is handed as 7th argument (`--capabilities` lists
 # `position-accounts`). An older one ignores that argument silently, so the
@@ -963,6 +1034,20 @@ if liq_stress_on; then
     DIGEST_HAS_POS=1
     SUMMARIZE_LIQ_ARGS=(--liq-thin "$LIQ_THIN" --liq-thin-avail "$LIQ_THIN_AVAIL")
 fi
+# Book mode (s131): the summarizer scores the genesis mode. An older one only
+# sees TORUS_BOOK_ROWS in the node env, which a BOOK_MODE=-only non-Classic
+# cell does not set: it would score the cell as Classic (crash gate bound 202
+# instead of 2), so refuse that combination here, before the run.
+SUMMARIZER_HAS_BOOK_MODE=0
+if summarizer_has_genesis_book_mode; then
+    SUMMARIZER_HAS_BOOK_MODE=1
+elif [ -n "$GEN_BOOK_MODE" ] && [ -z "$BM_ROWS" ]; then
+    echo "FATAL: BOOK_MODE=$BM_KNOB (genesis consensus.book_mode=$GEN_BOOK_MODE, no TORUS_BOOK_ROWS on the nodes)" \
+        "needs a summarizer that accepts --genesis-book-mode, and $TOOLS_DIR/summarize.py does not: it would" \
+        "score the cell as Classic (TOOLS_FROM_WORKTREE=$TOOLS_FROM_WORKTREE; use this harness's own tools:" \
+        "TOOLS_FROM_WORKTREE=0, or set TORUS_BOOK_ROWS=<0-3> in EXTRA_ENV instead)" >&2
+    exit 1
+fi
 # liq_thin_patch <genesis> <n> <available>: native `available` = <available> on
 # the balances noted "bulk-test 60" .. "bulk-test 60+n-1" (load senders
 # 0..n-1). Prints the rows changed. rc 1, genesis untouched, unless exactly n
@@ -995,6 +1080,26 @@ record_genesis_evm_n() {
     local p=$1 n=$2 tmp
     tmp="$p.evm-n.tmp"
     if ! jq --argjson n "$n" '.genesis.evm_block_interval = $n' "$p" > "$tmp" || ! mv -f "$tmp" "$p"; then
+        rm -f -- "${tmp:?}"
+        return 1
+    fi
+}
+
+# record_genesis_book_mode <summary.json> <name>: .genesis.book_mode = name
+# (the cell genesis' consensus.book_mode) and .cell.book_mode = its label
+# (summarize.py, possibly an older copy, derives the label from the node env).
+# rc 1, file untouched, on failure.
+record_genesis_book_mode() {
+    local p=$1 name=$2 label tmp
+    case "$name" in
+        classic) label=classic ;;
+        order_rows) label=mode1 ;;
+        level_authority) label=mode2 ;;
+        level_authority_chunked) label=mode3 ;;
+        *) return 1 ;;
+    esac
+    tmp="$p.book-mode.tmp"
+    if ! jq --arg n "$name" --arg l "$label" '.genesis.book_mode = $n | .cell.book_mode = $l' "$p" > "$tmp" || ! mv -f "$tmp" "$p"; then
         rm -f -- "${tmp:?}"
         return 1
     fi
@@ -1193,12 +1298,14 @@ genesis_key() { # key | store ARGS...: genesis_cache.py with this cell's key inp
     local cmd=$1; shift
     python3 -I "$SELF_DIR/genesis_cache.py" "$cmd" --root "$MAINREPO" --run-cell "$SELF_DIR/run-cell.sh" \
         --param MARKETS="$MARKETS" --param BULK_COUNT="$BULK_COUNT" --param TIMEOUT_BASE_MS="$GEN_TIMEOUT_BASE_MS" \
-        --param EVM_BLOCK_INTERVAL="$GEN_EVM_BLOCK_INTERVAL" --param LIQ_THIN="$LIQ_THIN" --param LIQ_THIN_AVAIL="$LIQ_THIN_AVAIL" "$@"
+        --param EVM_BLOCK_INTERVAL="$GEN_EVM_BLOCK_INTERVAL" --param LIQ_THIN="$LIQ_THIN" --param LIQ_THIN_AVAIL="$LIQ_THIN_AVAIL" \
+        --param BOOK_MODE="$GEN_BOOK_MODE" "$@"
 }
 genesis_key_store() {
     genesis_key store --dir "$GENESIS_CACHE_DIR" --genesis "$GENESIS" --md5 "$GEN_MD5" $GEN_FORCED \
         --meta label="$LABEL" --meta markets="$GEN_MARKETS" --meta native_balances="$GEN_ACCTS" --meta bulk_count="$GEN_BULK" \
-        --meta timeout_base_ms="$GEN_TBMS" --meta evm_block_interval="$GEN_EVM_N" --meta liq_thin_rows="${LIQ_THIN_ROWS:-}" \
+        --meta timeout_base_ms="$GEN_TBMS" --meta evm_block_interval="$GEN_EVM_N" --meta book_mode="$GEN_BOOK_MODE_GOT" \
+        --meta liq_thin_rows="${LIQ_THIN_ROWS:-}" \
         --gen-out <(tail -c +$((GEN_LOG_FROM + 1)) "$OUT/run.log" | head -c $((GEN_LOG_TO - GEN_LOG_FROM))) \
         2>>"$OUT/run.log"
 }
@@ -1218,8 +1325,9 @@ fi
 if [ "$GEN_REUSED" = 1 ]; then
     # The entry holds the values the build path reads with jq below (its md5 was re-checked on the copy).
     # (the one field that may be empty comes last: read collapses adjacent tabs)
-    IFS=$'\t' read -r GEN_MD5 GEN_MARKETS GEN_ACCTS GEN_BULK GEN_TBMS GEN_EVM_N GEN_BUILT LIQ_THIN_ROWS < <(jq -r \
-        '[.md5, .markets, .native_balances, .bulk_count, .timeout_base_ms, .evm_block_interval, .built_at, (.liq_thin_rows // "")] | @tsv' <<<"$GEN_META")
+    IFS=$'\t' read -r GEN_MD5 GEN_MARKETS GEN_ACCTS GEN_BULK GEN_TBMS GEN_EVM_N GEN_BUILT GEN_BOOK_MODE_GOT LIQ_THIN_ROWS < <(jq -r \
+        '[.md5, .markets, .native_balances, .bulk_count, .timeout_base_ms, .evm_block_interval, .built_at,
+          (.book_mode // "classic"), (.liq_thin_rows // "")] | @tsv' <<<"$GEN_META")
     # run.log gets the build path's lines in their form (checks and spec expectations read them, e.g. the
     # generator's "  state_hash_activation = off"): this line, then the generator's output as it prints it for
     # this cell (genesis_cache.py replay: its summary from the entry), then the reuse line (test_genesis_reuse_lines.py).
@@ -1234,7 +1342,7 @@ else
     fi
     # The generator's run.log bytes (GEN_LOG_FROM..GEN_LOG_TO) go into the cache entry (genesis_key_store).
     GEN_LOG_FROM=$(stat -c %s -- "$OUT/run.log")
-    TIMEOUT_BASE_MS=$GEN_TIMEOUT_BASE_MS EVM_BLOCK_INTERVAL=$GEN_EVM_BLOCK_INTERVAL MARKETS=$MARKETS BULK_COUNT=$BULK_COUNT OUT="$GENESIS" BENCH_BIN="$BENCH" "$MAINREPO/devnet/wsl/gen-3val-genesis.sh" >>"$OUT/run.log" 2>&1 \
+    TIMEOUT_BASE_MS=$GEN_TIMEOUT_BASE_MS EVM_BLOCK_INTERVAL=$GEN_EVM_BLOCK_INTERVAL BOOK_MODE=$GEN_BOOK_MODE MARKETS=$MARKETS BULK_COUNT=$BULK_COUNT OUT="$GENESIS" BENCH_BIN="$BENCH" "$MAINREPO/devnet/wsl/gen-3val-genesis.sh" >>"$OUT/run.log" 2>&1 \
         || die "genesis generation failed (see run.log)"
     GEN_LOG_TO=$(stat -c %s -- "$OUT/run.log")
     GEN_TBMS=$(jq '.consensus.timeout_base_ms' "$GENESIS")
@@ -1260,13 +1368,21 @@ if [ "$LIQ_THIN" -gt 0 ]; then
 fi
 if [ "$GEN_REUSED" != 1 ]; then
     # One jq pass (each parses the whole genesis: ~3 s at BULK_COUNT=1M).
-    read -r GEN_MARKETS GEN_ACCTS GEN_BULK < <(jq -r '[(.markets|length), (.native_balances|length),
-        ([.native_balances[] | (.note // "") | select(test("^bulk-test [0-9]+$"))] | length)] | @tsv' "$GENESIS")
+    # consensus.book_mode: absent = classic; a 0-3 number = that mode's name (the node reads both).
+    read -r GEN_MARKETS GEN_ACCTS GEN_BULK GEN_BOOK_MODE_GOT < <(jq -r '[(.markets|length), (.native_balances|length),
+        ([.native_balances[] | (.note // "") | select(test("^bulk-test [0-9]+$"))] | length),
+        ((.consensus.book_mode // "classic") | if type == "number"
+            then (["classic", "order_rows", "level_authority", "level_authority_chunked"][.] // "invalid:\(.)")
+            else tostring end)] | @tsv' "$GENESIS")
     GEN_MD5=$(md5sum "$GENESIS" | cut -d' ' -f1)
 fi
 [ "$GEN_MARKETS" = "$MARKETS" ] || die "genesis has $GEN_MARKETS markets, wanted $MARKETS"
 [ "$GEN_BULK" = "$BULK_COUNT" ] || die "genesis has $GEN_BULK bulk-test senders, wanted BULK_COUNT=$BULK_COUNT"
 log "genesis markets=$GEN_MARKETS native_balances=$GEN_ACCTS bulk_count=$GEN_BULK md5=$GEN_MD5"
+# The genesis book mode must be the cell's (a hand-patched weighted-full genesis, or a generator without BOOK_MODE).
+[ "$GEN_BOOK_MODE_GOT" = "${GEN_BOOK_MODE:-classic}" ] \
+    || die "genesis consensus.book_mode=$GEN_BOOK_MODE_GOT, wanted ${GEN_BOOK_MODE:-classic} (${GEN_BOOK_MODE_SRC:-no TORUS_BOOK_ROWS / BOOK_MODE in EXTRA_ENV}): gen-3val-genesis.sh copies .consensus from $MAINREPO/testnet/genesis-weighted-full.json; remove a hand patch there (set the mode per cell with EXTRA_ENV BOOK_MODE= or TORUS_BOOK_ROWS=)"
+log "genesis consensus.book_mode=$GEN_BOOK_MODE_GOT (${GEN_BOOK_MODE_SRC:-absent: classic})"
 if [ "$GEN_REUSED" != 1 ]; then
     if [ -n "$GENESIS_CACHE_DIR" ]; then
         # Keyed again by the store, after the build: a first (or FORCE=1) build writes the weighted-full genesis.
@@ -1324,7 +1440,7 @@ for kv in $EXTRA_ENV; do export "$kv"; done
 [ -n "$HOTSTUFF_CPUS" ] && export HOTSTUFF_CPUS
 NODE_ENV_JSON=$(env | grep -E '^(TORUS_|HOTSTUFF_CPUS=)' | sort | python3 -c 'import sys,json;print(json.dumps(dict(l.rstrip("\n").split("=",1) for l in sys.stdin)))')
 log "node env: $NODE_ENV_JSON"
-log "cell=$LABEL $(node_flags_line)"
+log "cell=$LABEL $(node_flags_line "$GEN_BOOK_MODE_GOT")"
 T_LAUNCH=$(date +%s)
 CLEAN=1 "$WSL/launch-3val.sh" >>"$OUT/run.log" 2>&1 || die "launch-3val.sh failed"
 sleep 2
@@ -1985,6 +2101,8 @@ for i in 0 1 2; do
       echo "== phase60 val$i"; awk -f "$TOOLS_DIR/phase60.awk" "$OUT/phase-val$i.csv"; } > "$OUT/analysis-val$i.txt" 2>&1
 done
 
+SUMMARIZE_BOOK_ARGS=()
+[ "$SUMMARIZER_HAS_BOOK_MODE" = 1 ] && SUMMARIZE_BOOK_ARGS=(--genesis-book-mode "$GEN_BOOK_MODE_GOT")
 python3 "$TOOLS_DIR/summarize.py" \
     --out "$OUT" --label "$LABEL" --worktree "$WT" --commit "$WT_COMMIT" --dirty "$WT_DIRTY" \
     --markets "$MARKETS" --dur "$DUR" --rate "$RATE" --senders "$SENDERS" \
@@ -1999,12 +2117,14 @@ python3 "$TOOLS_DIR/summarize.py" \
     --max-in-flight "${MAX_IN_FLIGHT:-}" --open-order-budget "${OPEN_ORDER_BUDGET:-}" \
     --in-flight-tail "${IN_FLIGHT_TAIL:-}" \
     "${SUMMARIZE_LIQ_ARGS[@]}" \
+    "${SUMMARIZE_BOOK_ARGS[@]}" \
     --digest-quiescent "$DIGEST_QUIESCENT" --digest-secs "${DIGSECS[*]}" --digest-heights "${DHGT[*]}" \
     | tee -a "$OUT/run.log"
 rc=${PIPESTATUS[0]}
 if [ "$rc" = 0 ]; then
     record_genesis_evm_n "$OUT/summary.json" "$GEN_EVM_N" || log "WARNING: summary.json .genesis.evm_block_interval not written"
     record_genesis_bulk_count "$OUT/summary.json" "$BULK_COUNT" || log "WARNING: summary.json .genesis.bulk_count not written"
+    record_genesis_book_mode "$OUT/summary.json" "$GEN_BOOK_MODE_GOT" || log "WARNING: summary.json .genesis.book_mode / .cell.book_mode not written"
 fi
 # summarize.py rewrote summary.json: put the pre-load record (and its verdict) back.
 if preload_on && [ "$rc" = 0 ]; then

@@ -39,7 +39,7 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
 - **Aliased opaque position rows in the parallel settle:** answered s132 (they cannot exist on a fresh genesis); reject-on-load fix on `fix/aliased-rows-reject` (2026-10-21), not merged yet. Tracked in Pre-testnet decisions.
 - **EVM proposer concentration (Q12):** decided s131: keep N = 11 for the testnet (coprime to 3 / 4 validators); revisit before mainnet. Tracked in Pre-testnet decisions.
 - **Retention default (prune by default or not):** decided s131: prune by default, N = 100,000 blocks, archive nodes opt out with `--archive` (RH4 GC worker + compaction filter merged, perf doc sections 103 and 112). Still open: which testnet node runs as the archive node; revisit N if the trial testnet's catch-up or disk numbers say so. Tracked in Pre-testnet decisions.
-- **Book storage mode for the genesis (Classic vs mode 3):** bench 8p / 8s and owner decision. Tracked in Pre-testnet decisions and `docs/perf/bench-queue.md`.
+- **Book storage mode for the genesis (Classic vs mode 3):** bench 8p / 8s and owner decision. The mode is now a genesis field (s131, `feat/book-mode-genesis`): `consensus.book_mode`, absent = Classic, `"level_authority_chunked"` = mode 3; the node refuses a disagreeing `TORUS_BOOK_ROWS` or DB marker. What is left is the value. Tracked in Pre-testnet decisions and `docs/perf/bench-queue.md`.
 - **Running state hash in the genesis:** whether the testnet genesis sets `consensus.state_hash_activation_height` (absent = running hash off; `docs/plans/running-state-hash-impl.md`). Owner decision before the genesis.
 - **WAN measurements:** PE on WAN, push-manifest threshold, header re-send and the T2.5 cap of 400 were all measured on one host only. The trial testnet doubles as the WAN test. Tracked in Pre-testnet decisions.
 
@@ -531,7 +531,13 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
   (`TORUS_BOOK_ROWS=3`) cuts the exec-thread book save from 65.70 to 4.93 ms per block and blocks/s 3.24 -> 10.14, but
   costs the flush worker (per-block flush, +18% whole-process CPU-s per 1M fills); mode 3 is the candidate. Pending:
   bench 8p (longer Classic vs mode 3 A/B, deep and standard shape) and the owner's decision; design note
-  `docs/plans/deep-book-save-options.md` on branch `docs/deep-book-save-options`. **L3.3 (`TORUS_BOOK_FAST_ENCODE`,
+  `docs/plans/deep-book-save-options.md` on branch `docs/deep-book-save-options`. **Genesis field: DONE (s131,
+  `feat/book-mode-genesis`).** The mode is `consensus.book_mode` in the genesis (absent = Classic, mode 3 =
+  `"level_authority_chunked"`), fixed for the chain's life; every node takes it from there, `TORUS_BOOK_ROWS` may
+  only repeat it (deprecated) and a data dir whose `__book_mode__` marker disagrees refuses to start, so a mixed
+  fleet on a fresh genesis is no longer possible (`docs/configuration-reference.md`, `docs/node-operator-guide.md`).
+  Bench cells get it from `run-cell.sh` (EXTRA_ENV `TORUS_BOOK_ROWS=N` or `BOOK_MODE=`, written into the cell
+  genesis). Choosing mode 3 for the testnet = setting the field. **L3.3 (`TORUS_BOOK_FAST_ENCODE`,
   default on since s131, section 105: deep book B/A blocks/s 1.086, p50 0.884, p99 0.919, CPU-s per 1M fills 0.989,
   n = 1; `0` turns it off) only affects Classic:** if the genesis picks mode 3 it is dead code and should be removed
   in a cleanup. **L3.1 (`TORUS_BOOK_COALESCE`, checkpoint-coalesced Classic book save) is on by default since s131 where its

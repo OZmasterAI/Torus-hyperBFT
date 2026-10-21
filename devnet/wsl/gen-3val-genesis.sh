@@ -41,6 +41,15 @@
 #               OUT, never the reused weighted-full genesis. Unset or empty =
 #               the field stays absent (node default 11) and OUT is
 #               byte-identical to a run without the knob.
+#   BOOK_MODE=<mode>  the order-book storage mode, genesis field
+#               .consensus.book_mode (owner s131: chain-wide, the node takes
+#               its mode from genesis and refuses a TORUS_BOOK_ROWS that
+#               disagrees). classic | order_rows | level_authority |
+#               level_authority_chunked, or 0-3 (written as the name); else
+#               FATAL before anything is written. Patches only OUT, never the
+#               reused weighted-full genesis. Unset, empty, classic or 0 = the
+#               field stays absent (absent is Classic, so one Classic chain has
+#               one genesis) and OUT is byte-identical to a run without it.
 #   BENCH_BIN=  bench-throughput binary (default: cargo-bin resolution, which
 #               honours CARGO_TARGET_DIR, then <repo>/target/release).
 set -euo pipefail
@@ -57,6 +66,18 @@ command -v jq >/dev/null || { echo "FATAL: jq not installed" >&2; exit 1; }
 if [ -n "${EVM_BLOCK_INTERVAL:-}" ]; then
     [[ "$EVM_BLOCK_INTERVAL" =~ ^[1-9][0-9]{0,2}$ ]] && [ "$EVM_BLOCK_INTERVAL" -ge 2 ] && [ "$EVM_BLOCK_INTERVAL" -le 100 ] \
         || { echo "FATAL: EVM_BLOCK_INTERVAL must be an integer in 2..=100 (torus_types::EVM_BLOCK_INTERVAL_RANGE) (got '$EVM_BLOCK_INTERVAL')" >&2; exit 1; }
+fi
+# BOOK_MODE -> the genesis name (torus_types::book_mode::BookMode::name);
+# empty for Classic (the field stays absent).
+BOOK_MODE_NAME=""
+if [ -n "${BOOK_MODE:-}" ]; then
+    case "$BOOK_MODE" in
+        0|classic) BOOK_MODE_NAME="" ;;  # absent = Classic: never written explicitly
+        1|order_rows) BOOK_MODE_NAME=order_rows ;;
+        2|level_authority) BOOK_MODE_NAME=level_authority ;;
+        3|level_authority_chunked) BOOK_MODE_NAME=level_authority_chunked ;;
+        *) echo "FATAL: BOOK_MODE must be classic, order_rows, level_authority, level_authority_chunked or 0-3 (got '$BOOK_MODE')" >&2; exit 1 ;;
+    esac
 fi
 
 BULK_COUNT="${BULK_COUNT:-100000}"
@@ -150,6 +171,12 @@ if [ -n "${EVM_BLOCK_INTERVAL:-}" ]; then
     tmp=$(mktemp) && jq --argjson n "$EVM_BLOCK_INTERVAL" '.evm.block_interval = $n' "$OUT" > "$tmp" && mv "$tmp" "$OUT"
 fi
 
+# 4c. Optional order-book storage mode (owner s131). Validated at the top;
+#     chain-wide, so all validators agree (absent = classic).
+if [ -n "$BOOK_MODE_NAME" ]; then
+    tmp=$(mktemp) && jq --arg m "$BOOK_MODE_NAME" '.consensus.book_mode = $m' "$OUT" > "$tmp" && mv "$tmp" "$OUT"
+fi
+
 # 5. Optional running state hash activation (docs/plans/running-state-hash-impl.md).
 #    CHAIN-WIDE genesis field: every node hashes from this height; absent = off.
 if [ -n "${STATE_HASH_ACTIVATION:-}" ]; then
@@ -173,6 +200,7 @@ jq -r '
     "  timeout_ms = \(.consensus.timeout_base_ms)",
     "  evm_block_interval = \(.evm.block_interval // "absent (node default 11)")",
     "  state_hash_activation = \(.consensus.state_hash_activation_height // "off")",
+    "  book_mode  = \(.consensus.book_mode // "absent (classic)")",
     "  chain_id   = \(.chain_id)",
     "  validators = \(.validators|length)  (\([.validators[].address] | join(" ")) )",
     "  native_bal = \(.native_balances|length)",

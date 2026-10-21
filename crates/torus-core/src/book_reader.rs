@@ -75,8 +75,8 @@ impl BookLayout {
     pub fn describe(self) -> &'static str {
         match self {
             BookLayout::Classic => "classic whole-book blobs",
-            BookLayout::OrderRows => "per-order rows (TORUS_BOOK_ROWS=1)",
-            BookLayout::LevelAuthority => "level authority (TORUS_BOOK_ROWS=2/3)",
+            BookLayout::OrderRows => "per-order rows (book mode 1)",
+            BookLayout::LevelAuthority => "level authority (book mode 2/3)",
         }
     }
 

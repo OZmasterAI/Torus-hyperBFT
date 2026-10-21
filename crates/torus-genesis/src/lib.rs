@@ -124,6 +124,12 @@ pub struct ConsensusConfig {
     /// every node hashes). Absent = running hash disabled.
     #[serde(default)]
     pub state_hash_activation_height: Option<u64>,
+    /// Order-book storage mode (owner s131), CHAIN-WIDE and fixed for the
+    /// chain's life: `"classic"`, `"order_rows"`, `"level_authority"`,
+    /// `"level_authority_chunked"` (or 0-3). Absent = Classic; any other value
+    /// refuses the genesis. The node takes its mode from here.
+    #[serde(default)]
+    pub book_mode: torus_types::book_mode::BookMode,
 }
 
 fn default_chain_id() -> u64 {
@@ -741,6 +747,7 @@ impl Genesis {
             // via the `--exec-trust-cache` CLI flag.
             exec_trust_cache: false,
             state_hash_activation_height: self.consensus.state_hash_activation_height,
+            book_mode: self.consensus.book_mode,
         }
     }
 
@@ -1066,6 +1073,77 @@ mod tests {
         assert!(config.validate().is_ok());
         config.state_hash_activation_height = Some(0);
         assert!(config.validate().is_err(), "height 0 is never executed");
+    }
+
+    /// Owner s131: the order-book storage mode is CHAIN-WIDE genesis field
+    /// `consensus.book_mode`; absent (every existing genesis, incl. the
+    /// testnet's and the devnet's) = Classic.
+    #[test]
+    fn genesis_without_book_mode_is_classic() {
+        use torus_types::book_mode::BookMode;
+        let sample = Genesis::from_json(&sample_genesis_json()).unwrap();
+        assert_eq!(sample.consensus.book_mode, BookMode::Classic);
+        assert_eq!(sample.chain_config().book_mode, BookMode::Classic);
+        for (name, json) in [
+            (
+                "testnet base",
+                include_str!("../../../testnet/genesis-weighted-base.json"),
+            ),
+            (
+                "testnet setup2b",
+                include_str!("../../../testnet/genesis-weighted-base-setup2b.json"),
+            ),
+            ("devnet", include_str!("../../../devnet/genesis.json")),
+        ] {
+            let g = Genesis::from_json(json).unwrap();
+            assert_eq!(g.chain_config().book_mode, BookMode::Classic, "{name}");
+        }
+    }
+
+    /// Names and their 0-3 numbers both parse; anything else refuses the
+    /// genesis (never a silent Classic).
+    #[test]
+    fn genesis_book_mode_maps_to_chain_config() {
+        use torus_types::book_mode::BookMode;
+        let base: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        let with = |v: serde_json::Value| {
+            let mut json = base.clone();
+            json["consensus"]["book_mode"] = v;
+            Genesis::from_json(&json.to_string())
+        };
+        for (v, want) in [
+            (serde_json::json!("classic"), BookMode::Classic),
+            (serde_json::json!("order_rows"), BookMode::OrderRows),
+            (
+                serde_json::json!("level_authority"),
+                BookMode::LevelAuthority,
+            ),
+            (
+                serde_json::json!("level_authority_chunked"),
+                BookMode::LevelAuthorityChunked,
+            ),
+            (serde_json::json!(0), BookMode::Classic),
+            (serde_json::json!(1), BookMode::OrderRows),
+            (serde_json::json!(2), BookMode::LevelAuthority),
+            (serde_json::json!(3), BookMode::LevelAuthorityChunked),
+        ] {
+            let g = with(v.clone()).unwrap_or_else(|e| panic!("{v}: {e}"));
+            assert_eq!(g.consensus.book_mode, want, "{v}");
+            let config = g.chain_config();
+            assert_eq!(config.book_mode, want, "{v}");
+            assert!(config.validate().is_ok());
+        }
+        for v in [
+            serde_json::json!(4),
+            serde_json::json!(-1),
+            serde_json::json!("3"),
+            serde_json::json!("Classic"),
+            serde_json::json!("mode3"),
+            serde_json::json!(null),
+            serde_json::json!(true),
+        ] {
+            assert!(with(v.clone()).is_err(), "{v} must refuse the genesis");
+        }
     }
 
     /// Consensus bug (b): genesis records the hotstuff genesis set as the

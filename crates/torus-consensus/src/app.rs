@@ -1635,6 +1635,10 @@ struct ExecutionContext {
     /// flight C and the window bookkeeping (E-only; the mutex is
     /// uncontended). Unused while `checkpoint` is `None`.
     ckpt: std::sync::Mutex<CkptState>,
+    /// The chain's order-book storage mode (genesis `consensus.book_mode`,
+    /// `ChainConfig::book_mode`, owner s131): every native context of the
+    /// consensus executor is built in this mode. Fixed for the chain's life.
+    book_mode: torus_bridge::native_executor::BookMode,
     /// 8k L3.1 (`TORUS_BOOK_COALESCE`, node-local, requested by default since
     /// s131; `0` = off): pipelined
     /// blocks with resident Classic books skip the per-block whole-book
@@ -1651,9 +1655,9 @@ struct ExecutionContext {
     /// seeded random policy.
     #[cfg(test)]
     test_ckpt_due: Option<Arc<dyn Fn(u64) -> bool + Send + Sync>>,
-    /// Test-only stand-in for the process-global `TORUS_BOOK_ROWS` +
-    /// `TORUS_RESIDENT_BOOKS=1` (`OnceLock`s in production): `Some(mode)` builds
-    /// every native context in `mode` with the resident holder attached.
+    /// Test-only override of `book_mode` + `TORUS_RESIDENT_BOOKS=1` (a
+    /// `OnceLock` in production): `Some(mode)` builds every native context in
+    /// `mode` with the resident holder attached.
     #[cfg(test)]
     test_book_mode: Option<torus_bridge::native_executor::BookMode>,
     /// Test-only: with `test_book_mode` set, build the contexts WITHOUT the
@@ -5380,6 +5384,7 @@ impl ExecutionContext {
                     torus_block.header.proposer,
                     self.treasury_address,
                     self.dev_pool_address,
+                    self.book_mode,
                     &mut resident_books,
                 ),
             };
@@ -7500,6 +7505,19 @@ impl TorusApp {
         mempool: Option<Arc<Mempool>>,
         signing_key: Option<ed25519_dalek::SigningKey>,
     ) -> Result<Self, String> {
+        // s131: the consensus executor runs `config.book_mode`; every other
+        // context of the process (RPC reads, the checkpoint layer) runs the
+        // process mode the node set from the same chain config. Refuse a
+        // config that disagrees with it (never two modes in one process).
+        if let Some(process) = torus_types::book_mode::chain_book_mode() {
+            if process != config.book_mode {
+                return Err(format!(
+                    "chain config book mode {} differs from this process's book mode {}",
+                    config.book_mode.describe(),
+                    process.describe()
+                ));
+            }
+        }
         let manifest_in_state_db = Arc::ptr_eq(&state_db.db_arc(), &manifest_db.db_arc());
         if !manifest_in_state_db {
             manifest_db
@@ -7620,6 +7638,7 @@ impl TorusApp {
             last_job_books_deferred: AtomicBool::new(false),
             checkpoint: None,
             ckpt: Default::default(),
+            book_mode: config.book_mode,
             book_coalesce: false,
             #[cfg(test)]
             test_coalesce_skip: None,
@@ -7747,9 +7766,8 @@ impl TorusApp {
         // non-deferred book mode; refuse to start otherwise (owner s109).
         // Step 6: the role default (15 s on validators) yields to a deferred
         // book mode instead (per-block flush, warned).
-        let checkpoint_interval = crate::exec_pipeline::effective_checkpoint_interval(
-            torus_bridge::native_executor::configured_book_mode(),
-        )?;
+        let checkpoint_interval =
+            crate::exec_pipeline::effective_checkpoint_interval(config.book_mode)?;
         if crate::exec_pipeline::exec_pipeline_enabled() {
             exec_ctx.checkpoint =
                 crate::exec_pipeline::CheckpointPolicy::for_interval(checkpoint_interval);
@@ -8522,6 +8540,7 @@ impl TorusApp {
             reputation_leader_selection: false,
             exec_trust_cache: false,
             state_hash_activation_height: None,
+            book_mode: Default::default(),
         };
         let mut seed = [0u8; 32];
         seed[..8].copy_from_slice(&id.to_le_bytes());
@@ -11535,6 +11554,7 @@ mod exec_throttle_tests {
                 reputation_leader_selection: false,
                 exec_trust_cache: false,
                 state_hash_activation_height: None,
+                book_mode: Default::default(),
             };
             (config, state_db)
         };
@@ -13037,6 +13057,7 @@ mod crash_recovery_tests {
             // Running state hash on from height 1 (chain config), as a
             // genesis-synced node of a chain with activation 1.
             state_hash_activation_height: Some(1),
+            book_mode: Default::default(),
         };
         torus_state::running_hash::configure_activation(&state_db, config.state_hash_activation_height)
             .expect("configure running hash activation");
@@ -16846,6 +16867,7 @@ mod crash_recovery_tests {
             last_job_books_deferred: AtomicBool::new(false),
             checkpoint: None,
             ckpt: Default::default(),
+            book_mode: config.book_mode,
             book_coalesce: false,
             #[cfg(test)]
             test_coalesce_skip: None,
@@ -23464,6 +23486,72 @@ mod crash_recovery_tests {
             assert_ne!(
                 env.1, bench.1,
                 "on={on}: Classic and mode-3 roots must differ"
+            );
+        }
+    }
+
+    /// s131: the consensus executor takes the book mode from the chain config
+    /// (genesis `consensus.book_mode`), not the env. A context built from a
+    /// config in mode 3 (`test_book_mode` None: the production `new_env`
+    /// path) writes the mode-3 marker and exactly the state of an explicit
+    /// mode-3 context, and differs from the Classic default, serial and
+    /// pipelined.
+    #[test]
+    fn chain_config_book_mode_drives_the_executor() {
+        use torus_bridge::native_executor::BookMode;
+        assert!(
+            std::env::var("TORUS_BOOK_ROWS").is_err(),
+            "TORUS_BOOK_ROWS must be unset for this test"
+        );
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
+        // (config book mode, test override, pipelined)
+        let run = |config_mode: BookMode, test_mode: Option<BookMode>, on: bool| {
+            let (mut config, state_db) = make_test_config_and_db();
+            config.epoch_length = 4;
+            config.book_mode = config_mode;
+            fund_book_fixture(&state_db);
+            let mut ctx = make_exec_ctx(&config, &state_db);
+            assert_eq!(
+                ctx.book_mode, config_mode,
+                "the context carries the config's mode"
+            );
+            ctx.test_book_mode = test_mode;
+            if on {
+                ctx.attach_flush_worker(None);
+            }
+            for b in &book_fixture_blocks() {
+                dispatch_and_execute(&ctx, &state_db, b);
+            }
+            assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
+            drop(ctx);
+            let root = torus_state::native_trie::persisted_native_root(&state_db).unwrap();
+            let marker = StateBackend::get_cf_raw(
+                &state_db,
+                torus_state::cf::CF_NATIVE_MARKETS,
+                b"__book_mode__",
+            )
+            .unwrap();
+            (root, dump_all_cfs(&state_db), marker)
+        };
+        for on in [false, true] {
+            let what = if on { "pipelined" } else { "serial" };
+            let config3 = run(BookMode::LevelAuthorityChunked, None, on);
+            let explicit3 = run(BookMode::Classic, Some(BookMode::LevelAuthorityChunked), on);
+            let classic = run(BookMode::Classic, None, on);
+            assert_eq!(
+                config3.2,
+                Some(vec![3]),
+                "{what}: config mode 3 writes the mode-3 marker"
+            );
+            assert_eq!(classic.2, Some(vec![0]), "{what}: Classic marker");
+            assert_eq!(
+                config3.0, explicit3.0,
+                "{what}: native root = explicit mode 3"
+            );
+            assert_dumps_equal(&config3.1, &explicit3.1, what);
+            assert_ne!(
+                config3.0, classic.0,
+                "{what}: mode 3 is not Classic (comparison not vacuous)"
             );
         }
     }

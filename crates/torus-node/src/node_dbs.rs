@@ -26,6 +26,7 @@ use hotstuff_rs::block_tree::variables::COMMITTED_VALIDATOR_SET;
 use torus_consensus::RocksKVStore;
 use torus_state::cf::{CF_ACCOUNTS, CF_BLOCK_HEADERS, CF_CONSENSUS_META, CF_STAKING_VALIDATORS};
 use torus_state::{consensus_db_path, NativeDaStore, StateBackend, StateDb};
+use torus_types::book_mode::{self, BookMode};
 
 /// The node's state DB and consensus DB, opened and checked.
 pub struct NodeDbs {
@@ -148,12 +149,61 @@ pub fn apply_genesis_if_fresh(
         .initialize(&dbs.state)
         .map_err(|e| format!("genesis initialize: {e}"))?;
     tracing::info!(%state_root, "genesis state seeded");
+    // s131: the DB names the chain's book mode from genesis on, so a restart
+    // (with or without `--genesis`) can never pick another mode, even before
+    // the first block wrote the marker.
+    torus_bridge::native_executor::write_book_mode_marker(&dbs.state, genesis.consensus.book_mode)?;
     let (app_state, vs_state) = genesis
         .to_hotstuff_genesis()
         .map_err(|e| format!("genesis hotstuff state: {e}"))?;
     hotstuff_rs::replica::Replica::initialize(dbs.kv_store(), app_state, vs_state);
     tracing::info!("consensus replica initialized with genesis validator set");
     Ok(true)
+}
+
+/// s131: the node's order-book storage mode. The chain's mode is `genesis`
+/// (`consensus.book_mode`); without `--genesis` (`None`) it is the DB's
+/// `__book_mode__` marker (written when genesis was applied), else Classic.
+/// `env` (`TORUS_BOOK_ROWS`) may only repeat it (deprecated, warned); a value
+/// that disagrees or is not a mode refuses to start, and so does a DB marker
+/// that names another mode. Runs before genesis is applied.
+pub fn node_book_mode(
+    state: &StateDb,
+    genesis: Option<BookMode>,
+    env: Option<&str>,
+) -> Result<BookMode, String> {
+    let refuse = |e: String| format!("refusing to start: {e}");
+    let marker = torus_bridge::native_executor::read_book_mode_marker(state).map_err(refuse)?;
+    let (chain, source) = match genesis {
+        Some(m) => (m, "genesis consensus.book_mode"),
+        None => match marker {
+            Some(b) => (
+                BookMode::from_marker_byte(b).ok_or_else(|| {
+                    refuse(format!("the DB's book-mode marker {b} is not a known mode"))
+                })?,
+                "the DB's book-mode marker; no --genesis",
+            ),
+            None => (
+                BookMode::Classic,
+                "default; no --genesis and no book-mode marker",
+            ),
+        },
+    };
+    let resolved = book_mode::resolve_node_book_mode(chain, env).map_err(refuse)?;
+    if resolved.deprecated_env {
+        tracing::warn!(
+            "TORUS_BOOK_ROWS is deprecated: the book mode comes from genesis consensus.book_mode \
+             (\"{}\" on this chain); the value agrees, so the node starts. Unset it",
+            chain.name()
+        );
+    }
+    book_mode::check_book_mode_marker(marker, chain).map_err(refuse)?;
+    tracing::info!(
+        book_mode = chain.name(),
+        "book mode: {} ({source})",
+        chain.describe()
+    );
+    Ok(chain)
 }
 
 /// Open the state DB and the consensus DB under `data_dir`, apply the
@@ -314,6 +364,113 @@ mod tests {
 
     fn genesis() -> torus_genesis::Genesis {
         torus_genesis::Genesis::from_json(include_str!("../../../devnet/genesis.json")).unwrap()
+    }
+
+    fn genesis_with_book_mode(mode: &str) -> torus_genesis::Genesis {
+        let mut v: serde_json::Value =
+            serde_json::from_str(include_str!("../../../devnet/genesis.json")).unwrap();
+        v["consensus"]["book_mode"] = serde_json::json!(mode);
+        torus_genesis::Genesis::from_json(&v.to_string()).unwrap()
+    }
+
+    fn marker(db: &StateDb) -> Option<u8> {
+        torus_bridge::native_executor::read_book_mode_marker(db).unwrap()
+    }
+
+    /// s131: applying genesis writes the chain's book-mode marker, so the DB
+    /// names the mode before the first block; a restart leaves it.
+    #[test]
+    fn fresh_genesis_writes_its_book_mode_marker() {
+        for (name, byte) in [
+            ("classic", 0u8),
+            ("order_rows", 1),
+            ("level_authority_chunked", 3),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let g = genesis_with_book_mode(name);
+            {
+                let dbs = open_node_dbs(dir.path()).unwrap();
+                assert_eq!(marker(&dbs.state), None, "{name}: fresh");
+                assert!(apply_genesis_if_fresh(&dbs, &g).unwrap());
+                assert_eq!(marker(&dbs.state), Some(byte), "{name}");
+            }
+            let dbs = open_node_dbs(dir.path()).unwrap();
+            assert!(
+                !apply_genesis_if_fresh(&dbs, &genesis()).unwrap(),
+                "{name}: restart"
+            );
+            assert_eq!(
+                marker(&dbs.state),
+                Some(byte),
+                "{name}: restart keeps the marker"
+            );
+        }
+        // A genesis without the field writes Classic.
+        let dir = tempfile::tempdir().unwrap();
+        let dbs = open_node_dbs(dir.path()).unwrap();
+        assert!(apply_genesis_if_fresh(&dbs, &genesis()).unwrap());
+        assert_eq!(marker(&dbs.state), Some(0));
+    }
+
+    /// s131: genesis gives the mode; `TORUS_BOOK_ROWS` may only repeat it; a
+    /// DB marker naming another mode refuses; without `--genesis` the marker
+    /// gives it.
+    #[test]
+    fn node_book_mode_follows_genesis_env_and_marker() {
+        use torus_types::book_mode::BookMode::{Classic, LevelAuthorityChunked as M3, OrderRows};
+        let dir = tempfile::tempdir().unwrap();
+        let dbs = open_node_dbs(dir.path()).unwrap();
+        let db = &dbs.state;
+        // fresh DB
+        assert_eq!(node_book_mode(db, Some(M3), None), Ok(M3));
+        assert_eq!(node_book_mode(db, Some(M3), Some("")), Ok(M3));
+        assert_eq!(node_book_mode(db, Some(M3), Some("3")), Ok(M3));
+        assert_eq!(node_book_mode(db, Some(Classic), Some("0")), Ok(Classic));
+        assert_eq!(
+            node_book_mode(db, None, None),
+            Ok(Classic),
+            "no genesis, no marker"
+        );
+        for (g, env) in [
+            (Some(M3), "0"),
+            (Some(Classic), "3"),
+            (Some(M3), "x"),
+            (None, "3"),
+        ] {
+            let err = node_book_mode(db, g, Some(env)).unwrap_err();
+            assert!(
+                err.starts_with("refusing to start: ") && err.contains("TORUS_BOOK_ROWS"),
+                "{g:?} {env}: {err}"
+            );
+        }
+        // a DB written under mode 3
+        torus_bridge::native_executor::write_book_mode_marker(db, M3).unwrap();
+        assert_eq!(node_book_mode(db, Some(M3), None), Ok(M3));
+        assert_eq!(
+            node_book_mode(db, None, None),
+            Ok(M3),
+            "restart without --genesis: the marker"
+        );
+        assert_eq!(node_book_mode(db, None, Some("3")), Ok(M3));
+        assert!(node_book_mode(db, None, Some("0"))
+            .unwrap_err()
+            .contains("TORUS_BOOK_ROWS"));
+        for g in [Classic, OrderRows] {
+            let err = node_book_mode(db, Some(g), None).unwrap_err();
+            assert!(
+                err.starts_with("refusing to start: book-mode marker mismatch"),
+                "{err}"
+            );
+        }
+        // a marker byte that is no mode
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, b"__book_mode__", &[7])
+            .unwrap();
+        assert!(node_book_mode(db, None, None)
+            .unwrap_err()
+            .contains("not a known mode"));
+        assert!(node_book_mode(db, Some(M3), None)
+            .unwrap_err()
+            .contains("book-mode marker mismatch"));
     }
 
     /// What `run` does on a first start: genesis state, then the replica.

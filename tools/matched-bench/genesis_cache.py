@@ -63,6 +63,7 @@ PARAMS = (
     "EVM_BLOCK_INTERVAL",
     "LIQ_THIN",
     "LIQ_THIN_AVAIL",
+    "BOOK_MODE",
 )
 # env the generator scripts read from the environment run-cell.sh hands them (unset and empty are the same:
 # the scripts read them as ${NAME:-default})

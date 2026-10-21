@@ -186,8 +186,7 @@ fn checkpoint_interval_env_set(v: Option<&str>) -> bool {
 /// book mode. An explicit interval > 0 with a deferred book mode (2/3) refuses
 /// to start ([`check_checkpoint_book_mode`], task 1.2). The role default
 /// yields to a deferred book mode instead (per-block flush, `Ok(None)`): the
-/// operator chose the book mode, not the interval (e.g. the bench
-/// `RECORD_ENV`'s `TORUS_BOOK_ROWS=3`).
+/// chain's genesis chose the book mode, not the interval.
 pub fn resolve_checkpoint_interval(
     raw: Option<String>,
     default: Option<std::time::Duration>,
@@ -204,8 +203,9 @@ pub fn resolve_checkpoint_interval(
         Err(_) => {
             tracing::warn!(
                 ?mode,
-                "TORUS_BOOK_ROWS selects a deferred book save: the compiled default checkpoint \
-                 interval is off (per-block flush); set TORUS_BOOK_ROWS unset/0/1 for checkpoints"
+                "the chain's book mode (genesis consensus.book_mode) uses a deferred book save: \
+                 the compiled default checkpoint interval is off (per-block flush); checkpoints \
+                 need a classic or order_rows chain"
             );
             Ok(None)
         }
@@ -348,8 +348,8 @@ pub fn check_checkpoint_book_mode(
     match (interval, mode) {
         (Some(iv), BookMode::LevelAuthority | BookMode::LevelAuthorityChunked) => Err(format!(
             "TORUS_CHECKPOINT_INTERVAL_MS={} needs a non-deferred book mode, but \
-             TORUS_BOOK_ROWS selects {:?} (deferred book save); unset \
-             TORUS_CHECKPOINT_INTERVAL_MS or use TORUS_BOOK_ROWS unset/0 (Classic) or 1 (OrderRows)",
+             the chain's book mode (genesis consensus.book_mode) is {:?} (deferred book save); \
+             unset TORUS_CHECKPOINT_INTERVAL_MS (checkpoints need a classic or order_rows chain)",
             iv.as_millis(),
             mode
         )),
@@ -1756,7 +1756,7 @@ mod tests {
             );
             let err = resolve_checkpoint_interval(Some("15000".into()), d, mode)
                 .expect_err("an explicit interval with a deferred book mode refuses to start");
-            assert!(err.contains("TORUS_BOOK_ROWS"), "{err}");
+            assert!(err.contains("consensus.book_mode"), "{err}");
             assert_eq!(
                 resolve_checkpoint_interval(Some("0".into()), d, mode),
                 Ok(None),
@@ -1787,7 +1787,7 @@ mod tests {
             let err = check_checkpoint_book_mode(on, mode)
                 .expect_err("interval > 0 with a deferred book mode must refuse to start");
             assert!(err.contains("TORUS_CHECKPOINT_INTERVAL_MS"), "{err}");
-            assert!(err.contains("TORUS_BOOK_ROWS"), "{err}");
+            assert!(err.contains("consensus.book_mode"), "{err}");
         }
         for mode in [BookMode::Classic, BookMode::OrderRows] {
             assert_eq!(check_checkpoint_book_mode(on, mode), Ok(()), "{mode:?}");
