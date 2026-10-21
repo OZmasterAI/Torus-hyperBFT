@@ -13884,6 +13884,76 @@ mod leader_state_tests {
         assert_hints_exclude(&ls, &[x]);
     }
 
+    /// The same divergence at run time: a committed insert-and-exclude delta reaching the hints
+    /// before execution syncs the new member must still exclude it once it is synced.
+    #[test]
+    fn committed_insert_and_exclude_before_hint_sync_keeps_exclusion() {
+        use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
+        let ls = LeaderState::new();
+        let (four, _) = make_set(4);
+        let (five, vks) = make_set(5);
+        let x = vks[4];
+        ls.sync_validators(&four);
+        ls.seed_leader_exclusions(&committed_set(&vks[..4], &[]));
+        let mut updates = ValidatorSetUpdates::new();
+        updates.insert(x, Power::new(1));
+        updates.exclude_leader(x);
+        ls.apply_leader_exclusion_updates(&updates);
+        assert_hints_exclude(&ls, &[]);
+        ls.sync_validators(&five);
+        assert_hints_exclude(&ls, &[x]);
+    }
+
+    /// A committed re-admission of a validator the hints lack yet: once synced it is eligible
+    /// (the committed set no longer excludes it).
+    #[test]
+    fn readmit_of_member_the_hints_lack_yet_is_not_excluded_after_sync() {
+        use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
+        let ls = LeaderState::new();
+        let (four, _) = make_set(4);
+        let (five, vks) = make_set(5);
+        let x = vks[4];
+        ls.sync_validators(&four);
+        ls.seed_leader_exclusions(&committed_set(&vks, &[x]));
+        let mut readmit = ValidatorSetUpdates::new();
+        readmit.readmit_leader(x);
+        ls.apply_leader_exclusion_updates(&readmit);
+        ls.sync_validators(&five);
+        assert_hints_exclude(&ls, &[]);
+    }
+
+    /// Removing an excluded member drops its exclusion, as hotstuff's `ValidatorSet::remove`
+    /// does: re-inserted later without an exclusion, it leads again. While the hints still list
+    /// it (execution behind the delete) it stays excluded there.
+    #[test]
+    fn removed_excluded_member_is_not_excluded_when_reinserted() {
+        use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
+        let ls = LeaderState::new();
+        let (four, _) = make_set(4);
+        let (five, vks) = make_set(5);
+        let x = vks[4];
+        ls.sync_validators(&five);
+        ls.seed_leader_exclusions(&committed_set(&vks, &[x]));
+        assert_hints_exclude(&ls, &[x]);
+
+        let mut delete = ValidatorSetUpdates::new();
+        delete.delete(x);
+        ls.apply_leader_exclusion_updates(&delete);
+        assert_hints_exclude(&ls, &[x]);
+        ls.sync_validators(&four);
+        assert_hints_exclude(&ls, &[]);
+
+        let mut insert = ValidatorSetUpdates::new();
+        insert.insert(x, Power::new(1));
+        ls.apply_leader_exclusion_updates(&insert);
+        ls.sync_validators(&five);
+        assert_hints_exclude(&ls, &[]);
+        assert!(
+            (1..100u64).any(|view| plain_iwrr(&ls, view) == x),
+            "re-inserted member leads again"
+        );
+    }
+
     /// Item 7 step 1 (E12): EVM txs go to the leader of the next EVM height
     /// (`height % N == 0`), not the current-view leader. That height is
     /// proposed one view per block after the newest observed proposal.
