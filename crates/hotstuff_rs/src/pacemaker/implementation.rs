@@ -421,6 +421,11 @@ impl<N: Network> Pacemaker<N> {
                                 .last_advance_view
                                 .is_some_and(|v| v < self.view_info.view))
                     {
+                        // A TC for the view just left (C3) only pulls stragglers into this view; it
+                        // must not count as this view's AdvanceView, or the one carrying TC(view)
+                        // would be skipped and (in an epoch-change view, which never advances on
+                        // timeout) nothing would move this replica on.
+                        let advances_current_view = new_tc.view >= self.view_info.view;
                         let pacemaker_message = PacemakerMessage::advance_view(
                             ProgressCertificate::TimeoutCertificate(new_tc),
                         );
@@ -433,7 +438,9 @@ impl<N: Network> Pacemaker<N> {
                             })
                             .publish(&self.event_publisher)
                         }
-                        self.state.last_advance_view = Some(self.view_info.view);
+                        if advances_current_view {
+                            self.state.last_advance_view = Some(self.view_info.view);
+                        }
                     }
                 }
 
