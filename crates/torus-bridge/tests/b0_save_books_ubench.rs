@@ -86,6 +86,20 @@ fn order(market_id: u64, is_buy: bool, price: u64, qty: u64) -> NativeAction {
     })
 }
 
+/// `execute_batch` that fails loudly on any rejected action (an empty book
+/// would time nothing). Returns the block's fill count.
+fn exec(c: &mut NativeExecContext<NativeStateOverlay>, batch: &[(Address, NativeAction)]) -> u32 {
+    let before = c.trade_index;
+    let r = NativeExecutor::execute_batch(c, batch);
+    assert!(
+        r.results.iter().all(|r| r.success),
+        "action rejected: {:?}",
+        r.results.iter().find(|r| !r.success)
+    );
+    assert_eq!(c.take_fatal_error(), None);
+    c.trade_index - before
+}
+
 fn fund(c: &NativeExecContext<NativeStateOverlay>, who: &Address) {
     let funds = NativeBalance {
         available: fp(1_000_000_000_000),
@@ -99,9 +113,16 @@ fn fund(c: &NativeExecContext<NativeStateOverlay>, who: &Address) {
 fn build(per_market: u64) -> (tempfile::TempDir, StateDb, ResidentBooks, u64) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = StateDb::open(dir.path()).expect("open db");
+    // Pre-testnet P0 (main d78ea41b): orders on an unlisted market are
+    // rejected (`UnknownMarket`), so list every market first.
+    for m in 1..=N_MARKETS {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed")
+            .unwrap();
+    }
     let mut holder = ResidentBooks::default();
     let traders = per_market / PER_TRADER;
     let mut height = 1;
+    let mut resting = 0;
     for first in (0..traders).step_by(TRADERS_PER_BLOCK as usize) {
         let ov = NativeStateOverlay::new(db.clone());
         let mut c = ctx(ov.clone(), height, &mut holder);
@@ -118,13 +139,15 @@ fn build(per_market: u64) -> (tempfile::TempDir, StateDb, ResidentBooks, u64) {
                 }
             }
         }
-        let _ = NativeExecutor::execute_batch(&mut c, &batch);
+        exec(&mut c, &batch);
         c.save_order_books();
         assert_eq!(c.take_fatal_error(), None);
+        resting = c.resting_order_count();
         c.stash_resident(&mut holder);
         ov.flush(&db).unwrap();
         height += 1;
     }
+    assert_eq!(resting as u64, per_market * N_MARKETS, "build: resting depth");
     (dir, db, holder, height)
 }
 
@@ -146,6 +169,7 @@ fn profile(shape: &str, per_market: u64) {
     let taker = addr(7);
     let (mut b0_e, mut def_e, mut def_w) = (Vec::new(), Vec::new(), Vec::new());
     let mut resting = 0;
+    let mut fills_total = 0u64;
     for i in 0..2 * BLOCKS_PER_ARM {
         let ov = NativeStateOverlay::new(db.clone());
         let mut c = ctx(ov.clone(), height, &mut holder);
@@ -162,7 +186,9 @@ fn profile(shape: &str, per_market: u64) {
                 ));
             }
         }
-        let _ = NativeExecutor::execute_batch(&mut c, &batch);
+        let fills = exec(&mut c, &batch);
+        assert_eq!(fills as u64, FILLS * N_MARKETS, "block {i}: fills");
+        fills_total += fills as u64;
         // A B A B ...: odd blocks b0 (whole save on E), even blocks deferred.
         if i % 2 == 1 {
             let t = Instant::now();
@@ -178,11 +204,12 @@ fn profile(shape: &str, per_market: u64) {
         }
         assert_eq!(c.take_fatal_error(), None);
         resting = c.resting_order_count();
+        assert_eq!(resting as u64, per_market * N_MARKETS, "block {i}: resting depth");
         c.stash_resident(&mut holder);
         ov.flush(&db).unwrap();
         height += 1;
     }
-    println!("resting after the run: {resting}");
+    println!("resting after the run: {resting}; fills over the run: {fills_total}");
     println!(
         "{:<34} | {:>8} {:>8} {:>8} | {:>12}",
         "save_books, ms per block", "mean", "p50", "p90", "mean per 1k fills"
