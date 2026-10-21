@@ -1067,6 +1067,19 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
      row is the cost of hash on + attestation + L6.1 + L2.1. matched/s is not resolved (1.022 / 1.001).
    * R vs section 120 A (cross-campaign): matched/s -1.7% / -3.0% and exec CPU per fill +5.3% / +8.7%. The binary,
      not the hash, carries most of section 123's gap to section 120.
+9l. **[HOLD, owner s136: queued, NOT ready; do not start until the owner says go] Binary gap: `53a6d83c` vs
+   `29bfc705`, hash-off Classic.** Section 124 found R (hash off, `29bfc705`) below section 120's A (hash off,
+   `53a6d83c`) across campaigns: matched/s 0.983 / 0.970 (deep / standard), exec-thread on-CPU per 1k fills 1.053 /
+   1.087, CPU-s per 1M fills 1.023 / 1.048; native blocks/s 0.974 / 1.321 (standard up, likely T5.3). Cross-campaign,
+   R n = 2: a lead, not a result.
+   * Step 1, confirm: one campaign, both binaries side by side with R's env (Classic, hash off, no attestation, L3.1
+     on, L2.1 off, 15 s checkpoints), deep + standard, n = 3 per shape round-matched, ~1 h 15 min. If exec-thread CPU
+     per fill does not resolve (CI includes 1) on either shape, record it and stop.
+   * Step 2, if confirmed: exec-thread CPU profile (perf, same load) of both binaries; diff by function.
+   * Step 3, only if the profile names nothing: bisect `53a6d83c..29bfc705` (101 commits, ~7 steps). Try these
+     first: executor unlisted-market reject `d78ea41b`; delist / UpdateMarketParams `6eba584a`, `23b0190e`;
+     aliased-row refusals `73e8068d`, `d46234af`; L2.1 / b0 / b1 paths with flags off; RH4 DA GC `bbc38711` ff.
+   * Report per step: the exec-path rule rows (section 91 rule) with CIs. Doc target: the next results-doc section.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
