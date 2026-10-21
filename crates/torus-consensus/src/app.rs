@@ -34690,9 +34690,36 @@ mod crash_recovery_tests {
         calls: Vec<(crate::exec_pipeline::CompleteSite, u64)>,
         /// Broken hook-site or replay invariants.
         errors: Vec<String>,
+        /// h2h (s134): the CHAINED running hash `h_n` of every captured
+        /// height, recomputed from the captured write sets
+        /// ([`torus_state::running_hash::next_running_hash`]; the first
+        /// captured height chains from zero, as at the activation height).
+        chain: BTreeMap<u64, [u8; 32]>,
+        /// Heights whose hashed write set holds `cf_native_order_books`
+        /// entries (hash id 3).
+        book_heights: std::collections::BTreeSet<u64>,
     }
 
     impl O0Ledger {
+        /// Chain height `h`'s captured write set onto `h - 1` (see
+        /// [`Self::chain`]); a re-hash (replay) must chain to the same value.
+        fn chain_in(&mut self, h: u64, entries: &[torus_state::running_hash::WriteEntry]) {
+            let prev = match self.chain.get(&(h - 1)) {
+                Some(p) => *p,
+                None if self.chain.range(..h).next().is_none() => [0u8; 32],
+                None => return,
+            };
+            let x = torus_state::running_hash::next_running_hash(&prev, h, entries);
+            if let Some(old) = self.chain.insert(h, x) {
+                if old != x {
+                    self.errors.push(format!("chained h_n of {h} changed when hashed again"));
+                }
+            }
+            if entries.iter().any(|(id, _, _)| *id == 3) {
+                self.book_heights.insert(h);
+            }
+        }
+
         /// The completion hook's record of height `h` (snapshot `snap`): the
         /// status and side rows of every height in (completed, h], the
         /// per-CF dump hashes at `h`; the snapshot's marker must be `h`.
@@ -34755,6 +34782,7 @@ mod crash_recovery_tests {
         /// same set.
         fn take_hn(&mut self, db: &StateDb) {
             for (h, entries) in torus_state::running_hash::capture_drain(db) {
+                self.chain_in(h, &entries);
                 let mut parts: Vec<Vec<u8>> = Vec::new();
                 for (id, k, v) in &entries {
                     parts.push(vec![*id]);
@@ -34781,6 +34809,7 @@ mod crash_recovery_tests {
             heights.sort_unstable();
             heights.dedup();
             for (h, entries) in captured {
+                self.chain_in(h, &entries);
                 let mut parts: Vec<Vec<u8>> = Vec::new();
                 for (id, k, v) in &entries {
                     parts.push(vec![*id]);
@@ -44641,6 +44670,136 @@ mod crash_recovery_tests {
             mutant.is_some(),
             "clearing the window flag at a checkpoint passed the harness"
         );
+    }
+
+    /// h2h (s134): the first height where `node`'s CHAINED `h_n`
+    /// ([`O0Ledger::chain`]) differs from (or is missing against) the
+    /// golden's, over 1..=[`B1_BLOCKS`]; a fail-stop counts at its height.
+    fn b1_chain_divergence(golden: &O0Node, node: &O0Node) -> Option<u64> {
+        let (g, n) = (golden.ledger(), node.ledger());
+        let first = (1..=B1_BLOCKS).find(|h| g.chain.get(h) != n.chain.get(h));
+        match (first, node.failed_at) {
+            (Some(h), Some(f)) => Some(h.min(f)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// h2h (s134): mode 3 + b1 with the running state hash ON is safe
+    /// against node-local checkpoint windows. b1 keeps a window's book rows
+    /// in W's `window.side` until the checkpoint (the same kind of node-local
+    /// state that forced L6.1 for Classic L3.1), but each block's pass 2
+    /// still runs in that block's `Digest` and its rows are IN that block's
+    /// `h_n` preimage (the digest's sidecar layer), read through the side
+    /// rows, then the DB. So `h_n` must not depend on when a node
+    /// checkpoints. Nodes in mode 3 with the hash active from height 1 and
+    /// different checkpoint timing (serial; per block; every 5; never by time;
+    /// a seeded random 1-in-4 policy; drained and W-gated; and two cells with
+    /// mid-window fail-stops whose lost windows replay from the last
+    /// checkpoint) agree on the chained `h_n` at EVERY height 1..=300
+    /// (recomputed from each node's captured write sets), on the stored
+    /// running hash and on the attest-height checkpoint rows 100 / 200 / 300.
+    /// The L6.1 window rule does not apply to mode 3 (refused by genesis
+    /// validation): book-CF entries are hashed at non-attest heights. Control:
+    /// W skipping the side rows (B1_MUT_SKIP_SIDE) breaks the chain.
+    #[test]
+    fn b1_mode3_hash_on_same_h_n_at_every_height_on_every_node() {
+        use torus_state::running_hash::{read_activation_height, read_checkpoint, read_running_hash};
+        // The L6.1 window rule is Classic-only: a mode-3 genesis with it is
+        // refused, so a mode-3 chain hashes its books at every height.
+        let (mut config, _) = b1_fixture();
+        assert_eq!(config.state_hash_activation_height, Some(1));
+        assert_eq!(config.book_window_activation(), None);
+        config.book_mode = torus_bridge::native_executor::BookMode::LevelAuthorityChunked;
+        assert!(config.validate().is_ok());
+        config.book_window_commit = true;
+        assert!(config.validate().is_err(), "L6.1 with book mode 3");
+
+        let blocks = b1_blocks();
+        let seeded = |c: O0Cfg, seed: u64| O0Cfg { ctl_seed: seed, ..c };
+        let cfgs = [
+            b1_cfg(None, O0Run::D),
+            b1_cfg(Some(P5Ckpt::PerBlock), O0Run::D),
+            b1_cfg(Some(P5Ckpt::Every5), O0Run::D),
+            b1_cfg(Some(P5Ckpt::Never), O0Run::D),
+            b1_cfg(Some(P5Ckpt::Random), O0Run::D),
+            seeded(b1_cfg(Some(P5Ckpt::Every5), O0Run::G), 0xb1_02),
+            seeded(b1_cfg(Some(P5Ckpt::Random), O0Run::G), 0xb1_03),
+        ];
+        let nodes = b1_run(&blocks, &cfgs, 0);
+        let golden = &nodes[0];
+        b1_assert_golden_node(golden);
+        {
+            let g = golden.ledger();
+            assert!(g.errors.is_empty(), "golden: {:?}", g.errors);
+            assert_eq!(read_activation_height(&golden.db), Some(1), "hash on from 1");
+            for h in 1..=B1_BLOCKS {
+                assert!(g.chain.contains_key(&h), "golden: no chained h_n at {h}");
+            }
+            let off_attest = g.book_heights.iter().filter(|h| *h % 100 != 0).count();
+            println!("b1 h2h golden: book-CF entries hashed at {off_attest} non-attest heights");
+            assert!(off_attest >= 100, "books hashed per block in mode 3: {off_attest}");
+        }
+        // Mid-window fail-stops (not checkpoint heights under every-5; 98 / 199
+        // just below an attest height): the window's blocks above the durable
+        // marker are lost and replayed from the last checkpoint.
+        let crash_at: [u64; 4] = [47, 98, 163, 199];
+        let mut crash_blocks = b1_blocks();
+        for h in crash_at {
+            crash_blocks[h as usize - 1].fatal = true;
+        }
+        let crash_cfgs = [
+            b1_cfg(Some(P5Ckpt::Every5), O0Run::D),
+            seeded(b1_cfg(Some(P5Ckpt::Random), O0Run::G), 0xb1_04),
+        ];
+        let crashed = b1_run(&crash_blocks, &crash_cfgs, 0);
+
+        let g = golden.ledger().chain.clone();
+        let checked: Vec<&O0Node> = nodes[1..].iter().chain(crashed.iter()).collect();
+        for node in checked {
+            let what = format!("b1 h2h {:?} restarts {}", node.cfg, node.restarts);
+            {
+                let l = node.ledger();
+                assert!(l.errors.is_empty(), "{what}: {:?}", l.errors);
+            }
+            assert_eq!(node.failed_at, None, "{what}: fail-stop");
+            assert_eq!(
+                b1_chain_divergence(golden, node),
+                None,
+                "FINDING: {what}: chained h_n differs from the serial golden"
+            );
+            assert_eq!(
+                read_running_hash(&node.db),
+                Some((B1_BLOCKS, g[&B1_BLOCKS])),
+                "{what}: stored running hash"
+            );
+            for h in [100, 200, 300] {
+                assert_eq!(read_checkpoint(&node.db, h), Some(g[&h]), "{what}: checkpoint {h}");
+            }
+            assert_eq!(b1_final(golden), b1_final(node), "{what}: final state");
+            println!("{what}: h_n equal at 1..={B1_BLOCKS}, paths {:?}", node.paths);
+        }
+        for node in &nodes[1..] {
+            b1_assert_w_saved_books(node);
+        }
+        for node in &crashed {
+            assert_eq!(node.restarts, crash_at.len() as u64, "{:?}: restarts", node.cfg);
+        }
+
+        // Control: W reading the DB only (not the window's side rows) makes
+        // h_n depend on the checkpoint timing; the chain comparison sees it.
+        let mutants = b1_run(
+            &blocks,
+            &[
+                b1_cfg(Some(P5Ckpt::Every5), O0Run::D),
+                seeded(b1_cfg(Some(P5Ckpt::Random), O0Run::G), 0xb1_05),
+            ],
+            crate::exec_pipeline::B1_MUT_SKIP_SIDE,
+        );
+        for node in &mutants {
+            let at = b1_chain_divergence(golden, node);
+            println!("b1 h2h mutation skip-side {:?}: diverges at {at:?}", node.cfg);
+            assert!(at.is_some(), "{:?}: skip-side kept the same h_n chain", node.cfg);
+        }
     }
 
     /// Three replicas of the reduce-only P2 sequence (OrderRows) with
