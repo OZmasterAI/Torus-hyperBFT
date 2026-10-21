@@ -412,3 +412,118 @@ fn tc_summary_high_qc_must_be_the_highest_signed_qc() {
     dropped.high_qc = None;
     assert!(!dropped.is_correct(&tree).unwrap(), "signed QCs but no high QC");
 }
+
+// ---------------------------------------------------------------------------
+// s134 review test gaps (fix/tc-require-tc).
+// ---------------------------------------------------------------------------
+
+/// The winner rule is strict: a tip no newer than the high QC loses (the tie
+/// goes to the QC). A TC whose signed QC view equals its tip view, with the
+/// flag forged to true, is not correct.
+#[test]
+fn tc_summary_tip_tied_with_high_qc_does_not_win() {
+    let keys = keys();
+    let set = validator_set(&keys);
+    let (tree, _) = steady_block_tree(&set);
+    let c = block(2);
+    let qc = generic_pc(ViewNumber::new(VIEW - 1), block(3).hash, &keys[..3], &set);
+    let tips = vec![Some(tip(&c, VIEW - 1)); 3];
+    let qcs = vec![Some(qc); 3];
+    let tc = collected_tc(&keys[..3], &set, VIEW - 1, &tips, &qcs);
+    assert!(tc.is_correct(&tree).unwrap(), "control: collector TC is correct");
+    assert!(!tc.high_tip_is_winner, "control: the collector gives a tie to the QC");
+
+    let mut forged = tc.clone();
+    forged.high_tip_is_winner = true;
+    assert!(!forged.is_correct(&tree).unwrap(), "a tip tied with the high QC must not win");
+}
+
+/// The header path checks a header's TC against the HEADER's view, not the
+/// replica's current view: headers bypass receive-side view filtering.
+/// Replica at VIEW; a header from leader(VIEW + 2).
+#[test]
+fn header_path_checks_the_tc_against_the_header_view() {
+    let b = block(1);
+    let keys = keys();
+    let set = validator_set(&keys);
+    let header_view = VIEW + 2;
+    // `true` iff the header passed the certificate check (the
+    // ReceiveProposalHeader event is published right after it).
+    let passes = |tc: TimeoutCertificate| {
+        let mut r = replica();
+        let vss = r.tree.validator_set_state().unwrap();
+        let leader = proposer_for(ViewNumber::new(header_view), &keys, &vss, &r.tree);
+        let header = ProposalHeader {
+            chain_id: CHAIN_ID,
+            view: ViewNumber::new(header_view),
+            block_hash: b.hash,
+            height: b.height,
+            data_hash: b.data_hash,
+            justify: b.justify.clone(),
+            tc: Some(tc),
+            nec: None,
+            has_validator_set_updates: false,
+        };
+        r.hotstuff
+            .on_receive_msg(HotStuffMessage::ProposalHeader(header), &leader, &mut r.tree, &mut ValidApp)
+            .unwrap();
+        r.events.try_iter().any(|event| matches!(event, Event::ReceiveProposalHeader(_)))
+    };
+    let tips = |view: u64| vec![Some(tip(&b, view)); 3];
+    let none = [None, None, None];
+    let for_header = collected_tc(&keys[..3], &set, header_view - 1, &tips(header_view - 1), &none);
+    let for_local = collected_tc(&keys[..3], &set, VIEW - 1, &tips(VIEW - 1), &none);
+    assert!(passes(for_header), "TC for header.view - 1 must pass");
+    assert!(!passes(for_local), "TC for the local view - 1 is not a TC for header.view - 1");
+}
+
+/// An NEC signed by `signers` of `set`, for `view` over `high_tip_qc_view`.
+fn nec_signed_by(signers: &[SigningKey], set: &ValidatorSet, view: u64, high_tip_qc_view: u64) -> NoEndorsementCertificate {
+    let message = (ViewNumber::new(view), ViewNumber::new(high_tip_qc_view)).try_to_vec().unwrap();
+    let mut signatures = SignatureSet::new(set.len());
+    for key in signers {
+        let pos = set.position(&key.verifying_key()).unwrap();
+        signatures.set(pos, Some(Keypair::new(key.clone()).sign(&message)));
+    }
+    NoEndorsementCertificate {
+        view: ViewNumber::new(view),
+        high_tip_qc_view: ViewNumber::new(high_tip_qc_view),
+        signatures,
+    }
+}
+
+/// During a validator-set change (update committed, not yet decided) the
+/// leader's NE collector uses the committed set, so an NEC from the committed
+/// set must validate; one from the previous set still does (as for TCs, either
+/// active set). Once the update is decided only the committed set counts.
+#[test]
+fn nec_from_either_active_set_is_valid_during_a_validator_set_change() {
+    use crate::hotstuff::types::valid_nec;
+    use crate::types::update_sets::AppStateUpdates;
+    use crate::types::validator_set::ValidatorSetState;
+
+    let old_keys = signing_keys(&[1, 2, 3, 4]);
+    let old_set = validator_set(&old_keys);
+    let new_keys = signing_keys(&[11, 12, 13, 14]);
+    let new_set = validator_set(&new_keys);
+    let other_keys = signing_keys(&[21, 22, 23, 24]);
+    let other_set = validator_set(&other_keys);
+    let tree = |decided: bool| {
+        let vss = ValidatorSetState::new(new_set.clone(), old_set.clone(), Some(BlockHeight::new(2)), decided);
+        let mut tree = BlockTreeSingleton::new(MemKV::default());
+        tree.initialize(&AppStateUpdates::new(), &vss).unwrap();
+        tree
+    };
+    let from_new = nec_signed_by(&new_keys[..3], &new_set, VIEW, 1);
+    let from_old = nec_signed_by(&old_keys[..3], &old_set, VIEW, 1);
+    let from_other = nec_signed_by(&other_keys[..3], &other_set, VIEW, 1);
+
+    let transition = tree(false);
+    assert!(valid_nec(&from_new, &transition).unwrap(), "committed-set NEC (what the leader collects)");
+    assert!(valid_nec(&from_old, &transition).unwrap(), "previous-set NEC");
+    assert!(!valid_nec(&from_other, &transition).unwrap(), "NEC from neither set");
+
+    let decided = tree(true);
+    assert!(valid_nec(&from_new, &decided).unwrap(), "committed-set NEC after the update is decided");
+    assert!(!valid_nec(&from_old, &decided).unwrap(), "previous-set NEC after the update is decided");
+}
