@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -165,7 +166,7 @@ class StateAttestTest(unittest.TestCase):
             out[h] = (local(h), {a: local(h) for a in voters}, local(h) if q else None)
         return out
 
-    def run_scan(self, nodes, logs=None, wait_s=0.2, activation=None):
+    def run_scan(self, nodes, logs=None, wait_s=0.2, activation=None, hole_wait_s=0.0):
         paths = []
         for i, text in enumerate(logs or [log_text(a) for a in self.addrs]):
             p = os.path.join(self.d, "val%d.log" % i)
@@ -181,6 +182,7 @@ class StateAttestTest(unittest.TestCase):
             wait_s,
             sleep=0.05,
             activation=activation,
+            hole_wait_s=hole_wait_s,
         )
 
     def three(self, **kw):
@@ -514,6 +516,177 @@ class StateAttestTest(unittest.TestCase):
         self.assertFalse(out["ok"])
         self.assertEqual(out["latest_after_walk"][0], None)
         self.assertEqual((out["advanced_during_scan"], out["min_compared"]), (0, 64))
+
+    def hole(self, nodes, h, voters):
+        """checkpoint h without val2's vote and without a quorum on every node"""
+        for n in nodes:
+            local, _, _ = n.checkpoints[h]
+            n.checkpoints[h] = (local, {a: local for a in voters}, None)
+
+    def test_hole_below_newest_heals_within_the_resubmit_wait(self):
+        """9j2 smoke: val2's attestation for 3000 was skipped as a replay (oracle feed, same key, same-ms nonce);
+        the node re-signs after 65 s, so the scan waits for the hole instead of failing at once"""
+        nodes = self.three()
+        self.hole(nodes, 700, self.addrs[:2])
+        calls = {"n": 0}
+
+        def heal(h):
+            if h == 700:
+                calls["n"] += 1
+                if calls["n"] > 6:  # the resubmission lands after a few re-reads
+                    for n in nodes:
+                        local = n.checkpoints[700][0]
+                        n.checkpoints[700] = (local, {a: local for a in self.addrs}, local)
+
+        nodes[0].on_call = heal
+        out = self.run_scan(nodes, hole_wait_s=5)
+        self.assertTrue(out["ok"], out["problems"])
+        self.assertEqual(out["holes_initial"], [700])
+        self.assertEqual(out["holes_healed"], [700])
+        self.assertEqual(out["quorum_reached"], 12)
+        self.assertEqual(out["votes_per_validator"], {"val0": 12, "val1": 12, "val2": 12})
+
+    def test_hole_that_never_heals_still_fails(self):
+        nodes = self.three()
+        self.hole(nodes, 700, self.addrs[:2])
+        out = self.run_scan(nodes, hole_wait_s=0.3)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["holes_initial"], [700])
+        self.assertEqual(out["holes_healed"], [])
+        self.assertGreaterEqual(out["hole_wait_s"], 0.3)
+        self.assertTrue(any("without an on-chain quorum on every node: 700" in p for p in out["problems"]), out["problems"])
+
+    def test_initial_vote_mismatch_at_a_hole_is_never_healed_away(self):
+        """Codex P1 probe: a hole whose first read shows a vote differing from h_n must fail even if a later read
+        is clean with a quorum"""
+        nodes = self.three()
+        for n in nodes:
+            local = n.checkpoints[700][0]
+            bad = {self.addrs[0]: local, self.addrs[1]: h32("e")}
+            n.checkpoints[700] = (local, bad, None)
+
+        def heal(h):
+            if h == 700:
+                for n in nodes:
+                    local = n.checkpoints[700][0]
+                    n.checkpoints[700] = (local, {a: local for a in self.addrs}, local)
+
+        reads = {"n": 0}
+
+        def on_call(h):
+            if h == 700:
+                reads["n"] += 1
+                if reads["n"] > 3:  # after the initial walk read
+                    heal(h)
+
+        nodes[0].on_call = on_call
+        out = self.run_scan(nodes, hole_wait_s=3)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["holes_healed"], [])
+        self.assertEqual(out["holes_not_retried"], [700])
+        self.assertTrue(any("differ from a node's h_n" in p for p in out["problems"]), out["problems"])
+
+    def test_retry_that_shows_a_mismatch_keeps_it_as_evidence(self):
+        nodes = self.three()
+        self.hole(nodes, 700, self.addrs[:2])
+        reads = {"n": 0}
+
+        def on_call(h):
+            if h == 700:
+                reads["n"] += 1
+                if reads["n"] > 3:  # the retry sees a quorum hash that is not the node's h_n
+                    for n in nodes:
+                        local = n.checkpoints[700][0]
+                        n.checkpoints[700] = (local, {a: local for a in self.addrs}, h32("d"))
+
+        nodes[0].on_call = on_call
+        out = self.run_scan(nodes, hole_wait_s=3)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["holes_healed"], [])
+        self.assertEqual(out["holes_not_retried"], [700])
+        self.assertTrue(any("quorum hash differs" in p for p in out["problems"]), out["problems"])
+
+    def test_retry_mismatch_is_kept_when_a_peer_errors(self):
+        """Codex P1 probe on 3ea3ddfd: a bad vote on val0 and an RPC error on val2 in the same retry must fail
+        the cell, even if a later retry is clean with a quorum"""
+        nodes = self.three()
+        self.hole(nodes, 700, self.addrs[:2])
+        reads = {"n": 0}
+
+        def on_call(h):
+            if h != 700:
+                return
+            reads["n"] += 1
+            if reads["n"] == 4:  # first retry: val0 reports a vote differing from h_n, val2 errors
+                local = nodes[0].checkpoints[700][0]
+                nodes[0].checkpoints[700] = (local, {self.addrs[0]: local, self.addrs[1]: h32("e")}, None)
+                nodes[2].fail_heights.add(700)
+            elif reads["n"] == 5:  # later retries: clean with a quorum everywhere
+                nodes[2].fail_heights.discard(700)
+                for n in nodes:
+                    local = n.checkpoints[700][0]
+                    n.checkpoints[700] = (local, {a: local for a in self.addrs}, local)
+
+        nodes[0].on_call = on_call
+        out = self.run_scan(nodes, hole_wait_s=3)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["holes_healed"], [])
+        self.assertEqual(out["holes_not_retried"], [700])
+        self.assertTrue(any("differ from a node's h_n" in p for p in out["problems"]), out["problems"])
+
+    def test_hole_wait_budget_is_an_absolute_deadline_with_slow_rpcs(self):
+        """Codex P2 probe: slow replies over several holes must not stretch the wait past the budget"""
+        nodes = self.three()
+        for h in (300, 500, 700, 900):
+            self.hole(nodes, h, self.addrs[:2])
+
+        def slow(h):
+            if h in (300, 500, 700, 900):
+                time.sleep(0.4)  # 4 holes x 3 nodes x 0.4 s = 4.8 s per polling pass
+
+        for n in nodes:
+            n.on_call = slow
+        out = self.run_scan(nodes, hole_wait_s=1.0)
+        self.assertFalse(out["ok"])
+        self.assertEqual(sorted(out["holes_initial"]), [300, 500, 700, 900])
+        self.assertLessEqual(out["hole_wait_s"], 1.6)  # one in-flight request may finish past the deadline
+
+    def test_late_reply_past_the_deadline_never_heals(self):
+        """Codex P2 probe on ce13b9d8: a reply that arrives after the absolute deadline (socket timeouts only bound
+        inactivity) must not heal a hole even if it carries a quorum"""
+        nodes = self.three()
+        self.hole(nodes, 700, self.addrs[:2])
+        reads = {"n": 0}
+
+        def late_quorum(h):
+            if h != 700:
+                return
+            reads["n"] += 1
+            if reads["n"] > 1:  # every retry: the quorum is there, but the reply comes after the budget
+                for n in nodes:
+                    local = n.checkpoints[700][0]
+                    n.checkpoints[700] = (local, {a: local for a in self.addrs}, local)
+                time.sleep(1.5)
+
+        nodes[0].on_call = late_quorum
+        out = self.run_scan(nodes, hole_wait_s=0.5)
+        self.assertEqual(out["holes_healed"], [])
+        self.assertLessEqual(out["hole_wait_s"], 1.0)
+        self.assertFalse(out["ok"])
+
+    def test_no_hole_wait_by_default(self):
+        nodes = self.three()
+        self.hole(nodes, 700, self.addrs[:2])
+        out = self.run_scan(nodes)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["hole_wait_s"], 0.0)
+
+    def test_newest_without_quorum_is_not_a_hole(self):
+        nodes = self.three(quorum=lambda h: h != 1200)
+        out = self.run_scan(nodes, hole_wait_s=5)
+        self.assertTrue(out["ok"], out["problems"])
+        self.assertEqual(out["holes_initial"], [])
+        self.assertEqual(out["hole_wait_s"], 0.0)
 
     def test_unreachable_node_fails(self):
         nodes = self.three()

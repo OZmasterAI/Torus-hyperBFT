@@ -47,6 +47,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 
@@ -133,16 +134,18 @@ def write_keys(keys_path, d):
 
 # ------------------------------------------------------------------ rpc / metrics / logs
 class Rpc:
-    def __init__(self, url, timeout=10):
+    def __init__(self, url, timeout=10, attempts=3):
         self.url = url
         self.timeout = timeout
+        self.attempts = attempts
 
     def call(self, method, params):
         """(result, None) or (None, error text)"""
         body = json.dumps(
             {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         ).encode()
-        for attempt in range(3):
+        err = "no attempt made"
+        for attempt in range(self.attempts):
             try:
                 req = urllib.request.Request(
                     self.url, body, {"content-type": "application/json"}
@@ -151,7 +154,8 @@ class Rpc:
                     reply = json.load(r)
             except RPC_ERRORS as e:
                 err = "%s: %s" % (type(e).__name__, e)
-                time.sleep(0.5 * (attempt + 1))
+                if attempt + 1 < self.attempts:
+                    time.sleep(0.5 * (attempt + 1))
                 continue
             if "error" in reply:
                 e = reply["error"] or {}
@@ -159,7 +163,8 @@ class Rpc:
                     isinstance(e, dict) and e.get("code") == -32005
                 ):  # per-IP rate limit: retry
                     err = "rate limited: %s" % e.get("message")
-                    time.sleep(1.0 * (attempt + 1))
+                    if attempt + 1 < self.attempts:
+                        time.sleep(1.0 * (attempt + 1))
                     continue
                 return None, "rpc error: %s" % (
                     e.get("message") if isinstance(e, dict) else e
@@ -472,7 +477,101 @@ def judge_log(name, path, want, problems):
     return lf
 
 
-def scan(rpcs, keys, metrics_urls, logs, wait_s, sleep=2.0, activation=None, excluded=()):
+def holes_of(rows, t):
+    """common heights below the newest t where some node reports no on-chain quorum"""
+    return [
+        r["height"]
+        for r in rows
+        if r["height"] != t
+        and not any("error" in p for p in r["per_node"])
+        and any(p["quorum"] is None for p in r["per_node"])
+    ]
+
+
+def read_is_clean(per):
+    """a hole's read that carries no evidence of disagreement: every node answered, the same h_n everywhere, every
+    vote equal to the reading node's h_n, and any quorum hash equal to it (only 'no quorum yet' may differ)"""
+    if any("error" in p for p in per):
+        return False
+    if len({p["local"] for p in per}) != 1:
+        return False
+    for p in per:
+        if any(vh != p["local"] or not matches for vh, matches in p["votes"].values()):
+            return False
+        if p["quorum"] is not None and p["quorum"] != p["local"]:
+            return False
+    return True
+
+
+def state_hash_by(rpc, height, deadline):
+    """state_hash() bounded by an absolute wall-clock deadline: the socket timeout only bounds inactivity, so a
+    trickled reply could run past it (Codex P2 on ce13b9d8); a reply not complete by the deadline is an error."""
+    box = {}
+
+    def run():
+        box["v"] = state_hash(rpc, height)
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    th.join(max(0.0, deadline - time.monotonic()))
+    if th.is_alive() or "v" not in box or time.monotonic() > deadline:
+        return None, "hole wait deadline passed during the request"
+    return box["v"]
+
+
+def heal_holes(out, rpcs, rows, t, hole_wait_s, sleep=2.0):
+    """A validator whose attestation did not land re-signs it with a fresh nonce once the nonce window passed
+    (state_hash.rs DEFAULT_RESUBMIT_AFTER_MS = NONCE_WINDOW_MS + 5 s = 65 s); e.g. the bench oracle feed signs with
+    the same validator key and a same-millisecond nonce gets the attestation skipped as a replay (9j2 smoke,
+    checkpoint 3000). So a PLAIN hole (below the newest checkpoint, no quorum yet, otherwise clean) is re-read
+    until it heals or hole_wait_s passes. Evidence is never erased (Codex P1): a hole whose initial read shows a
+    hash / vote / quorum mismatch is not retried, and a retry that shows one replaces the row and ends the retries,
+    so judge_rows fails the cell either way. A hole still open, pruned or unreadable stays a failure. The budget is
+    an absolute deadline checked before every request, with each request's timeout capped to what is left and no
+    in-call retries (Codex P2)."""
+    holes = holes_of(rows, t)
+    out["holes_initial"] = list(holes)
+    out["hole_wait_s"] = 0.0
+    out["holes_healed"] = []
+    out["holes_not_retried"] = []
+    if not holes or hole_wait_s <= 0:
+        return
+    by_h = {r["height"]: r for r in rows}
+    for h in list(holes):
+        if not read_is_clean(by_h[h]["per_node"]):
+            holes.remove(h)
+            out["holes_not_retried"].append(h)
+    t0 = time.monotonic()
+    deadline = t0 + hole_wait_s
+    while holes and time.monotonic() < deadline:
+        time.sleep(max(0.0, min(sleep, deadline - time.monotonic())))
+        for h in list(holes):
+            per = []
+            for rpc in rpcs:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    per.append({"error": "hole wait budget spent"})
+                    continue
+                r, err = state_hash_by(Rpc(rpc.url, timeout=min(rpc.timeout, left), attempts=1), h, deadline)
+                per.append(r if err is None else {"error": err})
+            # an unreadable node keeps its earlier (readable) answer, so a mismatch another node shows in this
+            # retry is never dropped because a peer errored (Codex P1 on 3ea3ddfd)
+            merged = [old if "error" in p else p for p, old in zip(per, by_h[h]["per_node"])]
+            if not read_is_clean(merged):
+                by_h[h]["per_node"] = merged  # the mismatch is the evidence judge_rows must see
+                holes.remove(h)
+                out["holes_not_retried"].append(h)
+                continue
+            if any("error" in p for p in per):
+                continue  # a pruned / unreadable / out-of-budget node: the hole stays open, never healed
+            if all(p["quorum"] is not None for p in per) and time.monotonic() <= deadline:
+                by_h[h]["per_node"] = per
+                holes.remove(h)
+                out["holes_healed"].append(h)
+    out["hole_wait_s"] = round(time.monotonic() - t0, 1)
+
+
+def scan(rpcs, keys, metrics_urls, logs, wait_s, sleep=2.0, activation=None, excluded=(), hole_wait_s=0.0):
     """excluded: validator names (val<i>) killed without restart (run-cell KILL_NO_RESTART): their RPC, metrics and
     log are not read and their votes are not required; every check runs over the others (with stakes 2/2/1 and
     val2 down the survivors still form the > 2/3 quorum). rpcs / metrics_urls / logs stay positional (index =
@@ -506,6 +605,7 @@ def scan(rpcs, keys, metrics_urls, logs, wait_s, sleep=2.0, activation=None, exc
     if t is not None and None not in latest:
         out["quorum_wait_s"], out["quorum_wait_done"] = wait_quorum(rpcs, t, wait_s, sleep)
         rows = read_rows(rpcs, t)
+        heal_holes(out, rpcs, rows, t, hole_wait_s, sleep)
         # the chain keeps committing during the wait and the walk: re-read every node's newest checkpoint so the
         # minimum window accounts for what retention pruned under the walk (9g-hn smoke: 63 of 64)
         after = []
@@ -680,6 +780,7 @@ def main(argv=None):
     s.add_argument("--log", action="append", default=[])
     s.add_argument("--keys", required=True)
     s.add_argument("--wait-s", type=float, default=90)
+    s.add_argument("--hole-wait-s", type=float, default=0, help="re-read checkpoints below the newest that lack a quorum for up to this long (attestation resubmit window)")
     s.add_argument("--activation", type=int, default=None, help="STATE_HASH_ACTIVATION height (sets the minimum compared window)")
     s.add_argument("--out", required=True)
     s.add_argument(
@@ -726,6 +827,7 @@ def main(argv=None):
             a.wait_s,
             activation=a.activation,
             excluded=tuple(sorted(set(a.exclude))),
+            hole_wait_s=a.hole_wait_s,
         )
         with open(a.out, "w") as f:
             json.dump(out, f, indent=1)
