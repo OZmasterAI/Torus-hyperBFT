@@ -599,9 +599,6 @@ fn run(blocks: &[Block], r: Run, fault: &LastBlockFault) -> (RunOut, RunStats) {
             .put_native_balance(&addr(n), &bal)
             .unwrap();
     }
-    if r.aliases {
-        seed_aliases(&db);
-    }
     let mut stats = RunStats::default();
     let mut out = Vec::new();
     let streamed_before = settle_streamed_calls_on_this_thread();
@@ -609,6 +606,13 @@ fn run(blocks: &[Block], r: Run, fault: &LastBlockFault) -> (RunOut, RunStats) {
     let hybrid_before = settle_streamed_hybrid_on_this_thread();
     for (h, block) in blocks.iter().enumerate() {
         let last = h + 1 == blocks.len();
+        // Main's pre-testnet fix (b57b3fd4) refuses an aliased row on load
+        // (corrupt state: the block fail-stops in every settle mode), so the
+        // rows appear before the LAST block, as in settle_no_merge_tests.rs
+        // (only the last block may go fatal).
+        if last && r.aliases {
+            seed_aliases(&db);
+        }
         let rec = Recorder::new(NativeStateOverlay::new(db.clone()));
         let mut probe = SettleStreamProbe {
             jitter_seed: if r.jitter == 0 {
@@ -1159,7 +1163,8 @@ fn settle_streamed_forced_sequential_is_untouched() {
     }
 }
 
-/// The case the purity stop exists for: trader 5's stored row under key
+/// The case the purity stop existed for (before main's pre-testnet fix
+/// refused aliased rows on load; now both modes fail-stop the block): trader 5's stored row under key
 /// (5, 1) names market 2 and the one under (5, 2) names market 3
 /// ([`ALIASES`]). In the last block trader 5 trades in markets 1 AND 2, and
 /// market 3's plan panics. Flag off reruns the call sequentially from
@@ -1198,14 +1203,20 @@ fn settle_streamed_impure_prefix_plan_stops_the_stream() {
             };
             let what = format!("impure prefix, plan panic {market}");
             let pick = |_: &RunOut, _: &RunStats| LastBlockFault::PlanPanic(market);
+            // Since main's pre-testnet fix (b57b3fd4) the aliased rows are
+            // refused on load, so the last block fail-stops before any plan
+            // can hold a foreign market's key: flag on and off stop alike,
+            // with nothing applied (no fallback, no streamed prefix).
             for (no_merge, off, ons) in
                 assert_streamed_equivalent(&blocks, r, &[0, 0x1A], &pick, &what)
             {
-                assert_eq!(off.fallbacks, 2, "{what}: {off:?}");
+                assert!(off.fatal.is_some(), "{what}: the aliased rows stop the block ({off:?})");
+                assert_eq!(off.fallbacks, 0, "{what}: {off:?}");
                 for on in ons {
+                    assert!(on.fatal.is_some(), "{what}, L2.2 {no_merge}: {on:?}");
                     assert_eq!(
                         on.hybrid, 0,
-                        "{what}, L2.2 {no_merge}: stopped at market 1's impure plan ({on:?})"
+                        "{what}, L2.2 {no_merge}: nothing streamed before the stop ({on:?})"
                     );
                 }
             }
