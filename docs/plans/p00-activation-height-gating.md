@@ -229,5 +229,29 @@ Each phase lands on its own branch with RED-first tests and full gates; each one
    is written as `serde_json` writes the u64 / i64 / f64 holding it exactly (unchanged digests), else as an
    exact decimal (an integer beyond 64 bits: the literal).
 5. **Integration tests 1-4** (~2-3 d): needs a test-only feature with a state-visible rule.
+   Built s134 on `feat/p00-phase5` (from phase 4 a7803f82): `crates/torus-consensus/src/p00_cluster_tests.rs`,
+   four validators in one process (hotstuff_rs replicas over `ChannelNetwork`, each a real `TorusApp` on
+   a state DB + consensus DB, stopped / restarted / wiped like a process). Test feature: torus-types
+   cargo feature `test-features` (enabled from torus-consensus's dev-dependencies only; no node build has
+   it) adds `Feature::TestStateRule` = id 127; its rule (test builds) runs the native phase of a block with
+   the bit and bumps a hashed `cf_treasury` row (count, height), so the bit's height is in every `h_n`.
+   An "old binary" is `AppOptions::known_features` without bit 127 plus a schedule without the feature
+   (`TorusApp::try_new_with_options`; the node passes `KNOWN_FEATURES`, the rule functions take the set);
+   `ExecHold` (test) holds a node's execution thread before a height and kills it there. Every node
+   records its running-hash write sets (`running_hash::capture_*`); the tests recompute `h_n` from them
+   and check the stored hash. Tests: (1) crossing at H: every node's headers carry the bit from exactly H,
+   the rule row from H, identical write sets and `h_n` at every height; (2) 3 of 4 upgraded: the chain
+   goes on, the old node refuses H (vote / insertion, `UPGRADE REQUIRED`), its applied and committed
+   heights stop below H, no fail-stop, its history is a prefix of the others'; 2 of 4: every node stalls
+   below H, no header at H anywhere, all headers equal (no fork); (3) crash with applied H-2, H-1, H+1 and
+   committed past H: the boot replay crosses H by the stored headers and matches the uncrashed nodes;
+   the same crash restarted on an old binary: the replay fail-stops before H (applied H-1, nothing of H
+   flushed); (4) every node upgrades to a release that moves a future height (900 -> above the tip), one
+   from an empty data dir (block sync from genesis): every `h_n` from before the upgrade is unchanged and
+   the feature switches on at the new height on all four; a node restarted with another schedule
+   replays its committed gap by the header bits (no fail-stop, same `h_n`) and then inserts no block
+   whose bits differ from its schedule. Mutations checked: execution reading the node's schedule
+   instead of the header bits, and the execution fail-stop ignoring the known set, each fail a test.
+   nextest: `threads-required = 4` for these tests (view timers under a full parallel run).
 6. **Ops** (~0.5-1 d): features gauge, RPC schedule listing, upgrade runbook.
 7. **Governance `ScheduleActivation`** (before mainnet, 3-4 d) through `EpochRotationPlan`.
