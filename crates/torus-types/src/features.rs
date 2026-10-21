@@ -20,11 +20,22 @@ pub enum Feature {
     /// The running state hash (docs/plans/running-state-hash-impl.md); the old
     /// genesis field `consensus.state_hash_activation_height` is its alias.
     RunningStateHash = 0,
+    /// TEST-ONLY (cargo feature `test-features`, enabled from
+    /// torus-consensus's dev-dependencies; no node build reaches it): the P0.0
+    /// integration tests' feature with a state-visible rule (the block pipeline
+    /// writes a hashed row in every block that carries the bit). Id 127, the
+    /// top bit, is reserved for it: no real feature takes it.
+    #[cfg(feature = "test-features")]
+    TestStateRule = 127,
 }
 
 impl Feature {
     /// Every feature this binary knows, in id order.
+    #[cfg(not(feature = "test-features"))]
     pub const ALL: &'static [Feature] = &[Feature::RunningStateHash];
+    /// Every feature this binary knows, in id order.
+    #[cfg(feature = "test-features")]
+    pub const ALL: &'static [Feature] = &[Feature::RunningStateHash, Feature::TestStateRule];
 
     /// The fixed id (the bit position).
     pub const fn id(self) -> u8 {
@@ -40,6 +51,8 @@ impl Feature {
     pub const fn name(self) -> &'static str {
         match self {
             Feature::RunningStateHash => "running_state_hash",
+            #[cfg(feature = "test-features")]
+            Feature::TestStateRule => "test_state_rule",
         }
     }
 }
@@ -66,7 +79,14 @@ pub const fn unknown_features(features: u128) -> u128 {
 
 /// The lowest unknown feature id in `features`, for the `UPGRADE REQUIRED` log.
 pub fn first_unknown_feature(features: u128) -> Option<u32> {
-    let unknown = unknown_features(features);
+    first_unknown_feature_in(features, KNOWN_FEATURES)
+}
+
+/// [`first_unknown_feature`] against the feature set `known` instead of this
+/// binary's [`KNOWN_FEATURES`] (the node passes `KNOWN_FEATURES`; the P0.0
+/// integration tests run an "old binary" in process with a smaller set).
+pub fn first_unknown_feature_in(features: u128, known: u128) -> Option<u32> {
+    let unknown = features & !known;
     (unknown != 0).then(|| unknown.trailing_zeros())
 }
 
@@ -166,7 +186,12 @@ mod tests {
     fn ids_are_fixed_and_known_features_is_their_union() {
         assert_eq!(Feature::RunningStateHash.id(), 0);
         assert_eq!(Feature::RunningStateHash.bit(), 1);
+        #[cfg(not(feature = "test-features"))]
         assert_eq!(KNOWN_FEATURES, 1);
+        #[cfg(feature = "test-features")]
+        assert_eq!(KNOWN_FEATURES, 1 | (1 << 127));
+        assert_eq!(first_unknown_feature_in(0b11, 0b01), Some(1));
+        assert_eq!(first_unknown_feature_in(0b01, 0b01), None);
         assert_eq!(unknown_features(0b101), 0b100);
         assert_eq!(first_unknown_feature(0b1), None);
         assert_eq!(first_unknown_feature(1 | (1 << 9) | (1 << 77)), Some(9));

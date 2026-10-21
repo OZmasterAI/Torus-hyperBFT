@@ -1507,6 +1507,9 @@ struct ExecutionContext {
     /// does not know fail-stops (`UPGRADE REQUIRED`), known bits that differ
     /// from this schedule are logged.
     pub(crate) activations: torus_types::ActivationSchedule,
+    /// P0.0: the features this binary knows (`KNOWN_FEATURES`; the phase 5
+    /// cluster tests run an "old binary" with a smaller set).
+    pub(crate) known_features: u128,
     metrics: Option<Arc<torus_telemetry::Metrics>>,
     /// Shared mempool handle for the exec trust-cache read path: a HIT lets the
     /// execution thread reuse a locally-verified sender and skip the secp256k1
@@ -1644,6 +1647,11 @@ struct ExecutionContext {
     /// context the pipeline built, in execution order.
     #[cfg(test)]
     test_exec_features: std::sync::Mutex<Vec<(u64, u128)>>,
+    /// Test-only (P0.0 phase 5): holds the execution thread before a height
+    /// (a node whose execution lags its commits), then lets it go on or dies
+    /// there like a killed process (`p00_cluster_tests`).
+    #[cfg(test)]
+    pub(crate) test_exec_hold: Option<Arc<ExecHold>>,
     /// Test-only: with `test_book_mode` set, build the contexts WITHOUT the
     /// resident holder (the per-block reload, `TORUS_RESIDENT_BOOKS=0`).
     #[cfg(test)]
@@ -3107,9 +3115,10 @@ fn datum_evm_transactions(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
 fn feature_bits_fail_stop(
     header: &TorusBlockHeader,
     schedule: &torus_types::ActivationSchedule,
+    known: u128,
     exec_failed: &std::sync::atomic::AtomicBool,
 ) -> bool {
-    if let Some(id) = torus_types::features::first_unknown_feature(header.features) {
+    if let Some(id) = torus_types::features::first_unknown_feature_in(header.features, known) {
         tracing::error!(
             height = header.height,
             feature = id,
@@ -3161,10 +3170,11 @@ fn check_parent_link(
     justify: &PhaseCertificate,
     genesis: &TorusBlockHeader,
     schedule: &torus_types::ActivationSchedule,
+    known: u128,
     parent: impl FnOnce(&CryptoHash) -> ParentHeader,
     boundary: impl FnOnce(u64) -> Result<Option<PlanEvm>, EpochPlanNotReady>,
 ) -> BlockDataCheck {
-    check_parent_link_or_upgrade(header, justify, genesis, schedule, parent, boundary)
+    check_parent_link_or_upgrade(header, justify, genesis, schedule, known, parent, boundary)
         .unwrap_or(BlockDataCheck::Invalid)
 }
 
@@ -3187,6 +3197,7 @@ fn check_parent_link_or_upgrade(
     justify: &PhaseCertificate,
     genesis: &TorusBlockHeader,
     schedule: &torus_types::ActivationSchedule,
+    known: u128,
     parent: impl FnOnce(&CryptoHash) -> ParentHeader,
     boundary: impl FnOnce(u64) -> Result<Option<PlanEvm>, EpochPlanNotReady>,
 ) -> Result<BlockDataCheck, UpgradeRequired> {
@@ -3225,7 +3236,7 @@ fn check_parent_link_or_upgrade(
     // P0.0: the feature bits are this node's schedule at this height. A bit this binary does not
     // know is a newer release's feature: no vote, no insertion (owner decision: an old binary
     // stops). After the link check, so a bogus height is Invalid first.
-    if let Some(id) = torus_types::features::first_unknown_feature(header.features) {
+    if let Some(id) = torus_types::features::first_unknown_feature_in(header.features, known) {
         tracing::error!(
             height = header.height,
             feature = id,
@@ -4569,7 +4580,12 @@ impl ExecutionContext {
 
         // P0.0: execution runs by the committed header's bits (crash replay
         // too). A bit this binary does not know: fail-stop BEFORE executing.
-        if feature_bits_fail_stop(&torus_block.header, &self.activations, &self.exec_failed) {
+        if feature_bits_fail_stop(
+            &torus_block.header,
+            &self.activations,
+            self.known_features,
+            &self.exec_failed,
+        ) {
             return;
         }
         // P0.0 phase 3: the running state hash follows the header's bit (before
@@ -5263,7 +5279,14 @@ impl ExecutionContext {
         // not wait for activity).
         // A read error is a node fault: fail-stop (C4), never "assume".
         // Bug (b): every boundary block runs it too (validator-set plans).
+        // P0.0 phase 5 (test builds only): the test feature's rule runs in the
+        // native phase, so a block carrying its bit runs that phase.
+        #[cfg(test)]
+        let test_rule = torus_block.header.features & torus_types::Feature::TestStateRule.bit() != 0;
+        #[cfg(not(test))]
+        let test_rule = false;
         let run_native = if has_native
+            || test_rule
             || computed_fee_revenue > 0
             || evm_gas != (0, 0)
             || core_writer_due
@@ -5688,6 +5711,9 @@ impl ExecutionContext {
             // P0.0 phase 2: execution gates features on the committed header's bits,
             // never this node's schedule (crash replay runs the stored header).
             ctx.features = torus_block.header.features;
+            // P0.0 phase 5: the test feature's state-visible rule (test builds only).
+            #[cfg(test)]
+            p00_cluster_tests::test_state_rule(&ctx);
             #[cfg(test)]
             self.test_exec_features
                 .lock()
@@ -6773,6 +6799,16 @@ fn execution_loop(rx: std::sync::mpsc::Receiver<CommittedBlockMsg>, ctx: Executi
             }
             None => durable,
         };
+        // P0.0 phase 5 (test-only): a held execution thread; killed = the
+        // process died here (nothing of this height or later executes).
+        #[cfg(test)]
+        if let Some(hold) = ctx.test_exec_hold.as_ref() {
+            if !hold.may_execute(height) {
+                ctx.exec_failed.store(true, Ordering::SeqCst);
+                tracing::warn!(height, "test: execution thread killed before this height");
+                return;
+            }
+        }
         // T1.5: contain execution panics — a panic here must become a
         // controlled fail-stop (latch + loop exit), not silent thread death
         // with consensus zombie-advancing while state is frozen.
@@ -6911,6 +6947,14 @@ pub struct TorusApp {
     /// P0.0: this node's activation schedule (`ChainConfig::activations`): the
     /// `features` bits it proposes and requires before the vote and at insertion.
     pub(crate) activations: torus_types::ActivationSchedule,
+    /// P0.0: the features this binary knows (`KNOWN_FEATURES`; the phase 5
+    /// cluster tests run an "old binary" with a smaller set). A header bit
+    /// outside it: no vote, no insertion, no proposal on it, no execution.
+    pub(crate) known_features: u128,
+    /// Test-only (P0.0 phase 5): every `UPGRADE REQUIRED` refusal of this
+    /// node, `(site, height)` with site `vote` / `insert` / `propose`.
+    #[cfg(test)]
+    pub(crate) test_upgrade_refusals: Arc<std::sync::Mutex<Vec<(&'static str, u64)>>>,
     staking: StakingManager,
     epoch_length: u64,
     last_validator_set: ValidatorSet,
@@ -7728,6 +7772,68 @@ impl Drop for AsyncValidateWorker {
 /// racing-push window distribution is unmeasured — measure on devnet before
 /// finalizing the consts (1 vs 2 slices). The old 5 × 20 ms in-line budget moved
 /// off-thread to the recovery worker (`WORKER_PULL_RETRIES`/`WORKER_PULL_DELAY`).
+/// Construction options of a [`TorusApp`] that are not chain config. The
+/// node uses the defaults.
+#[derive(Clone)]
+pub(crate) struct AppOptions {
+    /// The features this binary knows: `KNOWN_FEATURES`. The P0.0 phase 5
+    /// cluster tests pass a smaller set to run an "old binary" in process.
+    pub(crate) known_features: u128,
+    /// Test-only: hold the execution thread before a height.
+    #[cfg(test)]
+    pub(crate) exec_hold: Option<Arc<ExecHold>>,
+}
+
+impl Default for AppOptions {
+    fn default() -> Self {
+        Self {
+            known_features: torus_types::KNOWN_FEATURES,
+            #[cfg(test)]
+            exec_hold: None,
+        }
+    }
+}
+
+/// Test-only (P0.0 phase 5): the execution thread waits before executing any
+/// height `>= from` until the test kills it ([`Self::kill`]: the thread exits
+/// there without executing, as a killed process; the fail-stop latch keeps
+/// the node from writing more).
+#[cfg(test)]
+pub(crate) struct ExecHold {
+    pub(crate) from: u64,
+    /// `None` = holding, `Some(false)` = killed.
+    verdict: std::sync::Mutex<Option<bool>>,
+    cv: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl ExecHold {
+    pub(crate) fn new(from: u64) -> Arc<Self> {
+        Arc::new(Self {
+            from,
+            verdict: std::sync::Mutex::new(None),
+            cv: std::sync::Condvar::new(),
+        })
+    }
+
+    pub(crate) fn kill(&self) {
+        *self.verdict.lock().unwrap() = Some(false);
+        self.cv.notify_all();
+    }
+
+    /// Whether the execution thread may execute `height` (blocks while held).
+    fn may_execute(&self, height: u64) -> bool {
+        if height < self.from {
+            return true;
+        }
+        let mut verdict = self.verdict.lock().unwrap();
+        while verdict.is_none() {
+            verdict = self.cv.wait(verdict).unwrap();
+        }
+        verdict.unwrap()
+    }
+}
+
 const RECONSTRUCT_RETRIES: usize = 1;
 const RECONSTRUCT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
 
@@ -7779,6 +7885,29 @@ impl TorusApp {
         metrics: Option<Arc<torus_telemetry::Metrics>>,
         mempool: Option<Arc<Mempool>>,
         signing_key: Option<ed25519_dalek::SigningKey>,
+    ) -> Result<Self, String> {
+        Self::try_new_with_options(
+            state_db,
+            manifest_db,
+            config,
+            metrics,
+            mempool,
+            signing_key,
+            AppOptions::default(),
+        )
+    }
+
+    /// [`Self::try_new_with_manifest_db`] with [`AppOptions`] (the node uses
+    /// the defaults; the P0.0 phase 5 cluster tests run an "old binary" and a
+    /// node whose execution lags its commits).
+    pub(crate) fn try_new_with_options(
+        state_db: StateDb,
+        manifest_db: StateDb,
+        config: &ChainConfig,
+        metrics: Option<Arc<torus_telemetry::Metrics>>,
+        mempool: Option<Arc<Mempool>>,
+        signing_key: Option<ed25519_dalek::SigningKey>,
+        options: AppOptions,
     ) -> Result<Self, String> {
         let manifest_in_state_db = Arc::ptr_eq(&state_db.db_arc(), &manifest_db.db_arc());
         if !manifest_in_state_db {
@@ -7864,6 +7993,7 @@ impl TorusApp {
             dev_pool_address: config.dev_pool_address,
             genesis_header: genesis_header.clone(),
             activations: config.activations.clone(),
+            known_features: options.known_features,
             metrics: metrics.clone(),
             mempool: mempool.clone(),
             exec_trust_cache: config.exec_trust_cache,
@@ -7912,6 +8042,8 @@ impl TorusApp {
             test_book_mode: None,
             #[cfg(test)]
             test_exec_features: Default::default(),
+            #[cfg(test)]
+            test_exec_hold: options.exec_hold.clone(),
             #[cfg(test)]
             test_no_resident: false,
             #[cfg(test)]
@@ -8167,6 +8299,9 @@ impl TorusApp {
             last_header,
             genesis_header,
             activations: config.activations.clone(),
+            known_features: options.known_features,
+            #[cfg(test)]
+            test_upgrade_refusals: Default::default(),
             staking,
             epoch_length: config.epoch_length,
             last_validator_set: genesis_validator_set,
@@ -9887,10 +10022,17 @@ impl TorusApp {
             &block.justify,
             &self.genesis_header,
             &self.activations,
+            self.known_features,
             parent,
             |h| self.boundary_evm(h),
         );
         if link != BlockDataCheck::Held {
+            #[cfg(test)]
+            if torus_types::features::first_unknown_feature_in(header.features, self.known_features)
+                .is_some()
+            {
+                self.test_upgrade_refusals.lock().unwrap().push(("vote", header.height));
+            }
             return link;
         }
         // T0b (rebase s87): refuse to vote for a block too far ahead of this
@@ -9946,13 +10088,20 @@ impl TorusApp {
     ) -> ProduceBlockResponse {
         // P0.0: a parent carrying a feature this binary does not know cannot be
         // executed here; refuse to build on it (owner decision: an old binary stops).
-        if let Some(id) = torus_types::features::first_unknown_feature(parent_header.features) {
+        if let Some(id) =
+            torus_types::features::first_unknown_feature_in(parent_header.features, self.known_features)
+        {
             tracing::error!(
                 parent_height = parent_header.height,
                 feature = id,
                 "UPGRADE REQUIRED: feature {id} at {} -- refusing to propose on it",
                 parent_header.height
             );
+            #[cfg(test)]
+            self.test_upgrade_refusals
+                .lock()
+                .unwrap()
+                .push(("propose", parent_header.height + 1));
             return refused_proposal();
         }
         // Bug (b): a planned boundary block needs this node's execution at the
@@ -10232,11 +10381,17 @@ impl App<RocksKVStore> for TorusApp {
                 &block.justify,
                 &self.genesis_header,
                 &self.activations,
+                self.known_features,
                 |hash| tree_parent_header(request.block_tree(), hash),
                 |h| self.boundary_evm(h),
             ),
             None => Ok(BlockDataCheck::Invalid),
         };
+        #[cfg(test)]
+        if link.is_err() {
+            let height = datum_header(datums[0].bytes()).map_or(0, |h| h.height);
+            self.test_upgrade_refusals.lock().unwrap().push(("insert", height));
+        }
         if let Some(response) =
             insertion_link_response_for_datum(link, datums[0].bytes(), &block.data_hash)
         {
@@ -17159,6 +17314,7 @@ mod crash_recovery_tests {
             dev_pool_address: config.dev_pool_address,
             genesis_header: torus_bridge::genesis_parent_header_for(config),
             activations: config.activations.clone(),
+            known_features: torus_types::KNOWN_FEATURES,
             metrics: None,
             mempool,
             exec_trust_cache,
@@ -17198,6 +17354,8 @@ mod crash_recovery_tests {
             test_book_mode: None,
             #[cfg(test)]
             test_exec_features: Default::default(),
+            #[cfg(test)]
+            test_exec_hold: None,
             #[cfg(test)]
             test_no_resident: false,
             #[cfg(test)]
@@ -25612,6 +25770,7 @@ mod crash_recovery_tests {
                 &justify_for(&hs_parent),
                 &app.genesis_header,
                 &app.activations,
+                app.known_features,
                 move |_| ParentHeader::Header(Box::new(header)),
                 |_| Ok(None)
             ),
@@ -25658,6 +25817,7 @@ mod crash_recovery_tests {
                     &justify_for(&hs_parent),
                     &app.genesis_header,
                     &app.activations,
+                    app.known_features,
                     move |_| ParentHeader::Header(Box::new(header)),
                     |_| Ok(None)
                 ),
@@ -25765,6 +25925,7 @@ mod crash_recovery_tests {
             &justify_for(&hs_parent),
             &app.genesis_header,
             &app.activations,
+            app.known_features,
             move |_| ParentHeader::Header(Box::new(header)),
             |_| Ok(None),
         )
@@ -25917,11 +26078,12 @@ mod crash_recovery_tests {
                 &justify_for(&hs_parent),
                 &app.genesis_header,
                 &app.activations,
+                app.known_features,
                 move |_| ParentHeader::Header(Box::new(header)),
                 |_| Ok(None),
             ))
         };
-        for bits in [UNKNOWN_BIT, rsh | UNKNOWN_BIT, 1 << 127] {
+        for bits in [UNKNOWN_BIT, rsh | UNKNOWN_BIT, 1 << 126] {
             let newer = with_features(child_of(&parent, 2_000), bits);
             assert!(
                 matches!(
@@ -25974,6 +26136,7 @@ mod crash_recovery_tests {
                 &justify_for(&hs_parent),
                 &old.genesis_header,
                 &old.activations,
+                old.known_features,
                 move |_| ParentHeader::Header(Box::new(header)),
                 |_| Ok(None),
             );
@@ -26460,6 +26623,7 @@ mod crash_recovery_tests {
                     &justify_for(&hs_parent),
                     &app.genesis_header,
                     &app.activations,
+                    app.known_features,
                     move |_| ParentHeader::Header(Box::new(header)),
                     |_| Ok(None)
                 ),
@@ -26674,6 +26838,7 @@ mod crash_recovery_tests {
             &justify_for(&hs_parent),
             &app.genesis_header,
             &app.activations,
+            app.known_features,
             move |_| ParentHeader::Header(Box::new(header)),
             boundary,
         )
@@ -47946,3 +48111,8 @@ mod crash_recovery_tests {
         );
     }
 }
+
+/// P0.0 phase 5: the multi-node activation tests (test plan items 1-4).
+#[cfg(test)]
+#[path = "p00_cluster_tests.rs"]
+mod p00_cluster_tests;

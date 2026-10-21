@@ -15,6 +15,13 @@ k256 = { workspace = true }
 ed25519-dalek = { workspace = true }
 rayon = "1"
 
+[features]
+# P0.0 phase 5: TEST-ONLY. Adds `Feature::TestStateRule` (id 127), the
+# integration tests' feature with a state-visible rule. Enabled from
+# torus-consensus's dev-dependencies only; no node build reaches it
+# (`cargo tree -e features,no-dev -p torus-node -i torus-types`).
+test-features = []
+
 [dev-dependencies]
 serde_json = { workspace = true }
 hex = { workspace = true }
