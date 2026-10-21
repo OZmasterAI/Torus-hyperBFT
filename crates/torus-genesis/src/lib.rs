@@ -141,6 +141,10 @@ pub struct ConsensusConfig {
     /// `state_hash_activation_height` is the alias of `running_state_hash`.
     #[serde(default)]
     pub activations: std::collections::BTreeMap<torus_types::Feature, u64>,
+    /// L6.1 window-committed Classic order books (CHAIN-WIDE, consensus-
+    /// changing; docs/plans/l61-window-committed-books.md). Absent = off.
+    #[serde(default)]
+    pub book_window_commit: bool,
 }
 
 fn default_chain_id() -> u64 {
@@ -805,6 +809,7 @@ impl Genesis {
             exec_trust_cache: false,
             activations,
             book_mode: self.consensus.book_mode,
+            book_window_commit: self.consensus.book_window_commit,
         }
     }
 
@@ -1264,6 +1269,25 @@ mod tests {
         ] {
             assert!(with(v.clone()).is_err(), "{v} must refuse the genesis");
         }
+    }
+
+    /// L6.1: `consensus.book_window_commit` is a CHAIN-WIDE genesis field,
+    /// absent (every existing genesis) = off; on needs the running hash.
+    #[test]
+    fn genesis_book_window_commit_is_chain_config() {
+        let genesis = Genesis::from_json(&sample_genesis_json()).unwrap();
+        assert!(!genesis.consensus.book_window_commit);
+        assert!(!genesis.chain_config().book_window_commit, "off by default");
+        let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        json["consensus"]["book_window_commit"] = serde_json::json!(true);
+        json["consensus"]["state_hash_activation_height"] = serde_json::json!(1);
+        let mut config = Genesis::from_json(&json.to_string())
+            .unwrap()
+            .chain_config();
+        assert!(config.book_window_commit);
+        assert!(config.validate().is_ok());
+        config.activations = Default::default();
+        assert!(config.validate().is_err(), "L6.1 without the running hash");
     }
 
     /// Consensus bug (b): genesis records the hotstuff genesis set as the

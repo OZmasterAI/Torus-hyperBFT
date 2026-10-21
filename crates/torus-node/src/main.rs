@@ -474,6 +474,7 @@ fn default_chain_config() -> ChainConfig {
         )
         .expect("an empty genesis set never conflicts with the built-in table"),
         book_mode: Default::default(),
+        book_window_commit: false,
     }
 }
 

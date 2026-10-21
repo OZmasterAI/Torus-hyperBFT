@@ -5671,6 +5671,13 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// 8k L3.1: the markets whose encode this block's save skipped
     /// ([`Self::take_coalesced_books`]).
     coalesced_books: Vec<MarketId>,
+    /// L6.1 window-committed books (set by the committer per block,
+    /// consensus: `running_hash::book_window_full_save_at`): this block is an
+    /// attest height, so the Classic save writes the blob of EVERY book in
+    /// the context (market ascending), not only the dirty ones, and never
+    /// coalesces; the running hash commits to the full book state here.
+    /// Default `false`. Row modes ignore it (a node refuses L6.1 there).
+    pub book_window_full_save: bool,
     /// L3: level-hash sponge cache budget in BYTES for mode-2 saves
     /// (`TORUS_LEVEL_HASH_CACHE` env, MB; default
     /// [`DEFAULT_LEVEL_HASH_CACHE_MB`] = ON). 0 = disabled (exact-today),
@@ -6257,6 +6264,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             resident_reused,
             coalesce_books: false,
             coalesced_books: Vec::new(),
+            book_window_full_save: false,
             level_hash_cache_bytes: level_hash_cache_env_bytes(),
             save_books_workers: save_books_workers_env(),
             save_books_min_ops: save_books_min_ops_env(),
@@ -7268,7 +7276,14 @@ impl<T: StateBackend> NativeExecContext<T> {
         // Deterministic save order (market id ascending) — the overlay is
         // keyed so final bytes never depend on order, but stable iteration
         // keeps write counts and logs reproducible.
-        let mut dirty: Vec<MarketId> = self.dirty_books.iter().copied().collect();
+        // L6.1: an attest-height Classic save writes every book (the running
+        // hash commits to the full book state there).
+        let full = self.book_window_full_save && self.book_mode == BookMode::Classic;
+        let mut dirty: Vec<MarketId> = if full {
+            self.order_books.keys().copied().collect()
+        } else {
+            self.dirty_books.iter().copied().collect()
+        };
         dirty.sort_unstable();
         // L3 attribution (µbench-only): per-sub-step accumulators. With the
         // `save-timings` feature off, `timed` is statically false and every
@@ -7311,7 +7326,8 @@ impl<T: StateBackend> NativeExecContext<T> {
             };
             match self.book_mode {
                 // 8k L3.1: the window close encodes it (`coalesce_books`).
-                BookMode::Classic if self.coalesce_books => {
+                // L6.1: never at an attest height (`full`).
+                BookMode::Classic if self.coalesce_books && !full => {
                     self.coalesced_books.push(market_id);
                     book.discard_row_ops();
                     book.discard_level_ops();

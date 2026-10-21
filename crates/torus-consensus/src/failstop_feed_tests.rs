@@ -59,6 +59,7 @@ fn chain_config() -> ChainConfig {
         // the fail-stop here is the injected one, never `UPGRADE REQUIRED`.
         activations: Default::default(),
         book_mode: Default::default(),
+        book_window_commit: false,
     }
 }
 
