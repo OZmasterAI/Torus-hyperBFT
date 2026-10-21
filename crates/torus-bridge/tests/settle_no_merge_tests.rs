@@ -834,14 +834,21 @@ fn an_aliased_position_row_fail_stops_the_block() {
                 fatal.as_deref().is_some_and(|f| f.contains("borsh error: position row")),
                 "{label}: the block fail-stops on the aliased row: {fatal:?}"
             );
-            let key = position_key(&addr(5), 1);
-            let stored: Vec<_> = run
-                .db_dump
-                .iter()
-                .filter(|(cf, k, _)| cf == CF_NATIVE_POSITIONS && k.starts_with(addr(5).as_slice()))
-                .map(|(_, k, _)| k.clone())
-                .collect();
-            assert_eq!(stored, vec![key.to_vec()], "{label}: block 2 never flushed");
+            // Block 2 never flushed: the DB is block 1's plus the stored row.
+            let (first, _) = run_seeded(&blocks[..1], 2, true, &LastBlockFault::None, None, parallel);
+            let key = position_key(&addr(5), 1).to_vec();
+            let is_alias = |(cf, k, _): &(String, Vec<u8>, Vec<u8>)| cf == CF_NATIVE_POSITIONS && *k == key;
+            let alias = run.db_dump.iter().find(|r| is_alias(r)).expect("the aliased row").clone();
+            let mut want: Vec<_> = first.db_dump.into_iter().filter(|r| !is_alias(r)).chain([alias]).collect();
+            want.sort();
+            let mut got = run.db_dump.clone();
+            got.sort();
+            assert!(got == want, "{label}: block 2 was flushed");
+            assert_eq!(
+                trader_rows(&run, 5).first(),
+                Some(&(1, 2, fp(2))),
+                "{label}: the aliased row is kept as stored"
+            );
         }
     }
 }
