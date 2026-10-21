@@ -717,26 +717,29 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         consensus_db = %torus_state::consensus_db_path(&cli.data_dir).display(),
         "state database and consensus database (HotStuff + DA store) opened"
     );
-    // 3b. Archive-upgrade rule (claude-review P1, s131): a defaulted retention
-    // on an unpruned data dir past N refuses before any pruner exists.
-    node_dbs::enforce_history_retention(
-        &state_db,
+    // 3b + 4. Archive-upgrade rule (claude-review P1, s131): a defaulted
+    // retention on an unpruned data dir past N refuses before any pruner
+    // exists. Genesis initialization: only on first run (see
+    // `node_dbs::genesis_applied`); P0.0 phase 4: the data dir is bound to the
+    // genesis file's digest, a changed file refuses to start.
+    let genesis_file = cli.genesis.as_deref().map(load_genesis).transpose()?;
+    let binding = node_dbs::bind_genesis_and_retention(
+        &dbs,
+        genesis_file
+            .as_ref()
+            .zip(cli.genesis.as_deref())
+            .map(|((genesis, digest), path)| node_dbs::GenesisFile { genesis, digest, path }),
         retention,
         retention_is_explicit(&cli),
         &cli.data_dir,
     )?;
-
-    // 4. Genesis initialization
-    let mut chain_config = if let Some(genesis_path) = &cli.genesis {
-        let (genesis, file_digest) = load_genesis(genesis_path)?;
+    let mut chain_config = if let (Some((genesis, file_digest)), Some(genesis_path), Some(binding)) =
+        (&genesis_file, &cli.genesis, binding)
+    {
         let config = genesis.chain_config();
-
-        // Only initialize on first run (see `node_dbs::genesis_applied`).
-        // P0.0 phase 4: the data dir is bound to this file's digest; a
-        // changed file refuses to start.
         info!(genesis = %genesis_path.display(), "genesis file");
         let digest = file_digest.digest;
-        match node_dbs::init_genesis(&dbs, &genesis, &file_digest, genesis_path, &cli.data_dir)? {
+        match binding {
             node_dbs::GenesisBinding::Fresh => {
                 info!(%digest, "genesis digest stored: this data dir is bound to the genesis file")
             }
@@ -753,7 +756,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         config
     } else {
-        node_dbs::check_no_genesis_file(&dbs, &cli.data_dir)?;
         info!("no genesis file provided, using default chain config");
         default_chain_config()
     };

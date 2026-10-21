@@ -250,6 +250,31 @@ pub fn init_genesis(
     Ok(GenesisBinding::Fresh)
 }
 
+/// The `--genesis` file as boot step 4 reads it.
+pub struct GenesisFile<'a> {
+    pub genesis: &'a torus_genesis::Genesis,
+    pub digest: &'a GenesisDigest,
+    pub path: &'a Path,
+}
+
+/// Boot steps 3b and 4: the history-retention rule
+/// ([`enforce_history_retention`]) and the genesis binding ([`init_genesis`],
+/// or [`check_no_genesis_file`] without a genesis file). `Ok(None)`: no
+/// genesis file.
+pub fn bind_genesis_and_retention(
+    dbs: &NodeDbs,
+    file: Option<GenesisFile<'_>>,
+    retention: Option<u64>,
+    explicit: bool,
+    data_dir: &Path,
+) -> Result<Option<GenesisBinding>, String> {
+    enforce_history_retention(&dbs.state, retention, explicit, data_dir)?;
+    match file {
+        Some(f) => init_genesis(dbs, f.genesis, f.digest, f.path, data_dir).map(Some),
+        None => check_no_genesis_file(dbs, data_dir).map(|()| None),
+    }
+}
+
 /// Boot step 4 without a genesis file: a data dir bound to a genesis file
 /// refuses (the default chain config would replace that genesis' config).
 pub fn check_no_genesis_file(dbs: &NodeDbs, data_dir: &Path) -> Result<(), String> {
@@ -1088,6 +1113,47 @@ mod tests {
         assert_eq!(boot(dir.path(), DEVNET_GENESIS), Ok(GenesisBinding::Matched));
         let edited = devnet_with(|v| v["chain_name"] = "edited".into());
         assert!(boot(dir.path(), &edited).unwrap_err().contains("changed: chain_name."));
+    }
+
+    /// Codex review of phase 4 (P2): a start refused for a changed genesis
+    /// writes nothing, in particular not the history-retention marker. An
+    /// explicit-retention start with the wrong genesis on an archive dir
+    /// must not let the next default start (which would prune) through.
+    #[test]
+    fn a_changed_genesis_refusal_writes_no_retention_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        boot(dir.path(), DEVNET_GENESIS).unwrap();
+        let dbs = open_node_dbs(dir.path()).unwrap();
+        for h in 0..=50u64 {
+            dbs.state.put_cf_raw(CF_BLOCK_HEADERS, &h.to_be_bytes(), b"header").unwrap();
+        }
+        let marker = |dbs: &NodeDbs| {
+            dbs.state.get_cf_raw(CF_CONSENSUS_META, META_HISTORY_RETENTION).unwrap()
+        };
+        assert_eq!(marker(&dbs), None, "an archive dir");
+        let edited_text = devnet_with(|v| v["chain_name"] = "edited".into());
+        let (edited, edited_digest) = genesis_file(&edited_text);
+        let path = Path::new("/etc/torus/genesis.json");
+        let file = |g, d| Some(GenesisFile { genesis: g, digest: d, path });
+        let err = bind_genesis_and_retention(
+            &dbs,
+            file(&edited, &edited_digest),
+            Some(10),
+            true,
+            dir.path(),
+        )
+        .unwrap_err();
+        assert!(err.contains("changed: chain_name."), "{err}");
+        assert_eq!(marker(&dbs), None, "the refused start recorded the retention mode");
+        // The archive protection still holds for a defaulted start.
+        let (original, digest) = genesis_file(DEVNET_GENESIS);
+        let err = bind_genesis_and_retention(&dbs, file(&original, &digest), Some(10), false, dir.path())
+            .unwrap_err();
+        assert!(err.contains("holds unpruned history"), "{err}");
+        assert_eq!(marker(&dbs), None);
+        // The no-genesis refusal of a bound dir writes nothing either.
+        assert!(bind_genesis_and_retention(&dbs, None, Some(10), true, dir.path()).is_err());
+        assert_eq!(marker(&dbs), None);
     }
 
     #[test]
