@@ -635,6 +635,42 @@ mod review {
         assert!(!l.hotstuff.has_missing_data_retries(), "nothing left to retry");
     }
 
+    /// Validates everything as `UnsupportedUpgrade` (a block using a feature
+    /// this binary does not know, P0.0).
+    struct UnsupportedApp;
+
+    impl App<MemKV> for UnsupportedApp {
+        fn produce_block(&mut self, _: ProduceBlockRequest<MemKV>) -> ProduceBlockResponse {
+            unreachable!("re-proposal test")
+        }
+        fn validate_block(&mut self, _: ValidateBlockRequest<MemKV>) -> ValidateBlockResponse {
+            ValidateBlockResponse::UnsupportedUpgrade
+        }
+        fn validate_block_for_sync(&mut self, _: ValidateBlockRequest<MemKV>) -> ValidateBlockResponse {
+            unreachable!("re-proposal test")
+        }
+    }
+
+    /// Batch 9 merge (P0.0 x phase B): a recovered tip this binary cannot
+    /// execute (`UnsupportedUpgrade`) is handled like `Invalid`: not
+    /// inserted, not re-proposed, not scheduled as a `MissingData` retry
+    /// (a retry cannot succeed before an upgrade). The view times out and an
+    /// upgraded leader re-proposes it.
+    #[test]
+    fn case5_unsupported_upgrade_response_is_not_reproposed() {
+        let x = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(), CryptoHash::new([84; 32]), Data::new(vec![]));
+        let the_tc = tc(VIEW - 1, Some(tip(&x, VIEW - 1)), None);
+        let mut l = recording_leader(&[], &[], PhaseCertificate::genesis_pc(), Some(the_tc.clone()));
+        l.enter(&mut UnsupportedApp);
+        let origin = keys()[0].verifying_key();
+        l.hotstuff
+            .on_receive_msg(HotStuffMessage::ProposalResponse(response_for(&x, &the_tc)), &origin, &mut l.tree, &mut UnsupportedApp)
+            .unwrap();
+        assert!(l.headers().is_empty(), "an unsupported tip must not be re-proposed");
+        assert!(!l.tree.contains(&x.hash), "an unsupported tip must not be inserted");
+        assert!(!l.hotstuff.has_missing_data_retries(), "an unsupported tip is not a MissingData retry");
+    }
+
     /// [P2] genesis highest PC, but TC(v-1) is held and its high tip wins:
     /// re-propose the tip with the TC rather than a fresh height-0 block.
     #[test]

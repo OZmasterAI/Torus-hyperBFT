@@ -2015,7 +2015,10 @@ impl<N: Network> HotStuff<N> {
                     ValidateBlockResponse::Valid { app_state_updates, validator_set_updates } => {
                         Some((app_state_updates, validator_set_updates))
                     }
-                    ValidateBlockResponse::Invalid => {
+                    // An unsupported upgrade (P0.0) cannot be executed by this binary, and a
+                    // retry cannot change that: drop it like `Invalid` (the view times out and
+                    // an upgraded leader re-proposes the tip).
+                    ValidateBlockResponse::Invalid | ValidateBlockResponse::UnsupportedUpgrade => {
                         if let RecoveryState::Recovering { recovered, .. } = &mut self.recovery_state {
                             *recovered = None;
                         }
