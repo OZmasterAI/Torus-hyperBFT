@@ -1,6 +1,6 @@
 # Implementation Plan: item 6 Phase 1 (resident rows, margin sums, liquidation L1)
 
-Status: IN PROGRESS. Written s89 (2026-10-04). s91: C1 `81a9567`, C2 `ccdb59b`, sync point 2
+Status: DONE (s134 refresh): Phase 1 merged to main in `59fa407` (s94, Gate 2 met: 1.097x / 0.997x main). Was: IN PROGRESS. Written s89 (2026-10-04). s91: C1 `81a9567`, C2 `ccdb59b`, sync point 2
 `d52a33f` (main 92a02ed with native anti-spam + oracle lane + oracle-signer exemption, built on
 ozarchy as `merge/item6-sync2`); C3 building. s91 decisions: Gate 2 on two load shapes
 (section 1.1, step 6), a per-fill track next to C3/C4 (section 5.1), 18c builds and ozarchy

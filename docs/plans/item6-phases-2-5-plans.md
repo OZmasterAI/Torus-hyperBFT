@@ -1,6 +1,8 @@
 # Plans: item 6 Phases 2-5 (short form)
 
-Status: PLAN, nothing built. Written s89 (2026-10-04). Each phase gets a full plan (in the
+Status (s134 refresh): Phase 2 closed out on main (`3efff0d6`, option A); Phase 3 merged (`dc8116d5`, step 6 `d3cba5e2`);
+Phase 4 steps 1-4 and 6 merged (last `fd82758f`; step 5 not merged); Phase 5 step 1 merged (`d3cab057`), then parked
+(owner s128). Each phase has its own `item6-phaseN-impl.md`. Was: PLAN, nothing built. Written s89 (2026-10-04). Each phase gets a full plan (in the
 form of `item6-phase1-impl.md`: budget, step 0 guardrails, steps with cost gates, stop
 rule) when the phase before it has passed its gate, because the profile after each phase
 decides the details. Design: `market-scaling-in-memory-design.md` section 3.

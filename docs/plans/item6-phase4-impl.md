@@ -1,11 +1,13 @@
 # Implementation Plan: item 6 Phase 4 (one record per trader in memory)
 
-Status: PLAN, nothing built (2026-10-13). Section 6 decided by the owner (s118): 1 a, 2 b, 3 a, 4 a, 5 a.
+Status (s134 refresh): steps 1-4 and 6 merged to main (`7487b764`, `4043e9de`, `9ab4c7a5`, `bb33b988`, `fd82758f`; gate
+section 67 on steps 1-4: 300 markets PASS). Step 5 failed its A/B (section 68: no net gain) and is not merged (`6288ebe8`).
+Was: PLAN, nothing built (2026-10-13). Section 6 decided by the owner (s118): 1 a, 2 b, 3 a, 4 a, 5 a.
 Parent design: `market-scaling-in-memory-design.md` Phase 4,
 section 4 (memory budget), section 5 rules 1, 4, 8, 9, and D4 a. Short form: `item6-phases-2-5-plans.md`
 Phase 4. Format and base: `item6-phase3-impl.md`.
 
-**Code references are `file:line` on `feat/item6-phase3-step2` @ `bd522027`** (Phase 3 step 2, not on main).
+**Code references are `file:line` on `feat/item6-phase3-step2` @ `bd522027`** (Phase 3 step 2; on main since `dc8116d5`).
 `perf/p3-merge-wait` (`06611175`, results doc section 54) is being merged into step 2. It changes `app.rs`,
 `backend.rs` and `checkpoint_layer.rs`, so anchors in those three files will move after that merge.
 `native_executor.rs`, `trader_positions.rs`, `resident_rows.rs` and `position.rs` are not touched by it.

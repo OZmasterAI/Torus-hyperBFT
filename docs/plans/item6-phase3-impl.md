@@ -1,6 +1,7 @@
 # Implementation Plan: item 6 Phase 3 (coalesced state checkpoints + replay)
 
-Status: UN-SHELVED s111 (owner, same day): step 1 starts. The shelve judged Phase 3 on a CPU rule
+Status: DONE (s134 refresh): steps 1 + 2 merged to main in `dc8116d5` (final gate sections 61-62), step 3 in `b26314d9`,
+step 6 (15 s validator interval) in `d3cba5e2`; step 5 (owner-only) not built. Was: UN-SHELVED s111 (owner, same day): step 1 starts. The shelve judged Phase 3 on a CPU rule
 that misses its payoff; the prototype (plan row 47, results doc section 42) showed matched/s +4.7%,
 native blocks/s +6.1%, CPU -2.1% at equal fills, disk writes -51%, +0.8 GB RAM/node, restart <= 26.6 s,
 and Phases 4-5 build on Phase 3. Gate revised (section 1). Task 1.1 merged; step 3 built
