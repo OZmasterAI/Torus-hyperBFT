@@ -107,6 +107,8 @@
 #                = those validators only (KILL_NO_RESTART needs the killed one
 #                out of it). Recorded via cell.bench_cmd.
 #   OVERWRITE=1  allow reusing an existing non-empty results dir
+#                (every per-run kill artifact, kill-norestart.json and crash*.json, is
+#                removed at cell start; run-id.json names the run, see reset_run_artifacts)
 #   HEALTH_TIMEOUT (240 s)
 #   DRAIN_TIMEOUT  default 180 + 2*MARKETS s (300 markets => 780 s). A 300-market
 #                  cell does NOT drain inside 180 s — r6-base-300m-r1 ended with
@@ -1267,6 +1269,30 @@ if [ -d "$OUT" ] && [ -n "$(ls -A "$OUT" 2>/dev/null)" ] && [ "${OVERWRITE:-0}" 
 fi
 mkdir -p "$OUT"
 : > "$OUT/run.log"
+# Per-run kill artifacts never outlive their run (OVERWRITE=1 reuses the dir): a
+# stale kill-norestart.json would make summarize.py exclude a LIVE validator of
+# this run (its divergent digest could then PASS), a stale crash*.json would
+# score a crash this run never had. run-id.json is this run's identity:
+# crash-kill.sh norestart copies its run_id into kill-norestart.json and
+# summarize.py applies the record's exclusion only when run_id and kill_node
+# match it (a record it cannot match REJECTs the cell: stale kill record).
+reset_run_artifacts() { # <out> <label> <KILL_NO_RESTART or empty>
+    local out=${1:?} f
+    for f in "$out"/kill-norestart.json "$out"/crash.json "$out"/crash-[0-9]*.json \
+             "$out"/crash-kill.json "$out"/crash-kill-[0-9]*.json "$out"/crash-kill.skipped \
+             "$out"/crash-restart-tail.log "$out"/crash-restart-tail-[0-9]*.log "$out"/run-id.json; do
+        [ -e "$f" ] || continue
+        rm -f -- "${f:?}" || return 1
+    done
+    python3 - "$out/run-id.json" "${2-}" "${3-}" "$(date +%s.%N)-$$-$RANDOM" <<'PY'
+import json, sys
+path, label, knr, nonce = sys.argv[1:5]
+with open(path, "w") as f:
+    json.dump({"label": label, "run_id": label + "/" + nonce, "kill_no_restart": knr or None}, f)
+PY
+}
+reset_run_artifacts "$OUT" "$LABEL" "$KILL_NO_RESTART" \
+    || { echo "FATAL: could not clear the per-run kill artifacts / write $OUT/run-id.json" >&2; exit 1; }
 
 SAMPLER_PID=""; CPU_PID=""; BENCH_PID=""; CRASH_PID=""; KNR_PID=""; ORACLE_PID=""; ORACLE_RC=""
 # alive <pid>: running or stopped, NOT an unreaped zombie (kill -0 succeeds on those).

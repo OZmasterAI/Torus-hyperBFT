@@ -14,7 +14,8 @@
 # stop-3val.sh's read loops skip a blank line). Prints the marker line
 # "kill-no-restart: SIGKILL val<idx> pid <pid> ..." BEFORE the signal (the
 # campaign driver's watch_nodes accepts exactly that pid's death) and writes
-# <out-dir>/kill-norestart.json, which summarize.py reads.
+# <out-dir>/kill-norestart.json (with <out-dir>/run-id.json's run_id), which
+# summarize.py reads.
 #
 # Why: with the flush worker attached, block N's state batch + applied-height
 # marker are written by W while E already runs N+1. The applied-height marker is
@@ -337,10 +338,17 @@ if [ "$NORESTART" = 1 ]; then
     T_DEAD=$(date +%s.%N)
     crash_replace_pid_line "$PIDSF" "$IDX" "" || {
         echo "crash-kill: FATAL could not blank val$IDX's line in $PIDSF (stop-3val.sh would kill -9 a reused pid)" >&2; exit 1; }
-    python3 - "$OUT/$REC" <<PY || exit 1
+    # run_id: run-cell.sh's run-id.json for this cell (None without one);
+    # summarize.py applies the exclusion only when it matches the current run.
+    python3 - "$OUT/$REC" "$OUT/run-id.json" <<PY || exit 1
 import json, sys
+try:
+    with open(sys.argv[2]) as f:
+        run_id = json.load(f).get("run_id")
+except (OSError, ValueError, AttributeError):
+    run_id = None
 json.dump({
- "enabled": True, "mode": "no_restart",
+ "enabled": True, "mode": "no_restart", "run_id": run_id,
  "kill_node": "val$IDX", "kill_idx": $IDX, "kill_at_s": $KILL_AT_S,
  "killed_pid": $PID, "kill_ts": float("$T_KILL"), "dead_ts": float("$T_DEAD"),
  "pre_kill": {"block_height": $PRE_H, "blocks_committed": $PRE_C,

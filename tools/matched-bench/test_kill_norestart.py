@@ -285,6 +285,15 @@ class NorestartCliTest(unittest.TestCase):
         self.assertEqual(rec["pre_kill"]["blocks_committed"], 1236)
         self.assertLessEqual(rec["kill_ts"], rec["dead_ts"])
         self.assertFalse(os.path.exists(os.path.join(self.out, "crash-kill.json")))
+        self.assertIsNone(rec["run_id"])  # no run-id.json in this out dir
+
+    def test_the_record_carries_this_runs_run_id(self):
+        with open(os.path.join(self.out, "run-id.json"), "w") as f:
+            json.dump({"label": "c", "run_id": "c/1700000000.1-77-5", "kill_no_restart": "val2"}, f)
+        r = self.run_norestart()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(os.path.join(self.out, "kill-norestart.json")) as f:
+            self.assertEqual(json.load(f)["run_id"], "c/1700000000.1-77-5")
 
     def test_the_guard_still_refuses_val0(self):
         r = self.run_norestart(idx="0")
@@ -454,12 +463,64 @@ def socket_closed_port():
 
 # ------------------------------------------------------------------ summarize.py
 KILL_AT = 60
+RUN_ID = "t/1700000000.000000000-4242-17"
 
 
-def write_kill_cell(d, killed=True, agree_rows=("val0", "val1"), digests=None):
+def write_run_identity(d, run_id=RUN_ID, knob="val2"):
+    """run-cell.sh reset_run_artifacts' run-id.json (this run's identity)"""
+    with open(os.path.join(d, "run-id.json"), "w") as f:
+        json.dump({"label": "t", "run_id": run_id, "kill_no_restart": knob}, f)
+
+
+def write_kill_record(d, run_id=RUN_ID, kill_node="val2", kill_ts=None):
+    """crash-kill.sh norestart's kill-norestart.json"""
+    with open(os.path.join(d, "kill-norestart.json"), "w") as f:
+        json.dump(
+            {
+                "enabled": True,
+                "mode": "no_restart",
+                "run_id": run_id,
+                "kill_node": kill_node,
+                "kill_idx": int(kill_node[-1]),
+                "kill_at_s": KILL_AT,
+                "killed_pid": 1003,
+                "kill_ts": BENCH_START + KILL_AT + 0.5 if kill_ts is None else kill_ts,
+                "dead_ts": BENCH_START + KILL_AT + 0.6,
+                "pre_kill": {
+                    "block_height": 600,
+                    "blocks_committed": 602,
+                    "exec_queue_depth": 2,
+                    "flush_worker_depth": 0,
+                    "matched": 60000,
+                    "log_bytes": 4096,
+                },
+            },
+            f,
+        )
+
+
+def rewrite_sampler(d, col, fn, nodes=("val0", "val1")):
+    """sampler.csv column `col` := fn(seconds into the bench) on `nodes`"""
+    path = Path(d) / "sampler.csv"
+    with path.open() as f:
+        reader = csv.DictReader(f)
+        fields = reader.fieldnames
+        data = list(reader)
+    for row in data:
+        if row["node"] in nodes:
+            row[col] = str(fn(int(float(row["ts"])) - BENCH_START))
+    with path.open("w") as f:
+        w = csv.DictWriter(f, fields)
+        w.writeheader()
+        w.writerows(data)
+
+
+def write_kill_cell(d, killed=True, agree_rows=("val0", "val1"), digests=None, kill_ts=None):
     """a 120 s cell: every node commits 10 blocks/s; the survivors' timeout counter is flat before the kill and
-    climbs 0.5/s after it; val2 (killed) scrapes fail from KILL_AT on (all-zero rows, scrape_valid=0)"""
+    climbs 0.5/s after it; val2 (killed) scrapes fail from KILL_AT on (all-zero rows, scrape_valid=0).
+    run-id.json names this run (KILL_NO_RESTART=val2 when killed, unset otherwise); the record carries its run_id."""
     write_cell(d, 1000, 1000, dur=120)
+    write_run_identity(d, knob="val2" if killed else None)
     path = Path(d) / "sampler.csv"
     with path.open() as f:
         reader = csv.DictReader(f)
@@ -508,28 +569,7 @@ def write_kill_cell(d, killed=True, agree_rows=("val0", "val1"), digests=None):
                 + "\n"
             )
     if killed:
-        with open(os.path.join(d, "kill-norestart.json"), "w") as f:
-            json.dump(
-                {
-                    "enabled": True,
-                    "mode": "no_restart",
-                    "kill_node": "val2",
-                    "kill_idx": 2,
-                    "kill_at_s": KILL_AT,
-                    "killed_pid": 1003,
-                    "kill_ts": BENCH_START + KILL_AT + 0.5,
-                    "dead_ts": BENCH_START + KILL_AT + 0.6,
-                    "pre_kill": {
-                        "block_height": 600,
-                        "blocks_committed": 602,
-                        "exec_queue_depth": 2,
-                        "flush_worker_depth": 0,
-                        "matched": 60000,
-                        "log_bytes": 4096,
-                    },
-                },
-                f,
-            )
+        write_kill_record(d, kill_ts=kill_ts)
 
 
 CLEAN_DISSEM = [
@@ -625,6 +665,141 @@ class SummarizeKillTest(unittest.TestCase):
         self.assertNotIn("killed_node", s["headline"])
         self.assertEqual(sorted(s["liveness"]["nodes"]), ["val0", "val1", "val2"])
         self.assertNotIn("KILL-NO-RESTART", out)
+        self.assertNotIn("kill_record_check", s)
+
+    # ---- Codex P2a: a kill record applies only to the run that wrote it
+    def assert_not_excluded(self, s):
+        self.assertNotIn("kill_no_restart", s)
+        self.assertNotIn("excluded_nodes", s["agreement"])
+        self.assertNotIn("excluded_nodes", s["liveness"])
+        self.assertNotIn("killed_node", s["headline"])
+
+    def test_stale_record_in_an_all_up_rerun_is_ignored_never_excludes(self):
+        """the probe: OVERWRITE=1 all-up rerun over a dir that kept an old kill record (fresh=REJECT stale=ACCEPT
+        excluded=['val2']). The live val2's divergent digest must still be scored: DISAGREE -> REJECT."""
+        write_kill_cell(
+            self.d,
+            killed=False,
+            agree_rows=("val0", "val1", "val2"),
+            digests={"val0": "same", "val1": "same", "val2": "divergent"},
+        )
+        write_kill_record(self.d, run_id="t/an-earlier-run")
+        s, out = self.summ("1200 1201 1202")
+        self.assertNotEqual(s["validity"]["verdict"], "ACCEPT")
+        self.assertEqual(s["validity"]["verdict"], "REJECT")
+        self.assertEqual(s["agreement"]["agreement_verdict"], "DISAGREE")
+        self.assert_not_excluded(s)
+        c = s["kill_record_check"]
+        self.assertEqual(c["action"], "ignored")
+        self.assertEqual((c["record_run_id"], c["run_id"]), ("t/an-earlier-run", RUN_ID))
+        self.assertIn("did not set KILL_NO_RESTART", c["reason"])
+        self.assertNotIn("KILL-NO-RESTART", out)
+
+    def test_stale_record_in_an_all_up_rerun_with_agreeing_nodes_still_judges_all_three(self):
+        write_kill_cell(self.d, killed=False, agree_rows=("val0", "val1", "val2"))
+        write_kill_record(self.d, run_id="t/an-earlier-run")
+        s, _ = self.summ("1200 1201 1202")
+        self.assertEqual(s["validity"]["verdict"], "ACCEPT", s["validity"])
+        self.assertEqual(sorted(s["liveness"]["nodes"]), ["val0", "val1", "val2"])
+        self.assert_not_excluded(s)
+        self.assertEqual(s["kill_record_check"]["action"], "ignored")
+
+    def test_record_from_another_run_rejects_without_excluding(self):
+        write_kill_cell(self.d)
+        write_kill_record(self.d, run_id="t/an-earlier-run")
+        s, _ = self.summ()
+        self.assertEqual(s["validity"]["verdict"], "REJECT")
+        self.assertTrue(
+            any("stale kill record" in r for r in s["validity"]["fail_reasons"]),
+            s["validity"],
+        )
+        self.assert_not_excluded(s)
+        self.assertEqual(s["kill_record_check"]["action"], "rejected")
+        self.assertEqual(s["status"], "INVALID")
+
+    def test_record_naming_another_node_than_the_knob_rejects(self):
+        write_kill_cell(self.d)
+        write_run_identity(self.d, knob="val1")
+        s, _ = self.summ()
+        self.assertEqual(s["validity"]["verdict"], "REJECT")
+        self.assertIn("stale kill record", s["kill_record_check"]["reason"])
+        self.assert_not_excluded(s)
+
+    def test_record_without_a_run_identity_rejects(self):
+        write_kill_cell(self.d)
+        os.remove(os.path.join(self.d, "run-id.json"))
+        s, _ = self.summ()
+        self.assertEqual(s["validity"]["verdict"], "REJECT")
+        self.assertEqual(s["kill_record_check"]["action"], "rejected")
+        self.assertIn("no run-id.json", s["kill_record_check"]["reason"])
+        self.assert_not_excluded(s)
+
+    # ---- Codex P2b: one shared boundary sample between 'before' and 'after'
+    def test_boundary_increment_between_the_last_pre_and_first_post_kill_scrape_counts_in_after(self):
+        """the probe: one timeout and the kill's order-age observations land between the scrape at kill-0.5 s and
+        the one at kill+0.5 s (timeouts_total=1.0 before/min=0.0 after/min=0.0; order_age before=None after=None)"""
+        write_kill_cell(self.d)
+        rewrite_sampler(
+            self.d, "torus_consensus_timeout_total_total", lambda s: 1 if s > KILL_AT else 0
+        )
+        metric = "torus_order_age_admit_seconds_bucket"
+        with open(os.path.join(self.d, "buckets.csv"), "w") as f:
+            f.write("ts,node,metric,le,count\n")
+            for s in range(121):
+                post = s > KILL_AT
+                for le, n in (("0.05", 4), ("0.1", 10), ("+Inf", 10)):
+                    f.write("%d,val0,%s,%s,%d\n" % (BENCH_START + s, metric, le, n if post else 0))
+        s, _ = self.summ()
+        self.assertEqual(s["validity"]["verdict"], "ACCEPT", s["validity"])
+        v0 = s["kill_no_restart"]["per_node"]["val0"]
+        self.assertEqual(v0["before"]["timeouts_per_min"], 0.0)
+        self.assertEqual(v0["after"]["timeouts_per_min"], 1.0)  # 1 timeout over the 60 s after window
+        self.assertEqual(v0["before"]["sampled"]["last_ts"], v0["after"]["sampled"]["first_ts"])
+        self.assertEqual(v0["after"]["sampled"]["first_ts"], BENCH_START + KILL_AT)
+        self.assertIsNone(v0["before"]["order_age_ms"]["admit"])  # nothing observed before the kill
+        admit = v0["after"]["order_age_ms"]["admit"]
+        self.assertEqual(admit["n"], 10)
+        self.assertIsNotNone(admit["p50"])
+        self.assertEqual(
+            v0["before"]["order_age_sampled"]["last_ts"], v0["after"]["order_age_sampled"]["first_ts"]
+        )
+        self.assertIn("shared", s["kill_no_restart"]["boundary"])
+
+    def test_windows_report_the_spans_they_actually_sampled(self):
+        write_kill_cell(self.d)
+        s, _ = self.summ()
+        k = s["kill_no_restart"]
+        v0 = k["per_node"]["val0"]
+        self.assertEqual(
+            v0["before"]["sampled"],
+            {"samples": 61, "first_ts": BENCH_START, "last_ts": BENCH_START + KILL_AT, "span_s": 60.0},
+        )
+        self.assertEqual(
+            v0["after"]["sampled"],
+            {"samples": 61, "first_ts": BENCH_START + KILL_AT, "last_ts": BENCH_START + 120, "span_s": 60.0},
+        )
+        self.assertEqual(v0["before"]["span_s"], 60.0)
+        # the dead node: before only, ending at its last valid scrape at or before the kill
+        v2 = k["per_node"]["val2"]
+        self.assertEqual(v2["before"]["sampled"]["last_ts"], BENCH_START + KILL_AT)
+        self.assertNotIn("after", v2)
+        # no buckets.csv in this cell: order age is None with a reason, not an empty or zero dict
+        self.assertIsNone(v0["after"]["order_age_ms"])
+        self.assertEqual(v0["after"]["order_age_sampled"]["samples"], 0)
+        self.assertIn("buckets.csv", v0["after"]["order_age_reason"])
+        self.assertEqual(k["windows"]["before"], [BENCH_START, BENCH_START + KILL_AT + 0.5])
+
+    def test_a_window_with_fewer_than_two_samples_is_none_with_a_reason_not_zero(self):
+        write_kill_cell(self.d, kill_ts=BENCH_START + 0.5)  # only the t0 scrape precedes the kill
+        s, _ = self.summ()
+        v0 = s["kill_no_restart"]["per_node"]["val0"]
+        b = v0["before"]
+        self.assertEqual(b["sampled"]["samples"], 1)
+        for key in ("blk_s", "committed_blk_s", "matched_s", "timeouts_per_min", "views_per_min"):
+            self.assertIsNone(b[key], key)
+        self.assertIn(">= 2", b["reason"])
+        self.assertEqual(v0["after"]["sampled"]["first_ts"], BENCH_START)  # the shared boundary
+        self.assertIsNotNone(v0["after"]["blk_s"])
 
 
 # ------------------------------------------------------------------ state_attest.py scan --exclude
@@ -883,6 +1058,68 @@ class RunCellKnobTest(unittest.TestCase):
             self.assertIn('"%s",' % k, rc)
         with open(DRIVER_BODY) as f:
             self.assertIn('grep -qF "kill-no-restart: SIGKILL val$i pid $p "', f.read())
+
+
+# ------------------------------------------------------------------ run-cell.sh run identity (Codex P2a)
+class RunIdentityTest(unittest.TestCase):
+    STALE = (
+        "kill-norestart.json",
+        "crash.json",
+        "crash-2.json",
+        "crash-kill.json",
+        "crash-kill-2.json",
+        "crash-kill.skipped",
+        "crash-restart-tail.log",
+        "crash-restart-tail-2.log",
+    )
+
+    def setUp(self):
+        self.fn = src_between(RUN_CELL_SH, "reset_run_artifacts() {", "\n}\n")
+        self.d = tempfile.mkdtemp(prefix="knr-runid-")
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+
+    def reset(self, label="cell-a", knr=""):
+        r = subprocess.run(
+            ["bash", "-c", "set -uo pipefail\n" + self.fn + '\nreset_run_artifacts "$1" "$2" "$3"',
+             "_", self.d, label, knr],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(self.d, "run-id.json")) as f:
+            return json.load(f)
+
+    def test_clears_every_kill_artifact_and_keeps_the_rest(self):
+        keep = ("sampler.csv", "run.log", "summary.json")
+        for n in self.STALE + keep:
+            with open(os.path.join(self.d, n), "w") as f:
+                f.write("{}")
+        ident = self.reset("cell-a", "val2")
+        for n in self.STALE:
+            self.assertFalse(os.path.exists(os.path.join(self.d, n)), n)
+        for n in keep:
+            self.assertTrue(os.path.exists(os.path.join(self.d, n)), n)
+        self.assertEqual(ident["label"], "cell-a")
+        self.assertEqual(ident["kill_no_restart"], "val2")
+        self.assertTrue(ident["run_id"].startswith("cell-a/"), ident)
+
+    def test_every_run_gets_a_new_run_id_and_an_off_knob_is_null(self):
+        a = self.reset()
+        b = self.reset()
+        self.assertNotEqual(a["run_id"], b["run_id"])
+        self.assertIsNone(a["kill_no_restart"])
+
+    def test_wiring(self):
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        i_out = src.index('mkdir -p "$OUT"\n: > "$OUT/run.log"\n')
+        i_reset = src.index('reset_run_artifacts "$OUT" "$LABEL" "$KILL_NO_RESTART"')
+        i_kill = src.index('"$TOOLS_DIR/crash-kill.sh" norestart')
+        self.assertLess(i_out, i_reset)
+        self.assertLess(i_reset, i_kill)
+        with open(CRASH_KILL_SH) as f:
+            self.assertIn('"$OUT/$REC" "$OUT/run-id.json"', f.read())
 
 
 # ------------------------------------------------------------------ VALIDATOR_STAKES: genesis + cache key

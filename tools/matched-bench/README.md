@@ -651,6 +651,16 @@ VALIDATOR_STAKES=2,2,1 BENCH_RPCS=0,1 KILL_NO_RESTART=val2 KILL_NO_RESTART_AT_S=
   survivors and judges liveness over them; the killed node is listed in
   `agreement.excluded_nodes` / `liveness.excluded_nodes`, never as a
   disagreement, so it cannot REJECT the cell by itself.
+- **The record belongs to one run.** run-cell.sh removes every per-run kill
+  artifact (`kill-norestart.json`, `crash*.json`, `crash-restart-tail*.log`)
+  at cell start, also under `OVERWRITE=1`, and writes `run-id.json`
+  (`label`, `run_id`, `kill_no_restart`); crash-kill.sh copies `run_id` into
+  the record. summarize.py applies the exclusion only when the record's
+  `run_id` and `kill_node` match `run-id.json`. A record in a run that did not
+  set `KILL_NO_RESTART` is ignored (all three validators judged); one it
+  cannot match (no `run-id.json`, another run, another node) is not applied
+  and REJECTs the cell (`stale kill record`). Either way summary.json carries
+  `kill_record_check`.
 - **`STATE_HASH_ATTEST=1` + kill** works only because the stakes leave a
   quorum: the attestation quorum is stake-weighted `> 2/3` (staking.rs), so
   with 2/2/1 and val2 down val0+val1 (4/5) still certify every checkpoint.
@@ -662,7 +672,13 @@ VALIDATOR_STAKES=2,2,1 BENCH_RPCS=0,1 KILL_NO_RESTART=val2 KILL_NO_RESTART_AT_S=
   window split at the kill (`windows.before` = `[t_bench0, kill_ts]`,
   `windows.after` = `[kill_ts, t_bench1]`; the dead node: before only):
   `blk_s`, `committed_blk_s`, `matched_s`, `timeouts_per_min`,
-  `views_per_min`, `order_age_ms` (p50/p90/p99 per stage). `headline` gains
+  `views_per_min`, `order_age_ms` (p50/p90/p99 per stage). One shared
+  boundary per node: the last sample at or before `kill_ts` ends `before` and
+  starts `after` (sampler.csv and buckets.csv each), so the increment between
+  the last pre-kill and the first post-kill scrape counts in `after`. Each
+  window reports what it actually sampled (`sampled` / `order_age_sampled`:
+  `samples`, `first_ts`, `last_ts`, `span_s`); with < 2 samples its values
+  are None with a `reason` / `order_age_reason`, never 0. `headline` gains
   `killed_node`, `kill_at_s`, `height_at_kill`. Timeout views per minute over
   time: `sampler.csv`, column `torus_consensus_timeout_total_total` (1 Hz, per
   node); `torus_consensus_view` beside it.
