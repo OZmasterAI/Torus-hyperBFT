@@ -1159,7 +1159,7 @@ fn settle_streamed_identical_engine_mode() {
 /// Forced sequential: the flag does nothing (no stream, same output).
 #[test]
 fn settle_streamed_forced_sequential_is_untouched() {
-    let blocks = stream(0x8C21_5E0, 8, 3, 300);
+    let blocks = stream(0x08C2_15E0, 8, 3, 300);
     let r = Run {
         mode: Mode::Forced {
             parallel: false,
@@ -1175,19 +1175,16 @@ fn settle_streamed_forced_sequential_is_untouched() {
     }
 }
 
-/// The case the purity stop existed for (before main's pre-testnet fix
-/// refused aliased rows on load; now both modes fail-stop the block): trader 5's stored row under key
-/// (5, 1) names market 2 and the one under (5, 2) names market 3
+/// The case the purity stop was written for: trader 5's stored row under
+/// key (5, 1) names market 2 and the one under (5, 2) names market 3
 /// ([`ALIASES`]). In the last block trader 5 trades in markets 1 AND 2, and
-/// market 3's plan panics. Flag off reruns the call sequentially from
-/// scratch, where market 2 reads the (5, 2) row market 1 just wrote. Had the
-/// streamed pass B applied market 1's plan (which holds market 2's key) and
-/// market 2's plan (computed from the stored row) before resuming at market
-/// 3, the result would differ; the stream must stop before market 1's
-/// impure plan, so nothing is applied before the fallback.
+/// market 3's plan panics. Before main's pre-testnet fix (b57b3fd4) market
+/// 1's plan held market 2's key and the stream had to stop before it. Since
+/// that fix such a row is refused on load (corrupt state), so the call's
+/// fallback fail-stops the block; flag on must stop it exactly as flag off.
 #[test]
 fn settle_streamed_impure_prefix_plan_stops_the_stream() {
-    let ladder = stream(0x1A0A_5ED, 4, 1, 0).remove(0)[0].clone();
+    let ladder = stream(0x01A0_A5ED, 4, 1, 0).remove(0)[0].clone();
     let t5 = addr(5);
     let other = addr(9);
     let mut last = Vec::new();
@@ -1216,10 +1213,11 @@ fn settle_streamed_impure_prefix_plan_stops_the_stream() {
             let what = format!("impure prefix, plan panic {market}");
             let pick = |_: &RunOut, _: &RunStats| LastBlockFault::PlanPanic(market);
             // Since main's pre-testnet fix (b57b3fd4) the aliased rows are
-            // refused on load: the plan panic still sends the call to the
-            // sequential fallback, which then refuses trader 5's row and
-            // fail-stops the block. Flag on and off stop alike, and the
-            // stream applies no prefix before it.
+            // refused on load, so no plan can hold a foreign market's key
+            // (the case the purity stop guarded): the stream may apply a
+            // prefix, the plan panic sends the rest of the call to the
+            // sequential fallback, and that refuses trader 5's row. Flag on
+            // and off stop the block alike (equal writes and results above).
             for (no_merge, off, ons) in
                 assert_streamed_equivalent(&blocks, r, &[0, 0x1A], &pick, &what)
             {
@@ -1228,11 +1226,7 @@ fn settle_streamed_impure_prefix_plan_stops_the_stream() {
                     "{what}: the aliased row stops the block ({off:?})"
                 );
                 for on in ons {
-                    assert!(on.fatal.is_some(), "{what}, L2.2 {no_merge}: {on:?}");
-                    assert_eq!(
-                        on.hybrid, 0,
-                        "{what}, L2.2 {no_merge}: nothing streamed before the stop ({on:?})"
-                    );
+                    assert_eq!(on.fatal, off.fatal, "{what}, L2.2 {no_merge}");
                 }
             }
         }

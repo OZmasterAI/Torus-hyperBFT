@@ -111,7 +111,7 @@ fn storm(per_market: usize) -> Vec<(Address, NativeAction)> {
     let mut t = 3u32;
     for k in 0..per_market {
         for m in 1..=MARKETS {
-            let buy = (k + m as usize) % 2 == 0;
+            let buy = (k + m as usize).is_multiple_of(2);
             let price = if buy { 1_001 + LEVELS } else { 999 - LEVELS };
             out.push(place(addr(t % TRADERS), m, buy, price, 3, TimeInForce::IOC));
             t += 13;
