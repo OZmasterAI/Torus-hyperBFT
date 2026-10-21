@@ -962,6 +962,14 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    full-save spike (`exec_save_books_seconds` at %100 heights), hash cost per block (flush `state_hash_seconds` and
    entries), RSS; and confirm every node's h_n agrees (no hash mismatch / fail-stop lines). Pass: B within noise of A;
    B clearly beats C on the deep book.
+9h. **L2.1 microbench on a quiet host (one-off, owner s131)** (next free gap; ~30 min; NOT a node bench: an in-process
+   `cargo test --release` microbench). 18c's numbers are too noisy (load ~100). Binaries/branches: `perf/l21-streamed-settle`
+   at `0323b755` (before wake-up batching) and `39f8c7f3` (batched wake-ups, merged with main be1c378d), built in a separate
+   target dir (not the bench target dirs). Run `cargo test --release -p torus-bridge --test ubench_settle_streamed -- --ignored
+   --nocapture` (check the file header for the exact invocation/env) with L2.2 on, 300 markets, 17k and 65k fills per call,
+   flag `TORUS_SETTLE_STREAMED` on vs off, interleaved, >= 12 reps per cell; also at 65k with `TORUS_MATCH_WORKERS=17`.
+   Report per cell: exec wall per call (median), exec-thread CPU per call, pass B ms, parks per call (39f8c7f3 only), on/off
+   ratios with spread. Question: on a quiet host, how large is L2.1's exec-thread CPU cost, and does batching change it?
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
