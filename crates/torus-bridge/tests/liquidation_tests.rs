@@ -1681,6 +1681,29 @@ fn p2_rows_of_a_delisted_market_close_at_the_stored_price() {
     invariants(&c, 900, before);
 }
 
+/// Codex P2 (s131): a governance-delisted market keeps its
+/// `CF_NATIVE_MARKETS` row (still in `listed_market_ids`) but is delisted
+/// too: with no usable mark its rows rank and close at the stored price
+/// instead of waiting for an oracle that may never return.
+#[test]
+fn p2_rows_of_a_governance_delisted_market_close_at_the_stored_price() {
+    let (_d, db) = p2_fixture();
+    let before = total_value(&ctx_at(db.clone(), 1), &p2_marks(900));
+    step(&db, 1, 1_000, 0);
+    drop(step(&db, 2, 900, 0));
+    db.put_cf_raw(CF_NATIVE_MARKETS, &torus_types::market_delisted_key(2), &[]).unwrap();
+    // Block 70: market 2's last aggregate (block 2) is 68 s old: no mark.
+    let ev = Captured::default();
+    let c = ev.with(|| step_marks(&db, 70, &[(1, 900), (3, 900), (4, 900)], ADL_WORK_PER_BLOCK));
+    assert!(c.fatal_error.is_none(), "{:?}", c.fatal_error);
+    assert!(c.delisted_markets.contains(&2));
+    assert!(obligations(&c).is_empty(), "market 2's rows do not wait");
+    assert!(c.positions.positions_for_trader(&ADL_ESCROW_LONG).unwrap().is_empty(), "the escrow is flat");
+    let m2: Vec<String> = ev.events("liquidation: ADL close").iter().filter(|e| e["market"] == "2").map(|e| e["price"].clone()).collect();
+    assert_eq!(m2, vec![fp(1_000).to_string(); 2], "market 2 closed at the stored prices");
+    invariants(&c, 900, before);
+}
+
 /// M2 for the vault after the drain: the vault is market 1's only short
 /// holder (short 5 @ 900, cash 10, long 1 in market 2 at its entry). A
 /// long-escrow row of 5 at stored price 1,000 closes against it: the vault
