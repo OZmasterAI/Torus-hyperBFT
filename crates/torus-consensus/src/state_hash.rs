@@ -18,8 +18,7 @@ use torus_mempool::Mempool;
 use torus_state::running_hash::{
     checkpoint_heights, read_activation_height, read_applied_height, read_checkpoint,
     read_configured_activation, read_divergence, read_running_hash, read_unverified_since,
-    record_divergence,
-    STATE_HASH_CHECKPOINT_INTERVAL, STATE_HASH_CHECKPOINT_RETAIN,
+    record_divergence, STATE_HASH_CHECKPOINT_INTERVAL, STATE_HASH_CHECKPOINT_RETAIN,
 };
 use torus_state::StateDb;
 use torus_types::{Address, NativeAction, TorusBlock, B256};
@@ -36,7 +35,10 @@ pub fn failstop_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         let on = parse_failstop(std::env::var("TORUS_STATE_HASH_FAILSTOP").ok());
-        tracing::info!(on, "running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP)");
+        tracing::info!(
+            on,
+            "running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP)"
+        );
         on
     })
 }
@@ -83,7 +85,10 @@ pub enum ChainHealth {
 impl ChainHealth {
     /// No valid local chain: never attest, never fail-stop on a mismatch.
     pub fn is_unverified(self) -> bool {
-        matches!(self, ChainHealth::Unverified { .. } | ChainHealth::RowsMissing { .. })
+        matches!(
+            self,
+            ChainHealth::Unverified { .. } | ChainHealth::RowsMissing { .. }
+        )
     }
 }
 
@@ -110,7 +115,10 @@ pub fn chain_health(state_db: &StateDb) -> ChainHealth {
         Some((hashed, _)) if hashed == applied && read_activation_height(state_db).is_some() => {
             ChainHealth::Verified
         }
-        stored => ChainHealth::RowsMissing { applied, hashed: stored.map(|(h, _)| h) },
+        stored => ChainHealth::RowsMissing {
+            applied,
+            hashed: stored.map(|(h, _)| h),
+        },
     }
 }
 
@@ -247,8 +255,10 @@ impl StateHashMonitor {
         metrics: Option<&torus_telemetry::Metrics>,
     ) -> ChainHealth {
         let health = chain_health(state_db);
-        self.rows_missing_at_boot
-            .store(matches!(health, ChainHealth::RowsMissing { .. }), Ordering::SeqCst);
+        self.rows_missing_at_boot.store(
+            matches!(health, ChainHealth::RowsMissing { .. }),
+            Ordering::SeqCst,
+        );
         if let Some(m) = metrics {
             m.state_hash_unverified.set(health.is_unverified() as i64);
         }
@@ -313,15 +323,27 @@ impl StateHashMonitor {
         {
             let mut inner = self.inner.lock().unwrap();
             if !attested.is_empty() {
-                inner.to_check.entry(block.header.height).or_default().extend(attested);
+                inner
+                    .to_check
+                    .entry(block.header.height)
+                    .or_default()
+                    .extend(attested);
             }
             let ready: Vec<u64> = inner.to_check.range(..=durable).map(|(h, _)| *h).collect();
             for carried in ready {
                 for checkpoint in inner.to_check.remove(&carried).unwrap_or_default() {
-                    self.check(&mut inner, checkpoint, state_db, metrics, exec_failed, !unverified);
+                    self.check(
+                        &mut inner,
+                        checkpoint,
+                        state_db,
+                        metrics,
+                        exec_failed,
+                        !unverified,
+                    );
                 }
             }
-            let floor = durable.saturating_sub(STATE_HASH_CHECKPOINT_INTERVAL * STATE_HASH_CHECKPOINT_RETAIN);
+            let floor = durable
+                .saturating_sub(STATE_HASH_CHECKPOINT_INTERVAL * STATE_HASH_CHECKPOINT_RETAIN);
             inner.reported.retain(|(h, _)| *h > floor);
             inner.no_quorum.retain(|h| *h > floor);
             if unverified && unverified_log_due(inner.unverified_logged, Instant::now()) {
@@ -354,7 +376,10 @@ impl StateHashMonitor {
         allow_failstop: bool,
     ) {
         let Some(local) = read_checkpoint(state_db, checkpoint) else {
-            tracing::debug!(checkpoint, "state hash attestation for a checkpoint this node does not hold");
+            tracing::debug!(
+                checkpoint,
+                "state hash attestation for a checkpoint this node does not hold"
+            );
             return;
         };
         let local_b = B256::from(local);
@@ -413,7 +438,11 @@ impl StateHashMonitor {
             Ok(None) => {
                 let active = staking
                     .all_validators()
-                    .map(|vs| vs.iter().filter(|v| v.status == ValidatorStatus::Active).count())
+                    .map(|vs| {
+                        vs.iter()
+                            .filter(|v| v.status == ValidatorStatus::Active)
+                            .count()
+                    })
                     .unwrap_or(usize::MAX);
                 if votes.len() >= active && inner.no_quorum.insert(checkpoint) {
                     if let Some(m) = metrics {
@@ -533,14 +562,21 @@ mod tests {
         let t = Instant::now();
         assert!(unverified_log_due(None, t), "the first one is due");
         assert!(!unverified_log_due(Some(t), t));
-        assert!(!unverified_log_due(Some(t), t + UNVERIFIED_LOG_INTERVAL - Duration::from_millis(1)));
+        assert!(!unverified_log_due(
+            Some(t),
+            t + UNVERIFIED_LOG_INTERVAL - Duration::from_millis(1)
+        ));
         assert!(unverified_log_due(Some(t), t + UNVERIFIED_LOG_INTERVAL));
     }
 
     #[test]
     fn rows_missing_and_marked_are_unverified() {
         assert!(ChainHealth::Unverified { since: 5 }.is_unverified());
-        assert!(ChainHealth::RowsMissing { applied: 5, hashed: None }.is_unverified());
+        assert!(ChainHealth::RowsMissing {
+            applied: 5,
+            hashed: None
+        }
+        .is_unverified());
         assert!(!ChainHealth::Verified.is_unverified());
         assert!(!ChainHealth::Off.is_unverified());
     }

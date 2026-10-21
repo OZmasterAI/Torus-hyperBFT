@@ -97,7 +97,11 @@ mod tests {
         SignedNativeAction {
             action: NativeAction::ClaimRewards,
             nonce,
-            signature: ActionSignature::Eip712(Signature { v: 27, r: [0u8; 32], s: [0u8; 32] }),
+            signature: ActionSignature::Eip712(Signature {
+                v: 27,
+                r: [0u8; 32],
+                s: [0u8; 32],
+            }),
         }
     }
 
@@ -105,7 +109,9 @@ mod tests {
     fn shards_for(act: &SignedNativeAction, k: usize, n: usize) -> ([u8; 32], Vec<StoredShard>) {
         let body = bincode::serialize(act).expect("serialize");
         let enc = encode(&body, ErasureParams::new(k, n)).expect("encode");
-        let shards = (0..n).map(|i| StoredShard::from_encoded_body(&enc, i)).collect();
+        let shards = (0..n)
+            .map(|i| StoredShard::from_encoded_body(&enc, i))
+            .collect();
         (compute_action_hash(act).0, shards)
     }
 
@@ -117,11 +123,21 @@ mod tests {
         let (body_hash, shards) = shards_for(&act, 2, 3);
         // Two distinct peers, distinct data/parity indices (0 from A, 2 from B).
         let gathered = vec![
-            GatheredShard { source: "peerA", shard: shards[0].clone() },
-            GatheredShard { source: "peerB", shard: shards[2].clone() },
+            GatheredShard {
+                source: "peerA",
+                shard: shards[0].clone(),
+            },
+            GatheredShard {
+                source: "peerB",
+                shard: shards[2].clone(),
+            },
         ];
         let body = try_reconstruct_from_shards(&body_hash, &gathered).expect("reconstructs");
-        assert_eq!(body, bincode::serialize(&act).unwrap(), "rebuilt body == original");
+        assert_eq!(
+            body,
+            bincode::serialize(&act).unwrap(),
+            "rebuilt body == original"
+        );
     }
 
     /// T8: a corrupted shard fails its proof and is discarded BEFORE reconstruct;
@@ -131,10 +147,16 @@ mod tests {
         let act = action(2);
         let (body_hash, mut shards) = shards_for(&act, 2, 3);
         shards[0].shard_bytes[0] ^= 0xFF; // corrupt shard 0 → proof now fails
-        // Only the corrupt shard + one honest shard from ONE other peer.
+                                          // Only the corrupt shard + one honest shard from ONE other peer.
         let gathered = vec![
-            GatheredShard { source: "peerA", shard: shards[0].clone() }, // rejected by verify
-            GatheredShard { source: "peerB", shard: shards[1].clone() },
+            GatheredShard {
+                source: "peerA",
+                shard: shards[0].clone(),
+            }, // rejected by verify
+            GatheredShard {
+                source: "peerB",
+                shard: shards[1].clone(),
+            },
         ];
         // Only 1 verified shard survives (< k) → None (fall back), never a wrong body.
         assert!(try_reconstruct_from_shards(&body_hash, &gathered).is_none());
@@ -150,8 +172,14 @@ mod tests {
         // Attacker builds a perfectly valid erasure set for a DIFFERENT action…
         let (_forged_hash, forged_shards) = shards_for(&action(999), 2, 3);
         let gathered = vec![
-            GatheredShard { source: "peerA", shard: forged_shards[0].clone() },
-            GatheredShard { source: "peerB", shard: forged_shards[1].clone() },
+            GatheredShard {
+                source: "peerA",
+                shard: forged_shards[0].clone(),
+            },
+            GatheredShard {
+                source: "peerB",
+                shard: forged_shards[1].clone(),
+            },
         ];
         // …but claims it is `real_hash`. Shards verify vs their forged root, yet the
         // rebuilt body hashes to action(999) != real_hash → backstop rejects.
@@ -166,8 +194,14 @@ mod tests {
         let (body_hash, shards) = shards_for(&act, 2, 3);
         // Both shards (distinct indices) from the SAME peer.
         let gathered = vec![
-            GatheredShard { source: "peerA", shard: shards[0].clone() },
-            GatheredShard { source: "peerA", shard: shards[1].clone() },
+            GatheredShard {
+                source: "peerA",
+                shard: shards[0].clone(),
+            },
+            GatheredShard {
+                source: "peerA",
+                shard: shards[1].clone(),
+            },
         ];
         assert!(
             try_reconstruct_from_shards(&body_hash, &gathered).is_none(),
@@ -175,8 +209,14 @@ mod tests {
         );
         // Sanity: the SAME two shards from TWO peers DO reconstruct.
         let spread = vec![
-            GatheredShard { source: "peerA", shard: shards[0].clone() },
-            GatheredShard { source: "peerB", shard: shards[1].clone() },
+            GatheredShard {
+                source: "peerA",
+                shard: shards[0].clone(),
+            },
+            GatheredShard {
+                source: "peerB",
+                shard: shards[1].clone(),
+            },
         ];
         assert!(try_reconstruct_from_shards(&body_hash, &spread).is_some());
     }

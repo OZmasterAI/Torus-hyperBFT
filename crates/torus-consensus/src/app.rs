@@ -1966,7 +1966,9 @@ fn cached_matches_compact(cached: &PendingProposal, compact: &CompactBlock) -> b
                     .block
                     .native_actions
                     .iter()
-                    .map(|action| torus_types::compute_action_hash_with_scratch(action, &mut scratch))
+                    .map(|action| {
+                        torus_types::compute_action_hash_with_scratch(action, &mut scratch)
+                    })
                     .eq(compact.native_action_hashes.iter().copied())
             }
         }
@@ -2214,7 +2216,10 @@ fn persist_committed_block_durably_timed(
     // Header first in the batch (find_last_committed_height scans CF_BLOCK_HEADERS):
     // header and body land atomically, so a crash between this write and
     // execution still exposes the committed height AND its body for the replay.
-    match (state_db.cf_handle(CF_BLOCK_HEADERS), header_record_bytes(block)) {
+    match (
+        state_db.cf_handle(CF_BLOCK_HEADERS),
+        header_record_bytes(block),
+    ) {
         (Ok(cf), Some(header_bytes)) => {
             batch.put_cf(cf, height_key, &header_bytes);
             header = true;
@@ -3524,7 +3529,10 @@ impl ExecutionContext {
             let (expired, skipped) = rocksdb_deletes_skipped(|| {
                 torus_state::nonce_window::expired_nonce_keys(overlay, parent_ms, block_ms)
             });
-            self.test_nonce_tombstones.lock().unwrap().push((height, skipped));
+            self.test_nonce_tombstones
+                .lock()
+                .unwrap()
+                .push((height, skipped));
             expired?
         };
         #[cfg(test)]
@@ -4714,7 +4722,10 @@ impl ExecutionContext {
             }
         }
         if !pipelined && !self.pipeline_barrier() {
-            tracing::error!(height, "FATAL: flush worker failed before barrier — fail-stop");
+            tracing::error!(
+                height,
+                "FATAL: flush worker failed before barrier — fail-stop"
+            );
             return;
         }
 
@@ -4946,7 +4957,9 @@ impl ExecutionContext {
             #[cfg(test)]
             let validated = match self.test_replay_fault {
                 Some(ReplayFault::EvmLocalFault) => Err(torus_bridge::BridgeError::Evm(
-                    torus_evm::EvmError::LocalFault("getPosition oracle read: injected (test)".into()),
+                    torus_evm::EvmError::LocalFault(
+                        "getPosition oracle read: injected (test)".into(),
+                    ),
                 )),
                 Some(ReplayFault::EvmSectionError) => Err(torus_bridge::BridgeError::Evm(
                     torus_evm::EvmError::Internal("injected EVM section error (test)".into()),
@@ -5209,7 +5222,10 @@ impl ExecutionContext {
         // (EVM success) still writes the same bytes in its own batch, with the
         // receipts; the header in the marker batch does not depend on that
         // write (a failed one fail-stops the block above, for its receipts).
-        debug_assert!(!(pipelined && fold_header), "a pipelined block's header is dispatch-durable");
+        debug_assert!(
+            !(pipelined && fold_header),
+            "a pipelined block's header is dispatch-durable"
+        );
         if let Some(ref m) = self.metrics {
             m.exec_evm_seconds
                 .observe(evm_timer.elapsed().as_secs_f64());
@@ -5292,7 +5308,8 @@ impl ExecutionContext {
         // P0.0 phase 5 (test builds only): the test feature's rule runs in the
         // native phase, so a block carrying its bit runs that phase.
         #[cfg(test)]
-        let test_rule = torus_block.header.features & torus_types::Feature::TestStateRule.bit() != 0;
+        let test_rule =
+            torus_block.header.features & torus_types::Feature::TestStateRule.bit() != 0;
         #[cfg(not(test))]
         let test_rule = false;
         let run_native = if has_native
@@ -5544,7 +5561,12 @@ impl ExecutionContext {
             // the marker land without the header (no post-flush fallback).
             if let Some(bytes) = &header_record {
                 if let Err(e) = overlay.put_cf_raw(CF_BLOCK_HEADERS, &height.to_be_bytes(), bytes) {
-                    self.fail_stop_on_fault(torus_block, fold_header, "header fold into the flush batch", &e);
+                    self.fail_stop_on_fault(
+                        torus_block,
+                        fold_header,
+                        "header fold into the flush batch",
+                        &e,
+                    );
                     return;
                 }
             }
@@ -5911,8 +5933,7 @@ impl ExecutionContext {
             let accum = ctx.phase_accum;
             let secs = torus_bridge::native_executor::ExecPhaseAccum::secs;
             let tail_secs = secs(tail_ns);
-            let untimed_secs =
-                (engine_secs - secs(accum.timed_total_ns()) - tail_secs).max(0.0);
+            let untimed_secs = (engine_secs - secs(accum.timed_total_ns()) - tail_secs).max(0.0);
             tracing::debug!(
                 height,
                 engine_ms = engine_secs * 1e3,
@@ -6068,12 +6089,14 @@ impl ExecutionContext {
                 // accumulators; both 0 in book modes 0/1, which have no
                 // two-pass save.
                 let split = ctx.save_split;
-                m.exec_save_books_drain_seconds.observe(secs(split.drain_ns));
+                m.exec_save_books_drain_seconds
+                    .observe(secs(split.drain_ns));
                 // Deferred blocks: the write half runs on W, which observes
                 // `exec_save_books_write_seconds` when it applies the sidecar —
                 // still ONE observation per native block.
                 if deferred_books.is_none() {
-                    m.exec_save_books_write_seconds.observe(secs(split.write_ns));
+                    m.exec_save_books_write_seconds
+                        .observe(secs(split.write_ns));
                 }
                 // L3: publish the level-hash sponge cache effectiveness, summed
                 // across all books, right after the save that populates it. None
@@ -6243,146 +6266,151 @@ impl ExecutionContext {
                 }
                 resident_ok = true;
             } else {
-            debug_assert!(coalesced.is_empty(), "L3.1: a serial block encodes its books");
-            if let Some(status) = &action_status {
-                let bytes =
-                    crate::action_results::encode_status(status, self.metrics.as_deref());
-                if let Err(e) = overlay.put_cf_raw(
-                    torus_state::cf::CF_BLOCK_ACTION_STATUS,
-                    &height.to_be_bytes(),
-                    &bytes,
-                ) {
-                    tracing::error!(%e, height, "failed to stage the action status record");
+                debug_assert!(
+                    coalesced.is_empty(),
+                    "L3.1: a serial block encodes its books"
+                );
+                if let Some(status) = &action_status {
+                    let bytes =
+                        crate::action_results::encode_status(status, self.metrics.as_deref());
+                    if let Err(e) = overlay.put_cf_raw(
+                        torus_state::cf::CF_BLOCK_ACTION_STATUS,
+                        &height.to_be_bytes(),
+                        &bytes,
+                    ) {
+                        tracing::error!(%e, height, "failed to stage the action status record");
+                    }
                 }
-            }
-            // Item 6 Phase 1: the context's overlay clones hold R; drop them
-            // so `end_resident` can take R back.
-            drop(ctx);
-            // Flush native state, maintain the incremental native bucketed-Merkle trie, AND write the
-            // native applied-height marker — all in ONE atomic batch (Phase A A2.2 + T156-F1). The
-            // marker fold is the crash-safety fix: native state and "this height is applied" now
-            // commit together, so a hard crash can never re-execute this block on restart and
-            // double-apply its fee distribution / epoch rewards. A trie-maintenance failure still
-            // never drops committed native state (same batch); it only leaves the off-by-default
-            // incremental native root stale for this block. If the atomic write itself fails, NEITHER
-            // native state nor the marker is written, so replay correctly re-executes on restart.
-            let flush_stats = {
-                // rank-root: optional in-RAM trie node cache (value-neutral;
-                // guarded by persisted-root self-authentication).
-                let mut trie_cache = self
-                    .trie_cache
-                    .lock()
-                    .expect("trie-cache mutex poisoned (exec thread panicked mid-block)");
-                let cache_opt = if torus_state::native_trie::native_root_cache_enabled() {
-                    Some(&mut *trie_cache)
-                } else {
-                    None
+                // Item 6 Phase 1: the context's overlay clones hold R; drop them
+                // so `end_resident` can take R back.
+                drop(ctx);
+                // Flush native state, maintain the incremental native bucketed-Merkle trie, AND write the
+                // native applied-height marker — all in ONE atomic batch (Phase A A2.2 + T156-F1). The
+                // marker fold is the crash-safety fix: native state and "this height is applied" now
+                // commit together, so a hard crash can never re-execute this block on restart and
+                // double-apply its fee distribution / epoch rewards. A trie-maintenance failure still
+                // never drops committed native state (same batch); it only leaves the off-by-default
+                // incremental native root stale for this block. If the atomic write itself fails, NEITHER
+                // native state nor the marker is written, so replay correctly re-executes on restart.
+                let flush_stats = {
+                    // rank-root: optional in-RAM trie node cache (value-neutral;
+                    // guarded by persisted-root self-authentication).
+                    let mut trie_cache = self
+                        .trie_cache
+                        .lock()
+                        .expect("trie-cache mutex poisoned (exec thread panicked mid-block)");
+                    let cache_opt = if torus_state::native_trie::native_root_cache_enabled() {
+                        Some(&mut *trie_cache)
+                    } else {
+                        None
+                    };
+                    // rank-root round-3: bucket-member cache (self-gating — disabled
+                    // budget => is_enabled() false => exact-today).
+                    let mut member_cache = self
+                        .member_cache
+                        .lock()
+                        .expect("member-cache mutex poisoned (exec thread panicked mid-block)");
+                    let member_opt = if member_cache.is_enabled() {
+                        Some(&mut *member_cache)
+                    } else {
+                        None
+                    };
+                    // Bug (c): the block's EVM batch (if any) is the prefix of this
+                    // ONE atomic write.
+                    self.pre_flush_check(height).and_then(|()| {
+                        overlay.flush_after_batch_with_native_trie_stats(
+                            evm_batch.take().unwrap_or_default(),
+                            &self.state_db,
+                            Some(height),
+                            cache_opt,
+                            member_opt,
+                        )
+                    })
                 };
-                // rank-root round-3: bucket-member cache (self-gating — disabled
-                // budget => is_enabled() false => exact-today).
-                let mut member_cache = self
-                    .member_cache
-                    .lock()
-                    .expect("member-cache mutex poisoned (exec thread panicked mid-block)");
-                let member_opt = if member_cache.is_enabled() {
-                    Some(&mut *member_cache)
-                } else {
-                    None
-                };
-                // Bug (c): the block's EVM batch (if any) is the prefix of this
-                // ONE atomic write.
-                self.pre_flush_check(height).and_then(|()| {
-                    overlay.flush_after_batch_with_native_trie_stats(
-                        evm_batch.take().unwrap_or_default(),
-                        &self.state_db,
-                        Some(height),
-                        cache_opt,
-                        member_opt,
-                    )
-                })
-            };
-            resident_ok = flush_stats.is_ok();
-            match &flush_stats {
-                Ok(stats) => {
-                    if let Some(ref m) = self.metrics {
-                        m.exec_root_seconds.observe(stats.root_seconds);
-                        m.state_hash_seconds.observe(stats.state_hash_seconds);
-                        m.state_hash_entries.inc_by(stats.state_hash_entries as u64);
-                        m.exec_state_write_seconds.observe(stats.write_seconds);
-                        // r7: build (serialize pending maps) vs db (WAL +
-                        // memtable) — which half the ~380-400 ms/blk at 300m is.
-                        m.exec_state_write_build_seconds
-                            .observe(stats.write_build_seconds);
-                        m.exec_state_write_db_seconds
-                            .observe(stats.write_db_seconds);
-                        m.exec_state_write_batch_bytes
-                            .observe(stats.batch_bytes as f64);
-                        m.exec_root_dirty_buckets.observe(stats.dirty_buckets as f64);
-                        m.exec_root_bucket_scans.inc_by(stats.bucket_scans as u64);
-                        m.member_cache_hits.inc_by(stats.member_hits as u64);
-                        m.member_cache_misses.inc_by(stats.member_misses as u64);
-                        m.member_cache_evictions.inc_by(stats.member_evictions as u64);
-                        m.member_cache_resident_buckets
-                            .set(stats.member_resident_buckets as i64);
-                        // 3c: per-cf-tag dirty-entry attribution.
-                        for (i, n) in stats.dirty_entries_by_cf.iter().enumerate() {
-                            m.exec_dirty_entries_by_cf[i].inc_by(*n as u64);
+                resident_ok = flush_stats.is_ok();
+                match &flush_stats {
+                    Ok(stats) => {
+                        if let Some(ref m) = self.metrics {
+                            m.exec_root_seconds.observe(stats.root_seconds);
+                            m.state_hash_seconds.observe(stats.state_hash_seconds);
+                            m.state_hash_entries.inc_by(stats.state_hash_entries as u64);
+                            m.exec_state_write_seconds.observe(stats.write_seconds);
+                            // r7: build (serialize pending maps) vs db (WAL +
+                            // memtable) — which half the ~380-400 ms/blk at 300m is.
+                            m.exec_state_write_build_seconds
+                                .observe(stats.write_build_seconds);
+                            m.exec_state_write_db_seconds
+                                .observe(stats.write_db_seconds);
+                            m.exec_state_write_batch_bytes
+                                .observe(stats.batch_bytes as f64);
+                            m.exec_root_dirty_buckets
+                                .observe(stats.dirty_buckets as f64);
+                            m.exec_root_bucket_scans.inc_by(stats.bucket_scans as u64);
+                            m.member_cache_hits.inc_by(stats.member_hits as u64);
+                            m.member_cache_misses.inc_by(stats.member_misses as u64);
+                            m.member_cache_evictions
+                                .inc_by(stats.member_evictions as u64);
+                            m.member_cache_resident_buckets
+                                .set(stats.member_resident_buckets as i64);
+                            // 3c: per-cf-tag dirty-entry attribution.
+                            for (i, n) in stats.dirty_entries_by_cf.iter().enumerate() {
+                                m.exec_dirty_entries_by_cf[i].inc_by(*n as u64);
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    // R01: NEITHER this block's state (EVM prefix included,
-                    // bug (c)) NOR its applied marker is durable. Executing the
-                    // next block on top would build on a base without them and,
-                    // once its own flush lands, move the marker past this height
-                    // (replay would skip it). Fail-stop for every block, like
-                    // the flush worker; restart replays from the durable marker.
-                    tracing::error!(
-                        %e,
-                        height,
-                        has_evm,
-                        "FATAL: native overlay flush + applied-height marker failed — block NOT \
-                         marked applied; fail-stop (restart replays it)"
-                    );
-                    // r3: the header (folded, or meant to be) did not land with
-                    // the batch; keep the pre-fold contract (header persisted
-                    // at exec) via the standalone put so the committed height
-                    // stays visible to `find_last_committed_height` for the replay.
-                    if fold_header {
-                        persist_block_header(&self.state_db, torus_block);
+                    Err(e) => {
+                        // R01: NEITHER this block's state (EVM prefix included,
+                        // bug (c)) NOR its applied marker is durable. Executing the
+                        // next block on top would build on a base without them and,
+                        // once its own flush lands, move the marker past this height
+                        // (replay would skip it). Fail-stop for every block, like
+                        // the flush worker; restart replays from the durable marker.
+                        tracing::error!(
+                            %e,
+                            height,
+                            has_evm,
+                            "FATAL: native overlay flush + applied-height marker failed — block NOT \
+                             marked applied; fail-stop (restart replays it)"
+                        );
+                        // r3: the header (folded, or meant to be) did not land with
+                        // the batch; keep the pre-fold contract (header persisted
+                        // at exec) via the standalone put so the committed height
+                        // stays visible to `find_last_committed_height` for the replay.
+                        if fold_header {
+                            persist_block_header(&self.state_db, torus_block);
+                        }
+                        self.exec_failed.store(true, Ordering::SeqCst);
+                        return;
                     }
-                    self.exec_failed.store(true, Ordering::SeqCst);
-                    return;
                 }
-            }
 
-            // Phase A: native post-commit credited EVM account balances (fees / validator rewards)
-            // straight to CF_ACCOUNTS via the overlay flush, bypassing incremental trie maintenance.
-            // Re-sync those accounts into CF_HASHED_*/CF_TRIE_* so the incremental root keeps tracking
-            // the full scan (devnet-smoke finding). Best-effort: a failure only degrades the
-            // flag-gated (off-by-default) incremental path, never the committed plain state.
-            let native_evm_addrs = overlay.dirty_evm_accounts();
-            let resync_timer = std::time::Instant::now();
-            if let Err(e) =
-                torus_state::incremental::resync_evm_accounts(&self.state_db, &native_evm_addrs)
-            {
-                tracing::error!(%e, height, "failed to resync incremental trie after native post-commit");
-            }
-            if let Some(ref m) = self.metrics {
-                m.exec_evm_resync_seconds
-                    .observe(resync_timer.elapsed().as_secs_f64());
-            }
-            if let Some(ref m) = self.metrics {
-                m.exec_flush_seconds
-                    .observe(flush_timer.elapsed().as_secs_f64());
-                m.observe_order_ages(OrderStage::Durable, order_nonces.iter().copied());
-            }
-            // Item 7 option 0 step 0 (F11): complete after the resync.
-            #[cfg(test)]
-            {
-                self.test_path("serial.flush");
-                self.test_complete(crate::exec_pipeline::CompleteSite::ESerialFlush, height);
-            }
+                // Phase A: native post-commit credited EVM account balances (fees / validator rewards)
+                // straight to CF_ACCOUNTS via the overlay flush, bypassing incremental trie maintenance.
+                // Re-sync those accounts into CF_HASHED_*/CF_TRIE_* so the incremental root keeps tracking
+                // the full scan (devnet-smoke finding). Best-effort: a failure only degrades the
+                // flag-gated (off-by-default) incremental path, never the committed plain state.
+                let native_evm_addrs = overlay.dirty_evm_accounts();
+                let resync_timer = std::time::Instant::now();
+                if let Err(e) =
+                    torus_state::incremental::resync_evm_accounts(&self.state_db, &native_evm_addrs)
+                {
+                    tracing::error!(%e, height, "failed to resync incremental trie after native post-commit");
+                }
+                if let Some(ref m) = self.metrics {
+                    m.exec_evm_resync_seconds
+                        .observe(resync_timer.elapsed().as_secs_f64());
+                }
+                if let Some(ref m) = self.metrics {
+                    m.exec_flush_seconds
+                        .observe(flush_timer.elapsed().as_secs_f64());
+                    m.observe_order_ages(OrderStage::Durable, order_nonces.iter().copied());
+                }
+                // Item 7 option 0 step 0 (F11): complete after the resync.
+                #[cfg(test)]
+                {
+                    self.test_path("serial.flush");
+                    self.test_complete(crate::exec_pipeline::CompleteSite::ESerialFlush, height);
+                }
             } // end serial flush
 
             // Item 6 Phase 1: after the hand-off / the flush, R takes this
@@ -6513,9 +6541,11 @@ impl ExecutionContext {
                     // r3: time the put ALONE (the encode above is CPU; a long
                     // put here is a write-group / write-controller wait).
                     let put_timer = std::time::Instant::now();
-                    let _ = self
-                        .state_db
-                        .put_cf_raw(CF_BLOCK_BODIES, &height.to_be_bytes(), &body_bytes);
+                    let _ = self.state_db.put_cf_raw(
+                        CF_BLOCK_BODIES,
+                        &height.to_be_bytes(),
+                        &body_bytes,
+                    );
                     if let Some(ref m) = self.metrics {
                         m.exec_body_persist_write_seconds
                             .observe(put_timer.elapsed().as_secs_f64());
@@ -6829,7 +6859,10 @@ fn execution_loop(rx: std::sync::mpsc::Receiver<CommittedBlockMsg>, ctx: Executi
         }));
         if result.is_err() {
             ctx.exec_failed.store(true, Ordering::SeqCst);
-            tracing::error!(height, "execution pipeline PANICKED executing committed block");
+            tracing::error!(
+                height,
+                "execution pipeline PANICKED executing committed block"
+            );
         }
         // The hook's receiver checks the row is readable before publishing.
         if header_from_exec && !ctx.exec_failed.load(Ordering::SeqCst) {
@@ -7666,7 +7699,10 @@ impl AsyncValidateShared {
         let height = verdict.block.header.height;
         cache.retain(|_, v| v.block.header.height + 10 > height);
         if cache.len() >= ASYNC_VALIDATE_CACHE_CAP {
-            tracing::warn!(height, "async-validate cache full — dropping verdict (sync fallback)");
+            tracing::warn!(
+                height,
+                "async-validate cache full — dropping verdict (sync fallback)"
+            );
             return;
         }
         cache.insert(key, verdict);
@@ -8036,7 +8072,11 @@ impl TorusApp {
             // entirely downstream of the 64-slot exec channel), never balloons
             // memory. `None` unless TORUS_ASYNC_POST_FLUSH is on ⇒ exact-today.
             post_flush_writer: async_post_flush_enabled().then(|| {
-                torus_state::BackgroundCfWriter::spawn(state_db.clone(), "torus-post-flush-writer", 256)
+                torus_state::BackgroundCfWriter::spawn(
+                    state_db.clone(),
+                    "torus-post-flush-writer",
+                    256,
+                )
             }),
             exec_failed: exec_failed.clone(),
             exec_shutdown: exec_shutdown.clone(),
@@ -8130,13 +8170,16 @@ impl TorusApp {
         if !maintain_trie {
             tracing::info!("native trie maintenance off (default; TORUS_NATIVE_TRIE_MAINTENANCE=1 enables): CF_NATIVE_TRIE/CF_NATIVE_HASHED not maintained, trie marked stale; native root falls back to full scan");
         }
-        if let Err(e) = torus_state::native_trie::ensure_native_trie_built(&state_db, maintain_trie) {
+        if let Err(e) = torus_state::native_trie::ensure_native_trie_built(&state_db, maintain_trie)
+        {
             tracing::warn!(%e, "failed to build initial native trie (incremental native root unavailable until rebuilt)");
         }
         // s77 packed trade rows: node-local trade history in the old per-fill
         // format is wiped once, before replay writes any new-format rows.
         match torus_state::trade_rows::ensure_trade_history_format(&state_db) {
-            Ok(true) => tracing::info!("trade history: old row format wiped (packed rows from here on)"),
+            Ok(true) => {
+                tracing::info!("trade history: old row format wiped (packed rows from here on)")
+            }
             Ok(false) => {}
             Err(e) => tracing::warn!(%e, "trade history: format check failed"),
         }
@@ -8158,8 +8201,14 @@ impl TorusApp {
         // keeps running and voting, reports it (ERROR + gauge) and never
         // attests until the chain is valid again.
         state_hash.report_at_boot(&state_db, metrics.as_deref());
-        // P0.0 phase 6: the feature gauges from the last applied header.
-        exec_ctx.features.after_block(&last_header);
+        // P0.0 phase 6: the feature gauges from the last applied header (a
+        // clean restart replays nothing and gets genesis back: read the
+        // durable applied-height header instead).
+        exec_ctx.features.after_block(&Self::feature_gauge_header(
+            &state_db,
+            &exec_ctx,
+            &last_header,
+        ));
 
         // The proposer identity, resolved from the replayed state before the
         // execution thread starts.
@@ -8210,9 +8259,9 @@ impl TorusApp {
         // replayed headers already turned on.
         exec_ctx.configure_book_coalesce(
             crate::exec_pipeline::book_coalesce_requested(),
-            config
-                .state_hash_activation_height()
-                .or(torus_state::running_hash::read_configured_activation(&state_db)),
+            config.state_hash_activation_height().or(
+                torus_state::running_hash::read_configured_activation(&state_db),
+            ),
         );
         // s124: the epoch fast path only changes which blocks take the
         // pipelined path, so it needs W.
@@ -8475,8 +8524,7 @@ impl TorusApp {
                         app.park_deferred(h, source, Vec::new());
                     }
                 }
-                app.exec_next_height =
-                    Some(app.exec_next_height.map_or(first, |n| n.min(first)));
+                app.exec_next_height = Some(app.exec_next_height.map_or(first, |n| n.min(first)));
                 if app.exec_hole_since.is_none() {
                     app.exec_hole_since = Some(std::time::Instant::now());
                 }
@@ -8647,7 +8695,10 @@ impl TorusApp {
         if let Some(ref worker) = self.da_gc_worker {
             let t = std::time::Instant::now();
             while !worker.is_dead() {
-                assert!(t.elapsed() < std::time::Duration::from_secs(60), "worker did not exit");
+                assert!(
+                    t.elapsed() < std::time::Duration::from_secs(60),
+                    "worker did not exit"
+                );
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
@@ -9008,6 +9059,32 @@ impl TorusApp {
     /// caller parks execution at `h` and lets the live heal loop + block-sync
     /// backfill get a bounded window to re-deliver and heal it, fail-stopping only
     /// if the budget expires — instead of latching the fail-stop pre-network.
+    /// P0.0 phase 6 (Codex P2): the header the boot feature gauges report.
+    /// `replayed` (from [`Self::replay_committed`]) when replay executed a
+    /// block; otherwise (a clean restart: applied == committed, nothing
+    /// replayed, genesis returned) the durable header at the applied height.
+    /// Genesis only when nothing has applied (or that header cannot be read).
+    fn feature_gauge_header(
+        state_db: &StateDb,
+        exec_ctx: &ExecutionContext,
+        replayed: &TorusBlockHeader,
+    ) -> TorusBlockHeader {
+        if replayed.height > 0 {
+            return replayed.clone();
+        }
+        match exec_ctx.applied_height() {
+            Ok(Some(applied)) if applied > 0 => load_replay_header(state_db, applied)
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        applied,
+                        "feature gauges: applied-height header unreadable, reporting from genesis"
+                    );
+                    replayed.clone()
+                }),
+            _ => replayed.clone(),
+        }
+    }
+
     fn replay_committed(
         state_db: &StateDb,
         exec_ctx: &ExecutionContext,
@@ -9250,8 +9327,10 @@ impl TorusApp {
         let (mut actions, timing) = mempool.get_native_da_batch_timed(hashes);
         if let Some(m) = metrics.as_ref() {
             if let Some(flush) = timing.flush {
-                m.validate_block_da_flush_seconds.observe(flush.as_secs_f64());
-                m.validate_block_da_flush_bodies.inc_by(timing.flushed as u64);
+                m.validate_block_da_flush_seconds
+                    .observe(flush.as_secs_f64());
+                m.validate_block_da_flush_bodies
+                    .inc_by(timing.flushed as u64);
             }
             m.validate_block_da_multiget_seconds
                 .observe(timing.read.multi_get.as_secs_f64());
@@ -9524,7 +9603,10 @@ impl TorusApp {
         Vec<torus_types::SignedNativeAction>,
         Vec<torus_types::B256>,
     ) {
-        self.mirror_or_drop_native_at(self.last_header.height.saturating_add(1), native_with_senders)
+        self.mirror_or_drop_native_at(
+            self.last_header.height.saturating_add(1),
+            native_with_senders,
+        )
     }
 
     /// [`Self::mirror_or_drop_native`] for a proposal at `height` (the DA
@@ -9661,8 +9743,7 @@ impl TorusApp {
         actions: &[torus_types::SignedNativeAction],
         height: u64,
     ) {
-        let _custody_span =
-            ObserveOnDrop::new(metrics, |m| &m.validate_block_custody_seconds);
+        let _custody_span = ObserveOnDrop::new(metrics, |m| &m.validate_block_custody_seconds);
         if !shard_custody_enabled() {
             return;
         }
@@ -9818,8 +9899,8 @@ impl TorusApp {
                 // found here is never deleted under the vote; one being
                 // deleted right now counts as missing (`torus_state::DaGcFence`).
                 if let Some(mempool) = mempool {
-                    let busy = mempool
-                        .pin_native_da(compact.header.height, &compact.native_action_hashes);
+                    let busy =
+                        mempool.pin_native_da(compact.header.height, &compact.native_action_hashes);
                     if !busy.is_empty() {
                         tracing::warn!(
                             busy = busy.len(),
@@ -10071,7 +10152,10 @@ impl TorusApp {
                     header.height,
                 );
                 #[cfg(test)]
-                self.test_upgrade_refusals.lock().unwrap().push(("vote", header.height));
+                self.test_upgrade_refusals
+                    .lock()
+                    .unwrap()
+                    .push(("vote", header.height));
             }
             return link;
         }
@@ -10128,9 +10212,10 @@ impl TorusApp {
     ) -> ProduceBlockResponse {
         // P0.0: a parent carrying a feature this binary does not know cannot be
         // executed here; refuse to build on it (owner decision: an old binary stops).
-        if let Some(id) =
-            torus_types::features::first_unknown_feature_in(parent_header.features, self.known_features)
-        {
+        if let Some(id) = torus_types::features::first_unknown_feature_in(
+            parent_header.features,
+            self.known_features,
+        ) {
             tracing::error!(
                 parent_height = parent_header.height,
                 feature = id,
@@ -10241,8 +10326,7 @@ impl TorusApp {
         // same value RPC `parentHash` and the fork checker compare — and it is
         // kept consistent with the hotstuff `justify.block` the QC points at (an
         // honest leader builds on the block its high-QC justifies).
-        let parent_hash =
-            alloy_primitives::keccak256(parent_header.canonical_header_bytes());
+        let parent_hash = alloy_primitives::keccak256(parent_header.canonical_header_bytes());
         let block = TorusBlock {
             header: TorusBlockHeader {
                 height: parent_header.height + 1,
@@ -10437,7 +10521,10 @@ impl App<RocksKVStore> for TorusApp {
         #[cfg(test)]
         if link.is_err() {
             let height = datum_header(datums[0].bytes()).map_or(0, |h| h.height);
-            self.test_upgrade_refusals.lock().unwrap().push(("insert", height));
+            self.test_upgrade_refusals
+                .lock()
+                .unwrap()
+                .push(("insert", height));
         }
         if let Some(response) =
             insertion_link_response_for_datum(link, datums[0].bytes(), &block.data_hash)
@@ -10532,49 +10619,48 @@ impl App<RocksKVStore> for TorusApp {
         // UNCONDITIONALLY (below) so a missing body can never freeze consensus
         // height/view -- the livelock root cause (mem 28e1a821) was an early return
         // here, before last_header advanced, which froze RPC height and churned views.
-        let (header, source): (TorusBlockHeader, ExecSource) = if let Ok(full) =
-            bincode::deserialize::<TorusBlock>(datum_bytes)
-        {
-            // FULL datum carries its bodies inline and its committed header — the
-            // consensus datum is self-consistent and authoritative. Drop any
-            // stale same-height cache entry (cleanup) but NEVER let it override
-            // the committed block (T1.2 body determinism).
-            let height = full.header.height;
-            self.pending_proposals.remove(&height);
-            (full.header.clone(), ExecSource::Ready(full))
-        } else if let Ok(compact) = bincode::deserialize::<CompactBlock>(datum_bytes) {
-            // The COMMITTED header is the consensus datum — taken VERBATIM,
-            // never rebuilt from a local cache or from execution results. The
-            // body is the set the committed compact references by hash: a cached
-            // proposal is a valid fast path ONLY when its action hashes match
-            // that reference exactly (skips a DA read); otherwise reconstruct
-            // all-or-nothing from the durable DA store. A stale same-height
-            // re-proposal (fewer / other actions, having overwritten this
-            // height's `pending_proposals` entry) must NEVER be executed in
-            // place of the committed block — that was the t12-diag1 divergence
-            // (proposer executed its cached 40 of the committed 59 and persisted
-            // a divergent header).
-            let height = compact.header.height;
-            match self.pending_proposals.remove(&height) {
-                Some(cached) if cached_matches_compact(&cached, &compact) => {
-                    let cached = cached.into_block();
-                    let ready = TorusBlock {
-                        header: compact.header.clone(),
-                        native_actions: cached.native_actions,
-                        evm_transactions: compact.evm_transactions.clone(),
-                        core_writer_actions: compact.core_writer_actions.clone(),
-                    };
-                    (compact.header.clone(), ExecSource::Ready(ready))
+        let (header, source): (TorusBlockHeader, ExecSource) =
+            if let Ok(full) = bincode::deserialize::<TorusBlock>(datum_bytes) {
+                // FULL datum carries its bodies inline and its committed header — the
+                // consensus datum is self-consistent and authoritative. Drop any
+                // stale same-height cache entry (cleanup) but NEVER let it override
+                // the committed block (T1.2 body determinism).
+                let height = full.header.height;
+                self.pending_proposals.remove(&height);
+                (full.header.clone(), ExecSource::Ready(full))
+            } else if let Ok(compact) = bincode::deserialize::<CompactBlock>(datum_bytes) {
+                // The COMMITTED header is the consensus datum — taken VERBATIM,
+                // never rebuilt from a local cache or from execution results. The
+                // body is the set the committed compact references by hash: a cached
+                // proposal is a valid fast path ONLY when its action hashes match
+                // that reference exactly (skips a DA read); otherwise reconstruct
+                // all-or-nothing from the durable DA store. A stale same-height
+                // re-proposal (fewer / other actions, having overwritten this
+                // height's `pending_proposals` entry) must NEVER be executed in
+                // place of the committed block — that was the t12-diag1 divergence
+                // (proposer executed its cached 40 of the committed 59 and persisted
+                // a divergent header).
+                let height = compact.header.height;
+                match self.pending_proposals.remove(&height) {
+                    Some(cached) if cached_matches_compact(&cached, &compact) => {
+                        let cached = cached.into_block();
+                        let ready = TorusBlock {
+                            header: compact.header.clone(),
+                            native_actions: cached.native_actions,
+                            evm_transactions: compact.evm_transactions.clone(),
+                            core_writer_actions: compact.core_writer_actions.clone(),
+                        };
+                        (compact.header.clone(), ExecSource::Ready(ready))
+                    }
+                    // Reconstruct lazily (and RE-try on each drain) from the durable DA
+                    // store — a body still missing here becomes a heal-able hole, never
+                    // an out-of-order execution.
+                    _ => (compact.header.clone(), ExecSource::Compact(compact)),
                 }
-                // Reconstruct lazily (and RE-try on each drain) from the durable DA
-                // store — a body still missing here becomes a heal-able hole, never
-                // an out-of-order execution.
-                _ => (compact.header.clone(), ExecSource::Compact(compact)),
-            }
-        } else {
-            tracing::warn!("on_committed_block: failed to deserialize block datum");
-            return;
-        };
+            } else {
+                tracing::warn!("on_committed_block: failed to deserialize block datum");
+                return;
+            };
 
         let height = header.height;
 
@@ -11017,10 +11103,7 @@ impl TorusApp {
                     );
                 }
                 mempool.select_native_for_block_with_senders_excluding(
-                    action_cap,
-                    &in_flight,
-                    bytes_cap,
-                    orders_cap,
+                    action_cap, &in_flight, bytes_cap, orders_cap,
                 )
             }
             PacedSelectionCaps::CancelsOnly => {
@@ -11206,11 +11289,7 @@ impl TorusApp {
                                     );
                                 }
                                 None => {
-                                    self.park_deferred(
-                                        next,
-                                        ExecSource::Ready(block),
-                                        slashes,
-                                    );
+                                    self.park_deferred(next, ExecSource::Ready(block), slashes);
                                 }
                             }
                             return;
@@ -11255,8 +11334,7 @@ impl TorusApp {
             // heal loop still accounts the hole + budget without a futile fetch.
             ExecSource::Durable(height) => match load_replay_header(&self.state_db, height) {
                 Some(header) => {
-                    let is_empty =
-                        header.native_action_count == 0 && header.evm_tx_count == 0;
+                    let is_empty = header.native_action_count == 0 && header.evm_tx_count == 0;
                     if is_empty {
                         Ok(TorusBlock {
                             header,
@@ -12029,7 +12107,11 @@ mod exec_throttle_tests {
         );
     }
 
-    fn signed_action(seed_byte: u8, nonce: u64, action: NativeAction) -> torus_types::SignedNativeAction {
+    fn signed_action(
+        seed_byte: u8,
+        nonce: u64,
+        action: NativeAction,
+    ) -> torus_types::SignedNativeAction {
         let key = k256::ecdsa::SigningKey::from_slice(&[seed_byte; 32]).unwrap();
         torus_types::eip712::sign_native_action(action, nonce, &key)
     }
@@ -12402,12 +12484,26 @@ mod exec_dispatch_tests {
         assert!(app.exec_hole_since.is_none());
 
         // Exactly one block crossed so far: height 1.
-        assert_eq!(rx.try_recv().expect("h1 was sent").torus_block.header.height, 1);
+        assert_eq!(
+            rx.try_recv()
+                .expect("h1 was sent")
+                .torus_block
+                .header
+                .height,
+            1
+        );
         assert!(rx.try_recv().is_err(), "heights 2/3 are parked, not sent");
 
         // Reconcile tick drains what now fits: 2 sends, 3 re-parks (Full again).
         app.on_reconcile_tick();
-        assert_eq!(rx.try_recv().expect("h2 drains first").torus_block.header.height, 2);
+        assert_eq!(
+            rx.try_recv()
+                .expect("h2 drains first")
+                .torus_block
+                .header
+                .height,
+            2
+        );
         assert_eq!(
             app.deferred_exec.keys().copied().collect::<Vec<_>>(),
             vec![3],
@@ -12416,8 +12512,18 @@ mod exec_dispatch_tests {
         assert_eq!(app.exec_next_height, Some(3));
 
         app.on_reconcile_tick();
-        assert_eq!(rx.try_recv().expect("h3 drains last").torus_block.header.height, 3);
-        assert!(app.deferred_exec.is_empty(), "pacing defers; nothing is shed");
+        assert_eq!(
+            rx.try_recv()
+                .expect("h3 drains last")
+                .torus_block
+                .header
+                .height,
+            3
+        );
+        assert!(
+            app.deferred_exec.is_empty(),
+            "pacing defers; nothing is shed"
+        );
         assert_eq!(app.exec_next_height, Some(4));
         assert!(!app.is_exec_failed());
 
@@ -12545,7 +12651,10 @@ mod exec_dispatch_tests {
 
         assert_eq!(rx.try_recv().unwrap().torus_block.header.height, 1);
         app.on_reconcile_tick();
-        let got2 = rx.try_recv().expect("h2 drains from the Ready park").torus_block;
+        let got2 = rx
+            .try_recv()
+            .expect("h2 drains from the Ready park")
+            .torus_block;
         assert_eq!(
             bincode::serialize(&got2).unwrap(),
             bincode::serialize(&b2).unwrap()
@@ -13528,7 +13637,11 @@ mod crash_recovery_tests {
     fn list_test_markets(state_db: &StateDb) {
         for m in 1..=8u64 {
             state_db
-                .put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed")
+                .put_cf_raw(
+                    torus_state::cf::CF_NATIVE_MARKETS,
+                    &m.to_be_bytes(),
+                    b"listed",
+                )
                 .expect("list market");
         }
     }
@@ -13578,8 +13691,11 @@ mod crash_recovery_tests {
         };
         // P0.0 phase 3: what execution writes before block 1 (with it in
         // place, block 1 needs no pipeline barrier).
-        torus_state::running_hash::configure_activation(&state_db, config.state_hash_activation_height())
-            .expect("configure running hash activation");
+        torus_state::running_hash::configure_activation(
+            &state_db,
+            config.state_hash_activation_height(),
+        )
+        .expect("configure running hash activation");
         (config, state_db)
     }
 
@@ -13625,7 +13741,9 @@ mod crash_recovery_tests {
             0 => B256::ZERO,
             1 => alloy_primitives::keccak256(default_genesis_header().canonical_header_bytes()),
             _ => alloy_primitives::keccak256(
-                make_block(height - 1, vec![]).header.canonical_header_bytes(),
+                make_block(height - 1, vec![])
+                    .header
+                    .canonical_header_bytes(),
             ),
         };
         TorusBlock {
@@ -13816,7 +13934,10 @@ mod crash_recovery_tests {
             ),
             "a child whose parent_hash matches the finalized parent must be accepted"
         );
-        assert!(!ef_ok.load(Ordering::SeqCst), "no fail-stop on a valid link");
+        assert!(
+            !ef_ok.load(Ordering::SeqCst),
+            "no fail-stop on a valid link"
+        );
 
         // Wrong link: child at height 6 with a bogus parent_hash -> rejected AND
         // the fail-stop latch is set (commit means commit).
@@ -13937,10 +14058,7 @@ mod crash_recovery_tests {
 
         let (last, parked) = TorusApp::replay_committed(&state_db, &exec_ctx);
 
-        assert_eq!(
-            parked, None,
-            "a fully-replayable gap must NOT park a hole"
-        );
+        assert_eq!(parked, None, "a fully-replayable gap must NOT park a hole");
         assert_eq!(
             last.height, 5,
             "replay must find the committed tip despite the prune meta key"
@@ -13978,9 +14096,15 @@ mod crash_recovery_tests {
 
         let (last, parked) = TorusApp::replay_committed(&state_db, &exec_ctx);
 
-        assert!(exec_ctx.exec_failed.load(Ordering::SeqCst), "height 1 must fail-stop");
+        assert!(
+            exec_ctx.exec_failed.load(Ordering::SeqCst),
+            "height 1 must fail-stop"
+        );
         assert_eq!(parked, None, "a fail-stop is not a hole");
-        assert_eq!(last.height, 0, "no height executed: last good is the genesis parent");
+        assert_eq!(
+            last.height, 0,
+            "no height executed: last good is the genesis parent"
+        );
         assert_eq!(
             read_native_applied_height(&state_db),
             None,
@@ -14028,7 +14152,11 @@ mod crash_recovery_tests {
 
         exec_ctx.execute_committed_block(&make_block(1, vec![]), vec![]);
 
-        assert_dumps_equal(&before, &dump_all_cfs(&state_db), "nothing runs after a fail-stop");
+        assert_dumps_equal(
+            &before,
+            &dump_all_cfs(&state_db),
+            "nothing runs after a fail-stop",
+        );
         assert_eq!(read_native_applied_height(&state_db), None);
     }
 
@@ -14051,7 +14179,11 @@ mod crash_recovery_tests {
     fn persist_block_body_for_test(state_db: &StateDb, block: &TorusBlock) {
         let body_bytes = serde_json::to_vec(&block.body()).unwrap();
         state_db
-            .put_cf_raw(CF_BLOCK_BODIES, &block.header.height.to_be_bytes(), &body_bytes)
+            .put_cf_raw(
+                CF_BLOCK_BODIES,
+                &block.header.height.to_be_bytes(),
+                &body_bytes,
+            )
             .unwrap();
     }
 
@@ -14177,7 +14309,9 @@ mod crash_recovery_tests {
         let (last, parked) = TorusApp::replay_committed(&state_db, &exec_ctx);
 
         assert!(
-            !exec_ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst),
+            !exec_ctx
+                .exec_failed
+                .load(std::sync::atomic::Ordering::SeqCst),
             "FIX 1b: a boot gap hole must PARK, not latch a pre-network fail-stop"
         );
         assert_eq!(
@@ -14234,7 +14368,9 @@ mod crash_recovery_tests {
             "FIX 1a: a body made durable at commit must let replay COMPLETE, never hole"
         );
         assert!(
-            !exec_ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst),
+            !exec_ctx
+                .exec_failed
+                .load(std::sync::atomic::Ordering::SeqCst),
             "FIX 1a: recovery must not fail-stop when the committed body is durable"
         );
         assert_eq!(
@@ -14280,9 +14416,16 @@ mod crash_recovery_tests {
                 .unwrap();
             let raw = state_db
                 .inner()
-                .get_cf(state_db.cf_handle(CF_BLOCK_BODIES).unwrap(), 5u64.to_be_bytes())
+                .get_cf(
+                    state_db.cf_handle(CF_BLOCK_BODIES).unwrap(),
+                    5u64.to_be_bytes(),
+                )
                 .unwrap();
-            assert_eq!(raw.is_some(), mode == PruneMode::Filter, "{mode:?}: lazy on disk");
+            assert_eq!(
+                raw.is_some(),
+                mode == PruneMode::Filter,
+                "{mode:?}: lazy on disk"
+            );
             for h in 1..=10u64 {
                 assert_eq!(
                     load_replay_body(&state_db, h).is_some(),
@@ -14318,7 +14461,11 @@ mod crash_recovery_tests {
             .unwrap()
             .unwrap();
         let expected = alloy_primitives::keccak256(&block.header.canonical_header_bytes());
-        assert_eq!(&raw[..32], expected.as_slice(), "header record must prefix the block hash");
+        assert_eq!(
+            &raw[..32],
+            expected.as_slice(),
+            "header record must prefix the block hash"
+        );
     }
 
     /// r4 commit-persist RED-first: the commit-time persist writes the body as a
@@ -14333,7 +14480,10 @@ mod crash_recovery_tests {
         let block = make_block(9, vec![sign_claim_rewards(9), sign_claim_rewards(9)]);
         let key = 9u64.to_be_bytes();
         persist_commit_manifest(&state_db, 9, b"datum-9");
-        assert!(state_db.get_cf_raw(CF_COMMIT_MANIFEST, &key).unwrap().is_some());
+        assert!(state_db
+            .get_cf_raw(CF_COMMIT_MANIFEST, &key)
+            .unwrap()
+            .is_some());
 
         let durable = persist_committed_block_durably(&state_db, &block);
         assert_eq!(
@@ -14357,7 +14507,10 @@ mod crash_recovery_tests {
             "payload after the tag IS the bincode wire encoding of the body"
         );
         assert!(
-            state_db.get_cf_raw(CF_COMMIT_MANIFEST, &key).unwrap().is_none(),
+            state_db
+                .get_cf_raw(CF_COMMIT_MANIFEST, &key)
+                .unwrap()
+                .is_none(),
             "commit manifest pruned in the same batch as the durable body"
         );
         let b = load_replay_body(&state_db, 9).expect("crash-replay reader decodes the bin record");
@@ -14367,7 +14520,12 @@ mod crash_recovery_tests {
             torus_types::compute_action_hash(&block.native_actions[1]),
             "actions round-trip hash-for-hash"
         );
-        assert_eq!(load_replay_header(&state_db, 9).unwrap().native_action_count, 2);
+        assert_eq!(
+            load_replay_header(&state_db, 9)
+                .unwrap()
+                .native_action_count,
+            2
+        );
     }
 
     /// r4 commit-persist: crash-replay must decode BOTH record formats — heights
@@ -14381,11 +14539,17 @@ mod crash_recovery_tests {
         persist_block_for_test(&state_db, &b2); // legacy JSON writer
         persist_committed_block_durably(&state_db, &b3); // tagged bin writer
         assert_eq!(
-            state_db.get_cf_raw(CF_BLOCK_BODIES, &2u64.to_be_bytes()).unwrap().unwrap()[0],
+            state_db
+                .get_cf_raw(CF_BLOCK_BODIES, &2u64.to_be_bytes())
+                .unwrap()
+                .unwrap()[0],
             b'{'
         );
         assert_eq!(
-            state_db.get_cf_raw(CF_BLOCK_BODIES, &3u64.to_be_bytes()).unwrap().unwrap()[0],
+            state_db
+                .get_cf_raw(CF_BLOCK_BODIES, &3u64.to_be_bytes())
+                .unwrap()
+                .unwrap()[0],
             torus_state::block_body::BODY_RECORD_TAG_BIN_V1
         );
         let r2 = load_replay_body(&state_db, 2).expect("legacy JSON body decodes");
@@ -14404,9 +14568,14 @@ mod crash_recovery_tests {
             torus_state::block_body::BodyRecordFormat::LegacyJson,
         )
         .unwrap();
-        state_db.put_cf_raw(CF_BLOCK_BODIES, &3u64.to_be_bytes(), &legacy).unwrap();
+        state_db
+            .put_cf_raw(CF_BLOCK_BODIES, &3u64.to_be_bytes(), &legacy)
+            .unwrap();
         let r3_legacy = load_replay_body(&state_db, 3).unwrap();
-        assert_eq!(hashes(&r3_legacy.native_actions), hashes(&r3.native_actions));
+        assert_eq!(
+            hashes(&r3_legacy.native_actions),
+            hashes(&r3.native_actions)
+        );
     }
 
     /// r4 commit-persist / body-persist-skip RED-first: a NON-EMPTY native block
@@ -14436,28 +14605,44 @@ mod crash_recovery_tests {
 
         // Tag both rows so an exec-time rewrite is observable.
         let key = 3u64.to_be_bytes();
-        let mut tagged_header = state_db.get_cf_raw(CF_BLOCK_HEADERS, &key).unwrap().unwrap();
+        let mut tagged_header = state_db
+            .get_cf_raw(CF_BLOCK_HEADERS, &key)
+            .unwrap()
+            .unwrap();
         tagged_header.extend_from_slice(b"#dispatch-row");
-        state_db.put_cf_raw(CF_BLOCK_HEADERS, &key, &tagged_header).unwrap();
+        state_db
+            .put_cf_raw(CF_BLOCK_HEADERS, &key, &tagged_header)
+            .unwrap();
         let mut tagged_body = state_db.get_cf_raw(CF_BLOCK_BODIES, &key).unwrap().unwrap();
         tagged_body.extend_from_slice(b"#dispatch-row");
-        state_db.put_cf_raw(CF_BLOCK_BODIES, &key, &tagged_body).unwrap();
+        state_db
+            .put_cf_raw(CF_BLOCK_BODIES, &key, &tagged_body)
+            .unwrap();
 
         let exec_ctx = make_exec_ctx(&config, &state_db);
         exec_ctx.execute_committed_block_with(&b3, vec![], durable);
 
         assert!(
-            !exec_ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst),
+            !exec_ctx
+                .exec_failed
+                .load(std::sync::atomic::Ordering::SeqCst),
             "execution must succeed"
         );
-        assert_eq!(read_native_applied_height(&state_db), Some(3), "block 3 executed");
+        assert_eq!(
+            read_native_applied_height(&state_db),
+            Some(3),
+            "block 3 executed"
+        );
         assert_eq!(
             state_db.get_cf_raw(CF_BLOCK_BODIES, &key).unwrap().unwrap(),
             tagged_body,
             "exec must NOT rewrite CF_BLOCK_BODIES when dispatch reported the body durable"
         );
         assert_eq!(
-            state_db.get_cf_raw(CF_BLOCK_HEADERS, &key).unwrap().unwrap(),
+            state_db
+                .get_cf_raw(CF_BLOCK_HEADERS, &key)
+                .unwrap()
+                .unwrap(),
             tagged_header,
             "exec must NOT rewrite CF_BLOCK_HEADERS when dispatch reported the header durable"
         );
@@ -14479,8 +14664,14 @@ mod crash_recovery_tests {
 
         // (a) nothing durable ⇒ both rows written by exec.
         let b3 = make_block(3, vec![sign_claim_rewards(3)]);
-        assert!(state_db.get_cf_raw(CF_BLOCK_BODIES, &key).unwrap().is_none());
-        assert!(state_db.get_cf_raw(CF_BLOCK_HEADERS, &key).unwrap().is_none());
+        assert!(state_db
+            .get_cf_raw(CF_BLOCK_BODIES, &key)
+            .unwrap()
+            .is_none());
+        assert!(state_db
+            .get_cf_raw(CF_BLOCK_HEADERS, &key)
+            .unwrap()
+            .is_none());
         let exec_ctx = make_exec_ctx(&config, &state_db);
         exec_ctx.execute_committed_block(&b3, vec![]);
         assert_eq!(read_native_applied_height(&state_db), Some(3));
@@ -14489,7 +14680,9 @@ mod crash_recovery_tests {
         let body = load_replay_body(&state_db, 3).expect("exec-time body write must land");
         assert_eq!(body.native_actions.len(), 1);
         assert_eq!(
-            load_replay_header(&state_db, 3).expect("exec-time header write must land").height,
+            load_replay_header(&state_db, 3)
+                .expect("exec-time header write must land")
+                .height,
             3
         );
 
@@ -14499,9 +14692,14 @@ mod crash_recovery_tests {
         b4.header.parent_hash = alloy_primitives::keccak256(b3.header.canonical_header_bytes());
         let key4 = 4u64.to_be_bytes();
         assert!(persist_block_header(&state_db, &b4));
-        let mut tagged_header = state_db.get_cf_raw(CF_BLOCK_HEADERS, &key4).unwrap().unwrap();
+        let mut tagged_header = state_db
+            .get_cf_raw(CF_BLOCK_HEADERS, &key4)
+            .unwrap()
+            .unwrap();
         tagged_header.extend_from_slice(b"#dispatch-row");
-        state_db.put_cf_raw(CF_BLOCK_HEADERS, &key4, &tagged_header).unwrap();
+        state_db
+            .put_cf_raw(CF_BLOCK_HEADERS, &key4, &tagged_header)
+            .unwrap();
         exec_ctx.execute_committed_block_with(
             &b4,
             vec![],
@@ -14512,11 +14710,17 @@ mod crash_recovery_tests {
         );
         assert_eq!(read_native_applied_height(&state_db), Some(4));
         assert_eq!(
-            load_replay_body(&state_db, 4).expect("body must be written when not durable").native_actions.len(),
+            load_replay_body(&state_db, 4)
+                .expect("body must be written when not durable")
+                .native_actions
+                .len(),
             1
         );
         assert_eq!(
-            state_db.get_cf_raw(CF_BLOCK_HEADERS, &key4).unwrap().unwrap(),
+            state_db
+                .get_cf_raw(CF_BLOCK_HEADERS, &key4)
+                .unwrap()
+                .unwrap(),
             tagged_header,
             "header reported durable must not be rewritten even when the body is"
         );
@@ -14563,7 +14767,13 @@ mod crash_recovery_tests {
         }
 
         assert!(load_replay_header(&state_db, 11).is_some());
-        assert_eq!(load_replay_body(&state_db, 11).unwrap().native_actions.len(), 2);
+        assert_eq!(
+            load_replay_body(&state_db, 11)
+                .unwrap()
+                .native_actions
+                .len(),
+            2
+        );
         assert!(
             state_db
                 .get_cf_raw(CF_COMMIT_MANIFEST, &11u64.to_be_bytes())
@@ -14656,7 +14866,10 @@ mod crash_recovery_tests {
         {
             let state_db = StateDb::open(&dir).expect("open");
             let block = make_block(7, vec![sign_claim_rewards(7)]);
-            assert_eq!(block.header.native_action_count, 1, "sanity: non-empty block");
+            assert_eq!(
+                block.header.native_action_count, 1,
+                "sanity: non-empty block"
+            );
             persist_committed_block_durably(&state_db, &block);
             assert!(
                 sync_committed_wal(&state_db, true),
@@ -14722,8 +14935,15 @@ mod crash_recovery_tests {
 
         // Drain with both bodies missing: nothing executes, frontier stays at the hole.
         app.drain_exec_queue();
-        assert_eq!(app.exec_next_height, Some(5), "a missing-body hole must NOT advance");
-        assert!(app.deferred_exec.contains_key(&5), "the hole stays buffered");
+        assert_eq!(
+            app.exec_next_height,
+            Some(5),
+            "a missing-body hole must NOT advance"
+        );
+        assert!(
+            app.deferred_exec.contains_key(&5),
+            "the hole stays buffered"
+        );
         assert!(!app.is_exec_failed(), "still within budget — no latch");
 
         // Late body injection for the hole (5) ONLY: block-sync wrote 5's body.
@@ -14734,12 +14954,19 @@ mod crash_recovery_tests {
             Some(6),
             "the injected body must heal height 5 in order and advance to 6"
         );
-        assert!(app.deferred_exec.contains_key(&6), "6 waits — its body is still missing");
+        assert!(
+            app.deferred_exec.contains_key(&6),
+            "6 waits — its body is still missing"
+        );
 
         // Inject 6's body too: the run drains fully.
         persist_block_body_for_test(&app.state_db, &b6);
         app.drain_exec_queue();
-        assert_eq!(app.exec_next_height, Some(7), "the whole contiguous run heals in order");
+        assert_eq!(
+            app.exec_next_height,
+            Some(7),
+            "the whole contiguous run heals in order"
+        );
         assert!(app.deferred_exec.is_empty(), "queue fully drained");
     }
 
@@ -14815,7 +15042,10 @@ mod crash_recovery_tests {
         let loaded = load_commit_manifest(&cdb, 5).expect("manifest durable at commit");
         let compact: CompactBlock =
             bincode::deserialize(&loaded).expect("manifest decodes to the committed CompactBlock");
-        let want: Vec<_> = actions.iter().map(torus_types::compute_action_hash).collect();
+        let want: Vec<_> = actions
+            .iter()
+            .map(torus_types::compute_action_hash)
+            .collect();
         assert_eq!(
             compact.native_action_hashes, want,
             "the manifest must carry every committed action hash (the peer-pull key)"
@@ -14835,7 +15065,10 @@ mod crash_recovery_tests {
     fn boot_parked_hole_arms_peer_pull_with_real_hashes() {
         let (config, state_db) = make_test_config_and_db();
         let actions: Vec<SignedNativeAction> = (0..20).map(sign_claim_rewards).collect();
-        let want: Vec<_> = actions.iter().map(torus_types::compute_action_hash).collect();
+        let want: Vec<_> = actions
+            .iter()
+            .map(torus_types::compute_action_hash)
+            .collect();
         // Height 5 (small: `make_block` recurses over parent hashes; h1165 would
         // overflow the test stack). The height is cosmetic to the heal logic.
         let block = make_block(5, actions);
@@ -14926,7 +15159,11 @@ mod crash_recovery_tests {
 
         // Bodies absent from the DA store: the hole holds, no out-of-order exec.
         app.drain_exec_queue();
-        assert_eq!(app.exec_next_height, Some(5), "a missing-body hole must NOT advance");
+        assert_eq!(
+            app.exec_next_height,
+            Some(5),
+            "a missing-body hole must NOT advance"
+        );
         assert!(!app.is_exec_failed(), "still within budget — no latch");
 
         // A peer serves height 5's bodies into the durable DA store.
@@ -14941,7 +15178,11 @@ mod crash_recovery_tests {
         // Height 6's bodies arrive too: the run drains fully.
         let _ = mempool.mirror_native_to_da(&a6);
         app.drain_exec_queue();
-        assert_eq!(app.exec_next_height, Some(7), "the whole contiguous run heals in order");
+        assert_eq!(
+            app.exec_next_height,
+            Some(7),
+            "the whole contiguous run heals in order"
+        );
         assert!(app.deferred_exec.is_empty(), "queue fully drained");
     }
 
@@ -14976,8 +15217,9 @@ mod crash_recovery_tests {
         app.da_fetcher = Some(fetcher.clone());
         app.exec_hole_since = Some(std::time::Instant::now());
 
-        let missing: Vec<torus_types::B256> =
-            (0..20u8).map(|i| torus_types::B256::from([i; 32])).collect();
+        let missing: Vec<torus_types::B256> = (0..20u8)
+            .map(|i| torus_types::B256::from([i; 32]))
+            .collect();
 
         // 40 commit-driven retries (>> the hotstuff 9-cap): every one must issue a
         // fresh pull for the REAL missing hashes, and none may fail-stop (default
@@ -14987,7 +15229,11 @@ mod crash_recovery_tests {
         }
 
         let calls = fetcher.calls.lock().unwrap();
-        assert_eq!(calls.len(), 40, "the heal loop must pull on every retry, never give up at 9");
+        assert_eq!(
+            calls.len(),
+            40,
+            "the heal loop must pull on every retry, never give up at 9"
+        );
         assert!(
             calls.iter().all(|c| c.len() == missing.len()),
             "every retry pulls the REAL missing bodies (non-empty) — not the stalling empty set"
@@ -15140,7 +15386,11 @@ mod crash_recovery_tests {
         };
         let (saw, did_not) = (node(true), node(false));
 
-        let row = |db: &StateDb| StakingManager::new(db.clone()).get_validator(&leader).unwrap();
+        let row = |db: &StateDb| {
+            StakingManager::new(db.clone())
+                .get_validator(&leader)
+                .unwrap()
+        };
         assert_eq!(
             format!("{:?}", row(&saw)),
             format!("{:?}", row(&did_not)),
@@ -15149,8 +15399,15 @@ mod crash_recovery_tests {
         let slash_records = |db: &StateDb| {
             StateBackend::iterate_cf(db, torus_state::cf::CF_SLASH_RECORDS, None).unwrap()
         };
-        assert_eq!(slash_records(&saw), slash_records(&did_not), "slash records");
-        assert!(slash_records(&saw).is_empty(), "no slash from local observation");
+        assert_eq!(
+            slash_records(&saw),
+            slash_records(&did_not),
+            "slash records"
+        );
+        assert!(
+            slash_records(&saw).is_empty(),
+            "no slash from local observation"
+        );
         assert_eq!(
             torus_state::running_hash::read_running_hash(&saw),
             torus_state::running_hash::read_running_hash(&did_not),
@@ -15188,14 +15445,22 @@ mod crash_recovery_tests {
     fn epoch_rotation_identical_across_exec_lag() {
         use torus_economics::types::{ValidatorState, ValidatorStatus};
         let consensus_keys: Vec<[u8; 32]> = (1..=4u8)
-            .map(|i| ed25519_dalek::SigningKey::from_bytes(&[0x40 + i; 32]).verifying_key().to_bytes())
+            .map(|i| {
+                ed25519_dalek::SigningKey::from_bytes(&[0x40 + i; 32])
+                    .verifying_key()
+                    .to_bytes()
+            })
             .collect();
         let accounts: Vec<k256::ecdsa::SigningKey> = (1..=4u8)
             .map(|i| k256::ecdsa::SigningKey::from_slice(&[0x50 + i; 32]).unwrap())
             .collect();
-        let rotated_key = ed25519_dalek::SigningKey::from_bytes(&[0x60; 32]).verifying_key().to_bytes();
+        let rotated_key = ed25519_dalek::SigningKey::from_bytes(&[0x60; 32])
+            .verifying_key()
+            .to_bytes();
         let rotate = torus_types::eip712::sign_native_action(
-            NativeAction::RotateValidatorKey { new_pubkey: torus_types::PublicKey(rotated_key) },
+            NativeAction::RotateValidatorKey {
+                new_pubkey: torus_types::PublicKey(rotated_key),
+            },
             NONCE_BASE + 1,
             &accounts[0],
         );
@@ -15233,8 +15498,13 @@ mod crash_recovery_tests {
                     next += 1;
                 }
                 let before = dump_all_cfs(&db);
-                let updates = app.epoch_validator_set_updates(boundary).expect("plan ready");
-                assert!(before == dump_all_cfs(&db), "consensus thread wrote the DB at {boundary}");
+                let updates = app
+                    .epoch_validator_set_updates(boundary)
+                    .expect("plan ready");
+                assert!(
+                    before == dump_all_cfs(&db),
+                    "consensus thread wrote the DB at {boundary}"
+                );
                 seen.push(canonical_updates(updates));
             }
             while next <= 8 {
@@ -15271,7 +15541,10 @@ mod crash_recovery_tests {
         let (ins, del) = near.0[1].clone().expect("plan for 8 changes the set");
         assert!(ins.iter().any(|(k, _)| *k == rotated_key), "{ins:?}");
         assert!(del.contains(&consensus_keys[0]), "{del:?}");
-        assert_eq!(near.3, rotated_key, "validator 0 row carries the rotated key");
+        assert_eq!(
+            near.3, rotated_key,
+            "validator 0 row carries the rotated key"
+        );
         assert!(near.2.is_empty(), "pending rotation consumed");
     }
 
@@ -15290,12 +15563,21 @@ mod crash_recovery_tests {
         for b in &blocks[..3] {
             dispatch_and_execute(&ctx, &db, b);
         }
-        assert!(app.epoch_validator_set_updates(4).is_ok(), "boundary 4 needs applied >= 0");
+        assert!(
+            app.epoch_validator_set_updates(4).is_ok(),
+            "boundary 4 needs applied >= 0"
+        );
         assert!(app.epoch_validator_set_updates(8).is_err(), "applied 3 < 4");
         let parent7 = make_block(7, vec![]).header;
-        assert!(app.build_proposal(parent7).data.vec().is_empty(), "leader refuses block 8");
+        assert!(
+            app.build_proposal(parent7).data.vec().is_empty(),
+            "leader refuses block 8"
+        );
         dispatch_and_execute(&ctx, &db, &blocks[3]);
-        assert!(app.epoch_validator_set_updates(8).is_ok(), "applied 4: plan for 8 readable");
+        assert!(
+            app.epoch_validator_set_updates(8).is_ok(),
+            "applied 4: plan for 8 readable"
+        );
         drop(ctx);
     }
 
@@ -15332,7 +15614,10 @@ mod crash_recovery_tests {
         // A DIFFERENT block Y at the same height → conflicting commit, must latch.
         let block_y = make_block(5, vec![sign_claim_rewards(2), sign_claim_rewards(3)]);
         let y_hash = alloy_primitives::keccak256(block_y.header.canonical_header_bytes());
-        assert_ne!(x_hash, y_hash, "precondition: the two blocks must hash differently");
+        assert_ne!(
+            x_hash, y_hash,
+            "precondition: the two blocks must hash differently"
+        );
 
         let latch = AtomicBool::new(false);
         assert!(
@@ -15469,16 +15754,27 @@ mod crash_recovery_tests {
         use torus_state::cf::{CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES};
         use torus_state::trade_rows::{META_TRADE_HISTORY_FORMAT, TRADE_HISTORY_FORMAT};
         let (config, state_db) = make_test_config_and_db();
-        state_db.put_cf_raw(CF_NATIVE_TRADES, &[1; 20], &[0; 65]).unwrap();
-        state_db.put_cf_raw(CF_NATIVE_USER_TRADES, &[2; 32], &[0; 74]).unwrap();
+        state_db
+            .put_cf_raw(CF_NATIVE_TRADES, &[1; 20], &[0; 65])
+            .unwrap();
+        state_db
+            .put_cf_raw(CF_NATIVE_USER_TRADES, &[2; 32], &[0; 74])
+            .unwrap();
 
         let _app = TorusApp::new(state_db.clone(), &config, None, None, None);
 
         for cf in [CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES] {
-            assert!(StateBackend::iterate_cf(&state_db, cf, None).unwrap().is_empty(), "{cf}");
+            assert!(
+                StateBackend::iterate_cf(&state_db, cf, None)
+                    .unwrap()
+                    .is_empty(),
+                "{cf}"
+            );
         }
         assert_eq!(
-            state_db.get_cf_raw(CF_CONSENSUS_META, META_TRADE_HISTORY_FORMAT).unwrap(),
+            state_db
+                .get_cf_raw(CF_CONSENSUS_META, META_TRADE_HISTORY_FORMAT)
+                .unwrap(),
             Some(vec![TRADE_HISTORY_FORMAT])
         );
     }
@@ -15516,9 +15812,12 @@ mod crash_recovery_tests {
         ];
         let core_payloads = [
             vec![],
-            vec![torus_types::CoreWriterAction::PermanentStake {
-                amount: U256::from(42),
-            }; 3],
+            vec![
+                torus_types::CoreWriterAction::PermanentStake {
+                    amount: U256::from(42),
+                };
+                3
+            ],
         ];
         for actions in [vec![], vec![sign_claim_rewards(1), sign_claim_rewards(2)]] {
             for evm in &evm_payloads {
@@ -15538,10 +15837,7 @@ mod crash_recovery_tests {
                         bincode::serialize(&decoded.core_writer_actions).unwrap(),
                         bincode::serialize(&block.core_writer_actions).unwrap()
                     );
-                    assert_eq!(
-                        pending.encode(false),
-                        bincode::serialize(&block).unwrap()
-                    );
+                    assert_eq!(pending.encode(false), bincode::serialize(&block).unwrap());
                 }
             }
         }
@@ -15598,8 +15894,7 @@ mod crash_recovery_tests {
     fn pending_proposal_warm_and_cold_match_reference_for_body_variants() {
         let actions = vec![sign_claim_rewards(1), big_order_batch_action(2, 400)];
         let mut resigned = actions.clone();
-        let torus_types::ActionSignature::Eip712(ref mut signature) = resigned[0].signature
-        else {
+        let torus_types::ActionSignature::Eip712(ref mut signature) = resigned[0].signature else {
             panic!("fixture must have an EIP-712 signature");
         };
         signature.r[0] ^= 1;
@@ -15692,7 +15987,10 @@ mod crash_recovery_tests {
         );
         assert_eq!(
             msg.settled_durable(),
-            DurableRows { header: true, body: true }
+            DurableRows {
+                header: true,
+                body: true
+            }
         );
         let durable_body = load_replay_body(&state_db, 5).expect("body durable before dispatch");
         assert_eq!(
@@ -15979,7 +16277,10 @@ mod crash_recovery_tests {
     /// Parse `name N` (histogram `_count` line) out of `Metrics::encode()` text.
     fn metric_count(text: &str, name: &str) -> u64 {
         text.lines()
-            .find_map(|l| l.strip_prefix(name).and_then(|rest| rest.trim().parse().ok()))
+            .find_map(|l| {
+                l.strip_prefix(name)
+                    .and_then(|rest| rest.trim().parse().ok())
+            })
             .unwrap_or(0)
     }
 
@@ -16263,13 +16564,19 @@ mod crash_recovery_tests {
             ValidateBlockResponse::MissingData
         ));
         let text = metrics.encode();
-        assert_eq!(metric_count(&text, "torus_validate_block_da_multiget_seconds_count"), 2);
+        assert_eq!(
+            metric_count(&text, "torus_validate_block_da_multiget_seconds_count"),
+            2
+        );
         assert_eq!(
             metric_count(&text, "torus_validate_block_da_flush_seconds_count"),
             1,
             "a miss flushes before giving up"
         );
-        assert_eq!(metric_count(&text, "torus_validate_block_da_wait_seconds_count"), 1);
+        assert_eq!(
+            metric_count(&text, "torus_validate_block_da_wait_seconds_count"),
+            1
+        );
     }
 
     #[test]
@@ -16286,7 +16593,10 @@ mod crash_recovery_tests {
 
         // The worker recorded the heavy-stage timers while validating.
         let text = metrics.encode();
-        assert_eq!(metric_count(&text, "torus_validate_block_decode_seconds_count"), 1);
+        assert_eq!(
+            metric_count(&text, "torus_validate_block_decode_seconds_count"),
+            1
+        );
         assert_eq!(
             metric_count(&text, "torus_validate_block_da_reconstruct_seconds_count"),
             1
@@ -16297,7 +16607,10 @@ mod crash_recovery_tests {
 
         // HIT: the heavy stage did NOT re-run on the calling thread.
         let text = metrics.encode();
-        assert_eq!(metric_count(&text, "torus_validate_block_decode_seconds_count"), 1);
+        assert_eq!(
+            metric_count(&text, "torus_validate_block_decode_seconds_count"),
+            1
+        );
         assert_eq!(
             metric_count(&text, "torus_validate_block_da_reconstruct_seconds_count"),
             1
@@ -16550,7 +16863,10 @@ mod crash_recovery_tests {
         /// hit elsewhere (no subscriber) was cached as never (650a9fa5).
         struct Sometimes;
         impl tracing::Subscriber for Sometimes {
-            fn register_callsite(&self, _: &'static tracing::Metadata<'static>) -> tracing::subscriber::Interest {
+            fn register_callsite(
+                &self,
+                _: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
                 tracing::subscriber::Interest::sometimes()
             }
             fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
@@ -16566,7 +16882,9 @@ mod crash_recovery_tests {
             fn exit(&self, _: &tracing::span::Id) {}
         }
         static GLOBAL: std::sync::Once = std::sync::Once::new();
-        GLOBAL.call_once(|| tracing::subscriber::set_global_default(Sometimes).expect("no other global subscriber"));
+        GLOBAL.call_once(|| {
+            tracing::subscriber::set_global_default(Sometimes).expect("no other global subscriber")
+        });
         let buf = Buf::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(buf.clone())
@@ -16609,7 +16927,10 @@ mod crash_recovery_tests {
         let (kept, bodies, hashes) = app.mirror_or_drop_native(with_senders);
         assert_eq!(
             hashes,
-            actions.iter().map(torus_types::compute_action_hash).collect::<Vec<_>>()
+            actions
+                .iter()
+                .map(torus_types::compute_action_hash)
+                .collect::<Vec<_>>()
         );
         assert_eq!(kept.as_ptr(), original_allocation);
         assert_eq!(
@@ -16694,7 +17015,11 @@ mod crash_recovery_tests {
         );
         let (kept, bodies, hashes) =
             app.mirror_or_drop_native(vec![(action.recover_sender().unwrap(), action.clone())]);
-        assert_eq!(kept.len(), 1, "an already-stored body stays in the proposal");
+        assert_eq!(
+            kept.len(),
+            1,
+            "an already-stored body stays in the proposal"
+        );
         assert_eq!(bodies.len(), 1);
         assert_eq!(hashes, vec![torus_types::compute_action_hash(&action)]);
         assert_eq!(mempool.da_flush_failures(), 0, "no write was attempted");
@@ -16753,8 +17078,7 @@ mod crash_recovery_tests {
         let block = make_block(1, vec![action.clone()]);
         let datum = encode_proposal_datum(&block, false);
 
-        let mut app =
-            TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
+        let mut app = TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
         app.last_validator_set = make_validator_set(4);
 
         match app.decode_proposal_and_ensure_durable(&datum) {
@@ -16810,8 +17134,7 @@ mod crash_recovery_tests {
         let block = make_block(1, vec![action.clone()]);
         let datum = encode_proposal_datum(&block, true);
 
-        let mut app =
-            TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
+        let mut app = TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
         app.last_validator_set = make_validator_set(4);
 
         match app.decode_proposal_and_ensure_durable(&datum) {
@@ -16836,7 +17159,10 @@ mod crash_recovery_tests {
     fn validate_block_custodies_no_shards_by_default() {
         assert!(
             !matches!(
-                std::env::var("TORUS_SHARD_CUSTODY").ok().as_deref().map(str::trim),
+                std::env::var("TORUS_SHARD_CUSTODY")
+                    .ok()
+                    .as_deref()
+                    .map(str::trim),
                 Some("1")
             ),
             "run this test without TORUS_SHARD_CUSTODY=1 in the environment"
@@ -16858,8 +17184,7 @@ mod crash_recovery_tests {
             .mirror_native_to_da(std::slice::from_ref(&compact))
             .expect("mirror compact body into DA store");
 
-        let mut app =
-            TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
+        let mut app = TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
         app.last_validator_set = make_validator_set(4);
 
         let full_datum = encode_proposal_datum(&make_block(1, vec![full.clone()]), false);
@@ -16874,7 +17199,10 @@ mod crash_recovery_tests {
         }
 
         // Durability is unchanged: the full-block body was mirrored.
-        assert!(mempool.get_native_da(&full_hash).is_some(), "full body durable");
+        assert!(
+            mempool.get_native_da(&full_hash).is_some(),
+            "full body durable"
+        );
         let params = torus_state::ErasureParams::for_validator_set(4);
         for hash in [&full_hash, &compact_hash] {
             for i in 0..params.n as u16 {
@@ -17005,17 +17333,17 @@ mod crash_recovery_tests {
             let mut seed = [0u8; 32];
             seed[..8].copy_from_slice(&(i + 1).to_le_bytes());
             let key = k256::ecdsa::SigningKey::from_slice(&seed).unwrap();
-            let a = torus_types::eip712::sign_native_action(
-                NativeAction::ClaimRewards,
-                base + i,
-                &key,
-            );
+            let a =
+                torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, base + i, &key);
             let s = a.recover_sender().unwrap();
             mempool.add_native_action_presigned(s, a).unwrap();
         }
 
         let app = TorusApp::new(state_db.clone(), &config, None, Some(mempool), None);
-        assert_eq!(app.last_header.height, 0, "precondition: fresh/stale local frontier");
+        assert_eq!(
+            app.last_header.height, 0,
+            "precondition: fresh/stale local frontier"
+        );
 
         // Parent height far ahead of our applied frontier → EMPTY payload.
         let parent_hdr = test_parent_at(&app, 918);
@@ -17331,7 +17659,11 @@ mod crash_recovery_tests {
         // intent is unchanged: an empty committed block in the gap is executed
         // (empty body) and marked applied.
         state_db
-            .put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &2u64.to_be_bytes())
+            .put_cf_raw(
+                CF_CONSENSUS_META,
+                META_NATIVE_APPLIED_HEIGHT,
+                &2u64.to_be_bytes(),
+            )
             .unwrap();
 
         let _app = TorusApp::new(state_db.clone(), &config, None, None, None);
@@ -17697,7 +18029,9 @@ mod crash_recovery_tests {
                 assert!(ctx.pipeline_barrier(), "flush worker drained");
                 assert!(!ctx.exec_failed.load(Ordering::SeqCst), "no fail-stop");
                 assert_eq!(
-                    action_status(&state_db, 1).expect("block 1 record").native_skipped,
+                    action_status(&state_db, 1)
+                        .expect("block 1 record")
+                        .native_skipped,
                     vec![skipped],
                     "pipelined {pipelined}: expiry {expiry} vs block time {block_ms} ms"
                 );
@@ -17718,7 +18052,12 @@ mod crash_recovery_tests {
         let key = k256::ecdsa::SigningKey::from_slice(&[37u8; 32]).unwrap();
         let block_ms = block_timestamp_ms(make_block(1, vec![]).header.timestamp);
         // Oldest allowed, 1 ms too old, newest allowed, 1 ms too new.
-        let nonces = [block_ms - W, block_ms - W - 1, block_ms + W, block_ms + W + 1];
+        let nonces = [
+            block_ms - W,
+            block_ms - W - 1,
+            block_ms + W,
+            block_ms + W + 1,
+        ];
         let block = make_block(
             1,
             nonces
@@ -17735,7 +18074,9 @@ mod crash_recovery_tests {
             assert!(ctx.pipeline_barrier(), "flush worker drained");
             assert!(!ctx.exec_failed.load(Ordering::SeqCst), "no fail-stop");
             assert_eq!(
-                action_status(&state_db, 1).expect("block 1 record").native_skipped,
+                action_status(&state_db, 1)
+                    .expect("block 1 record")
+                    .native_skipped,
                 vec![false, true, false, true],
                 "pipelined {pipelined}: window around block time {block_ms} ms"
             );
@@ -17799,8 +18140,11 @@ mod crash_recovery_tests {
         let evm_key = k256::ecdsa::SigningKey::from_slice(&[34u8; 32]).unwrap();
         let session_key = ed25519_dalek::SigningKey::from_bytes(&[35u8; 32]);
 
-        let first =
-            torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, NONCE_BASE + 1, &key_a);
+        let first = torus_types::eip712::sign_native_action(
+            NativeAction::ClaimRewards,
+            NONCE_BASE + 1,
+            &key_a,
+        );
         let parent3 = make_block(3, vec![]);
         let block1 = make_block(4, vec![first.clone()]);
 
@@ -17818,8 +18162,11 @@ mod crash_recovery_tests {
             NONCE_BASE + 8,
             &session_key,
         );
-        let valid =
-            torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, NONCE_BASE + 9, &key_c);
+        let valid = torus_types::eip712::sign_native_action(
+            NativeAction::ClaimRewards,
+            NONCE_BASE + 9,
+            &key_c,
+        );
         // Positions: 0 replay of block 1's action, 1 forged, 2 expired, 3 valid.
         let mut block2 = make_block(5, vec![first, forged, expired, valid]);
         block2.header.parent_hash =
@@ -17915,7 +18262,11 @@ mod crash_recovery_tests {
                 }),
                 "replica {replica}: replay, forged and expired skipped; valid executed (and failed)"
             );
-            assert!(nonce_consumed(&state_db, k256_address(&key_a), NONCE_BASE + 1));
+            assert!(nonce_consumed(
+                &state_db,
+                k256_address(&key_a),
+                NONCE_BASE + 1
+            ));
             assert!(
                 nonce_consumed(&state_db, k256_address(&key_c), NONCE_BASE + 9),
                 "valid action executed"
@@ -18241,7 +18592,10 @@ mod crash_recovery_tests {
             reduce_only: false,
             client_order_id: None,
         };
-        let tif = |t, o: PlaceOrderParams| PlaceOrderParams { time_in_force: t, ..o };
+        let tif = |t, o: PlaceOrderParams| PlaceOrderParams {
+            time_in_force: t,
+            ..o
+        };
         let sign = |a: NativeAction, n: u64, k: &k256::ecdsa::SigningKey| {
             torus_types::eip712::sign_native_action(a, NONCE_BASE + n, k)
         };
@@ -18262,7 +18616,11 @@ mod crash_recovery_tests {
                 4,
                 vec![
                     sign(place(tif(TimeInForce::IOC, order(true, 105, 1))), 2, k_a),
-                    sign(place(tif(TimeInForce::PostOnly, order(true, 110, 1))), 3, k_a),
+                    sign(
+                        place(tif(TimeInForce::PostOnly, order(true, 110, 1))),
+                        3,
+                        k_a,
+                    ),
                     sign(
                         place(PlaceOrderParams {
                             order_type: OrderType::Market,
@@ -18271,7 +18629,14 @@ mod crash_recovery_tests {
                         4,
                         k_a,
                     ),
-                    sign(place(PlaceOrderParams { reduce_only: true, ..order(false, 100, 1) }), 5, k_a),
+                    sign(
+                        place(PlaceOrderParams {
+                            reduce_only: true,
+                            ..order(false, 100, 1)
+                        }),
+                        5,
+                        k_a,
+                    ),
                     sign(place(tif(TimeInForce::FOK, order(true, 110, 5))), 6, k_a),
                     sign(
                         place(PlaceOrderParams {
@@ -18294,7 +18659,14 @@ mod crash_recovery_tests {
                     sign(place(order(true, 100, 100_000)), 8, k_a),
                 ],
             ),
-            make_block(5, vec![sign(place(tif(TimeInForce::IOC, order(false, 100, 3))), 2, k_d)]),
+            make_block(
+                5,
+                vec![sign(
+                    place(tif(TimeInForce::IOC, order(false, 100, 3))),
+                    2,
+                    k_d,
+                )],
+            ),
         ];
         link_blocks(&mut blocks);
         blocks
@@ -18345,8 +18717,18 @@ mod crash_recovery_tests {
                     (0..8).all(|i| status.native_label(i) == "rejected"),
                     "{label}"
                 );
-                assert!(status.native_failed[0].message.starts_with("order rejected: IOC"), "{label}");
-                assert!(status.native_failed[7].message.starts_with("insufficient margin"), "{label}");
+                assert!(
+                    status.native_failed[0]
+                        .message
+                        .starts_with("order rejected: IOC"),
+                    "{label}"
+                );
+                assert!(
+                    status.native_failed[7]
+                        .message
+                        .starts_with("insufficient margin"),
+                    "{label}"
+                );
                 let raw = db
                     .get_cf_raw(torus_state::cf::CF_BLOCK_ACTION_STATUS, &4u64.to_be_bytes())
                     .unwrap()
@@ -18358,7 +18740,11 @@ mod crash_recovery_tests {
                     .unwrap()
                     .expect("record");
                 assert_eq!(raw[0], 0x01, "{label}: block 5 keeps v1");
-                assert_eq!(action_status(&db, 5).unwrap().native_label(0), "executed", "{label}");
+                assert_eq!(
+                    action_status(&db, 5).unwrap().native_label(0),
+                    "executed",
+                    "{label}"
+                );
                 dumps.push((label, dump_all_cfs(&db)));
             }
         }
@@ -18403,8 +18789,11 @@ mod crash_recovery_tests {
                     "{label}: {:?}",
                     status.native_failed
                 );
-                let msgs: Vec<&str> =
-                    status.native_failed.iter().map(|f| f.message.as_str()).collect();
+                let msgs: Vec<&str> = status
+                    .native_failed
+                    .iter()
+                    .map(|f| f.message.as_str())
+                    .collect();
                 for (i, want) in [
                     "order rejected: price 100.50000000 is not a multiple of the tick 1.00000000",
                     "order rejected: price 100.50000000 is not a multiple of the tick 1.00000000",
@@ -19056,7 +19445,8 @@ mod crash_recovery_tests {
             StateBackend::iterate_cf(&state_db, torus_state::cf::CF_NATIVE_USER_TRADES, None)
                 .unwrap();
         assert_eq!(trades.len(), 1, "one market row via the background writer");
-        let (market, block, chunk) = torus_state::trade_rows::parse_trade_key(&trades[0].0).unwrap();
+        let (market, block, chunk) =
+            torus_state::trade_rows::parse_trade_key(&trades[0].0).unwrap();
         assert_eq!((market, block, chunk), (1, 2, 0));
         let (ts, fills) = torus_state::trade_rows::decode_trade_row(&trades[0].1).unwrap();
         assert_eq!(ts, block2.header.timestamp);
@@ -19068,7 +19458,13 @@ mod crash_recovery_tests {
             .flat_map(|(_, v)| torus_state::trade_rows::decode_user_row(v).unwrap().1)
             .map(|e| e.role)
             .collect();
-        assert_eq!(roles.iter().copied().collect::<std::collections::BTreeSet<_>>(), [0, 1].into());
+        assert_eq!(
+            roles
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [0, 1].into()
+        );
     }
 
     // ---- L3 flush-pipe (b): async post-flush stage (TORUS_ASYNC_POST_FLUSH) ----
@@ -19398,7 +19794,10 @@ mod crash_recovery_tests {
         let metrics = Arc::new(torus_telemetry::Metrics::new());
         exec_ctx.metrics = Some(metrics.clone());
 
-        exec_ctx.execute_committed_block(&make_block(1, vec![sign_claim_rewards(NONCE_BASE + 7)]), vec![]);
+        exec_ctx.execute_committed_block(
+            &make_block(1, vec![sign_claim_rewards(NONCE_BASE + 7)]),
+            vec![],
+        );
 
         let text = metrics.encode();
         for name in [
@@ -21491,7 +21890,10 @@ mod crash_recovery_tests {
             "then H+1"
         );
         assert!(rx.try_recv().is_err(), "nothing else queued");
-        assert!(!app.is_exec_failed(), "in-order delivery must not fail-stop");
+        assert!(
+            !app.is_exec_failed(),
+            "in-order delivery must not fail-stop"
+        );
     }
 
     /// RED-first (deferred hole heals): a committed block whose native bodies are
@@ -21540,9 +21942,21 @@ mod crash_recovery_tests {
         let c7 = committed_compact_block(&b7);
         app.on_committed_block(&c7, c7.hash);
 
-        assert_eq!(rx.try_recv().unwrap().torus_block.header.height, 5, "5 first");
-        assert_eq!(rx.try_recv().unwrap().torus_block.header.height, 6, "then 6");
-        assert_eq!(rx.try_recv().unwrap().torus_block.header.height, 7, "then 7");
+        assert_eq!(
+            rx.try_recv().unwrap().torus_block.header.height,
+            5,
+            "5 first"
+        );
+        assert_eq!(
+            rx.try_recv().unwrap().torus_block.header.height,
+            6,
+            "then 6"
+        );
+        assert_eq!(
+            rx.try_recv().unwrap().torus_block.header.height,
+            7,
+            "then 7"
+        );
         assert!(rx.try_recv().is_err(), "exactly three blocks, in order");
         assert!(
             !app.is_exec_failed(),
@@ -21641,8 +22055,16 @@ mod crash_recovery_tests {
             make_block(
                 1,
                 vec![
-                    sign(NativeAction::TransferToPerp { amount: deposit }, 9_000, &k_a),
-                    sign(NativeAction::TransferToPerp { amount: deposit }, 9_001, &k_b),
+                    sign(
+                        NativeAction::TransferToPerp { amount: deposit },
+                        9_000,
+                        &k_a,
+                    ),
+                    sign(
+                        NativeAction::TransferToPerp { amount: deposit },
+                        9_001,
+                        &k_b,
+                    ),
                 ],
             ),
             make_block(2, vec![]),
@@ -21686,12 +22108,20 @@ mod crash_recovery_tests {
             ),
             make_block(
                 11,
-                vec![sign(NativeAction::PlaceOrder(order(true, 102)), 9_008, &k_b)],
+                vec![sign(
+                    NativeAction::PlaceOrder(order(true, 102)),
+                    9_008,
+                    &k_b,
+                )],
             ),
             make_block(12, vec![]),
             make_block(
                 13,
-                vec![sign(NativeAction::PlaceOrder(order(false, 103)), 9_009, &k_a)],
+                vec![sign(
+                    NativeAction::PlaceOrder(order(false, 103)),
+                    9_009,
+                    &k_a,
+                )],
             ),
         ];
         link_blocks(&mut blocks);
@@ -21732,7 +22162,10 @@ mod crash_recovery_tests {
     /// durable rows (what makes a block eligible for the fast path).
     fn dispatch_and_execute(ctx: &ExecutionContext, state_db: &StateDb, block: &TorusBlock) {
         let durable = persist_committed_block_durably(state_db, block);
-        assert!(durable.header && durable.body, "fixture rows must be dispatch-durable");
+        assert!(
+            durable.header && durable.body,
+            "fixture rows must be dispatch-durable"
+        );
         ctx.execute_committed_block_with(block, vec![], durable);
     }
 
@@ -21813,15 +22246,30 @@ mod crash_recovery_tests {
                 .filter(|b| traded.contains(&b.header.height))
                 .map(|b| b.native_actions.len())
                 .sum();
-            assert!(filled > 0, "fixture must produce fills (on={on} writer={writer})");
+            assert!(
+                filled > 0,
+                "fixture must produce fills (on={on} writer={writer})"
+            );
 
             let text = metrics.encode();
             let count = |stage: &str| {
                 metric_value(&text, &format!("torus_order_age_{stage}_seconds_count")) as usize
             };
-            assert_eq!(count("exec"), native, "exec (on={on} writer={writer}):\n{text}");
-            assert_eq!(count("durable"), native, "durable (on={on} writer={writer}):\n{text}");
-            assert_eq!(count("fills_visible"), filled, "fills_visible (on={on} writer={writer}):\n{text}");
+            assert_eq!(
+                count("exec"),
+                native,
+                "exec (on={on} writer={writer}):\n{text}"
+            );
+            assert_eq!(
+                count("durable"),
+                native,
+                "durable (on={on} writer={writer}):\n{text}"
+            );
+            assert_eq!(
+                count("fills_visible"),
+                filled,
+                "fills_visible (on={on} writer={writer}):\n{text}"
+            );
         }
     }
 
@@ -21854,7 +22302,8 @@ mod crash_recovery_tests {
         }
         let last = blocks.last().unwrap();
         let mut empty = make_block(last.header.height + 1, vec![]);
-        empty.header.parent_hash = alloy_primitives::keccak256(last.header.canonical_header_bytes());
+        empty.header.parent_hash =
+            alloy_primitives::keccak256(last.header.canonical_header_bytes());
         dispatch_and_execute(&ctx, &state_db, &empty);
 
         let text = metrics.encode();
@@ -21897,10 +22346,16 @@ mod crash_recovery_tests {
                 assert!(!rows_on.is_empty(), "fixture must write {cf} when on");
                 assert!(rows_off.is_empty(), "{cf} must stay empty when off");
             } else {
-                assert_eq!(rows_on, rows_off, "CF {cf} must not depend on trade history");
+                assert_eq!(
+                    rows_on, rows_off,
+                    "CF {cf} must not depend on trade history"
+                );
             }
         }
-        assert_eq!(root_on, root_off, "native root must not depend on trade history");
+        assert_eq!(
+            root_on, root_off,
+            "native root must not depend on trade history"
+        );
     }
 
     type SeenFills = Arc<std::sync::Mutex<Vec<Arc<torus_state::trade_rows::BlockFills>>>>;
@@ -21928,7 +22383,11 @@ mod crash_recovery_tests {
         on: bool,
         history: bool,
         sink_wants: Option<bool>,
-    ) -> (Vec<CfDump>, torus_types::B256, Option<Vec<Arc<torus_state::trade_rows::BlockFills>>>) {
+    ) -> (
+        Vec<CfDump>,
+        torus_types::B256,
+        Option<Vec<Arc<torus_state::trade_rows::BlockFills>>>,
+    ) {
         torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         let (_cfg, state_db) = make_test_config_and_db();
         fund_pipeline_fixture(&state_db);
@@ -21936,14 +22395,19 @@ mod crash_recovery_tests {
         ctx.trade_history = history;
         let seen: SeenFills = Default::default();
         if let Some(wants) = sink_wants {
-            let sink: Arc<dyn torus_state::trade_rows::FillSink> =
-                Arc::new(TestSink { wants, seen: seen.clone() });
+            let sink: Arc<dyn torus_state::trade_rows::FillSink> = Arc::new(TestSink {
+                wants,
+                seen: seen.clone(),
+            });
             assert!(ctx.fill_sink.set(sink).is_ok());
         }
         for b in &pipeline_fixture_blocks() {
             dispatch_and_execute(&ctx, &state_db, b);
         }
-        assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fixture must not fail-stop");
+        assert!(
+            !ctx.exec_failed.load(Ordering::SeqCst),
+            "fixture must not fail-stop"
+        );
         drop(ctx); // drains + joins W
         let root = torus_state::native_trie::persisted_native_root(&state_db).unwrap();
         let seen = sink_wants.is_some().then(|| seen.lock().unwrap().clone());
@@ -22010,8 +22474,14 @@ mod crash_recovery_tests {
             let before = dump_all_cfs(&state_db);
             armed.store(true, Ordering::SeqCst);
             ctx.execute_committed_block_with(block3, vec![], durable);
-            assert!(!armed.load(Ordering::SeqCst), "on={on}: the sink ran mid-block");
-            assert!(ctx.exec_failed.load(Ordering::SeqCst), "on={on}: DA latch set");
+            assert!(
+                !armed.load(Ordering::SeqCst),
+                "on={on}: the sink ran mid-block"
+            );
+            assert!(
+                ctx.exec_failed.load(Ordering::SeqCst),
+                "on={on}: DA latch set"
+            );
             drop(ctx); // drains + joins W
 
             let applied = read_native_applied_height(&state_db);
@@ -22053,7 +22523,8 @@ mod crash_recovery_tests {
             );
             let mut from_rows = Vec::new();
             for (key, value) in cf_rows(&dump, torus_state::cf::CF_NATIVE_TRADES) {
-                let (market, height, _chunk) = torus_state::trade_rows::parse_trade_key(key).unwrap();
+                let (market, height, _chunk) =
+                    torus_state::trade_rows::parse_trade_key(key).unwrap();
                 let (ts, trades) = torus_state::trade_rows::decode_trade_row(value).unwrap();
                 for t in trades {
                     from_rows.push((height, ts, market, t));
@@ -22073,10 +22544,17 @@ mod crash_recovery_tests {
                     })
                 })
                 .collect();
-            assert_eq!(from_sink, from_rows, "stream and history disagree (on={on})");
+            assert_eq!(
+                from_sink, from_rows,
+                "stream and history disagree (on={on})"
+            );
             for b in &seen {
                 // A wanting sink: every fill carries its extras.
-                assert_eq!(b.extras.len(), b.fills.len(), "extras index-aligned (on={on})");
+                assert_eq!(
+                    b.extras.len(),
+                    b.fills.len(),
+                    "extras index-aligned (on={on})"
+                );
                 for e in &b.extras {
                     assert_ne!(e.maker_order_id, 0, "extras carry order ids");
                     assert_ne!(e.taker_order_id, 0, "extras carry order ids");
@@ -22095,13 +22573,27 @@ mod crash_recovery_tests {
             let (plain, root_plain, _) = run_fill_fixture(on, true, None);
             let (idle, root_idle, seen) = run_fill_fixture(on, true, Some(false));
             let seen = seen.unwrap();
-            assert_eq!(fill_summary(&seen), vec![(3, 1, 0), (6, 1, 0), (11, 1, 0)], "on={on}");
-            assert!(seen.iter().all(|b| b.extras.is_empty()), "no subscriber, no extras (on={on})");
+            assert_eq!(
+                fill_summary(&seen),
+                vec![(3, 1, 0), (6, 1, 0), (11, 1, 0)],
+                "on={on}"
+            );
+            assert!(
+                seen.iter().all(|b| b.extras.is_empty()),
+                "no subscriber, no extras (on={on})"
+            );
             let (_, _, wanted) = run_fill_fixture(on, true, Some(true));
             for (a, b) in seen.iter().zip(wanted.unwrap().iter()) {
-                assert_eq!(a.fills, b.fills, "the fills do not depend on a subscriber (on={on})");
+                assert_eq!(
+                    a.fills, b.fills,
+                    "the fills do not depend on a subscriber (on={on})"
+                );
             }
-            assert_dumps_equal(&plain, &idle, &format!("idle sink vs none, history on (on={on})"));
+            assert_dumps_equal(
+                &plain,
+                &idle,
+                &format!("idle sink vs none, history on (on={on})"),
+            );
             assert_eq!(root_plain, root_idle, "native root (on={on})");
         }
     }
@@ -22122,8 +22614,14 @@ mod crash_recovery_tests {
                     (b.height, b.timestamp, &b.fills, &b.extras)
                 );
             }
-            for cf in [torus_state::cf::CF_NATIVE_TRADES, torus_state::cf::CF_NATIVE_USER_TRADES] {
-                assert!(cf_rows(&dump, cf).is_empty(), "{cf} must stay empty (on={on})");
+            for cf in [
+                torus_state::cf::CF_NATIVE_TRADES,
+                torus_state::cf::CF_NATIVE_USER_TRADES,
+            ] {
+                assert!(
+                    cf_rows(&dump, cf).is_empty(),
+                    "{cf} must stay empty (on={on})"
+                );
             }
         }
     }
@@ -22136,8 +22634,15 @@ mod crash_recovery_tests {
             for history in [true, false] {
                 let (plain, root_plain, _) = run_fill_fixture(on, history, None);
                 let (sunk, root_sunk, _) = run_fill_fixture(on, history, Some(true));
-                assert_dumps_equal(&plain, &sunk, &format!("sink vs none (on={on} history={history})"));
-                assert_eq!(root_plain, root_sunk, "native root (on={on} history={history})");
+                assert_dumps_equal(
+                    &plain,
+                    &sunk,
+                    &format!("sink vs none (on={on} history={history})"),
+                );
+                assert_eq!(
+                    root_plain, root_sunk,
+                    "native root (on={on} history={history})"
+                );
             }
         }
     }
@@ -22151,9 +22656,18 @@ mod crash_recovery_tests {
         for on in [false, true] {
             let (plain, root_plain, _) = run_fill_fixture(on, false, None);
             let (idle, root_idle, seen) = run_fill_fixture(on, false, Some(false));
-            assert!(seen.unwrap().is_empty(), "an unwanted sink must receive nothing (on={on})");
-            for cf in [torus_state::cf::CF_NATIVE_TRADES, torus_state::cf::CF_NATIVE_USER_TRADES] {
-                assert!(cf_rows(&idle, cf).is_empty(), "{cf} must stay empty (on={on})");
+            assert!(
+                seen.unwrap().is_empty(),
+                "an unwanted sink must receive nothing (on={on})"
+            );
+            for cf in [
+                torus_state::cf::CF_NATIVE_TRADES,
+                torus_state::cf::CF_NATIVE_USER_TRADES,
+            ] {
+                assert!(
+                    cf_rows(&idle, cf).is_empty(),
+                    "{cf} must stay empty (on={on})"
+                );
             }
             assert_dumps_equal(&plain, &idle, &format!("idle sink vs none (on={on})"));
             assert_eq!(root_plain, root_idle, "native root (on={on})");
@@ -22183,7 +22697,11 @@ mod crash_recovery_tests {
         assert_eq!(trades.len(), 3, "fills at heights 3, 6 and 11");
         let nonces =
             StateBackend::iterate_cf(&db_on, torus_state::cf::CF_NATIVE_NONCES, None).unwrap();
-        assert_eq!(nonces.len(), 11, "10 distinct fixture nonces + sign_claim_rewards(4); the duplicate in 6 consumed none");
+        assert_eq!(
+            nonces.len(),
+            11,
+            "10 distinct fixture nonces + sign_claim_rewards(4); the duplicate in 6 consumed none"
+        );
     }
 
     /// §5 `exec_pipeline_parked_worker_reads_previous_height` (F1/F6 + depth
@@ -22204,8 +22722,15 @@ mod crash_recovery_tests {
         dispatch_and_execute(&ctx, &state_db, &blocks[0]); // native 1 -> W received, parked
         assert!(gate.wait_received(1), "W must have taken job 1");
         assert_eq!(gate.received(), vec![1]);
-        assert_eq!(ctx.exec_applied.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(read_native_applied_height(&state_db), None, "batch(1) not durable yet");
+        assert_eq!(
+            ctx.exec_applied.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            read_native_applied_height(&state_db),
+            None,
+            "batch(1) not durable yet"
+        );
 
         // Block 2 must block at the hand-off (W still holds 1) — run it on a thread.
         let db2 = state_db.clone();
@@ -22217,8 +22742,15 @@ mod crash_recovery_tests {
             ctx
         });
         std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(!worker_thread.is_finished(), "E must block on the FIRST hand-off after a parked job");
-        assert_eq!(gate.received(), vec![1], "W must not have received job 2 while parked on 1");
+        assert!(
+            !worker_thread.is_finished(),
+            "E must block on the FIRST hand-off after a parked job"
+        );
+        assert_eq!(
+            gate.received(),
+            vec![1],
+            "W must not have received job 2 while parked on 1"
+        );
         assert_eq!(read_native_applied_height(&state_db), None);
 
         gate.release();
@@ -22226,10 +22758,18 @@ mod crash_recovery_tests {
         assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
         drop(ctx);
         assert_eq!(gate.received(), vec![1, 2, 3]);
-        assert_eq!(read_native_applied_height(&state_db), Some(3), "marker advanced in order: 1, 2, 3");
+        assert_eq!(
+            read_native_applied_height(&state_db),
+            Some(3),
+            "marker advanced in order: 1, 2, 3"
+        );
         let trades =
             StateBackend::iterate_cf(&state_db, torus_state::cf::CF_NATIVE_TRADES, None).unwrap();
-        assert_eq!(trades.len(), 1, "block 3's fill spent balances written by block 1");
+        assert_eq!(
+            trades.len(),
+            1,
+            "block 3's fill spent balances written by block 1"
+        );
     }
 
     /// §5 `exec_pipeline_redelivery_is_skipped` (F3): while batch(1) is still on
@@ -22251,7 +22791,10 @@ mod crash_recovery_tests {
         assert_eq!(read_native_applied_height(&state_db), None);
         // Re-deliver 1 (same block, same hash) — synchronous skip, no hand-off.
         dispatch_and_execute(&ctx, &state_db, &blocks[0]);
-        assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst), "same hash is not a conflict");
+        assert!(
+            !ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst),
+            "same hash is not a conflict"
+        );
         gate.release();
         drop(ctx);
         assert_eq!(gate.received(), vec![1], "exactly one job for height 1");
@@ -22313,10 +22856,17 @@ mod crash_recovery_tests {
             "E must latch the fail-stop when W failed under it"
         );
         drop(ctx);
-        assert_eq!(read_native_applied_height(&state_db), Some(1), "nothing of 2/3 durable");
+        assert_eq!(
+            read_native_applied_height(&state_db),
+            Some(1),
+            "nothing of 2/3 durable"
+        );
         let trades =
             StateBackend::iterate_cf(&state_db, torus_state::cf::CF_NATIVE_TRADES, None).unwrap();
-        assert!(trades.is_empty(), "block 3's fill must not have been written");
+        assert!(
+            trades.is_empty(),
+            "block 3's fill must not have been written"
+        );
 
         // Restart: serial replay from the durable marker re-executes 2 and 3.
         let ctx2 = pipeline_ctx(&state_db, false, None);
@@ -22325,7 +22875,11 @@ mod crash_recovery_tests {
         assert!(!ctx2.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
         drop(ctx2);
         assert_eq!(read_native_applied_height(&state_db), Some(3));
-        assert_dumps_equal(&dump_ref, &dump_all_cfs(&state_db), "replay after crash vs serial");
+        assert_dumps_equal(
+            &dump_ref,
+            &dump_all_cfs(&state_db),
+            "replay after crash vs serial",
+        );
     }
 
     // ---- R01: a failed serial write of a block's state or marker fail-stops ----
@@ -22597,7 +23151,10 @@ mod crash_recovery_tests {
         let handle = std::thread::spawn(move || execution_loop(rx, ctx));
         drop(tx);
         handle.join().unwrap();
-        assert!(latch.load(Ordering::SeqCst), "an unexplained channel close must fail-stop");
+        assert!(
+            latch.load(Ordering::SeqCst),
+            "an unexplained channel close must fail-stop"
+        );
     }
 
     /// R01b D: the same close after a deliberate stop does not latch.
@@ -22636,7 +23193,10 @@ mod crash_recovery_tests {
             panic!("simulated consensus write failure");
         });
         assert!(t.join().is_err());
-        assert!(latch.load(Ordering::SeqCst), "consensus-thread death must fail-stop");
+        assert!(
+            latch.load(Ordering::SeqCst),
+            "consensus-thread death must fail-stop"
+        );
     }
 
     // ---- Exec-aware admission (TORUS_ADMISSION_EXEC_AWARE) ----
@@ -22991,15 +23551,28 @@ mod crash_recovery_tests {
         let ctx = pipeline_ctx(&state_db, true, Some(gate.clone()));
 
         ctx.execute_committed_block_with(&blocks[0], vec![], DurableRows::default());
-        assert!(gate.received().is_empty(), "non-durable rows => serial, no W job");
-        assert_eq!(read_native_applied_height(&state_db), Some(1), "serial marker durable synchronously");
         assert!(
-            state_db.get_cf_raw(CF_BLOCK_HEADERS, &1u64.to_be_bytes()).unwrap().is_some(),
+            gate.received().is_empty(),
+            "non-durable rows => serial, no W job"
+        );
+        assert_eq!(
+            read_native_applied_height(&state_db),
+            Some(1),
+            "serial marker durable synchronously"
+        );
+        assert!(
+            state_db
+                .get_cf_raw(CF_BLOCK_HEADERS, &1u64.to_be_bytes())
+                .unwrap()
+                .is_some(),
             "folded header landed with the serial batch"
         );
 
         dispatch_and_execute(&ctx, &state_db, &blocks[1]);
-        assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst), "parent-link check passed");
+        assert!(
+            !ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst),
+            "parent-link check passed"
+        );
         drop(ctx);
         assert_eq!(gate.received(), vec![2]);
         assert_eq!(read_native_applied_height(&state_db), Some(2));
@@ -23061,14 +23634,22 @@ mod crash_recovery_tests {
         gate.hold();
         dispatch_and_execute(&ctx, &state_db, &blocks[1]);
         assert!(gate.wait_received(2), "W must have taken Marker(2)");
-        assert_eq!(read_native_applied_height(&state_db), Some(1), "Marker(2) in flight, not durable");
+        assert_eq!(
+            read_native_applied_height(&state_db),
+            Some(1),
+            "Marker(2) in flight, not durable"
+        );
         assert_eq!(
             ctx.resident_books.lock().unwrap().height(),
             Some(2),
             "holder must advance on E at the hand-off, not at durability"
         );
         let parent = ctx.last_job.lock().unwrap().clone();
-        assert_eq!(parent.as_ref().map(|p| p.height()), Some(2), "parent layer is Marker(2)");
+        assert_eq!(
+            parent.as_ref().map(|p| p.height()),
+            Some(2),
+            "parent layer is Marker(2)"
+        );
 
         // Negative control: the guard over the BARE DB (marker=1) must trip.
         {
@@ -23086,7 +23667,10 @@ mod crash_recovery_tests {
                 false,
                 Some(&mut probe),
             );
-            assert!(c.resident_rebuilt(), "DB-only marker read (1) vs holder (2) must rebuild");
+            assert!(
+                c.resident_rebuilt(),
+                "DB-only marker read (1) vs holder (2) must rebuild"
+            );
             // Re-seed at height 2 for the real check below (the probe drained it).
             let mut holder = ResidentBooks::default();
             let mut seed = NativeExecContext::new_with_modes(
@@ -23131,7 +23715,11 @@ mod crash_recovery_tests {
 
         gate.release();
         assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
-        assert_eq!(read_native_applied_height(&state_db), Some(2), "Marker(2) landed after release");
+        assert_eq!(
+            read_native_applied_height(&state_db),
+            Some(2),
+            "Marker(2) landed after release"
+        );
         assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
     }
 
@@ -23220,9 +23808,17 @@ mod crash_recovery_tests {
                 BookMode::LevelAuthority,
                 Some(books),
             );
-            assert!(ctx.fatal_error.is_none(), "load {height}: {:?}", ctx.fatal_error);
+            assert!(
+                ctx.fatal_error.is_none(),
+                "load {height}: {:?}",
+                ctx.fatal_error
+            );
             NativeExecutor::execute_batch(&mut ctx, batch);
-            assert!(ctx.fatal_error.is_none(), "exec {height}: {:?}", ctx.fatal_error);
+            assert!(
+                ctx.fatal_error.is_none(),
+                "exec {height}: {:?}",
+                ctx.fatal_error
+            );
             let _ = NativeExecutor::drain_core_writer(&mut ctx);
             let save = if deferred {
                 Some(ctx.save_order_books_deferred().expect("mode 2 must defer"))
@@ -23247,27 +23843,28 @@ mod crash_recovery_tests {
             fund_evm_balance(db, b, deposit);
             build_native_trie_to_cf(db).unwrap();
         };
-        let spawn_worker = |db: &StateDb,
-                            gate: Arc<crate::exec_pipeline::WorkerGate>,
-                            exec_failed: Arc<std::sync::atomic::AtomicBool>| {
-            crate::exec_pipeline::FlushWorker::spawn(
-                crate::exec_pipeline::WorkerEnv {
-                    state_db: db.clone(),
-                    trie_cache: Arc::new(std::sync::Mutex::new(Default::default())),
-                    member_cache: Arc::new(std::sync::Mutex::new(
-                        NativeMemberCache::with_budget(0),
-                    )),
-                    metrics: None,
-                    exec_failed,
-                    gate: Some(gate),
-                    test_on_complete: None,
-                    test_paths: None,
-                    test_drain: None,
-                    test_evm_step_panic: None,
-                },
-                0,
-            )
-        };
+        let spawn_worker =
+            |db: &StateDb,
+             gate: Arc<crate::exec_pipeline::WorkerGate>,
+             exec_failed: Arc<std::sync::atomic::AtomicBool>| {
+                crate::exec_pipeline::FlushWorker::spawn(
+                    crate::exec_pipeline::WorkerEnv {
+                        state_db: db.clone(),
+                        trie_cache: Arc::new(std::sync::Mutex::new(Default::default())),
+                        member_cache: Arc::new(std::sync::Mutex::new(
+                            NativeMemberCache::with_budget(0),
+                        )),
+                        metrics: None,
+                        exec_failed,
+                        gate: Some(gate),
+                        test_on_complete: None,
+                        test_paths: None,
+                        test_drain: None,
+                        test_evm_step_panic: None,
+                    },
+                    0,
+                )
+            };
 
         // ---- Serial reference (save + flush on "E"). ----
         let (_c0, db_ref) = make_test_config_and_db();
@@ -23283,10 +23880,16 @@ mod crash_recovery_tests {
         }
         let dump_ref = dump_all_cfs(&db_ref);
         let root_ref = persisted_native_root(&db_ref).unwrap();
-        let trades = StateBackend::iterate_cf(&db_ref, torus_state::cf::CF_NATIVE_TRADES, None)
-            .unwrap();
-        assert!(!trades.is_empty(), "fixture must produce a fill (not vacuous)");
-        assert!(!dump_books(&db_ref).is_empty(), "fixture must persist book rows");
+        let trades =
+            StateBackend::iterate_cf(&db_ref, torus_state::cf::CF_NATIVE_TRADES, None).unwrap();
+        assert!(
+            !trades.is_empty(),
+            "fixture must produce a fill (not vacuous)"
+        );
+        assert!(
+            !dump_books(&db_ref).is_empty(),
+            "fixture must persist book rows"
+        );
 
         // ---- Deferred through the real W (differential + hold ordering). ----
         let (_c1, db_w) = make_test_config_and_db();
@@ -23333,7 +23936,11 @@ mod crash_recovery_tests {
             .unwrap();
         assert!(gate.wait_received(3), "W must have taken job 3");
         // Parked: NOTHING of block 3 is durable — E wrote no book byte itself.
-        assert_eq!(read_native_applied_height(&db_w), Some(2), "marker(3) in flight");
+        assert_eq!(
+            read_native_applied_height(&db_w),
+            Some(2),
+            "marker(3) in flight"
+        );
         assert_eq!(
             dump_books(&db_w),
             books_after_2,
@@ -23344,7 +23951,11 @@ mod crash_recovery_tests {
         drop(worker);
         assert!(!exec_failed.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(read_native_applied_height(&db_w), Some(3));
-        assert_dumps_equal(&dump_ref, &dump_all_cfs(&db_w), "deferred-through-W vs serial");
+        assert_dumps_equal(
+            &dump_ref,
+            &dump_all_cfs(&db_w),
+            "deferred-through-W vs serial",
+        );
         assert_eq!(
             root_ref,
             persisted_native_root(&db_w).unwrap(),
@@ -23378,7 +23989,11 @@ mod crash_recovery_tests {
             "shared fail-stop latched"
         );
         drop(worker_c);
-        assert_eq!(read_native_applied_height(&db_c), None, "marker must not advance");
+        assert_eq!(
+            read_native_applied_height(&db_c),
+            None,
+            "marker must not advance"
+        );
         assert!(
             dump_books(&db_c).is_empty(),
             "no book byte may be durable after an injected W write failure"
@@ -23451,7 +24066,11 @@ mod crash_recovery_tests {
             make_block(
                 7,
                 vec![
-                    sign(NativeAction::CancelAllOrders { market_id: Some(1) }, 5, &k_a),
+                    sign(
+                        NativeAction::CancelAllOrders { market_id: Some(1) },
+                        5,
+                        &k_a,
+                    ),
                     sign(place(order(true, 97, 2)), 6, &k_b),
                 ],
             ),
@@ -23459,7 +24078,11 @@ mod crash_recovery_tests {
             make_block(9, vec![sign(place(order(false, 96, 1)), 7, &k_a)]),
             make_block(
                 10,
-                vec![sign(NativeAction::CancelAllOrders { market_id: None }, 7, &k_b)],
+                vec![sign(
+                    NativeAction::CancelAllOrders { market_id: None },
+                    7,
+                    &k_b,
+                )],
             ),
             make_block(11, vec![sign(place(order(false, 105, 2)), 8, &k_a)]),
             make_block(12, vec![]),
@@ -23494,10 +24117,13 @@ mod crash_recovery_tests {
     }
 
     fn dump_book_cfs(db: &StateDb) -> Vec<CfDump> {
-        [torus_state::cf::CF_NATIVE_ORDER_BOOKS, torus_state::cf::CF_BOOK_ORDER_ROWS]
-            .iter()
-            .map(|cf| (*cf, StateBackend::iterate_cf(db, cf, None).unwrap()))
-            .collect()
+        [
+            torus_state::cf::CF_NATIVE_ORDER_BOOKS,
+            torus_state::cf::CF_BOOK_ORDER_ROWS,
+        ]
+        .iter()
+        .map(|cf| (*cf, StateBackend::iterate_cf(db, cf, None).unwrap()))
+        .collect()
     }
 
     /// Book-CF rows visible THROUGH a frozen set only (layered over an empty
@@ -23505,10 +24131,13 @@ mod crash_recovery_tests {
     fn frozen_book_rows(frozen: &Arc<torus_state::FrozenPending>) -> usize {
         let (_c, empty) = make_test_config_and_db();
         let probe = NativeStateOverlay::with_parent(empty, Some(frozen.clone()));
-        [torus_state::cf::CF_NATIVE_ORDER_BOOKS, torus_state::cf::CF_BOOK_ORDER_ROWS]
-            .iter()
-            .map(|cf| StateBackend::iterate_cf(&probe, cf, None).unwrap().len())
-            .sum()
+        [
+            torus_state::cf::CF_NATIVE_ORDER_BOOKS,
+            torus_state::cf::CF_BOOK_ORDER_ROWS,
+        ]
+        .iter()
+        .map(|cf| StateBackend::iterate_cf(&probe, cf, None).unwrap().len())
+        .sum()
     }
 
     fn run_book_fixture(
@@ -23529,7 +24158,11 @@ mod crash_recovery_tests {
                     // bytes — they ride the job's sidecar instead.
                     let last = ctx.last_job.lock().unwrap().clone().expect("fast path");
                     assert_eq!(last.height(), h);
-                    assert_eq!(frozen_book_rows(&last), 0, "h{h}: book writes must be deferred to W");
+                    assert_eq!(
+                        frozen_book_rows(&last),
+                        0,
+                        "h{h}: book writes must be deferred to W"
+                    );
                 }
             }
         }
@@ -23557,15 +24190,29 @@ mod crash_recovery_tests {
             let (db_off, off, root_off, received_off) = run_book_fixture(false, mode);
             let (db_on, on, root_on, received_on) = run_book_fixture(true, mode);
             assert!(received_off.is_empty());
-            assert_eq!(received_on, vec![1, 2, 3, 5, 6, 7, 9, 10, 11, 13], "{mode:?}");
+            assert_eq!(
+                received_on,
+                vec![1, 2, 3, 5, 6, 7, 9, 10, 11, 13],
+                "{mode:?}"
+            );
             assert_dumps_equal(&off, &on, "deferred books ON vs OFF");
-            assert_eq!(root_off, root_on, "{mode:?}: persisted native root must be identical");
+            assert_eq!(
+                root_off, root_on,
+                "{mode:?}: persisted native root must be identical"
+            );
             assert_eq!(read_native_applied_height(&db_on), Some(13));
             let trades =
                 StateBackend::iterate_cf(&db_on, torus_state::cf::CF_NATIVE_TRADES, None).unwrap();
-            assert!(trades.len() >= 5, "{mode:?}: fixture fills (not vacuous): {}", trades.len());
+            assert!(
+                trades.len() >= 5,
+                "{mode:?}: fixture fills (not vacuous): {}",
+                trades.len()
+            );
             let books = dump_book_cfs(&db_on);
-            assert!(!books[0].1.is_empty() && !books[1].1.is_empty(), "{mode:?}: book rows persisted");
+            assert!(
+                !books[0].1.is_empty() && !books[1].1.is_empty(),
+                "{mode:?}: book rows persisted"
+            );
             assert_eq!(dump_book_cfs(&db_off), books);
         }
     }
@@ -23615,8 +24262,16 @@ mod crash_recovery_tests {
         let ctx = t.join().unwrap();
         assert!(ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
         drop(ctx);
-        assert_eq!(read_native_applied_height(&state_db), Some(1), "nothing of 2/3 durable");
-        assert_eq!(dump_book_cfs(&state_db), books_after_1, "no book byte of 2/3 durable");
+        assert_eq!(
+            read_native_applied_height(&state_db),
+            Some(1),
+            "nothing of 2/3 durable"
+        );
+        assert_eq!(
+            dump_book_cfs(&state_db),
+            books_after_1,
+            "no book byte of 2/3 durable"
+        );
 
         let ctx2 = book_pipeline_ctx(&state_db, false, None, mode);
         let (_last, parked) = TorusApp::replay_committed(&state_db, &ctx2);
@@ -23624,7 +24279,11 @@ mod crash_recovery_tests {
         assert!(!ctx2.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
         drop(ctx2);
         assert_eq!(read_native_applied_height(&state_db), Some(3));
-        assert_dumps_equal(&dump_ref, &dump_all_cfs(&state_db), "replay after crash vs serial");
+        assert_dumps_equal(
+            &dump_ref,
+            &dump_all_cfs(&state_db),
+            "replay after crash vs serial",
+        );
     }
 
     /// Stale-parent guard: if the resident holder is NOT the predecessor's
@@ -23666,13 +24325,20 @@ mod crash_recovery_tests {
             ctx
         });
         std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(!t.is_finished(), "E must wait for W before rebuilding books");
+        assert!(
+            !t.is_finished(),
+            "E must wait for W before rebuilding books"
+        );
         gate.release();
         let ctx = t.join().unwrap();
         assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
         drop(ctx);
         assert_eq!(read_native_applied_height(&state_db), Some(3));
-        assert_dumps_equal(&dump_ref, &dump_all_cfs(&state_db), "rebuild after deferred parent vs serial");
+        assert_dumps_equal(
+            &dump_ref,
+            &dump_all_cfs(&state_db),
+            "rebuild after deferred parent vs serial",
+        );
     }
 
     /// Kill switch: `TORUS_EXEC_PIPELINE=0` => no worker is attached, the
@@ -23682,7 +24348,9 @@ mod crash_recovery_tests {
         let (_cfg, state_db) = make_test_config_and_db();
         let ctx = pipeline_ctx(&state_db, false, None);
         assert!(ctx.flush_worker.is_none());
-        assert!(!crate::exec_pipeline::parse_exec_pipeline_toggle(Some("0".to_string())));
+        assert!(!crate::exec_pipeline::parse_exec_pipeline_toggle(Some(
+            "0".to_string()
+        )));
         assert!(crate::exec_pipeline::parse_exec_pipeline_toggle(None));
     }
 
@@ -23771,7 +24439,10 @@ mod crash_recovery_tests {
                 "{mode:?}: every height (native and empty) must pass through the hashed flush"
             );
             let total: usize = serial.iter().map(|(_, w)| w.len()).sum();
-            assert!(total > 40, "{mode:?}: fixture write set is not vacuous ({total})");
+            assert!(
+                total > 40,
+                "{mode:?}: fixture write set is not vacuous ({total})"
+            );
             for on in [false, true] {
                 let straight = run_book_fixture_capturing(on, mode, &[]);
                 assert_write_sets_equal(&serial, &straight, &format!("{mode:?} serial vs on={on}"));
@@ -23848,10 +24519,17 @@ mod crash_recovery_tests {
                 drop(ctx);
                 let captured = torus_state::running_hash::capture_take(&state_db);
                 let stored = torus_state::running_hash::read_running_hash(&state_db);
-                assert_eq!(stored, Some(fold_captured(&captured)), "{mode:?} on={on} {restarts:?}");
+                assert_eq!(
+                    stored,
+                    Some(fold_captured(&captured)),
+                    "{mode:?} on={on} {restarts:?}"
+                );
                 finals.push(stored.unwrap());
             }
-            assert!(finals.windows(2).all(|w| w[0] == w[1]), "{mode:?}: {finals:?}");
+            assert!(
+                finals.windows(2).all(|w| w[0] == w[1]),
+                "{mode:?}: {finals:?}"
+            );
         }
     }
 
@@ -24173,24 +24851,39 @@ mod crash_recovery_tests {
         use torus_state::cf::{CF_SLASH_RECORDS, CF_STAKING_VALIDATORS, CF_STORAGE};
         use torus_state::running_hash::hashed_cf_id;
         let (state_db, captured) = run_out_of_batch_fixture(&[]);
-        assert_eq!(captured.iter().map(|(h, _)| *h).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        assert_eq!(
+            captured.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
         let at = |h: u64| &captured.iter().find(|(x, _)| *x == h).unwrap().1;
         let in_db = |id: u8, cf: &str, w: &[torus_state::running_hash::WriteEntry]| {
             let rows: Vec<_> = w.iter().filter(|e| e.0 == id).collect();
             for (_, k, v) in &rows {
-                assert_eq!(&state_db.get_cf_raw(cf, k).unwrap(), v, "{cf} entry must equal the DB");
+                assert_eq!(
+                    &state_db.get_cf_raw(cf, k).unwrap(),
+                    v,
+                    "{cf} entry must equal the DB"
+                );
             }
             rows.len()
         };
         // (c) EVM bundle: the contract's storage slot (only reachable via the bundle).
         let storage = hashed_cf_id(CF_STORAGE).unwrap();
-        assert_eq!(in_db(storage, CF_STORAGE, at(1)), 1, "slot 0 of the created contract");
+        assert_eq!(
+            in_db(storage, CF_STORAGE, at(1)),
+            1,
+            "slot 0 of the created contract"
+        );
         // (a) slash at 2: the slash record and the slashed / tombstoned
         // validator row.
         let slashes = hashed_cf_id(CF_SLASH_RECORDS).unwrap();
         assert_eq!(in_db(slashes, CF_SLASH_RECORDS, at(2)), 1, "slash record");
         let validators = hashed_cf_id(CF_STAKING_VALIDATORS).unwrap();
-        assert_eq!(in_db(validators, CF_STAKING_VALIDATORS, at(2)), 1, "validator row");
+        assert_eq!(
+            in_db(validators, CF_STAKING_VALIDATORS, at(2)),
+            1,
+            "validator row"
+        );
         // 3 is empty: nothing hashed.
         assert!(at(3).is_empty(), "{:?}", at(3));
         // (b) epoch boundary 4 (empty block): only what its execution wrote,
@@ -24199,8 +24892,16 @@ mod crash_recovery_tests {
         let plan8 = [b"epoch_vset:plan:".as_slice(), &8u64.to_be_bytes()].concat();
         assert!(at(4).iter().any(|(_, k, _)| *k == plan8), "{:?}", at(4));
         for (id, k, v) in at(4) {
-            let cf = torus_state::running_hash::HASHED_CFS.iter().find(|(i, _)| i == id).unwrap().1;
-            assert_eq!(&state_db.get_cf_raw(cf, k).unwrap(), v, "{cf} entry must equal the DB");
+            let cf = torus_state::running_hash::HASHED_CFS
+                .iter()
+                .find(|(i, _)| i == id)
+                .unwrap()
+                .1;
+            assert_eq!(
+                &state_db.get_cf_raw(cf, k).unwrap(),
+                v,
+                "{cf} entry must equal the DB"
+            );
         }
         // Restarts do not change the hash.
         let (db2, _) = run_out_of_batch_fixture(&[1, 2, 3]);
@@ -24233,7 +24934,11 @@ mod crash_recovery_tests {
         let mut blocks: Vec<TorusBlock> = book_fixture_blocks()
             .into_iter()
             .map(|b| {
-                let bits = if b.header.height >= act { TEST_FEATURES } else { 0 };
+                let bits = if b.header.height >= act {
+                    TEST_FEATURES
+                } else {
+                    0
+                };
                 with_features(b, bits)
             })
             .collect();
@@ -24260,14 +24965,33 @@ mod crash_recovery_tests {
             (db, captured)
         };
         let (genesis_node, captured) = node(0, false, false);
-        assert_eq!(captured.first().map(|(h, _)| *h), Some(act), "first hashed height = activation");
+        assert_eq!(
+            captured.first().map(|(h, _)| *h),
+            Some(act),
+            "first hashed height = activation"
+        );
         assert_eq!(read_activation_height(&genesis_node), Some(act));
         let reference = read_running_hash(&genesis_node).unwrap();
-        assert_eq!(reference, fold_captured(&captured), "h_act chains from zeros");
+        assert_eq!(
+            reference,
+            fold_captured(&captured),
+            "h_act chains from zeros"
+        );
         assert_eq!(reference.0, 13);
-        for (stop_at, on) in [(2, false), (3, true), (5, false), (5, true), (6, true), (9, false)] {
+        for (stop_at, on) in [
+            (2, false),
+            (3, true),
+            (5, false),
+            (5, true),
+            (6, true),
+            (9, false),
+        ] {
             let (db, _) = node(stop_at, on, false);
-            assert_eq!(read_running_hash(&db), Some(reference), "stopped at {stop_at} on={on}");
+            assert_eq!(
+                read_running_hash(&db),
+                Some(reference),
+                "stopped at {stop_at} on={on}"
+            );
             assert_eq!(read_unverified_since(&db), None);
         }
         // Chain rows lost above the activation height: no valid h_{act..}.
@@ -24275,7 +24999,11 @@ mod crash_recovery_tests {
         assert!(captured.is_empty(), "never hashed");
         assert_eq!(read_running_hash(&late), None);
         assert_eq!(read_unverified_since(&late), Some(9));
-        assert_eq!(read_configured_activation(&late), Some(act), "found in the stored headers");
+        assert_eq!(
+            read_configured_activation(&late),
+            Some(act),
+            "found in the stored headers"
+        );
     }
 
     /// Task 4: kill after flushing N (committed blocks N+1.. durable, not yet
@@ -24343,7 +25071,11 @@ mod crash_recovery_tests {
         let ctx = t.join().unwrap();
         assert!(ctx.exec_failed.load(Ordering::SeqCst));
         drop(ctx);
-        assert_eq!(read_running_hash(&db).map(|(h, _)| h), Some(5), "hash advances only with the batch");
+        assert_eq!(
+            read_running_hash(&db).map(|(h, _)| h),
+            Some(5),
+            "hash advances only with the batch"
+        );
         for b in &blocks[7..] {
             persist_committed_block_durably(&db, b);
         }
@@ -24351,7 +25083,11 @@ mod crash_recovery_tests {
         let (_last, parked) = TorusApp::replay_committed(&db, &ctx);
         assert_eq!(parked, None);
         drop(ctx);
-        assert_eq!(read_running_hash(&db), Some(reference), "(b) replay after a lost batch");
+        assert_eq!(
+            read_running_hash(&db),
+            Some(reference),
+            "(b) replay after a lost batch"
+        );
     }
 
     // ---- Running state hash: auto-attestation (Task 6) ----
@@ -24420,18 +25156,32 @@ mod crash_recovery_tests {
             ctx
         };
         let pool = |_: ()| {
-            Arc::new(Mempool::new(state_db.clone(), torus_mempool::MempoolConfig::default()))
+            Arc::new(Mempool::new(
+                state_db.clone(),
+                torus_mempool::MempoolConfig::default(),
+            ))
         };
 
         let m1 = pool(());
         let ctx = new_node(&m1);
         run_empty_blocks(&ctx, &state_db, 1, 99);
-        assert!(pooled_attestations(&m1).is_empty(), "no checkpoint before 100");
+        assert!(
+            pooled_attestations(&m1).is_empty(),
+            "no checkpoint before 100"
+        );
         run_empty_blocks(&ctx, &state_db, 100, 100);
         let local = B256::from(read_checkpoint(&state_db, 100).expect("checkpoint 100 durable"));
-        assert_eq!(pooled_attestations(&m1), vec![(me, 100, local)], "one attestation at 100");
+        assert_eq!(
+            pooled_attestations(&m1),
+            vec![(me, 100, local)],
+            "one attestation at 100"
+        );
         run_empty_blocks(&ctx, &state_db, 101, 150);
-        assert_eq!(pooled_attestations(&m1).len(), 1, "never a second one for 100");
+        assert_eq!(
+            pooled_attestations(&m1).len(),
+            1,
+            "never a second one for 100"
+        );
         drop(ctx);
 
         // Restart before inclusion: the vote is not on-chain -> re-submitted once.
@@ -24440,7 +25190,10 @@ mod crash_recovery_tests {
         run_empty_blocks(&ctx, &state_db, 151, 152);
         let pooled = m2.select_native_for_block(1_000);
         assert_eq!(pooled.len(), 1, "re-submitted after restart");
-        assert!(matches!(pooled[0].action, NativeAction::AttestStateHash { height: 100, .. }));
+        assert!(matches!(
+            pooled[0].action,
+            NativeAction::AttestStateHash { height: 100, .. }
+        ));
 
         // Include it (block 153); restart again: on-chain -> nothing submitted.
         let mut b153 = make_block(153, pooled);
@@ -24450,7 +25203,9 @@ mod crash_recovery_tests {
         b153.header.parent_hash =
             alloy_primitives::keccak256(make_block(152, vec![]).header.canonical_header_bytes());
         dispatch_and_execute(&ctx, &state_db, &b153);
-        let votes = StakingManager::new(state_db.clone()).state_hash_votes(100).unwrap();
+        let votes = StakingManager::new(state_db.clone())
+            .state_hash_votes(100)
+            .unwrap();
         assert_eq!(votes, vec![(me, local.0)], "vote on-chain");
         drop(ctx);
         let m3 = pool(());
@@ -24458,7 +25213,10 @@ mod crash_recovery_tests {
         let mut b154 = make_block(154, vec![]);
         b154.header.parent_hash = alloy_primitives::keccak256(b153.header.canonical_header_bytes());
         dispatch_and_execute(&ctx, &state_db, &b154);
-        assert!(pooled_attestations(&m3).is_empty(), "vote already on-chain: no re-submit");
+        assert!(
+            pooled_attestations(&m3).is_empty(),
+            "vote already on-chain: no re-submit"
+        );
 
         // A node without a key never submits; a key that is not an active
         // validator never submits.
@@ -24483,7 +25241,12 @@ mod crash_recovery_tests {
     fn node_at_checkpoint(
         pipelined: bool,
         failstop: bool,
-    ) -> (ExecutionContext, StateDb, Arc<torus_telemetry::Metrics>, B256) {
+    ) -> (
+        ExecutionContext,
+        StateDb,
+        Arc<torus_telemetry::Metrics>,
+        B256,
+    ) {
         let (config, state_db) = make_test_config_and_db();
         let keys = validator_keys();
         seed_active_validators(&state_db, &[&keys[0], &keys[1], &keys[2]]);
@@ -24501,14 +25264,21 @@ mod crash_recovery_tests {
 
     /// Block 101 carrying `votes` (validator index, hash) for checkpoint 100,
     /// then an empty 102 (lets a pipelined node make 101 durable).
-    fn run_votes(ctx: &ExecutionContext, state_db: &StateDb, votes: &[(usize, B256)]) -> TorusBlock {
+    fn run_votes(
+        ctx: &ExecutionContext,
+        state_db: &StateDb,
+        votes: &[(usize, B256)],
+    ) -> TorusBlock {
         let keys = validator_keys();
         let actions = votes
             .iter()
             .enumerate()
             .map(|(i, (v, hash))| {
                 torus_types::eip712::sign_native_action(
-                    NativeAction::AttestStateHash { height: 100, hash: *hash },
+                    NativeAction::AttestStateHash {
+                        height: 100,
+                        hash: *hash,
+                    },
                     block_time_ms(101) + i as u64,
                     &keys[*v],
                 )
@@ -24542,10 +25312,17 @@ mod crash_recovery_tests {
             let (ctx, db, metrics, local) = node_at_checkpoint(pipelined, false);
             let other = B256::repeat_byte(0xee);
             let b101 = run_votes(&ctx, &db, &[(0, local), (1, other)]);
-            assert_eq!(mismatch_count(&metrics, &addr_of(1)), 1, "pipelined={pipelined}");
+            assert_eq!(
+                mismatch_count(&metrics, &addr_of(1)),
+                1,
+                "pipelined={pipelined}"
+            );
             assert_eq!(mismatch_count(&metrics, &addr_of(0)), 0, "matching vote");
             assert_eq!(mismatch_count(&metrics, "quorum"), 0);
-            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fail-stop off by default");
+            assert!(
+                !ctx.exec_failed.load(Ordering::SeqCst),
+                "fail-stop off by default"
+            );
 
             // Re-running detection (fresh monitor, fail-stop on) writes nothing.
             drop(ctx); // drains W
@@ -24556,7 +25333,10 @@ mod crash_recovery_tests {
                 monitor.after_block(&b101, &db, None, Some(&metrics), &latch);
             }
             assert_dumps_equal(&before, &dump_all_cfs(&db), "detection is read-only");
-            assert!(!latch.load(Ordering::SeqCst), "no quorum -> nothing to fail-stop on");
+            assert!(
+                !latch.load(Ordering::SeqCst),
+                "no quorum -> nothing to fail-stop on"
+            );
         }
     }
 
@@ -24570,19 +25350,36 @@ mod crash_recovery_tests {
             let (ctx, db, metrics, _local) = node_at_checkpoint(false, failstop);
             run_votes(&ctx, &db, &[(0, x), (1, x), (2, x)]);
             assert_eq!(
-                StakingManager::new(db.clone()).state_hash_quorum(100).unwrap(),
+                StakingManager::new(db.clone())
+                    .state_hash_quorum(100)
+                    .unwrap(),
                 Some(x.0),
                 "quorum recorded on-chain"
             );
             assert_eq!(mismatch_count(&metrics, "quorum"), 1, "failstop={failstop}");
-            assert_eq!(ctx.exec_failed.load(Ordering::SeqCst), failstop, "latched iff fail-stop on");
+            assert_eq!(
+                ctx.exec_failed.load(Ordering::SeqCst),
+                failstop,
+                "latched iff fail-stop on"
+            );
         }
 
         let (ctx, db, metrics, local) = node_at_checkpoint(false, true);
         run_votes(&ctx, &db, &[(0, local), (1, local), (2, x)]);
-        assert_eq!(StakingManager::new(db.clone()).state_hash_quorum(100).unwrap(), None);
-        assert_eq!(metric_value(&metrics.encode(), "torus_state_hash_no_quorum_total"), 1.0);
-        assert!(!ctx.exec_failed.load(Ordering::SeqCst), "no quorum never latches");
+        assert_eq!(
+            StakingManager::new(db.clone())
+                .state_hash_quorum(100)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            metric_value(&metrics.encode(), "torus_state_hash_no_quorum_total"),
+            1.0
+        );
+        assert!(
+            !ctx.exec_failed.load(Ordering::SeqCst),
+            "no quorum never latches"
+        );
 
         // Matching quorum: no mismatch, no latch.
         let (ctx, db, metrics, local) = node_at_checkpoint(false, true);
@@ -24595,11 +25392,17 @@ mod crash_recovery_tests {
 
     /// Empty blocks `prev+1..=to` linked to the ACTUAL `prev` (after a block
     /// that carried actions); returns the last block.
-    fn run_linked_empty(ctx: &ExecutionContext, db: &StateDb, prev: &TorusBlock, to: u64) -> TorusBlock {
+    fn run_linked_empty(
+        ctx: &ExecutionContext,
+        db: &StateDb,
+        prev: &TorusBlock,
+        to: u64,
+    ) -> TorusBlock {
         let mut prev = prev.clone();
         for h in prev.header.height + 1..=to {
             let mut b = make_block(h, vec![]);
-            b.header.parent_hash = alloy_primitives::keccak256(prev.header.canonical_header_bytes());
+            b.header.parent_hash =
+                alloy_primitives::keccak256(prev.header.canonical_header_bytes());
             dispatch_and_execute(ctx, db, &b);
             assert!(!ctx.exec_failed.load(Ordering::SeqCst), "height {h}");
             prev = b;
@@ -24608,7 +25411,10 @@ mod crash_recovery_tests {
     }
 
     fn mempool_for(db: &StateDb) -> Arc<Mempool> {
-        Arc::new(Mempool::new(db.clone(), torus_mempool::MempoolConfig::default()))
+        Arc::new(Mempool::new(
+            db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ))
     }
 
     /// Review finding 1: a hash-unverified node (no valid chain above the
@@ -24635,7 +25441,10 @@ mod crash_recovery_tests {
             ctx.metrics = Some(metrics.clone());
             ctx.state_hash.set_attest_key(key.clone());
             run_empty_blocks(&ctx, &db, restart_at + 1, 250);
-            let mut heights: Vec<u64> = pooled_attestations(&pool).iter().map(|(_, h, _)| *h).collect();
+            let mut heights: Vec<u64> = pooled_attestations(&pool)
+                .iter()
+                .map(|(_, h, _)| *h)
+                .collect();
             heights.sort();
             let gauge = metric_value(&metrics.encode(), "torus_state_hash_unverified");
             if attests {
@@ -24643,7 +25452,10 @@ mod crash_recovery_tests {
                 assert_eq!(gauge, 0.0);
             } else {
                 assert_eq!(read_unverified_since(&db), Some(61));
-                assert!(heights.is_empty(), "hash-unverified: never attests ({heights:?})");
+                assert!(
+                    heights.is_empty(),
+                    "hash-unverified: never attests ({heights:?})"
+                );
                 assert_eq!(gauge, 1.0, "unverified gauge");
             }
         }
@@ -24660,13 +25472,15 @@ mod crash_recovery_tests {
         use crate::state_hash::{ChainHealth, StateHashMonitor};
         use torus_state::cf::{META_RUNNING_STATE_HASH, META_RUNNING_STATE_HASH_ACTIVATION};
         use torus_state::running_hash::{read_checkpoint, read_unverified_since};
-        let gauge = |m: &torus_telemetry::Metrics| {
-            metric_value(&m.encode(), "torus_state_hash_unverified")
-        };
+        let gauge =
+            |m: &torus_telemetry::Metrics| metric_value(&m.encode(), "torus_state_hash_unverified");
         let key = k256::ecdsa::SigningKey::from_slice(&[74u8; 32]).unwrap();
         let (config, db) = make_test_config_and_db();
         let fresh = torus_telemetry::Metrics::new();
-        assert_eq!(StateHashMonitor::default().report_at_boot(&db, Some(&fresh)), ChainHealth::Off);
+        assert_eq!(
+            StateHashMonitor::default().report_at_boot(&db, Some(&fresh)),
+            ChainHealth::Off
+        );
         seed_active_validators(&db, &[&key]);
         let ctx = make_exec_ctx(&config, &db);
         run_empty_blocks(&ctx, &db, 1, 150);
@@ -24683,7 +25497,13 @@ mod crash_recovery_tests {
             db.delete_cf_raw(CF_CONSENSUS_META, k).unwrap();
         }
         let booted = Arc::new(torus_telemetry::Metrics::new());
-        drop(TorusApp::new(db.clone(), &config, Some(booted.clone()), None, None));
+        drop(TorusApp::new(
+            db.clone(),
+            &config,
+            Some(booted.clone()),
+            None,
+            None,
+        ));
         assert_eq!(gauge(&booted), 1.0, "TorusApp boot reports the lost chain");
 
         let pool = mempool_for(&db);
@@ -24693,7 +25513,10 @@ mod crash_recovery_tests {
         ctx.state_hash.set_attest_key(key.clone());
         assert_eq!(
             ctx.state_hash.report_at_boot(&db, Some(&metrics)),
-            ChainHealth::RowsMissing { applied: 150, hashed: None }
+            ChainHealth::RowsMissing {
+                applied: 150,
+                hashed: None
+            }
         );
         assert_eq!(gauge(&metrics), 1.0);
         // The attest path before any flush marked the node.
@@ -24704,11 +25527,17 @@ mod crash_recovery_tests {
             Some(&metrics),
             &ctx.exec_failed,
         );
-        assert!(pooled_attestations(&pool).is_empty(), "rows lost: no attestation");
+        assert!(
+            pooled_attestations(&pool).is_empty(),
+            "rows lost: no attestation"
+        );
         assert_eq!(gauge(&metrics), 1.0);
         run_empty_blocks(&ctx, &db, 151, 250);
         assert_eq!(read_unverified_since(&db), Some(151));
-        assert!(pooled_attestations(&pool).is_empty(), "hash-unverified: never attests");
+        assert!(
+            pooled_attestations(&pool).is_empty(),
+            "hash-unverified: never attests"
+        );
         assert_eq!(gauge(&metrics), 1.0);
         assert!(!ctx.exec_failed.load(Ordering::SeqCst), "keeps running");
     }
@@ -24728,13 +25557,20 @@ mod crash_recovery_tests {
         write_native_applied_height(&db, 101); // 101's hashed batch lost
         run_empty_blocks(&ctx, &db, 102, 105);
         assert_eq!(read_unverified_since(&db), Some(102));
-        assert_eq!(read_running_hash(&db).map(|(h, _)| h), Some(100), "never chained over 101");
+        assert_eq!(
+            read_running_hash(&db).map(|(h, _)| h),
+            Some(100),
+            "never chained over 101"
+        );
         let x = B256::repeat_byte(0xee);
         let keys = validator_keys();
         let votes = (0..3)
             .map(|v| {
                 torus_types::eip712::sign_native_action(
-                    NativeAction::AttestStateHash { height: 100, hash: x },
+                    NativeAction::AttestStateHash {
+                        height: 100,
+                        hash: x,
+                    },
                     block_time_ms(106) + v as u64,
                     &keys[v],
                 )
@@ -24743,11 +25579,26 @@ mod crash_recovery_tests {
         let b106 = make_block(106, votes);
         dispatch_and_execute(&ctx, &db, &b106);
         run_linked_empty(&ctx, &db, &b106, 107);
-        assert_eq!(StakingManager::new(db.clone()).state_hash_quorum(100).unwrap(), Some(x.0));
-        assert_eq!(mismatch_count(&metrics, "quorum"), 1, "mismatch still reported");
-        assert!(!ctx.exec_failed.load(Ordering::SeqCst), "hash-unverified: no fail-stop");
+        assert_eq!(
+            StakingManager::new(db.clone())
+                .state_hash_quorum(100)
+                .unwrap(),
+            Some(x.0)
+        );
+        assert_eq!(
+            mismatch_count(&metrics, "quorum"),
+            1,
+            "mismatch still reported"
+        );
+        assert!(
+            !ctx.exec_failed.load(Ordering::SeqCst),
+            "hash-unverified: no fail-stop"
+        );
         assert_eq!(torus_state::running_hash::read_divergence(&db), None);
-        assert_eq!(metric_value(&metrics.encode(), "torus_state_hash_unverified"), 1.0);
+        assert_eq!(
+            metric_value(&metrics.encode(), "torus_state_hash_unverified"),
+            1.0
+        );
     }
 
     /// Epoch / running-hash fixture validators: (account key, consensus key);
@@ -24757,7 +25608,9 @@ mod crash_recovery_tests {
             .map(|i| {
                 (
                     k256::ecdsa::SigningKey::from_slice(&[0x70 + i; 32]).unwrap(),
-                    ed25519_dalek::SigningKey::from_bytes(&[0x30 + i; 32]).verifying_key().to_bytes(),
+                    ed25519_dalek::SigningKey::from_bytes(&[0x30 + i; 32])
+                        .verifying_key()
+                        .to_bytes(),
                 )
             })
             .collect()
@@ -24791,10 +25644,16 @@ mod crash_recovery_tests {
     /// Blocks 1..=8 (epoch length 4): validator 0 rotates its consensus key at
     /// 2 (planned at 4, installed at 8), validator 1 changes its commission at
     /// 6. Returns the blocks and the rotated key.
-    fn epoch_fixture_blocks(vals: &[(k256::ecdsa::SigningKey, [u8; 32])]) -> (Vec<TorusBlock>, [u8; 32]) {
-        let rotated_key = ed25519_dalek::SigningKey::from_bytes(&[0x3f; 32]).verifying_key().to_bytes();
+    fn epoch_fixture_blocks(
+        vals: &[(k256::ecdsa::SigningKey, [u8; 32])],
+    ) -> (Vec<TorusBlock>, [u8; 32]) {
+        let rotated_key = ed25519_dalek::SigningKey::from_bytes(&[0x3f; 32])
+            .verifying_key()
+            .to_bytes();
         let rotate = torus_types::eip712::sign_native_action(
-            NativeAction::RotateValidatorKey { new_pubkey: torus_types::PublicKey(rotated_key) },
+            NativeAction::RotateValidatorKey {
+                new_pubkey: torus_types::PublicKey(rotated_key),
+            },
             NONCE_BASE + 1,
             &vals[0].0,
         );
@@ -24851,8 +25710,13 @@ mod crash_recovery_tests {
                     next += 1;
                 }
                 let before = dump_all_cfs(&db);
-                let updates = app.epoch_validator_set_updates(boundary).expect("plan ready");
-                assert!(before == dump_all_cfs(&db), "consensus thread wrote the DB at {boundary}");
+                let updates = app
+                    .epoch_validator_set_updates(boundary)
+                    .expect("plan ready");
+                assert!(
+                    before == dump_all_cfs(&db),
+                    "consensus thread wrote the DB at {boundary}"
+                );
                 seen.push(canonical_updates(updates));
             }
             while next <= 8 {
@@ -24876,10 +25740,18 @@ mod crash_recovery_tests {
         assert_eq!(seen[0], None, "first boundary: no plan");
         let (ins, del) = seen[1].clone().expect("plan for 8 changes the set");
         assert!(ins.iter().any(|(k, _)| *k == rotated_key), "{ins:?}");
-        assert!(del.contains(&vals[0].1) && del.contains(&vals[4].1), "{del:?}");
+        assert!(
+            del.contains(&vals[0].1) && del.contains(&vals[4].1),
+            "{del:?}"
+        );
 
         let staking = StakingManager::new(db.clone());
-        let row = |i: usize| staking.get_validator(&k256_address(&vals[i].0)).unwrap().unwrap();
+        let row = |i: usize| {
+            staking
+                .get_validator(&k256_address(&vals[i].0))
+                .unwrap()
+                .unwrap()
+        };
         assert_eq!(row(0).pubkey, rotated_key);
         assert_eq!(row(1).commission_bps, 600);
         assert_eq!(row(4).status, ValidatorStatus::Candidate);
@@ -24902,7 +25774,11 @@ mod crash_recovery_tests {
             let v = db.get_cf_raw(CF_STAKING_VALIDATORS, &key).unwrap();
             (key, v)
         };
-        assert!(rows_at(6).contains(&db_row(1)), "commission change at 6: {:?}", rows_at(6));
+        assert!(
+            rows_at(6).contains(&db_row(1)),
+            "commission change at 6: {:?}",
+            rows_at(6)
+        );
         let at8 = rows_at(8);
         assert!(at8.contains(&db_row(0)), "rotated key at 8: {at8:?}");
         assert!(at8.contains(&db_row(4)), "status change at 8: {at8:?}");
@@ -24939,7 +25815,10 @@ mod crash_recovery_tests {
         };
         let (clean, corrupted) = (node(false), node(true));
         assert_eq!(clean.map(|(h, _)| h), Some(7));
-        assert_ne!(clean, corrupted, "a corrupted validator row must change the hash");
+        assert_ne!(
+            clean, corrupted,
+            "a corrupted validator row must change the hash"
+        );
     }
 
     /// Review finding 3: an attestation admitted to the mempool but dropped
@@ -24972,7 +25851,10 @@ mod crash_recovery_tests {
         let m2 = mempool_for(&db);
         ctx.mempool = Some(m2.clone()); // m1 dropped it
         run_empty_blocks(&ctx, &db, 101, 105);
-        assert!(pooled_attestations(&m2).is_empty(), "previous nonce still live: no resubmission");
+        assert!(
+            pooled_attestations(&m2).is_empty(),
+            "previous nonce still live: no resubmission"
+        );
         drop(ctx);
 
         // Window elapsed: re-signed and resubmitted until on-chain.
@@ -24984,7 +25866,10 @@ mod crash_recovery_tests {
         run_empty_blocks(&ctx, &db, 101, 101);
         let second = m2.select_native_for_block(1_000);
         assert_eq!(second.len(), 1, "resubmitted after the drop");
-        assert!(matches!(second[0].action, NativeAction::AttestStateHash { height: 100, .. }));
+        assert!(matches!(
+            second[0].action,
+            NativeAction::AttestStateHash { height: 100, .. }
+        ));
         assert_ne!(second[0].nonce, first[0].nonce, "fresh nonce");
         // The resubmitted one lands, and the dropped one lands late: one vote.
         let local = torus_state::running_hash::read_checkpoint(&db, 100).unwrap();
@@ -24995,7 +25880,9 @@ mod crash_recovery_tests {
         ctx.mempool = Some(mempool_for(&db));
         dispatch_and_execute(&ctx, &db, &b102);
         assert_eq!(
-            StakingManager::new(db.clone()).state_hash_votes(100).unwrap(),
+            StakingManager::new(db.clone())
+                .state_hash_votes(100)
+                .unwrap(),
             vec![(me, local)],
             "exactly one on-chain vote"
         );
@@ -25025,12 +25912,19 @@ mod crash_recovery_tests {
         assert!(latch.load(Ordering::SeqCst), "re-latched at boot");
         let latch = AtomicBool::new(false);
         crate::state_hash::StateHashMonitor::with_failstop(false).relatch_at_boot(&db, &latch);
-        assert!(!latch.load(Ordering::SeqCst), "fail-stop off at boot: not re-latched");
+        assert!(
+            !latch.load(Ordering::SeqCst),
+            "fail-stop off at boot: not re-latched"
+        );
 
         let (ctx, db, _m, _local) = node_at_checkpoint(false, false);
         run_votes(&ctx, &db, &[(0, x), (1, x), (2, x)]);
         drop(ctx);
-        assert_eq!(read_divergence(&db), None, "fail-stop off: nothing recorded");
+        assert_eq!(
+            read_divergence(&db),
+            None,
+            "fail-stop off: nothing recorded"
+        );
     }
 
     /// Review test gap: under the exec pipeline a block's votes sit in the
@@ -25043,7 +25937,10 @@ mod crash_recovery_tests {
         let x = B256::repeat_byte(0x42);
         let vote = |v: usize| {
             torus_types::eip712::sign_native_action(
-                NativeAction::AttestStateHash { height: 100, hash: x },
+                NativeAction::AttestStateHash {
+                    height: 100,
+                    hash: x,
+                },
                 block_time_ms(101) + v as u64,
                 &keys[v],
             )
@@ -25058,7 +25955,12 @@ mod crash_recovery_tests {
         let b101 = make_block(101, vec![vote(0), vote(1)]);
         let mut b102 = make_block(102, vec![vote(2)]);
         b102.header.parent_hash = alloy_primitives::keccak256(b101.header.canonical_header_bytes());
-        let durable_votes = || StakingManager::new(db.clone()).state_hash_votes(100).unwrap().len();
+        let durable_votes = || {
+            StakingManager::new(db.clone())
+                .state_hash_votes(100)
+                .unwrap()
+                .len()
+        };
         gate.hold();
         dispatch_and_execute(&ctx, &db, &b101);
         assert!(gate.wait_received(101));
@@ -25068,14 +25970,20 @@ mod crash_recovery_tests {
             ctx
         });
         std::thread::sleep(std::time::Duration::from_millis(200));
-        assert_eq!(durable_votes(), 0, "101's votes are not durable while 102 executes");
+        assert_eq!(
+            durable_votes(),
+            0,
+            "101's votes are not durable while 102 executes"
+        );
         gate.release();
         let ctx = t.join().unwrap();
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
         drop(ctx);
         assert_eq!(durable_votes(), 3);
         assert_eq!(
-            StakingManager::new(db.clone()).state_hash_quorum(100).unwrap(),
+            StakingManager::new(db.clone())
+                .state_hash_quorum(100)
+                .unwrap(),
             Some(x.0),
             "102's vote completed the quorum over the parent layer's two"
         );
@@ -25099,8 +26007,11 @@ mod crash_recovery_tests {
             code: None,
             account_id: None,
         };
-        db.put_account(&k256_address(&key), &account(KECCAK_EMPTY_CODE, U256::from(10u128.pow(18))))
-            .unwrap();
+        db.put_account(
+            &k256_address(&key),
+            &account(KECCAK_EMPTY_CODE, U256::from(10u128.pow(18))),
+        )
+        .unwrap();
         // Proxy: forward calldata to CoreWriter (0x0810), then STOP.
         #[rustfmt::skip]
         let code = vec![
@@ -25112,12 +26023,19 @@ mod crash_recovery_tests {
         let proxy = Address::repeat_byte(0xC0);
         let code_hash = alloy_primitives::keccak256(&code);
         db.put_code(&code_hash, &code).unwrap();
-        db.put_account(&proxy, &account(code_hash, U256::ZERO)).unwrap();
-        let mut calldata = alloy_primitives::keccak256("cancelOrder(bytes32)".as_bytes())[..4].to_vec();
+        db.put_account(&proxy, &account(code_hash, U256::ZERO))
+            .unwrap();
+        let mut calldata =
+            alloy_primitives::keccak256("cancelOrder(bytes32)".as_bytes())[..4].to_vec();
         calldata.extend_from_slice(&[0u8; 31]);
         calldata.push(42);
         let mut b1 = make_block(1, vec![]);
-        b1.evm_transactions = vec![signed_eip1559(&key, 0, alloy_primitives::TxKind::Call(proxy), calldata)];
+        b1.evm_transactions = vec![signed_eip1559(
+            &key,
+            0,
+            alloy_primitives::TxKind::Call(proxy),
+            calldata,
+        )];
         b1.header.evm_tx_count = 1;
 
         torus_state::running_hash::capture_begin(&db);
@@ -25129,13 +26047,21 @@ mod crash_recovery_tests {
         let captured = torus_state::running_hash::capture_take(&db);
 
         let queue_rows = StateBackend::iterate_cf(&db, CF_CORE_WRITER_QUEUE, None).unwrap();
-        assert_eq!(queue_rows.len(), 1, "the tx succeeded and the precompile enqueued");
+        assert_eq!(
+            queue_rows.len(),
+            1,
+            "the tx succeeded and the precompile enqueued"
+        );
         let queue = hashed_cf_id(CF_CORE_WRITER_QUEUE).unwrap();
         let hashed: Vec<_> = captured[0].1.iter().filter(|e| e.0 == queue).collect();
         assert_eq!(captured[0].0, 1);
         assert_eq!(
             hashed,
-            vec![&(queue, queue_rows[0].0.clone(), Some(queue_rows[0].1.clone()))],
+            vec![&(
+                queue,
+                queue_rows[0].0.clone(),
+                Some(queue_rows[0].1.clone())
+            )],
             "the precompile's queue row is in D(1)"
         );
         // Item 7 step 2 (owner answer 3): an order kind also writes the last order
@@ -25574,7 +26500,11 @@ mod crash_recovery_tests {
                 ctx.test_crash_after_evm_section = true;
                 ctx.execute_committed_block_with(block, vec![], durable);
                 drop(ctx);
-                assert_eq!(read_native_applied_height(&db), None, "crashed before the flush");
+                assert_eq!(
+                    read_native_applied_height(&db),
+                    None,
+                    "crashed before the flush"
+                );
             }
             let ctx = make_exec_ctx(&config, &db);
             ctx.execute_committed_block_with(block, vec![], durable);
@@ -25584,7 +26514,10 @@ mod crash_recovery_tests {
             db
         };
         let (clean, crashed) = (node(false), node(true));
-        for ((cf, a), (_, b)) in dump_all_cfs(&clean).iter().zip(dump_all_cfs(&crashed).iter()) {
+        for ((cf, a), (_, b)) in dump_all_cfs(&clean)
+            .iter()
+            .zip(dump_all_cfs(&crashed).iter())
+        {
             assert_eq!(a, b, "{cf} differs after the crash + replay");
         }
     }
@@ -25654,17 +26587,21 @@ mod crash_recovery_tests {
                 .verifying_key()
                 .to_bytes();
             staking
-                .put_validator(v, &torus_economics::ValidatorState {
-                    address: *v,
-                    pubkey,
-                    commission_bps: 500,
-                    self_stake: torus_economics::MIN_SELF_DELEGATION * U256::from(100 + i as u64),
-                    total_delegated: U256::ZERO,
-                    status: torus_economics::ValidatorStatus::Active,
-                    jailed_until: None,
-                    last_commission_change_block: None,
-                    oracle_signer: None,
-                })
+                .put_validator(
+                    v,
+                    &torus_economics::ValidatorState {
+                        address: *v,
+                        pubkey,
+                        commission_bps: 500,
+                        self_stake: torus_economics::MIN_SELF_DELEGATION
+                            * U256::from(100 + i as u64),
+                        total_delegated: U256::ZERO,
+                        status: torus_economics::ValidatorStatus::Active,
+                        jailed_until: None,
+                        last_commission_change_block: None,
+                        oracle_signer: None,
+                    },
+                )
                 .unwrap();
         }
         // Consensus side: genesis set from staking, as on a real node
@@ -25685,20 +26622,35 @@ mod crash_recovery_tests {
                 root_before,
                 "empty non-boundary block {h} must not touch native state"
             );
-            assert!(vals.iter().all(|v| staking.get_pending_rewards(v).unwrap().is_none()));
+            assert!(vals
+                .iter()
+                .all(|v| staking.get_pending_rewards(v).unwrap().is_none()));
         }
         // Block 4 = epoch boundary; its proposal asks for the set change first.
-        let at4 = app.epoch_validator_set_updates(4).expect("plan ready at 4").is_some();
-        let actions = if boundary_action { vec![sign_claim_rewards(4)] } else { vec![] };
+        let at4 = app
+            .epoch_validator_set_updates(4)
+            .expect("plan ready at 4")
+            .is_some();
+        let actions = if boundary_action {
+            vec![sign_claim_rewards(4)]
+        } else {
+            vec![]
+        };
         ctx.execute_committed_block(&make_block(4, actions), vec![]);
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
         assert_eq!(read_native_applied_height(&db), Some(4));
         let rewarded = vals.iter().all(|v| {
-            staking.get_pending_rewards(v).unwrap().is_some_and(|r| r.amount > U256::ZERO)
+            staking
+                .get_pending_rewards(v)
+                .unwrap()
+                .is_some_and(|r| r.amount > U256::ZERO)
         });
         // Blocks 5-7 empty, linked to the persisted block 4 (non-empty in the
         // control); the rotation at boundary 8 then reads 4's post-state + 5-7.
-        let stored4 = db.get_cf_raw(CF_BLOCK_HEADERS, &4u64.to_be_bytes()).unwrap().unwrap();
+        let stored4 = db
+            .get_cf_raw(CF_BLOCK_HEADERS, &4u64.to_be_bytes())
+            .unwrap()
+            .unwrap();
         let mut parent_hash = B256::from_slice(&stored4[..32]);
         for h in 5..=7u64 {
             let mut b = make_block(h, vec![]);
@@ -25708,7 +26660,10 @@ mod crash_recovery_tests {
             assert_eq!(read_native_applied_height(&db), Some(h));
         }
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
-        let at8 = app.epoch_validator_set_updates(8).expect("plan ready at 8").is_some();
+        let at8 = app
+            .epoch_validator_set_updates(8)
+            .expect("plan ready at 8")
+            .is_some();
         drop(ctx);
         let validators = staking
             .all_validators()
@@ -25716,7 +26671,11 @@ mod crash_recovery_tests {
             .into_iter()
             .map(|v| (v.address, v.status, v.total_stake()))
             .collect();
-        EpochOutcome { rewarded, validators, vs_updates_at: [at4, at8] }
+        EpochOutcome {
+            rewarded,
+            validators,
+            vs_updates_at: [at4, at8],
+        }
     }
 
     /// Control (GREEN today): a NON-empty boundary block credits inflation and
@@ -25724,8 +26683,15 @@ mod crash_recovery_tests {
     #[test]
     fn nonempty_epoch_boundary_block_runs_epoch_processing() {
         let out = epoch_fixture(true);
-        assert!(out.rewarded, "control: inflation must be non-zero for this fixture");
-        assert_eq!(out.vs_updates_at, [false, false], "no validator-set diff: {out:?}");
+        assert!(
+            out.rewarded,
+            "control: inflation must be non-zero for this fixture"
+        );
+        assert_eq!(
+            out.vs_updates_at,
+            [false, false],
+            "no validator-set diff: {out:?}"
+        );
         assert!(out
             .validators
             .iter()
@@ -25737,8 +26703,15 @@ mod crash_recovery_tests {
     #[test]
     fn empty_epoch_boundary_block_runs_epoch_processing() {
         let empty = epoch_fixture(false);
-        assert!(empty.rewarded, "empty boundary block 4 must distribute validator inflation");
-        assert_eq!(empty, epoch_fixture(true), "empty vs non-empty boundary must match");
+        assert!(
+            empty.rewarded,
+            "empty boundary block 4 must distribute validator inflation"
+        );
+        assert_eq!(
+            empty,
+            epoch_fixture(true),
+            "empty vs non-empty boundary must match"
+        );
     }
 
     // ---- T0b: block timestamp rule (rebase s87, owner option A) ----
@@ -25747,9 +26720,15 @@ mod crash_recovery_tests {
     fn proposal_timestamp_drift_bound() {
         assert!(check_timestamp_drift(1_005, 1_000).is_ok(), "drift 5");
         assert!(check_timestamp_drift(1_006, 1_000).is_err(), "drift 6");
-        assert!(check_timestamp_drift(0, 0).is_ok(), "first block after genesis (ts 0)");
+        assert!(
+            check_timestamp_drift(0, 0).is_ok(),
+            "first block after genesis (ts 0)"
+        );
         assert!(check_timestamp_drift(50, 1_000).is_ok(), "behind the clock");
-        assert!(check_timestamp_drift(u64::MAX, u64::MAX).is_ok(), "no overflow");
+        assert!(
+            check_timestamp_drift(u64::MAX, u64::MAX).is_ok(),
+            "no overflow"
+        );
     }
 
     /// The parent-timestamp source reads the header of either datum format.
@@ -25759,7 +26738,11 @@ mod crash_recovery_tests {
         b.header.timestamp = 123_456;
         for compact in [false, true] {
             let h = datum_header(&encode_proposal_datum(&b, compact)).unwrap();
-            assert_eq!(h.canonical_header_bytes(), b.header.canonical_header_bytes(), "compact={compact}");
+            assert_eq!(
+                h.canonical_header_bytes(),
+                b.header.canonical_header_bytes(),
+                "compact={compact}"
+            );
         }
     }
 
@@ -25803,8 +26786,14 @@ mod crash_recovery_tests {
     fn far_future_proposal_is_refused_before_the_vote() {
         let parent = tip_2000();
         let mut app = ts_app(2_010);
-        assert_eq!(pre_vote(&mut app, &parent, &child_of(&parent, 2_015)), BlockDataCheck::Held);
-        assert_eq!(pre_vote(&mut app, &parent, &child_of(&parent, 2_016)), BlockDataCheck::Invalid);
+        assert_eq!(
+            pre_vote(&mut app, &parent, &child_of(&parent, 2_015)),
+            BlockDataCheck::Held
+        );
+        assert_eq!(
+            pre_vote(&mut app, &parent, &child_of(&parent, 2_016)),
+            BlockDataCheck::Invalid
+        );
         assert_eq!(
             pre_vote(&mut app, &parent, &child_of(&parent, 9_999_999)),
             BlockDataCheck::Invalid
@@ -25820,7 +26809,11 @@ mod crash_recovery_tests {
         let parent = tip_2000();
         let far = child_of(&parent, 9_999_999);
         let mut app = ts_app(2_010);
-        assert_eq!(pre_vote(&mut app, &parent, &far), BlockDataCheck::Invalid, "no vote");
+        assert_eq!(
+            pre_vote(&mut app, &parent, &far),
+            BlockDataCheck::Invalid,
+            "no vote"
+        );
 
         // Insertion: validate_block's parent-link check, then the datum path.
         let hs_parent = hs_block(&parent, PhaseCertificate::genesis_pc());
@@ -25867,10 +26860,19 @@ mod crash_recovery_tests {
     fn regressing_timestamp_is_refused_before_the_vote_and_by_the_parent_link() {
         let parent = tip_2000();
         let mut app = ts_app(2_010);
-        assert_eq!(pre_vote(&mut app, &parent, &child_of(&parent, 2_000)), BlockDataCheck::Held);
-        assert_eq!(pre_vote(&mut app, &parent, &child_of(&parent, 1_999)), BlockDataCheck::Invalid);
+        assert_eq!(
+            pre_vote(&mut app, &parent, &child_of(&parent, 2_000)),
+            BlockDataCheck::Held
+        );
+        assert_eq!(
+            pre_vote(&mut app, &parent, &child_of(&parent, 1_999)),
+            BlockDataCheck::Invalid
+        );
         let hs_parent = hs_block(&parent, PhaseCertificate::genesis_pc());
-        for (ts, want) in [(2_000, BlockDataCheck::Held), (1_999, BlockDataCheck::Invalid)] {
+        for (ts, want) in [
+            (2_000, BlockDataCheck::Held),
+            (1_999, BlockDataCheck::Invalid),
+        ] {
             let header = parent.header.clone();
             assert_eq!(
                 check_parent_link(
@@ -25919,7 +26921,10 @@ mod crash_recovery_tests {
         parent.timestamp = now + 3;
         let _ = app.build_proposal(parent.clone());
         let produced = &app.pending_proposals[&(parent.height + 1)].block;
-        assert!(produced.header.timestamp >= parent.timestamp, "never below the parent");
+        assert!(
+            produced.header.timestamp >= parent.timestamp,
+            "never below the parent"
+        );
         assert!(check_timestamp_drift(produced.header.timestamp, now).is_ok());
     }
 
@@ -26001,7 +27006,8 @@ mod crash_recovery_tests {
     /// (its block-1 bits) and to each other.
     fn link_from_genesis(config: &ChainConfig, blocks: &mut [TorusBlock]) {
         let genesis = torus_bridge::genesis_parent_header_for(config);
-        blocks[0].header.parent_hash = alloy_primitives::keccak256(genesis.canonical_header_bytes());
+        blocks[0].header.parent_hash =
+            alloy_primitives::keccak256(genesis.canonical_header_bytes());
         link_blocks(blocks);
     }
 
@@ -26250,8 +27256,7 @@ mod crash_recovery_tests {
             rsh.name()
         );
         // (activation height, applied height, active, next, until)
-        for (at, applied, on, next, until) in
-            [(2u64, 4u64, 1.0, 0.0, -1.0), (6, 2, 0.0, 6.0, 4.0)]
+        for (at, applied, on, next, until) in [(2u64, 4u64, 1.0, 0.0, -1.0), (6, 2, 0.0, 6.0, 4.0)]
         {
             let (mut config, db) = make_test_config_and_db();
             config.activations = rsh_at(at);
@@ -26340,10 +27345,16 @@ mod crash_recovery_tests {
         }
         let wrong_known = with_features(child_of(&parent, 2_000), rsh);
         assert!(
-            matches!(link(&old, &wrong_known), Some(ValidateBlockResponse::Invalid)),
+            matches!(
+                link(&old, &wrong_known),
+                Some(ValidateBlockResponse::Invalid)
+            ),
             "known bit off-schedule: invalid"
         );
-        assert!(link(&old, &child_of(&parent, 2_000)).is_none(), "honest: linked");
+        assert!(
+            link(&old, &child_of(&parent, 2_000)).is_none(),
+            "honest: linked"
+        );
     }
 
     /// P0.0, Codex review of phase 2 (P2): `UnsupportedUpgrade` (no blacklist)
@@ -26374,9 +27385,15 @@ mod crash_recovery_tests {
         let bound = |block: &TorusBlock| {
             CryptoHash::new(TorusApp::hash_datum(&bincode::serialize(block).unwrap()))
         };
-        let newer = with_features(child_of(&parent, 2_000), parent.header.features | UNKNOWN_BIT);
+        let newer = with_features(
+            child_of(&parent, 2_000),
+            parent.header.features | UNKNOWN_BIT,
+        );
         assert!(
-            matches!(verdict(&newer, &bound(&newer)), Some(ValidateBlockResponse::UnsupportedUpgrade)),
+            matches!(
+                verdict(&newer, &bound(&newer)),
+                Some(ValidateBlockResponse::UnsupportedUpgrade)
+            ),
             "a datum bound to its block: unsupported upgrade"
         );
         // Tampered: the block commits to other bytes (another timestamp, or no
@@ -26386,12 +27403,18 @@ mod crash_recovery_tests {
         let plain = with_features(newer.clone(), parent.header.features);
         for committed in [&other, &plain] {
             assert!(
-                matches!(verdict(&newer, &bound(committed)), Some(ValidateBlockResponse::Invalid)),
+                matches!(
+                    verdict(&newer, &bound(committed)),
+                    Some(ValidateBlockResponse::Invalid)
+                ),
                 "a datum that does not hash to data_hash is invalid (blacklist)"
             );
         }
         assert!(
-            matches!(verdict(&newer, &CryptoHash::new([7; 32])), Some(ValidateBlockResponse::Invalid)),
+            matches!(
+                verdict(&newer, &CryptoHash::new([7; 32])),
+                Some(ValidateBlockResponse::Invalid)
+            ),
             "any other data_hash: invalid"
         );
     }
@@ -26569,7 +27592,11 @@ mod crash_recovery_tests {
                 drop(ctx);
                 let nonce = db.get_account(&sender).unwrap().map_or(0, |a| a.nonce);
                 let included = bits & rsh == 0;
-                assert_eq!(nonce, u64::from(included), "{what}: EVM spec of the header bits");
+                assert_eq!(
+                    nonce,
+                    u64::from(included),
+                    "{what}: EVM spec of the header bits"
+                );
             }
         }
     }
@@ -26587,7 +27614,8 @@ mod crash_recovery_tests {
                 with_features(make_block(h, vec![]), bits)
             })
             .collect();
-        blocks[0].header.parent_hash = alloy_primitives::keccak256(genesis.canonical_header_bytes());
+        blocks[0].header.parent_hash =
+            alloy_primitives::keccak256(genesis.canonical_header_bytes());
         link_blocks(&mut blocks);
         blocks
     }
@@ -26633,7 +27661,10 @@ mod crash_recovery_tests {
             dispatch_and_execute(&ctx, db, b);
         }
         assert!(ctx.pipeline_barrier(), "{mode:?}: W failed");
-        assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{mode:?}: fail-stop");
+        assert!(
+            !ctx.exec_failed.load(Ordering::SeqCst),
+            "{mode:?}: fail-stop"
+        );
     }
 
     /// `(N, h_N)` of a node scheduling the bit where the headers carry it
@@ -26646,10 +27677,22 @@ mod crash_recovery_tests {
         p3_boot(&db, &config);
         let below = (h - 1) as usize;
         p3_execute(&db, &config, &blocks[..below], P3Exec::Serial);
-        assert_eq!(read_running_hash(&db), None, "reference: nothing hashed below H");
+        assert_eq!(
+            read_running_hash(&db),
+            None,
+            "reference: nothing hashed below H"
+        );
         p3_execute(&db, &config, &blocks[below..=below], P3Exec::Serial);
-        assert_eq!(read_running_hash(&db).map(|(at, _)| at), Some(h), "reference: hashed at H");
-        assert_eq!(read_activation_height(&db), Some(h), "reference: chain starts at H");
+        assert_eq!(
+            read_running_hash(&db).map(|(at, _)| at),
+            Some(h),
+            "reference: hashed at H"
+        );
+        assert_eq!(
+            read_activation_height(&db),
+            Some(h),
+            "reference: chain starts at H"
+        );
         p3_execute(&db, &config, &blocks[h as usize..], P3Exec::Serial);
         let end = read_running_hash(&db).expect("reference: hashed");
         assert_eq!(end.0, blocks.len() as u64);
@@ -26663,15 +27706,27 @@ mod crash_recovery_tests {
             read_activation_height, read_configured_activation, read_running_hash,
             read_unverified_since,
         };
-        assert_eq!(read_native_applied_height(db), Some(reference.0), "{what}: applied");
+        assert_eq!(
+            read_native_applied_height(db),
+            Some(reference.0),
+            "{what}: applied"
+        );
         assert_eq!(read_unverified_since(db), None, "{what}: hash-verified");
         assert_eq!(
             read_activation_height(db),
             Some(h),
             "{what}: the chain starts at the first header with the bit"
         );
-        assert_eq!(read_configured_activation(db), Some(h), "{what}: configured from the headers");
-        assert_eq!(read_running_hash(db), Some(reference), "{what}: the same h_n");
+        assert_eq!(
+            read_configured_activation(db),
+            Some(h),
+            "{what}: configured from the headers"
+        );
+        assert_eq!(
+            read_running_hash(db),
+            Some(reference),
+            "{what}: the same h_n"
+        );
     }
 
     /// P0.0 phase 3: the running state hash starts at the first block whose
@@ -26701,10 +27756,13 @@ mod crash_recovery_tests {
                 Some(P3Exec::Checkpointed),
                 None,
             ] {
-                let what = format!("local schedule {local:?}, {}", match mode {
-                    Some(m) => format!("live {m:?}"),
-                    None => "boot replay".into(),
-                });
+                let what = format!(
+                    "local schedule {local:?}, {}",
+                    match mode {
+                        Some(m) => format!("live {m:?}"),
+                        None => "boot replay".into(),
+                    }
+                );
                 let (_, db) = make_test_config_and_db();
                 p3_boot(&db, &config);
                 match mode {
@@ -28828,7 +29886,12 @@ mod crash_recovery_tests {
             .unwrap()
     }
 
-    fn oracle_put_validator(db: &StateDb, seed: u8, mult: u64, status: torus_economics::ValidatorStatus) {
+    fn oracle_put_validator(
+        db: &StateDb,
+        seed: u8,
+        mult: u64,
+        status: torus_economics::ValidatorStatus,
+    ) {
         StakingManager::new(db.clone())
             .put_validator(
                 &oracle_addr(seed),
@@ -28854,8 +29917,12 @@ mod crash_recovery_tests {
         for (seed, mult) in ORACLE_VALIDATORS {
             oracle_put_validator(&db, seed, mult, torus_economics::ValidatorStatus::Active);
         }
-        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &ORACLE_MARKET.to_be_bytes(), b"listed")
-            .unwrap();
+        db.put_cf_raw(
+            torus_state::cf::CF_NATIVE_MARKETS,
+            &ORACLE_MARKET.to_be_bytes(),
+            b"listed",
+        )
+        .unwrap();
         (config, db)
     }
 
@@ -28929,14 +29996,26 @@ mod crash_recovery_tests {
             let rows = oracle_sub_rows(&db);
             assert_eq!(rows.len(), 1, "{path}");
             let v = &rows[0].1;
-            assert_eq!(u64::from_be_bytes(v[v.len() - 8..].try_into().unwrap()), 777_777, "{path}");
+            assert_eq!(
+                u64::from_be_bytes(v[v.len() - 8..].try_into().unwrap()),
+                777_777,
+                "{path}"
+            );
         }
     }
 
     /// The mark as AccountReader::mark sees it at block timestamp `now` (+ stamp block).
     fn mark_at(db: &StateDb, now: u64) -> Option<(FixedPoint, u64)> {
         let ctx = torus_bridge::native_executor::NativeExecContext::new(
-            db.clone(), 0, now, 0, 1_000, 4, Address::ZERO, Address::ZERO, Address::ZERO,
+            db.clone(),
+            0,
+            now,
+            0,
+            1_000,
+            4,
+            Address::ZERO,
+            Address::ZERO,
+            Address::ZERO,
         );
         let p = ctx.oracle.get_price(ORACLE_MARKET, now).ok()?;
         p.usable().map(|m| (m, p.block_number))
@@ -28956,12 +30035,28 @@ mod crash_recovery_tests {
             &[],
         ]);
         ctx.execute_committed_block(&blocks[0], vec![]);
-        assert_eq!(oracle_sub_rows(&db).len(), 3, "only Active validators' rows are stored");
-        assert_eq!(mark_at(&db, 1_001), None, "block 1's submissions are not aggregated in block 1");
+        assert_eq!(
+            oracle_sub_rows(&db).len(),
+            3,
+            "only Active validators' rows are stored"
+        );
+        assert_eq!(
+            mark_at(&db, 1_001),
+            None,
+            "block 1's submissions are not aggregated in block 1"
+        );
         ctx.execute_committed_block(&blocks[1], vec![]);
-        assert_eq!(mark_at(&db, 1_002), Some((px(102), 2)), "stake-weighted (simple median 101)");
+        assert_eq!(
+            mark_at(&db, 1_002),
+            Some((px(102), 2)),
+            "stake-weighted (simple median 101)"
+        );
         ctx.execute_committed_block(&blocks[2], vec![]);
-        assert_eq!(mark_at(&db, 1_003), Some((px(102), 3)), "block 3's prices count from block 4");
+        assert_eq!(
+            mark_at(&db, 1_003),
+            Some((px(102), 3)),
+            "block 3's prices count from block 4"
+        );
         ctx.execute_committed_block(&blocks[3], vec![]);
         assert_eq!(mark_at(&db, 1_004), Some((px(200), 4)));
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
@@ -28987,7 +30082,11 @@ mod crash_recovery_tests {
         for b in &blocks[11..13] {
             ctx.execute_committed_block(b, vec![]);
         }
-        assert_eq!(mark_at(&db, 1_013), Some((px(100), 11)), "2 reporters: last price, stamp kept");
+        assert_eq!(
+            mark_at(&db, 1_013),
+            Some((px(100), 11)),
+            "2 reporters: last price, stamp kept"
+        );
         for b in &blocks[13..] {
             ctx.execute_committed_block(b, vec![]);
         }
@@ -29009,7 +30108,11 @@ mod crash_recovery_tests {
         assert_eq!(ctx.resident_books.lock().unwrap().height(), Some(1));
         ctx.execute_committed_block(&blocks[1], vec![]);
         assert_eq!(mark_at(&db, 1_002), Some((px(100), 2)));
-        assert_eq!(ctx.resident_books.lock().unwrap().height(), Some(2), "holder not drained");
+        assert_eq!(
+            ctx.resident_books.lock().unwrap().height(),
+            Some(2),
+            "holder not drained"
+        );
     }
 
     /// 1: V1..V3 @100; 2 empty; 3: V1..V3 @200; 4..=6 empty; 7: V1 @300, V2 @310;
@@ -29091,7 +30194,8 @@ mod crash_recovery_tests {
     fn oracle_determinism_serial_pipelined_and_replay_are_identical() {
         let blocks = oracle_determinism_blocks();
         let (serial, root_s, db_s) = run_fixture(OracleRun::Serial, &blocks, oracle_fixture_db);
-        let (piped, root_p, _) = run_fixture(OracleRun::PipelinedParked, &blocks, oracle_fixture_db);
+        let (piped, root_p, _) =
+            run_fixture(OracleRun::PipelinedParked, &blocks, oracle_fixture_db);
         let (replay, root_r, _) = run_fixture(OracleRun::Replay, &blocks, oracle_fixture_db);
         // Non-vacuous: 8..=13: V1 300, V2 310 (ts 1007), V3 200 (ts 1003, 3x) in the
         // window through ts 1013 -> stake-weighted 200, re-stamped; 14: V3's row
@@ -29114,10 +30218,22 @@ mod crash_recovery_tests {
         let mut blocks = oracle_blocks(&[&[(61, 100), (62, 100), (63, 100)], &[], &[]]);
         blocks[2].header.timestamp = 1_012; // last block: no child to relink
         let (serial, root_s, db_s) = run_fixture(OracleRun::Serial, &blocks, oracle_fixture_db);
-        let (piped, root_p, _) = run_fixture(OracleRun::PipelinedParked, &blocks, oracle_fixture_db);
-        assert_eq!(mark_at(&db_s, 1_012), Some((px(100), 2)), "block 2's aggregate survives");
-        assert!(oracle_sub_rows(&db_s).is_empty(), "block 3 pruned block 1's rows");
-        assert_dumps_equal(&serial, &piped, "oracle: serial vs pipelined (parent-layer due-check)");
+        let (piped, root_p, _) =
+            run_fixture(OracleRun::PipelinedParked, &blocks, oracle_fixture_db);
+        assert_eq!(
+            mark_at(&db_s, 1_012),
+            Some((px(100), 2)),
+            "block 2's aggregate survives"
+        );
+        assert!(
+            oracle_sub_rows(&db_s).is_empty(),
+            "block 3 pruned block 1's rows"
+        );
+        assert_dumps_equal(
+            &serial,
+            &piped,
+            "oracle: serial vs pipelined (parent-layer due-check)",
+        );
         assert_eq!(root_s, root_p);
     }
 
@@ -29130,11 +30246,33 @@ mod crash_recovery_tests {
         let (config, db) = oracle_fixture_db();
         let pm = PositionManager::new(db.clone());
         for (seed, amt) in [(71u8, collateral), (72, 10_000_000), (73, 10_000_000)] {
-            pm.put_native_balance(&oracle_addr(seed), &NativeBalance { available: px(amt), order_margin: FixedPoint::ZERO })
-                .unwrap();
+            pm.put_native_balance(
+                &oracle_addr(seed),
+                &NativeBalance {
+                    available: px(amt),
+                    order_margin: FixedPoint::ZERO,
+                },
+            )
+            .unwrap();
         }
-        pm.apply_fill(&oracle_addr(71), ORACLE_MARKET, true, px(size), px(1_000), MarginType::Cross).unwrap();
-        pm.apply_fill(&oracle_addr(72), ORACLE_MARKET, false, px(size), px(1_000), MarginType::Cross).unwrap();
+        pm.apply_fill(
+            &oracle_addr(71),
+            ORACLE_MARKET,
+            true,
+            px(size),
+            px(1_000),
+            MarginType::Cross,
+        )
+        .unwrap();
+        pm.apply_fill(
+            &oracle_addr(72),
+            ORACLE_MARKET,
+            false,
+            px(size),
+            px(1_000),
+            MarginType::Cross,
+        )
+        .unwrap();
         (config, db)
     }
 
@@ -29230,14 +30368,20 @@ mod crash_recovery_tests {
 
     /// Heights 1..=rounds.len() (ts = 1000 + h), linked.
     fn liq_blocks(rounds: Vec<Vec<SignedNativeAction>>) -> Vec<TorusBlock> {
-        let mut blocks: Vec<TorusBlock> =
-            rounds.into_iter().enumerate().map(|(i, a)| make_block(i as u64 + 1, a)).collect();
+        let mut blocks: Vec<TorusBlock> = rounds
+            .into_iter()
+            .enumerate()
+            .map(|(i, a)| make_block(i as u64 + 1, a))
+            .collect();
         link_blocks(&mut blocks);
         blocks
     }
 
     fn signed_pos_of(db: &StateDb, who: &Address) -> FixedPoint {
-        match torus_core::position::PositionManager::new(db.clone()).get_position(who, ORACLE_MARKET).unwrap() {
+        match torus_core::position::PositionManager::new(db.clone())
+            .get_position(who, ORACLE_MARKET)
+            .unwrap()
+        {
             Some(p) if p.is_long => p.size,
             Some(p) => -p.size,
             None => FixedPoint::ZERO,
@@ -29261,8 +30405,15 @@ mod crash_recovery_tests {
         let ctx = make_exec_ctx(&config, &db);
         let t = oracle_addr(71);
         let mut rounds = vec![
-            vec![oracle_sub(61, 1, 990), oracle_sub(62, 1, 990), oracle_sub(63, 1, 990)], // 1 (ts 1001)
-            vec![signed_bid(73, 2_073, 985, 40), signed_bid(73, 2_074, 970, 50)],           // 2 (mark 990)
+            vec![
+                oracle_sub(61, 1, 990),
+                oracle_sub(62, 1, 990),
+                oracle_sub(63, 1, 990),
+            ], // 1 (ts 1001)
+            vec![
+                signed_bid(73, 2_073, 985, 40),
+                signed_bid(73, 2_074, 970, 50),
+            ], // 2 (mark 990)
         ];
         rounds.extend(std::iter::repeat_n(Vec::new(), 29)); // 3..=31 (ts 1003..=1031)
         rounds.push(vec![signed_bid(73, 32_073, 985, 100)]); // 32 (ts 1032)
@@ -29270,16 +30421,32 @@ mod crash_recovery_tests {
         ctx.execute_committed_block(&blocks[0], vec![]);
         assert_eq!(signed_pos_of(&db, &t), px(200), "block 1: no mark yet");
         ctx.execute_committed_block(&blocks[1], vec![]);
-        assert_eq!(signed_pos_of(&db, &t), px(160), "block 2: chunk 1 filled by block 2's own 985 bid");
+        assert_eq!(
+            signed_pos_of(&db, &t),
+            px(160),
+            "block 2: chunk 1 filled by block 2's own 985 bid"
+        );
         ctx.execute_committed_block(&blocks[2], vec![]);
-        assert_eq!(signed_pos_of(&db, &t), px(110), "block 3 (empty, cooldown): the entire position is ordered");
+        assert_eq!(
+            signed_pos_of(&db, &t),
+            px(110),
+            "block 3 (empty, cooldown): the entire position is ordered"
+        );
         for b in &blocks[3..31] {
             ctx.execute_committed_block(b, vec![]); // 4..=31 (ts <= 1031)
         }
-        assert_eq!(signed_pos_of(&db, &t), px(110), "cooldown: empty book, nothing fills");
+        assert_eq!(
+            signed_pos_of(&db, &t),
+            px(110),
+            "cooldown: empty book, nothing fills"
+        );
         assert!(oracle_sub_rows(&db).is_empty(), "rows pruned");
         ctx.execute_committed_block(&blocks[31], vec![]); // 32, ts 1032
-        assert_eq!(signed_pos_of(&db, &t), px(88), "cooldown over: chunk 2 = 20% of 110");
+        assert_eq!(
+            signed_pos_of(&db, &t),
+            px(88),
+            "cooldown over: chunk 2 = 20% of 110"
+        );
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
         assert_eq!(read_native_applied_height(&db), Some(32));
     }
@@ -29293,18 +30460,46 @@ mod crash_recovery_tests {
         let (config, db) = oracle_fixture_db();
         let pm = PositionManager::new(db.clone());
         for (seed, amt) in [(71u8, 40), (74, 50), (72, 1_000_000), (73, 1_000_000)] {
-            pm.put_native_balance(&oracle_addr(seed), &NativeBalance { available: px(amt), order_margin: FixedPoint::ZERO })
-                .unwrap();
+            pm.put_native_balance(
+                &oracle_addr(seed),
+                &NativeBalance {
+                    available: px(amt),
+                    order_margin: FixedPoint::ZERO,
+                },
+            )
+            .unwrap();
         }
         for long in [71u8, 74] {
-            pm.apply_fill(&oracle_addr(long), ORACLE_MARKET, true, px(10), px(100), MarginType::Cross).unwrap();
-            pm.apply_fill(&oracle_addr(72), ORACLE_MARKET, false, px(10), px(100), MarginType::Cross).unwrap();
+            pm.apply_fill(
+                &oracle_addr(long),
+                ORACLE_MARKET,
+                true,
+                px(10),
+                px(100),
+                MarginType::Cross,
+            )
+            .unwrap();
+            pm.apply_fill(
+                &oracle_addr(72),
+                ORACLE_MARKET,
+                false,
+                px(10),
+                px(100),
+                MarginType::Cross,
+            )
+            .unwrap();
         }
         (config, db)
     }
 
     fn liq_det_blocks() -> Vec<TorusBlock> {
-        let subs = |h: u64, p: i64| vec![oracle_sub(61, h, p), oracle_sub(62, h, p), oracle_sub(63, h, p)];
+        let subs = |h: u64, p: i64| {
+            vec![
+                oracle_sub(61, h, p),
+                oracle_sub(62, h, p),
+                oracle_sub(63, h, p),
+            ]
+        };
         let mut r1 = subs(1, 100);
         r1.push(signed_bid(73, 1_073, 95, 10));
         let mut rounds = vec![r1, vec![], subs(3, 97), vec![], subs(5, 80)];
@@ -29320,10 +30515,26 @@ mod crash_recovery_tests {
         let (piped, root_p, _) = run_fixture(OracleRun::PipelinedParked, &blocks, liq_det_fixture);
         let (replay, root_r, _) = run_fixture(OracleRun::Replay, &blocks, liq_det_fixture);
         // Non-vacuous: all three mechanisms ran.
-        assert_eq!(signed_pos_of(&db_s, &oracle_addr(71)), FixedPoint::ZERO, "T1 backstopped");
-        assert_eq!(signed_pos_of(&db_s, &oracle_addr(74)), FixedPoint::ZERO, "T2 sold into the book");
-        assert_eq!(signed_pos_of(&db_s, &oracle_addr(73)), px(10), "M bought T2's 10 @ 95");
-        assert_eq!(signed_pos_of(&db_s, &LIQUIDATOR_VAULT), FixedPoint::ZERO, "vault ADL'd");
+        assert_eq!(
+            signed_pos_of(&db_s, &oracle_addr(71)),
+            FixedPoint::ZERO,
+            "T1 backstopped"
+        );
+        assert_eq!(
+            signed_pos_of(&db_s, &oracle_addr(74)),
+            FixedPoint::ZERO,
+            "T2 sold into the book"
+        );
+        assert_eq!(
+            signed_pos_of(&db_s, &oracle_addr(73)),
+            px(10),
+            "M bought T2's 10 @ 95"
+        );
+        assert_eq!(
+            signed_pos_of(&db_s, &LIQUIDATOR_VAULT),
+            FixedPoint::ZERO,
+            "vault ADL'd"
+        );
         assert_eq!(signed_pos_of(&db_s, &oracle_addr(72)), -px(10));
         assert_dumps_equal(&serial, &piped, "liquidation: serial vs pipelined (parked)");
         assert_dumps_equal(&serial, &replay, "liquidation: serial vs crash replay");
@@ -29352,17 +30563,27 @@ mod crash_recovery_tests {
             let mut per_block = Vec::new();
             for b in &blocks {
                 dispatch_and_execute(&ctx, &db, b);
-                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "pipelined={pipelined} no_r={no_r}");
+                assert!(
+                    !ctx.exec_failed.load(Ordering::SeqCst),
+                    "pipelined={pipelined} no_r={no_r}"
+                );
                 if let Some(w) = ctx.flush_worker.as_ref() {
                     assert!(w.wait_idle());
                 }
-                let rows: Vec<CfDump> = [CF_NATIVE_LIQUIDATION, CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES]
-                    .iter()
-                    .map(|cf| (*cf, StateBackend::iterate_cf(&db, cf, None).unwrap()))
-                    .collect();
+                let rows: Vec<CfDump> = [
+                    CF_NATIVE_LIQUIDATION,
+                    CF_NATIVE_POSITIONS,
+                    CF_NATIVE_BALANCES,
+                ]
+                .iter()
+                .map(|cf| (*cf, StateBackend::iterate_cf(&db, cf, None).unwrap()))
+                .collect();
                 per_block.push(rows);
             }
-            assert_eq!(ctx.resident_books.lock().unwrap().rows_builds(), u64::from(!no_r));
+            assert_eq!(
+                ctx.resident_books.lock().unwrap().rows_builds(),
+                u64::from(!no_r)
+            );
             drop(ctx);
             let captured = torus_state::running_hash::capture_take(&db);
             let stored = torus_state::running_hash::read_running_hash(&db);
@@ -29387,18 +30608,24 @@ mod crash_recovery_tests {
     fn signed_limits(seed: u8, nonce: u64, orders: &[(u64, bool, i64, i64)]) -> SignedNativeAction {
         let orders = orders
             .iter()
-            .map(|&(market_id, is_buy, price, qty)| torus_types::PlaceOrderParams {
-                market_id,
-                is_buy,
-                price: px(price),
-                quantity: px(qty),
-                order_type: torus_types::OrderType::Limit,
-                time_in_force: torus_types::TimeInForce::GTC,
-                reduce_only: false,
-                client_order_id: None,
-            })
+            .map(
+                |&(market_id, is_buy, price, qty)| torus_types::PlaceOrderParams {
+                    market_id,
+                    is_buy,
+                    price: px(price),
+                    quantity: px(qty),
+                    order_type: torus_types::OrderType::Limit,
+                    time_in_force: torus_types::TimeInForce::GTC,
+                    reduce_only: false,
+                    client_order_id: None,
+                },
+            )
             .collect();
-        torus_types::eip712::sign_native_action(NativeAction::PlaceOrderBatch(orders), NONCE_BASE + nonce, &oracle_key(seed))
+        torus_types::eip712::sign_native_action(
+            NativeAction::PlaceOrderBatch(orders),
+            NONCE_BASE + nonce,
+            &oracle_key(seed),
+        )
     }
 
     /// Option B: T (71) funded 101.0505 (101 + B-blind's δ top-up of its
@@ -29408,9 +30635,18 @@ mod crash_recovery_tests {
         use torus_core::position::{NativeBalance, PositionManager};
         let (config, db) = oracle_fixture_db();
         let pm = PositionManager::new(db.clone());
-        for (seed, amt) in [(71u8, px(101) + FixedPoint::from_raw(px(505).raw() / 10_000)), (73, px(1_000_000))] {
-            pm.put_native_balance(&oracle_addr(seed), &NativeBalance { available: amt, order_margin: FixedPoint::ZERO })
-                .unwrap();
+        for (seed, amt) in [
+            (71u8, px(101) + FixedPoint::from_raw(px(505).raw() / 10_000)),
+            (73, px(1_000_000)),
+        ] {
+            pm.put_native_balance(
+                &oracle_addr(seed),
+                &NativeBalance {
+                    available: amt,
+                    order_margin: FixedPoint::ZERO,
+                },
+            )
+            .unwrap();
         }
         (config, db)
     }
@@ -29422,9 +30658,17 @@ mod crash_recovery_tests {
     /// give identical state.
     #[test]
     fn option_b_serial_pipelined_and_replay_are_identical() {
-        let mut rounds = vec![vec![signed_limits(73, 1_073, &[(1, true, 101, 10), (2, true, 101, 10)])]];
+        let mut rounds = vec![vec![signed_limits(
+            73,
+            1_073,
+            &[(1, true, 101, 10), (2, true, 101, 10)],
+        )]];
         rounds.extend(std::iter::repeat_n(Vec::new(), 3)); // 2..=4
-        rounds.push(vec![signed_limits(71, 5_071, &[(1, false, 100, 10), (2, false, 100, 10)])]); // 5
+        rounds.push(vec![signed_limits(
+            71,
+            5_071,
+            &[(1, false, 100, 10), (2, false, 100, 10)],
+        )]); // 5
         rounds.extend(std::iter::repeat_n(Vec::new(), 2)); // 6, 7
         let blocks = liq_blocks(rounds);
         let (serial, root_s, db_s) = run_fixture(OracleRun::Serial, &blocks, option_b_fixture);
@@ -29432,8 +30676,15 @@ mod crash_recovery_tests {
         let (replay, root_r, _) = run_fixture(OracleRun::Replay, &blocks, option_b_fixture);
         let pm = torus_core::position::PositionManager::new(db_s.clone());
         for m in [1u64, 2] {
-            let p = pm.get_position(&oracle_addr(71), m).unwrap().unwrap_or_else(|| panic!("market {m}: T short"));
-            assert_eq!((p.is_long, p.size), (false, px(10)), "market {m}: filled @101");
+            let p = pm
+                .get_position(&oracle_addr(71), m)
+                .unwrap()
+                .unwrap_or_else(|| panic!("market {m}: T short"));
+            assert_eq!(
+                (p.is_long, p.size),
+                (false, px(10)),
+                "market {m}: filled @101"
+            );
         }
         assert_dumps_equal(&serial, &piped, "option B: serial vs pipelined (parked)");
         assert_dumps_equal(&serial, &replay, "option B: serial vs crash replay");
@@ -29448,7 +30699,10 @@ mod crash_recovery_tests {
         for seed in [71u8, 74] {
             pm.put_native_balance(
                 &oracle_addr(seed),
-                &torus_core::position::NativeBalance { available: px(1_000), order_margin: FixedPoint::ZERO },
+                &torus_core::position::NativeBalance {
+                    available: px(1_000),
+                    order_margin: FixedPoint::ZERO,
+                },
             )
             .unwrap();
         }
@@ -29463,7 +30717,11 @@ mod crash_recovery_tests {
     /// crash replay give identical state.
     #[test]
     fn same_batch_bid_serial_pipelined_and_replay_are_identical() {
-        let mut rounds = vec![vec![signed_limits(73, 1_073, &[(1, true, 101, 10), (2, true, 101, 10), (2, false, 110, 10)])]];
+        let mut rounds = vec![vec![signed_limits(
+            73,
+            1_073,
+            &[(1, true, 101, 10), (2, true, 101, 10), (2, false, 110, 10)],
+        )]];
         rounds.extend(std::iter::repeat_n(Vec::new(), 3)); // 2..=4
         rounds.push(vec![
             signed_limits(74, 5_074, &[(2, true, 105, 10)]),
@@ -29471,30 +30729,59 @@ mod crash_recovery_tests {
         ]); // 5
         rounds.extend(std::iter::repeat_n(Vec::new(), 2)); // 6, 7
         let blocks = liq_blocks(rounds);
-        let (serial, root_s, db_s) = run_fixture(OracleRun::Serial, &blocks, same_batch_bid_fixture);
-        let (piped, root_p, _) = run_fixture(OracleRun::PipelinedParked, &blocks, same_batch_bid_fixture);
+        let (serial, root_s, db_s) =
+            run_fixture(OracleRun::Serial, &blocks, same_batch_bid_fixture);
+        let (piped, root_p, _) =
+            run_fixture(OracleRun::PipelinedParked, &blocks, same_batch_bid_fixture);
         let (replay, root_r, _) = run_fixture(OracleRun::Replay, &blocks, same_batch_bid_fixture);
         let pm = torus_core::position::PositionManager::new(db_s.clone());
         for (m, size) in [(1u64, 10), (2, 2)] {
-            let p = pm.get_position(&oracle_addr(71), m).unwrap().unwrap_or_else(|| panic!("market {m}: T short"));
-            assert_eq!((p.is_long, p.size), (false, px(size)), "market {m}: T filled");
+            let p = pm
+                .get_position(&oracle_addr(71), m)
+                .unwrap()
+                .unwrap_or_else(|| panic!("market {m}: T short"));
+            assert_eq!(
+                (p.is_long, p.size),
+                (false, px(size)),
+                "market {m}: T filled"
+            );
         }
-        let b = pm.get_position(&oracle_addr(74), 2).unwrap().expect("B long");
-        assert_eq!((b.is_long, b.size), (true, px(2)), "B's same-batch bid filled 2 (beyond δ)");
-        assert_dumps_equal(&serial, &piped, "same-batch bid: serial vs pipelined (parked)");
+        let b = pm
+            .get_position(&oracle_addr(74), 2)
+            .unwrap()
+            .expect("B long");
+        assert_eq!(
+            (b.is_long, b.size),
+            (true, px(2)),
+            "B's same-batch bid filled 2 (beyond δ)"
+        );
+        assert_dumps_equal(
+            &serial,
+            &piped,
+            "same-batch bid: serial vs pipelined (parked)",
+        );
         assert_dumps_equal(&serial, &replay, "same-batch bid: serial vs crash replay");
         assert_eq!(root_s, root_p);
         assert_eq!(root_s, root_r);
     }
 
-    fn signed_stop_limit_buy(seed: u8, nonce: u64, trigger: i64, limit: i64, qty: i64) -> SignedNativeAction {
+    fn signed_stop_limit_buy(
+        seed: u8,
+        nonce: u64,
+        trigger: i64,
+        limit: i64,
+        qty: i64,
+    ) -> SignedNativeAction {
         torus_types::eip712::sign_native_action(
             NativeAction::PlaceOrder(torus_types::PlaceOrderParams {
                 market_id: ORACLE_MARKET,
                 is_buy: true,
                 price: px(limit),
                 quantity: px(qty),
-                order_type: torus_types::OrderType::StopLimit { trigger: px(trigger), limit: px(limit) },
+                order_type: torus_types::OrderType::StopLimit {
+                    trigger: px(trigger),
+                    limit: px(limit),
+                },
                 time_in_force: torus_types::TimeInForce::GTC,
                 reduce_only: false,
                 client_order_id: None,
@@ -29518,20 +30805,37 @@ mod crash_recovery_tests {
         let (config, db) = liq_fixture_db(10, 300);
         let ctx = make_exec_ctx(&config, &db);
         let (t, m) = (oracle_addr(71), oracle_addr(73));
-        let mut rounds = vec![vec![oracle_sub(61, 1, 990), oracle_sub(62, 1, 990), oracle_sub(63, 1, 990)]];
+        let mut rounds = vec![vec![
+            oracle_sub(61, 1, 990),
+            oracle_sub(62, 1, 990),
+            oracle_sub(63, 1, 990),
+        ]];
         rounds.extend(std::iter::repeat_n(Vec::new(), 11)); // 2..=12
-        rounds.push(vec![signed_bid(73, 13_073, 966, 4), signed_stop_limit_buy(73, 13_074, 960, 966, 6)]); // 13
+        rounds.push(vec![
+            signed_bid(73, 13_073, 966, 4),
+            signed_stop_limit_buy(73, 13_074, 960, 966, 6),
+        ]); // 13
         rounds.extend(std::iter::repeat_n(Vec::new(), 2)); // 14, 15
         let blocks = liq_blocks(rounds);
         for b in &blocks[..13] {
             ctx.execute_committed_block(b, vec![]);
         }
-        assert!(oracle_sub_rows(&db).is_empty(), "rows pruned: no oracle-due");
+        assert!(
+            oracle_sub_rows(&db).is_empty(),
+            "rows pruned: no oracle-due"
+        );
         assert_eq!(signed_pos_of(&db, &t), px(6), "block 13: partial (4 sold)");
         ctx.execute_committed_block(&blocks[13], vec![]); // 14: empty
-        assert_eq!(signed_pos_of(&db, &t), FixedPoint::ZERO, "block 14 re-ran the step");
+        assert_eq!(
+            signed_pos_of(&db, &t),
+            FixedPoint::ZERO,
+            "block 14 re-ran the step"
+        );
         assert_eq!(signed_pos_of(&db, &m), px(10));
-        assert!(!NativeExecutor::liquidation_due(&db).unwrap(), "flat: nothing pending");
+        assert!(
+            !NativeExecutor::liquidation_due(&db).unwrap(),
+            "flat: nothing pending"
+        );
         ctx.execute_committed_block(&blocks[14], vec![]);
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
     }
@@ -29543,15 +30847,37 @@ mod crash_recovery_tests {
         let (config, db) = oracle_fixture_db();
         let pm = PositionManager::new(db.clone());
         let fund = |seed: u8, amt: i64| {
-            pm.put_native_balance(&oracle_addr(seed), &NativeBalance { available: px(amt), order_margin: FixedPoint::ZERO })
-                .unwrap();
+            pm.put_native_balance(
+                &oracle_addr(seed),
+                &NativeBalance {
+                    available: px(amt),
+                    order_margin: FixedPoint::ZERO,
+                },
+            )
+            .unwrap();
         };
         for seed in adl_e2e_longs() {
             fund(seed, 50);
-            pm.apply_fill(&oracle_addr(seed), ORACLE_MARKET, true, px(10), px(1_000), MarginType::Cross).unwrap();
+            pm.apply_fill(
+                &oracle_addr(seed),
+                ORACLE_MARKET,
+                true,
+                px(10),
+                px(1_000),
+                MarginType::Cross,
+            )
+            .unwrap();
         }
         fund(72, 10_000_000);
-        pm.apply_fill(&oracle_addr(72), ORACLE_MARKET, false, px(140), px(1_000), MarginType::Cross).unwrap();
+        pm.apply_fill(
+            &oracle_addr(72),
+            ORACLE_MARKET,
+            false,
+            px(140),
+            px(1_000),
+            MarginType::Cross,
+        )
+        .unwrap();
         (config, db)
     }
 
@@ -29561,14 +30887,20 @@ mod crash_recovery_tests {
 
     /// Block 1: the mark 970 (aggregated at block 2's start); 2..=16 empty.
     fn adl_e2e_blocks() -> Vec<TorusBlock> {
-        let mut rounds = vec![vec![oracle_sub(61, 1, 970), oracle_sub(62, 1, 970), oracle_sub(63, 1, 970)]];
+        let mut rounds = vec![vec![
+            oracle_sub(61, 1, 970),
+            oracle_sub(62, 1, 970),
+            oracle_sub(63, 1, 970),
+        ]];
         rounds.extend(std::iter::repeat_n(Vec::new(), 15)); // 2..=16
         liq_blocks(rounds)
     }
 
     fn adl_rows(db: &StateDb) -> usize {
         let tag = torus_core::liquidation::ADL_OBLIGATION_TAG;
-        StateBackend::iterate_cf(db, torus_state::cf::CF_NATIVE_LIQUIDATION, Some(&[tag])).unwrap().len()
+        StateBackend::iterate_cf(db, torus_state::cf::CF_NATIVE_LIQUIDATION, Some(&[tag]))
+            .unwrap()
+            .len()
     }
 
     /// adl-budget P2: obligation rows keep the step DUE. Mark 970: all 14
@@ -29596,9 +30928,14 @@ mod crash_recovery_tests {
             for (i, b) in blocks.iter().enumerate() {
                 let h = i as u64 + 1;
                 if h >= 13 {
-                    assert!(oracle_sub_rows(&db).is_empty(), "block {h}: oracle rows pruned");
+                    assert!(
+                        oracle_sub_rows(&db).is_empty(),
+                        "block {h}: oracle rows pruned"
+                    );
                     for tag in [COOLDOWN_TAG, CURSOR_KEY[0], PENDING_TAG] {
-                        let rows = StateBackend::iterate_cf(&db, CF_NATIVE_LIQUIDATION, Some(&[tag])).unwrap();
+                        let rows =
+                            StateBackend::iterate_cf(&db, CF_NATIVE_LIQUIDATION, Some(&[tag]))
+                                .unwrap();
                         assert!(rows.is_empty(), "block {h}: no 0x{tag:02x} row");
                     }
                 }
@@ -29612,12 +30949,27 @@ mod crash_recovery_tests {
         };
         let (left, dump_1, root_1, db) = run();
         let want: Vec<usize> = std::iter::once(0).chain((2..=16).map(|h| 16 - h)).collect();
-        assert_eq!(left, want, "B = 2: 14 rows, none drained in B (its transfers spend W), one per block 3..=16");
+        assert_eq!(
+            left, want,
+            "B = 2: 14 rows, none drained in B (its transfers spend W), one per block 3..=16"
+        );
         for seed in adl_e2e_longs() {
-            assert_eq!(signed_pos_of(&db, &oracle_addr(seed)), FixedPoint::ZERO, "seed {seed}: flat at B");
+            assert_eq!(
+                signed_pos_of(&db, &oracle_addr(seed)),
+                FixedPoint::ZERO,
+                "seed {seed}: flat at B"
+            );
         }
-        assert_eq!(signed_pos_of(&db, &ADL_ESCROW_LONG), FixedPoint::ZERO, "the escrow drained");
-        assert_eq!(signed_pos_of(&db, &oracle_addr(72)), FixedPoint::ZERO, "S closed 140 against the escrow");
+        assert_eq!(
+            signed_pos_of(&db, &ADL_ESCROW_LONG),
+            FixedPoint::ZERO,
+            "the escrow drained"
+        );
+        assert_eq!(
+            signed_pos_of(&db, &oracle_addr(72)),
+            FixedPoint::ZERO,
+            "S closed 140 against the escrow"
+        );
         assert!(!NativeExecutor::liquidation_due(&db).unwrap());
         let (_, dump_2, root_2, _) = run();
         assert_dumps_equal(&dump_1, &dump_2, "adl drain: two runs");
@@ -29655,20 +31007,30 @@ mod crash_recovery_tests {
                     drop(ctx);
                     drop(db);
                     db = StateDb::open(&dir).expect("reopen the state db");
-                    torus_state::running_hash::configure_activation(&db, config.state_hash_activation_height())
-                        .expect("configure running hash activation");
+                    torus_state::running_hash::configure_activation(
+                        &db,
+                        config.state_hash_activation_height(),
+                    )
+                    .expect("configure running hash activation");
                     assert_eq!(adl_rows(&db), 8, "mid-drain after the reopen");
                     ctx = open_ctx(&db);
                 }
                 let work = |ctx: &ExecutionContext| {
-                    ctx.metrics.as_ref().expect("metrics attached").liquidation_adl_work_total.get()
+                    ctx.metrics
+                        .as_ref()
+                        .expect("metrics attached")
+                        .liquidation_adl_work_total
+                        .get()
                 };
                 let before = work(&ctx);
                 ctx.execute_committed_block(b, vec![]);
                 assert!(!ctx.exec_failed.load(Ordering::SeqCst), "block {}", i + 1);
                 units.push(work(&ctx) - before);
                 if i >= 8 {
-                    after.push((dump_all_cfs(&db), torus_state::native_trie::persisted_native_root(&db).unwrap()));
+                    after.push((
+                        dump_all_cfs(&db),
+                        torus_state::native_trie::persisted_native_root(&db).unwrap(),
+                    ));
                 }
             }
             assert_eq!(adl_rows(&db), 0);
@@ -29676,8 +31038,14 @@ mod crash_recovery_tests {
         };
         let (straight, units_s) = run(None);
         let (restarted, units_r) = run(Some(8));
-        assert!(units_s.iter().filter(|&&u| u > 0).count() >= 15, "B's units in block 2, a drain in blocks 3..=16: {units_s:?}");
-        assert_eq!(units_s, units_r, "drain work units per block, straight vs restarted");
+        assert!(
+            units_s.iter().filter(|&&u| u > 0).count() >= 15,
+            "B's units in block 2, a drain in blocks 3..=16: {units_s:?}"
+        );
+        assert_eq!(
+            units_s, units_r,
+            "drain work units per block, straight vs restarted"
+        );
         for (i, ((d1, r1), (d2, r2))) in straight.iter().zip(restarted.iter()).enumerate() {
             assert_dumps_equal(d1, d2, &format!("block {}", i + 9));
             assert_eq!(r1, r2, "block {}: native root", i + 9);
@@ -29691,9 +31059,16 @@ mod crash_recovery_tests {
     #[test]
     fn liquidation_telemetry_does_not_change_block_results_or_state() {
         torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
-        let mut rounds = vec![vec![oracle_sub(61, 1, 990), oracle_sub(62, 1, 990), oracle_sub(63, 1, 990)]];
+        let mut rounds = vec![vec![
+            oracle_sub(61, 1, 990),
+            oracle_sub(62, 1, 990),
+            oracle_sub(63, 1, 990),
+        ]];
         rounds.extend(std::iter::repeat_n(Vec::new(), 11)); // 2..=12
-        rounds.push(vec![signed_bid(73, 13_073, 966, 4), signed_stop_limit_buy(73, 13_074, 960, 966, 6)]); // 13
+        rounds.push(vec![
+            signed_bid(73, 13_073, 966, 4),
+            signed_stop_limit_buy(73, 13_074, 960, 966, 6),
+        ]); // 13
         rounds.extend(std::iter::repeat_n(Vec::new(), 2)); // 14, 15
         let blocks = liq_blocks(rounds);
         let run = |metrics: Option<Arc<torus_telemetry::Metrics>>| {
@@ -29711,8 +31086,16 @@ mod crash_recovery_tests {
         let m = Arc::new(torus_telemetry::Metrics::new());
         let (with, root_w, db_w) = run(Some(m.clone()));
         let (without, root_n, _) = run(None);
-        assert_eq!(signed_pos_of(&db_w, &oracle_addr(71)), FixedPoint::ZERO, "non-vacuous: T liquidated");
-        assert_dumps_equal(&with, &without, "liquidation telemetry: metrics attached vs not");
+        assert_eq!(
+            signed_pos_of(&db_w, &oracle_addr(71)),
+            FixedPoint::ZERO,
+            "non-vacuous: T liquidated"
+        );
+        assert_dumps_equal(
+            &with,
+            &without,
+            "liquidation telemetry: metrics attached vs not",
+        );
         assert_eq!(root_w, root_n);
         // Block 1's submissions aggregate at block 2's start; T is acted on by
         // stage 1 in every block 2..=14 (no bid before block 13: it stays under
@@ -29720,12 +31103,15 @@ mod crash_recovery_tests {
         assert_eq!(m.liquidations_stage1.get(), 13, "stage 1 in blocks 2..=14");
         assert_eq!(m.liquidation_acted.get(), 13);
         assert_eq!(m.liquidations_triggered.get(), 13);
-        assert_eq!((m.liquidations_backstop.get(), m.liquidations_adl.get()), (0, 0));
+        assert_eq!(
+            (m.liquidations_backstop.get(), m.liquidations_adl.get()),
+            (0, 0)
+        );
         assert_eq!(m.liquidation_pending.get(), 0, "flat after block 14");
-        let steps = m
-            .encode()
-            .lines()
-            .find_map(|l| l.strip_prefix("torus_liquidation_step_seconds_count ").map(|v| v.trim().parse::<u64>().unwrap()));
+        let steps = m.encode().lines().find_map(|l| {
+            l.strip_prefix("torus_liquidation_step_seconds_count ")
+                .map(|v| v.trim().parse::<u64>().unwrap())
+        });
         // One sample per native block: 1 (actions), 2..=12 (oracle rows /
         // pending row), 13 (actions), 14 (pending row); 15 runs no native
         // phase (flat, rows pruned, no actions).
@@ -29757,7 +31143,14 @@ mod crash_recovery_tests {
         let pm = PositionManager::new(db.clone());
         let (a, b) = (oracle_addr(75), oracle_addr(76));
         for t in [a, b] {
-            pm.put_native_balance(&t, &NativeBalance { available: px(100), order_margin: FixedPoint::ZERO }).unwrap();
+            pm.put_native_balance(
+                &t,
+                &NativeBalance {
+                    available: px(100),
+                    order_margin: FixedPoint::ZERO,
+                },
+            )
+            .unwrap();
         }
         let ioc_sell = torus_types::eip712::sign_native_action(
             NativeAction::PlaceOrder(torus_types::PlaceOrderParams {
@@ -29775,42 +31168,82 @@ mod crash_recovery_tests {
         );
         let to_spot = |nonce: u64, amount: i64| {
             torus_types::eip712::sign_native_action(
-                NativeAction::TransferToSpot { amount: U256::from(px(amount).raw() as u128) },
+                NativeAction::TransferToSpot {
+                    amount: U256::from(px(amount).raw() as u128),
+                },
                 NB + nonce,
                 &oracle_key(76),
             )
         };
         let mut r1: Vec<SignedNativeAction> = (61..=63).map(|s| oracle_sub(s, 1, 100)).collect();
         r1.push(signed_bid(75, 1_075, 200, 10));
-        let blocks = liq_blocks(vec![r1, vec![ioc_sell, to_spot(2_176, 100)], vec![to_spot(3_076, 1_000)]]);
+        let blocks = liq_blocks(vec![
+            r1,
+            vec![ioc_sell, to_spot(2_176, 100)],
+            vec![to_spot(3_076, 1_000)],
+        ]);
         let ctx = make_exec_ctx(&config, &db);
         let native = |t: &Address| {
             let x = pm.get_native_balance(t).unwrap();
             (x.available, x.order_margin)
         };
         dispatch_and_execute(&ctx, &db, &blocks[0]);
-        assert_eq!(native(&a), (FixedPoint::ZERO, px(100)), "block 1: A's bid @200 rests, IM at 200 reserved");
+        assert_eq!(
+            native(&a),
+            (FixedPoint::ZERO, px(100)),
+            "block 1: A's bid @200 rests, IM at 200 reserved"
+        );
         dispatch_and_execute(&ctx, &db, &blocks[1]);
-        assert_eq!(signed_pos_of(&db, &a), FixedPoint::ZERO, "block 2: no fill (B's sell refused by the band)");
+        assert_eq!(
+            signed_pos_of(&db, &a),
+            FixedPoint::ZERO,
+            "block 2: no fill (B's sell refused by the band)"
+        );
         assert_eq!(signed_pos_of(&db, &b), FixedPoint::ZERO);
-        assert_eq!(native(&a), (FixedPoint::ZERO, px(100)), "A's bid still rests");
-        assert_eq!(native(&b), (FixedPoint::ZERO, FixedPoint::ZERO), "B: its own 100 withdrawn");
+        assert_eq!(
+            native(&a),
+            (FixedPoint::ZERO, px(100)),
+            "A's bid still rests"
+        );
+        assert_eq!(
+            native(&b),
+            (FixedPoint::ZERO, FixedPoint::ZERO),
+            "B: its own 100 withdrawn"
+        );
         assert_eq!(read_evm_balance(&db, b), U256::from(px(100).raw() as u128));
         assert_eq!(native(&LIQUIDATOR_VAULT).0, FixedPoint::ZERO);
         // Refused for the right reason: executed (not skipped), rejected
         // (review S3: HL `oracleRejected`) with `price_band`; the transfer
         // executed.
         let s2 = action_status(&db, 2).expect("block 2 status");
-        assert!(s2.native_skipped.iter().all(|s| !s), "block 2: nothing skipped (nonces in window)");
+        assert!(
+            s2.native_skipped.iter().all(|s| !s),
+            "block 2: nothing skipped (nonces in window)"
+        );
         assert_eq!(s2.native_failed.len(), 1, "block 2: only B's sell failed");
-        assert_eq!(s2.native_failed[0].reason, FailureReason::PriceBand, "block 2: refused by the band");
-        assert_eq!(s2.native_failed[0].outcome, torus_state::action_status::Outcome::Rejected, "block 2: oracleRejected");
+        assert_eq!(
+            s2.native_failed[0].reason,
+            FailureReason::PriceBand,
+            "block 2: refused by the band"
+        );
+        assert_eq!(
+            s2.native_failed[0].outcome,
+            torus_state::action_status::Outcome::Rejected,
+            "block 2: oracleRejected"
+        );
         dispatch_and_execute(&ctx, &db, &blocks[2]);
         let s3 = action_status(&db, 3).expect("block 3 status");
-        assert!(s3.native_skipped.iter().all(|s| !s), "block 3: the transfer was executed, not skipped");
+        assert!(
+            s3.native_skipped.iter().all(|s| !s),
+            "block 3: the transfer was executed, not skipped"
+        );
         assert_eq!(s3.native_failed.len(), 1, "block 3: B's 1,000 refused");
         assert_eq!(native(&b), (FixedPoint::ZERO, FixedPoint::ZERO));
-        assert_eq!(read_evm_balance(&db, b), U256::from(px(100).raw() as u128), "block 3: nothing more");
+        assert_eq!(
+            read_evm_balance(&db, b),
+            U256::from(px(100).raw() as u128),
+            "block 3: nothing more"
+        );
         assert_eq!(native(&LIQUIDATOR_VAULT).0, FixedPoint::ZERO);
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
         assert_eq!(read_native_applied_height(&db), Some(3));
@@ -29831,23 +31264,45 @@ mod crash_recovery_tests {
 
     /// `SetOracleSigner` from validator `seed`; `signer` = the new signer's key
     /// (its proof of possession, review M3) or `None` to clear.
-    fn set_signer_action(h: u64, seed: u8, signer: Option<&k256::ecdsa::SigningKey>) -> SignedNativeAction {
+    fn set_signer_action(
+        h: u64,
+        seed: u8,
+        signer: Option<&k256::ecdsa::SigningKey>,
+    ) -> SignedNativeAction {
         let nonce = NONCE_BASE + h * 1_000 + 500 + seed as u64;
         let action = match signer {
-            None => NativeAction::SetOracleSigner { signer: Address::ZERO, proof: None },
+            None => NativeAction::SetOracleSigner {
+                signer: Address::ZERO,
+                proof: None,
+            },
             Some(k) => NativeAction::SetOracleSigner {
                 signer: key_addr(k),
-                proof: Some(torus_types::eip712::sign_oracle_signer_proof(&oracle_addr(seed), nonce, k)),
+                proof: Some(torus_types::eip712::sign_oracle_signer_proof(
+                    &oracle_addr(seed),
+                    nonce,
+                    k,
+                )),
             },
         };
         torus_types::eip712::sign_native_action(action, nonce, &oracle_key(seed))
     }
 
-    fn signer_submit(h: u64, key: &k256::ecdsa::SigningKey, tag: u8, price: i64) -> SignedNativeAction {
+    fn signer_submit(
+        h: u64,
+        key: &k256::ecdsa::SigningKey,
+        tag: u8,
+        price: i64,
+    ) -> SignedNativeAction {
         signer_submit_at(h, key, tag, price, (1_000 + h) * 1_000)
     }
 
-    fn signer_submit_at(h: u64, key: &k256::ecdsa::SigningKey, tag: u8, price: i64, sample_ms: u64) -> SignedNativeAction {
+    fn signer_submit_at(
+        h: u64,
+        key: &k256::ecdsa::SigningKey,
+        tag: u8,
+        price: i64,
+        sample_ms: u64,
+    ) -> SignedNativeAction {
         torus_types::eip712::sign_native_action(
             NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
                 prices: vec![(ORACLE_MARKET, px(price))],
@@ -29898,9 +31353,15 @@ mod crash_recovery_tests {
         let rows = oracle_sub_rows(&db);
         assert_eq!(rows.len(), 3, "one row per VALIDATOR");
         for (seed, _) in ORACLE_VALIDATORS {
-            assert!(rows.iter().any(|(k, _)| &k[11..31] == oracle_addr(seed).as_slice()));
+            assert!(rows
+                .iter()
+                .any(|(k, _)| &k[11..31] == oracle_addr(seed).as_slice()));
         }
-        assert_eq!(mark_at(&db, 1_003), Some((px(102), 3)), "stake-weighted by the validators");
+        assert_eq!(
+            mark_at(&db, 1_003),
+            Some((px(102), 3)),
+            "stake-weighted by the validators"
+        );
     }
 
     /// Block 2 carries V61's rotation AND a submission from its OLD signer: the
@@ -29913,14 +31374,21 @@ mod crash_recovery_tests {
         let (old, new) = (signer_key(61), oracle_key(222));
         let blocks = blocks_of(vec![
             vec![set_signer_action(1, 61, Some(&old))],
-            vec![set_signer_action(2, 61, Some(&new)), signer_submit(2, &old, 1, 100)],
+            vec![
+                set_signer_action(2, 61, Some(&new)),
+                signer_submit(2, &old, 1, 100),
+            ],
             vec![signer_submit(3, &old, 1, 500)],
             vec![signer_submit(4, &new, 2, 700)],
         ]);
         ctx.execute_committed_block(&blocks[0], vec![]);
         ctx.execute_committed_block(&blocks[1], vec![]);
         let after_rotation = oracle_sub_rows(&db);
-        assert_eq!(after_rotation.len(), 1, "same-block: the old signer still counts once");
+        assert_eq!(
+            after_rotation.len(),
+            1,
+            "same-block: the old signer still counts once"
+        );
         assert_eq!(&after_rotation[0].0[11..31], oracle_addr(61).as_slice());
         assert_eq!(
             signer_index_rows(&db),
@@ -29930,11 +31398,18 @@ mod crash_recovery_tests {
             )]
         );
         ctx.execute_committed_block(&blocks[2], vec![]);
-        assert_eq!(oracle_sub_rows(&db), after_rotation, "old signer rejected from the next block");
+        assert_eq!(
+            oracle_sub_rows(&db),
+            after_rotation,
+            "old signer rejected from the next block"
+        );
         ctx.execute_committed_block(&blocks[3], vec![]);
         let rows = oracle_sub_rows(&db);
         assert_eq!(rows.len(), 1);
-        assert_ne!(rows, after_rotation, "the new signer's submission replaces the row");
+        assert_ne!(
+            rows, after_rotation,
+            "the new signer's submission replaces the row"
+        );
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
     }
 
@@ -29949,7 +31424,10 @@ mod crash_recovery_tests {
             .map(|&(s, _)| set_signer_action(1, s, Some(&signer_key(s))))
             .collect();
         let subs = |h: u64, p: i64| -> Vec<SignedNativeAction> {
-            ORACLE_VALIDATORS.iter().map(|&(s, _)| signer_submit(h, &signer_key(s), s, p)).collect()
+            ORACLE_VALIDATORS
+                .iter()
+                .map(|&(s, _)| signer_submit(h, &signer_key(s), s, p))
+                .collect()
         };
         let mut b4 = subs(4, 300);
         b4.push(set_signer_action(4, 61, Some(&new61)));
@@ -29958,7 +31436,10 @@ mod crash_recovery_tests {
             subs(2, 100),
             vec![],
             b4,
-            vec![signer_submit(5, &signer_key(61), 61, 900), signer_submit(5, &new61, 1, 310)],
+            vec![
+                signer_submit(5, &signer_key(61), 61, 900),
+                signer_submit(5, &new61, 1, 310),
+            ],
             vec![set_signer_action(6, 62, None)],
             subs(7, 400), // 62's cleared signer is rejected
             // review M1(b): two samples of V63 in one block; the newer (450)
@@ -29969,21 +31450,37 @@ mod crash_recovery_tests {
             ],
         ]);
         let (serial, root_s, db_s) = run_fixture(OracleRun::Serial, &blocks, oracle_fixture_db);
-        let (piped, root_p, _) = run_fixture(OracleRun::PipelinedParked, &blocks, oracle_fixture_db);
+        let (piped, root_p, _) =
+            run_fixture(OracleRun::PipelinedParked, &blocks, oracle_fixture_db);
         let (replay, root_r, _) = run_fixture(OracleRun::Replay, &blocks, oracle_fixture_db);
         // Non-vacuous: 61 -> new signer, 62 cleared, 63 unchanged.
         let idx = signer_index_rows(&db_s);
         assert_eq!(idx.len(), 2, "{idx:?}");
-        assert!(idx.iter().any(|(k, v)| k[3..] == *key_addr(&new61).as_slice() && v[..] == *oracle_addr(61).as_slice()));
-        assert!(idx.iter().any(|(k, v)| k[3..] == *key_addr(&signer_key(63)).as_slice() && v[..] == *oracle_addr(63).as_slice()));
+        assert!(idx
+            .iter()
+            .any(|(k, v)| k[3..] == *key_addr(&new61).as_slice()
+                && v[..] == *oracle_addr(61).as_slice()));
+        assert!(idx
+            .iter()
+            .any(|(k, v)| k[3..] == *key_addr(&signer_key(63)).as_slice()
+                && v[..] == *oracle_addr(63).as_slice()));
         assert!(mark_at(&db_s, 1_008).is_some());
         let v63 = oracle_sub_rows(&db_s)
             .into_iter()
-            .map(|(_, v)| <torus_core::oracle::OracleSubmission as borsh::BorshDeserialize>::try_from_slice(&v).unwrap())
+            .map(|(_, v)| {
+                <torus_core::oracle::OracleSubmission as borsh::BorshDeserialize>::try_from_slice(
+                    &v,
+                )
+                .unwrap()
+            })
             .find(|r| r.validator == oracle_addr(63))
             .unwrap();
         assert_eq!(v63.price, px(450), "newest sample of the block wins");
-        assert_dumps_equal(&serial, &piped, "oracle signer: serial vs pipelined (parked)");
+        assert_dumps_equal(
+            &serial,
+            &piped,
+            "oracle signer: serial vs pipelined (parked)",
+        );
         assert_dumps_equal(&serial, &replay, "oracle signer: serial vs crash replay");
         assert_eq!(root_s, root_p);
         assert_eq!(root_s, root_r);
@@ -30018,12 +31515,23 @@ mod crash_recovery_tests {
         if let Some(w) = ctx.flush_worker.as_ref() {
             assert!(w.wait_idle(), "{what}: W failed");
         }
-        assert_eq!(ctx.resident_books.lock().unwrap().rows_height(), Some(h), "{what}: R height after {h}");
+        assert_eq!(
+            ctx.resident_books.lock().unwrap().rows_height(),
+            Some(h),
+            "{what}: R height after {h}"
+        );
         let rows = resident_rows_dump(ctx).expect("R stashed");
-        assert_dumps_equal(&rows, &resident_cfs_in_db(db), &format!("{what}: R vs DB after {h}"));
+        assert_dumps_equal(
+            &rows,
+            &resident_cfs_in_db(db),
+            &format!("{what}: R vs DB after {h}"),
+        );
         // Item 6 C7: the slot's decoded positions == a cold decode of R.
         assert_eq!(
-            ctx.resident_books.lock().unwrap().trader_positions_match_rows(),
+            ctx.resident_books
+                .lock()
+                .unwrap()
+                .trader_positions_match_rows(),
             Some(true),
             "{what}: decoded positions vs R after {h}"
         );
@@ -30055,12 +31563,23 @@ mod crash_recovery_tests {
             let h = b.header.height;
             dispatch_and_execute(&ctx, &state_db, b);
             let what = format!("{mode:?} on={on} no_r={no_r} restarts={restart_after:?}");
-            assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst), "{what}: fail-stop at {h}");
+            assert!(
+                !ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst),
+                "{what}: fail-stop at {h}"
+            );
             if no_r {
-                assert_eq!(ctx.resident_books.lock().unwrap().rows_height(), None, "{what}: no R");
+                assert_eq!(
+                    ctx.resident_books.lock().unwrap().rows_height(),
+                    None,
+                    "{what}: no R"
+                );
             } else {
                 assert_resident_rows_track_db(&ctx, &state_db, h, &what);
-                assert_eq!(ctx.resident_books.lock().unwrap().rows_shared_fallbacks(), 0, "{what}");
+                assert_eq!(
+                    ctx.resident_books.lock().unwrap().rows_shared_fallbacks(),
+                    0,
+                    "{what}"
+                );
             }
             if restart_after.contains(&h) {
                 builds += ctx.resident_books.lock().unwrap().rows_builds();
@@ -30087,15 +31606,27 @@ mod crash_recovery_tests {
             for b in &pipeline_fixture_blocks() {
                 dispatch_and_execute(&ctx, &state_db, b);
                 assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
-                assert_resident_rows_track_db(&ctx, &state_db, b.header.height, &format!("on={on}"));
+                assert_resident_rows_track_db(
+                    &ctx,
+                    &state_db,
+                    b.header.height,
+                    &format!("on={on}"),
+                );
             }
             let mut holder = ctx.resident_books.lock().unwrap();
             assert_eq!(holder.rows_builds(), 1, "on={on}: built once at block 1");
-            assert_eq!(holder.rows_shared_fallbacks(), 0, "on={on}: Arc::get_mut never fails");
+            assert_eq!(
+                holder.rows_shared_fallbacks(),
+                0,
+                "on={on}: Arc::get_mut never fails"
+            );
             // Phase 4 step 2: `len` counts R's raw rows only (no positions or
             // balances): count every R CF through `dump`.
             let r = holder.rows().unwrap();
-            let rows: usize = torus_state::resident_rows::RESIDENT_CFS.iter().map(|cf| r.dump(cf).unwrap().len()).sum();
+            let rows: usize = torus_state::resident_rows::RESIDENT_CFS
+                .iter()
+                .map(|cf| r.dump(cf).unwrap().len())
+                .sum();
             assert!(rows > 2, "non-vacuous: {rows}");
         }
     }
@@ -30122,15 +31653,31 @@ mod crash_recovery_tests {
                 spawned += f64::from(u8::from(in_flight));
                 // Odd heights: the next block joins the worker itself.
                 if b.header.height.is_multiple_of(2) {
-                    assert_resident_rows_track_db(&ctx, &state_db, b.header.height, &format!("worker on={on}"));
+                    assert_resident_rows_track_db(
+                        &ctx,
+                        &state_db,
+                        b.header.height,
+                        &format!("worker on={on}"),
+                    );
                 }
             }
             ctx.resident_books.lock().unwrap().settle_rows();
             let text = metrics.encode();
             let v = |name: &str| metric_value(&text, name);
-            assert!(spawned >= 4.0, "on={on}: native blocks ran on the worker ({spawned})");
-            assert_eq!(v("torus_exec_end_resident_seconds_count"), spawned, "on={on}");
-            assert_eq!(v("torus_exec_end_resident_wait_seconds_count"), spawned, "on={on}: one join per worker");
+            assert!(
+                spawned >= 4.0,
+                "on={on}: native blocks ran on the worker ({spawned})"
+            );
+            assert_eq!(
+                v("torus_exec_end_resident_seconds_count"),
+                spawned,
+                "on={on}"
+            );
+            assert_eq!(
+                v("torus_exec_end_resident_wait_seconds_count"),
+                spawned,
+                "on={on}: one join per worker"
+            );
             println!(
                 "STEP2 on={on} workers={spawned} end_resident_ms_sum={:.3} wait_ms_sum={:.3}",
                 v("torus_exec_end_resident_seconds_sum") * 1e3,
@@ -30154,14 +31701,17 @@ mod crash_recovery_tests {
         ] {
             for on in [false, true] {
                 let what = format!("{mode:?} on={on}");
-                let (dump_off, cap_off, hash_off, builds_off) = run_book_fixture_r(on, mode, true, &[]);
-                let (dump_on, cap_on, hash_on, builds_on) = run_book_fixture_r(on, mode, false, &[]);
+                let (dump_off, cap_off, hash_off, builds_off) =
+                    run_book_fixture_r(on, mode, true, &[]);
+                let (dump_on, cap_on, hash_on, builds_on) =
+                    run_book_fixture_r(on, mode, false, &[]);
                 assert_eq!((builds_off, builds_on), (0, 1), "{what}");
                 assert_dumps_equal(&dump_off, &dump_on, &format!("{what}: without vs with R"));
                 assert_write_sets_equal(&cap_off, &cap_on, &format!("{what}: without vs with R"));
                 assert!(hash_on.is_some());
                 assert_eq!(hash_off, hash_on, "{what}: running hash");
-                let (dump_rs, cap_rs, hash_rs, builds_rs) = run_book_fixture_r(on, mode, false, &[3, 7]);
+                let (dump_rs, cap_rs, hash_rs, builds_rs) =
+                    run_book_fixture_r(on, mode, false, &[3, 7]);
                 assert_eq!(builds_rs, 3, "{what}: one build per (re)start");
                 assert_dumps_equal(&dump_off, &dump_rs, &format!("{what}: with R + restarts"));
                 assert_write_sets_equal(&cap_off, &cap_rs, &format!("{what}: with R + restarts"));
@@ -30314,8 +31864,16 @@ mod crash_recovery_tests {
         ctx.test_book_mode = Some(BookMode::OrderRows);
         dispatch_and_execute(&ctx, &db, &first5[2]);
         assert!(ctx.exec_failed.load(SeqCst), "mode mismatch must fail-stop");
-        assert_eq!(read_native_applied_height(&db), Some(2), "nothing of 3 durable");
-        assert_eq!(ctx.resident_books.lock().unwrap().rows_height(), None, "R taken by the fatal block");
+        assert_eq!(
+            read_native_applied_height(&db),
+            Some(2),
+            "nothing of 3 durable"
+        );
+        assert_eq!(
+            ctx.resident_books.lock().unwrap().rows_height(),
+            None,
+            "R taken by the fatal block"
+        );
         assert_eq!(builds(&ctx), 1, "the fatal block reused R (successor of 2)");
 
         // Re-execute 3 (latch cleared, right mode): R rebuilds from the DB.
@@ -30336,9 +31894,16 @@ mod crash_recovery_tests {
         assert!(!ctx.exec_failed.load(SeqCst));
         assert_eq!(builds(&ctx), 3, "R at 3 vs block 5: rebuilt");
         assert_resident_rows_track_db(&ctx, &db, 5, "after 5");
-        assert_eq!(ctx.resident_books.lock().unwrap().rows_shared_fallbacks(), 0);
+        assert_eq!(
+            ctx.resident_books.lock().unwrap().rows_shared_fallbacks(),
+            0
+        );
         drop(ctx);
-        assert_dumps_equal(&dump_ref, &dump_all_cfs(&db), "guard sequence with R vs without R");
+        assert_dumps_equal(
+            &dump_ref,
+            &dump_all_cfs(&db),
+            "guard sequence with R vs without R",
+        );
     }
 
     /// Item 6 C1: an EVM lockbox deposit (0x0820) in block 1 is credited by
@@ -30351,9 +31916,11 @@ mod crash_recovery_tests {
         let key = k256::ecdsa::SigningKey::from_slice(&[71u8; 32]).unwrap();
         let trader = k256_address(&key);
         let amount_wei: u128 = 1_000 * 10u128.pow(18); // 1000 native units
-        let mut calldata = alloy_primitives::keccak256("depositToNative(uint128)".as_bytes())[..4].to_vec();
+        let mut calldata =
+            alloy_primitives::keccak256("depositToNative(uint128)".as_bytes())[..4].to_vec();
         calldata.extend_from_slice(&U256::from(amount_wei).to_be_bytes::<32>());
-        let lockbox = torus_core::precompiles::precompile_address(torus_core::precompiles::ADDR_LOCKBOX);
+        let lockbox =
+            torus_core::precompiles::precompile_address(torus_core::precompiles::ADDR_LOCKBOX);
         let order = |price: i128| {
             NativeAction::PlaceOrder(torus_types::PlaceOrderParams {
                 market_id: 1,
@@ -30368,8 +31935,22 @@ mod crash_recovery_tests {
         };
         let mut blocks = vec![
             make_block(1, vec![]),
-            make_block(2, vec![torus_types::eip712::sign_native_action(order(90), NONCE_BASE + 1, &key)]),
-            make_block(3, vec![torus_types::eip712::sign_native_action(order(95), NONCE_BASE + 2, &key)]),
+            make_block(
+                2,
+                vec![torus_types::eip712::sign_native_action(
+                    order(90),
+                    NONCE_BASE + 1,
+                    &key,
+                )],
+            ),
+            make_block(
+                3,
+                vec![torus_types::eip712::sign_native_action(
+                    order(95),
+                    NONCE_BASE + 2,
+                    &key,
+                )],
+            ),
         ];
         blocks[0].evm_transactions = vec![signed_eip1559_with_value(
             &key,
@@ -30402,7 +31983,10 @@ mod crash_recovery_tests {
                 let mut seen = Vec::new();
                 for b in &blocks {
                     dispatch_and_execute(&ctx, &db, b);
-                    assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on} no_r={no_r}");
+                    assert!(
+                        !ctx.exec_failed.load(Ordering::SeqCst),
+                        "on={on} no_r={no_r}"
+                    );
                     if let Some(w) = ctx.flush_worker.as_ref() {
                         assert!(w.wait_idle());
                     }
@@ -30413,16 +31997,31 @@ mod crash_recovery_tests {
                     }
                 }
                 let credit = FixedPoint::from_raw(1_000 * FixedPoint::SCALE);
-                assert_eq!(seen[0].0, FixedPoint::ZERO, "block 1: deposit queued, not credited");
+                assert_eq!(
+                    seen[0].0,
+                    FixedPoint::ZERO,
+                    "block 1: deposit queued, not credited"
+                );
                 assert_eq!(seen[1].0, credit, "block 2: credited by the drain");
-                assert_eq!(seen[1].1, FixedPoint::ZERO, "block 2's order ran before the drain: rejected");
-                assert!(seen[2].1 > FixedPoint::ZERO, "block 3's order rests on the credited balance");
+                assert_eq!(
+                    seen[1].1,
+                    FixedPoint::ZERO,
+                    "block 2's order ran before the drain: rejected"
+                );
+                assert!(
+                    seen[2].1 > FixedPoint::ZERO,
+                    "block 3's order rests on the credited balance"
+                );
                 drop(ctx);
                 dumps.push(dump_all_cfs(&db));
             }
         }
         for d in &dumps[1..] {
-            assert_dumps_equal(&dumps[0], d, "lockbox sequence: with/without R, serial/pipelined");
+            assert_dumps_equal(
+                &dumps[0],
+                d,
+                "lockbox sequence: with/without R, serial/pipelined",
+            );
         }
     }
 
@@ -32029,7 +33628,10 @@ mod crash_recovery_tests {
     fn r02_oracle_reader_fault_fail_stops_block() {
         let ms = block_time_ms(1);
         let (a, b) = (r02_claim(ms), r02_claim(ms + 1));
-        let mut blocks = vec![make_block(1, vec![a.clone()]), make_block(2, vec![b.clone()])];
+        let mut blocks = vec![
+            make_block(1, vec![a.clone()]),
+            make_block(2, vec![b.clone()]),
+        ];
         link_blocks(&mut blocks);
         r02_assert_fault_fail_stops_then_replays(
             &blocks,
@@ -32146,16 +33748,28 @@ mod crash_recovery_tests {
             drop(ctx);
             // The row goes bad on disk; a fresh context (as after a
             // restart) reads it (the resident rows are built from the DB).
-            db.put_cf_raw(CF_NATIVE_ORACLE, &garbage_key, b"garbage").unwrap();
+            db.put_cf_raw(CF_NATIVE_ORACLE, &garbage_key, b"garbage")
+                .unwrap();
             let ctx = pipeline_ctx(&db, on, None);
             let durable = persist_committed_block_durably(&db, &blocks[1]);
             let before = dump_all_cfs(&db);
             ctx.execute_committed_block_with(&blocks[1], vec![], durable);
             ctx.pipeline_barrier();
-            assert!(ctx.exec_failed.load(Ordering::SeqCst), "on={on}: must fail-stop");
+            assert!(
+                ctx.exec_failed.load(Ordering::SeqCst),
+                "on={on}: must fail-stop"
+            );
             drop(ctx);
-            assert_eq!(read_native_applied_height(&db), Some(1), "on={on}: block 2 not applied");
-            assert_dumps_equal(&before, &dump_all_cfs(&db), "R02: nothing of block 2 flushed");
+            assert_eq!(
+                read_native_applied_height(&db),
+                Some(1),
+                "on={on}: block 2 not applied"
+            );
+            assert_dumps_equal(
+                &before,
+                &dump_all_cfs(&db),
+                "R02: nothing of block 2 flushed",
+            );
 
             // Repair the row, restart, replay block 2.
             db.delete_cf_raw(CF_NATIVE_ORACLE, &garbage_key).unwrap();
@@ -32167,7 +33781,11 @@ mod crash_recovery_tests {
             assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}: replay");
             drop(ctx);
             assert_eq!(read_native_applied_height(&db), Some(2), "on={on}");
-            assert_dumps_equal(&dump_all_cfs(&db_ref), &dump_all_cfs(&db), "R02: replay vs no fault");
+            assert_dumps_equal(
+                &dump_all_cfs(&db_ref),
+                &dump_all_cfs(&db),
+                "R02: replay vs no fault",
+            );
         }
     }
     /// R02 branch 5 fixture: block 1 a native claim; block 2 a native claim
@@ -32199,7 +33817,9 @@ mod crash_recovery_tests {
     }
 
     fn r02_evm_nonce(db: &StateDb, key: &k256::ecdsa::SigningKey) -> u64 {
-        db.get_account(&k256_address(key)).unwrap().map_or(0, |a| a.nonce)
+        db.get_account(&k256_address(key))
+            .unwrap()
+            .map_or(0, |a| a.nonce)
     }
 
     /// The OrderBookReader precompile (0x0800).
@@ -32213,7 +33833,11 @@ mod crash_recovery_tests {
         let key = [height.to_be_bytes().as_slice(), &0u32.to_be_bytes()].concat();
         db.get_cf_raw(torus_state::cf::CF_RECEIPTS, &key)
             .unwrap()
-            .map(|r| serde_json::from_slice::<torus_types::Receipt>(&r).unwrap().status)
+            .map(|r| {
+                serde_json::from_slice::<torus_types::Receipt>(&r)
+                    .unwrap()
+                    .status
+            })
     }
 
     /// R02 branch 5 (owner option A): the block's EVM execution reports a
@@ -32227,12 +33851,21 @@ mod crash_recovery_tests {
     #[test]
     fn r02_evm_local_fault_fail_stops_block() {
         let key = k256::ecdsa::SigningKey::from_slice(&[0x55; 32]).unwrap();
-        let (blocks, b) = r02_evm_blocks(&key, alloy_primitives::TxKind::Create, vec![0x60, 0x01, 0x60, 0x00, 0x55]);
-        r02_assert_fault_fail_stops_then_replays(&blocks, &|db| r02_fund(db, &key), ReplayFault::EvmLocalFault, &|db| {
-            assert!(r02_nonce_consumed(db, &b));
-            assert_eq!(r02_evm_nonce(db, &key), 1, "the EVM tx ran");
-            assert_eq!(r02_receipt_status(db, 2), Some(true));
-        });
+        let (blocks, b) = r02_evm_blocks(
+            &key,
+            alloy_primitives::TxKind::Create,
+            vec![0x60, 0x01, 0x60, 0x00, 0x55],
+        );
+        r02_assert_fault_fail_stops_then_replays(
+            &blocks,
+            &|db| r02_fund(db, &key),
+            ReplayFault::EvmLocalFault,
+            &|db| {
+                assert!(r02_nonce_consumed(db, &b));
+                assert_eq!(r02_evm_nonce(db, &key), 1, "the EVM tx ran");
+                assert_eq!(r02_receipt_status(db, 2), Some(true));
+            },
+        );
         // Item 7 option 0 (task 3.7): the same on the EVM fast path.
         r02_assert_fault_fail_stops_then_replays_fast(
             &blocks,
@@ -32365,8 +33998,22 @@ mod crash_recovery_tests {
     fn r02_ordinary_evm_errors_do_not_fail_stop() {
         let key = k256::ecdsa::SigningKey::from_slice(&[0x56; 32]).unwrap();
         let cases = [
-            ("(a) section error", alloy_primitives::TxKind::Create, vec![0x60, 0x01, 0x60, 0x00, 0x55], Some(ReplayFault::EvmSectionError), 0, None),
-            ("(b) precompile revert", r02_reader_precompile(), vec![0xDE, 0xAD, 0xBE, 0xEF], None, 1, Some(false)),
+            (
+                "(a) section error",
+                alloy_primitives::TxKind::Create,
+                vec![0x60, 0x01, 0x60, 0x00, 0x55],
+                Some(ReplayFault::EvmSectionError),
+                0,
+                None,
+            ),
+            (
+                "(b) precompile revert",
+                r02_reader_precompile(),
+                vec![0xDE, 0xAD, 0xBE, 0xEF],
+                None,
+                1,
+                Some(false),
+            ),
         ];
         for (what, to, input, fault, evm_nonce, receipt) in cases {
             let (blocks, b) = r02_evm_blocks(&key, to, input);
@@ -32378,10 +34025,16 @@ mod crash_recovery_tests {
                 ctx.test_replay_fault = fault;
                 dispatch_and_execute(&ctx, &db, &blocks[1]);
                 assert!(ctx.pipeline_barrier(), "{what} on={on}");
-                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what} on={on}: no fail-stop");
+                assert!(
+                    !ctx.exec_failed.load(Ordering::SeqCst),
+                    "{what} on={on}: no fail-stop"
+                );
                 drop(ctx);
                 assert_eq!(read_native_applied_height(&db), Some(2), "{what} on={on}");
-                assert!(r02_nonce_consumed(&db, &b), "{what} on={on}: native part applied");
+                assert!(
+                    r02_nonce_consumed(&db, &b),
+                    "{what} on={on}: native part applied"
+                );
                 assert_eq!(r02_evm_nonce(&db, &key), evm_nonce, "{what} on={on}");
                 assert_eq!(r02_receipt_status(&db, 2), receipt, "{what} on={on}");
             }
@@ -32856,16 +34509,28 @@ mod crash_recovery_tests {
             assert_eq!(holder.rows_height(), None, "failed hand-off: R not stashed");
         }
         drop(ctx);
-        assert_eq!(read_native_applied_height(&state_db), Some(1), "nothing of 2/3 durable");
+        assert_eq!(
+            read_native_applied_height(&state_db),
+            Some(1),
+            "nothing of 2/3 durable"
+        );
 
         let ctx2 = pipeline_ctx(&state_db, false, None);
         let (_last, parked) = TorusApp::replay_committed(&state_db, &ctx2);
         assert_eq!(parked, None);
         assert!(!ctx2.exec_failed.load(Ordering::SeqCst));
         assert_resident_rows_track_db(&ctx2, &state_db, 3, "after the replay");
-        assert_eq!(ctx2.resident_books.lock().unwrap().rows_builds(), 1, "restart: R built cold once");
+        assert_eq!(
+            ctx2.resident_books.lock().unwrap().rows_builds(),
+            1,
+            "restart: R built cold once"
+        );
         drop(ctx2);
-        assert_dumps_equal(&dump_ref, &dump_all_cfs(&state_db), "crash + restart with R vs serial without R");
+        assert_dumps_equal(
+            &dump_ref,
+            &dump_all_cfs(&state_db),
+            "crash + restart with R vs serial without R",
+        );
     }
 
     // ======================================================================
@@ -32922,7 +34587,12 @@ mod crash_recovery_tests {
         for (seed, mult) in ORACLE_VALIDATORS {
             oracle_put_validator(&db, seed, mult, torus_economics::ValidatorStatus::Active);
         }
-        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &1u64.to_be_bytes(), b"listed").unwrap();
+        db.put_cf_raw(
+            torus_state::cf::CF_NATIVE_MARKETS,
+            &1u64.to_be_bytes(),
+            b"listed",
+        )
+        .unwrap();
         for (m, im) in [(2u64, 5i64), (3, 10)] {
             let row = (
                 "BTC".to_string(),
@@ -32931,16 +34601,33 @@ mod crash_recovery_tests {
                 FixedPoint::SCALE / 100,
                 px(im).raw(),
             );
-            db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), &borsh::to_vec(&row).unwrap())
-                .unwrap();
+            db.put_cf_raw(
+                torus_state::cf::CF_NATIVE_MARKETS,
+                &m.to_be_bytes(),
+                &borsh::to_vec(&row).unwrap(),
+            )
+            .unwrap();
         }
         let pm = PositionManager::new(db.clone());
         let fund = |seed: u8, amt: i64| {
-            pm.put_native_balance(&oracle_addr(seed), &NativeBalance { available: px(amt), order_margin: FixedPoint::ZERO })
-                .unwrap()
+            pm.put_native_balance(
+                &oracle_addr(seed),
+                &NativeBalance {
+                    available: px(amt),
+                    order_margin: FixedPoint::ZERO,
+                },
+            )
+            .unwrap()
         };
         for (i, seed) in C5_TRADERS.into_iter().enumerate() {
-            fund(seed, if seed == 84 { 150 } else { 3_000 + 1_000 * i as i64 });
+            fund(
+                seed,
+                if seed == 84 {
+                    150
+                } else {
+                    3_000 + 1_000 * i as i64
+                },
+            );
         }
         for seed in C5_MAKERS.into_iter().chain([C5_S]) {
             fund(seed, 1_000_000);
@@ -32949,14 +34636,31 @@ mod crash_recovery_tests {
         fund(C5_V2, 60);
         fund(C5_V3, 6_200);
         let (v1, v2, s) = (oracle_addr(C5_V1), oracle_addr(C5_V2), oracle_addr(C5_S));
-        pm.apply_fill(&v1, 1, true, px(10), px(100), MarginType::Cross).unwrap();
-        pm.apply_fill(&s, 1, false, px(10), px(100), MarginType::Cross).unwrap();
-        pm.apply_fill(&v2, 2, false, px(10), px(100), MarginType::Cross).unwrap();
-        pm.apply_fill(&s, 2, true, px(10), px(100), MarginType::Cross).unwrap();
-        pm.apply_fill(&oracle_addr(C5_V3), 3, true, px(1_100), px(100), MarginType::Cross).unwrap();
-        pm.apply_fill(&s, 3, false, px(1_100), px(100), MarginType::Cross).unwrap();
+        pm.apply_fill(&v1, 1, true, px(10), px(100), MarginType::Cross)
+            .unwrap();
+        pm.apply_fill(&s, 1, false, px(10), px(100), MarginType::Cross)
+            .unwrap();
+        pm.apply_fill(&v2, 2, false, px(10), px(100), MarginType::Cross)
+            .unwrap();
+        pm.apply_fill(&s, 2, true, px(10), px(100), MarginType::Cross)
+            .unwrap();
+        pm.apply_fill(
+            &oracle_addr(C5_V3),
+            3,
+            true,
+            px(1_100),
+            px(100),
+            MarginType::Cross,
+        )
+        .unwrap();
+        pm.apply_fill(&s, 3, false, px(1_100), px(100), MarginType::Cross)
+            .unwrap();
         for seed in [81u8, 82] {
-            fund_evm_balance(&db, oracle_addr(seed), U256::from(C5_EVM_FUNDING * FixedPoint::ONE.raw() as u128));
+            fund_evm_balance(
+                &db,
+                oracle_addr(seed),
+                U256::from(C5_EVM_FUNDING * FixedPoint::ONE.raw() as u128),
+            );
         }
         (config, db)
     }
@@ -33022,7 +34726,11 @@ mod crash_recovery_tests {
                     }
                 }
                 for (seed, _) in ORACLE_VALIDATORS {
-                    let prices = C5_MARKETS.iter().zip(mark).map(|(m, p)| (*m, px(p))).collect();
+                    let prices = C5_MARKETS
+                        .iter()
+                        .zip(mark)
+                        .map(|(m, p)| (*m, px(p)))
+                        .collect();
                     actions.push(torus_types::eip712::sign_native_action(
                         NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
                             prices,
@@ -33040,7 +34748,10 @@ mod crash_recovery_tests {
             }
             let maker = C5_MAKERS[(h % 2) as usize];
             if h % 6 == 0 {
-                actions.push(sign(maker, NativeAction::CancelAllOrders { market_id: None }));
+                actions.push(sign(
+                    maker,
+                    NativeAction::CancelAllOrders { market_id: None },
+                ));
                 fed.cancels += 1;
             }
             let mut quotes = Vec::new();
@@ -33059,11 +34770,21 @@ mod crash_recovery_tests {
                     0..=3 => {
                         let is_buy = rng.below(2) == 0;
                         let off = 1 + rng.below(3) as i64;
-                        NativeAction::PlaceOrder(order(m, is_buy, if is_buy { p - off } else { p + off }, qty))
+                        NativeAction::PlaceOrder(order(
+                            m,
+                            is_buy,
+                            if is_buy { p - off } else { p + off },
+                            qty,
+                        ))
                     }
                     4 | 5 => {
                         let is_buy = rng.below(2) == 0;
-                        NativeAction::PlaceOrder(order(m, is_buy, if is_buy { p + 2 } else { p - 2 }, qty))
+                        NativeAction::PlaceOrder(order(
+                            m,
+                            is_buy,
+                            if is_buy { p + 2 } else { p - 2 },
+                            qty,
+                        ))
                     }
                     6 => {
                         let mj = (mi + 1 + rng.below(2) as usize) % 3;
@@ -33075,7 +34796,9 @@ mod crash_recovery_tests {
                     }
                     7 => {
                         fed.cancels += 1;
-                        NativeAction::CancelAllOrders { market_id: (rng.below(2) == 0).then_some(m) }
+                        NativeAction::CancelAllOrders {
+                            market_id: (rng.below(2) == 0).then_some(m),
+                        }
                     }
                     8 if t == 81 || t == 82 => {
                         fed.transfers += 1;
@@ -33089,7 +34812,12 @@ mod crash_recovery_tests {
                         let mj = (mi + 1) % 3;
                         NativeAction::PlaceOrderBatch(vec![
                             order(m, true, p - 1 - rng.below(3) as i64, qty),
-                            order(C5_MARKETS[mj], false, mark[mj] + 1 + rng.below(3) as i64, qty),
+                            order(
+                                C5_MARKETS[mj],
+                                false,
+                                mark[mj] + 1 + rng.below(3) as i64,
+                                qty,
+                            ),
                         ])
                     }
                 };
@@ -33173,17 +34901,32 @@ mod crash_recovery_tests {
                 sums_dropped += ctx.resident_books.lock().unwrap().drop_sums_cache();
             }
             dispatch_and_execute(&ctx, &db, b);
-            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: fail-stop at {h}");
+            assert!(
+                !ctx.exec_failed.load(Ordering::SeqCst),
+                "{what}: fail-stop at {h}"
+            );
             if ctx.resident_books.lock().unwrap().rows_builds() == 0 {
-                assert_eq!(replica, C5Replica::Restarted, "{what}: R never built by {h}");
+                assert_eq!(
+                    replica,
+                    C5Replica::Restarted,
+                    "{what}: R never built by {h}"
+                );
                 if let Some(w) = ctx.flush_worker.as_ref() {
                     assert!(w.wait_idle(), "{what}: W failed");
                 }
-                assert_eq!(ctx.resident_books.lock().unwrap().rows_height(), None, "{what}: {h}");
+                assert_eq!(
+                    ctx.resident_books.lock().unwrap().rows_height(),
+                    None,
+                    "{what}: {h}"
+                );
             } else {
                 assert_resident_rows_track_db(&ctx, &db, h, &what);
             }
-            assert_eq!(ctx.resident_books.lock().unwrap().rows_shared_fallbacks(), 0, "{what}: {h}");
+            assert_eq!(
+                ctx.resident_books.lock().unwrap().rows_shared_fallbacks(),
+                0,
+                "{what}: {h}"
+            );
             let marks = mark_prices(&db);
             if marks != prev_marks {
                 mark_moves += 1;
@@ -33192,7 +34935,10 @@ mod crash_recovery_tests {
             }
             // Cooldown / pending rows: tag + trader (the 9-byte previous-mark rows persist).
             liq_row_blocks += u64::from(
-                StateBackend::iterate_cf(&db, CF_NATIVE_LIQUIDATION, None).unwrap().iter().any(|(k, _)| k.len() == 21),
+                StateBackend::iterate_cf(&db, CF_NATIVE_LIQUIDATION, None)
+                    .unwrap()
+                    .iter()
+                    .any(|(k, _)| k.len() == 21),
             );
             if replica == C5Replica::Restarted && h % C5_RESTART_EVERY == 0 && h < last {
                 builds += ctx.resident_books.lock().unwrap().rows_builds();
@@ -33204,7 +34950,10 @@ mod crash_recovery_tests {
         // Phase 4 step 2: every R CF (positions and balances through `Users`;
         // `len` counts R's raw rows only).
         let r_rows = ctx.resident_books.lock().unwrap().rows().map_or(0, |r| {
-            torus_state::resident_rows::RESIDENT_CFS.iter().map(|cf| r.dump(cf).map_or(0, |d| d.len())).sum()
+            torus_state::resident_rows::RESIDENT_CFS
+                .iter()
+                .map(|cf| r.dump(cf).map_or(0, |d| d.len()))
+                .sum()
         });
         builds += ctx.resident_books.lock().unwrap().rows_builds();
         drop(ctx);
@@ -33235,7 +34984,10 @@ mod crash_recovery_tests {
     /// each (`c5_run`); identical per-block consensus write sets (every
     /// `h_n`), running hash and full dump; the sequence is non-vacuous.
     /// Returns the warm run.
-    fn c5_warm_equals_cold(pipelined: bool, mode: Option<torus_bridge::native_executor::BookMode>) -> C5Run {
+    fn c5_warm_equals_cold(
+        pipelined: bool,
+        mode: Option<torus_bridge::native_executor::BookMode>,
+    ) -> C5Run {
         let started = std::time::Instant::now();
         let what = format!("pipelined={pipelined} {mode:?}");
         let (blocks, fed) = c5_blocks();
@@ -33244,9 +34996,21 @@ mod crash_recovery_tests {
         let restarted = c5_run(&blocks, C5Replica::Restarted, pipelined, mode);
         let dropped = c5_run(&blocks, C5Replica::SumsDropped, pipelined, mode);
 
-        assert_eq!((warm.builds, dropped.builds), (1, 1), "{what}: R built once");
-        assert_eq!(restarted.restarts, (C5_BLOCKS - 1) / C5_RESTART_EVERY, "{what}");
-        assert_eq!(restarted.builds, restarted.restarts + 1, "{what}: one cold build per (re)start");
+        assert_eq!(
+            (warm.builds, dropped.builds),
+            (1, 1),
+            "{what}: R built once"
+        );
+        assert_eq!(
+            restarted.restarts,
+            (C5_BLOCKS - 1) / C5_RESTART_EVERY,
+            "{what}"
+        );
+        assert_eq!(
+            restarted.builds,
+            restarted.restarts + 1,
+            "{what}: one cold build per (re)start"
+        );
         assert_eq!(
             warm.captured.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
             (1..=C5_BLOCKS).collect::<Vec<_>>(),
@@ -33255,24 +35019,45 @@ mod crash_recovery_tests {
         assert!(warm.hash.is_some());
         assert_eq!(warm.hash, Some(fold_captured(&warm.captured)), "{what}");
         for (name, other) in [("restarted", &restarted), ("sums dropped", &dropped)] {
-            assert_write_sets_equal(&warm.captured, &other.captured, &format!("{what}: warm vs {name}"));
-            assert_eq!(warm.hash, other.hash, "{what}: running hash, warm vs {name}");
+            assert_write_sets_equal(
+                &warm.captured,
+                &other.captured,
+                &format!("{what}: warm vs {name}"),
+            );
+            assert_eq!(
+                warm.hash, other.hash,
+                "{what}: running hash, warm vs {name}"
+            );
             assert_dumps_equal(&warm.dump, &other.dump, &format!("{what}: warm vs {name}"));
         }
 
         // Non-vacuous (the warm replica; the others equal it).
         let pm = torus_core::position::PositionManager::new(warm.db.clone());
-        let fills = StateBackend::iterate_cf(&warm.db, torus_state::cf::CF_NATIVE_TRADES, None).unwrap().len();
+        let fills = StateBackend::iterate_cf(&warm.db, torus_state::cf::CF_NATIVE_TRADES, None)
+            .unwrap()
+            .len();
         // Item 7 step 2 (B16): the dumps compared above cover the bbo rows.
-        let bbo_rows = StateBackend::iterate_cf(&warm.db, torus_state::cf::CF_NATIVE_BBO, None).unwrap().len();
+        let bbo_rows = StateBackend::iterate_cf(&warm.db, torus_state::cf::CF_NATIVE_BBO, None)
+            .unwrap()
+            .len();
         assert!(bbo_rows >= 1, "{what}: bbo rows {bbo_rows}");
         let liquidations = warm.metrics.liquidations_triggered.get();
-        let top_ups = warm.metrics.sell_top_ups_full.get() + warm.metrics.sell_top_ups_partial.get();
+        let top_ups =
+            warm.metrics.sell_top_ups_full.get() + warm.metrics.sell_top_ups_partial.get();
         let v1 = signed_pos_of(&warm.db, &oracle_addr(C5_V1));
-        let v2 = pm.get_position(&oracle_addr(C5_V2), 2).unwrap().map(|p| p.size);
-        let v3 = pm.get_position(&oracle_addr(C5_V3), 3).unwrap().map(|p| p.size);
+        let v2 = pm
+            .get_position(&oracle_addr(C5_V2), 2)
+            .unwrap()
+            .map(|p| p.size);
+        let v3 = pm
+            .get_position(&oracle_addr(C5_V3), 3)
+            .unwrap()
+            .map(|p| p.size);
         let funded = U256::from(C5_EVM_FUNDING * FixedPoint::ONE.raw() as u128);
-        let evm_moved = [81u8, 82].iter().filter(|&&s| read_evm_balance(&warm.db, oracle_addr(s)) != funded).count();
+        let evm_moved = [81u8, 82]
+            .iter()
+            .filter(|&&s| read_evm_balance(&warm.db, oracle_addr(s)) != funded)
+            .count();
         println!(
             "C5 {what}: fed {fed:?}; fills {fills}, liquidations {liquidations}, top-ups {top_ups}, \
              mark moves {} ({} after the last epoch boundary), blocks with cooldown / pending rows {}, \
@@ -33287,18 +35072,34 @@ mod crash_recovery_tests {
             restarted.builds,
             started.elapsed().as_secs_f64(),
         );
-        assert!(fed.empty >= 10 && fed.cancels >= 20 && fed.transfers >= 2 && fed.non_pool_sell_batches >= 10, "{fed:?}");
+        assert!(
+            fed.empty >= 10
+                && fed.cancels >= 20
+                && fed.transfers >= 2
+                && fed.non_pool_sell_batches >= 10,
+            "{fed:?}"
+        );
         assert!(fills >= 200, "{what}: fills {fills}");
         assert!(liquidations >= 2, "{what}: liquidations {liquidations}");
         assert!(top_ups >= 20, "{what}: B-blind top-ups {top_ups}");
-        assert!(warm.mark_moves >= 50 && warm.mark_moves_after_last_epoch >= 1, "{what}: mark moves");
+        assert!(
+            warm.mark_moves >= 50 && warm.mark_moves_after_last_epoch >= 1,
+            "{what}: mark moves"
+        );
         assert!(warm.liq_row_blocks >= 1, "{what}: cooldown / pending rows");
         assert!(warm.r_rows >= 30, "{what}: R rows {}", warm.r_rows);
         assert_eq!(v1, FixedPoint::ZERO, "{what}: V1 liquidated");
         assert_eq!(v2, None, "{what}: V2 liquidated");
         assert_ne!(v3, Some(px(1_100)), "{what}: V3 liquidated");
-        assert_eq!(evm_moved, 2, "{what}: deposits / withdrawals moved EVM balances");
-        assert!(dropped.sums_dropped >= 500, "{what}: the cache held entries ({})", dropped.sums_dropped);
+        assert_eq!(
+            evm_moved, 2,
+            "{what}: deposits / withdrawals moved EVM balances"
+        );
+        assert!(
+            dropped.sums_dropped >= 500,
+            "{what}: the cache held entries ({})",
+            dropped.sums_dropped
+        );
         warm
     }
 
@@ -33319,7 +35120,10 @@ mod crash_recovery_tests {
 
     #[test]
     fn warm_equals_cold_every_block_pipelined_level_authority_chunked() {
-        c5_warm_equals_cold(true, Some(torus_bridge::native_executor::BookMode::LevelAuthorityChunked));
+        c5_warm_equals_cold(
+            true,
+            Some(torus_bridge::native_executor::BookMode::LevelAuthorityChunked),
+        );
     }
 
     // ======================================================================
@@ -41395,7 +43199,17 @@ mod crash_recovery_tests {
         fault: &P2Fault,
         ckpt: Option<crate::exec_pipeline::CheckpointPolicy>,
     ) -> P2Run {
-        p2_run_seeded(blocks, pipelined, mode, reference, fault, ckpt, &|_| {}, false, None)
+        p2_run_seeded(
+            blocks,
+            pipelined,
+            mode,
+            reference,
+            fault,
+            ckpt,
+            &|_| {},
+            false,
+            None,
+        )
     }
 
     /// [`p2_run_with`] on a `p2_fixture` DB that `seed` wrote to first, and
@@ -43350,7 +45164,10 @@ mod crash_recovery_tests {
         let (off, off_runs) = run(false);
         let (on, on_runs) = run(true);
         assert_eq!(off_runs, 0, "flag off: no unmerged flush");
-        assert!(on_runs > 20, "flag on: the parallel settle flushed unmerged ({on_runs})");
+        assert!(
+            on_runs > 20,
+            "flag on: the parallel settle flushed unmerged ({on_runs})"
+        );
         assert_write_sets_equal(&off.captured, &on.captured, "settle no merge");
         assert!(on.hash.is_some(), "running hash active");
         assert_eq!(off.hash, on.hash, "running hash h_n");
@@ -43502,19 +45319,46 @@ mod crash_recovery_tests {
         let pm = PositionManager::new(db.clone());
         let (odd, even) = (Address::repeat_byte(0xA7), Address::repeat_byte(0xA8));
         for (t, long) in [(odd, true), (even, false)] {
-            pm.put_native_balance(&t, &NativeBalance { available: px(1_000), order_margin: FixedPoint::ZERO })
+            pm.put_native_balance(
+                &t,
+                &NativeBalance {
+                    available: px(1_000),
+                    order_margin: FixedPoint::ZERO,
+                },
+            )
+            .unwrap();
+            pm.apply_fill(&t, 1, long, px(1), px(100), MarginType::Cross)
                 .unwrap();
-            pm.apply_fill(&t, 1, long, px(1), px(100), MarginType::Cross).unwrap();
         }
         let key = position_key(&odd, 1);
-        let mut row = db.get_cf_raw(torus_state::cf::CF_NATIVE_POSITIONS, &key).unwrap().expect("odd's position");
+        let mut row = db
+            .get_cf_raw(torus_state::cf::CF_NATIVE_POSITIONS, &key)
+            .unwrap()
+            .expect("odd's position");
         assert_eq!(row[1 + 20 + 8], 1, "is_long byte");
         row[1 + 20 + 8] = 2;
-        db.put_cf_raw(torus_state::cf::CF_NATIVE_POSITIONS, &key, &row).unwrap();
-        db.put_cf_raw(torus_state::cf::CF_NATIVE_POSITIONS, b"short", b"under-no-trader").unwrap();
-        db.put_cf_raw(torus_state::cf::CF_NATIVE_BALANCES, b"odd-balances-key", b"under-no-trader").unwrap();
-        pm.put_native_balance(&p2_cvlm_user(), &NativeBalance { available: px(5), order_margin: FixedPoint::ZERO })
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_POSITIONS, &key, &row)
             .unwrap();
+        db.put_cf_raw(
+            torus_state::cf::CF_NATIVE_POSITIONS,
+            b"short",
+            b"under-no-trader",
+        )
+        .unwrap();
+        db.put_cf_raw(
+            torus_state::cf::CF_NATIVE_BALANCES,
+            b"odd-balances-key",
+            b"under-no-trader",
+        )
+        .unwrap();
+        pm.put_native_balance(
+            &p2_cvlm_user(),
+            &NativeBalance {
+                available: px(5),
+                order_margin: FixedPoint::ZERO,
+            },
+        )
+        .unwrap();
     }
 
     /// [`p2_seed_irregular`]'s balance-only trader whose address starts with `cvlm`.
@@ -43554,13 +45398,22 @@ mod crash_recovery_tests {
                 let s = g.stats();
                 s.spawned > s.released
             });
-            let waits = || ctx.metrics.as_ref().map_or(0, |m| m.exec_checkpoint_deferred_read_waits.get());
+            let waits = || {
+                ctx.metrics
+                    .as_ref()
+                    .map_or(0, |m| m.exec_checkpoint_deferred_read_waits.get())
+            };
             let before = waits();
             let st = &ctx.state;
             let raw = |v: &[u8]| Some(v.to_vec());
-            assert_eq!(st.get_cf_raw(CF_NATIVE_POSITIONS, b"short").unwrap(), raw(b"under-no-trader"), "block {h}: short positions key");
             assert_eq!(
-                st.get_cf_raw(CF_NATIVE_BALANCES, b"odd-balances-key").unwrap(),
+                st.get_cf_raw(CF_NATIVE_POSITIONS, b"short").unwrap(),
+                raw(b"under-no-trader"),
+                "block {h}: short positions key"
+            );
+            assert_eq!(
+                st.get_cf_raw(CF_NATIVE_BALANCES, b"odd-balances-key")
+                    .unwrap(),
                 raw(b"under-no-trader"),
                 "block {h}: balances key under no trader"
             );
@@ -43575,17 +45428,43 @@ mod crash_recovery_tests {
                 "block {h}: balances seek"
             );
             let c = p2_cvlm_user();
-            let want = torus_core::position::NativeBalance { available: px(5), order_margin: FixedPoint::ZERO };
-            let row = st.get_cf_raw(CF_NATIVE_BALANCES, c.as_slice()).unwrap().expect("cvlm user's balance row");
-            assert_eq!(row, borsh::to_vec(&want).unwrap(), "block {h}: cvlm user's balance row");
+            let want = torus_core::position::NativeBalance {
+                available: px(5),
+                order_margin: FixedPoint::ZERO,
+            };
+            let row = st
+                .get_cf_raw(CF_NATIVE_BALANCES, c.as_slice())
+                .unwrap()
+                .expect("cvlm user's balance row");
+            assert_eq!(
+                row,
+                borsh::to_vec(&want).unwrap(),
+                "block {h}: cvlm user's balance row"
+            );
             let typed = ctx.positions.get_native_balance(&c).unwrap();
-            assert_eq!((typed.available, typed.order_margin), (want.available, want.order_margin), "block {h}: typed");
+            assert_eq!(
+                (typed.available, typed.order_margin),
+                (want.available, want.order_margin),
+                "block {h}: typed"
+            );
             let under = st.iterate_cf(CF_NATIVE_BALANCES, Some(b"cvlm")).unwrap();
-            assert!(under.contains(&(c.to_vec(), row.clone())), "block {h}: cvlm-headed prefix read lists the user");
-            assert_eq!(st.iterate_cf_from(CF_NATIVE_BALANCES, c.as_slice(), 1).unwrap(), vec![(c.to_vec(), row)], "block {h}: seek");
+            assert!(
+                under.contains(&(c.to_vec(), row.clone())),
+                "block {h}: cvlm-headed prefix read lists the user"
+            );
+            assert_eq!(
+                st.iterate_cf_from(CF_NATIVE_BALANCES, c.as_slice(), 1)
+                    .unwrap(),
+                vec![(c.to_vec(), row)],
+                "block {h}: seek"
+            );
             let resident = st.has_resident();
             if resident {
-                assert_eq!(waits(), before, "block {h}: a read of the two CFs blocked on the deferred part");
+                assert_eq!(
+                    waits(),
+                    before,
+                    "block {h}: a read of the two CFs blocked on the deferred part"
+                );
             }
             let mut s = stats.lock().unwrap();
             s.blocks += 1;
@@ -43624,35 +45503,102 @@ mod crash_recovery_tests {
             Some(&probe),
         );
         let probed = std::mem::take(&mut *seen.lock().unwrap());
-        assert!(probed.blocks >= 100 && probed.resident == probed.blocks, "R attached at every probe: {probed:?}");
-        assert!(probed.held >= 100, "probed while a deferred merge was held: {probed:?}");
+        assert!(
+            probed.blocks >= 100 && probed.resident == probed.blocks,
+            "R attached at every probe: {probed:?}"
+        );
+        assert!(
+            probed.held >= 100,
+            "probed while a deferred merge was held: {probed:?}"
+        );
         let stats = gate.stats();
-        assert_eq!(stats.timeouts, 0, "E waited for a held deferred merge: {stats:?}");
+        assert_eq!(
+            stats.timeouts, 0,
+            "E waited for a held deferred merge: {stats:?}"
+        );
         assert!(stats.held >= 100, "merges held until upkeep: {stats:?}");
-        assert_eq!(gated.metrics.exec_checkpoint_deferred_read_waits.get(), 0, "no read blocked on the deferred part");
+        assert_eq!(
+            gated.metrics.exec_checkpoint_deferred_read_waits.get(),
+            0,
+            "no read blocked on the deferred part"
+        );
         assert!(gated.max_lag >= 40, "max lag {}", gated.max_lag);
-        assert!(gated.r_db_checked >= 2, "R (through Users) == DB at the durable heights: {}", gated.r_db_checked);
-        let per_block = p2_run_seeded(&blocks, true, mode, false, &P2Fault::None, None, seed, false, None);
+        assert!(
+            gated.r_db_checked >= 2,
+            "R (through Users) == DB at the durable heights: {}",
+            gated.r_db_checked
+        );
+        let per_block = p2_run_seeded(
+            &blocks,
+            true,
+            mode,
+            false,
+            &P2Fault::None,
+            None,
+            seed,
+            false,
+            None,
+        );
         assert!(per_block.r_db_checked >= 100, "{}", per_block.r_db_checked);
         // Without R the probe reads the layers and the DB: same values.
         let off_probe = p2_irregular_probe(None, seen.clone());
-        let off = p2_run_seeded(&blocks, true, mode, false, &P2Fault::None, Some(ckpt_never()), seed, true, Some(&off_probe));
+        let off = p2_run_seeded(
+            &blocks,
+            true,
+            mode,
+            false,
+            &P2Fault::None,
+            Some(ckpt_never()),
+            seed,
+            true,
+            Some(&off_probe),
+        );
         let off_probed = std::mem::take(&mut *seen.lock().unwrap());
-        assert!(off_probed.blocks == probed.blocks && off_probed.resident == 0, "{off_probed:?}");
+        assert!(
+            off_probed.blocks == probed.blocks && off_probed.resident == 0,
+            "{off_probed:?}"
+        );
         // The value-sum walk (both CFs, every row) read the same rows through
         // R as without it (the last block's sum).
-        let value_sum = |run: &P2Run| metric_value(&run.metrics.encode(), "torus_liquidation_value_sum");
-        assert_eq!(value_sum(&gated), value_sum(&off), "value-sum walk through R == without R");
-        let serial_off = p2_run_seeded(&blocks, false, mode, false, &P2Fault::None, None, seed, true, None);
+        let value_sum =
+            |run: &P2Run| metric_value(&run.metrics.encode(), "torus_liquidation_value_sum");
+        assert_eq!(
+            value_sum(&gated),
+            value_sum(&off),
+            "value-sum walk through R == without R"
+        );
+        let serial_off = p2_run_seeded(
+            &blocks,
+            false,
+            mode,
+            false,
+            &P2Fault::None,
+            None,
+            seed,
+            true,
+            None,
+        );
         assert_eq!(off.r_db_checked + serial_off.r_db_checked, 0, "no R");
-        for (what, run) in [("per-block", &per_block), ("never without R", &off), ("serial without R", &serial_off)] {
+        for (what, run) in [
+            ("per-block", &per_block),
+            ("never without R", &off),
+            ("serial without R", &serial_off),
+        ] {
             assert_write_sets_equal(&run.captured, &gated.captured, &format!("gated vs {what}"));
             assert_eq!(run.hash, gated.hash, "gated vs {what}: running hash");
             assert_dumps_equal(&run.dump, &gated.dump, &format!("gated vs {what}"));
         }
         // The seeded rows were state (and the lenient row is still raw or was rewritten by a block).
-        let has = |cf: &str, k: &[u8]| gated.dump.iter().any(|(c, rows)| *c == cf && rows.iter().any(|(key, _)| key == k));
-        assert!(has(torus_state::cf::CF_NATIVE_POSITIONS, b"short") && has(torus_state::cf::CF_NATIVE_BALANCES, b"odd-balances-key"));
+        let has = |cf: &str, k: &[u8]| {
+            gated
+                .dump
+                .iter()
+                .any(|(c, rows)| *c == cf && rows.iter().any(|(key, _)| key == k))
+        };
+        assert!(
+            has(torus_state::cf::CF_NATIVE_POSITIONS, b"short")
+                && has(torus_state::cf::CF_NATIVE_BALANCES, b"odd-balances-key")
+        );
     }
 
     /// Item 6 Phase 4 step 2 (plan Task 2.2): after every block whose
@@ -43667,11 +45613,27 @@ mod crash_recovery_tests {
         let (blocks, _fed) = p2_blocks(false);
         let mode = Some(BookMode::Classic);
         let serial = p2_run(&blocks, false, mode, false, &P2Fault::None);
-        assert!(serial.r_db_checked >= 100, "serial: {}", serial.r_db_checked);
-        for (name, policy, min) in [("per-block", None, 100), ("every 5", Some(ckpt_every(5)), 15), ("never", Some(ckpt_never()), 2)] {
+        assert!(
+            serial.r_db_checked >= 100,
+            "serial: {}",
+            serial.r_db_checked
+        );
+        for (name, policy, min) in [
+            ("per-block", None, 100),
+            ("every 5", Some(ckpt_every(5)), 15),
+            ("never", Some(ckpt_never()), 2),
+        ] {
             let run = p2_run_with(&blocks, true, mode, false, &P2Fault::None, policy);
-            assert!(run.r_db_checked >= min, "{name}: R == DB checked after {} blocks", run.r_db_checked);
-            assert_write_sets_equal(&serial.captured, &run.captured, &format!("{name} vs serial"));
+            assert!(
+                run.r_db_checked >= min,
+                "{name}: R == DB checked after {} blocks",
+                run.r_db_checked
+            );
+            assert_write_sets_equal(
+                &serial.captured,
+                &run.captured,
+                &format!("{name} vs serial"),
+            );
             assert_eq!(serial.hash, run.hash, "{name} vs serial: running hash");
             assert_dumps_equal(&serial.dump, &run.dump, &format!("{name} vs serial"));
         }
@@ -45051,7 +47013,6 @@ mod crash_recovery_tests {
         assert!(stats.live_objects() >= 0 && stats.live_bytes() >= 0);
     }
 
-
     // ======================================================================
     // Applied block without its header (Codex D12 r2, pre-existing on main):
     // every block whose applied marker is durable has its CF_BLOCK_HEADERS
@@ -45067,8 +47028,15 @@ mod crash_recovery_tests {
         for b in blocks.iter().filter(|b| b.header.height <= applied) {
             let h = b.header.height;
             let row = db.get_cf_raw(CF_BLOCK_HEADERS, &h.to_be_bytes()).unwrap();
-            assert!(row.is_some(), "{what}: applied marker {applied} but header {h} missing");
-            assert_eq!(row, header_record_bytes(b), "{what}: header {h} is not the committed record");
+            assert!(
+                row.is_some(),
+                "{what}: applied marker {applied} but header {h} missing"
+            );
+            assert_eq!(
+                row,
+                header_record_bytes(b),
+                "{what}: header {h} is not the committed record"
+            );
         }
     }
 
@@ -45080,7 +47048,8 @@ mod crash_recovery_tests {
             .iter()
             .filter(|b| b.header.height <= applied)
             .filter(|b| {
-                db.get_cf_raw(CF_BLOCK_HEADERS, &b.header.height.to_be_bytes()).unwrap()
+                db.get_cf_raw(CF_BLOCK_HEADERS, &b.header.height.to_be_bytes())
+                    .unwrap()
                     != header_record_bytes(b)
             })
             .map(|b| b.header.height)
@@ -45090,7 +47059,12 @@ mod crash_recovery_tests {
     /// An EVM tx of `key` calling an empty account (valid, succeeds unless a
     /// fault is injected).
     fn hdr_evm_call(key: &k256::ecdsa::SigningKey, nonce: u64) -> Vec<u8> {
-        signed_eip1559(key, nonce, alloy_primitives::TxKind::Call(Address::repeat_byte(0x66)), vec![])
+        signed_eip1559(
+            key,
+            nonce,
+            alloy_primitives::TxKind::Call(Address::repeat_byte(0x66)),
+            vec![],
+        )
     }
 
     /// Codex D12 r2 scenario: block 2 carries a valid EVM tx, its dispatch-time
@@ -45121,7 +47095,10 @@ mod crash_recovery_tests {
                 ctx.test_replay_fault = Some(ReplayFault::EvmSectionError);
                 ctx.execute_committed_block_with(&blocks[1], vec![], DurableRows::default());
                 ctx.test_replay_fault = None;
-                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: block 2 no fail-stop");
+                assert!(
+                    !ctx.exec_failed.load(Ordering::SeqCst),
+                    "{what}: block 2 no fail-stop"
+                );
                 assert_eq!(read_native_applied_height(&db), Some(2), "{what}");
                 hdr_assert_applied_headers(&db, &blocks, &format!("{what} after block 2"));
                 if restart {
@@ -45131,13 +47108,19 @@ mod crash_recovery_tests {
                     drop(ctx);
                     let ctx = pipeline_ctx(&db, false, None);
                     let (last, parked) = TorusApp::replay_committed(&db, &ctx);
-                    assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: boot replay no fail-stop");
+                    assert!(
+                        !ctx.exec_failed.load(Ordering::SeqCst),
+                        "{what}: boot replay no fail-stop"
+                    );
                     assert_eq!(parked, None, "{what}");
                     assert_eq!(last.height, 3, "{what}: block 3 replayed");
                 } else {
                     dispatch_and_execute(&ctx, &db, &blocks[2]);
                     assert!(ctx.pipeline_barrier(), "{what}");
-                    assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: block 3 no fail-stop");
+                    assert!(
+                        !ctx.exec_failed.load(Ordering::SeqCst),
+                        "{what}: block 3 no fail-stop"
+                    );
                 }
                 assert_eq!(read_native_applied_height(&db), Some(3), "{what}");
                 hdr_assert_applied_headers(&db, &blocks, &format!("{what} after block 3"));
@@ -45151,8 +47134,11 @@ mod crash_recovery_tests {
     #[test]
     fn applied_block_keeps_header_evm_ordinary_error_with_native_phase() {
         let key = k256::ecdsa::SigningKey::from_slice(&[0x67; 32]).unwrap();
-        let (blocks, b) =
-            r02_evm_blocks(&key, alloy_primitives::TxKind::Create, vec![0x60, 0x01, 0x60, 0x00, 0x55]);
+        let (blocks, b) = r02_evm_blocks(
+            &key,
+            alloy_primitives::TxKind::Create,
+            vec![0x60, 0x01, 0x60, 0x00, 0x55],
+        );
         for on in [false, true] {
             let (_c, db) = make_test_config_and_db();
             r02_fund(&db, &key);
@@ -45163,7 +47149,10 @@ mod crash_recovery_tests {
             ctx.execute_committed_block_with(&blocks[1], vec![], DurableRows::default());
             ctx.test_replay_fault = None;
             assert!(ctx.pipeline_barrier(), "on={on}");
-            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}: no fail-stop");
+            assert!(
+                !ctx.exec_failed.load(Ordering::SeqCst),
+                "on={on}: no fail-stop"
+            );
             assert_eq!(read_native_applied_height(&db), Some(2), "on={on}");
             assert!(r02_nonce_consumed(&db, &b), "on={on}: native phase ran");
             hdr_assert_applied_headers(&db, &blocks, &format!("on={on}"));
@@ -45196,7 +47185,11 @@ mod crash_recovery_tests {
         // (what, blocks: the last one runs with the seam, EVM-success block:
         // the failed metadata write fail-stops it)
         let cases: Vec<(&str, Vec<TorusBlock>, bool)> = vec![
-            ("empty block (marker-only flush)", vec![make_block(1, vec![]), make_block(2, vec![])], false),
+            (
+                "empty block (marker-only flush)",
+                vec![make_block(1, vec![]), make_block(2, vec![])],
+                false,
+            ),
             (
                 "empty epoch-boundary block (native phase, no actions)",
                 (1..=4).map(|h| make_block(h, vec![])).collect(),
@@ -45204,7 +47197,10 @@ mod crash_recovery_tests {
             ),
             (
                 "native-only block",
-                vec![make_block(1, vec![r02_claim(ms)]), make_block(2, vec![r02_claim(ms + 1)])],
+                vec![
+                    make_block(1, vec![r02_claim(ms)]),
+                    make_block(2, vec![r02_claim(ms + 1)]),
+                ],
                 false,
             ),
             (
@@ -45212,10 +47208,17 @@ mod crash_recovery_tests {
                 vec![make_block(1, vec![]), evm(2, 1_000_000_000, vec![])],
                 true,
             ),
-            ("EVM success, no fee revenue (EVM marker flush)", vec![make_block(1, vec![]), evm(2, 0, vec![])], true),
+            (
+                "EVM success, no fee revenue (EVM marker flush)",
+                vec![make_block(1, vec![]), evm(2, 0, vec![])],
+                true,
+            ),
             (
                 "EVM success + native action",
-                vec![make_block(1, vec![r02_claim(ms)]), evm(2, 1_000_000_000, vec![r02_claim(ms + 1)])],
+                vec![
+                    make_block(1, vec![r02_claim(ms)]),
+                    evm(2, 1_000_000_000, vec![r02_claim(ms + 1)]),
+                ],
                 true,
             ),
         ];
@@ -45257,11 +47260,17 @@ mod crash_recovery_tests {
                 );
                 let missing = hdr_missing_headers(&db, &blocks);
                 if !missing.is_empty() {
-                    failures.push(format!("{what} on={on}: applied, header(s) {missing:?} missing"));
+                    failures.push(format!(
+                        "{what} on={on}: applied, header(s) {missing:?} missing"
+                    ));
                 }
             }
         }
-        assert!(failures.is_empty(), "applied blocks without their header:\n{}", failures.join("\n"));
+        assert!(
+            failures.is_empty(),
+            "applied blocks without their header:\n{}",
+            failures.join("\n")
+        );
     }
 
     // ======================================================================
@@ -45312,11 +47321,19 @@ mod crash_recovery_tests {
                     d12_claim(b, 2_000_000),
                 ],
             ),
-            d12_block(2, 2000, vec![d12_claim(c, 2_000_000), d12_claim(b, 2_000_000)]),
+            d12_block(
+                2,
+                2000,
+                vec![d12_claim(c, 2_000_000), d12_claim(b, 2_000_000)],
+            ),
             d12_block(3, 2030, vec![]),
             d12_block(4, 2059, vec![d12_claim(a, 2_059_000)]),
             d12_block(5, 2060, vec![]),
-            d12_block(6, 2060, vec![d12_claim(b, 2_000_000), d12_claim(a, 1_999_999)]),
+            d12_block(
+                6,
+                2060,
+                vec![d12_claim(b, 2_000_000), d12_claim(a, 1_999_999)],
+            ),
             d12_block(7, 2061, vec![]),
             d12_block(8, 2200, vec![]),
             d12_block(9, 2200, vec![d12_claim(d, 2_200_000)]),
@@ -45340,7 +47357,8 @@ mod crash_recovery_tests {
             .unwrap()
             .iter()
             .map(|(k, _)| {
-                let (nonce, sender) = torus_state::cf::native_nonce_key_parts(k).expect("28-byte key");
+                let (nonce, sender) =
+                    torus_state::cf::native_nonce_key_parts(k).expect("28-byte key");
                 (nonce, seeds[&sender])
             })
             .collect::<std::collections::BTreeSet<_>>()
@@ -45353,7 +47371,12 @@ mod crash_recovery_tests {
         let (a, b, c, d, e, f) = (0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6);
         match h {
             1 => vec![(1_999_000, a), (1_999_999, a), (2_000_000, b)],
-            2 | 3 => vec![(1_999_000, a), (1_999_999, a), (2_000_000, b), (2_000_000, c)],
+            2 | 3 => vec![
+                (1_999_000, a),
+                (1_999_999, a),
+                (2_000_000, b),
+                (2_000_000, c),
+            ],
             4 => vec![
                 (1_999_000, a),
                 (1_999_999, a),
@@ -45395,10 +47418,20 @@ mod crash_recovery_tests {
                 if on {
                     assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
                 }
-                assert_eq!(d12_rows(&db), d12_expected_rows(h), "on={on}: rows after {h}");
+                assert_eq!(
+                    d12_rows(&db),
+                    d12_expected_rows(h),
+                    "on={on}: rows after {h}"
+                );
                 if h == 5 {
-                    assert!(db.get_cf_raw(torus_state::cf::CF_NATIVE_NONCES, &a_old).unwrap().is_none());
-                    assert!(db.get_cf_raw(torus_state::cf::CF_NATIVE_NONCES, &a_edge).unwrap().is_none());
+                    assert!(db
+                        .get_cf_raw(torus_state::cf::CF_NATIVE_NONCES, &a_old)
+                        .unwrap()
+                        .is_none());
+                    assert!(db
+                        .get_cf_raw(torus_state::cf::CF_NATIVE_NONCES, &a_edge)
+                        .unwrap()
+                        .is_none());
                 }
             }
             assert_eq!(
@@ -45418,7 +47451,11 @@ mod crash_recovery_tests {
                 "on={on}: every block prunes once"
             );
             let deleted: Vec<usize> = log.iter().map(|(_, _, d)| *d).collect();
-            assert_eq!(deleted, vec![0, 0, 0, 0, 2, 0, 2, 1, 0, 1, 0, 1, 0], "on={on}");
+            assert_eq!(
+                deleted,
+                vec![0, 0, 0, 0, 2, 0, 2, 1, 0, 1, 0, 1, 0],
+                "on={on}"
+            );
             for (h, scanned, del) in &log {
                 assert!(
                     *scanned <= del + torus_state::nonce_window::NONCE_PRUNE_CHUNK,
@@ -45426,7 +47463,11 @@ mod crash_recovery_tests {
                 );
             }
             for same_second in [2, 6, 9, 11, 13] {
-                assert_eq!(log[same_second - 1].1, 0, "on={on}: h={same_second} reads nothing");
+                assert_eq!(
+                    log[same_second - 1].1,
+                    0,
+                    "on={on}: h={same_second} reads nothing"
+                );
             }
         }
     }
@@ -45515,7 +47556,9 @@ mod crash_recovery_tests {
             2_200_000,
         );
         assert!(
-            db.get_cf_raw(torus_state::cf::CF_NATIVE_NONCES, &d_key).unwrap().is_none(),
+            db.get_cf_raw(torus_state::cf::CF_NATIVE_NONCES, &d_key)
+                .unwrap()
+                .is_none(),
             "batch(9) not durable yet"
         );
         let (db_t, b10) = (db.clone(), blocks[9].clone());
@@ -45529,7 +47572,11 @@ mod crash_recovery_tests {
         let ctx = t.join().unwrap();
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
         let log = ctx.test_nonce_prune.lock().unwrap().clone();
-        assert_eq!(log.last().map(|(h, _, d)| (*h, *d)), Some((10, 1)), "10 deleted D");
+        assert_eq!(
+            log.last().map(|(h, _, d)| (*h, *d)),
+            Some((10, 1)),
+            "10 deleted D"
+        );
         drop(ctx);
         assert_eq!(d12_rows(&db), d12_expected_rows(10));
     }
@@ -45563,7 +47610,11 @@ mod crash_recovery_tests {
             let captured = torus_state::running_hash::capture_take(&db);
             let what = format!("crash after {crash_after}");
             assert_write_sets_equal(&straight, &captured, &what);
-            assert_eq!(hash, torus_state::running_hash::read_running_hash(&db), "{what}");
+            assert_eq!(
+                hash,
+                torus_state::running_hash::read_running_hash(&db),
+                "{what}"
+            );
             assert_dumps_equal(&dump, &dump_all_cfs(&db), &what);
         }
     }
@@ -45604,9 +47655,14 @@ mod crash_recovery_tests {
             d12_block(2, 2061, vec![d12_claim(0xb2, 2_061_000)]),
         ];
         link_blocks(&mut blocks);
-        r02_assert_fault_fail_stops_then_replays(&blocks, &|_| {}, ReplayFault::NoncePrune, &|db| {
-            assert_eq!(d12_rows(db), vec![(2_061_000, 0xb2)]);
-        });
+        r02_assert_fault_fail_stops_then_replays(
+            &blocks,
+            &|_| {},
+            ReplayFault::NoncePrune,
+            &|db| {
+                assert_eq!(d12_rows(db), vec![(2_061_000, 0xb2)]);
+            },
+        );
     }
 
     /// D12 (Codex r1): run `d12_blocks` 1..=4, then break the parent header
@@ -45622,7 +47678,10 @@ mod crash_recovery_tests {
                 dispatch_and_execute(&ctx, &db, b);
             }
             assert!(ctx.pipeline_barrier(), "on={on} {what}");
-            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on} {what}: control");
+            assert!(
+                !ctx.exec_failed.load(Ordering::SeqCst),
+                "on={on} {what}: control"
+            );
             corrupt(&db);
             let durable = persist_committed_block_durably(&db, &blocks[4]);
             let before = dump_all_cfs(&db);
@@ -45642,8 +47701,16 @@ mod crash_recovery_tests {
             assert_eq!(tomb.len(), 4, "on={on} {what}: block 5 must not scan");
             drop(ctx);
             assert_eq!(read_native_applied_height(&db), Some(4), "on={on} {what}");
-            assert_eq!(d12_rows(&db), d12_expected_rows(4), "on={on} {what}: no deletes");
-            assert_dumps_equal(&before, &dump_all_cfs(&db), &format!("on={on} {what}: nothing flushed"));
+            assert_eq!(
+                d12_rows(&db),
+                d12_expected_rows(4),
+                "on={on} {what}: no deletes"
+            );
+            assert_dumps_equal(
+                &before,
+                &dump_all_cfs(&db),
+                &format!("on={on} {what}: nothing flushed"),
+            );
         }
     }
 
@@ -45654,7 +47721,8 @@ mod crash_recovery_tests {
     fn d12_missing_parent_header_fail_stops() {
         d12_assert_bad_parent_header_fail_stops(
             &|db| {
-                db.delete_cf_raw(CF_BLOCK_HEADERS, &4u64.to_be_bytes()).unwrap();
+                db.delete_cf_raw(CF_BLOCK_HEADERS, &4u64.to_be_bytes())
+                    .unwrap();
             },
             "missing",
         );
@@ -45715,7 +47783,10 @@ mod crash_recovery_tests {
                     dispatch_and_execute(&ctx, &db, b);
                 }
                 assert!(ctx.pipeline_barrier());
-                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on} seeded={seeded}");
+                assert!(
+                    !ctx.exec_failed.load(Ordering::SeqCst),
+                    "on={on} seeded={seeded}"
+                );
                 let log = ctx.test_nonce_prune.lock().unwrap().clone();
                 let del = if seeded { 3 } else { 0 };
                 assert_eq!(log[0].0, 1);
@@ -45726,9 +47797,17 @@ mod crash_recovery_tests {
                     log[0].1
                 );
                 let tomb = ctx.test_nonce_tombstones.lock().unwrap().clone();
-                assert_eq!(tomb[0], (1, 0), "on={on} seeded={seeded}: no tombstone exists yet");
+                assert_eq!(
+                    tomb[0],
+                    (1, 0),
+                    "on={on} seeded={seeded}: no tombstone exists yet"
+                );
                 drop(ctx);
-                assert_eq!(d12_rows(&db), vec![(4_940_000, 0xb2)], "on={on} seeded={seeded}");
+                assert_eq!(
+                    d12_rows(&db),
+                    vec![(4_940_000, 0xb2)],
+                    "on={on} seeded={seeded}"
+                );
             }
         }
     }
@@ -45765,12 +47844,16 @@ mod crash_recovery_tests {
             let tomb = ctx.test_nonce_tombstones.lock().unwrap().clone();
             assert_eq!(tomb.len(), N as usize, "on={on}");
             for (h, skipped) in &tomb {
-                assert_eq!(*skipped, 0, "on={on} h={h}: parent cursor stepped over tombstones");
+                assert_eq!(
+                    *skipped, 0,
+                    "on={on} h={h}: parent cursor stepped over tombstones"
+                );
             }
             drop(ctx);
             // Probe check: the last block's range scanned from 0 steps over
             // every tombstone left by the earlier prunes.
-            let last_ms = torus_types::eip712::block_timestamp_ms(blocks.last().unwrap().header.timestamp);
+            let last_ms =
+                torus_types::eip712::block_timestamp_ms(blocks.last().unwrap().header.timestamp);
             let (from_zero, skipped) = rocksdb_deletes_skipped(|| {
                 torus_state::nonce_window::expired_nonce_keys(&db, 0, last_ms + 2_000).unwrap()
             });
@@ -45830,7 +47913,9 @@ mod crash_recovery_tests {
                 ctx.test_replay_fault = Some(ReplayFault::EvmSectionError);
                 ctx.execute_committed_block_with(&blocks[1], vec![], DurableRows::default());
                 ctx.test_replay_fault = None;
-                let header2 = db.get_cf_raw(CF_BLOCK_HEADERS, &2u64.to_be_bytes()).unwrap();
+                let header2 = db
+                    .get_cf_raw(CF_BLOCK_HEADERS, &2u64.to_be_bytes())
+                    .unwrap();
                 assert_eq!(
                     (
                         read_native_applied_height(&db),
@@ -45847,19 +47932,29 @@ mod crash_recovery_tests {
                     drop(ctx);
                     let ctx = pipeline_ctx(&db, false, None);
                     let (last, parked) = TorusApp::replay_committed(&db, &ctx);
-                    assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: boot replay failed");
+                    assert!(
+                        !ctx.exec_failed.load(Ordering::SeqCst),
+                        "{what}: boot replay failed"
+                    );
                     assert_eq!(parked, None, "{what}");
                     assert_eq!(last.height, 3, "{what}: block 3 replayed");
                     ctx
                 } else {
                     dispatch_and_execute(&ctx, &db, &blocks[2]);
                     assert!(ctx.pipeline_barrier(), "{what}");
-                    assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: block 3 failed");
+                    assert!(
+                        !ctx.exec_failed.load(Ordering::SeqCst),
+                        "{what}: block 3 failed"
+                    );
                     ctx
                 };
                 assert_eq!(read_native_applied_height(&db), Some(3), "{what}");
                 assert_eq!(
-                    ctx.test_nonce_prune.lock().unwrap().last().map(|&(h, _, deleted)| (h, deleted)),
+                    ctx.test_nonce_prune
+                        .lock()
+                        .unwrap()
+                        .last()
+                        .map(|&(h, _, deleted)| (h, deleted)),
                     Some((3, 1)),
                     "{what}: block 3's prune deleted block 1's row"
                 );
@@ -45867,7 +47962,10 @@ mod crash_recovery_tests {
                 drop(ctx);
                 let ctx = pipeline_ctx(&db, false, None);
                 let (_, parked) = TorusApp::replay_committed(&db, &ctx);
-                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: restart failed");
+                assert!(
+                    !ctx.exec_failed.load(Ordering::SeqCst),
+                    "{what}: restart failed"
+                );
                 assert_eq!(parked, None, "{what}");
                 assert_eq!(read_native_applied_height(&db), Some(3), "{what}");
             }
@@ -46163,7 +48261,11 @@ mod crash_recovery_tests {
                 2
             }
         };
-        let names = ["1..=1001 (record only)", "1002..=1128 (tree prunes)", "1129.. (deleting)"];
+        let names = [
+            "1..=1001 (record only)",
+            "1002..=1128 (tree prunes)",
+            "1129.. (deleting)",
+        ];
         fn summary(xs: &mut [Duration]) -> String {
             if xs.is_empty() {
                 return "n=0".into();
@@ -46219,8 +48321,16 @@ mod crash_recovery_tests {
         };
         let mut arms = [
             ("off", app_for(&state_off, &db_off, None), db_off.clone()),
-            ("inline", app_for(&state_inline, &db_inline, Some(true)), db_inline.clone()),
-            ("worker", app_for(&state_worker, &db_worker, Some(false)), db_worker.clone()),
+            (
+                "inline",
+                app_for(&state_inline, &db_inline, Some(true)),
+                db_inline.clone(),
+            ),
+            (
+                "worker",
+                app_for(&state_worker, &db_worker, Some(false)),
+                db_worker.clone(),
+            ),
         ];
         let mut times: [[Vec<Duration>; 3]; 3] = Default::default();
         for h in 1..=blocks {
@@ -46265,7 +48375,11 @@ mod crash_recovery_tests {
             println!(
                 "GC {name}: consensus-thread handoff mean {handoff:.1}us (n={n}); \
                  pass mean {pass:.1}us (n={passes}, {})",
-                if *name == "worker" { "on the worker" } else { "on the consensus thread" }
+                if *name == "worker" {
+                    "on the worker"
+                } else {
+                    "on the consensus thread"
+                }
             );
         }
 
@@ -46279,7 +48393,10 @@ mod crash_recovery_tests {
             let actions = actions_at(h);
             store.put_batch(&actions).unwrap();
             set_pointer(&db, h);
-            let hashes: Vec<_> = actions.iter().map(torus_types::compute_action_hash).collect();
+            let hashes: Vec<_> = actions
+                .iter()
+                .map(torus_types::compute_action_hash)
+                .collect();
             let t = Instant::now();
             let missing = store.missing(&hashes).unwrap();
             let presence = t.elapsed();
@@ -46857,7 +48974,11 @@ mod crash_recovery_tests {
                 "{what}: the unfillable gap is counted"
             );
         } else {
-            assert_eq!(held_total(&metrics), 0, "{what}: 1227 back-filled from the tree");
+            assert_eq!(
+                held_total(&metrics),
+                0,
+                "{what}: 1227 back-filled from the tree"
+            );
         }
     }
 
@@ -47104,7 +49225,10 @@ mod crash_recovery_tests {
         assert!(store.contains(&hx.0).unwrap(), "pinned by 1229");
         // P3 (claude-review r4): the hold is counted, by its reason.
         assert_eq!(
-            (held_passes(&metrics, "dispatch_behind"), held_total(&metrics)),
+            (
+                held_passes(&metrics, "dispatch_behind"),
+                held_total(&metrics)
+            ),
             (1, 1),
             "dispatch behind the committed tip is a counted hold"
         );
@@ -47230,7 +49354,10 @@ mod crash_recovery_tests {
         let (_config, db) = make_test_config_and_db();
         let noop = |_: u64, _: &[torus_types::B256], _: Option<&[SignedNativeAction]>| {};
         let history = crate::da_gc::BlockTreeHistory::new(&db, &noop);
-        assert!(history.uncommitted_hashes().unwrap().is_empty(), "empty tree");
+        assert!(
+            history.uncommitted_hashes().unwrap().is_empty(),
+            "empty tree"
+        );
         let [a, b, c, d, e] = [1u64, 2, 3, 4, 5].map(sign_claim_rewards);
         let hash = torus_types::compute_action_hash;
         let mut chain = vec![
@@ -47243,10 +49370,16 @@ mod crash_recovery_tests {
         // Nothing committed: the tail starts at genesis.
         let h1 = tree_insert(&db, 0, None, tree_data(&chain[0], true));
         let set = |v: Vec<torus_types::B256>| v.into_iter().collect::<HashSet<_>>();
-        assert_eq!(set(history.uncommitted_hashes().unwrap()), set(vec![hash(&a)]));
+        assert_eq!(
+            set(history.uncommitted_hashes().unwrap()),
+            set(vec![hash(&a)])
+        );
         let h2 = tree_insert(&db, 1, Some(h1), tree_data(&chain[1], true));
         tree_commit(&db, &h2);
-        assert!(history.uncommitted_hashes().unwrap().is_empty(), "1, 2 committed");
+        assert!(
+            history.uncommitted_hashes().unwrap().is_empty(),
+            "1, 2 committed"
+        );
         // Branch one: 3 (compact) <- 4 (full); branch two: 3' (empty data).
         let h3 = tree_insert(&db, 2, Some(h2), tree_data(&chain[2], true));
         tree_insert(&db, 3, Some(h3), tree_data(&chain[3], false));
@@ -47258,9 +49391,18 @@ mod crash_recovery_tests {
             set(history.uncommitted_hashes().unwrap()),
             set(vec![hash(&c), hash(&d), hash(&e)])
         );
-        assert_eq!(history.committed_through().unwrap(), Some(2), "tip unchanged");
+        assert_eq!(
+            history.committed_through().unwrap(),
+            Some(2),
+            "tip unchanged"
+        );
         // An undecodable tail datum: unreadable, never "no actions".
-        tree_insert(&db, 3, Some(h3b), Data::new(vec![Datum::new(vec![0xff; 7])]));
+        tree_insert(
+            &db,
+            3,
+            Some(h3b),
+            Data::new(vec![Datum::new(vec![0xff; 7])]),
+        );
         assert!(history.uncommitted_hashes().is_err());
     }
 
@@ -47287,7 +49429,11 @@ mod crash_recovery_tests {
         tree_commit(&db, &h1);
         let h2 = tree_insert(&db, 1, Some(h1), tree_data(&chain[1], true));
         tree_insert(&db, 2, Some(h2), tree_data(&chain[2], true));
-        assert_eq!(history.committed_through().unwrap(), Some(1), "the pass reads tip 1");
+        assert_eq!(
+            history.committed_through().unwrap(),
+            Some(1),
+            "the pass reads tip 1"
+        );
         // 2 commits before the pass reads the tail.
         tree_commit(&db, &h2);
         let set = |v: Vec<torus_types::B256>| v.into_iter().collect::<HashSet<_>>();
@@ -47347,12 +49493,19 @@ mod crash_recovery_tests {
         app.on_committed_block(&committed, committed.hash);
         da_gc_settle(&app);
         assert_eq!(app.exec_next_height, Some(1229), "1228 dispatched");
-        assert!(tree_serves_block(&consensus, &h1229), "the tree still holds 1229");
+        assert!(
+            tree_serves_block(&consensus, &h1229),
+            "the tree still holds 1229"
+        );
         assert!(
             store.contains(&hx.0).unwrap(),
             "uncommitted 1229 (served by block sync, may commit) needs x"
         );
-        assert_eq!(held_total(&metrics), 0, "row 100 went, x is skipped, not held");
+        assert_eq!(
+            held_total(&metrics),
+            0,
+            "row 100 went, x is skipped, not held"
+        );
         // Restart: no cached proposal. 1229 commits and must rebuild from
         // the DA store.
         drop(app);
@@ -47422,7 +49575,10 @@ mod crash_recovery_tests {
         assert_eq!(app.exec_next_height, Some(1229), "1228 dispatched");
         assert!(store.contains(&hx.0).unwrap(), "an unreadable tail holds");
         assert_eq!(
-            (held_passes(&metrics, "tail_unreadable"), held_total(&metrics)),
+            (
+                held_passes(&metrics, "tail_unreadable"),
+                held_total(&metrics)
+            ),
             (1, 1)
         );
         assert_eq!(metrics.da_bodies_gc_deleted.get(), 0);
@@ -47506,7 +49662,9 @@ mod crash_recovery_tests {
         // Height 3's body is lost (its block arrives as a full datum).
         for (i, a) in actions.iter().enumerate() {
             if i != 2 {
-                mempool.mirror_native_to_da(std::slice::from_ref(a)).unwrap();
+                mempool
+                    .mirror_native_to_da(std::slice::from_ref(a))
+                    .unwrap();
             }
         }
         let mut blocks: Vec<TorusBlock> = (1..=6u64)
@@ -47526,7 +49684,10 @@ mod crash_recovery_tests {
         let hooks = app.da_gc_hooks().clone();
         assert_eq!(hooks.passes.load(Ordering::SeqCst), 0, "no pass ran");
         assert_eq!(da_gc_state(&state_db), None, "no GC write");
-        assert!(!da_has(&mempool, &actions[2]), "no restore on the consensus thread");
+        assert!(
+            !da_has(&mempool, &actions[2]),
+            "no restore on the consensus thread"
+        );
         assert!(da_has(&mempool, &actions[0]), "due at 5, but nothing ran");
         assert_eq!(hist_sum_count(&metrics, "torus_da_gc_handoff_seconds").1, 6);
         hooks.resume();
@@ -47537,7 +49698,11 @@ mod crash_recovery_tests {
             "a pass ran on the consensus thread"
         );
         assert!(da_has(&mempool, &actions[2]), "restored by the worker");
-        assert_eq!(da_gc_state(&state_db).map(|s| s.1), Some(7), "cursor past 6");
+        assert_eq!(
+            da_gc_state(&state_db).map(|s| s.1),
+            Some(7),
+            "cursor past 6"
+        );
         for (i, a) in actions.iter().enumerate() {
             let h = i as u64 + 1;
             assert_eq!(da_has(&mempool, a), h + 4 > 6, "body of {h}");
@@ -47550,7 +49715,11 @@ mod crash_recovery_tests {
         mempool.mirror_native_to_da(&actions[..1]).unwrap();
         let committed = committed_compact_block(&blocks[0]);
         app.on_committed_block(&committed, committed.hash);
-        assert_eq!(da_gc_state(&state_db).map(|s| s.1), Some(2), "recorded inline");
+        assert_eq!(
+            da_gc_state(&state_db).map(|s| s.1),
+            Some(2),
+            "recorded inline"
+        );
         assert!(app.da_gc_hooks().pass_threads.lock().unwrap().contains(&me));
     }
 
@@ -47589,7 +49758,11 @@ mod crash_recovery_tests {
             coalesced > 0 && coalesced <= n - DA_GC_QUEUE_CAP as u64,
             "coalesced {coalesced} of {n}"
         );
-        assert_eq!(metrics.da_gc_queue_depth.get(), DA_GC_QUEUE_CAP as i64, "full");
+        assert_eq!(
+            metrics.da_gc_queue_depth.get(),
+            DA_GC_QUEUE_CAP as i64,
+            "full"
+        );
         assert_eq!(metrics.da_gc_lag_heights.get(), n as i64);
         assert_eq!(app.da_gc_hooks().passes.load(Ordering::SeqCst), 0);
         assert!(took < std::time::Duration::from_secs(60), "{took:?}");
@@ -47630,8 +49803,10 @@ mod crash_recovery_tests {
         // Body `i` is action `sign_claim_rewards(i)` (signed once: signing
         // dominates a debug run otherwise).
         let signed: Vec<SignedNativeAction> = (0..=EQ_TIP).map(sign_claim_rewards).collect();
-        let hashes: Vec<torus_types::B256> =
-            signed.iter().map(torus_types::compute_action_hash).collect();
+        let hashes: Vec<torus_types::B256> = signed
+            .iter()
+            .map(torus_types::compute_action_hash)
+            .collect();
         let body = |i: u64| signed[i as usize].clone();
         let block_bodies = |h: u64| -> Vec<u64> {
             match h {
@@ -47770,7 +49945,10 @@ mod crash_recovery_tests {
         let last = inline.last().unwrap();
         assert!(!last.contains(&1) && !last.contains(&40) && !last.contains(&62));
         assert!(last.contains(&33), "pinned by the abandoned fork, for good");
-        assert!(last.contains(&12) && last.contains(&15), "inside 151's / 160's window");
+        assert!(
+            last.contains(&12) && last.contains(&15),
+            "inside 151's / 160's window"
+        );
         assert!(last.contains(&63), "row 63 is due only at 201");
     }
 
@@ -47926,7 +50104,10 @@ mod crash_recovery_tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(load_replay_body(&state_db, 6).is_none(), "6's write is held");
+        assert!(
+            load_replay_body(&state_db, 6).is_none(),
+            "6's write is held"
+        );
         let (pruned_tx, _pruned_rx) = std::sync::mpsc::channel();
         app.commit_persist
             .as_mut()
@@ -48130,7 +50311,9 @@ mod crash_recovery_tests {
             torus_types::compute_action_hash(&x),
             torus_types::compute_action_hash(&y),
         );
-        mempool.mirror_native_to_da(&[x.clone(), y.clone()]).unwrap();
+        mempool
+            .mirror_native_to_da(&[x.clone(), y.clone()])
+            .unwrap();
         da_gc_commit(&mut app, 1, vec![x.clone()]);
         da_gc_commit(&mut app, 2, vec![y.clone()]);
         for h in 3..=4 {
@@ -48166,9 +50349,15 @@ mod crash_recovery_tests {
         *app.da_gc_hooks().before_delete.lock().unwrap() = None;
         assert!(!da_has(&mempool, &x), "the marked delete landed");
         assert_eq!(mempool.da_gc_fence().deleting(), 0);
-        assert_eq!(mempool.native_da_missing(&[hx]), vec![hx], "the checker sees it missing");
+        assert_eq!(
+            mempool.native_da_missing(&[hx]),
+            vec![hx],
+            "the checker sees it missing"
+        );
         // Fetched again: pinned, it stays.
-        mempool.mirror_native_to_da(std::slice::from_ref(&x)).unwrap();
+        mempool
+            .mirror_native_to_da(std::slice::from_ref(&x))
+            .unwrap();
         da_gc_commit(&mut app, 6, vec![]);
         assert!(da_has(&mempool, &x));
         assert!(da_has(&mempool, &y), "pinned before its pass: kept");
@@ -48193,7 +50382,9 @@ mod crash_recovery_tests {
         da_gc_commit(&mut app, 1, vec![]);
         let x = sign_claim_rewards(1);
         let hx = torus_types::compute_action_hash(&x);
-        mempool.mirror_native_to_da(std::slice::from_ref(&x)).unwrap();
+        mempool
+            .mirror_native_to_da(std::slice::from_ref(&x))
+            .unwrap();
         let fence = mempool.da_gc_fence().clone();
         let speculate = |height: u64, compact: bool| {
             let datum = encode_proposal_datum(&high_block(height, vec![x.clone()]), compact);

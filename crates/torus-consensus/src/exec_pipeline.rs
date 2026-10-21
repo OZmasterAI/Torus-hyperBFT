@@ -226,7 +226,11 @@ pub fn effective_checkpoint_interval(
 /// True when the operator set `TORUS_CHECKPOINT_INTERVAL_MS` (not the role
 /// default).
 pub fn checkpoint_interval_explicit() -> bool {
-    checkpoint_interval_env_set(std::env::var("TORUS_CHECKPOINT_INTERVAL_MS").ok().as_deref())
+    checkpoint_interval_env_set(
+        std::env::var("TORUS_CHECKPOINT_INTERVAL_MS")
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// 8k L3.1 (`TORUS_BOOK_COALESCE`, node-local, requested by default since
@@ -984,7 +988,8 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
         let ckpt = matches!(job, Job::Checkpoint { .. });
         let digest = matches!(job, Job::Digest { .. });
         if let Some(m) = &env.metrics {
-            m.flush_worker_depth.set(*shared.outstanding.lock().unwrap() as i64);
+            m.flush_worker_depth
+                .set(*shared.outstanding.lock().unwrap() as i64);
         }
         let inject_fail = env.gate.as_ref().is_some_and(|g| g.wait_open(height, ckpt));
         let timer = std::time::Instant::now();
@@ -996,7 +1001,9 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
             // thread). Once it is, nothing more is written — not even a block
             // handed off before it; restart replays from the durable marker.
             if env.exec_failed.load(Ordering::SeqCst) {
-                return Err(JobError::Write("fail-stop latched — refusing to write".into()));
+                return Err(JobError::Write(
+                    "fail-stop latched — refusing to write".into(),
+                ));
             }
             run_job(&env, &shared, &mut window, &mut job)
         }));
@@ -1013,10 +1020,16 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
                 m.flush_worker_checkpoint_seconds.observe(wall);
             }
         }
-        if let (Ok(Ok(()) | Err(JobError::TrieStale(_))), Some(m), Job::Flush { order_nonces, .. }) =
-            (&result, &env.metrics, &job)
+        if let (
+            Ok(Ok(()) | Err(JobError::TrieStale(_))),
+            Some(m),
+            Job::Flush { order_nonces, .. },
+        ) = (&result, &env.metrics, &job)
         {
-            m.observe_order_ages(torus_telemetry::OrderStage::Durable, order_nonces.iter().copied());
+            m.observe_order_ages(
+                torus_telemetry::OrderStage::Durable,
+                order_nonces.iter().copied(),
+            );
         }
         // Item 7 option 0 step 0 (F11): the height is complete (batch AND
         // EVM mirror resync written); before W publishes it or receives its
@@ -1380,10 +1393,7 @@ fn run_job(
                 _ => rocksdb::WriteBatch::default(),
             };
             let flush_result = {
-                let mut trie_cache = env
-                    .trie_cache
-                    .lock()
-                    .expect("trie-cache mutex poisoned");
+                let mut trie_cache = env.trie_cache.lock().expect("trie-cache mutex poisoned");
                 let cache_opt = if torus_state::native_trie::native_root_cache_enabled() {
                     Some(&mut *trie_cache)
                 } else {
@@ -1687,7 +1697,11 @@ mod tests {
             Some(Duration::from_millis(1))
         );
         for bad in ["abc", "-5", "15s", "1.5"] {
-            assert_eq!(parse_checkpoint_interval(Some(bad.into()), None), None, "{bad:?}");
+            assert_eq!(
+                parse_checkpoint_interval(Some(bad.into()), None),
+                None,
+                "{bad:?}"
+            );
         }
         assert_eq!(parse_checkpoint_max_bytes(None), None);
         assert_eq!(parse_checkpoint_max_bytes(Some("0".into())), None);
@@ -1723,19 +1737,34 @@ mod tests {
     fn checkpoint_interval_role_default_is_15s_on_validators_off_on_rpc_only() {
         use std::time::Duration;
         assert_eq!(VALIDATOR_CHECKPOINT_INTERVAL, Duration::from_secs(15));
-        assert_eq!(role_checkpoint_interval(false), Some(Duration::from_secs(15)));
+        assert_eq!(
+            role_checkpoint_interval(false),
+            Some(Duration::from_secs(15))
+        );
         assert_eq!(role_checkpoint_interval(true), None);
         for rpc_only in [false, true] {
             let d = role_checkpoint_interval(rpc_only);
             assert_eq!(parse_checkpoint_interval(None, d), d, "{rpc_only}");
-            assert_eq!(parse_checkpoint_interval(Some(" ".into()), d), d, "{rpc_only}");
-            assert_eq!(parse_checkpoint_interval(Some("0".into()), d), None, "{rpc_only}");
+            assert_eq!(
+                parse_checkpoint_interval(Some(" ".into()), d),
+                d,
+                "{rpc_only}"
+            );
+            assert_eq!(
+                parse_checkpoint_interval(Some("0".into()), d),
+                None,
+                "{rpc_only}"
+            );
             assert_eq!(
                 parse_checkpoint_interval(Some("5000".into()), d),
                 Some(Duration::from_secs(5)),
                 "{rpc_only}"
             );
-            assert_eq!(parse_checkpoint_interval(Some("abc".into()), d), None, "{rpc_only}");
+            assert_eq!(
+                parse_checkpoint_interval(Some("abc".into()), d),
+                None,
+                "{rpc_only}"
+            );
         }
     }
 
@@ -1748,7 +1777,11 @@ mod tests {
         use torus_bridge::native_executor::BookMode;
         let d = role_checkpoint_interval(false);
         for mode in [BookMode::LevelAuthority, BookMode::LevelAuthorityChunked] {
-            assert_eq!(resolve_checkpoint_interval(None, d, mode), Ok(None), "{mode:?}");
+            assert_eq!(
+                resolve_checkpoint_interval(None, d, mode),
+                Ok(None),
+                "{mode:?}"
+            );
             assert_eq!(
                 resolve_checkpoint_interval(Some("".into()), d, mode),
                 Ok(None),
@@ -1769,7 +1802,11 @@ mod tests {
                 Ok(Some(Duration::from_secs(15))),
                 "{mode:?}"
             );
-            assert_eq!(resolve_checkpoint_interval(None, None, mode), Ok(None), "{mode:?}");
+            assert_eq!(
+                resolve_checkpoint_interval(None, None, mode),
+                Ok(None),
+                "{mode:?}"
+            );
             assert_eq!(
                 resolve_checkpoint_interval(Some("0".into()), d, mode),
                 Ok(None),
@@ -1873,7 +1910,10 @@ mod tests {
         // time to complete if it wrongly could. A slow scheduler can only make
         // this check pass, never fail it spuriously.
         std::thread::sleep(std::time::Duration::from_millis(100));
-        assert!(!sender.is_finished(), "submit(2) must block while W holds job 1");
+        assert!(
+            !sender.is_finished(),
+            "submit(2) must block while W holds job 1"
+        );
         assert_eq!(gate.received(), vec![1], "W must not have received 2 yet");
         assert_eq!(worker.outstanding(), 2);
         assert_eq!(worker.durable_height(), 0);
@@ -1912,7 +1952,10 @@ mod tests {
             .unwrap();
         assert!(!worker.wait_idle(), "wait_idle must report the failure");
         assert!(worker.failed());
-        assert!(exec_failed.load(Ordering::SeqCst), "shared fail-stop latched");
+        assert!(
+            exec_failed.load(Ordering::SeqCst),
+            "shared fail-stop latched"
+        );
         assert!(
             worker
                 .submit(Job::Marker {
@@ -1950,7 +1993,10 @@ mod tests {
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !gate.latch_parked() {
-            assert!(std::time::Instant::now() < deadline, "W never reached the latch seam");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "W never reached the latch seam"
+            );
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         // W is between its two stores.

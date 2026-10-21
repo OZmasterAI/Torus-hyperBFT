@@ -54,7 +54,10 @@ type ListFailure = (usize, u32, u32, Outcome, FailureReason, String);
 /// placement margin / reduce-only / tick / price-band checks); anything else
 /// that did not execute `Failed`.
 fn outcome(action: &NativeAction, reason: FailureReason) -> Outcome {
-    let placement = matches!(action, NativeAction::PlaceOrder(_) | NativeAction::PlaceOrderBatch(_));
+    let placement = matches!(
+        action,
+        NativeAction::PlaceOrder(_) | NativeAction::PlaceOrderBatch(_)
+    );
     if placement && reason.hl_rejected_name().is_some() {
         Outcome::Rejected
     } else {
@@ -428,13 +431,30 @@ mod tests {
         let a = Address::repeat_byte(1);
         let list = vec![
             (a, NativeAction::PlaceOrder(order(1))),
-            (a, NativeAction::PlaceOrderBatch(vec![order(1), order(2), order(3), order(4)])),
-            (a, NativeAction::ModifyOrder { order_id: 1, new_price: None, new_qty: None }),
+            (
+                a,
+                NativeAction::PlaceOrderBatch(vec![order(1), order(2), order(3), order(4)]),
+            ),
+            (
+                a,
+                NativeAction::ModifyOrder {
+                    order_id: 1,
+                    new_price: None,
+                    new_qty: None,
+                },
+            ),
             (a, NativeAction::PlaceOrder(order(2))),
             (a, NativeAction::PlaceOrderBatch(vec![order(1), order(2)])),
             (a, NativeAction::PlaceOrder(order(3))),
             (a, NativeAction::PlaceOrderBatch(vec![order(1), order(2)])),
-            (a, NativeAction::ModifyOrder { order_id: 2, new_price: None, new_qty: None }),
+            (
+                a,
+                NativeAction::ModifyOrder {
+                    order_id: 2,
+                    new_price: None,
+                    new_qty: None,
+                },
+            ),
         ];
         let result = batch(vec![
             err(FailureReason::IocCancel, "ioc"),
@@ -451,29 +471,64 @@ mod tests {
             err(FailureReason::PriceBand, "band"),
             err(FailureReason::Tick, "modify tick"),
         ]);
-        let failures =
-            native_failures(&[0, 1, 2, 3, 4, 5, 6, 7], [(&list, &[0, 1, 2, 3, 4, 5, 6, 7], &mut result.clone()), (&[], &[], &mut batch(vec![]))]);
+        let failures = native_failures(
+            &[0, 1, 2, 3, 4, 5, 6, 7],
+            [
+                (&list, &[0, 1, 2, 3, 4, 5, 6, 7], &mut result.clone()),
+                (&[], &[], &mut batch(vec![])),
+            ],
+        );
         let got: Vec<_> = failures
             .iter()
-            .map(|f| (f.index, f.order, f.failed_orders, f.outcome, f.reason, f.message.as_str()))
+            .map(|f| {
+                (
+                    f.index,
+                    f.order,
+                    f.failed_orders,
+                    f.outcome,
+                    f.reason,
+                    f.message.as_str(),
+                )
+            })
             .collect();
         assert_eq!(
             got,
             vec![
                 (0, 0, 1, Outcome::Rejected, FailureReason::IocCancel, "ioc"),
                 (1, 1, 2, Outcome::Rejected, FailureReason::BadAloPx, "alo"),
-                (2, 0, 1, Outcome::Failed, FailureReason::Margin, "modify margin"),
-                (3, 0, 1, Outcome::Rejected, FailureReason::Margin, "insufficient margin"),
+                (
+                    2,
+                    0,
+                    1,
+                    Outcome::Failed,
+                    FailureReason::Margin,
+                    "modify margin"
+                ),
+                (
+                    3,
+                    0,
+                    1,
+                    Outcome::Rejected,
+                    FailureReason::Margin,
+                    "insufficient margin"
+                ),
                 (4, 0, 2, Outcome::Failed, FailureReason::Lot, "lot"),
                 (5, 0, 1, Outcome::Rejected, FailureReason::Tick, "tick"),
                 (6, 1, 1, Outcome::Rejected, FailureReason::PriceBand, "band"),
                 (7, 0, 1, Outcome::Failed, FailureReason::Tick, "modify tick"),
             ]
         );
-        assert!(failures.iter().all(|f| f.orders.is_empty()), "per-order statuses not written yet");
+        assert!(
+            failures.iter().all(|f| f.orders.is_empty()),
+            "per-order statuses not written yet"
+        );
         assert_eq!(
             failures,
-            native_failures_by_content(&list, &[0, 1, 2, 3, 4, 5, 6, 7], [(&list, result), (&[], batch(vec![]))])
+            native_failures_by_content(
+                &list,
+                &[0, 1, 2, 3, 4, 5, 6, 7],
+                [(&list, result), (&[], batch(vec![]))]
+            )
         );
     }
 
@@ -564,12 +619,18 @@ mod tests {
             native_failed,
         };
         let failed = NativeActionFailure::new(0, 0, 1, FailureReason::OpenLimit, "limit".into());
-        let counts = |m: &torus_telemetry::Metrics| (m.exec_action_failures.get(), m.exec_action_rejections.get());
+        let counts = |m: &torus_telemetry::Metrics| {
+            (m.exec_action_failures.get(), m.exec_action_rejections.get())
+        };
 
         let one_failed = encode_status(&status(vec![failed.clone()]), Some(&m));
         assert_eq!(counts(&m), (1, 0), "a failed action bumps failures only");
         let one_rejected = encode_status(&status(vec![rejected(1)]), Some(&m));
-        assert_eq!(counts(&m), (1, 1), "a rejected action bumps rejections only");
+        assert_eq!(
+            counts(&m),
+            (1, 1),
+            "a rejected action bumps rejections only"
+        );
         let mixed = encode_status(&status(vec![failed, rejected(2), rejected(3)]), Some(&m));
         assert_eq!(counts(&m), (2, 3));
         assert_eq!(
@@ -577,8 +638,14 @@ mod tests {
             (one_failed.len() + one_rejected.len() + mixed.len()) as u64
         );
         let text = m.encode();
-        assert!(text.contains("torus_exec_action_failures_total 2\n"), "{text}");
-        assert!(text.contains("torus_exec_action_rejections_total 3\n"), "{text}");
+        assert!(
+            text.contains("torus_exec_action_failures_total 2\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("torus_exec_action_rejections_total 3\n"),
+            "{text}"
+        );
     }
 
     /// s112 (v4): each drained row becomes one result in queue order: an
@@ -913,7 +980,10 @@ mod tests {
             let t = std::time::Instant::now();
             let ((pre, pre_i), (post, post_i)) = sort_native_actions_indexed(owned);
             let t_map = std::time::Instant::now();
-            let new = native_failures(&body_index, [(&pre, &pre_i, &mut a), (&post, &post_i, &mut b)]);
+            let new = native_failures(
+                &body_index,
+                [(&pre, &pre_i, &mut a), (&post, &post_i, &mut b)],
+            );
             new_map_ms.push(t_map.elapsed().as_secs_f64() * 1e3);
             new_ms.push(t.elapsed().as_secs_f64() * 1e3);
             // Item 6 cut 5: the node drops the results on the end_resident

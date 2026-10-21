@@ -349,14 +349,9 @@ impl DaGcRunner {
     /// handed off while the queue was full; nothing followed it).
     fn run_from_tree(&self, height: u64, shard_count: u16) -> DaGcOutcome {
         match crate::da_gc::committed_native_actions_in_tree(&self.gc.block_tree_db, height) {
-            Ok(Some((hashes, actions))) => self.run(
-                height,
-                actions.as_deref(),
-                &hashes,
-                true,
-                shard_count,
-                true,
-            ),
+            Ok(Some((hashes, actions))) => {
+                self.run(height, actions.as_deref(), &hashes, true, shard_count, true)
+            }
             other => {
                 tracing::warn!(
                     height,

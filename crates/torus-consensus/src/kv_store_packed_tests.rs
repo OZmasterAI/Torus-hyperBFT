@@ -201,7 +201,10 @@ fn vote_state_writes_are_timed_and_other_writes_are_not() {
         .contains("torus_vote_state_write_seconds_count 0"));
 
     store.write(pack(&[
-        LegacyOp::Set(HIGHEST_VIEW_PHASE_VOTED.to_vec(), 7u64.to_le_bytes().to_vec()),
+        LegacyOp::Set(
+            HIGHEST_VIEW_PHASE_VOTED.to_vec(),
+            7u64.to_le_bytes().to_vec(),
+        ),
         LegacyOp::Set(b"last-voted".to_vec(), b"x".to_vec()),
     ]));
     assert!(metrics

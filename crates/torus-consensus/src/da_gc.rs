@@ -353,7 +353,10 @@ pub fn read_tree_committed_tip_block(
             "block tree: the highest committed block has no height".into(),
         ));
     };
-    Ok(Some((hash, torus_height_of(height.int()).unwrap_or(u64::MAX))))
+    Ok(Some((
+        hash,
+        torus_height_of(height.int()).unwrap_or(u64::MAX),
+    )))
 }
 
 /// RH4 DA body GC settings of a node ([`crate::app::TorusApp::set_da_body_gc`]).
@@ -932,7 +935,8 @@ mod tests {
             };
             let mut data_hash = [0u8; 32];
             data_hash[..8].copy_from_slice(&h.to_be_bytes());
-            let datum = hotstuff_rs::types::data_types::Datum::new(vec![h as u8; 32 * hashes + 200]);
+            let datum =
+                hotstuff_rs::types::data_types::Datum::new(vec![h as u8; 32 * hashes + 200]);
             let block = Block::new(
                 BlockHeight::new(h),
                 justify,
@@ -954,7 +958,10 @@ mod tests {
                 pruning.push(took);
             }
         }
-        for (name, xs) in [("inside the window", &mut inside), ("pruning 1/commit", &mut pruning)] {
+        for (name, xs) in [
+            ("inside the window", &mut inside),
+            ("pruning 1/commit", &mut pruning),
+        ] {
             xs.sort();
             let us = |d: Duration| d.as_secs_f64() * 1e6;
             let mean = xs.iter().map(|d| us(*d)).sum::<f64>() / xs.len() as f64;
