@@ -622,7 +622,8 @@ fn rows_naming_another_key_are_refused_on_load() {
                 .unwrap_err(),
         );
         assert!(cache.is_empty(), "{label}: nothing cached");
-        assert_eq!(pm.get_position(&addr(t), 7).unwrap(), Some(row(addr(t), 7)), "{label}");
+        let plain = pm.get_position(&addr(t), 7).unwrap().expect("the plain row");
+        assert_eq!((plain.trader, plain.market_id, plain.size), (addr(t), 7, fp(5)), "{label}");
         cache.flush_all(&pm).unwrap();
         assert_eq!(dump_cf(&pm, CF_NATIVE_POSITIONS), before, "{label}: nothing written");
     }
