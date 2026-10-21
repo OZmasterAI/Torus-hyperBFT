@@ -1044,17 +1044,26 @@ mod tests {
     /// A node double: `validators()` lists the signer once a SetOracleSigner
     /// with a valid validator signature and proof arrived; the first
     /// `drop_first` submissions are dropped (e.g. a nonce collision).
+    #[derive(Default)]
+    struct RegState {
+        /// (validator, registered signer)
+        rows: Vec<(Address, Option<Address>)>,
+        drop_first: usize,
+        submits: usize,
+    }
+
     #[derive(Clone, Default)]
     struct RegNode {
-        inner: std::sync::Arc<std::sync::Mutex<(Vec<(Address, Option<Address>)>, usize, usize)>>,
+        inner: std::sync::Arc<std::sync::Mutex<RegState>>,
     }
 
     impl RegNode {
         fn new(validator: Address, signer: Option<Address>, drop_first: usize) -> Self {
-            Self { inner: std::sync::Arc::new(std::sync::Mutex::new((vec![(validator, signer)], drop_first, 0))) }
+            let st = RegState { rows: vec![(validator, signer)], drop_first, submits: 0 };
+            Self { inner: std::sync::Arc::new(std::sync::Mutex::new(st)) }
         }
         fn submits(&self) -> usize {
-            self.inner.lock().unwrap().2
+            self.inner.lock().unwrap().submits
         }
     }
 
@@ -1064,7 +1073,7 @@ mod tests {
         }
         async fn validators(&self) -> Result<Vec<torus_price_feeder::node::ValidatorInfo>, String> {
             let g = self.inner.lock().unwrap();
-            Ok(g.0
+            Ok(g.rows
                 .iter()
                 .map(|(a, s)| torus_price_feeder::node::ValidatorInfo {
                     address: *a,
@@ -1075,9 +1084,9 @@ mod tests {
         }
         async fn submit(&self, signed: &SignedNativeAction) -> Result<String, String> {
             let mut g = self.inner.lock().unwrap();
-            g.2 += 1;
-            if g.1 > 0 {
-                g.1 -= 1;
+            g.submits += 1;
+            if g.drop_first > 0 {
+                g.drop_first -= 1;
                 return Ok("0xdropped".into());
             }
             let sender = signed.validate(signed.nonce, TORUS_CHAIN_ID).map_err(|e| e.to_string())?;
@@ -1088,7 +1097,7 @@ mod tests {
             if proven != *signer {
                 return Err("bad proof".into());
             }
-            let row = g.0.iter_mut().find(|(a, _)| *a == sender).ok_or("not a validator")?;
+            let row = g.rows.iter_mut().find(|(a, _)| *a == sender).ok_or("not a validator")?;
             row.1 = Some(*signer);
             Ok("0xok".into())
         }
