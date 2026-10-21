@@ -63,6 +63,12 @@ fn crossing_buys() -> Vec<(Address, NativeAction)> {
 fn bench_trades(c: &mut Criterion, name: &str, defer: bool) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = StateDb::open(dir.path()).expect("open db");
+    // Pre-testnet P0 (main d78ea41b): orders on an unlisted market are
+    // rejected (`UnknownMarket`), so list the bench market(s) first.
+    for m in [MARKET] {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed")
+            .unwrap();
+    }
 
     // Fund senders once, directly in RocksDB (overlay writes are never
     // flushed, so the DB stays clean across iterations).
@@ -99,7 +105,9 @@ fn bench_trades(c: &mut Criterion, name: &str, defer: bool) {
                     sender(1),
                     sender(2),
                 );
-                NativeExecutor::execute_batch(&mut ctx, &sells);
+                let seeded = NativeExecutor::execute_batch(&mut ctx, &sells);
+                assert!(seeded.results.iter().all(|r| r.success), "seed rejected");
+                assert!(ctx.resting_order_count() > 0, "empty book");
                 ctx.defer_trades = defer;
                 ctx
             },

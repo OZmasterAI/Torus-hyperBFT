@@ -32,7 +32,27 @@ const N_MARKETS: u64 = 10;
 fn open_db() -> (tempfile::TempDir, StateDb) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = StateDb::open(dir.path()).expect("open db");
+    // Pre-testnet P0 (main d78ea41b): orders on an unlisted market are
+    // rejected (`UnknownMarket`), so list every market first.
+    for m in 1..=N_MARKETS {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed")
+            .unwrap();
+    }
     (dir, db)
+}
+
+/// `execute_batch` that fails loudly on any rejected action (an empty book
+/// would time nothing). Returns the block's fill count.
+fn exec(ctx: &mut NativeExecContext<NativeStateOverlay>, batch: &[(Address, NativeAction)]) -> u32 {
+    let before = ctx.trade_index;
+    let r = NativeExecutor::execute_batch(ctx, batch);
+    assert!(
+        r.results.iter().all(|r| r.success),
+        "action rejected: {:?}",
+        r.results.iter().find(|r| !r.success)
+    );
+    assert_eq!(ctx.take_fatal_error(), None);
+    ctx.trade_index - before
 }
 
 fn addr(n: u8) -> Address {
@@ -144,7 +164,8 @@ fn savebooks_cell_shape() {
             fund(&ctx, &addr(1), fp(5_000_000_000));
             fund(&ctx, &addr(2), fp(5_000_000_000));
         }
-        let _ = NativeExecutor::execute_batch(&mut ctx, &cell_batch(h));
+        let fills = exec(&mut ctx, &cell_batch(h));
+        assert!(fills > 0, "cell block {h} filled nothing");
         let take = sample.contains(&h);
         ctx.collect_save_timings = take;
         let t = Instant::now();
@@ -187,7 +208,7 @@ fn savebooks_deep_book_accumulate() {
                 batch.push(place(addr(1), gtc(m, true, 300 + lvl, 1)));
             }
         }
-        let _ = NativeExecutor::execute_batch(&mut ctx, &batch);
+        exec(&mut ctx, &batch);
         let take = sample.contains(&h);
         ctx.collect_save_timings = take;
         let t = Instant::now();
@@ -240,8 +261,9 @@ fn savebooks_depth_sweep() {
                 }
             }
         }
-        let _ = NativeExecutor::execute_batch(&mut ctx, &seed);
+        exec(&mut ctx, &seed);
         let resting = ctx.resting_order_count();
+        assert_eq!(resting, N_MARKETS as usize * LEVELS as usize * depth, "seed depth");
         ctx.save_order_books();
         ctx.stash_resident(&mut holder);
         ov.flush(&db).unwrap();
@@ -255,7 +277,7 @@ fn savebooks_depth_sweep() {
                 touch.push(place(addr(255), gtc(m, true, 300 + lvl, 1)));
             }
         }
-        let _ = NativeExecutor::execute_batch(&mut ctx, &touch);
+        exec(&mut ctx, &touch);
         ctx.collect_save_timings = true;
         let t = Instant::now();
         ctx.save_order_books();
@@ -316,7 +338,7 @@ fn savebooks_levelcache_ab() {
                 }
             }
         }
-        let _ = NativeExecutor::execute_batch(&mut ctx, &seed);
+        exec(&mut ctx, &seed);
         ctx.save_order_books();
         ctx.stash_resident(&mut holder);
         ov.flush(&db).unwrap();
@@ -356,7 +378,7 @@ fn savebooks_levelcache_ab() {
                     }
                 }
             }
-            let _ = NativeExecutor::execute_batch(&mut ctx, &batch);
+            exec(&mut ctx, &batch);
             ctx.collect_save_timings = true;
             let t = Instant::now();
             ctx.save_order_books();
@@ -430,7 +452,8 @@ fn savebooks_read_probe() {
             fund(&ctx, &addr(1), fp(5_000_000_000));
             fund(&ctx, &addr(2), fp(5_000_000_000));
         }
-        let _ = NativeExecutor::execute_batch(&mut ctx, &cell_batch(h));
+        let fills = exec(&mut ctx, &cell_batch(h));
+        assert!(fills > 0, "cell block {h} filled nothing");
         let take = cps.contains(&h);
         ctx.collect_save_timings = take;
         let t = Instant::now();
@@ -469,7 +492,7 @@ fn level_hash_cache_stats_aggregates_across_books() {
                 batch.push(place(addr(1), gtc(m, true, 100 + lvl, 5)));
             }
         }
-        let _ = NativeExecutor::execute_batch(&mut ctx, &batch);
+        exec(&mut ctx, &batch);
         ctx.save_order_books();
         assert!(
             ctx.level_hash_cache_stats().is_none(),
@@ -493,7 +516,7 @@ fn level_hash_cache_stats_aggregates_across_books() {
                 batch.push(place(addr(1), gtc(m, true, 100 + lvl, 5)));
             }
         }
-        let _ = NativeExecutor::execute_batch(&mut ctx, &batch);
+        exec(&mut ctx, &batch);
         ctx.save_order_books();
 
         // Manual fold: what the exported gauges should read.
