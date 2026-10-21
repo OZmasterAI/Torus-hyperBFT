@@ -1541,6 +1541,9 @@ struct ExecutionContext {
     header_hook: HeaderHookSlot,
     /// Running state hash: attestation submitter (shared with `TorusApp`).
     state_hash: Arc<crate::state_hash::StateHashMonitor>,
+    /// P0.0 phase 6: the feature-schedule gauges (applied header bits, next
+    /// activation, blocks until it).
+    features: crate::feature_status::FeatureMonitor,
     /// L3 flush-pipe (b): background writer for the exec-time block-body persist
     /// (CF_BLOCK_BODIES), gated by `TORUS_ASYNC_POST_FLUSH`. `Some` moves the
     /// (already-durable-at-dispatch) exec-time body rewrite off the exec critical
@@ -4586,6 +4589,13 @@ impl ExecutionContext {
             self.known_features,
             &self.exec_failed,
         ) {
+            crate::feature_status::report_upgrade_required(
+                self.metrics.as_deref(),
+                "execute",
+                torus_block.header.features,
+                self.known_features,
+                height,
+            );
             return;
         }
         // P0.0 phase 3: the running state hash follows the header's bit (before
@@ -6753,6 +6763,8 @@ impl ExecutionContext {
             self.metrics.as_deref(),
             &self.exec_failed,
         );
+        // P0.0 phase 6: the feature gauges follow the applied header.
+        self.features.after_block(&torus_block.header);
 
         *self.last_block_end.lock().unwrap() = Some(std::time::Instant::now());
         tracing::info!(height, "execution pipeline: block done");
@@ -8009,6 +8021,11 @@ impl TorusApp {
             fill_sink: fill_sink.clone(),
             header_hook: header_hook.clone(),
             state_hash: state_hash.clone(),
+            features: crate::feature_status::FeatureMonitor::new(
+                metrics.as_deref(),
+                &config.activations,
+                options.known_features,
+            ),
             trade_writer: Some(torus_state::BackgroundCfWriter::spawn(
                 state_db.clone(),
                 "torus-trade-writer",
@@ -8141,6 +8158,8 @@ impl TorusApp {
         // keeps running and voting, reports it (ERROR + gauge) and never
         // attests until the chain is valid again.
         state_hash.report_at_boot(&state_db, metrics.as_deref());
+        // P0.0 phase 6: the feature gauges from the last applied header.
+        exec_ctx.features.after_block(&last_header);
 
         // The proposer identity, resolved from the replayed state before the
         // execution thread starts.
@@ -10041,10 +10060,17 @@ impl TorusApp {
             |h| self.boundary_evm(h),
         );
         if link != BlockDataCheck::Held {
-            #[cfg(test)]
             if torus_types::features::first_unknown_feature_in(header.features, self.known_features)
                 .is_some()
             {
+                crate::feature_status::report_upgrade_required(
+                    self.metrics.as_deref(),
+                    "vote",
+                    header.features,
+                    self.known_features,
+                    header.height,
+                );
+                #[cfg(test)]
                 self.test_upgrade_refusals.lock().unwrap().push(("vote", header.height));
             }
             return link;
@@ -10110,6 +10136,13 @@ impl TorusApp {
                 feature = id,
                 "UPGRADE REQUIRED: feature {id} at {} -- refusing to propose on it",
                 parent_header.height
+            );
+            crate::feature_status::report_upgrade_required(
+                self.metrics.as_deref(),
+                "propose",
+                parent_header.features,
+                self.known_features,
+                parent_header.height,
             );
             #[cfg(test)]
             self.test_upgrade_refusals
@@ -10409,6 +10442,19 @@ impl App<RocksKVStore> for TorusApp {
         if let Some(response) =
             insertion_link_response_for_datum(link, datums[0].bytes(), &block.data_hash)
         {
+            // P0.0 phase 6: only a datum bound to its block is an upgrade
+            // (tampered data with an unknown bit is `Invalid`).
+            if matches!(response, ValidateBlockResponse::UnsupportedUpgrade) {
+                if let Some(header) = datum_header(datums[0].bytes()) {
+                    crate::feature_status::report_upgrade_required(
+                        self.metrics.as_deref(),
+                        "insert",
+                        header.features,
+                        self.known_features,
+                        header.height,
+                    );
+                }
+            }
             return response;
         }
 
@@ -17339,6 +17385,7 @@ mod crash_recovery_tests {
             fill_sink: Default::default(),
             header_hook: Default::default(),
             state_hash: Default::default(),
+            features: Default::default(),
             // None -> exec-time body write is synchronous (exact-today). Tests that
             // exercise the async stage build their own writer explicitly.
             post_flush_writer: None,
@@ -26067,6 +26114,123 @@ mod crash_recovery_tests {
         assert!(
             !old.pending_proposals.contains_key(&6),
             "nothing built on it"
+        );
+    }
+
+    /// P0.0 phase 6: a node's feature gauges at boot (the schedule, the bits
+    /// of the last applied header, the next activation) and after each applied
+    /// block, and `UPGRADE REQUIRED` from the vote and proposal sites and from
+    /// execution. RED before phase 6: nothing reported.
+    #[test]
+    fn feature_gauges_at_boot_after_each_block_and_on_upgrade_required() {
+        let rsh = torus_types::Feature::RunningStateHash;
+        let series =
+            |m: &torus_telemetry::Metrics, name: &str| -> f64 { metric_value(&m.encode(), name) };
+        let active = format!(
+            "torus_feature_active{{feature=\"{}\",id=\"0\"}}",
+            rsh.name()
+        );
+        let at = format!(
+            "torus_feature_activation_height{{feature=\"{}\",id=\"0\"}}",
+            rsh.name()
+        );
+        // Boot (fresh data dir: the genesis parent header at 0).
+        let (mut config, db) = make_test_config_and_db();
+        config.activations = rsh_at(6);
+        let m = Arc::new(torus_telemetry::Metrics::new());
+        let app = TorusApp::new(db, &config, Some(m.clone()), None, None);
+        assert_eq!(series(&m, &at), 6.0);
+        assert_eq!(series(&m, &active), 0.0);
+        assert_eq!(series(&m, "torus_feature_next_activation_height"), 6.0);
+        assert_eq!(series(&m, "torus_feature_blocks_until_activation"), 6.0);
+        assert_eq!(series(&m, "torus_upgrade_required"), 0.0);
+        drop(app);
+
+        // Execution: the gauges follow each applied header.
+        let (mut config, db) = make_test_config_and_db();
+        config.activations = rsh_at(3);
+        let m = Arc::new(torus_telemetry::Metrics::new());
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.metrics = Some(m.clone());
+        ctx.features = crate::feature_status::FeatureMonitor::new(
+            Some(&m),
+            &config.activations,
+            torus_types::KNOWN_FEATURES,
+        );
+        let mut blocks = vec![
+            with_features(make_block(1, vec![]), 0),
+            with_features(make_block(2, vec![]), 0),
+            with_features(make_block(3, vec![]), rsh.bit()),
+            with_features(make_block(4, vec![]), rsh.bit() | UNKNOWN_BIT),
+        ];
+        link_from_genesis(&config, &mut blocks);
+        let want = [(1, 0.0, 3.0, 2.0), (2, 0.0, 3.0, 1.0), (3, 1.0, 0.0, -1.0)];
+        for (b, (height, on, next, until)) in blocks.iter().zip(want) {
+            ctx.execute_committed_block(b, vec![]);
+            assert_eq!(read_native_applied_height(&db), Some(height));
+            assert_eq!(series(&m, &active), on, "{height}");
+            assert_eq!(
+                series(&m, "torus_feature_next_activation_height"),
+                next,
+                "{height}"
+            );
+            assert_eq!(
+                series(&m, "torus_feature_blocks_until_activation"),
+                until,
+                "{height}"
+            );
+        }
+        assert_eq!(series(&m, "torus_upgrade_required"), 0.0);
+        ctx.execute_committed_block(&blocks[3], vec![]);
+        assert!(ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(series(&m, "torus_upgrade_required"), 1.0);
+        assert_eq!(
+            series(&m, "torus_upgrade_required_feature"),
+            f64::from(UNKNOWN_BIT.trailing_zeros())
+        );
+        assert_eq!(series(&m, "torus_upgrade_required_height"), 4.0);
+        assert_eq!(
+            series(
+                &m,
+                "torus_upgrade_required_refusals_total{site=\"execute\"}"
+            ),
+            1.0
+        );
+        drop(ctx);
+
+        // Vote and proposal refusals.
+        let parent = with_features(tip_2000(), 0); // height 4, no bits
+        let mut old = gated_app(2_010, torus_types::ActivationSchedule::default());
+        let m = Arc::new(torus_telemetry::Metrics::new());
+        old.metrics = Some(m.clone());
+        let newer = with_features(child_of(&parent, 2_000), UNKNOWN_BIT);
+        assert_eq!(
+            pre_vote(&mut old, &parent, &child_of(&parent, 2_000)),
+            BlockDataCheck::Held
+        );
+        assert_eq!(
+            series(&m, "torus_upgrade_required"),
+            0.0,
+            "control: no bits"
+        );
+        assert_eq!(pre_vote(&mut old, &parent, &newer), BlockDataCheck::Invalid);
+        assert_eq!(series(&m, "torus_upgrade_required"), 1.0);
+        assert_eq!(series(&m, "torus_upgrade_required_height"), 5.0);
+        assert_eq!(
+            series(&m, "torus_upgrade_required_refusals_total{site=\"vote\"}"),
+            1.0
+        );
+        assert!(old
+            .build_proposal(newer.header.clone())
+            .data
+            .vec()
+            .is_empty());
+        assert_eq!(
+            series(
+                &m,
+                "torus_upgrade_required_refusals_total{site=\"propose\"}"
+            ),
+            1.0
         );
     }
 

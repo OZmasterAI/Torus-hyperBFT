@@ -132,6 +132,8 @@ struct Node {
     state: Option<StateDb>,
     refusals: Arc<std::sync::Mutex<Vec<(&'static str, u64)>>>,
     exec_failed: Arc<AtomicBool>,
+    /// P0.0 phase 6: this run's metrics (new at every start, as a process).
+    metrics: Arc<torus_telemetry::Metrics>,
     /// Every flushed height's running-hash write set, across restarts.
     writes: BTreeMap<u64, Vec<WriteEntry>>,
     /// `read_running_hash` when the node last stopped.
@@ -170,6 +172,7 @@ impl Cluster {
                 state: None,
                 refusals: Default::default(),
                 exec_failed: Default::default(),
+                metrics: Arc::new(torus_telemetry::Metrics::new()),
                 writes: BTreeMap::new(),
                 stored_hash: None,
             })
@@ -210,11 +213,12 @@ impl Cluster {
             known_features: binary.known,
             exec_hold: binary.hold.clone(),
         };
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
         let app = TorusApp::try_new_with_options(
             state.clone(),
             consensus,
             &chain_config(binary.schedule.clone()),
-            None,
+            Some(metrics.clone()),
             None,
             Some(self.keys[i].clone()),
             options,
@@ -225,6 +229,7 @@ impl Cluster {
         let node = &mut self.nodes[i];
         node.refusals = app.test_upgrade_refusals.clone();
         node.exec_failed = app.exec_failed_handle();
+        node.metrics = metrics;
         let config = Configuration::builder()
             .me(self.keys[i].clone())
             .chain_id(ChainID::new(TORUS_CHAIN_ID))
@@ -451,6 +456,28 @@ impl Cluster {
     fn refusals(&self, i: usize) -> Vec<(&'static str, u64)> {
         self.nodes[i].refusals.lock().unwrap().clone()
     }
+
+    /// P0.0 phase 6: node `i`'s value of the series `series` (the exposition
+    /// line's name and labels), `None` when absent.
+    fn gauge(&self, i: usize, series: &str) -> Option<i64> {
+        self.nodes[i].metrics.encode().lines().find_map(|l| {
+            l.strip_prefix(series)
+                .and_then(|rest| rest.strip_prefix(' '))
+                .map(|v| v.parse().unwrap())
+        })
+    }
+
+    /// P0.0 phase 6: node `i`'s `torus_feature_active` for `f`.
+    fn feature_active(&self, i: usize, f: Feature) -> Option<i64> {
+        self.gauge(
+            i,
+            &format!(
+                "torus_feature_active{{feature=\"{}\",id=\"{}\"}}",
+                f.name(),
+                f.id()
+            ),
+        )
+    }
 }
 
 impl Drop for Cluster {
@@ -537,11 +564,54 @@ fn p00_mixed_binaries_three_of_four_go_on_and_the_old_node_halts_below_h() {
         assert!(matches!(site, "vote" | "insert" | "propose"), "{site}");
         assert!(height >= H, "refused {height} < H ({site})");
     }
+    // P0.0 phase 6: the old node's gauges show UPGRADE REQUIRED for the test
+    // feature at H; it does not know the feature (no series for it) and has
+    // nothing scheduled.
+    let rule = Feature::TestStateRule;
+    assert_eq!(
+        c.gauge(3, "torus_upgrade_required"),
+        Some(1),
+        "{}",
+        c.status()
+    );
+    assert_eq!(
+        c.gauge(3, "torus_upgrade_required_feature"),
+        Some(i64::from(rule.id()))
+    );
+    assert_eq!(c.gauge(3, "torus_upgrade_required_height"), Some(H as i64));
+    assert_eq!(
+        c.feature_active(3, rule),
+        None,
+        "an old binary has no series for it"
+    );
+    assert_eq!(
+        c.gauge(3, "torus_feature_blocks_until_activation"),
+        Some(-1)
+    );
     for i in NEW {
         assert!(c.refusals(i).is_empty(), "node {i}: {:?}", c.refusals(i));
         assert!(
             !c.nodes[i].exec_failed.load(Ordering::SeqCst),
             "node {i} failed"
+        );
+        // Upgraded nodes: the feature on from H, nothing left to activate.
+        assert_eq!(c.gauge(i, "torus_upgrade_required"), Some(0), "node {i}");
+        assert_eq!(c.feature_active(i, rule), Some(1), "node {i}");
+        let height = format!(
+            "torus_feature_activation_height{{feature=\"{}\",id=\"{}\"}}",
+            rule.name(),
+            rule.id()
+        );
+        assert_eq!(c.gauge(i, &height), Some(H as i64), "node {i}");
+        assert_eq!(
+            c.gauge(i, "torus_feature_next_activation_height"),
+            Some(0),
+            "node {i}"
+        );
+        assert_eq!(
+            c.gauge(i, "torus_feature_blocks_until_activation"),
+            Some(-1),
+            "node {i}"
         );
     }
     let top = c.min_applied(&NEW);
@@ -680,6 +750,17 @@ fn p00_crash_then_old_binary_replay_fail_stops_before_h() {
         "the replay fail-stopped"
     );
     assert_eq!(c.applied(3), H - 1, "replayed below H only");
+    // P0.0 phase 6: the boot replay's fail-stop shows in the gauges.
+    assert_eq!(c.gauge(3, "torus_upgrade_required"), Some(1));
+    assert_eq!(
+        c.gauge(3, "torus_upgrade_required_feature"),
+        Some(i64::from(Feature::TestStateRule.id()))
+    );
+    assert_eq!(c.gauge(3, "torus_upgrade_required_height"), Some(H as i64));
+    assert_eq!(
+        c.gauge(3, "torus_upgrade_required_refusals_total{site=\"execute\"}"),
+        Some(1)
+    );
     let others = [0, 1, 2];
     c.wait_applied(&others, H + 4);
     assert_eq!(c.applied(3), H - 1, "the old node does not execute on");

@@ -168,6 +168,15 @@ impl ActivationSchedule {
         self.heights.get(&feature).copied()
     }
 
+    /// The next height above `height` at which this schedule switches a
+    /// feature on (`None`: nothing is scheduled above it). Same reading as
+    /// [`Self::active_at`]: heights 0 and 1 are block 1, so a feature at 0 or
+    /// 1 is already on at height 0.
+    pub fn next_activation_after(&self, height: u64) -> Option<u64> {
+        let _ = height;
+        None
+    }
+
     /// Every scheduled feature and its height, in id order.
     pub fn iter(&self) -> impl Iterator<Item = (Feature, u64)> + '_ {
         self.heights.iter().map(|(f, h)| (*f, *h))
@@ -239,6 +248,22 @@ mod tests {
             ActivationSchedule::merge(&BTreeMap::new(), &[(Feature::RunningStateHash, 7)]).unwrap();
         assert_eq!(only.active_at(7), 1);
         assert_eq!(only.active_at(6), 0);
+    }
+
+    /// P0.0 phase 6 (ops gauges / RPC): the next activation above a height.
+    /// RED before phase 6: always `None`.
+    #[test]
+    fn next_activation_is_the_lowest_scheduled_height_above_the_given_one() {
+        let s = schedule(&[(Feature::RunningStateHash, 10)]);
+        assert_eq!(s.next_activation_after(0), Some(10));
+        assert_eq!(s.next_activation_after(9), Some(10));
+        assert_eq!(s.next_activation_after(10), None, "on at 10");
+        assert_eq!(s.next_activation_after(u64::MAX), None);
+        for at in [0, 1] {
+            let s = schedule(&[(Feature::RunningStateHash, at)]);
+            assert_eq!(s.next_activation_after(0), None, "{at}: block 1 bits at 0");
+        }
+        assert_eq!(ActivationSchedule::default().next_activation_after(0), None);
     }
 
     #[test]
