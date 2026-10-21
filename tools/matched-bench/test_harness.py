@@ -1600,6 +1600,42 @@ class StateHashAttestHarnessTest(unittest.TestCase):
 
 
 # --------------------------------------------- run-cell.sh: which tools score
+class ResummarizeStateAttestTest(unittest.TestCase):
+    """[claude-review] P2: summarize.py rewrites summary.json without .state_attest; a cell whose scan
+    wrote no state-attest.json must come back REJECT from resummarize.sh, not ACCEPT."""
+
+    def cell(self):
+        d = tempfile.mkdtemp(prefix="attest-resum-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        write_cell(d, 1000, 1000, dur=120)
+        write_agreement(d, ["0xaa"] * 3)
+        run_summarize(d, dur=120)
+        return d
+
+    def resummarize(self, d):
+        r = subprocess.run(["bash", os.path.join(HERE, "resummarize.sh"), d],
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(d, "summary.json")) as f:
+            return json.load(f)
+
+    def attest_summary(self, d):
+        r = subprocess.run([sys.executable, "-I", os.path.join(HERE, "state_attest.py"), "summary", "--dir", d],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_scan_without_file_stays_rejected(self):
+        d = self.cell()
+        self.attest_summary(d)  # no state-attest.json: ok=false, REJECT
+        s = self.resummarize(d)
+        self.assertIs(s["state_attest"]["ok"], False)
+        self.assertEqual(s["validity"]["verdict"], "REJECT")
+
+    def test_cell_without_attest_is_untouched(self):
+        s = self.resummarize(self.cell())
+        self.assertNotIn("state_attest", s)
+
+
 class ToolsDirResolutionTest(unittest.TestCase):
     """A candidate is scored by ITS OWN summarize.py. run-cell.sh lives in the
     integration repo but is handed a candidate worktree; resolving the scoring

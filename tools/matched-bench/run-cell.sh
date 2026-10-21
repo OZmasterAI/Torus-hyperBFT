@@ -1925,7 +1925,7 @@ if state_attest_on; then
         --metrics "http://127.0.0.1:${METS[0]}/metrics" --metrics "http://127.0.0.1:${METS[1]}/metrics" \
         --metrics "http://127.0.0.1:${METS[2]}/metrics" \
         --log "$RUN_DIR/val0.log" --log "$RUN_DIR/val1.log" --log "$RUN_DIR/val2.log" \
-        --keys "$ORACLE_KEYS" --wait-s 90 --out "$OUT/state-attest.json" 2>&1) \
+        --keys "$ORACLE_KEYS" --wait-s 90 --activation "$STATE_HASH_ACTIVATION" --out "$OUT/state-attest.json" 2>&1) \
         || STATE_ATTEST_LINE="state attest: ok=0 scan failed: $(tail -c 400 <<<"$STATE_ATTEST_LINE")"
     log "$STATE_ATTEST_LINE"
 fi

@@ -344,6 +344,16 @@ def row_view(r, names, addr_of):
     return entry, voters, vote_diff, q_diff
 
 
+def min_window(t, activation):
+    """checkpoints every node must still serve at newest common t: min(RETAIN, (t - activation) // INTERVAL), >= 1
+    (activation unknown: 1, the window is not checked)"""
+    if t is None:
+        return 0
+    if activation is None:
+        return 1
+    return max(1, min(RETAIN, (t - activation) // INTERVAL))
+
+
 def judge_rows(out, rows, names, addr_of):
     """fills out's per-height fields and appends the per-height problems"""
     problems = out["problems"]
@@ -381,6 +391,13 @@ def judge_rows(out, rows, names, addr_of):
     )
     if out.get("newest_common") is not None and not table:
         problems.append("no checkpoint every node retains (latest per node %s)" % out["latest_per_node"])
+    want = min_window(out.get("newest_common"), out.get("activation"))
+    out["min_compared"] = want
+    if table and len(table) < want:
+        problems.append(
+            "compared only %d checkpoint(s), want >= %d (an RPC error or a node's retention cut the window; partial %s)"
+            % (len(table), want, out["partial_heights"])
+        )
     if hn_diff:
         first = next(e for e in table if e["height"] == hn_diff[-1])
         problems.append(
@@ -415,6 +432,8 @@ def judge_metrics(name, url, problems):
     if not nd["submitted"]:
         problems.append("%s: %s = %s (the node sent no attestation)" % (name, METRICS["submitted"], nd["submitted"]))
     problems += ["%s: %s = %s" % (name, METRICS[k], nd[k]) for k in ("mismatch", "no_quorum", "unverified") if nd.get(k)]
+    # no_quorum (plain counter) and unverified (gauge) are always exported once the node runs: absent = unreadable
+    problems += ["%s: %s missing from the scrape" % (name, METRICS[k]) for k in ("no_quorum", "unverified") if nd.get(k) is None]
     return nd
 
 
@@ -435,10 +454,16 @@ def judge_log(name, path, want, problems):
     return lf
 
 
-def scan(rpcs, keys, metrics_urls, logs, wait_s, sleep=2.0):
+def scan(rpcs, keys, metrics_urls, logs, wait_s, sleep=2.0, activation=None):
     names = ["val%d" % i for i in range(len(rpcs))]
     addr_of = {a: "val%d" % i for i, a, _ in keys}
-    out = {"nodes": names, "validators": {"val%d" % i: a for i, a, _ in keys}, "interval": INTERVAL, "problems": []}
+    out = {
+        "nodes": names,
+        "validators": {"val%d" % i: a for i, a, _ in keys},
+        "interval": INTERVAL,
+        "activation": activation,
+        "problems": [],
+    }
     problems = out["problems"]
     latest = []
     for name, rpc in zip(names, rpcs):
@@ -615,6 +640,7 @@ def main(argv=None):
     s.add_argument("--log", action="append", default=[])
     s.add_argument("--keys", required=True)
     s.add_argument("--wait-s", type=float, default=90)
+    s.add_argument("--activation", type=int, default=None, help="STATE_HASH_ACTIVATION height (sets the minimum compared window)")
     s.add_argument("--out", required=True)
     m = sub.add_parser("summary")
     m.add_argument("--dir", required=True)
@@ -644,7 +670,7 @@ def main(argv=None):
                 file=sys.stderr,
             )
             return 2
-        out = scan([Rpc(u) for u in a.rpc], keys, a.metrics, a.log, a.wait_s)
+        out = scan([Rpc(u) for u in a.rpc], keys, a.metrics, a.log, a.wait_s, activation=a.activation)
         with open(a.out, "w") as f:
             json.dump(out, f, indent=1)
         print(line_of(out))

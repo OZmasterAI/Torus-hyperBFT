@@ -161,7 +161,7 @@ class StateAttestTest(unittest.TestCase):
             out[h] = (local(h), {a: local(h) for a in voters}, local(h) if q else None)
         return out
 
-    def run_scan(self, nodes, logs=None, wait_s=0.2):
+    def run_scan(self, nodes, logs=None, wait_s=0.2, activation=None):
         paths = []
         for i, text in enumerate(logs or [log_text(a) for a in self.addrs]):
             p = os.path.join(self.d, "val%d.log" % i)
@@ -176,6 +176,7 @@ class StateAttestTest(unittest.TestCase):
             c.logs,
             wait_s,
             sleep=0.05,
+            activation=activation,
         )
 
     def three(self, **kw):
@@ -400,6 +401,35 @@ class StateAttestTest(unittest.TestCase):
         out = self.run_scan(nodes)
         self.assertFalse(out["ok"])
         self.assertIn("val0: torus_state_hash_mismatch_total = 3.0", out["problems"])
+
+    def test_missing_no_quorum_or_unverified_metric_fails(self):
+        """review nit 2: both are always exported; absent = the scrape is not the node's, not 'no problem'"""
+        nodes = self.three()
+        nodes[1].metrics = "\n".join(
+            l for l in metrics_text().splitlines() if "no_quorum" not in l and "unverified" not in l
+        ) + "\n"
+        out = self.run_scan(nodes)
+        self.assertFalse(out["ok"])
+        self.assertIn("val1: torus_state_hash_no_quorum_total missing from the scrape", out["problems"])
+        self.assertIn("val1: torus_state_hash_unverified missing from the scrape", out["problems"])
+
+    def test_window_shorter_than_activation_allows_fails(self):
+        """review nit 1: an RPC error / short retention must not shrink the compared window silently"""
+        nodes = self.three()
+        nodes[0].checkpoints = self.checkpoints(lo=1100)  # val0 serves only 1100, 1200
+        out = self.run_scan(nodes, activation=1)
+        self.assertFalse(out["ok"])
+        self.assertEqual((out["compared"], out["min_compared"]), (2, 11))
+        self.assertTrue(any(p.startswith("compared only 2 checkpoint(s), want >= 11") for p in out["problems"]), out["problems"])
+        self.assertEqual(sa.min_window(1200, 1), 11)
+        self.assertEqual(sa.min_window(100000, 1), 64)
+        self.assertEqual(sa.min_window(150, 1), 1)
+        self.assertEqual(sa.min_window(1200, None), 1)
+
+    def test_full_window_with_activation_is_ok(self):
+        out = self.run_scan(self.three(), activation=1)
+        self.assertTrue(out["ok"], out["problems"])
+        self.assertEqual((out["compared"], out["min_compared"]), (12, 11))
 
     def test_unreachable_node_fails(self):
         nodes = self.three()
