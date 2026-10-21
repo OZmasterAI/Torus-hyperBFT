@@ -1620,6 +1620,9 @@ mod blacklist_decision_tests {
         }));
         // Only a genuinely invalid (crypto/structurally bad) block is blacklisted.
         assert!(warrants_blacklist(&ValidateBlockResponse::Invalid));
+        // P0.0: a block with a feature this binary does not know came from an
+        // upgraded honest peer: this node must upgrade, the peer is not at fault.
+        assert!(!warrants_blacklist(&ValidateBlockResponse::UnsupportedUpgrade));
     }
 }
 

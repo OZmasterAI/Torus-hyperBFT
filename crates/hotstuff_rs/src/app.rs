@@ -405,4 +405,11 @@ pub enum ValidateBlockResponse {
     /// invalid: the missing data should be fetched and validation retried. During
     /// block-sync this means the serving peer must NOT be blacklisted.
     MissingData,
+
+    /// The block uses a protocol feature this binary does not know (a newer
+    /// release's, torus P0.0 activation gating): this replica cannot insert or
+    /// execute it until it is upgraded, but the block is not invalid. Insertion
+    /// treats it like `Invalid` (not inserted); block sync ends the session
+    /// WITHOUT blacklisting the serving peer (it served a valid block).
+    UnsupportedUpgrade,
 }

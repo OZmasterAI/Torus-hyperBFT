@@ -3155,13 +3155,39 @@ fn check_parent_link(
     parent: impl FnOnce(&CryptoHash) -> ParentHeader,
     boundary: impl FnOnce(u64) -> Result<Option<PlanEvm>, EpochPlanNotReady>,
 ) -> BlockDataCheck {
+    check_parent_link_or_upgrade(header, justify, genesis, schedule, parent, boundary)
+        .unwrap_or(BlockDataCheck::Invalid)
+}
+
+/// P0.0: a header carries a feature this binary does not know (a newer
+/// release's): this node cannot vote on, insert or execute it, but the block
+/// is not invalid, so a block-sync peer serving it is not at fault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UpgradeRequired {
+    /// The lowest unknown feature id.
+    feature: u32,
+}
+
+/// [`check_parent_link`] telling an unknown feature bit (`Err`) apart from an
+/// invalid header. The vote path folds it into `Invalid` (no vote);
+/// insertion maps it to `ValidateBlockResponse::UnsupportedUpgrade`
+/// ([`insertion_link_response`]), so block sync does not blacklist the
+/// upgraded peer that served the block (Codex review of phase 1, P2).
+fn check_parent_link_or_upgrade(
+    header: &TorusBlockHeader,
+    justify: &PhaseCertificate,
+    genesis: &TorusBlockHeader,
+    schedule: &torus_types::ActivationSchedule,
+    parent: impl FnOnce(&CryptoHash) -> ParentHeader,
+    boundary: impl FnOnce(u64) -> Result<Option<PlanEvm>, EpochPlanNotReady>,
+) -> Result<BlockDataCheck, UpgradeRequired> {
     let parent = if justify.is_genesis_pc() {
         genesis.clone()
     } else {
         match parent(&justify.block) {
             ParentHeader::Header(header) => *header,
-            ParentHeader::NotInTree => return BlockDataCheck::Missing,
-            ParentHeader::Undecodable => return BlockDataCheck::Invalid,
+            ParentHeader::NotInTree => return Ok(BlockDataCheck::Missing),
+            ParentHeader::Undecodable => return Ok(BlockDataCheck::Invalid),
         }
     };
     let expected = alloy_primitives::keccak256(parent.canonical_header_bytes());
@@ -3175,7 +3201,7 @@ fn check_parent_link(
             parent_timestamp = parent.timestamp,
             "REJECTED -- block timestamp regresses below its parent's"
         );
-        return BlockDataCheck::Invalid;
+        return Ok(BlockDataCheck::Invalid);
     }
     if header.height != parent.height + 1 || header.parent_hash != expected {
         tracing::warn!(
@@ -3185,7 +3211,7 @@ fn check_parent_link(
             expected_parent = %expected,
             "REJECTED -- header does not link to its parent block's header (ancestry violation)"
         );
-        return BlockDataCheck::Invalid;
+        return Ok(BlockDataCheck::Invalid);
     }
     // P0.0: the feature bits are this node's schedule at this height. A bit this binary does not
     // know is a newer release's feature: no vote, no insertion (owner decision: an old binary
@@ -3199,7 +3225,7 @@ fn check_parent_link(
              does not know",
             header.height
         );
-        return BlockDataCheck::Invalid;
+        return Err(UpgradeRequired { feature: id });
     }
     let want = schedule.active_at(header.height);
     if header.features != want {
@@ -3209,14 +3235,14 @@ fn check_parent_link(
             expected = want,
             "REJECTED -- header feature bits differ from this node's activation schedule"
         );
-        return BlockDataCheck::Invalid;
+        return Ok(BlockDataCheck::Invalid);
     }
     // Item 7 steps 1-2: the six EVM values (gas limit, N, M, big gas limit, both base fees) are the
     // rule values. Off a boundary: the parent's. At a boundary: the plan's (unset or no plan: the
     // parent's). After the link check, so a bogus height is Invalid and never waits on a plan.
     let rule = match boundary(header.height) {
         Ok(plan) => plan.unwrap_or_default().resolve(&parent),
-        Err(EpochPlanNotReady) => return BlockDataCheck::Missing,
+        Err(EpochPlanNotReady) => return Ok(BlockDataCheck::Missing),
     };
     let got = torus_types::EvmHeaderValues::of(header);
     if got != rule {
@@ -3226,9 +3252,24 @@ fn check_parent_link(
             ?rule,
             "REJECTED -- EVM header values differ from the rule values"
         );
-        return BlockDataCheck::Invalid;
+        return Ok(BlockDataCheck::Invalid);
     }
-    BlockDataCheck::Held
+    Ok(BlockDataCheck::Held)
+}
+
+/// `validate_block`'s verdict from the parent link (`None`: linked, go on).
+/// An unknown feature bit is `UnsupportedUpgrade`: not inserted, and block
+/// sync ends the session without blacklisting the serving peer.
+fn insertion_link_response(
+    link: Result<BlockDataCheck, UpgradeRequired>,
+) -> Option<ValidateBlockResponse> {
+    match link {
+        Ok(BlockDataCheck::Held) => None,
+        Ok(BlockDataCheck::Missing) => Some(ValidateBlockResponse::MissingData),
+        Ok(BlockDataCheck::Invalid) => Some(ValidateBlockResponse::Invalid),
+        // RED stub (P0.0 phase 1 review P2): still Invalid.
+        Err(_) => Some(ValidateBlockResponse::Invalid),
+    }
 }
 
 /// Item 7 step 0, pre-vote only (like the native action count): the EVM body
@@ -9982,7 +10023,7 @@ impl App<RocksKVStore> for TorusApp {
         // is inserted), so a block inserted by any path (full proposal, sync,
         // header + body) links to its parent's header.
         let link = match datum_header(datums[0].bytes()) {
-            Some(header) => check_parent_link(
+            Some(header) => check_parent_link_or_upgrade(
                 &header,
                 &block.justify,
                 &self.genesis_header,
@@ -9990,12 +10031,10 @@ impl App<RocksKVStore> for TorusApp {
                 |hash| tree_parent_header(request.block_tree(), hash),
                 |h| self.boundary_evm(h),
             ),
-            None => BlockDataCheck::Invalid,
+            None => Ok(BlockDataCheck::Invalid),
         };
-        match link {
-            BlockDataCheck::Held => {}
-            BlockDataCheck::Missing => return ValidateBlockResponse::MissingData,
-            BlockDataCheck::Invalid => return ValidateBlockResponse::Invalid,
+        if let Some(response) = insertion_link_response(link) {
+            return response;
         }
 
         self.validate_datum_after_fail_stop(datums[0].bytes(), &block.data_hash)
@@ -25540,6 +25579,67 @@ mod crash_recovery_tests {
             !old.pending_proposals.contains_key(&6),
             "nothing built on it"
         );
+    }
+
+    /// P0.0, Codex review of phase 1 (P2): insertion (`validate_block`, which
+    /// block sync runs through `validate_block_for_sync`) of a header with a
+    /// bit this binary does not know answers `UnsupportedUpgrade`, not
+    /// `Invalid`: block sync then ends the session without blacklisting the
+    /// upgraded peer that served it (`warrants_blacklist`), and this node
+    /// halts at H (no insertion, no vote; execution fail-stops with UPGRADE
+    /// REQUIRED). A header that does not link, or whose known bits differ from
+    /// the schedule, stays `Invalid`. The vote path is unchanged (`Invalid`).
+    /// RED before the fix: `Invalid` (the honest peer was blacklisted).
+    #[test]
+    fn unknown_feature_bit_at_insertion_is_an_unsupported_upgrade_not_invalid() {
+        let rsh = torus_types::Feature::RunningStateHash.bit();
+        let parent = tip_2000(); // height 4, no bits
+        let mut old = gated_app(2_010, torus_types::ActivationSchedule::default());
+        let link = |app: &TorusApp, block: &TorusBlock| {
+            let hs_parent = hs_block(&parent, PhaseCertificate::genesis_pc());
+            let header = parent.header.clone();
+            insertion_link_response(check_parent_link_or_upgrade(
+                &block.header,
+                &justify_for(&hs_parent),
+                &app.genesis_header,
+                &app.activations,
+                move |_| ParentHeader::Header(Box::new(header)),
+                |_| Ok(None),
+            ))
+        };
+        for bits in [UNKNOWN_BIT, rsh | UNKNOWN_BIT, 1 << 127] {
+            let newer = with_features(child_of(&parent, 2_000), bits);
+            assert!(
+                matches!(
+                    link(&old, &newer),
+                    Some(ValidateBlockResponse::UnsupportedUpgrade)
+                ),
+                "bits {bits:#x}: unsupported upgrade, not invalid"
+            );
+            assert_eq!(
+                pre_vote(&mut old, &parent, &newer),
+                BlockDataCheck::Invalid,
+                "bits {bits:#x}: still no vote"
+            );
+            assert_eq!(
+                insertion_link(&old, &parent, &newer),
+                BlockDataCheck::Invalid,
+                "bits {bits:#x}: the folded link check is unchanged"
+            );
+            // The link is checked first: a header that does not link is invalid.
+            let mut bogus = newer.clone();
+            bogus.header.height += 1;
+            assert!(
+                matches!(link(&old, &bogus), Some(ValidateBlockResponse::Invalid)),
+                "bits {bits:#x}, bad height"
+            );
+        }
+        let wrong_known = with_features(child_of(&parent, 2_000), rsh);
+        assert!(
+            matches!(link(&old, &wrong_known), Some(ValidateBlockResponse::Invalid)),
+            "known bit off-schedule: invalid"
+        );
+        assert!(link(&old, &child_of(&parent, 2_000)).is_none(), "honest: linked");
     }
 
     /// P0.0: the proposer stamps the schedule's bits, the genesis parent header
