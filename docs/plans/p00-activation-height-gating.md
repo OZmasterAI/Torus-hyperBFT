@@ -263,6 +263,15 @@ Each phase lands on its own branch with RED-first tests and full gates; each one
    at height 12, then committed stuck at 11 after the restart while the others reached ~300-670).
    Live P0.0 paths do not reach it (an old binary refuses insertion at H, so nothing commits after its
    fail-stop), but any execution fail-stop that a commit outruns before the process exits does.
+   Codex review of phase 5 (2 x P2), fixed on `feat/p00-phase6`: (1) a workspace `--all-features` build
+   put the test bit 127 in `KNOWN_FEATURES` while its rule is test code only; now `Feature::is_test_only`
+   features are never in `KNOWN_FEATURES` (such a binary meets bit 127 as `UPGRADE REQUIRED`),
+   `ActivationSchedule::for_chain` (genesis and node default) refuses a feature outside it, and the cluster
+   tests' upgraded release passes `KNOWN_FEATURES | bit 127` through `AppOptions::known_features` (the old
+   release passes `KNOWN_FEATURES`); (2) the 2-of-4 stall test waited for `H - 3` applied, assuming QCs in
+   consecutive views; now the four nodes commit a common prefix on the old release, nodes 0 and 1 stop
+   (no quorum, frozen tips) and restart upgraded with `H` = the running nodes' committed tip + 8, and the
+   test waits for an old node to refuse `H`.
 6. **Ops** (~0.5-1 d): features gauge, RPC schedule listing, upgrade runbook.
    Built s134 on `feat/p00-phase6` (from phase 5 342aa460). Gauges (`crates/torus-consensus/src/feature_status.rs`):
    `torus_feature_active{feature,id}` per known feature from the last applied header's bits (execution
