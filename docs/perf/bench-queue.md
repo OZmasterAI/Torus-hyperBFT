@@ -937,6 +937,22 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    `torus_commit_feed_{decode,evm,manifest,enqueue}_seconds`, `torus_exec_dispatch_send_seconds` (blocked on the exec
    channel), `torus_commit_event_handler_seconds`. Verdict: which step carries B's extra ~+30 ms per view, and is it
    B0 (b0) or only B (b1)?
+9g. **L6.1: Classic final form with the running state hash on** (owner s131; after 9f; ~1 h 30). L3.1 needs the hash
+   off (9e: deep blocks/s 3.50 -> 15.23). L6.1 (genesis `consensus.book_window_commit`, default off) hashes the
+   order-book CF only at %100 heights, where every book is written and hashed, so h_n no longer depends on node-local
+   checkpoint windows and L3.1 can run with the hash on. **One binary** `perf/l61-window-books` `53a6d83c` (L3.1 merge
+   e1106362 + L6.1; L3.3, option 0, exec-hash defaults on; reviews: [claude-review] P1 + P2s fixed, verification: no
+   findings; nextest 4298/4298). It predates L2.2 default-on: set `TORUS_SETTLE_NO_MERGE=1` on ALL arms. Classic, 15 s
+   checkpoints, no byte cap, no EVM load. Genesis via `gen-3val-genesis.sh` (it supports `STATE_HASH_ACTIVATION` and
+   `BOOK_WINDOW_COMMIT`; `genesis_cache.py` keys on both). Arms: **A** = hash off, L3.1 on (code default) — 9e's B;
+   **B** = `STATE_HASH_ACTIVATION=1 BOOK_WINDOW_COMMIT=1`, L3.1 on (startup log must say coalesce ON and book window
+   commit ON); **C** = `STATE_HASH_ACTIVATION=1`, `TORUS_BOOK_COALESCE=0` (Classic + L3.3 with the hash on: today's
+   hash-on baseline). Shapes: deep (8i P1M) and standard; warm-up, then A B C C B A per shape (n = 2), 300 s cells.
+   Report per arm: native blocks/s, matched/s, block p50 / p99, timeouts, exec on-CPU ms per 1k fills, CPU-s per 1M
+   fills, save_order_books ms per block, the window-close spike (`torus_exec_book_coalesce_close_seconds`), the %100
+   full-save spike (`exec_save_books_seconds` at %100 heights), hash cost per block (flush `state_hash_seconds` and
+   entries), RSS; and confirm every node's h_n agrees (no hash mismatch / fail-stop lines). Pass: B within noise of A;
+   B clearly beats C on the deep book.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
