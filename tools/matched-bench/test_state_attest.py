@@ -606,6 +606,34 @@ class StateAttestTest(unittest.TestCase):
         self.assertEqual(out["holes_not_retried"], [700])
         self.assertTrue(any("quorum hash differs" in p for p in out["problems"]), out["problems"])
 
+    def test_retry_mismatch_is_kept_when_a_peer_errors(self):
+        """Codex P1 probe on 3ea3ddfd: a bad vote on val0 and an RPC error on val2 in the same retry must fail
+        the cell, even if a later retry is clean with a quorum"""
+        nodes = self.three()
+        self.hole(nodes, 700, self.addrs[:2])
+        reads = {"n": 0}
+
+        def on_call(h):
+            if h != 700:
+                return
+            reads["n"] += 1
+            if reads["n"] == 4:  # first retry: val0 reports a vote differing from h_n, val2 errors
+                local = nodes[0].checkpoints[700][0]
+                nodes[0].checkpoints[700] = (local, {self.addrs[0]: local, self.addrs[1]: h32("e")}, None)
+                nodes[2].fail_heights.add(700)
+            elif reads["n"] == 5:  # later retries: clean with a quorum everywhere
+                nodes[2].fail_heights.discard(700)
+                for n in nodes:
+                    local = n.checkpoints[700][0]
+                    n.checkpoints[700] = (local, {a: local for a in self.addrs}, local)
+
+        nodes[0].on_call = on_call
+        out = self.run_scan(nodes, hole_wait_s=3)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["holes_healed"], [])
+        self.assertEqual(out["holes_not_retried"], [700])
+        self.assertTrue(any("differ from a node's h_n" in p for p in out["problems"]), out["problems"])
+
     def test_hole_wait_budget_is_an_absolute_deadline_with_slow_rpcs(self):
         """Codex P2 probe: slow replies over several holes must not stretch the wait past the budget"""
         nodes = self.three()

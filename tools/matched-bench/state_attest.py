@@ -535,13 +535,16 @@ def heal_holes(out, rpcs, rows, t, hole_wait_s, sleep=2.0):
                 bounded = Rpc(rpc.url, timeout=min(rpc.timeout, left), attempts=1)
                 r, err = state_hash(bounded, h)
                 per.append(r if err is None else {"error": err})
-            if any("error" in p for p in per):
-                continue  # keep the earlier read: a pruned / unreadable / out-of-budget hole stays open
-            if not read_is_clean(per):
-                by_h[h]["per_node"] = per  # the mismatch is the evidence judge_rows must see
+            # an unreadable node keeps its earlier (readable) answer, so a mismatch another node shows in this
+            # retry is never dropped because a peer errored (Codex P1 on 3ea3ddfd)
+            merged = [old if "error" in p else p for p, old in zip(per, by_h[h]["per_node"])]
+            if not read_is_clean(merged):
+                by_h[h]["per_node"] = merged  # the mismatch is the evidence judge_rows must see
                 holes.remove(h)
                 out["holes_not_retried"].append(h)
                 continue
+            if any("error" in p for p in per):
+                continue  # a pruned / unreadable / out-of-budget node: the hole stays open, never healed
             if all(p["quorum"] is not None for p in per):
                 by_h[h]["per_node"] = per
                 holes.remove(h)
