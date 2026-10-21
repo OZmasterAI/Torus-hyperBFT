@@ -305,6 +305,48 @@ mod tests {
         assert!(GenesisDigest::decode(b"not json").is_err());
     }
 
+    /// Codex review of phase 4 (P2): numbers are digested without precision
+    /// loss. Through `serde_json::Value` an integer above u64 and a long
+    /// decimal were rounded to f64, so a changed (ignored or future) field
+    /// could keep the digest.
+    #[test]
+    fn numbers_are_digested_without_precision_loss() {
+        let d = |n: &str| GenesisDigest::of_json(&format!("{{\"chain_id\":1,\"future\":{n}}}")).unwrap();
+        for (a, b) in [
+            ("18446744073709551616", "18446744073709551617"),
+            ("-9223372036854775809", "-9223372036854775810"),
+            ("340282366920938463463374607431768211455", "340282366920938463463374607431768211454"),
+            ("0.10000000000000000001", "0.1"),
+            ("1.00000000000000000000000000001", "1.0"),
+            ("123456789012345678901234567890.5", "123456789012345678901234567890.25"),
+            ("1e400", "2e400"),
+        ] {
+            assert_ne!(d(a).digest, d(b).digest, "{a} vs {b}");
+            assert_eq!(d(a).changed_fields(&d(b)), vec!["future"], "{a} vs {b}");
+        }
+        // The same value written another way is the same number.
+        for (a, b) in [("1.0", "1.00"), ("1.0", "10e-1"), ("0.5", "5E-1"), ("1e20", "100000000000000000000.0")] {
+            assert_eq!(d(a), d(b), "{a} vs {b}");
+        }
+        // An integer and a float are different values (as serde_json writes them).
+        assert_ne!(d("1").digest, d("1.0").digest);
+    }
+
+    /// Numbers that fit `serde_json`'s u64 / i64 / f64 keep the digest a
+    /// phase 4 data dir stored (the canonical form of the parsed value).
+    #[test]
+    fn representable_numbers_keep_the_value_canonical_form() {
+        for text in [
+            DEVNET,
+            r#"{"a":[0,-1,18446744073709551615,-9223372036854775808,0.5,1.0,-0.0,1e20,1.5e-7,3.14159]}"#,
+        ] {
+            let v: Value = serde_json::from_str(text).unwrap();
+            let mut pre = DIGEST_DOMAIN.to_vec();
+            pre.extend(canonical_json(&v));
+            assert_eq!(GenesisDigest::of_json(text).unwrap().digest, keccak256(&pre), "{text:.80}");
+        }
+    }
+
     #[test]
     fn not_json_is_an_error() {
         assert!(GenesisDigest::of_json("{ \"chain_id\": ").is_err());
