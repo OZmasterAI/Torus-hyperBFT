@@ -543,6 +543,46 @@ fn adl_obligation_open_at_settlement_drains_against_the_vault() {
     assert!(liq::next_obligation(&db, &[liq::ADL_OBLIGATION_TAG]).unwrap().is_none());
 }
 
+/// Codex P2 (s131): the same ADL obligation, but the mark is stale from the
+/// settlement block on (the oracle stopped for the delisted market). The
+/// settlement closes 14 at the last aggregate and deletes its row; the drain
+/// must not wait for a fresh mark that may never come: a governance-delisted
+/// market ranks at the obligation's stored price (owner s96, as a removed
+/// market), so the next liquidation step closes the escrow against the vault.
+#[test]
+fn adl_obligation_drains_after_a_stale_price_settlement() {
+    let (_d, db) = setup(&[14]);
+    fund(&db, 13, 50);
+    set_grace(&db, 5);
+    open_pair(&db, M, 14, 13, 10, 100);
+    set_mark(&db, M, 100, H);
+    delist_m(&db);
+    set_mark(&db, M, 120, H + 2);
+    {
+        let mut ctx = ctx_at(db.clone(), H + 2);
+        let _ = NativeExecutor::run_liquidations_with(&mut ctx, 2_048, 64, 0);
+        assert_eq!(ctx.take_fatal_error(), None);
+    }
+    assert_eq!(pos_of(&db, &liq::ADL_ESCROW_SHORT, M), fp(-10));
+    // Last aggregate 120 s of block time before H + 5: stale from here on.
+    db.put_cf_raw(CF_NATIVE_ORACLE, &agg_key(M), &agg_row(fp(120), ts(H + 5) - 120)).unwrap();
+    let (_, s) = block(&db, H + 5, 1, &[]);
+    assert!(s.iter().all(|r| r.success), "{s:?}");
+    assert_eq!(pos(&db, 14, M), FixedPoint::ZERO, "14 closed at the stale 120");
+    assert_eq!(bal(&db, &addr(14)).available, fp(FUND + 200));
+    assert_eq!(pos_of(&db, &LIQUIDATOR_VAULT, M), fp(10), "vault mirrors the escrow");
+    assert_eq!(row(&db), None);
+    {
+        let mut ctx = ctx_at(db.clone(), H + 6);
+        assert!(NativeExecutor::liquidation_due(&ctx.state).unwrap());
+        let _ = NativeExecutor::run_liquidations(&mut ctx);
+        assert_eq!(ctx.take_fatal_error(), None);
+    }
+    assert_eq!(net_oi(&db, M), (FixedPoint::ZERO, 0), "escrow closed against the vault at its stored price");
+    assert!(liq::next_obligation(&db, &[liq::ADL_OBLIGATION_TAG]).unwrap().is_none());
+    assert_eq!(bal(&db, &liq::ADL_ESCROW_SHORT).available, FixedPoint::ZERO, "escrow dust swept");
+}
+
 /// An underwater account: its close at the settlement price leaves negative
 /// collateral; when flat it moves to the vault (D9, conserved), as after a
 /// liquidation.
