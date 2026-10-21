@@ -211,6 +211,22 @@ pub struct EpochBoundaryResult {
 struct BalanceCache {
     map: HashMap<Address, CachedBalance>,
     dirty: Vec<Address>,
+    /// 8k L2.1: the streamed region's undo log ([`Self::begin_undo`]);
+    /// `None` outside it.
+    undo: Option<BalanceUndo>,
+    /// 8k L2.1: the read faults the streamed region's pass B hit, per key in
+    /// read order, re-raised by [`Self::load`] after a rollback (the replay).
+    latched: HashMap<Address, VecDeque<CoreError>>,
+}
+
+/// 8k L2.1: [`BalanceCache`] as it was when the streamed region began: the
+/// dirty list's length and each entry's value before the region's first
+/// `set` of it (`None`: absent). Entries the region only LOADED stay: the
+/// backend is frozen for the call, so they hold what a later read returns.
+#[derive(Default)]
+struct BalanceUndo {
+    dirty_len: usize,
+    prior: Vec<(Address, Option<(NativeBalance, bool)>)>,
 }
 
 /// Per-call `cum_volume` increments: maker and taker each add `price * qty`
@@ -338,13 +354,66 @@ mod volume_cache_probe {
 struct CachedBalance {
     balance: NativeBalance,
     dirty: bool,
+    /// 8k L2.1: the prior value is in the undo log already.
+    logged: bool,
 }
 
 impl BalanceCache {
     fn new() -> Self {
-        Self {
-            map: HashMap::default(),
-            dirty: Vec::new(),
+        Self::default()
+    }
+
+    /// 8k L2.1: start the streamed region's undo log (see
+    /// [`NativeExecutor::match_settle_streamed`], "Fallbacks").
+    fn begin_undo(&mut self) {
+        debug_assert!(self.undo.is_none() && self.latched.is_empty());
+        self.undo = Some(BalanceUndo {
+            dirty_len: self.dirty.len(),
+            prior: Vec::new(),
+        });
+    }
+
+    /// 8k L2.1: the region's writes stand; its latched faults are dropped
+    /// (pass B goes on reading the backend, as flag off's does).
+    fn commit_undo(&mut self) {
+        self.undo = None;
+        self.latched.clear();
+    }
+
+    /// 8k L2.1: back to the region's start, except what it loaded (frozen
+    /// backend values) and the read faults it hit, which [`Self::load`]
+    /// re-raises, per key in the order they happened, before any later read
+    /// of that key: a replay of the settle then sees, read for read, what
+    /// the backend gave the region, and the region's reads were the first of
+    /// their keys since the region began, as the replay's are with the flag
+    /// off. So a one-shot fault the region consumed still fails the replay
+    /// at the same read.
+    fn rollback_undo(&mut self) {
+        let Some(undo) = self.undo.take() else {
+            return;
+        };
+        for (addr, prior) in undo.prior.into_iter().rev() {
+            match prior {
+                Some((balance, dirty)) => {
+                    if let Some(entry) = self.map.get_mut(&addr) {
+                        entry.balance = balance;
+                        entry.dirty = dirty;
+                        entry.logged = false;
+                    }
+                }
+                None => {
+                    self.map.remove(&addr);
+                }
+            }
+        }
+        self.dirty.truncate(undo.dirty_len);
+    }
+
+    /// 8k L2.1: pass B's read of `addr` failed with `err` (after pass B used
+    /// it). Kept only inside the streamed region, for [`Self::rollback_undo`].
+    fn note_read_fault(&mut self, addr: &Address, err: CoreError) {
+        if self.undo.is_some() {
+            self.latched.entry(*addr).or_default().push_back(err);
         }
     }
 
@@ -357,6 +426,12 @@ impl BalanceCache {
         typed: Option<&dyn TypedRows>,
         addr: &Address,
     ) -> Result<NativeBalance, CoreError> {
+        // 8k L2.1: a replay re-raises the faults the rolled-back region hit.
+        if !self.latched.is_empty() && self.undo.is_none() {
+            if let Some(err) = self.latched.get_mut(addr).and_then(VecDeque::pop_front) {
+                return Err(err);
+            }
+        }
         if let Some(entry) = self.map.get(addr) {
             return Ok(entry.balance.clone());
         }
@@ -366,6 +441,7 @@ impl BalanceCache {
             CachedBalance {
                 balance: bal.clone(),
                 dirty: false,
+                logged: false,
             },
         );
         Ok(bal)
@@ -377,6 +453,11 @@ impl BalanceCache {
         match self.map.entry(*addr) {
             Entry::Occupied(mut slot) => {
                 let entry = slot.get_mut();
+                if let Some(undo) = self.undo.as_mut().filter(|_| !entry.logged) {
+                    entry.logged = true;
+                    undo.prior
+                        .push((*addr, Some((entry.balance.clone(), entry.dirty))));
+                }
                 entry.balance = bal;
                 if !entry.dirty {
                     entry.dirty = true;
@@ -384,9 +465,17 @@ impl BalanceCache {
                 }
             }
             Entry::Vacant(slot) => {
+                let logged = match self.undo.as_mut() {
+                    Some(undo) => {
+                        undo.prior.push((*addr, None));
+                        true
+                    }
+                    None => false,
+                };
                 slot.insert(CachedBalance {
                     balance: bal,
                     dirty: true,
+                    logged,
                 });
                 self.dirty.push(*addr);
             }
@@ -869,6 +958,213 @@ mod settle_no_merge_flag_tests {
         });
         assert!(unwound.is_err());
         assert_eq!(pin(), None, "restored on unwind");
+    }
+}
+
+/// 8k L2.1 (`TORUS_SETTLE_STREAMED`, node-local, OFF by default): pure
+/// parse. `1` or `true` (trimmed, any case) = on; unset, empty, `0` or
+/// `false` = off; anything else is warned and off.
+#[doc(hidden)]
+pub fn parse_settle_streamed(v: Option<&str>) -> bool {
+    let Some(v) = v else {
+        return false;
+    };
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" => true,
+        "" | "0" | "false" => false,
+        _ => {
+            tracing::warn!(
+                value = v,
+                "TORUS_SETTLE_STREAMED: not empty, 1, true, 0 or false (any case); using the default (off)"
+            );
+            false
+        }
+    }
+}
+
+/// 8k L2.1 test seam (no effect unless pinned by
+/// [`with_settle_stream_probe`]): a scheduling perturbation and two planted
+/// panics. Read on the calling (exec) thread at the start of each
+/// `execute_batch` call and copied into that call's pool jobs.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SettleStreamProbe {
+    /// Non-zero: each streamed job sleeps a pseudo-random 0-255 us (seeded)
+    /// before its market, and the exec thread before each market's pass B,
+    /// so markets finish and get consumed in many different interleavings.
+    pub jitter_seed: u64,
+    /// This market's match job panics (contained: the block's fatal exit),
+    /// on the streamed path and on the flag-off parallel match setup.
+    pub match_panic: Option<MarketId>,
+    /// This market's settle plan (pass A) panics (recovered: the sequential
+    /// fallback), streamed or not.
+    pub plan_panic: Option<MarketId>,
+}
+
+thread_local! {
+    /// 8k L2.1: [`with_settle_streamed`]'s per-thread pin; `None` = the env.
+    static SETTLE_STREAMED_PIN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// 8k L2.1: [`with_settle_stream_probe`]'s per-thread pin.
+    static SETTLE_STREAM_PROBE: std::cell::Cell<SettleStreamProbe> = const {
+        std::cell::Cell::new(SettleStreamProbe { jitter_seed: 0, match_panic: None, plan_panic: None })
+    };
+    /// 8k L2.1: calls on this thread whose parallel settle streamed pass B.
+    static SETTLE_STREAMED_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// 8k L2.1: markets whose pass B ran on this thread while a later
+    /// market's job was still running (the overlap the flag buys).
+    static SETTLE_STREAMED_EARLY: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// 8k L2.1: plan-failure fallbacks on this thread after a non-empty
+    /// streamed prefix (undone, then flag off's fallback replayed).
+    static SETTLE_STREAMED_HYBRID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 8k L2.1: runs `f` with `TORUS_SETTLE_STREAMED` pinned to `on` on this
+/// thread (tests and differential runs). The exec thread reads it at the
+/// start of each `execute_batch` call. The previous pin comes back when `f`
+/// returns or unwinds.
+#[doc(hidden)]
+pub fn with_settle_streamed<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SETTLE_STREAMED_PIN.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(SETTLE_STREAMED_PIN.with(|c| c.replace(Some(on))));
+    f()
+}
+
+/// 8k L2.1: runs `f` with the test probe pinned on this thread (restored on
+/// return or unwind).
+#[doc(hidden)]
+pub fn with_settle_stream_probe<R>(probe: SettleStreamProbe, f: impl FnOnce() -> R) -> R {
+    struct Restore(SettleStreamProbe);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SETTLE_STREAM_PROBE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(SETTLE_STREAM_PROBE.with(|c| c.replace(probe)));
+    f()
+}
+
+/// 8k L2.1: streamed parallel settles this thread ran so far.
+#[doc(hidden)]
+pub fn settle_streamed_calls_on_this_thread() -> u64 {
+    SETTLE_STREAMED_CALLS.with(std::cell::Cell::get)
+}
+
+/// 8k L2.1: markets this thread put through pass B while a later market's
+/// job was still running.
+#[doc(hidden)]
+pub fn settle_streamed_early_on_this_thread() -> u64 {
+    SETTLE_STREAMED_EARLY.with(std::cell::Cell::get)
+}
+
+/// 8k L2.1: (parks, nanoseconds parked) of this thread's waits for
+/// streamed job results so far (perf probe; the exec thread is this thread
+/// when it runs `execute_batch`).
+#[doc(hidden)]
+pub fn settle_stream_parks_on_this_thread() -> (u64, u64) {
+    crate::exec_pool::stream_parks_on_this_thread()
+}
+
+/// 8k L2.1 test / bench seam: runs `f` with the streamed settle's wake
+/// batch pinned to `batch` on this thread (`None`: the built-in policy,
+/// `Some(1)`: a wake-up per market as before the batching). Results do not
+/// depend on it.
+#[doc(hidden)]
+pub fn with_settle_stream_wake_batch<R>(batch: Option<usize>, f: impl FnOnce() -> R) -> R {
+    crate::exec_pool::with_wake_batch(batch, f)
+}
+
+/// 8k L2.1: plan-failure fallbacks this thread hit after a streamed prefix
+/// (the prefix undone, flag off's fallback replayed).
+#[doc(hidden)]
+pub fn settle_streamed_hybrid_on_this_thread() -> u64 {
+    SETTLE_STREAMED_HYBRID.with(std::cell::Cell::get)
+}
+
+thread_local! {
+    /// 8k L2.1 test seam: set while this thread computes a maker's snapshot
+    /// free margin ([`AccountReader::maker_free`]).
+    static MAKER_SNAPSHOT_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 8k L2.1 test seam: true while this thread reads a maker's snapshot free
+/// margin in matching ([`AccountReader::maker_free`]: its balance and the
+/// rows its valuation reads). A batch reads each maker once per Phase 3
+/// worker thread (C6c, `MAKER_FREE`), so how many such reads a block makes
+/// depends on which thread matched which market: fault-injecting tests that
+/// pick "the n-th read of a key" leave these reads out of the count.
+#[doc(hidden)]
+pub fn in_maker_snapshot_read_on_this_thread() -> bool {
+    MAKER_SNAPSHOT_READ.with(std::cell::Cell::get)
+}
+
+/// 8k L2.1 (`TORUS_SETTLE_STREAMED=1`, node-local, off by default): with
+/// the per-market match setup in the pool jobs and a parallel settle
+/// possible, each market's pool job matches the market and then computes its
+/// settle plan (pass A), and the exec thread runs pass B market by market,
+/// in market-id order, as each market's job finishes, while the pool still
+/// works on later markets. See `match_settle_streamed`. The thread's pin if
+/// set, else the env read once per process.
+fn settle_streamed_enabled() -> bool {
+    if let Some(on) = SETTLE_STREAMED_PIN.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = parse_settle_streamed(std::env::var("TORUS_SETTLE_STREAMED").ok().as_deref());
+        tracing::info!(
+            on,
+            "TORUS_SETTLE_STREAMED: settle pass B streams in market order while the pool matches and plans"
+        );
+        on
+    })
+}
+
+#[cfg(test)]
+mod settle_streamed_flag_tests {
+    use super::{
+        parse_settle_streamed, settle_streamed_enabled, with_settle_stream_probe,
+        with_settle_streamed, SettleStreamProbe, SETTLE_STREAMED_PIN, SETTLE_STREAM_PROBE,
+    };
+
+    /// The pin wins over the env, nests, restores (also on unwind) and stays
+    /// on its thread; so does the probe.
+    #[test]
+    fn pins_override_nest_and_restore() {
+        let pin = || SETTLE_STREAMED_PIN.with(|c| c.get());
+        assert_eq!(pin(), None);
+        assert_eq!(
+            settle_streamed_enabled(),
+            parse_settle_streamed(std::env::var("TORUS_SETTLE_STREAMED").ok().as_deref())
+        );
+        with_settle_streamed(true, || {
+            assert!(settle_streamed_enabled());
+            with_settle_streamed(false, || assert!(!settle_streamed_enabled()));
+            assert_eq!(pin(), Some(true));
+            std::thread::spawn(move || assert_eq!(SETTLE_STREAMED_PIN.with(|c| c.get()), None))
+                .join()
+                .unwrap();
+        });
+        assert_eq!(pin(), None);
+        let unwound = std::panic::catch_unwind(|| {
+            with_settle_streamed(true, || -> () { panic!("inside the pin") })
+        });
+        assert!(unwound.is_err());
+        assert_eq!(pin(), None, "restored on unwind");
+        let p = SettleStreamProbe {
+            jitter_seed: 7,
+            match_panic: Some(3),
+            plan_panic: None,
+        };
+        with_settle_stream_probe(p, || assert_eq!(SETTLE_STREAM_PROBE.with(|c| c.get()), p));
+        assert_eq!(
+            SETTLE_STREAM_PROBE.with(|c| c.get()),
+            SettleStreamProbe::default()
+        );
     }
 }
 
@@ -2730,6 +3026,13 @@ impl<T: StateBackend> AccountReader<'_, T> {
     /// ([`MAKER_FREE`]).
     fn maker_free(&self, maker: &Address) -> FixedPoint {
         let compute = || {
+            struct Restore(bool);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    MAKER_SNAPSHOT_READ.with(|c| c.set(self.0));
+                }
+            }
+            let _seam = Restore(MAKER_SNAPSHOT_READ.with(|c| c.replace(true)));
             self.positions
                 .get_native_balance(maker)
                 .and_then(|b| self.view(maker, &b))
@@ -3064,7 +3367,7 @@ impl SenderFold {
         let mut out = FoldOut {
             cache: BalanceCache {
                 map: HashMap::with_capacity_and_hasher(self.senders.len(), Default::default()),
-                dirty: Vec::new(),
+                ..BalanceCache::default()
             },
             ..FoldOut::default()
         };
@@ -3080,7 +3383,14 @@ impl SenderFold {
                 if st.balance_dirty {
                     out.cache.dirty.push(sender);
                 }
-                out.cache.map.insert(sender, CachedBalance { balance, dirty: st.balance_dirty });
+                out.cache.map.insert(
+                    sender,
+                    CachedBalance {
+                        balance,
+                        dirty: st.balance_dirty,
+                        logged: false,
+                    },
+                );
             }
         }
         out
@@ -5514,6 +5824,414 @@ fn reconcile_lent_book(
     CloidMarkets::absorb(cloid_markets, book, market);
 }
 
+/// [`NativeExecContext::return_matched_book`] on the fields it touches (a
+/// field borrow, so settle pass B can run while pool jobs read other fields).
+#[inline]
+fn return_matched_book_in(
+    order_books: &mut HashMap<MarketId, OrderBook>,
+    trader_markets: &mut Option<TraderMarkets>,
+    cloid_markets: &mut Option<CloidMarkets>,
+    market: MarketId,
+    mut book: OrderBook,
+) {
+    TraderMarkets::absorb(trader_markets, &mut book, market);
+    CloidMarkets::absorb(cloid_markets, &mut book, market);
+    order_books.insert(market, book);
+}
+
+/// [`NativeExecutor::latch_core_fault`] on the context's `fatal_error`.
+#[inline]
+fn latch_core_fault_in(fatal_error: &mut Option<String>, step: &str, err: &CoreError) {
+    if err.is_local_fault() && fatal_error.is_none() {
+        *fatal_error = Some(format!("{step}: {err}"));
+    }
+}
+
+/// An action's result before the call decides it (a placement that reaches
+/// Phase 4 keeps it until its settle; 8k L2.1: what a fallback's replay
+/// resets the streamed prefix's placements to).
+fn pending_result() -> NativeActionResult {
+    NativeActionResult::ok("pending", 0)
+}
+
+/// [`NativeExecContext::typed_rows`] from the `sums` field alone.
+#[inline]
+fn typed_rows_of(sums: &Option<BlockSums>) -> Option<&dyn TypedRows> {
+    Some(sums.as_ref()?.records.as_deref()?)
+}
+
+/// The context's trade-history fields (`persist_trade`), borrowed one by
+/// one. Build it with [`trade_sink!`].
+struct TradeSink<'c> {
+    trade_history: bool,
+    record_fills: bool,
+    defer_trades: bool,
+    block_height: u64,
+    fills_block: &'c mut u64,
+    pending_fills: &'c mut Vec<TradeFill>,
+    pending_extras: &'c mut Vec<FillExtras>,
+    inline_fills_written: &'c mut usize,
+    trade_index: &'c mut u32,
+}
+
+/// A [`TradeSink`] over `$ctx`'s fields (`$ctx`: `&mut NativeExecContext`).
+macro_rules! trade_sink {
+    ($ctx:expr) => {
+        TradeSink {
+            trade_history: $ctx.trade_history,
+            record_fills: $ctx.record_fills,
+            defer_trades: $ctx.defer_trades,
+            block_height: $ctx.block_height,
+            fills_block: &mut $ctx.fills_block,
+            pending_fills: &mut $ctx.pending_fills,
+            pending_extras: &mut $ctx.pending_extras,
+            inline_fills_written: &mut $ctx.inline_fills_written,
+            trade_index: &mut $ctx.trade_index,
+        }
+    };
+}
+
+impl TradeSink<'_> {
+    /// Record one fill for this block's trade-history rows (written after
+    /// the batch, see `defer_trades`) and advance the per-block fill counter.
+    /// While `record_fills` is set, callers use [`Self::persist_with_extras`].
+    fn persist(&mut self, market_id: MarketId, fill: &torus_core::order_book::Fill) {
+        if self.trade_history || self.record_fills {
+            if !self.defer_trades && *self.fills_block != self.block_height {
+                // Inline mode, context reused for a new block: the earlier
+                // block's rows are already written.
+                self.pending_fills.clear();
+                self.pending_extras.clear();
+                *self.inline_fills_written = 0;
+            }
+            *self.fills_block = self.block_height;
+            self.pending_fills.push(TradeFill {
+                trade_index: *self.trade_index,
+                market: market_id,
+                maker: fill.maker,
+                taker: fill.taker,
+                price_raw: fill.price.raw(),
+                qty_raw: fill.quantity.raw(),
+                taker_side: if fill.maker_side == Side::Buy { 1 } else { 0 },
+            });
+        }
+        *self.trade_index += 1;
+    }
+
+    /// s80, only while `record_fills`: [`Self::persist`] plus the fill's
+    /// stream-only extras (`taker` / `maker` are its position effects), so
+    /// `pending_extras` stays index-aligned with `pending_fills`.
+    fn persist_with_extras(
+        &mut self,
+        market_id: MarketId,
+        fill: &torus_core::order_book::Fill,
+        taker: FillEffect,
+        maker: FillEffect,
+    ) {
+        debug_assert!(self.record_fills, "extras are recorded only for a stream");
+        self.persist(market_id, fill);
+        self.pending_extras.push(FillExtras {
+            maker_order_id: fill.maker_order_id,
+            taker_order_id: fill.taker_order_id,
+            maker_start_raw: maker.start_size.raw(),
+            taker_start_raw: taker.start_size.raw(),
+            maker_pnl_raw: maker.closed_pnl.map_or(0, |p| p.raw()),
+            taker_pnl_raw: taker.closed_pnl.map_or(0, |p| p.raw()),
+        });
+        debug_assert_eq!(self.pending_extras.len(), self.pending_fills.len());
+    }
+}
+
+/// 8k L2.1: the trade log as it was before the streamed region, so a match
+/// panic or a fallback seen after earlier markets' pass B leaves it as flag
+/// off has it then (flag off runs no pass B before every market matched and
+/// every plan is in).
+/// Without a rollover the region only appends (undo: truncate). In inline
+/// mode on a new height the first recorded fill would CLEAR the earlier
+/// height's fills (their rows are written, but the buffer still holds them
+/// for later calls and the caller); those are parked here instead (moved,
+/// no copy) and come back on a panic, or when the region recorded no fill
+/// (nothing cleared them yet: a later fill of the call clears them as flag
+/// off's would).
+struct TradeLogUndo {
+    fills_len: usize,
+    extras_len: usize,
+    trade_index: u32,
+    fills_block: u64,
+    inline_fills_written: usize,
+    parked: Option<(Vec<TradeFill>, Vec<FillExtras>)>,
+}
+
+impl TradeLogUndo {
+    /// On the context's trade fields (`trade_sink!`: a field borrow, so the
+    /// call's reader may still hold others).
+    fn begin(t: TradeSink<'_>) -> Self {
+        let mut undo = Self {
+            fills_len: t.pending_fills.len(),
+            extras_len: t.pending_extras.len(),
+            trade_index: *t.trade_index,
+            fills_block: *t.fills_block,
+            inline_fills_written: *t.inline_fills_written,
+            parked: None,
+        };
+        // `TradeSink::persist`'s rollover condition.
+        if !t.defer_trades && *t.fills_block != t.block_height {
+            undo.parked = Some((
+                std::mem::take(t.pending_fills),
+                std::mem::take(t.pending_extras),
+            ));
+        }
+        undo
+    }
+
+    /// The region's matching succeeded: its fills stand.
+    fn commit(self, t: TradeSink<'_>) {
+        if let Some((fills, extras)) = self.parked {
+            if *t.fills_block == self.fills_block {
+                // No fill recorded: nothing would have cleared them.
+                debug_assert!(t.pending_fills.is_empty() && t.pending_extras.is_empty());
+                *t.pending_fills = fills;
+                *t.pending_extras = extras;
+            }
+        }
+    }
+
+    /// A match panic or a fallback: the trade log as before the region.
+    fn rollback(self, t: TradeSink<'_>) {
+        match self.parked {
+            Some((fills, extras)) => {
+                *t.pending_fills = fills;
+                *t.pending_extras = extras;
+            }
+            None => {
+                t.pending_fills.truncate(self.fills_len);
+                t.pending_extras.truncate(self.extras_len);
+            }
+        }
+        *t.trade_index = self.trade_index;
+        *t.fills_block = self.fills_block;
+        *t.inline_fills_written = self.inline_fills_written;
+    }
+}
+
+/// 8k L2.1: the context fields settle pass B writes (and its metrics), each
+/// borrowed on its own, so the streamed settle runs pass B on the exec thread
+/// while pool jobs still read the fields it does not hold (positions, oracle,
+/// margin configs, marks, sums, reader fault). Pass B reads positions and
+/// typed rows through shared borrows passed next to it. Build it with
+/// [`pass_b_sink!`]; the flag-off parallel settle uses the same type, so both
+/// paths run literally the same per-market pass B.
+struct PassBSink<'c> {
+    order_books: &'c mut HashMap<MarketId, OrderBook>,
+    trader_markets: &'c mut Option<TraderMarkets>,
+    cloid_markets: &'c mut Option<CloidMarkets>,
+    dirty_books: &'c mut HashSet<MarketId>,
+    next_global_order_id: &'c mut u128,
+    fatal_error: &'c mut Option<String>,
+    metrics: Option<&'c torus_telemetry::Metrics>,
+    /// Feed a returned book's logs into the two indexes (always, but in the
+    /// 8k L2.1 streamed region: there the logs wait in the books until the
+    /// call's matching has succeeded, see [`NativeExecutor::match_settle_streamed`]).
+    absorb_indexes: bool,
+    trades: TradeSink<'c>,
+}
+
+/// A [`PassBSink`] over `$ctx`'s fields (`$ctx`: `&mut NativeExecContext`).
+macro_rules! pass_b_sink {
+    ($ctx:expr) => {
+        PassBSink {
+            order_books: &mut $ctx.order_books,
+            trader_markets: &mut $ctx.trader_markets,
+            cloid_markets: &mut $ctx.cloid_markets,
+            dirty_books: &mut $ctx.dirty_books,
+            next_global_order_id: &mut $ctx.next_global_order_id,
+            fatal_error: &mut $ctx.fatal_error,
+            metrics: $ctx.metrics.as_deref(),
+            absorb_indexes: true,
+            trades: trade_sink!($ctx),
+        }
+    };
+}
+
+/// 8k L2.1: pass B's call-local state: where pass B writes besides the
+/// context (one per `execute_batch` call, carried across the streamed and
+/// the post-stream part of pass B).
+struct PassBOut<'r, 'b> {
+    results: &'r mut [NativeActionResult],
+    total_gas: &'b mut u64,
+    bal_cache: &'b mut BalanceCache,
+    pos_cache: &'b mut PositionCache,
+    /// 8k L2.2: the unmerged per-market caches (`TORUS_SETTLE_NO_MERGE=1`).
+    pos_runs: Option<&'b mut Vec<PositionCache>>,
+    vol_cache: &'b mut VolumeCache,
+    /// s58 (`TORUS_SETTLE_DEFER_RESULTS`): each placed order's book reject,
+    /// by flat index (`Some` = placed in pass B, written by
+    /// [`PassBOut::finish`]). Empty with the flag off.
+    defer: bool,
+    deferred: Vec<Option<Option<FailureReason>>>,
+}
+
+impl<'r, 'b> PassBOut<'r, 'b> {
+    fn new(
+        results: &'r mut [NativeActionResult],
+        total_gas: &'b mut u64,
+        bal_cache: &'b mut BalanceCache,
+        pos_cache: &'b mut PositionCache,
+        pos_runs: Option<&'b mut Vec<PositionCache>>,
+        vol_cache: &'b mut VolumeCache,
+    ) -> Self {
+        // s58 (`TORUS_SETTLE_DEFER_RESULTS=1`): each placed order's book
+        // reject, by flat index (`Some` = placed here, written after the
+        // market loop). 1 byte per action (`FailureReason` is a Copy u8
+        // enum), fresh per call: `execute_batch` runs twice per block.
+        let defer = settle_defer_results_enabled();
+        let deferred = if defer {
+            vec![None; results.len()]
+        } else {
+            Vec::new()
+        };
+        Self {
+            results,
+            total_gas,
+            bal_cache,
+            pos_cache,
+            pos_runs,
+            vol_cache,
+            defer,
+            deferred,
+        }
+    }
+
+    /// s58: the deferred placed results, in one ascending pass (inside the
+    /// pass-B timer). A fill-failed order was written inline and never
+    /// recorded, so its `None` leaves it alone. Ends pass B's results.
+    fn finish(&mut self) {
+        if self.defer {
+            self.defer = false;
+            for (slot, d) in self
+                .results
+                .iter_mut()
+                .zip(std::mem::take(&mut self.deferred))
+            {
+                if let Some(reject) = d {
+                    *slot = NativeActionResult::placed_reject(reject);
+                }
+            }
+        }
+    }
+}
+
+/// 8k L2.1: what the streamed match + plan jobs read (all frozen for the
+/// call and shared by every job).
+struct StreamJobs<'j, 'r, T: StateBackend> {
+    reader: &'j AccountReader<'r, T>,
+    markets: &'j HashMap<MarketId, Phase2Market<'r>>,
+    pools: &'j HashMap<(Address, MarketId), FixedPoint>,
+    margin_configs: &'j HashMap<MarketId, MarketMarginConfig>,
+    positions: &'j PositionManager<T>,
+    typed: Option<&'j dyn TypedRows>,
+    record_fills: bool,
+    timestamp: u64,
+    probe: SettleStreamProbe,
+    /// Pool jobs (each takes markets in id order until they run out).
+    jobs: usize,
+}
+
+/// 8k L2.1: the streamed region's outcome.
+struct StreamedOut {
+    /// The lowest-id market whose match job panicked (the fatal exit).
+    panic: Option<crate::market_workers::MarketWorkerPanic>,
+    /// The settle decision (flag off's `use_parallel`); false on a panic.
+    parallel: bool,
+    /// Markets pass B has not applied, ascending, with their plans (all
+    /// computed when `parallel`; `None`: not computed, the gate said
+    /// sequential or a match panicked).
+    rest: Vec<(
+        crate::market_workers::MarketBatchResult,
+        Option<Result<MarketSettlePlan, String>>,
+    )>,
+    /// Markets pass B applied in the region, ascending (the undo of a match
+    /// panic or a fallback).
+    applied: Vec<AppliedMarket>,
+    /// Of those, applied while a later market's job was still running.
+    early: u64,
+    /// Times the exec thread parked waiting for a market's job.
+    parks: u64,
+    /// Exec-thread time in pass B and waiting for plans (settle time).
+    pass_b: std::time::Duration,
+    plan_wait: std::time::Duration,
+}
+
+/// 8k L2.1: a market the streamed region's pass B applied: what undoing it
+/// needs (its book is in `order_books`).
+struct AppliedMarket {
+    market_id: MarketId,
+    /// In `dirty_books` before the region.
+    was_dirty: bool,
+    results: Vec<crate::market_workers::MatchResult>,
+    next_order_id: OrderId,
+}
+
+/// 8k L2.1: the context as it was before the streamed region, for the two
+/// exits that must leave everything as flag off has it at that point (flag
+/// off runs no pass B before every market matched and every plan is in): a
+/// match panic (flag off's fatal exit) and a plan-failure fallback after a
+/// streamed prefix (flag off's sequential settle, replayed from the start
+/// of Phase 4). The call-local caches undo apart: the balance cache with
+/// its own log ([`BalanceCache::begin_undo`]); the position and volume
+/// caches, the L2.2 runs and pass B's deferred results start empty.
+struct StreamUndo {
+    gas: u64,
+    order_id: u128,
+    fatal: Option<String>,
+    trades: TradeLogUndo,
+}
+
+impl StreamUndo {
+    /// On the context's fields (the call's reader still holds others).
+    fn begin(gas: u64, order_id: u128, fatal: &Option<String>, trades: TradeSink<'_>) -> Self {
+        Self {
+            gas,
+            order_id,
+            fatal: fatal.clone(),
+            trades: TradeLogUndo::begin(trades),
+        }
+    }
+
+    /// The region's context writes stand.
+    fn commit<T: StateBackend>(self, ctx: &mut NativeExecContext<T>) {
+        self.trades.commit(trade_sink!(ctx));
+    }
+
+    /// Undoes what pass B of `applied` did to the context and the gas: the
+    /// order-id counter, the fatal error, the trade log (also across an
+    /// inline height rollover), the dirty-book set; the books leave
+    /// `order_books` again and are returned, in `applied`'s order. The
+    /// indexes were not fed in the region.
+    fn rollback<T: StateBackend>(
+        self,
+        ctx: &mut NativeExecContext<T>,
+        total_gas: &mut u64,
+        applied: &[AppliedMarket],
+    ) -> Vec<OrderBook> {
+        *total_gas = self.gas;
+        ctx.next_global_order_id = self.order_id;
+        ctx.fatal_error = self.fatal;
+        self.trades.rollback(trade_sink!(ctx));
+        applied
+            .iter()
+            .map(|a| {
+                if !a.was_dirty {
+                    ctx.dirty_books.remove(&a.market_id);
+                }
+                ctx.order_books
+                    .remove(&a.market_id)
+                    .expect("L2.1: pass B put the applied market's book back")
+            })
+            .collect()
+    }
+}
+
 pub struct NativeExecContext<T: StateBackend = StateDb> {
     pub positions: PositionManager<T>,
     pub oracle: OracleManager<T>,
@@ -6285,7 +7003,7 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// set (R's source of positions and balances; `None` without R: loads
     /// read the overlay).
     fn typed_rows(&self) -> Option<&dyn TypedRows> {
-        Some(self.sums.as_ref()?.records.as_deref()?)
+        typed_rows_of(&self.sums)
     }
 
     pub fn attach_resident_block(&mut self, block: &mut ResidentBlock) {
@@ -6432,6 +7150,13 @@ impl<T: StateBackend> NativeExecContext<T> {
             .map_or((0, 0), TraderMarkets::size)
     }
 
+    /// 8k L2.1 (tests): the cloid index's entries, stale ones too; `None`
+    /// while not built. O(1).
+    #[doc(hidden)]
+    pub fn cloid_index_len(&self) -> Option<usize> {
+        self.cloid_markets.as_ref().map(|c| c.map.len())
+    }
+
     /// P2-1 (tests): `(carried, rebuilt)` as [`ResidentBooks::trader_index`].
     #[cfg(test)]
     pub(crate) fn trader_index(&self) -> (Option<TraderIndexSnapshot>, TraderIndexSnapshot) {
@@ -6553,10 +7278,14 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// consistent for any caller that settles without that step (the r02
     /// unit tests call the settle passes directly).
     #[inline]
-    fn return_matched_book(&mut self, market: MarketId, mut book: OrderBook) {
-        TraderMarkets::absorb(&mut self.trader_markets, &mut book, market);
-        CloidMarkets::absorb(&mut self.cloid_markets, &mut book, market);
-        self.order_books.insert(market, book);
+    fn return_matched_book(&mut self, market: MarketId, book: OrderBook) {
+        return_matched_book_in(
+            &mut self.order_books,
+            &mut self.trader_markets,
+            &mut self.cloid_markets,
+            market,
+            book,
+        );
     }
 
     /// Drain the block's fills (`trade_index` order). Under `defer_trades` the
@@ -8360,9 +9089,7 @@ impl NativeExecutor {
         }
 
         let n = flat.len();
-        let mut results: Vec<NativeActionResult> = (0..n)
-            .map(|_| NativeActionResult::ok("pending", 0))
-            .collect();
+        let mut results: Vec<NativeActionResult> = (0..n).map(|_| pending_result()).collect();
         let mut total_gas = 0u64;
 
         // ---- Phase 1: Partition and execute non-PlaceOrder actions ----
@@ -8822,21 +9549,46 @@ impl NativeExecutor {
         // inputs are built inside its pool match job (single-market blocks
         // keep the inline path). Taking or creating the book stays here.
         let setup_in_jobs = parallel_match_setup_enabled() && market_batches.len() >= 2;
+        // 8k L2.1 test seam (default: nothing planted).
+        let probe = SETTLE_STREAM_PROBE.with(std::cell::Cell::get);
+        // C3: the parallel settle's gate over the call's fills (monotone:
+        // once a partial sum passes it, the total does too).
+        let settle_gate = |total_fills: usize| match settle_mode {
+            SettleMode::Force { parallel, .. } => parallel,
+            // L3-ENG: with the engine on, the (byte-identical) C3 parallel
+            // settle engages from a much lower fill count — cap-400 blocks
+            // never reach the classic 1024 gate.
+            SettleMode::Auto => {
+                (parallel_settle_enabled() && total_fills >= parallel_settle_min_fills())
+                    || (engine_threads >= 2 && total_fills >= parallel_engine_min_fills())
+            }
+        };
+        // 8k L2.1 (`TORUS_SETTLE_STREAMED=1`): fused match + plan jobs and a
+        // streamed pass B, whenever the match setup runs in the jobs (>= 2
+        // markets) and the parallel settle can engage at all.
+        let streamed = setup_in_jobs
+            && match settle_mode {
+                SettleMode::Force { parallel, .. } => parallel,
+                SettleMode::Auto => parallel_settle_enabled() || engine_threads >= 2,
+            }
+            && settle_streamed_enabled();
         let mut setup_items = Vec::new();
         for (&market_id, prepared) in &market_batches {
             // Item 6 M1 (row 42): a missing book gets the tick / lot Phase 2
             // checked against (`shapes` holds every batch market).
-            let mut book = NativeExecContext::<T>::take_book_for_matching(&mut ctx.order_books, market_id)
-                .unwrap_or_else(|| {
-                let (tick, lot) = markets.get(&market_id).map(|m| m.shape).unwrap_or_else(|| {
-                    // R02 branch 5: a failed read fail-stops (reader channel).
-                    Self::market_shape(&ctx.state, market_id).unwrap_or_else(|e| {
-                        reader.note_fault("market shape read", &e);
-                        (FixedPoint::ONE, FixedPoint::ONE)
-                    })
-                });
-                OrderBook::new(market_id, tick, lot)
-            });
+            let mut book =
+                NativeExecContext::<T>::take_book_for_matching(&mut ctx.order_books, market_id)
+                    .unwrap_or_else(|| {
+                        let (tick, lot) =
+                            markets.get(&market_id).map(|m| m.shape).unwrap_or_else(|| {
+                                // R02 branch 5: a failed read fail-stops (reader channel).
+                                Self::market_shape(&ctx.state, market_id).unwrap_or_else(|e| {
+                                    reader.note_fault("market shape read", &e);
+                                    (FixedPoint::ONE, FixedPoint::ONE)
+                                })
+                            });
+                        OrderBook::new(market_id, tick, lot)
+                    });
 
             if setup_in_jobs {
                 // TORUS_PARALLEL_MATCH_SETUP: the market's job builds its
@@ -8868,169 +9620,246 @@ impl NativeExecutor {
         // order in a book (Phase 2 only reserves; a worker adds only its
         // own requests, whose cloids differ by the claimed set; fired stops
         // are placed after settlement), so the books skip their re-check.
-        let matched = if setup_in_jobs {
+        let mut triggered: VecDeque<TriggeredStop> = VecDeque::new();
+        // 8k L2.1: settle time spent inside the streamed region (pass B and
+        // the waits for plans), added to the settle timer below.
+        let mut settle_carry = std::time::Duration::ZERO;
+        let settle_timer;
+        if streamed {
             #[cfg(test)]
             MATCH_SETUP_IN_JOBS.with(|c| c.set(c.get() + 1));
-            // The setup only reads `reader`, `markets`, `pools` and the
-            // configs (all frozen / immutable here) and writes its own
-            // book; a panic in it is that market's `MarketWorkerPanic`.
-            MarketWorkerPool::match_parallel_setup_with(
-                setup_items,
-                ctx.timestamp,
-                MarketWorkerPool::resolve_worker_cap_named(None),
-                Some(&reader),
-                true,
-                &|m, book, prepared| {
-                    Self::match_setup(
-                        &reader,
-                        &markets,
-                        &pools,
-                        &ctx.margin_configs,
-                        m,
-                        book,
-                        prepared,
-                    )
-                },
-            )
-        } else {
-            MarketWorkerPool::match_parallel_with(
-                worker_batches,
-                ctx.timestamp,
-                Some(&reader),
-                true,
-            )
-        };
-        let mut market_results = match matched {
-            Ok(r) => r,
-            Err(panic) => {
-                // T1.5 FAIL-STOP: the panicking worker consumed its market's
-                // book (and this block's other books were consumed with it),
-                // so settlement cannot proceed and the block must never be
-                // applied. Latch the fatal on the context — the committer
-                // halts the execution pipeline on it — and bail out loudly.
-                tracing::error!(
-                    market_id = panic.market_id,
-                    message = %panic.message,
-                    "market worker panicked — FATAL, block cannot be executed"
-                );
-                for &i in &place_order_indices {
-                    results[i] = NativeActionResult::err(
-                        "place_order",
-                        "market worker panicked — block execution aborted".to_string(),
-                    );
-                }
-                ctx.fatal_error = Some(format!(
-                    "market worker panicked (market {}): {}",
-                    panic.market_id, panic.message
-                ));
-                return NativeBatchResult { results, total_gas };
-            }
-        };
-        let match_elapsed = match_timer.elapsed();
-        ctx.phase_accum.match_ns += match_elapsed.as_nanos();
-        if let Some(ref m) = ctx.metrics {
-            m.exec_phase_match_seconds
-                .observe(match_elapsed.as_secs_f64());
-        }
-
-        // ---- Phase 4: settlement ----
-        // A5: settle markets in market-id order. `match_parallel` returns
-        // HashMap iteration order (random per instance) — balance mutations
-        // are commutative so consensus state never depended on it, but the
-        // per-block trade_index assignment (node-local trade keys) and the
-        // defensive `.min(order_margin)` clamps on the new cross-trader maker
-        // releases do observe settlement order. Sorting pins both.
-        market_results.sort_by_key(|m| m.market_id);
-        // s515: the policing positions are batch-scoped (never let them go
-        // stale on a resident book); stops fired during matching are placed
-        // after settlement, in market-id / order / trigger order.
-        let mut triggered: VecDeque<TriggeredStop> = VecDeque::new();
-        for mbr in market_results.iter_mut() {
-            // P2-1: what rested or was stored in this book feeds the index.
-            TraderMarkets::absorb(&mut ctx.trader_markets, &mut mbr.book, mbr.market_id);
-            // s114 follow-up: and the cloid index (adds before any later check).
-            CloidMarkets::absorb(&mut ctx.cloid_markets, &mut mbr.book, mbr.market_id);
-            mbr.book.clear_reduce_only_positions();
-            // Plan 9.11 (telemetry): this book's charged maker fills.
-            if let Some(m) = ctx.metrics.as_deref() {
-                m.maker_offmark_charged_fills.inc_by(mbr.book.account_margins().charged_maker_fills());
-            }
-            mbr.book.clear_account_margins();
-            for r in &mbr.results {
-                triggered.extend(r.result.triggered_stops.iter().cloned());
-            }
-            // s92 counters (aligned with the market's prepared orders).
-            if let (Some(m), Some(prepared)) = (ctx.metrics.as_deref(), market_batches.get(&mbr.market_id)) {
-                if fast_top_ups {
-                    // s58: the same counts, batched.
-                    Self::record_margin_cuts_batched(m, &mbr.results, prepared, mbr.book.tick_size);
-                } else {
-                    for (r, p) in mbr.results.iter().zip(prepared) {
-                        Self::record_margin_cuts(
-                            m,
-                            p.params.is_buy,
-                            &r.result,
-                            p.res_price,
-                            mbr.book.tick_size,
-                            p.top_up_candidate,
-                        );
-                    }
-                }
-            }
-        }
-        let settle_timer = std::time::Instant::now();
-        // C3: parallel settle pays a thread scope + plan handoff, so it needs
-        // >=2 markets with work (always) and, in Auto mode, enough fills to
-        // amortize the overhead. The sequential loop remains the canonical
-        // semantics that the parallel path must reproduce byte-for-byte.
-        let use_parallel = market_results.len() >= 2
-            && match settle_mode {
-                SettleMode::Force { parallel, .. } => parallel,
-                SettleMode::Auto => {
-                    let total_fills: usize = market_results
-                        .iter()
-                        .flat_map(|m| m.results.iter())
-                        .map(|r| r.result.fills.len())
-                        .sum();
-                    // L3-ENG: with the engine on, the (byte-identical) C3
-                    // parallel settle engages from a much lower fill count —
-                    // cap-400 blocks never reach the classic 1024 gate.
-                    (parallel_settle_enabled() && total_fills >= parallel_settle_min_fills())
-                        || (engine_threads >= 2 && total_fills >= parallel_engine_min_fills())
-                }
-            };
-        if use_parallel {
-            // R6: pass-A worker cap. Pinned caps come from `SettleMode::Force`
-            // (tests / A-B benches); production resolves it from the env.
-            let settle_workers = match settle_mode {
+            // Markets ascending: pass B's order, and the pool's take order.
+            setup_items.sort_unstable_by_key(|item| item.0);
+            let jobs = match settle_mode {
                 SettleMode::Force {
                     workers: Some(w), ..
                 } => w.max(1),
-                _ => settle_worker_cap(),
+                _ => MarketWorkerPool::resolve_worker_cap_named(None),
             };
-            Self::settle_market_results_parallel_runs(
-                ctx,
-                market_results,
-                &market_batches,
+            // The region's undo, for a match panic and for a fallback (see
+            // `match_settle_streamed`, "Fallbacks"). The call-local settle
+            // state starts empty; the placements reaching Phase 4 are pending.
+            debug_assert!(pos_cache.is_empty() && pos_runs.is_empty() && vol_cache.is_empty());
+            debug_assert!(market_batches.values().flatten().all(|p| {
+                let r = &results[p.index];
+                (r.action_type, r.success, r.gas_used) == ("pending", true, 0)
+            }));
+            let undo = StreamUndo::begin(
+                total_gas,
+                ctx.next_global_order_id,
+                &ctx.fatal_error,
+                trade_sink!(ctx),
+            );
+            bal_cache.begin_undo();
+            let mut out = PassBOut::new(
                 &mut results,
                 &mut total_gas,
                 &mut bal_cache,
                 &mut pos_cache,
                 settle_no_merge.then_some(&mut pos_runs),
                 &mut vol_cache,
-                settle_workers,
             );
+            let typed = typed_rows_of(&ctx.sums);
+            let streamed_out = {
+                let mut sink = pass_b_sink!(ctx);
+                Self::match_settle_streamed(
+                    StreamJobs {
+                        reader: &reader,
+                        markets: &markets,
+                        pools: &pools,
+                        margin_configs: &ctx.margin_configs,
+                        positions: &ctx.positions,
+                        typed,
+                        record_fills: ctx.record_fills,
+                        timestamp: ctx.timestamp,
+                        probe,
+                        jobs,
+                    },
+                    setup_items,
+                    &mut sink,
+                    &mut ctx.phase_accum,
+                    &market_batches,
+                    fast_top_ups,
+                    &settle_gate,
+                    &mut triggered,
+                    &mut out,
+                )
+            };
+            let mut streamed_out = streamed_out;
+            if let Some(panic) = streamed_out.panic.take() {
+                // T1.5 FAIL-STOP, exactly the flag-off exit below: the block
+                // is never applied. Markets before the panicking one may have
+                // gone through pass B already; what that did to the context
+                // and the call is undone, so the context is the one flag
+                // off's exit leaves: results, gas, the order-id counter, the
+                // trade log (which `write_trades_inline` writes, also across
+                // an inline height rollover), the books (flag off lost every
+                // book of the call: the applied ones leave again and are
+                // dropped) and the dirty set. Both indexes were not fed in
+                // the region. The call-local caches are dropped.
+                drop(out);
+                drop(undo.rollback(ctx, &mut total_gas, &streamed_out.applied));
+                return Self::match_panic_exit(
+                    ctx,
+                    panic,
+                    &place_order_indices,
+                    results,
+                    total_gas,
+                );
+            }
+            let in_region = streamed_out.pass_b + streamed_out.plan_wait;
+            let match_elapsed = match_timer.elapsed().saturating_sub(in_region);
+            ctx.phase_accum.match_ns += match_elapsed.as_nanos();
+            if let Some(ref m) = ctx.metrics {
+                m.exec_phase_match_seconds
+                    .observe(match_elapsed.as_secs_f64());
+            }
+            settle_carry = in_region;
+            settle_timer = std::time::Instant::now();
+            // Flag off's fallback decision, over every plan (the applied
+            // ones passed it).
+            let fallback = if streamed_out.parallel {
+                Self::plan_fallback(streamed_out.rest.iter().filter_map(|(_, p)| p.as_ref()))
+            } else {
+                None
+            };
+            if fallback.is_some() && !streamed_out.applied.is_empty() {
+                // A fallback after a streamed prefix: undo the prefix's pass
+                // B and replay flag off's sequential settle from the start of
+                // Phase 4 over every market (`settle_streamed_rest`).
+                Self::undo_streamed_prefix(ctx, undo, &mut streamed_out, &market_batches, &mut out);
+                SETTLE_STREAMED_HYBRID.with(|c| c.set(c.get() + 1));
+                if let Some(ref m) = ctx.metrics {
+                    m.exec_settle_streamed_resumed_fallbacks.inc();
+                }
+            } else {
+                out.bal_cache.commit_undo();
+                undo.commit(ctx);
+            }
+            Self::absorb_indexes_after_stream(ctx, &mut streamed_out);
+            Self::settle_streamed_rest(ctx, streamed_out, fallback, &market_batches, out);
         } else {
-            Self::settle_market_results_sequential(
-                ctx,
-                market_results,
-                &market_batches,
-                &mut results,
-                &mut total_gas,
-                &mut bal_cache,
-                &mut pos_cache,
-                &mut vol_cache,
-            );
+            let matched = if setup_in_jobs {
+                #[cfg(test)]
+                MATCH_SETUP_IN_JOBS.with(|c| c.set(c.get() + 1));
+                // The setup only reads `reader`, `markets`, `pools` and the
+                // configs (all frozen / immutable here) and writes its own
+                // book; a panic in it is that market's `MarketWorkerPanic`.
+                MarketWorkerPool::match_parallel_setup_with(
+                    setup_items,
+                    ctx.timestamp,
+                    MarketWorkerPool::resolve_worker_cap_named(None),
+                    Some(&reader),
+                    true,
+                    &|m, book, prepared| {
+                        if probe.match_panic == Some(m) {
+                            panic!("planted match panic (L2.1 test seam)");
+                        }
+                        Self::match_setup(
+                            &reader,
+                            &markets,
+                            &pools,
+                            &ctx.margin_configs,
+                            m,
+                            book,
+                            prepared,
+                        )
+                    },
+                )
+            } else {
+                MarketWorkerPool::match_parallel_with(
+                    worker_batches,
+                    ctx.timestamp,
+                    Some(&reader),
+                    true,
+                )
+            };
+            let mut market_results = match matched {
+                Ok(r) => r,
+                Err(panic) => {
+                    return Self::match_panic_exit(
+                        ctx,
+                        panic,
+                        &place_order_indices,
+                        results,
+                        total_gas,
+                    )
+                }
+            };
+            let match_elapsed = match_timer.elapsed();
+            ctx.phase_accum.match_ns += match_elapsed.as_nanos();
+            if let Some(ref m) = ctx.metrics {
+                m.exec_phase_match_seconds
+                    .observe(match_elapsed.as_secs_f64());
+            }
+
+            // ---- Phase 4: settlement ----
+            // A5: settle markets in market-id order. `match_parallel` returns
+            // HashMap iteration order (random per instance) — balance mutations
+            // are commutative so consensus state never depended on it, but the
+            // per-block trade_index assignment (node-local trade keys) and the
+            // defensive `.min(order_margin)` clamps on the new cross-trader maker
+            // releases do observe settlement order. Sorting pins both.
+            market_results.sort_by_key(|m| m.market_id);
+            // s515: the policing positions are batch-scoped (never let them go
+            // stale on a resident book); stops fired during matching are placed
+            // after settlement, in market-id / order / trigger order.
+            for mbr in market_results.iter_mut() {
+                Self::absorb_matched(
+                    Some((&mut ctx.trader_markets, &mut ctx.cloid_markets)),
+                    ctx.metrics.as_deref(),
+                    &market_batches,
+                    fast_top_ups,
+                    mbr,
+                    &mut triggered,
+                );
+            }
+            settle_timer = std::time::Instant::now();
+            // C3: parallel settle pays a thread scope + plan handoff, so it needs
+            // >=2 markets with work (always) and, in Auto mode, enough fills to
+            // amortize the overhead. The sequential loop remains the canonical
+            // semantics that the parallel path must reproduce byte-for-byte.
+            let use_parallel = market_results.len() >= 2
+                && settle_gate(
+                    market_results
+                        .iter()
+                        .flat_map(|m| m.results.iter())
+                        .map(|r| r.result.fills.len())
+                        .sum(),
+                );
+            if use_parallel {
+                // R6: pass-A worker cap. Pinned caps come from `SettleMode::Force`
+                // (tests / A-B benches); production resolves it from the env.
+                let settle_workers = match settle_mode {
+                    SettleMode::Force {
+                        workers: Some(w), ..
+                    } => w.max(1),
+                    _ => settle_worker_cap(),
+                };
+                Self::settle_market_results_parallel_runs(
+                    ctx,
+                    market_results,
+                    &market_batches,
+                    &mut results,
+                    &mut total_gas,
+                    &mut bal_cache,
+                    &mut pos_cache,
+                    settle_no_merge.then_some(&mut pos_runs),
+                    &mut vol_cache,
+                    settle_workers,
+                );
+            } else {
+                Self::settle_market_results_sequential(
+                    ctx,
+                    market_results,
+                    &market_batches,
+                    &mut results,
+                    &mut total_gas,
+                    &mut bal_cache,
+                    &mut pos_cache,
+                    &mut vol_cache,
+                );
+            }
         }
 
         // C1/O1: materialize all deferred position + balance mutations into the
@@ -9100,7 +9929,7 @@ impl NativeExecutor {
             Self::run_triggered_stops(ctx, triggered);
         }
 
-        let settle_elapsed = settle_timer.elapsed();
+        let settle_elapsed = settle_timer.elapsed() + settle_carry;
         ctx.phase_accum.settle_ns += settle_elapsed.as_nanos();
         if let Some(ref m) = ctx.metrics {
             m.exec_phase_settle_seconds
@@ -9549,6 +10378,538 @@ impl NativeExecutor {
         Some((outcomes, merged))
     }
 
+    /// T1.5 FAIL-STOP: a market worker panicked. The panicking worker
+    /// consumed its market's book (and this call's other books were consumed
+    /// with it), so settlement cannot proceed and the block must never be
+    /// applied. Latch the fatal on the context — the committer halts the
+    /// execution pipeline on it — and bail out loudly.
+    fn match_panic_exit<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        panic: crate::market_workers::MarketWorkerPanic,
+        place_order_indices: &[usize],
+        mut results: Vec<NativeActionResult>,
+        total_gas: u64,
+    ) -> NativeBatchResult {
+        tracing::error!(
+            market_id = panic.market_id,
+            message = %panic.message,
+            "market worker panicked — FATAL, block cannot be executed"
+        );
+        for &i in place_order_indices {
+            results[i] = NativeActionResult::err(
+                "place_order",
+                "market worker panicked — block execution aborted".to_string(),
+            );
+        }
+        ctx.fatal_error = Some(format!(
+            "market worker panicked (market {}): {}",
+            panic.market_id, panic.message
+        ));
+        NativeBatchResult { results, total_gas }
+    }
+
+    /// Phase 4's per-market prologue on a matched book, in market-id order:
+    /// feed its logs into the cancel-all and cloid indexes (`indexes`), clear
+    /// the batch-scoped policing state, count its charged maker fills and
+    /// margin cuts, and collect the stops it fired. Shared by the flag-off
+    /// path (all markets, then the settle) and the 8k L2.1 streamed path
+    /// (each market as its job finishes, before its pass B; `indexes` `None`:
+    /// the logs stay in the book until the call's matching succeeded, see
+    /// [`Self::absorb_indexes_after_stream`]). Touches only the book, the
+    /// two indexes, metrics and `triggered`; pass B of an earlier market
+    /// reads none of them, so the two interleavings are the same.
+    #[allow(clippy::too_many_arguments)]
+    fn absorb_matched(
+        indexes: Option<(&mut Option<TraderMarkets>, &mut Option<CloidMarkets>)>,
+        metrics: Option<&torus_telemetry::Metrics>,
+        market_batches: &HashMap<MarketId, Vec<PreparedOrder<'_>>>,
+        fast_top_ups: bool,
+        mbr: &mut crate::market_workers::MarketBatchResult,
+        triggered: &mut VecDeque<TriggeredStop>,
+    ) {
+        if let Some((trader_markets, cloid_markets)) = indexes {
+            // P2-1: what rested or was stored in this book feeds the index.
+            TraderMarkets::absorb(trader_markets, &mut mbr.book, mbr.market_id);
+            // s114 follow-up: and the cloid index (adds before any later check).
+            CloidMarkets::absorb(cloid_markets, &mut mbr.book, mbr.market_id);
+        }
+        mbr.book.clear_reduce_only_positions();
+        // Plan 9.11 (telemetry): this book's charged maker fills.
+        if let Some(m) = metrics {
+            m.maker_offmark_charged_fills
+                .inc_by(mbr.book.account_margins().charged_maker_fills());
+        }
+        mbr.book.clear_account_margins();
+        for r in &mbr.results {
+            triggered.extend(r.result.triggered_stops.iter().cloned());
+        }
+        // s92 counters (aligned with the market's prepared orders).
+        if let (Some(m), Some(prepared)) = (metrics, market_batches.get(&mbr.market_id)) {
+            if fast_top_ups {
+                // s58: the same counts, batched.
+                Self::record_margin_cuts_batched(m, &mbr.results, prepared, mbr.book.tick_size);
+            } else {
+                for (r, p) in mbr.results.iter().zip(prepared) {
+                    Self::record_margin_cuts(
+                        m,
+                        p.params.is_buy,
+                        &r.result,
+                        p.res_price,
+                        mbr.book.tick_size,
+                        p.top_up_candidate,
+                    );
+                }
+            }
+        }
+    }
+
+    /// 8k L2.1 (`TORUS_SETTLE_STREAMED=1`): Phase 3 and the streamed part of
+    /// Phase 4. Each market (ascending id) is one pool job: its match setup,
+    /// its matching, then its settle plan (pass A, contained). The exec
+    /// thread takes the jobs' results IN MARKET ORDER as they finish: for
+    /// each market it runs the Phase 4 prologue ([`Self::absorb_matched`])
+    /// and, once the settle decision is known to be parallel, its pass B
+    /// ([`Self::settle_pass_b_market`]), while the pool still works on later
+    /// markets.
+    ///
+    /// Why the order and every write are those of flag off:
+    /// - Jobs write nothing shared: a market's job owns its book and builds
+    ///   its own result and plan cache. They read only state frozen for the
+    ///   whole call (the backend: nothing writes it until the end-of-call
+    ///   flush; the reader, configs, marks, sums, Phase 2's `markets` and
+    ///   `pools`; the prepared orders). So a market's (match result, plan) is
+    ///   the same whether it ran before, during or after any pass B.
+    /// - Pass B of market k reads its own (result, plan), the prepared
+    ///   orders, the batch balance cache and the context fields in `sink`.
+    ///   Only the exec thread writes those, and only through the prologue
+    ///   and pass B of markets 0..k, in that order. No job can still change
+    ///   anything pass B of market k reads.
+    /// - The prologue of market k touches its book, metrics and the stop
+    ///   list (the two indexes are fed after the region, in market order);
+    ///   pass B of markets < k reads none of them. So prologue(0), B(0),
+    ///   prologue(1), B(1), ... is flag off's prologue(0..n) then B(0..n),
+    ///   write for write.
+    /// - The decision: flag off settles in parallel iff the gate holds on
+    ///   the call's total fills. The gate is monotone, so pass B starts only
+    ///   once the fills seen so far pass it (or every market is in and the
+    ///   total does); otherwise nothing is applied and the caller runs the
+    ///   sequential loop on all markets.
+    /// - Fallbacks (rule, Codex round 2: close the class): pass B streams
+    ///   only up to the first market whose plan failed (panic or fill error)
+    ///   or is impure (its cache holds another market's key: an opaque row).
+    ///   An impure plan alone is no fallback (flag off's pass B applies it
+    ///   too): the rest go through pass B after the region. On a FAILED plan
+    ///   flag off reruns the whole settle sequentially; streamed, the caller
+    ///   UNDOES everything the prefix's pass B did in this call
+    ///   ([`StreamUndo`], [`BalanceCache::rollback_undo`],
+    ///   [`Self::undo_streamed_prefix`]) and replays flag off's fallback
+    ///   from the start of Phase 4 over every market. Nothing of a partial
+    ///   prefix is kept, so no fault can make the two diverge through it.
+    ///   Faults on replay: the region's backend reads were the first of
+    ///   their keys since the region began (the backend is frozen for the
+    ///   call; only pass B reads balances, the jobs read positions), so the
+    ///   balance cache keeps what the region loaded and re-raises, per key
+    ///   in order, the read errors pass B hit, before reading that key
+    ///   again: read for read, the replay sees what flag off's sequential
+    ///   loop gets from the backend, including a one-shot fault the region
+    ///   consumed (same error, same stop point, same fatal). Telemetry
+    ///   counters pass B bumped for the prefix are not undone (they feed no
+    ///   state).
+    /// - No speculative reads (Codex P2): flag off computes plans only when
+    ///   it settles in parallel. A job computes its market's plan only once
+    ///   the fills of the markets matched so far (any order, an atomic sum)
+    ///   pass the gate, which then holds on the total too; else it leaves the
+    ///   plan to the exec thread, which computes it once the decision is
+    ///   parallel (plans read only call-frozen state, so it is the same
+    ///   plan). Below the gate no plan reads anything, so a read fault hits
+    ///   the sequential loop exactly as with the flag off.
+    /// - A match panic: the lowest-id panicking market ends the loop (taken
+    ///   in id order, so every lower market matched); the caller takes the
+    ///   flag-off fatal exit and undoes what pass B of the lower markets did
+    ///   to the context (`applied`, [`StreamUndo`]). Until the call's
+    ///   matching succeeded the books' index logs are not fed (the caller
+    ///   does it after the region, in market order, as flag off's prologue),
+    ///   so a panic leaves both indexes untouched, as flag off's exit does.
+    #[allow(clippy::too_many_arguments)]
+    fn match_settle_streamed<'m, 'x, T: StateBackend>(
+        jobs_in: StreamJobs<'_, '_, T>,
+        items: Vec<(MarketId, OrderBook, &'m [PreparedOrder<'x>], usize)>,
+        sink: &mut PassBSink<'_>,
+        accum: &mut ExecPhaseAccum,
+        market_batches: &'m HashMap<MarketId, Vec<PreparedOrder<'x>>>,
+        fast_top_ups: bool,
+        settle_gate: &(dyn Fn(usize) -> bool + Sync),
+        triggered: &mut VecDeque<TriggeredStop>,
+        out: &mut PassBOut<'_, '_>,
+    ) -> StreamedOut {
+        let StreamJobs {
+            reader,
+            markets,
+            pools,
+            margin_configs,
+            positions,
+            typed,
+            record_fills,
+            timestamp,
+            probe,
+            jobs,
+        } = jobs_in;
+        let ids: Vec<MarketId> = items.iter().map(|item| item.0).collect();
+        let n = ids.len();
+        let items: Vec<(MarketId, OrderBook, &'m [PreparedOrder<'x>])> =
+            items.into_iter().map(|(m, b, p, _)| (m, b, p)).collect();
+        type Plan = Option<Result<MarketSettlePlan, String>>;
+        type JobOut = Result<
+            (crate::market_workers::MarketBatchResult, Plan),
+            crate::market_workers::MarketWorkerPanic,
+        >;
+        // One market's contained plan, as flag-off pass A computes it.
+        let plan_of = |mbr: &crate::market_workers::MarketBatchResult| {
+            Self::market_settle_plan_contained(
+                positions,
+                typed,
+                margin_configs.get(&mbr.market_id),
+                mbr,
+                market_batches
+                    .get(&mbr.market_id)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]),
+                record_fills,
+                probe.plan_panic,
+            )
+        };
+        // Fills of the markets matched so far, in any order (a lower bound
+        // of the call's total: the gate passing on it is final). Relaxed: a
+        // stale (smaller) sum only leaves a plan to the exec thread.
+        let fills_matched = std::sync::atomic::AtomicUsize::new(0);
+        // The streamed region feeds no index (see above; `sink` is this
+        // call's, dropped after the region).
+        sink.absorb_indexes = false;
+        let work = |_: usize,
+                    (market_id, book, prepared): (MarketId, OrderBook, &'m [PreparedOrder<'x>])|
+         -> JobOut {
+            // Match: contained like the flag-off match jobs (a panic is this
+            // market's `MarketWorkerPanic`, the block's fatal exit).
+            let mbr = MarketWorkerPool::run_contained(market_id, move || {
+                if probe.match_panic == Some(market_id) {
+                    panic!("planted match panic (L2.1 test seam)");
+                }
+                let mut book = book;
+                let requests = Self::match_setup(
+                    reader,
+                    markets,
+                    pools,
+                    margin_configs,
+                    market_id,
+                    &mut book,
+                    prepared,
+                );
+                MarketWorkerPool::match_market(
+                    market_id,
+                    book,
+                    requests,
+                    timestamp,
+                    Some(reader as &dyn MakerAccountSource),
+                    true,
+                )
+            })?;
+            // Plan: contained and recovered like flag-off pass A, and only
+            // once the parallel settle is certain (no speculative reads).
+            let fills: usize = mbr.results.iter().map(|r| r.result.fills.len()).sum();
+            let matched =
+                fills_matched.fetch_add(fills, std::sync::atomic::Ordering::Relaxed) + fills;
+            let plan = settle_gate(matched).then(|| plan_of(&mbr));
+            Ok((mbr, plan))
+        };
+        let batch = crate::exec_pool::wake_batch(n);
+        crate::exec_pool::run_streamed(items, jobs, batch, probe.jitter_seed, &work, |rx| {
+            let mut pending: VecDeque<(crate::market_workers::MarketBatchResult, Plan)> =
+                VecDeque::with_capacity(n);
+            let mut decided: Option<bool> = None;
+            let mut fills_seen = 0usize;
+            let mut streaming = true;
+            let mut applied: Vec<AppliedMarket> = Vec::new();
+            let mut early = 0u64;
+            let (mut pass_b, mut plan_wait) =
+                (std::time::Duration::ZERO, std::time::Duration::ZERO);
+            let mut panic = None;
+            let parks_before = crate::exec_pool::stream_parks_on_this_thread().0;
+            for i in 0..n {
+                let wait_start = std::time::Instant::now();
+                let got = rx.take(i);
+                if decided == Some(true) {
+                    plan_wait += wait_start.elapsed();
+                }
+                let (mut mbr, plan) = match got {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(p)) => {
+                        panic = Some(p);
+                        break;
+                    }
+                    // Unreachable in practice (the job body is contained);
+                    // reported as flag off reports a job dying outside the
+                    // per-market containment.
+                    Err(_) => {
+                        panic = Some(crate::market_workers::MarketWorkerPanic {
+                            market_id: ids[i],
+                            message: "worker thread died outside contained matching".to_string(),
+                        });
+                        break;
+                    }
+                };
+                Self::absorb_matched(
+                    None,
+                    sink.metrics,
+                    market_batches,
+                    fast_top_ups,
+                    &mut mbr,
+                    triggered,
+                );
+                fills_seen += mbr
+                    .results
+                    .iter()
+                    .map(|r| r.result.fills.len())
+                    .sum::<usize>();
+                pending.push_back((mbr, plan));
+                if decided.is_none() && (i + 1 == n || settle_gate(fills_seen)) {
+                    decided = Some(settle_gate(fills_seen));
+                }
+                if decided != Some(true) || !streaming {
+                    continue;
+                }
+                while let Some((mbr, plan)) = pending.front_mut() {
+                    if plan.is_none() {
+                        // Matched before the gate was certain: its plan now
+                        // (exec-thread pass A time).
+                        let t = std::time::Instant::now();
+                        *plan = Some(plan_of(mbr));
+                        plan_wait += t.elapsed();
+                    }
+                    let ok = match plan.as_ref().expect("computed above") {
+                        Ok(p) => {
+                            p.orders.iter().all(|o| o.fill_error.is_none())
+                                && p.pos_cache
+                                    .market_range()
+                                    .is_none_or(|r| r == (mbr.market_id, mbr.market_id))
+                        }
+                        Err(_) => false,
+                    };
+                    if !ok {
+                        streaming = false;
+                        break;
+                    }
+                    let Some((mbr, Some(Ok(plan)))) = pending.pop_front() else {
+                        unreachable!("checked above");
+                    };
+                    if probe.jitter_seed != 0 {
+                        std::thread::sleep(std::time::Duration::from_micros(
+                            crate::exec_pool::jitter_us(
+                                probe.jitter_seed ^ 0xE8EC_7E5A,
+                                applied.len(),
+                            ),
+                        ));
+                    }
+                    let is_early = !rx.all_done();
+                    let (market_id, next_order_id) = (mbr.market_id, mbr.next_order_id);
+                    let was_dirty = sink.dirty_books.contains(&market_id);
+                    let t = std::time::Instant::now();
+                    let results = Self::settle_pass_b_market(
+                        sink,
+                        positions,
+                        typed,
+                        mbr,
+                        plan,
+                        market_batches,
+                        out,
+                    );
+                    pass_b += t.elapsed();
+                    applied.push(AppliedMarket {
+                        market_id,
+                        was_dirty,
+                        results,
+                        next_order_id,
+                    });
+                    early += u64::from(is_early);
+                }
+            }
+            let parallel = panic.is_none() && decided == Some(true);
+            if parallel {
+                // Every remaining plan, as flag off's pass A computes all of
+                // them before its fallback check (its first local fault is
+                // latched from any market's plan).
+                let t = std::time::Instant::now();
+                for (mbr, plan) in pending.iter_mut() {
+                    if plan.is_none() {
+                        *plan = Some(plan_of(mbr));
+                    }
+                }
+                plan_wait += t.elapsed();
+                // Pass A is fused into the jobs; what the exec thread still
+                // waits for is the plans (>= 1 ns, so a streamed call counts
+                // as a parallel settle).
+                accum.settle_pass_a_ns += plan_wait.as_nanos().max(1);
+                accum.settle_pass_b_ns += pass_b.as_nanos();
+            }
+            StreamedOut {
+                panic,
+                parallel,
+                rest: pending.into(),
+                applied,
+                early,
+                parks: crate::exec_pool::stream_parks_on_this_thread().0 - parks_before,
+                pass_b,
+                plan_wait,
+            }
+        })
+    }
+
+    /// 8k L2.1: after a streamed region whose matching succeeded, feed every
+    /// market's book logs into both indexes in market order, as flag off's
+    /// prologue does before its settle: the markets pass B applied (their
+    /// books are back in `order_books`), then the rest (still in `rest`).
+    /// The later book returns find the logs empty, as with the flag off.
+    fn absorb_indexes_after_stream<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        so: &mut StreamedOut,
+    ) {
+        for a in &so.applied {
+            if let Some(book) = ctx.order_books.get_mut(&a.market_id) {
+                TraderMarkets::absorb(&mut ctx.trader_markets, book, a.market_id);
+                CloidMarkets::absorb(&mut ctx.cloid_markets, book, a.market_id);
+            }
+        }
+        for (mbr, _) in so.rest.iter_mut() {
+            TraderMarkets::absorb(&mut ctx.trader_markets, &mut mbr.book, mbr.market_id);
+            CloidMarkets::absorb(&mut ctx.cloid_markets, &mut mbr.book, mbr.market_id);
+        }
+    }
+
+    /// 8k L2.1: a plan-failure fallback after a streamed prefix. Flag off
+    /// ran no pass B before it, so everything the prefix's pass B did is
+    /// undone: the context ([`StreamUndo::rollback`]), the gas, the balance
+    /// cache ([`BalanceCache::rollback_undo`]: it keeps the region's loads
+    /// and re-raises its read faults), the position cache and L2.2 runs,
+    /// the volume cache, the deferred results and the prefix's placement
+    /// results. The prefix's markets go back in front of `so.rest` (books
+    /// out of `order_books`, results as matched) for the replay, which is
+    /// then flag off's fallback over every market.
+    fn undo_streamed_prefix<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        undo: StreamUndo,
+        so: &mut StreamedOut,
+        market_batches: &HashMap<MarketId, Vec<PreparedOrder<'_>>>,
+        out: &mut PassBOut<'_, '_>,
+    ) {
+        let applied = std::mem::take(&mut so.applied);
+        let books = undo.rollback(ctx, out.total_gas, &applied);
+        out.bal_cache.rollback_undo();
+        *out.pos_cache = PositionCache::new();
+        if let Some(runs) = out.pos_runs.as_deref_mut() {
+            runs.clear();
+        }
+        out.vol_cache.clear();
+        out.deferred.iter_mut().for_each(|d| *d = None);
+        let mut rest = Vec::with_capacity(applied.len() + so.rest.len());
+        for (a, book) in applied.into_iter().zip(books) {
+            for p in market_batches.get(&a.market_id).into_iter().flatten() {
+                out.results[p.index] = pending_result();
+            }
+            let mbr = crate::market_workers::MarketBatchResult {
+                market_id: a.market_id,
+                book,
+                results: a.results,
+                next_order_id: a.next_order_id,
+            };
+            rest.push((mbr, None));
+        }
+        rest.append(&mut so.rest);
+        so.rest = rest;
+    }
+
+    /// 8k L2.1: Phase 4 after the streamed region, on the markets pass B has
+    /// not applied (ascending): the sequential loop when the gate said
+    /// sequential; flag off's C3 fallback when a plan failed (`fallback`,
+    /// over every market: after a streamed prefix the caller undid it,
+    /// [`Self::undo_streamed_prefix`]); otherwise pass B for the rest. Ends
+    /// pass B's results.
+    fn settle_streamed_rest<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        so: StreamedOut,
+        fallback: Option<(String, Option<String>)>,
+        market_batches: &HashMap<MarketId, Vec<PreparedOrder<'_>>>,
+        mut out: PassBOut<'_, '_>,
+    ) {
+        let (mbrs, plans): (Vec<_>, Vec<_>) = so.rest.into_iter().unzip();
+        if !so.parallel {
+            debug_assert!(
+                so.applied.is_empty(),
+                "pass B streams only after a parallel decision"
+            );
+            debug_assert!(
+                plans.iter().all(Option::is_none),
+                "no plan below the gate (no speculative reads)"
+            );
+            out.finish();
+            Self::settle_market_results_sequential(
+                ctx,
+                mbrs,
+                market_batches,
+                &mut *out.results,
+                &mut *out.total_gas,
+                &mut *out.bal_cache,
+                &mut *out.pos_cache,
+                &mut *out.vol_cache,
+            );
+            return;
+        }
+        SETTLE_STREAMED_CALLS.with(|c| c.set(c.get() + 1));
+        SETTLE_STREAMED_EARLY.with(|c| c.set(c.get() + so.early));
+        if let Some(ref m) = ctx.metrics {
+            m.exec_settle_streamed_markets
+                .inc_by(so.applied.len() as u64);
+            m.exec_settle_streamed_early_markets.inc_by(so.early);
+            m.exec_settle_streamed_parks.inc_by(so.parks);
+        }
+        if let Some((reason, fault)) = fallback {
+            debug_assert!(so.applied.is_empty(), "the prefix was undone");
+            out.finish();
+            Self::settle_fall_back(
+                ctx,
+                &reason,
+                fault,
+                mbrs,
+                market_batches,
+                &mut *out.results,
+                &mut *out.total_gas,
+                &mut *out.bal_cache,
+                &mut *out.pos_cache,
+                &mut *out.vol_cache,
+            );
+            return;
+        }
+        let t = std::time::Instant::now();
+        {
+            let typed = typed_rows_of(&ctx.sums);
+            let mut sink = pass_b_sink!(ctx);
+            for (mbr, plan) in mbrs.into_iter().zip(plans) {
+                let Some(Ok(plan)) = plan else {
+                    unreachable!("L2.1: every plan is computed and none failed");
+                };
+                Self::settle_pass_b_market(
+                    &mut sink,
+                    &ctx.positions,
+                    typed,
+                    mbr,
+                    plan,
+                    market_batches,
+                    &mut out,
+                );
+            }
+        }
+        out.finish();
+        ctx.phase_accum.settle_pass_b_ns += t.elapsed().as_nanos();
+    }
+
     /// Classic Phase-4 settlement: one thread walks the (market-id-sorted)
     /// match results and performs every mutation inline. This is the CANONICAL
     /// settle semantics — `settle_market_results_parallel` must produce
@@ -9880,6 +11241,8 @@ impl NativeExecutor {
             let margin_configs = &ctx.margin_configs;
             let record_fills = ctx.record_fills;
             let mrs: &[crate::market_workers::MarketBatchResult] = &market_results;
+            // 8k L2.1 test seam (`None` unless a test pinned it).
+            let plan_panic = SETTLE_STREAM_PROBE.with(std::cell::Cell::get).plan_panic;
 
             // Per-market weight for the LPT packer: plan cost is one pass over
             // the market's orders plus two position round-trips per fill.
@@ -9900,28 +11263,15 @@ impl NativeExecutor {
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
                 let cfg = margin_configs.get(&mbr.market_id);
-                // R01b: RECOVERED (sequential fallback below), and with one
-                // chunk this runs on `torus-execution` itself, so it must not
-                // trip the node's fail-stop panic hook.
-                crate::panic_scope::catch_recoverable(|| {
-                    Self::compute_market_settle_plan(
-                        positions,
-                        typed,
-                        cfg,
-                        mbr,
-                        prepared,
-                        record_fills,
-                    )
-                })
-                .map_err(|payload| {
-                    if let Some(s) = payload.downcast_ref::<&'static str>() {
-                        (*s).to_string()
-                    } else if let Some(s) = payload.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "non-string panic payload".to_string()
-                    }
-                })
+                Self::market_settle_plan_contained(
+                    positions,
+                    typed,
+                    cfg,
+                    mbr,
+                    prepared,
+                    record_fills,
+                    plan_panic,
+                )
             };
 
             let chunks =
@@ -9977,35 +11327,11 @@ impl NativeExecutor {
         // are still owned by `market_results` — the canonical sequential loop
         // reruns the whole settlement from scratch and is authoritative for
         // error semantics (per-order failure results, skipped trades).
-        let fallback_reason = plans.iter().find_map(|p| match p {
-            Err(msg) => Some(msg.clone()),
-            Ok(plan) => plan
-                .orders
-                .iter()
-                .find_map(|o| o.fill_error.clone()),
-        });
-        if let Some(msg) = fallback_reason {
-            tracing::error!(
-                error = %msg,
-                "C3: parallel settle aborted (worker panic or fill failure) — falling back to sequential settlement"
-            );
-            ctx.phase_accum.settle_fallbacks += 1;
-            // R02 (Codex P2): a worker's LOCAL fill fault fail-stops even if
-            // the sequential retry no longer hits it (transient), with the
-            // step sequential uses (first in the sequential order). Latched
-            // only AFTER the retry and only if it latched nothing, so the
-            // sequential loop's own first fault keeps precedence (pass A
-            // reads no balances: it can see a later fault of the same
-            // order). Panics and non-local errors: fallback only.
-            let fault = plans.iter().find_map(|p| {
-                p.as_ref()
-                    .ok()?
-                    .orders
-                    .iter()
-                    .find_map(|o| o.fill_fault.clone())
-            });
-            Self::settle_market_results_sequential(
+        if let Some((msg, fault)) = Self::plan_fallback(plans.iter()) {
+            Self::settle_fall_back(
                 ctx,
+                &msg,
+                fault,
                 market_results,
                 market_batches,
                 results,
@@ -10014,9 +11340,6 @@ impl NativeExecutor {
                 pos_cache,
                 vol_cache,
             );
-            if let (Some(f), None) = (fault, &ctx.fatal_error) {
-                ctx.fatal_error = Some(f);
-            }
             return;
         }
         let plans: Vec<MarketSettlePlan> = plans.into_iter().map(|p| p.unwrap()).collect();
@@ -10031,199 +11354,344 @@ impl NativeExecutor {
             Some(runs) => runs.reserve(plans.len()),
             None => pos_cache.reserve(plans.iter().map(|p| p.pos_cache.len()).sum()),
         }
-        // s58 (`TORUS_SETTLE_DEFER_RESULTS=1`): each placed order's book
-        // reject, by flat index (`Some` = placed here, written after the
-        // market loop). 1 byte per action (`FailureReason` is a Copy u8
-        // enum), fresh per call: `execute_batch` runs twice per block.
-        let defer = settle_defer_results_enabled();
-        let mut deferred: Vec<Option<Option<FailureReason>>> = if defer {
-            vec![None; results.len()]
-        } else {
-            Vec::new()
-        };
-        for (mbr, plan) in market_results.into_iter().zip(plans) {
-            let market_id = mbr.market_id;
-
-            // Reinsert updated book
-            ctx.return_matched_book(market_id, mbr.book);
-            ctx.dirty_books.insert(market_id);
-
-            // Update global ID high-water mark
-            if mbr.next_order_id > ctx.next_global_order_id {
-                ctx.next_global_order_id = mbr.next_order_id;
+        let mut out = PassBOut::new(
+            results, total_gas, bal_cache, pos_cache, pos_runs, vol_cache,
+        );
+        {
+            let typed = typed_rows_of(&ctx.sums);
+            let mut sink = pass_b_sink!(ctx);
+            for (mbr, plan) in market_results.into_iter().zip(plans) {
+                Self::settle_pass_b_market(
+                    &mut sink,
+                    &ctx.positions,
+                    typed,
+                    mbr,
+                    plan,
+                    market_batches,
+                    &mut out,
+                );
             }
+        }
+        out.finish();
+        ctx.phase_accum.settle_pass_b_ns += pass_b_timer.elapsed().as_nanos();
+    }
 
-            // This market's position mutations become part of the batch cache
-            // (disjoint keys across markets; single sorted flush at call end).
-            // 8k L2.2: or a run, flushed with it in the same key order.
-            match pos_runs.as_deref_mut() {
-                Some(runs) => runs.push(plan.pos_cache),
-                None => pos_cache.merge_disjoint(plan.pos_cache),
-            }
-
-            let prepared = match market_batches.get(&market_id) {
-                Some(p) => p,
-                None => continue,
-            };
-
-            // Orders of this market that stopped before their last fill side:
-            // (order index, sides applied).
-            let mut stops: Vec<(usize, usize)> = Vec::new();
-            for (k, ((match_result, prep), oplan)) in mbr
-                .results
+    /// C3: the parallel settle's fallback trigger over `plans` (market
+    /// order): the first worker panic or position-side fill failure, as
+    /// `(reason, fault)`, where `fault` is the first plan's LOCAL fill fault
+    /// in market order (R02), if any. `None`: pass B can apply them all.
+    fn plan_fallback<'p>(
+        plans: impl Iterator<Item = &'p Result<MarketSettlePlan, String>> + Clone,
+    ) -> Option<(String, Option<String>)> {
+        // Fallback triggers: a worker panic, or ANY position-side fill
+        // application failure (backend read error — sick-node territory).
+        // Workers borrowed only, so no shared state has mutated and the books
+        // are still owned by `market_results` — the canonical sequential loop
+        // reruns the whole settlement from scratch and is authoritative for
+        // error semantics (per-order failure results, skipped trades).
+        let reason = plans.clone().find_map(|p| match p {
+            Err(msg) => Some(msg.clone()),
+            Ok(plan) => plan.orders.iter().find_map(|o| o.fill_error.clone()),
+        })?;
+        // R02 (Codex P2): a worker's LOCAL fill fault fail-stops even if
+        // the sequential retry no longer hits it (transient), with the
+        // step sequential uses (first in the sequential order). Latched
+        // only AFTER the retry and only if it latched nothing, so the
+        // sequential loop's own first fault keeps precedence (pass A
+        // reads no balances: it can see a later fault of the same
+        // order). Panics and non-local errors: fallback only.
+        let fault = plans.into_iter().find_map(|p| {
+            p.as_ref()
+                .ok()?
+                .orders
                 .iter()
-                .zip(prepared.iter())
-                .zip(plan.orders)
-                .enumerate()
-            {
-                let result = &match_result.result;
+                .find_map(|o| o.fill_fault.clone())
+        });
+        Some((reason, fault))
+    }
 
-                // Funnel (perf A1): STP maker cancels already happened in the
-                // book during matching — same site as sequential.
-                if let Some(ref m) = ctx.metrics {
-                    m.orders_self_trade_cancels
-                        .inc_by(result.self_trade_cancels.len() as u64);
-                }
+    /// C3: the parallel settle's fallback: the canonical sequential loop over
+    /// `market_results`, then the plans' first local fill fault if the loop
+    /// latched nothing ([`Self::plan_fallback`]). 8k L2.1: also the streamed
+    /// settle's, over the markets pass B has not applied yet.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_fall_back<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        reason: &str,
+        fault: Option<String>,
+        market_results: Vec<crate::market_workers::MarketBatchResult>,
+        market_batches: &HashMap<MarketId, Vec<PreparedOrder<'_>>>,
+        results: &mut [NativeActionResult],
+        total_gas: &mut u64,
+        bal_cache: &mut BalanceCache,
+        pos_cache: &mut PositionCache,
+        vol_cache: &mut VolumeCache,
+    ) {
+        tracing::error!(
+            error = %reason,
+            "C3: parallel settle aborted (worker panic or fill failure) — falling back to sequential settlement"
+        );
+        ctx.phase_accum.settle_fallbacks += 1;
+        Self::settle_market_results_sequential(
+            ctx,
+            market_results,
+            market_batches,
+            results,
+            total_gas,
+            bal_cache,
+            pos_cache,
+            vol_cache,
+        );
+        if let (Some(f), None) = (fault, &ctx.fatal_error) {
+            ctx.fatal_error = Some(f);
+        }
+    }
 
-                // Taker-side margin release (amount precomputed; clamp here,
-                // where the balance authority lives).
-                if oplan.margin_release > FixedPoint::ZERO {
-                    match bal_cache.load(&ctx.positions, ctx.typed_rows(), &prep.sender) {
-                        Ok(mut bal) => {
-                            let release = oplan.margin_release.min(bal.order_margin);
-                            bal.order_margin -= release;
-                            bal.available += release;
-                            bal_cache.set(&prep.sender, bal);
-                        }
-                        // R02: as sequential.
-                        Err(e) => {
-                            Self::latch_core_fault(ctx, "settle taker release balance read", &e)
-                        }
-                    }
-                }
+    /// C3 pass B for ONE market: applies its plan's cross-market mutations
+    /// in exactly the sequential order (orders in prepared order, PnL credits
+    /// in fill order, then the market's A5 maker releases). Called for each
+    /// market in ascending market-id order, by the flag-off parallel settle
+    /// and (8k L2.1) by the streamed settle, so both run the same code in the
+    /// same order. Reads: `plan`, `mbr`, the prepared orders, balances through
+    /// `out.bal_cache` (backend frozen until the end-of-call flush) and the
+    /// sink's fields; writes only the sink's fields and `out`. Returns the
+    /// market's match results (the book went to `order_books`): the 8k L2.1
+    /// streamed region keeps them for a fallback's replay.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_pass_b_market<T: StateBackend>(
+        sink: &mut PassBSink<'_>,
+        positions: &PositionManager<T>,
+        typed: Option<&dyn TypedRows>,
+        mbr: crate::market_workers::MarketBatchResult,
+        plan: MarketSettlePlan,
+        market_batches: &HashMap<MarketId, Vec<PreparedOrder<'_>>>,
+        out: &mut PassBOut<'_, '_>,
+    ) -> Vec<crate::market_workers::MatchResult> {
+        let market_id = mbr.market_id;
 
-                // Realized-PnL credits, in exact fill order. Sequential
-                // interleaves balance credits with position application, so a
-                // balance-row READ failure at event j fails the order AT j —
-                // before any later (position-side) failure the worker may have
-                // recorded. The worker's event stream already stops at its own
-                // position failure, so walking it in order and failing on the
-                // first balance error reproduces the sequential outcome
-                // exactly; if no balance error occurs, the worker's position
-                // failure (if any) stands.
-                let mut fill_failed: Option<String> = None;
-                let mut sides_applied = 2 * result.fills.len();
-                for (side, trader, pnl, at) in &oplan.pnl_events {
-                    match bal_cache.load(&ctx.positions, ctx.typed_rows(), trader) {
-                        Ok(mut bal) => {
-                            bal.available += *pnl;
-                            bal_cache.set(trader, bal);
-                        }
-                        Err(e) => {
-                            // R02: as sequential (same step).
-                            Self::latch_core_fault(ctx, &format!("settle {side} fill"), &e);
-                            fill_failed = Some(format!("{side} fill failed: {e}"));
-                            sides_applied = *at;
-                            break;
-                        }
-                    }
-                }
-                // Any worker position failure fell back to sequential above,
-                // so the only failure here is a balance read: `sides_applied`
-                // is the whole stop point.
-                debug_assert!(oplan.fill_error.is_none());
-                if fill_failed.is_none() {
-                    fill_failed = oplan.fill_error;
-                }
-                // cum_volume counts every fill side the sequential loop
-                // completes before its stop (a failed side adds nothing).
-                if sides_applied < 2 * result.fills.len() {
-                    stops.push((k, sides_applied));
-                }
+        // Reinsert updated book (8k L2.1 streamed region: its logs reach
+        // the indexes once the call's matching succeeded).
+        if sink.absorb_indexes {
+            return_matched_book_in(
+                sink.order_books,
+                sink.trader_markets,
+                sink.cloid_markets,
+                market_id,
+                mbr.book,
+            );
+        } else {
+            sink.order_books.insert(market_id, mbr.book);
+        }
+        sink.dirty_books.insert(market_id);
 
-                if let Some(err) = fill_failed {
-                    results[prep.index] =
-                        NativeActionResult::rejected("place_order", (FailureReason::Fill, err));
-                    // Funnel (perf A1): died on fill application, not on the book.
-                    if let Some(ref m) = ctx.metrics {
-                        m.orders_rejected_other.inc();
-                        m.order_rejected(OrderRejectReason::Fill);
-                    }
-                    continue;
-                }
+        // Update global ID high-water mark
+        if mbr.next_order_id > *sink.next_global_order_id {
+            *sink.next_global_order_id = mbr.next_order_id;
+        }
 
-                // Record fills in canonical order, exactly like persist_trade.
-                if ctx.record_fills {
-                    for (fill, &[taker, maker]) in result.fills.iter().zip(&oplan.fill_effects) {
-                        Self::persist_trade_with_extras(ctx, market_id, fill, taker, maker);
-                    }
-                } else {
-                    for fill in &result.fills {
-                        Self::persist_trade(ctx, market_id, fill);
-                    }
-                }
+        // This market's position mutations become part of the batch cache
+        // (disjoint keys across markets; single sorted flush at call end).
+        // 8k L2.2: or a run, flushed with it in the same key order.
+        match out.pos_runs.as_deref_mut() {
+            Some(runs) => runs.push(plan.pos_cache),
+            None => out.pos_cache.merge_disjoint(plan.pos_cache),
+        }
 
-                if let Some(ref m) = ctx.metrics {
-                    m.orders_matched.inc_by(result.fills.len() as u64);
-                    Self::record_order_status_funnel(
-                        m,
-                        &result.status,
-                        result.fills.len(),
-                        result.reject,
-                    );
-                }
+        let prepared = match market_batches.get(&market_id) {
+            Some(p) => p,
+            None => return mbr.results,
+        };
 
-                *total_gas += PLACE_ORDER_GAS;
-                if defer {
-                    deferred[prep.index] = Some(result.reject);
-                } else {
-                    results[prep.index] = NativeActionResult::placed(result);
-                }
+        // Orders of this market that stopped before their last fill side:
+        // (order index, sides applied).
+        let mut stops: Vec<(usize, usize)> = Vec::new();
+        for (k, ((match_result, prep), oplan)) in mbr
+            .results
+            .iter()
+            .zip(prepared.iter())
+            .zip(plan.orders)
+            .enumerate()
+        {
+            let result = &match_result.result;
+
+            // Funnel (perf A1): STP maker cancels already happened in the
+            // book during matching — same site as sequential.
+            if let Some(m) = sink.metrics {
+                m.orders_self_trade_cancels
+                    .inc_by(result.self_trade_cancels.len() as u64);
             }
 
-            // cum_volume: the worker's per-trader sums when every order ran
-            // to its last fill side; otherwise per side, up to each stop.
-            if stops.is_empty() {
-                for (trader, add) in plan.volumes {
-                    *vol_cache.entry(trader).or_insert(FixedPoint::ZERO) += add;
-                }
-            } else {
-                for (k, match_result) in mbr.results.iter().take(prepared.len()).enumerate() {
-                    let fills = &match_result.result.fills;
-                    let sides = stops
-                        .iter()
-                        .find(|stop| stop.0 == k)
-                        .map_or(2 * fills.len(), |stop| stop.1);
-                    add_fill_volumes(vol_cache, fills, sides);
-                }
-            }
-
-            // A5 maker/STP releases — amounts precomputed by the worker in the
-            // canonical order; clamps applied here against live balances.
-            for (trader, amount) in plan.maker_releases {
-                match bal_cache.load(&ctx.positions, ctx.typed_rows(), &trader) {
+            // Taker-side margin release (amount precomputed; clamp here,
+            // where the balance authority lives).
+            if oplan.margin_release > FixedPoint::ZERO {
+                match out.bal_cache.load(positions, typed, &prep.sender) {
                     Ok(mut bal) => {
-                        let release = amount.min(bal.order_margin);
+                        let release = oplan.margin_release.min(bal.order_margin);
                         bal.order_margin -= release;
                         bal.available += release;
-                        bal_cache.set(&trader, bal);
+                        out.bal_cache.set(&prep.sender, bal);
                     }
-                    // R02: a local fault fail-stops (nothing released meanwhile).
-                    Err(e) => Self::latch_core_fault(ctx, "settle maker release balance read", &e),
+                    // R02: as sequential.
+                    Err(e) => {
+                        latch_core_fault_in(
+                            sink.fatal_error,
+                            "settle taker release balance read",
+                            &e,
+                        );
+                        out.bal_cache.note_read_fault(&prep.sender, e);
+                    }
+                }
+            }
+
+            // Realized-PnL credits, in exact fill order. Sequential
+            // interleaves balance credits with position application, so a
+            // balance-row READ failure at event j fails the order AT j —
+            // before any later (position-side) failure the worker may have
+            // recorded. The worker's event stream already stops at its own
+            // position failure, so walking it in order and failing on the
+            // first balance error reproduces the sequential outcome
+            // exactly; if no balance error occurs, the worker's position
+            // failure (if any) stands.
+            let mut fill_failed: Option<String> = None;
+            let mut sides_applied = 2 * result.fills.len();
+            for (side, trader, pnl, at) in &oplan.pnl_events {
+                match out.bal_cache.load(positions, typed, trader) {
+                    Ok(mut bal) => {
+                        bal.available += *pnl;
+                        out.bal_cache.set(trader, bal);
+                    }
+                    Err(e) => {
+                        // R02: as sequential (same step).
+                        latch_core_fault_in(sink.fatal_error, &format!("settle {side} fill"), &e);
+                        fill_failed = Some(format!("{side} fill failed: {e}"));
+                        sides_applied = *at;
+                        out.bal_cache.note_read_fault(trader, e);
+                        break;
+                    }
+                }
+            }
+            // Any worker position failure fell back to sequential above,
+            // so the only failure here is a balance read: `sides_applied`
+            // is the whole stop point.
+            debug_assert!(oplan.fill_error.is_none());
+            if fill_failed.is_none() {
+                fill_failed = oplan.fill_error;
+            }
+            // cum_volume counts every fill side the sequential loop
+            // completes before its stop (a failed side adds nothing).
+            if sides_applied < 2 * result.fills.len() {
+                stops.push((k, sides_applied));
+            }
+
+            if let Some(err) = fill_failed {
+                out.results[prep.index] =
+                    NativeActionResult::rejected("place_order", (FailureReason::Fill, err));
+                // Funnel (perf A1): died on fill application, not on the book.
+                if let Some(m) = sink.metrics {
+                    m.orders_rejected_other.inc();
+                    m.order_rejected(OrderRejectReason::Fill);
+                }
+                continue;
+            }
+
+            // Record fills in canonical order, exactly like persist_trade.
+            if sink.trades.record_fills {
+                for (fill, &[taker, maker]) in result.fills.iter().zip(&oplan.fill_effects) {
+                    sink.trades
+                        .persist_with_extras(market_id, fill, taker, maker);
+                }
+            } else {
+                for fill in &result.fills {
+                    sink.trades.persist(market_id, fill);
+                }
+            }
+
+            if let Some(m) = sink.metrics {
+                m.orders_matched.inc_by(result.fills.len() as u64);
+                Self::record_order_status_funnel(
+                    m,
+                    &result.status,
+                    result.fills.len(),
+                    result.reject,
+                );
+            }
+
+            *out.total_gas += PLACE_ORDER_GAS;
+            if out.defer {
+                out.deferred[prep.index] = Some(result.reject);
+            } else {
+                out.results[prep.index] = NativeActionResult::placed(result);
+            }
+        }
+
+        // cum_volume: the worker's per-trader sums when every order ran
+        // to its last fill side; otherwise per side, up to each stop.
+        if stops.is_empty() {
+            for (trader, add) in plan.volumes {
+                *out.vol_cache.entry(trader).or_insert(FixedPoint::ZERO) += add;
+            }
+        } else {
+            for (k, match_result) in mbr.results.iter().take(prepared.len()).enumerate() {
+                let fills = &match_result.result.fills;
+                let sides = stops
+                    .iter()
+                    .find(|stop| stop.0 == k)
+                    .map_or(2 * fills.len(), |stop| stop.1);
+                add_fill_volumes(out.vol_cache, fills, sides);
+            }
+        }
+
+        // A5 maker/STP releases — amounts precomputed by the worker in the
+        // canonical order; clamps applied here against live balances.
+        for (trader, amount) in plan.maker_releases {
+            match out.bal_cache.load(positions, typed, &trader) {
+                Ok(mut bal) => {
+                    let release = amount.min(bal.order_margin);
+                    bal.order_margin -= release;
+                    bal.available += release;
+                    out.bal_cache.set(&trader, bal);
+                }
+                // R02: a local fault fail-stops (nothing released meanwhile).
+                Err(e) => {
+                    latch_core_fault_in(sink.fatal_error, "settle maker release balance read", &e);
+                    out.bal_cache.note_read_fault(&trader, e);
                 }
             }
         }
-        // s58: the deferred placed results, in one ascending pass (inside
-        // the pass-B timer). A fill-failed order was written inline above
-        // and never recorded, so its `None` leaves it alone.
-        if defer {
-            for (slot, d) in results.iter_mut().zip(deferred) {
-                if let Some(reject) = d {
-                    *slot = NativeActionResult::placed_reject(reject);
-                }
+        mbr.results
+    }
+
+    /// One market's contained pass-A plan ([`Self::compute_market_settle_plan`]):
+    /// a panic is that market's `Err` (its message), never an unwind. R01b:
+    /// RECOVERED (the sequential fallback), and with one chunk this runs on
+    /// `torus-execution` itself, so it must not trip the node's fail-stop
+    /// panic hook. Shared by the flag-off pass A and the 8k L2.1 streamed
+    /// jobs. `plan_panic` is the L2.1 test seam (`None` in production).
+    #[allow(clippy::too_many_arguments)]
+    fn market_settle_plan_contained<T: StateBackend>(
+        positions: &PositionManager<T>,
+        typed: Option<&dyn TypedRows>,
+        cfg: Option<&MarketMarginConfig>,
+        mbr: &crate::market_workers::MarketBatchResult,
+        prepared: &[PreparedOrder<'_>],
+        record_fills: bool,
+        plan_panic: Option<MarketId>,
+    ) -> Result<MarketSettlePlan, String> {
+        crate::panic_scope::catch_recoverable(|| {
+            if plan_panic == Some(mbr.market_id) {
+                panic!("planted settle plan panic (L2.1 test seam)");
             }
-        }
-        ctx.phase_accum.settle_pass_b_ns += pass_b_timer.elapsed().as_nanos();
+            Self::compute_market_settle_plan(positions, typed, cfg, mbr, prepared, record_fills)
+        })
+        .map_err(|payload| {
+            if let Some(s) = payload.downcast_ref::<&'static str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "non-string panic payload".to_string()
+            }
+        })
     }
 
     /// C3 pass-A worker: compute one market's settlement plan. PURE with
@@ -12247,26 +13715,7 @@ impl NativeExecutor {
         market_id: MarketId,
         fill: &torus_core::order_book::Fill,
     ) {
-        if ctx.trade_history || ctx.record_fills {
-            if !ctx.defer_trades && ctx.fills_block != ctx.block_height {
-                // Inline mode, context reused for a new block: the earlier
-                // block's rows are already written.
-                ctx.pending_fills.clear();
-                ctx.pending_extras.clear();
-                ctx.inline_fills_written = 0;
-            }
-            ctx.fills_block = ctx.block_height;
-            ctx.pending_fills.push(TradeFill {
-                trade_index: ctx.trade_index,
-                market: market_id,
-                maker: fill.maker,
-                taker: fill.taker,
-                price_raw: fill.price.raw(),
-                qty_raw: fill.quantity.raw(),
-                taker_side: if fill.maker_side == Side::Buy { 1 } else { 0 },
-            });
-        }
-        ctx.trade_index += 1;
+        trade_sink!(ctx).persist(market_id, fill);
     }
 
     /// s80, only while `record_fills`: `persist_trade` plus the fill's
@@ -12279,17 +13728,7 @@ impl NativeExecutor {
         taker: FillEffect,
         maker: FillEffect,
     ) {
-        debug_assert!(ctx.record_fills, "extras are recorded only for a stream");
-        Self::persist_trade(ctx, market_id, fill);
-        ctx.pending_extras.push(FillExtras {
-            maker_order_id: fill.maker_order_id,
-            taker_order_id: fill.taker_order_id,
-            maker_start_raw: maker.start_size.raw(),
-            taker_start_raw: taker.start_size.raw(),
-            maker_pnl_raw: maker.closed_pnl.map_or(0, |p| p.raw()),
-            taker_pnl_raw: taker.closed_pnl.map_or(0, |p| p.raw()),
-        });
-        debug_assert_eq!(ctx.pending_extras.len(), ctx.pending_fills.len());
+        trade_sink!(ctx).persist_with_extras(market_id, fill, taker, maker);
     }
 
     /// FIX CONS-FIND-30: Ownership check added -- only the order's trader can cancel.
@@ -13367,9 +14806,7 @@ impl NativeExecutor {
         step: &str,
         err: &CoreError,
     ) {
-        if err.is_local_fault() && ctx.fatal_error.is_none() {
-            ctx.fatal_error = Some(format!("{step}: {err}"));
-        }
+        latch_core_fault_in(&mut ctx.fatal_error, step, err);
     }
 
     /// R02: a [`CoreError`] as the action's error result (unchanged), after

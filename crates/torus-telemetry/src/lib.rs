@@ -408,6 +408,19 @@ pub struct Metrics {
     /// one market's key in another's cache), so they were merged in order
     /// and `flush_all`-ed like the flag-off path. Expected 0.
     pub exec_settle_no_merge_fallbacks: Counter,
+    /// 8k L2.1 (`TORUS_SETTLE_STREAMED=1`): markets whose settle pass B ran
+    /// in the streamed region (while their call's pool jobs were running).
+    pub exec_settle_streamed_markets: Counter,
+    /// 8k L2.1: of those, markets applied while a later market's job was
+    /// still running (the overlap the flag buys).
+    pub exec_settle_streamed_early_markets: Counter,
+    /// 8k L2.1: times the exec thread parked waiting for a streamed market's
+    /// pool job (woken once per batch of up to 8 ready markets).
+    pub exec_settle_streamed_parks: Counter,
+    /// 8k L2.1: parallel-settle fallbacks after a streamed prefix (a plan
+    /// failed after pass B began: the prefix is undone and flag off's
+    /// sequential fallback replayed). Expected 0.
+    pub exec_settle_streamed_resumed_fallbacks: Counter,
     /// Post-engine tail on the exec thread: core-writer drain, governance,
     /// fee distribution and the epoch boundary.
     pub exec_post_engine_tail_seconds: Histogram,
@@ -2042,6 +2055,30 @@ impl Metrics {
             "TORUS_SETTLE_NO_MERGE=1 position flushes whose per-market caches were not provably disjoint, so merged + flush_all-ed (expected 0)",
             exec_settle_no_merge_fallbacks.clone(),
         );
+        let exec_settle_streamed_markets = Counter::default();
+        registry.register(
+            "torus_exec_settle_streamed_markets",
+            "TORUS_SETTLE_STREAMED=1 markets whose settle pass B ran while the call's pool jobs were running",
+            exec_settle_streamed_markets.clone(),
+        );
+        let exec_settle_streamed_early_markets = Counter::default();
+        registry.register(
+            "torus_exec_settle_streamed_early_markets",
+            "TORUS_SETTLE_STREAMED=1 markets whose settle pass B ran while a later market's job was still running",
+            exec_settle_streamed_early_markets.clone(),
+        );
+        let exec_settle_streamed_parks = Counter::default();
+        registry.register(
+            "torus_exec_settle_streamed_parks",
+            "TORUS_SETTLE_STREAMED=1 times the exec thread parked waiting for a market's pool job",
+            exec_settle_streamed_parks.clone(),
+        );
+        let exec_settle_streamed_resumed_fallbacks = Counter::default();
+        registry.register(
+            "torus_exec_settle_streamed_resumed_fallbacks",
+            "TORUS_SETTLE_STREAMED=1 parallel-settle fallbacks after a streamed pass B prefix, undone and replayed (expected 0)",
+            exec_settle_streamed_resumed_fallbacks.clone(),
+        );
 
         let exec_post_engine_tail_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
@@ -3349,6 +3386,10 @@ impl Metrics {
             exec_settle_pass_b_seconds,
             exec_cache_flush_seconds,
             exec_settle_no_merge_fallbacks,
+            exec_settle_streamed_markets,
+            exec_settle_streamed_early_markets,
+            exec_settle_streamed_parks,
+            exec_settle_streamed_resumed_fallbacks,
             exec_post_engine_tail_seconds,
             exec_liquidation_step_seconds,
             exec_engine_untimed_seconds,
@@ -4310,6 +4351,20 @@ mod tests {
             text.contains("torus_exec_settle_no_merge_fallbacks_total 1\n"),
             "{text}"
         );
+        // 8k L2.1: the streamed settle counters.
+        m.exec_settle_streamed_markets.inc_by(3);
+        m.exec_settle_streamed_early_markets.inc_by(2);
+        m.exec_settle_streamed_parks.inc_by(4);
+        m.exec_settle_streamed_resumed_fallbacks.inc();
+        let text = m.encode();
+        for line in [
+            "torus_exec_settle_streamed_markets_total 3\n",
+            "torus_exec_settle_streamed_early_markets_total 2\n",
+            "torus_exec_settle_streamed_parks_total 4\n",
+            "torus_exec_settle_streamed_resumed_fallbacks_total 1\n",
+        ] {
+            assert!(text.contains(line), "{line}: {text}");
+        }
     }
 
     /// L3 level-hash sponge cache stats (perf/l3-cache-stats): the aggregated

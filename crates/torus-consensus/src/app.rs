@@ -43298,6 +43298,56 @@ mod crash_recovery_tests {
         f()
     }
 
+    /// 8k L2.1 (`TORUS_SETTLE_STREAMED`, node-local, off by default): fused
+    /// match + plan jobs, pass B streamed in market order on the exec thread.
+    /// Over the 130 P2 blocks (reduce-only places and cloids; fills, closes
+    /// and flips in three markets, cancels, liquidations, epoch boundaries),
+    /// on the engine with 4 workers, pipelined with a checkpoint every 5
+    /// blocks, flag on equals flag off with L2.2 off AND on: write sets
+    /// (receipts included), the running hash h_n, every CF and the persisted
+    /// native root. The on runs must have streamed.
+    #[test]
+    fn settle_streamed_state_equals_flag_off() {
+        use torus_bridge::native_executor::{
+            parse_settle_streamed, settle_streamed_calls_on_this_thread, with_settle_no_merge,
+            with_settle_streamed, BookMode,
+        };
+        assert!(!parse_settle_streamed(None), "off by default");
+        let (blocks, _, cloid_places) = p2_blocks_with(true, true);
+        assert!(!cloid_places.is_empty(), "the stream places cloids");
+        let run = |no_merge: bool, on: bool| {
+            let before = settle_streamed_calls_on_this_thread();
+            let r = with_p2_engine_threads(4, || {
+                with_settle_no_merge(no_merge, || {
+                    with_settle_streamed(on, || {
+                        p2_run_with(
+                            &blocks,
+                            true,
+                            Some(BookMode::Classic),
+                            false,
+                            &P2Fault::None,
+                            Some(ckpt_every(5)),
+                        )
+                    })
+                })
+            });
+            (r, settle_streamed_calls_on_this_thread() - before)
+        };
+        let persisted = |db: &StateDb| torus_state::native_trie::persisted_native_root(db).unwrap();
+        for no_merge in [false, true] {
+            let what = format!("settle streamed (L2.2 {no_merge})");
+            let (off, off_calls) = run(no_merge, false);
+            let (on, on_calls) = run(no_merge, true);
+            assert_eq!(off_calls, 0, "{what}: flag off never streams");
+            assert!(on_calls > 20, "{what}: flag on streamed ({on_calls})");
+            assert_write_sets_equal(&off.captured, &on.captured, &what);
+            assert!(on.hash.is_some(), "running hash active");
+            assert_eq!(off.hash, on.hash, "{what}: running hash h_n");
+            assert_dumps_equal(&off.dump, &on.dump, &what);
+            assert_eq!(persisted(&off.db), persisted(&on.db), "{what}: native root");
+        }
+    }
+
     /// 8k L2.2 (`TORUS_SETTLE_NO_MERGE`, node-local, on by default): pass B
     /// keeps each market's position cache unmerged and the end-of-call flush
     /// writes them with the batch cache in the same key order. Over the 130
