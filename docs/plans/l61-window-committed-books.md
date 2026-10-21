@@ -38,6 +38,8 @@ that can then change state at n (instead of at the next native block, which may 
   one pass scans (`LIQ_SCAN_PER_BLOCK`) the pass at n writes the cursor, which makes n + 1, ... due until the walk
   ends; it also rewrites the ADL mark-base rows and acts on any account that a pass would classify differently now
   (e.g. a mark that aged out since the last native block).
+* **Native-phase bookkeeping rows**: a chain whose native phase never ran yet gets them at n (seen in the test:
+  `cf_native_markets` `__book_mode__` and `__next_global_order_id__`, written by the first native phase).
 * No change from the others when they are not due: the oracle step aggregates only with submission rows (which make the
   block due anyway), the CoreWriter drain only due rows, fees only with revenue, the epoch step only at boundaries, the
   EVM gas counter only with gas; the nonce-window prune runs on both paths.

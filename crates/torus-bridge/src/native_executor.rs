@@ -3275,11 +3275,26 @@ pub fn configured_book_mode() -> BookMode {
 /// advance (`TORUS_RESIDENT_ADVANCE_UNTOUCHED` not 0: without it every empty
 /// block makes the next one rebuild, which fail-stops with unsaved books).
 pub fn book_coalesce_blocker() -> Option<&'static str> {
-    if book_mode() != BookMode::Classic {
+    book_coalesce_blocker_for(
+        book_mode(),
+        resident_books_enabled(),
+        advance_untouched_enabled(),
+    )
+}
+
+/// 8k L3.1: [`book_coalesce_blocker`] of explicit settings (pure; tests and
+/// the startup gate's own tests).
+#[doc(hidden)]
+pub fn book_coalesce_blocker_for(
+    mode: BookMode,
+    resident: bool,
+    advance_untouched: bool,
+) -> Option<&'static str> {
+    if mode != BookMode::Classic {
         Some("book mode is not Classic (TORUS_BOOK_ROWS)")
-    } else if !resident_books_enabled() {
+    } else if !resident {
         Some("resident books are off (TORUS_RESIDENT_BOOKS=0)")
-    } else if !advance_untouched_enabled() {
+    } else if !advance_untouched {
         Some("the untouched-block advance is off (TORUS_RESIDENT_ADVANCE_UNTOUCHED=0)")
     } else {
         None

@@ -6371,17 +6371,27 @@ mod tests {
             flush_block(&db, h);
         }
         assert!(read_running_hash(&db).is_some());
-        assert!(configure_book_window(&db, Some(7)).unwrap(), "activation moved");
+        assert!(
+            configure_book_window(&db, Some(7)).unwrap(),
+            "activation moved"
+        );
         assert_eq!(read_running_hash(&db), None);
         assert_eq!(read_book_window(&db), Some(7));
         // An undecodable row (the pre-review `[1]`) is rewritten.
-        db.put_cf_raw(crate::cf::CF_CONSENSUS_META, crate::cf::META_STATE_HASH_BOOK_WINDOW, &[1])
-            .unwrap();
+        db.put_cf_raw(
+            crate::cf::CF_CONSENSUS_META,
+            crate::cf::META_STATE_HASH_BOOK_WINDOW,
+            &[1],
+        )
+        .unwrap();
         assert_eq!(read_book_window(&db), None);
         assert!(configure_book_window(&db, None).is_ok());
         assert_eq!(
-            db.get_cf_raw(crate::cf::CF_CONSENSUS_META, crate::cf::META_STATE_HASH_BOOK_WINDOW)
-                .unwrap(),
+            db.get_cf_raw(
+                crate::cf::CF_CONSENSUS_META,
+                crate::cf::META_STATE_HASH_BOOK_WINDOW
+            )
+            .unwrap(),
             None
         );
     }

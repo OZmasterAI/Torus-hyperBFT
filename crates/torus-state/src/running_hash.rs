@@ -405,8 +405,7 @@ pub fn books_hashed_at(book_window: Option<u64>, height: u64) -> bool {
 /// (`ChainConfig::book_window_activation`), never a node-local META row.
 #[inline]
 pub fn book_window_full_save_at(book_window: Option<u64>, height: u64) -> bool {
-    book_window_active(book_window, height)
-        && height.is_multiple_of(STATE_HASH_CHECKPOINT_INTERVAL)
+    book_window_active(book_window, height) && height.is_multiple_of(STATE_HASH_CHECKPOINT_INTERVAL)
 }
 
 /// [`books_hashed_at`] for a digest flushing into `db`, with the test-only

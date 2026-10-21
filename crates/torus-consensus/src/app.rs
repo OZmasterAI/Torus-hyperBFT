@@ -1338,7 +1338,8 @@ struct ExecutionContext {
     /// flight C and the window bookkeeping (E-only; the mutex is
     /// uncontended). Unused while `checkpoint` is `None`.
     ckpt: std::sync::Mutex<CkptState>,
-    /// 8k L3.1 (`TORUS_BOOK_COALESCE`, node-local, default off): pipelined
+    /// 8k L3.1 (`TORUS_BOOK_COALESCE`, node-local, requested by default since
+    /// s131; `0` = off): pipelined
     /// blocks with resident Classic books skip the per-block whole-book
     /// encode; each window close encodes the window's dirty books once
     /// (`CkptState::unsaved`). Set by [`Self::configure_book_coalesce`]
@@ -3536,12 +3537,34 @@ impl ExecutionContext {
     /// `consensus.state_hash_activation_height`; with the hash on, h_n needs
     /// every block's book bytes, so this needs L6.1 first) and the process's
     /// book settings ([`torus_bridge::native_executor::book_coalesce_blocker`]).
-    /// Otherwise warns once with the reason and stays off.
+    /// Otherwise warns once with the reason and stays off. Requested by
+    /// default since s131 (perf doc section 110): unset / empty / `1` /
+    /// `true`; `0` / `false` turn it off without a log line. L6.1
+    /// (`book_window`: genesis `book_window_commit`) allows it with the hash
+    /// on.
     fn configure_book_coalesce(
         &mut self,
         requested: bool,
         hash_activation: Option<u64>,
         book_window: bool,
+    ) {
+        self.configure_book_coalesce_with(
+            requested,
+            hash_activation,
+            book_window,
+            torus_bridge::native_executor::book_coalesce_blocker(),
+        );
+    }
+
+    /// [`Self::configure_book_coalesce`] with the process's book-settings
+    /// blocker passed in (`book_blocker`: `book_coalesce_blocker()` in
+    /// production; tests pass `book_coalesce_blocker_for(..)`).
+    fn configure_book_coalesce_with(
+        &mut self,
+        requested: bool,
+        hash_activation: Option<u64>,
+        book_window: bool,
+        book_blocker: Option<&'static str>,
     ) {
         self.book_coalesce = false;
         if !requested {
@@ -3560,13 +3583,14 @@ impl ExecutionContext {
             // non-attest h_n, so node-local windows cannot fork it.
             Some("the running state hash is configured (genesis state_hash_activation_height) without L6.1 (book_window_commit)")
         } else {
-            torus_bridge::native_executor::book_coalesce_blocker()
+            book_blocker
         };
         match blocker {
             Some(reason) => tracing::warn!(
                 reason,
                 ?hash_activation,
-                "TORUS_BOOK_COALESCE=1 ignored: L3.1 coalesced Classic book save stays OFF"
+                "TORUS_BOOK_COALESCE requested (on by default; 0 = off) but a precondition fails: \
+                 L3.1 coalesced Classic book save stays OFF"
             ),
             None => {
                 tracing::info!("TORUS_BOOK_COALESCE: L3.1 coalesced Classic book save ON (one encode per dirty book per checkpoint window)");
@@ -39178,6 +39202,100 @@ mod crash_recovery_tests {
         assert_dumps_equal(&off.dump, &on.dump, "L3.1 requested, hash on");
     }
 
+    /// 8k L3.1 default ON (owner s131, perf doc section 110): with
+    /// `TORUS_BOOK_COALESCE` unset the startup gate turns L3.1 on where every
+    /// precondition holds (checkpoint interval, no byte cap, running hash not
+    /// configured, Classic + resident books + the untouched-block advance),
+    /// with no warning; when any one fails it stays off with exactly ONE
+    /// warning naming the reason. `0` is off without a log line.
+    #[test]
+    fn l31_on_by_default_where_preconditions_hold() {
+        use torus_bridge::native_executor::{book_coalesce_blocker_for, BookMode};
+        let default = crate::exec_pipeline::parse_book_coalesce(None);
+        assert!(default, "TORUS_BOOK_COALESCE unset: requested");
+        let (config, db) = p2_fixture();
+        let mut ctx = make_exec_ctx(&config, &db);
+        let classic = book_coalesce_blocker_for(BookMode::Classic, true, true);
+        assert_eq!(classic, None, "Classic + resident + advance: no blocker");
+        let capped = crate::exec_pipeline::CheckpointPolicy {
+            max_bytes: Some(256 << 20),
+            ..ckpt_every(5)
+        };
+        let warns = |logs: &str| {
+            logs.lines()
+                .filter(|l| l.contains("WARN") && l.contains("TORUS_BOOK_COALESCE"))
+                .count()
+        };
+        // (checkpoint, hash activation, book blocker, reason fragment)
+        type Case = (
+            Option<crate::exec_pipeline::CheckpointPolicy>,
+            Option<u64>,
+            Option<&'static str>,
+            &'static str,
+        );
+        let blocked: Vec<Case> = vec![
+            (None, None, classic, "no checkpoint interval"),
+            (Some(capped), None, classic, "byte cap"),
+            (Some(ckpt_every(5)), Some(1), classic, "running state hash"),
+            (
+                Some(ckpt_every(5)),
+                None,
+                book_coalesce_blocker_for(BookMode::LevelAuthorityChunked, true, true),
+                "not Classic",
+            ),
+            (
+                Some(ckpt_every(5)),
+                None,
+                book_coalesce_blocker_for(BookMode::OrderRows, true, true),
+                "not Classic",
+            ),
+            (
+                Some(ckpt_every(5)),
+                None,
+                book_coalesce_blocker_for(BookMode::Classic, false, true),
+                "resident books are off",
+            ),
+            (
+                Some(ckpt_every(5)),
+                None,
+                book_coalesce_blocker_for(BookMode::Classic, true, false),
+                "untouched-block advance is off",
+            ),
+        ];
+        for (ckpt, hash, book, reason) in blocked {
+            ctx.checkpoint = ckpt;
+            ctx.book_coalesce = true;
+            let logs =
+                capture_logs(|| ctx.configure_book_coalesce_with(default, hash, false, book));
+            assert!(!ctx.book_coalesce, "{reason}: stays off");
+            assert_eq!(warns(&logs), 1, "{reason}: one warning\n{logs}");
+            assert!(logs.contains(reason), "{reason}: named\n{logs}");
+            assert!(!logs.contains("save ON"), "{reason}\n{logs}");
+        }
+        // Every precondition holds: on, no warning, the ON line once (bench
+        // harnesses grep for it).
+        for ckpt in [ckpt_every(5), ckpt_never()] {
+            ctx.checkpoint = Some(ckpt);
+            let logs =
+                capture_logs(|| ctx.configure_book_coalesce_with(default, None, false, classic));
+            assert!(ctx.book_coalesce, "preconditions hold: on by default");
+            assert_eq!(warns(&logs), 0, "{logs}");
+            assert_eq!(
+                logs.matches("L3.1 coalesced Classic book save ON").count(),
+                1,
+                "{logs}"
+            );
+        }
+        // `0` / `false`: the kill switch, silent.
+        for v in ["0", "false"] {
+            let requested = crate::exec_pipeline::parse_book_coalesce(Some(v));
+            let logs =
+                capture_logs(|| ctx.configure_book_coalesce_with(requested, None, false, classic));
+            assert!(!ctx.book_coalesce, "{v}: off");
+            assert!(!logs.contains("TORUS_BOOK_COALESCE"), "{v}: silent\n{logs}");
+        }
+    }
+
     /// 8k L3.1 (e), mutation: a close that skips its coalesced encode (the
     /// books stay owed to a later close) fails the golden for every close
     /// kind L3.1 runs under (not the byte cap, which keeps it off), so the harness catches a missed trigger (the design's main risk:
@@ -39807,9 +39925,7 @@ mod crash_recovery_tests {
             ExecutionPayload, Proposal, ProposalStatus, ProposalType,
         };
         torus_economics::GovernanceManager::new(db.clone())
-            .set_governance_params(&torus_economics::GovernanceParams::defaults(
-                Address::ZERO,
-            ))
+            .set_governance_params(&torus_economics::GovernanceParams::defaults(Address::ZERO))
             .unwrap();
         let proposal = |id: u64, status, end_block, executable_after, payload| Proposal {
             id,
@@ -39849,14 +39965,25 @@ mod crash_recovery_tests {
             )
             .unwrap();
         }
-        db.put_cf_raw(torus_state::cf::CF_FEE_CONFIG, b"gov_next_id", &3u64.to_be_bytes())
-            .unwrap();
+        db.put_cf_raw(
+            torus_state::cf::CF_FEE_CONFIG,
+            b"gov_next_id",
+            &3u64.to_be_bytes(),
+        )
+        .unwrap();
         let pm = PositionManager::new(db.clone());
         for i in 0..L61_LIQ_TRADERS as u32 {
             let mut a = [0xa6u8; 20];
             a[16..].copy_from_slice(&i.to_be_bytes());
-            pm.apply_fill(&Address::from(a), 2, true, px(1), px(100), MarginType::Cross)
-                .unwrap();
+            pm.apply_fill(
+                &Address::from(a),
+                2,
+                true,
+                px(1),
+                px(100),
+                MarginType::Cross,
+            )
+            .unwrap();
         }
     }
 
@@ -39950,8 +40077,7 @@ mod crash_recovery_tests {
 
     /// `run`'s dump at durable height `h`.
     fn l61_dump_at(run: &P2Run, h: u64) -> &[CfDump] {
-        &run
-            .dumps
+        &run.dumps
             .iter()
             .find(|(s, _)| *s == h)
             .unwrap_or_else(|| panic!("no dump at {h}"))
@@ -40028,9 +40154,20 @@ mod crash_recovery_tests {
             assert_eq!(l61_proposal_status(at(h), 2), S::Passed, "2 at {h}");
             assert!(!l61_liq_cursor(at(h)), "no cursor at {h}");
         }
-        assert_eq!(l61_proposal_status(at(100), 1), S::Rejected, "1 finalizes at 100");
-        assert_eq!(l61_proposal_status(at(100), 2), S::Executed, "2 executes at 100");
-        assert!(l61_liq_cursor(at(100)), "the pass at 100 stops at the scan budget");
+        assert_eq!(
+            l61_proposal_status(at(100), 1),
+            S::Rejected,
+            "1 finalizes at 100"
+        );
+        assert_eq!(
+            l61_proposal_status(at(100), 2),
+            S::Executed,
+            "2 executes at 100"
+        );
+        assert!(
+            l61_liq_cursor(at(100)),
+            "the pass at 100 stops at the scan budget"
+        );
         assert!(!l61_liq_cursor(at(101)), "101 is due and ends the walk");
         let off = l61_forced_run(
             &blocks,
@@ -40042,8 +40179,16 @@ mod crash_recovery_tests {
             None,
             &P2Fault::None,
         );
-        assert_eq!(l61_proposal_status(&off.dump, 1), S::Active, "off: never finalized");
-        assert_eq!(l61_proposal_status(&off.dump, 2), S::Passed, "off: never executed");
+        assert_eq!(
+            l61_proposal_status(&off.dump, 1),
+            S::Active,
+            "off: never finalized"
+        );
+        assert_eq!(
+            l61_proposal_status(&off.dump, 2),
+            S::Passed,
+            "off: never executed"
+        );
         assert!(!l61_liq_cursor(&off.dump), "off: no pass ran");
         assert_ne!(
             l61_state(l61_dump_at(&off, 100)),
@@ -40052,7 +40197,15 @@ mod crash_recovery_tests {
         );
         for (what, pipelined, mode, ckpt, coalesce, fast, fault) in [
             ("serial", false, classic, None, false, None, P2Fault::None),
-            ("serial, no resident books", false, None, None, false, None, P2Fault::None),
+            (
+                "serial, no resident books",
+                false,
+                None,
+                None,
+                false,
+                None,
+                P2Fault::None,
+            ),
             (
                 "L3.1 every 7, epoch fast path",
                 true,
@@ -40106,7 +40259,9 @@ mod crash_recovery_tests {
                 P2Fault::CkptCrash(_) => {
                     assert_eq!(run.faults, 1, "{what}: crashed once");
                     assert!(
-                        run.crash_windows.iter().all(|(s, last)| *s < 97 && *last < 100),
+                        run.crash_windows
+                            .iter()
+                            .all(|(s, last)| *s < 97 && *last < 100),
                         "{what}: lost and replayed blocks before 100: {:?}",
                         run.crash_windows
                     );
