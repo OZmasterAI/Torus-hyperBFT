@@ -550,6 +550,18 @@ fn list_markets(db: &StateDb) {
     }
 }
 
+/// Main's pre-testnet fix (b57b3fd4) refuses an aliased position row on
+/// load. With several aliased rows ([`ALIASES`]: traders 5 and 6) a
+/// parallel read (e.g. the engine's phase 2) may report either one first,
+/// on either arm, so a refusal's reason drops the row it names (the block
+/// fail-stops alike, never flushed; every other field still compares).
+fn aliased_row_fault(f: String) -> String {
+    match f.find("position row at key ") {
+        Some(i) if f.contains(" names trader ") => format!("{}position row at key <aliased>", &f[..i]),
+        _ => f,
+    }
+}
+
 /// One run's settings.
 #[derive(Clone, Copy, Debug)]
 struct Run {
@@ -667,8 +679,8 @@ fn run(blocks: &[Block], r: Run, fault: &LastBlockFault) -> (RunOut, RunStats) {
                 .iter()
                 .filter(|w| w.0 == CF_NATIVE_POSITIONS && w.2.is_none())
                 .count();
-            let fatal = ctx.fatal_error.clone();
-            let reader_fault = ctx.reader_fault.get().cloned();
+            let fatal = ctx.fatal_error.clone().map(aliased_row_fault);
+            let reader_fault = ctx.reader_fault.get().cloned().map(aliased_row_fault);
             // The committer's view (`take_fatal_error`): `fatal_error`, else
             // the reader fault.
             if let Some(f) = fatal.clone().or_else(|| reader_fault.clone()) {
@@ -1204,14 +1216,17 @@ fn settle_streamed_impure_prefix_plan_stops_the_stream() {
             let what = format!("impure prefix, plan panic {market}");
             let pick = |_: &RunOut, _: &RunStats| LastBlockFault::PlanPanic(market);
             // Since main's pre-testnet fix (b57b3fd4) the aliased rows are
-            // refused on load, so the last block fail-stops before any plan
-            // can hold a foreign market's key: flag on and off stop alike,
-            // with nothing applied (no fallback, no streamed prefix).
+            // refused on load: the plan panic still sends the call to the
+            // sequential fallback, which then refuses trader 5's row and
+            // fail-stops the block. Flag on and off stop alike, and the
+            // stream applies no prefix before it.
             for (no_merge, off, ons) in
                 assert_streamed_equivalent(&blocks, r, &[0, 0x1A], &pick, &what)
             {
-                assert!(off.fatal.is_some(), "{what}: the aliased rows stop the block ({off:?})");
-                assert_eq!(off.fallbacks, 0, "{what}: {off:?}");
+                assert!(
+                    off.fatal.as_deref().is_some_and(|f| f.contains("position row at key <aliased>")),
+                    "{what}: the aliased row stops the block ({off:?})"
+                );
                 for on in ons {
                     assert!(on.fatal.is_some(), "{what}, L2.2 {no_merge}: {on:?}");
                     assert_eq!(
