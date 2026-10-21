@@ -19194,6 +19194,205 @@ paired arm and n = 1.
 * Analysis: `ozarchy-9ghn-tools/analyst/` `cells_table.py` -> `cells_table.jsonl`, `drain_check.py` ->
   `drain_check.json`, `logscan.py` -> `9ghn-logscan.txt`, and `9ghn-foreign.txt` (section 120's `g9-foreign.py`).
 
+## 123. Step 9j stage 1, final head-to-head screen: one binary `perf/h2h-combined` `29bfc705` (node `f4f2679f`), hash on + attestation in every arm, C15 = Classic + L3.1 + L6.1, 15 s checkpoints vs C5 = same at 5 s vs CL21 = C15 + `TORUS_SETTLE_STREAMED=1` (L2.1) vs M15 = mode 3 (`level_authority_chunked`) + b1, 15 s vs M5 = same at 5 s, deep (8i P1M) and standard shapes, w1 (C15) + r1 C15 C5 CL21 M15 M5 / r2 reversed, 300 s cells, n = 2 (campaign ozarchy-9j, archy, 2026-10-21)
+
+**Winners for stage 2: Classic = C15, mode 3 = M15. Neither alternative passes the exec-path merge rule. CL21 adds
+exec-thread CPU per fill: standard 1.0075 [1.0034, 1.0116] (CI above 1), deep 1.052 [0.996, 1.110] (both rounds
++4.7 / +5.6%, 13.9 pooled sd; CI touches 1 only because of 1 df). In return it buys deep native blocks/s 1.086 [1.066,
+1.106], deep matched/s 1.0046 [1.0040, 1.0053] and standard p50 0.894 [0.863, 0.927]. C5 resolves nothing on deep
+(blocks/s 0.857 [0.31, 2.34], p99 1.088 [0.92, 1.29], exec on-CPU 1.0015 [0.965, 1.039]) and worsens standard p99 1.0134
+[1.0011, 1.0258]. M5 vs M15 is a tie on deep (every rule row within 0.5 pooled sd) and loses standard blocks/s 0.920
+[0.874, 0.968]. At 20 blocks/s the 100-block checkpoint bound fires before 15 s, so "5 s vs 15 s" changes the checkpoint
+count only 1.17-1.36x (Classic) and 1.46-1.63x (mode 3), not 3x. Across families, mode 3 runs 5% below Classic on
+matched/s (standard M15 / C15 0.951 [0.949, 0.954]) at +13.6% CPU-s per 1M fills (1.136 [1.134, 1.138]); its flush
+worker is ~51% busy vs Classic's 13-22%.**
+
+Question (bench queue 9j, owner go s75 via 18c): within each family, do the checkpoint interval (15 s vs 5 s) and the
+L2.1 streamed settle change the hash-on Classic + L6.1 path, and does mode 3 do better at 15 s or at 5 s? Winner per
+family by the exec-path merge rule (bench-queue top), deep primary, standard secondary; with no resolved winner the
+15 s arm is the default. Stage 2 runs the two winners head to head.
+
+### 123.1 Setup
+
+* Binary: one build of `perf/h2h-combined` `29bfc705`, staged `ozarchy-h2h-stage/m/release/torus-node` md5
+  `f4f2679f598ce0d9810eb796227561b8` (re-checked this run) on 3 / 3 nodes in all 22 cells (per-cell CHECK and
+  `node-environ-trie.txt`); bench `fa8fd4bd`.
+* Tools: `0f8eedb3` (local merge of origin/main `f8956086` with `fix/harness-attest-drain` `0a978665`; not on
+  origin/main), worktree `wt/9j-0f8eedb3`, frozen per shape in `ozarchy-9j-tools/{deep,standard}/tools/matched-bench`.
+* Arms (every arm `STATE_HASH_ACTIVATION=1 STATE_HASH_ATTEST=1`, fail-stop on, attestation key on every node):
+  **C15** = Classic, `BOOK_WINDOW_COMMIT=1` (L6.1), L3.1 on (default), `TORUS_CHECKPOINT_INTERVAL_MS=15000`.
+  **C5** = C15 at `5000`. **CL21** = C15 + `TORUS_SETTLE_STREAMED=1`. **M15** = genesis
+  `book_mode=level_authority_chunked` (mode 3) + b1, no L6.1, 15000. **M5** = M15 at 5000.
+* Load on every cell: 300 markets, rate 76,000, 5,000 senders, batch 400, cloid share 0, `MAX_IN_FLIGHT` 4, commit tail.
+  Deep = 1M-account preload (8i P1M); standard = 100,000 accounts.
+* Order per shape: w1 (C15, 300 s, warm-up gate), r1 C15 C5 CL21 M15 M5, r2 M5 M15 CL21 C5 C15. Deep 17:57-19:55,
+  standard 19:55-21:06, chained in one unit (`9j-chain.sh`), exit 0.
+* Attempt 1 stopped at deep r1-C15 on a false CHECK FAIL (the run.log expect `book_window_commit = on (L6.1)` is absent
+  on a genesis-cache hit). Expects rewritten cache-independent; deep restarted from w1. Attempt 1's cells are moved
+  aside as `ozarchy-9j-deep-{w1,r1-C15}-unused` and are not used here.
+
+### 123.2 Validity
+
+* 22 / 22 cells rc 0, ACCEPT / AGREE / PASS, 0 panic or fail-stop lines, md5 ok (`{deep,std}/cells.tsv`: 0 bad).
+  No CELL-FLAG, no rerun ("RERUN PASS: nothing queued" for both shapes).
+* State attestation (`j9chk`, every cell): `ok=1`, 63 checkpoints compared, quorum 63 / 63, votes 63 / 63 / 63, h_n
+  equal, 3 attest addresses, fail-stop on x3, margin rejects 0 on 3 nodes. `drained=1` in every run.log.
+* Node logs (all 66, ANSI stripped, `9j-logscan.txt`): `activation=Some(1)` and `TORUS_STATE_HASH_FAILSTOP on=true` on
+  every node; Classic cells: `L3.1 coalesced Classic book save ON` and L6.1 `on=Some(1)` on 3 / 3; mode-3 cells: neither
+  line (`j9chk`: genesis `level_authority_chunked`, no L6.1 window commit). 0 `panicked`, `STATE HASH MISMATCH`,
+  `diverged`, `hash-unverified`, ` ERROR ` or `FATAL` lines. The `TORUS_SETTLE_STREAMED` startup line reads
+  `on=true` on 3 / 3 nodes in the 4 CL21 cells and `on=false` in the other 18 (`9j-streamed.txt`).
+* `node-env-all.txt` (per-cell CHECK): `TORUS_CHECKPOINT_INTERVAL_MS` = 15000 / 5000 per arm on 3 / 3 nodes;
+  `TORUS_SETTLE_STREAMED=1` only in CL21; `TORUS_SETTLE_NO_MERGE` unset everywhere.
+* FOREIGN CPU rule (`contention-main.tsv`, 30 s rows in the load window, per process): no flag in any of the 22 cells.
+  Largest single process: claude 0.064 avg / 0.127 max (deep r1-C15); largest spike claude 0.183 (deep r2-C5).
+  Foreign total 0.069-0.177 core mean (0.177 = deep r1-C15).
+
+### 123.3 Per cell (run order; node mean)
+
+Block p50 / p99 from the `torus_commit_interval_seconds` histogram (load-window delta, node mean), as in section 120.
+Process cores = node user + sys CPU over the load window. Flush busy = `torus_flush_worker_seconds_sum` delta / wall
+(load window, 1 Hz series). Checkpoints = `torus_exec_checkpoints_total` delta in the load window.
+
+| cell | arm | matched/s | native blk/s | fills/blk | p50 / p99 ms | timeouts | exec on-CPU ms / 1k fills | CPU-s / 1M | process cores | flush busy | ckpts (s each) | save_books ms / blk |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| deep w1 | C15 | 257,259 | 18.574 | 13,116 | 13.5 / 494 | 5 | 2.645 | 24.53 | 6.31 | 0.200 | 55.7 (5.44) | 1.26 |
+| deep r1 | C15 | 255,152 | 19.596 | 12,284 | 12.5 / 482 | 2 | 2.659 | 24.72 | 6.30 | 0.200 | 58.3 (5.18) | 1.23 |
+| deep r1 | C5 | 256,072 | 18.172 | 13,088 | 12.6 / 518 | 0 | 2.670 | 24.71 | 6.33 | 0.236 | 82.3 (3.67) | 1.32 |
+| deep r1 | CL21 | 256,347 | 21.254 | 11,470 | 12.6 / 478 | 4 | 2.808 | 24.53 | 6.29 | 0.214 | 64.0 (4.73) | 1.23 |
+| deep r1 | M15 | 243,742 | 14.393 | 15,896 | 14.6 / 704 | 11 | 2.518 | 27.94 | 6.81 | 0.503 | 44.0 (6.89) | 3.54 |
+| deep r1 | M5 | 244,180 | 15.010 | 15,186 | 14.4 / 655 | 1 | 2.576 | 28.71 | 7.01 | 0.521 | 82.3 (3.67) | 3.65 |
+| deep r2 | M5 | 236,959 | 17.818 | 12,472 | 12.6 / 507 | 2 | 2.615 | 29.49 | 6.99 | 0.529 | 80.7 (3.74) | 3.08 |
+| deep r2 | M15 | 231,885 | 18.636 | 11,726 | 12.9 / 496 | 7 | 2.615 | 29.37 | 6.81 | 0.510 | 57.0 (5.30) | 3.11 |
+| deep r2 | CL21 | 250,486 | 22.710 | 10,556 | 11.2 / 470 | 4 | 2.787 | 24.71 | 6.19 | 0.247 | 69.0 (4.39) | 1.12 |
+| deep r2 | C5 | 254,690 | 16.525 | 14,574 | 14.0 / 533 | 0 | 2.658 | 24.60 | 6.27 | 0.248 | 81.7 (3.71) | 1.31 |
+| deep r2 | C15 | 249,344 | 20.878 | 11,371 | 11.7 / 484 | 4 | 2.662 | 24.83 | 6.19 | 0.237 | 62.7 (4.84) | 1.13 |
+| std w1 | C15 | 262,486 | 23.152 | 10,849 | 10.6 / 467 | 1 | 2.550 | 23.63 | 6.20 | 0.135 | 70.0 (4.31) | 0.53 |
+| std r1 | C15 | 264,305 | 23.136 | 10,931 | 11.4 / 463 | 2 | 2.566 | 23.72 | 6.27 | 0.136 | 69.3 (4.36) | 0.55 |
+| std r1 | C5 | 263,040 | 22.076 | 11,358 | 11.8 / 469 | 1 | 2.592 | 23.87 | 6.28 | 0.143 | 78.0 (3.87) | 0.57 |
+| std r1 | CL21 | 266,111 | 22.662 | 11,226 | 10.1 / 475 | 2 | 2.586 | 22.90 | 6.09 | 0.140 | 68.3 (4.42) | 0.52 |
+| std r1 | M15 | 251,439 | 17.802 | 13,373 | 14.2 / 491 | 2 | 2.578 | 26.94 | 6.77 | 0.510 | 54.0 (5.61) | 3.08 |
+| std r1 | M5 | 251,576 | 16.436 | 14,280 | 14.0 / 552 | 2 | 2.554 | 26.78 | 6.75 | 0.509 | 80.3 (3.77) | 3.06 |
+| std r2 | M5 | 253,536 | 17.510 | 13,549 | 13.5 / 494 | 0 | 2.582 | 26.84 | 6.79 | 0.513 | 81.3 (3.71) | 2.94 |
+| std r2 | M15 | 250,120 | 19.119 | 12,403 | 13.3 / 492 | 3 | 2.593 | 27.02 | 6.76 | 0.513 | 57.0 (5.30) | 2.90 |
+| std r2 | CL21 | 265,067 | 22.116 | 11,452 | 11.1 / 474 | 0 | 2.615 | 22.88 | 6.06 | 0.136 | 67.0 (4.52) | 0.54 |
+| std r2 | C5 | 263,091 | 22.063 | 11,409 | 11.5 / 474 | 0 | 2.581 | 23.88 | 6.28 | 0.142 | 80.3 (3.76) | 0.57 |
+| std r2 | C15 | 263,032 | 21.782 | 11,527 | 12.4 / 467 | 0 | 2.597 | 23.79 | 6.26 | 0.130 | 66.0 (4.59) | 0.57 |
+
+Drift: on deep every arm's r2 is below its r1 on matched/s (C15 -2.3%, C5 -0.5%, CL21 -2.3%, M15 -4.9%, M5 -3.0%;
+w1 257.3k), while blocks/s rose in r2 for C15, CL21, M15 and M5. The mirrored order (r2 = r1 reversed) cancels a
+linear trend in the per-round ratios. Standard is flat (C15 w1 / r1 / r2 262.5k / 264.3k / 263.0k).
+
+### 123.4 Arm means and ratios (ratio = geomean of the 2 per-round ratios, 95% t CI, 1 df; step / pooled sd within the family)
+
+**Deep (8i P1M)**
+
+| metric | C15 | C5 | CL21 | M15 | M5 | C5 / C15 [CI] (sd) | CL21 / C15 [CI] (sd) | M5 / M15 [CI] (sd) |
+|---|---|---|---|---|---|---|---|---|
+| matched/s | 252,248 | 255,381 | 253,417 | 237,814 | 240,569 | 1.0125 [0.905, 1.132] (+0.9) | **1.0046 [1.0040, 1.0053]** (+0.3) | 1.0118 [0.892, 1.148] (+0.4) |
+| native blocks/s | 20.237 | 17.349 | 21.982 | 16.514 | 16.414 | 0.857 [0.31, 2.34] (-2.8) | **1.086 [1.066, 1.106]** (+1.7) | 0.9985 [0.58, 1.73] (-0.0) |
+| block p50 ms | 12.1 | 13.3 | 11.9 | 13.8 | 13.5 | 1.094 [0.36, 3.29] (+1.3) | 0.980 [0.72, 1.33] (-0.3) | 0.976 [0.920, 1.036] (-0.3) |
+| block p99 ms | 483 | 526 | 474 | 600 | 581 | 1.088 [0.920, 1.287] (+5.8) | 0.982 [0.855, 1.127] (-1.2) | 0.976 [0.53, 1.79] (-0.1) |
+| timeouts per 1k native blocks | 0.49 (6 / 12,244) | 0 (0 / 10,495) | 0.60 (8 / 13,321) | 1.80 (18 / 9,989) | 0.30 (3 / 9,914) | (-4.0) | (+1.0) | (-2.5) |
+| **exec-thread on-CPU ms / 1k fills** | 2.660 | 2.664 | 2.797 | 2.567 | 2.595 | 1.0015 [0.965, 1.039] (+0.4) | 1.052 [0.996, 1.110] (+13.9) | 1.011 [0.873, 1.171] (+0.5) |
+| CPU-s per 1M fills | 24.77 | 24.66 | 24.62 | 28.65 | 29.10 | 0.995 [0.943, 1.051] (-1.2) | 0.994 [0.976, 1.012] (-1.6) | 1.016 [0.878, 1.176] (+0.5) |
+| process cores | 6.25 | 6.30 | 6.24 | 6.81 | 7.00 | 1.008 [0.953, 1.066] | 0.999 [0.984, 1.014] | **1.027 [1.008, 1.046]** |
+| exec-thread cores | 0.671 | 0.680 | 0.709 | 0.610 | 0.624 | 1.014 | 1.057 [0.998, 1.119] | 1.023 [1.003, 1.043] |
+| flush busy share | 0.218 | 0.242 | 0.230 | 0.507 | 0.525 | 1.113 [0.52, 2.36] | 1.057 [0.89, 1.25] | **1.035 [1.030, 1.040]** |
+| checkpoints in load window | 60.5 | 82.0 | 66.5 | 50.5 | 81.5 | 1.356 | 1.099 | 1.627 |
+| exec block ms | 44.7 | 52.9 | 39.3 | 53.8 | 56.1 | 1.182 | **0.879 [0.872, 0.886]** | 1.047 |
+| save_books ms / blk | 1.18 | 1.31 | 1.17 | 3.33 | 3.36 | 1.111 | 0.992 | 1.009 |
+| hash ms / native blk | 2.11 | 2.37 | 2.07 | 1.78 | 1.74 | 1.126 | 0.982 | 0.986 |
+| RSS mean MB | 4,215 | 4,301 | 4,199 | 4,781 | 4,555 | 1.020 | 0.996 | 0.954 |
+
+**Standard (100,000 accounts)**
+
+| metric | C15 | C5 | CL21 | M15 | M5 | C5 / C15 [CI] (sd) | CL21 / C15 [CI] (sd) | M5 / M15 [CI] (sd) |
+|---|---|---|---|---|---|---|---|---|
+| matched/s | 263,668 | 263,065 | 265,589 | 250,780 | 252,556 | 0.998 [0.966, 1.030] (-0.9) | **1.0073 [1.0016, 1.0130]** (+2.9) | 1.007 [0.927, 1.094] (+1.5) |
+| native blocks/s | 22.459 | 22.069 | 22.389 | 18.460 | 16.973 | 0.983 [0.67, 1.44] (-0.7) | 0.997 [0.79, 1.25] (-0.1) | **0.920 [0.874, 0.968]** (-1.8) |
+| block p50 ms | 11.9 | 11.6 | 10.6 | 13.7 | 13.7 | 0.979 [0.48, 2.01] (-0.4) | **0.894 [0.863, 0.927]** (-2.1) | 1.000 [0.84, 1.20] (-0.0) |
+| block p99 ms | 465 | 472 | 474 | 492 | 523 | **1.0134 [1.0011, 1.0258]** (+2.3) | 1.019 [0.954, 1.089] (+3.3) | 1.062 [0.52, 2.16] (+1.1) |
+| timeouts per 1k native blocks | 0.15 (2 / 13,587) | 0.08 (1 / 13,330) | 0.15 (2 / 13,545) | 0.45 (5 / 11,168) | 0.19 (2 / 10,268) | (-0.4) | (0.0) | (-1.1) |
+| **exec-thread on-CPU ms / 1k fills** | 2.581 | 2.587 | 2.601 | 2.586 | 2.568 | 1.002 [0.903, 1.112] (+0.3) | **1.0075 [1.0034, 1.0116]** (+1.1) | 0.993 [0.961, 1.026] (-1.1) |
+| CPU-s per 1M fills | 23.75 | 23.87 | 22.89 | 26.98 | 26.81 | 1.005 [0.988, 1.022] (+4.0) | **0.964 [0.940, 0.988]** (-28.8) | 0.994 [0.987, 1.000] (-3.3) |
+| process cores | 6.26 | 6.28 | 6.08 | 6.77 | 6.77 | 1.003 | **0.971 [0.953, 0.989]** | 1.001 |
+| exec-thread cores | 0.681 | 0.680 | 0.691 | 0.648 | 0.649 | 1.000 | **1.0148 [1.0131, 1.0165]** | 1.000 |
+| flush busy share | 0.133 | 0.142 | 0.138 | 0.511 | 0.511 | 1.069 [0.82, 1.40] | 1.037 [0.93, 1.15] | 1.000 [0.991, 1.009] |
+| checkpoints in load window | 67.7 | 79.2 | 67.7 | 55.5 | 80.8 | 1.170 | 1.000 | **1.457 [1.118, 1.899]** |
+| exec block ms | 40.9 | 41.6 | 37.0 | 50.2 | 54.2 | 1.019 | 0.907 [0.78, 1.06] | 1.080 |
+| save_books ms / blk | 0.56 | 0.57 | 0.53 | 2.99 | 3.00 | 1.011 | 0.946 [0.912, 0.980] | 1.004 |
+| hash ms / native blk | 1.43 | 1.45 | 1.43 | 1.71 | 1.80 | | | |
+| RSS mean MB | 3,209 | 3,112 | 3,236 | 3,483 | 3,324 | | | |
+
+Across families (context for stage 2; M / C15): deep M15 matched/s 0.943 [0.795, 1.118], M5 0.954 [0.912, 0.997];
+standard M15 0.951 [0.949, 0.954]. CPU-s per 1M fills: standard M15 1.136 [1.134, 1.138], deep 1.156 [0.867, 1.543].
+Exec-thread on-CPU per fill: standard 1.002 [0.965, 1.040], deep 0.965 [0.764, 1.218]. Mode 3 has a lower exec-thread
+load (cores 0.95x standard [0.915, 0.992]) and more work on the flush worker (busy share 3.84x [2.72, 5.43] standard;
+save_books 5.3x per block).
+
+### 123.5 Verdict
+
+* **Classic: C15 (medium-high confidence).**
+  * **CL21 fails the exec-path rule.** Exec-thread on-CPU per 1k fills is 1.0075 [1.0034, 1.0116] on standard (CI
+    above 1). On deep it is 1.052 [0.996, 1.110]: both rounds +4.7 / +5.6%, 13.9 pooled sd; the CI reaches 0.996 only
+    because 1 df gives t = 12.7.
+  * This is section 114's L2.1 cost again (deep 1.044 [1.009, 1.081]), now on the hash-on + L6.1 path. Section 119
+    put it at +1.7-2.5% in a quiet microbench and showed that wake-ups are not the cost.
+  * What CL21 buys: deep blocks/s +8.6% [6.6, 10.6] and exec block ms 0.879 (the exec thread does more work per fill,
+    but streaming shortens the block), deep matched/s +0.46% (resolved, 0.3 sd). On standard: p50 -10.6%, CPU-s per
+    1M fills -3.6% and process cores -2.9%, all resolved, against p99 +1.9% (not resolved).
+  * As in section 114, CL21 can become the Classic arm only by an owner exception to the CPU row.
+  * **C5 does not win.** No deep row resolves, and the point estimates go against it: blocks/s -14% (-2.8 sd), p99
+    +8.8% (+5.8 sd), fills per block +17%. The one row in its favour is timeouts (0 vs 6 events). On standard, p99 is
+    1.0134 [1.0011, 1.0258] (CI on the wrong side, 2.3 sd). Exec-thread CPU per fill is flat on both shapes (1.0015,
+    1.002), so the cadence change does not cost exec CPU per fill.
+  * Neither C5 nor CL21 is within 1.5 pooled sd of C15 on every rule row (C5 deep p99 5.8 sd, blocks/s 2.8 sd; CL21
+    exec on-CPU 13.9 sd), so the EXTEND clause does not apply.
+* **Mode 3: M15 (medium confidence).**
+  * On deep, M5 - M15 is within 0.5 pooled sd on matched/s, blocks/s, p50, p99, exec on-CPU and CPU-s, and no CI
+    resolves. Timeouts favour M5, 3 vs 18 events (-2.5 sd), but 11 of M15's 18 come from one cell (r1).
+  * On standard, M5 loses blocks/s 0.920 [0.874, 0.968] (both rounds 0.92, -1.8 sd), the rule's wrong side.
+  * M5 also costs process CPU on deep (1.027 [1.008, 1.046]) and flush-worker time (1.035 [1.030, 1.040]).
+  * The deep tie alone would meet the EXTEND clause; the resolved standard loss decides it for the 15 s default.
+* **Mechanisms, sized.**
+  * Checkpoint interval: the 100-block checkpoint bound fires before 15 s at these block rates. C15 checkpoints every
+    4.8-5.2 s on deep and 4.4-4.6 s on standard; C5 every 3.7-3.9 s. The 15 s / 5 s arms therefore differ by only
+    1.36x (deep) and 1.17x (standard) in checkpoint count. Mode 3, at lower block rates, differs by 1.63x / 1.46x.
+  * Every C5 per-checkpoint cost visible here is small: save_books +0.13 ms per block, hash +0.26 ms per native block
+    (deep). Against a 44.7 ms exec block this is ~1%, too small to explain the -14% deep blocks/s point. That point is
+    not resolved (CI [0.31, 2.34]), and C5's two rounds differ 10% (18.17 / 16.53).
+  * L2.1: deep exec-thread cores 0.671 -> 0.709 (+0.038 core) at equal fills per second. At ~20 blocks/s this is ~1.9
+    ms more exec-thread CPU per block, inside an exec block that is 5.4 ms shorter (44.7 -> 39.3 ms): the streamed
+    settle overlaps pass B with matching.
+* **Against references (other binaries and campaigns; indicative only).** Section 120's B (hash on + L6.1 + L3.1, no
+  attestation, `TORUS_SETTLE_NO_MERGE=1` by env, binary `53a6d83c`) ran deep 266.9k matched/s, 16.39 blocks/s, exec
+  on-CPU 2.454; standard 271.4k, 16.62, 2.358. C15 here: deep 252.2k, 20.24, 2.660; standard 263.7k, 22.46, 2.581. That is
+  matched/s -5.5% / -2.8% and exec on-CPU per fill +8.4% / +9.5% on another binary with attestation on. Stage 2's
+  Classic hash-off reference cells will place this binary against section 120's A.
+
+### 123.6 Limits and next
+
+* n = 2 per arm, 1 df: blocks/s and p50 / p99 CIs are wide on deep (deep C5 and M15 replicate blocks/s differ 10% /
+  26%). Timeout counts are small (0-18 events per arm).
+* No thread-level flush-worker on-CPU in `sched_by_node` here (absent from the per-thread table); the flush busy share
+  is the worker's own `torus_flush_worker_seconds` sum over wall time, so it includes the worker's waits inside a timed
+  flush.
+* **Stage 2** (bench queue 9j): C15 vs M15, n = 4 per shape in A B B A B A A B, plus a Classic hash-off reference, n
+  = 2 per shape (one cell at the start, one at the end).
+
+### 123.7 Data
+
+* Cells: `~/bench-results-matched/ozarchy-9j-{deep,std}-{w1,r1-C15,r1-C5,r1-CL21,r1-M15,r1-M5,r2-M5,r2-M15,r2-CL21,r2-C5,r2-C15}`
+  (`summary.json`, `buckets.csv`, `metrics-{before,after}-val<i>.txt`, `metrics-1hz.txt.gz`, `state-attest.json`,
+  `node-environ-trie.txt`, `val<i>.log.gz`). Ignore `ozarchy-9j-deep-{w1,r1-C15}-unused` (attempt 1).
+* Campaign: `ozarchy-9j-run/` (`handoff.json`, `campaign.log`, `campaign.done`, `contention-main.tsv`,
+  `{deep,std}/cells.tsv`; attempt 1: `campaign.attempt1.log`, `handoff.attempt1.json`). Tools: `ozarchy-9j-tools/`
+  (`9j-chain.sh`, `ozarchy-9j-{deep,std}-campaign.sh`, `spec-{deep,std}.json`, `9j-checks.sh`, `9j-contention.py`).
+* Analysis: `ozarchy-9j-tools/analyst/` `j9-analyse.py` (from section 120's `g9-analyse.py`; five arms, family sd,
+  process cores, flush busy, checkpoint counts) -> `9j-deep.txt`, `9j-std.txt`; `j9-foreign.py` -> `9j-foreign.txt`;
+  `j9-logscan.sh` -> `9j-logscan.txt`; `9j-streamed.txt`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
