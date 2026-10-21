@@ -56,6 +56,8 @@ only if:
     votes only;
   - `TimeoutCertificate::is_correct` requires `high_qc` to be a correct QC, so a TC built by anyone else around a
     forged vote is rejected everywhere (proposals, AdvanceView, a vote's `highest_tc`).
+  - Cost: n signature checks per check; a QC equal to the replica's own highest PC (already verified, the common
+    case) is not re-verified.
   - Rejected alternative: the TC builder taking the highest *verified* QC. A verifier only sees the signed summaries,
     so it cannot tell a skipped forged QC from a skipped real one; allowing a non-highest `high_qc` would let a
     byzantine builder pick a lower QC and evade V3.
@@ -91,7 +93,9 @@ is Commit (block_tree/invariants.rs:439).
 - **C3.** `on_receive_timeout_vote` routes `view == cur-1` to `prev_collector`. Bracha echo stays restricted to
   `view >= cur` (PM:275).
 - **C4.** A TC formed this way uses the existing highest_tc and AdvanceView path (PM:381-416), which also pulls
-  stragglers into v (PM:529-537).
+  stragglers into v (PM:529-537). It must not count as v's own AdvanceView (`last_advance_view`): otherwise the
+  AdvanceView carrying TC(v) is skipped and, in an epoch-change view (extends on timeout), every replica stays in v
+  holding TC(v) (found in phase B; fixed there).
 
 ### Liveness
 
