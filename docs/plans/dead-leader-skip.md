@@ -183,6 +183,11 @@ before TC phase C, since F2 checks leader(view).
 - **Transient (Q1): accept W = L** (exclusion lands 1-2 epochs after the 3rd miss). (a2) short timeout for a leader
   that missed its last slot is the follow-up if the one-down bench shows the transient matters; (b2) stays the
   heavier alternative.
+- **Possible later upgrade: (a2) short timeout for a leader that missed its last slot.** Every node gives such a
+  leader ~250 ms instead of the normal 1.2-2.4 s the next time it leads; it resets after one on-time proposal. Local
+  timers only (no message or format change), ~1-1.5 d. Derived effect in the transient before exclusion: ~1.5 ->
+  ~6.9 blk/s (4 equal stakes, LAN). Risk: a recovered but slow (high-RTT) leader can be cut off at 250 ms (tunable,
+  resets after one success). Owner s134: b1 first; a2 kept as a possible upgrade, decided after the one-down bench.
 - **Parameters (Q2): genesis parameters** with defaults K = 3 and j cap = 6, range-checked at genesis validation
   (later governance-adjustable). Not chosen: hard-coded constants (each change needs a release + P0.0 activation).
 - **Jailing (Q6): not part of b1.** b1 only removes leader slots; voting power and quorum math are unchanged.
