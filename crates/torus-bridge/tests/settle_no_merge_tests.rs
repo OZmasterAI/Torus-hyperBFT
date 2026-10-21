@@ -766,6 +766,20 @@ fn outcome(run: &RunOut) -> Outcome {
     (calls, run.db_dump.clone(), run.state_root)
 }
 
+/// Trader `t`'s stored position rows at the end: (key market, the row's
+/// market, its size).
+fn trader_rows(run: &RunOut, t: u8) -> Vec<(MarketId, MarketId, FixedPoint)> {
+    use borsh::BorshDeserialize;
+    run.db_dump
+        .iter()
+        .filter(|(cf, k, _)| cf == CF_NATIVE_POSITIONS && k.len() == 28 && k.starts_with(addr(t).as_slice()))
+        .map(|(_, k, v)| {
+            let p = Position::try_from_slice(v).expect("a position row");
+            (MarketId::from_be_bytes(k[20..].try_into().unwrap()), p.market_id, p.size)
+        })
+        .collect()
+}
+
 /// The block's fatal error (its last call's), if any.
 fn last_fatal(run: &RunOut) -> Option<String> {
     run.blocks.last().and_then(|b| b.calls.last()).and_then(|c| c.fatal.clone())
@@ -790,6 +804,11 @@ fn serial_and_parallel_settle_agree_on_an_aliased_row() {
             let (serial, _) = run_seeded(&blocks, cap, true, &LastBlockFault::None, aliases, false);
             let (parallel, stats) = run_seeded(&blocks, cap, true, &LastBlockFault::None, aliases, true);
             assert!(stats.parallel_calls >= 2, "{label}: the parallel settle ran ({stats:?})");
+            assert_eq!(
+                trader_rows(&serial, 5),
+                trader_rows(&parallel, 5),
+                "{label}: trader 5's rows (key market, row market, size), serial vs parallel settle"
+            );
             assert_eq!(outcome(&serial), outcome(&parallel), "{label}: serial vs parallel settle");
         }
     }
