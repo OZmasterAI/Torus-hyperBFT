@@ -694,7 +694,10 @@ mod tests {
     fn stats_count_rejections_per_validator() {
         let keys: Vec<ValidatorKey> =
             (0..3).map(|i| ValidatorKey { index: i, address: crate::key_address(&key(i as u8 + 1)), key: key(i as u8 + 1) }).collect();
-        let mut s = Stats::new(&keys, 300);
+        let reps = reporters(&keys, Some(vkeys(&[key(11), key(12), key(13)]))).unwrap();
+        let mut s = Stats::new(&reps, 300);
+        assert_eq!(s.per_validator[1].address, format!("{:#x}", keys[1].address));
+        assert_eq!(s.per_validator[1].signer, format!("{:#x}", crate::key_address(&key(12))));
         s.record(0, &Ok("0xab".into()));
         s.record(2, &Err("oracle pending cap 4 reached".into()));
         s.record(2, &Ok("0xcd".into()));
