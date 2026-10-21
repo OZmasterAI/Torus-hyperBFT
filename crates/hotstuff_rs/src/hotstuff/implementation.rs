@@ -708,8 +708,9 @@ impl<N: Network> HotStuff<N> {
     /// TC-required phase A (docs/plans/tc-required-and-tip-signing.md §2):
     /// the leader rules for this replica's view v.
     ///
-    /// - **L1.** `highest_pc` is QC(v-1) (or the genesis PC): propose on it,
-    ///   no TC needed.
+    /// - **L1.** `highest_pc` is QC(v-1): propose on it, no TC needed. The
+    ///   genesis PC also counts, but only when TC(v-1) is not held: a held
+    ///   TC goes through L2, so its winning tip or high QC is kept.
     /// - **L2.** Else, with `highest_tc` = TC(v-1): propose through the TC
     ///   (MonadBFT Algorithm 4) and attach it in every case. Case 3 (high QC
     ///   wins) first applies a correct `tc.high_qc` above `highest_pc`, then
@@ -730,16 +731,23 @@ impl<N: Network> HotStuff<N> {
         let view = self.view_info.view;
         let highest_pc = block_tree.highest_pc()?;
 
-        // L1: the happy path.
-        if carries_required_certificate(view, &highest_pc, None) {
+        // L1: the happy path, QC(v-1).
+        if highest_pc.view.int().checked_add(1) == Some(view.int()) && !highest_pc.is_genesis_pc() {
+            return self.propose_from_highest_pc(None, block_tree, app);
+        }
+
+        let tc = block_tree
+            .highest_tc()?
+            .filter(|tc| tc.view.int().checked_add(1) == Some(view.int()));
+
+        // L1, genesis bootstrap: only without TC(v-1), whose winning tip (or
+        // high QC) must not be dropped for a fresh height-0 block.
+        if tc.is_none() && highest_pc.is_genesis_pc() {
             return self.propose_from_highest_pc(None, block_tree, app);
         }
 
         // L3: no certificate for v - 1 yet.
-        let Some(tc) = block_tree
-            .highest_tc()?
-            .filter(|tc| tc.view.int().checked_add(1) == Some(view.int()))
-        else {
+        let Some(tc) = tc else {
             log::debug!(
                 "leader awaiting QC or TC for view {}: highest_pc view {}",
                 view.int() - 1,
