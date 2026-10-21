@@ -401,6 +401,17 @@ pub trait KVGet {
         }
     }
 
+    /* ↓↓↓ Validator Set Update View ↓↓↓ */
+
+    fn validator_set_update_view(&self) -> Result<Option<ViewNumber>, KVGetError> {
+        match self.get(&variables::VALIDATOR_SET_UPDATE_VIEW) {
+            Some(bytes) => ViewNumber::deserialize(&mut &*bytes)
+                .map(Some)
+                .map_err(|err| KVGetError::DeserializeValueError { key: Key::ValidatorSetUpdateView, source: err }),
+            None => Ok(None),
+        }
+    }
+
     /* ↓↓↓ Validator Set Update Complete ↓↓↓ */
     fn validator_set_update_complete(&self) -> Result<bool, KVGetError> {
         bool::deserialize(
@@ -424,7 +435,8 @@ pub trait KVGet {
             self.previous_validator_set()?,
             self.validator_set_update_block_height()?,
             self.validator_set_update_complete()?,
-        ))
+        )
+        .with_update_view(self.validator_set_update_view()?))
     }
 
     /* ↓↓↓ Highest View Phase-Voted ↓↓↓ */
@@ -487,6 +499,7 @@ pub enum Key {
     ValidatorSetUpdateHeight,
     ValidatorSetUpdateDecided,
     HighestViewPhaseVoted,
+    ValidatorSetUpdateView,
 }
 
 impl Display for Key {
@@ -517,6 +530,7 @@ impl Display for Key {
             Key::ValidatorSetUpdateHeight => write!(f, "Validator Set Update Block Height"),
             Key::ValidatorSetUpdateDecided => write!(f, "Validator Set Update Decided"),
             Key::HighestViewPhaseVoted => write!(f, "Highest View Phase-Voted"),
+            Key::ValidatorSetUpdateView => write!(f, "Validator Set Update View"),
         }
     }
 }

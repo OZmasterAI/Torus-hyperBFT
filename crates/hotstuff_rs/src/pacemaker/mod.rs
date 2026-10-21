@@ -244,6 +244,6 @@ pub mod types;
 
 // Re-export leader selection functions for external use and testing.
 pub use implementation::{
-    reputation_leader_selection_enabled, select_leader, select_leader_reputation_weighted,
+    check_leader_selection_mode, reputation_leader_selection_enabled, select_leader, select_leader_reputation_weighted,
     select_leader_with_reputation, set_reputation_leader_selection,
 };

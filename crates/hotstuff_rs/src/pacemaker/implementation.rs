@@ -1236,6 +1236,14 @@ pub fn set_reputation_leader_selection(enabled: bool) {
     REPUTATION_LEADER_SELECTION_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether a replica may run with reputation-weighted leader selection set to `reputation_enabled`.
+///
+/// Skeleton (TC phase C review P2): accepts every mode until the guard lands.
+pub fn check_leader_selection_mode(reputation_enabled: bool) -> Result<(), &'static str> {
+    let _ = reputation_enabled;
+    Ok(())
+}
+
 /// Whether reputation-weighted leader selection is currently enabled.
 pub fn reputation_leader_selection_enabled() -> bool {
     REPUTATION_LEADER_SELECTION_ENABLED.load(std::sync::atomic::Ordering::Relaxed)

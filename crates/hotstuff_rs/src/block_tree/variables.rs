@@ -171,6 +171,11 @@ pub const BLOCK_TREE_PRUNED_HEIGHT: [u8; 1] = [22];
 /// before), so a crash between the two re-delivers instead of losing heights —
 /// the `on_committed_block` contract is at-least-once, strictly ascending.
 pub const APP_FED_BLOCK_HEIGHT: [u8; 1] = [23];
+/// TC phase C review (docs/plans/tc-required-and-tip-signing.md §4): the view at which the most
+/// recently committed validator-set update took over as the source of fresh proposals (the view of
+/// the Commit or Decide PC on the updating block that committed it). Tips of views up to it were
+/// proposed under the previous set, later ones under the committed set.
+pub const VALIDATOR_SET_UPDATE_VIEW: [u8; 1] = [24];
 
 // Fields of Block
 pub const BLOCK_HEIGHT: [u8; 1] = [0];

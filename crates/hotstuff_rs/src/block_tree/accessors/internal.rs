@@ -180,6 +180,9 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         if let Some(height) = *update_height {
             wb.set_validator_set_update_block_height(height)?
         }
+        if let Some(view) = initial_validator_set_state.update_view() {
+            wb.set_validator_set_update_view(view)?
+        }
         wb.set_validator_set_update_decided(update_decided)?;
 
         wb.set_locked_pc(&PhaseCertificate::genesis_pc())?;
@@ -1538,6 +1541,18 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
                     key: Key::ValidatorSetUpdateHeight,
                     source: err,
                 })?,
+        );
+        Ok(())
+    }
+
+    /* ↓↓↓ Validator Set Update View ↓↓↓ */
+    pub fn set_validator_set_update_view(&mut self, view: ViewNumber) -> Result<(), BlockTreeError> {
+        let _: () = self.0.set(
+            &variables::VALIDATOR_SET_UPDATE_VIEW,
+            &view.try_to_vec().map_err(|err| KVSetError::SerializeValueError {
+                key: Key::ValidatorSetUpdateView,
+                source: err,
+            })?,
         );
         Ok(())
     }
