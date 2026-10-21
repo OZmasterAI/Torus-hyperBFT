@@ -400,15 +400,38 @@ pub(crate) fn validate_known_markets<S: StateBackend>(
         }
     };
     let check = |mid: u64| spec(mid).map(|_| ());
+    // Delist follow-up (node-local early answer): a non-reduce-only order on
+    // a governance-delisted market (`market_delisted_key` row) gets the
+    // executor's rejection text; the executor still decides in consensus.
+    let delisted = |mid: u64| -> Result<bool, String> {
+        state_db
+            .get_cf_raw(CF_NATIVE_MARKETS, &torus_types::market_delisted_key(mid))
+            .map(|row| row.is_some())
+            .map_err(|e| format!("market lookup failed: {e}"))
+    };
+    let reduce_only_rule = |p: &torus_types::PlaceOrderParams, is_delisted: bool| {
+        if is_delisted && !p.reduce_only {
+            Err(torus_types::market_delisted_reason(p.market_id))
+        } else {
+            Ok(())
+        }
+    };
     match action {
-        torus_types::NativeAction::PlaceOrder(p) => check_tick_lot(p, spec(p.market_id)?),
+        torus_types::NativeAction::PlaceOrder(p) => {
+            let s = spec(p.market_id)?;
+            reduce_only_rule(p, delisted(p.market_id)?)?;
+            check_tick_lot(p, s)
+        }
         torus_types::NativeAction::PlaceOrderBatch(orders) => {
             let mut specs = std::collections::BTreeMap::new();
             for p in orders {
-                let s = match specs.entry(p.market_id) {
+                let (s, d) = match specs.entry(p.market_id) {
                     std::collections::btree_map::Entry::Occupied(e) => *e.get(),
-                    std::collections::btree_map::Entry::Vacant(e) => *e.insert(spec(p.market_id)?),
+                    std::collections::btree_map::Entry::Vacant(e) => {
+                        *e.insert((spec(p.market_id)?, delisted(p.market_id)?))
+                    }
                 };
+                reduce_only_rule(p, d)?;
                 check_tick_lot(p, s)?;
             }
             Ok(())
@@ -438,6 +461,56 @@ pub(crate) fn validate_known_markets<S: StateBackend>(
         }
         _ => Ok(()),
     }
+}
+
+/// Delist follow-up (node-local read, `torus_getMarkets`): fills `info`'s
+/// delist fields from market `mid`'s governance rows: the delisted flag
+/// (`market_delisted_key`, value = delist height), the settlement row
+/// (`CF_NATIVE_LIQUIDATION 0x08`: `close_at`, the fixed price), a pending
+/// governance close price (`0x09`) and the oracle-closed marker
+/// (`market_oracle_closed_key`, value = completion height). Point reads, not
+/// charged to the scan budget. `latest`: the node's committed height; a row
+/// without a price is in its grace period while `close_at > latest` (the
+/// settlement step first works on the market AT `close_at`).
+fn fill_delist_view<S: StateBackend>(
+    state: &S,
+    mid: u64,
+    latest: u64,
+    info: &mut RpcMarketInfo,
+) -> Result<(), RpcError> {
+    use torus_core::liquidation as liq;
+    let internal = |what: &str, e: String| RpcError::Internal(format!("{what} of market {mid}: {e}"));
+    let be8 = |v: &[u8]| v.get(..8).and_then(|b| b.try_into().ok()).map(u64::from_be_bytes);
+    let Some(flag) = state
+        .get_cf_raw(CF_NATIVE_MARKETS, &torus_types::market_delisted_key(mid))
+        .map_err(|e| internal("delist flag", e.to_string()))?
+    else {
+        return Ok(());
+    };
+    info.status = "delisted".to_string();
+    info.delisted = true;
+    info.delist_height = be8(&flag).map(hex_u64);
+    let row = liq::delist_settlement(state, mid).map_err(|e| internal("settlement row", e.to_string()))?;
+    let closed = state
+        .get_cf_raw(CF_NATIVE_MARKETS, &torus_types::market_oracle_closed_key(mid))
+        .map_err(|e| internal("oracle-closed marker", e.to_string()))?;
+    info.settlement = match (&row, &closed) {
+        (Some(r), _) if r.price.is_none() && r.close_at > latest => "grace",
+        (None, Some(_)) => "settled",
+        // From close_at (waiting for a price or walking), or the walk done
+        // and the ADL obligations still draining.
+        _ => "settling",
+    }
+    .to_string();
+    if let Some(r) = row {
+        info.close_at = Some(hex_u64(r.close_at));
+        info.close_price = r.price.map(dec_fp);
+    }
+    info.governance_close_price = liq::delist_close_price(state, mid)
+        .map_err(|e| internal("governance close price", e.to_string()))?
+        .map(dec_fp);
+    info.settled_height = closed.as_deref().and_then(be8).map(hex_u64);
+    Ok(())
 }
 
 /// s94 option 2 at intake (node-local, non-consensus): the executor's price
@@ -1327,6 +1400,7 @@ impl TorusApiServer for RpcState {
         };
         let mut markets = Vec::new();
         let mut scanned = 0usize;
+        let latest = self.latest_height.load(Relaxed);
         // R24: every market row visited, the ones before `offset` included,
         // is charged to the scan budget (`after` seeks past them instead).
         let mut budget = self.scan_budget();
@@ -1353,7 +1427,7 @@ impl TorusApiServer for RpcState {
                 .map_err(|e| RpcError::Internal(format!("borsh decode market: {e}")))
                 .map_err(ErrorObjectOwned::from)?;
 
-            markets.push(RpcMarketInfo {
+            let mut info = RpcMarketInfo {
                 market_id: hex_u64(mid),
                 base_asset: market.base_asset,
                 quote_asset: market.quote_asset,
@@ -1367,7 +1441,9 @@ impl TorusApiServer for RpcState {
                 close_price: None,
                 governance_close_price: None,
                 settled_height: None,
-            });
+            };
+            fill_delist_view(&self.state, mid, latest, &mut info).map_err(ErrorObjectOwned::from)?;
+            markets.push(info);
 
             if markets.len() >= limit {
                 break;

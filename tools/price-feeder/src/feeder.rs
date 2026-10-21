@@ -184,6 +184,7 @@ impl<H: HttpGet + 'static, N: NodeApi, C: Clock> Feeder<H, N, C> {
     fn aggregate_all(
         &self,
         listed: &BTreeSet<MarketId>,
+        closed: &BTreeSet<MarketId>,
         now: u64,
     ) -> (BTreeMap<MarketId, FixedPoint>, BTreeMap<MarketId, Omission>) {
         let rules = rules(&self.cfg);
@@ -191,6 +192,10 @@ impl<H: HttpGet + 'static, N: NodeApi, C: Clock> Feeder<H, N, C> {
         let mut prices = BTreeMap::new();
         let mut omitted = BTreeMap::new();
         for m in &self.cfg.markets {
+            if closed.contains(&m.market_id) {
+                omitted.insert(m.market_id, Omission { reason: "delist settled".into(), sources: 0, weight: 0 });
+                continue;
+            }
             if !listed.contains(&m.market_id) {
                 omitted.insert(m.market_id, Omission { reason: "not listed".into(), sources: 0, weight: 0 });
                 continue;
@@ -260,15 +265,23 @@ impl<H: HttpGet + 'static, N: NodeApi, C: Clock> Feeder<H, N, C> {
                 return CycleReport::new(CycleOutcome::MarketsUnavailable(e));
             }
         };
+        // Delist follow-up: a market whose delist settlement is complete is
+        // dropped (the chain ignores its prices), reported as "delist settled".
+        let mut closed = BTreeSet::new();
         let listed: BTreeSet<MarketId> = self
             .cfg
             .markets
             .iter()
             .filter(|m| {
-                markets
-                    .iter()
-                    .find(|x| x.id == m.market_id)
-                    .is_some_and(|x| check_listing(m.market_id, &m.base_asset, x).is_ok())
+                let Some(x) = markets.iter().find(|x| x.id == m.market_id) else { return false };
+                if check_listing(m.market_id, &m.base_asset, x).is_err() {
+                    return false;
+                }
+                if x.oracle_closed {
+                    closed.insert(m.market_id);
+                    return false;
+                }
+                true
             })
             .map(|m| m.market_id)
             .collect();
@@ -281,7 +294,7 @@ impl<H: HttpGet + 'static, N: NodeApi, C: Clock> Feeder<H, N, C> {
         self.record_venues();
 
         // 4. Aggregate.
-        let (prices, omitted) = self.aggregate_all(&listed, now);
+        let (prices, omitted) = self.aggregate_all(&listed, &closed, now);
         let mut report = CycleReport::new(CycleOutcome::NothingToSend);
         {
             let mut st = self.status.lock().unwrap();

@@ -57,7 +57,7 @@ pub fn parse_markets_page(v: &Value) -> Result<Vec<MarketInfo>, String> {
                 id: hex_u64(m.get("marketId").unwrap_or(&Value::Null), "marketId")?,
                 base_asset: field(m, "baseAsset")?.to_string(),
                 quote_asset: field(m, "quoteAsset")?.to_string(),
-                oracle_closed: false,
+                oracle_closed: m.get("settlement").and_then(Value::as_str) == Some("settled"),
             })
         })
         .collect()
@@ -206,7 +206,14 @@ pub async fn startup_check<N: NodeApi>(cfg: &Config, node: &N, signer: Address) 
             None => warnings.push(format!("market {} ({}) is not listed; skipped", m.market_id, m.base_asset)),
             Some(x) => {
                 check_listing(m.market_id, &m.base_asset, x)?;
-                listed.insert(m.market_id);
+                if x.oracle_closed {
+                    warnings.push(format!(
+                        "market {} ({}) is delisted and its settlement is complete (oracle closed); skipped",
+                        m.market_id, m.base_asset
+                    ));
+                } else {
+                    listed.insert(m.market_id);
+                }
             }
         }
     }
