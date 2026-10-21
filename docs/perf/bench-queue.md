@@ -983,7 +983,13 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    deep 1.015 [0.84, 1.22] unresolved; blocks/s, p50, p99 CIs span 1. Window-close histogram empty in B by design;
    B's %100 save (~59-64 ms deep, 32-128 ms buckets, one per %100 height) replaces A's close (67 ms). h_n not compared
    value for value (no attest key, 0 attestations): equal hash entries and heights on 3 / 3 nodes in all 8 hash-on
-   cells.**
+   cells.** **h_n proven value for value s75 (section 122): ozarchy-9ghn, same binary, B + `STATE_HASH_ATTEST=1`
+   (fail-stop on), deep and standard w1 + r1, 4 / 4 cells rc 0 ACCEPT / AGREE. 213 / 213 compared checkpoints (55 /
+   63 / 32 / 63) have h_n equal on 3 / 3 nodes, quorum with 3 / 3 votes, and 0 mismatch / no-quorum / fail-stop lines.
+   The attest-live drain is cleared in all 4 cells: the quiet-window native step is exactly 3 per checkpoint, and no
+   order / cancel / rejection counter moved from drain start to digest end. Tools 54ffec29 + b4856e8d: the first smoke
+   on 54ffec29 failed only for harness reasons (attestations kept the drain from going quiet; 63 < 64 compared because
+   the chain advanced during the scan).**
 9h. **L2.1 microbench on a quiet host (one-off, owner s131)** (next free gap; ~30 min; NOT a node bench: an in-process
    `cargo test --release` microbench). 18c's numbers are too noisy (load ~100). Binaries/branches: `perf/l21-streamed-settle`
    at `0323b755` (before wake-up batching) and `39f8c7f3` (batched wake-ups, merged with main be1c378d), built in a separate
