@@ -662,6 +662,40 @@ class AttestLiveHttpTest(unittest.TestCase):
         self.assertGreater(drain['attest_live']['window_restarts'], 0)
         self.assertGreater(drain['attest_live']['window_scan']['other'], 0)
 
+    FEED = ['--feed-live', '--feed-mempool-max', '6']
+
+    def test_cli_feed_live_allows_the_running_feeds_oracle_submissions(self):
+        """Codex re-review P2 probe: ORACLE_FEED_DRAIN=1 + STATE_HASH_ATTEST=1.
+        The feed keeps submitting SubmitOraclePrices through the feed-live
+        drain; they must not restart the quiet window (feed_live_drained=True,
+        feed_plus_attest_drained=False, window_restarts=4 before the fix)."""
+        bodies = {h: block_body(*(['SubmitOraclePrices'] + [ATTEST_KIND]*3 if h % 2
+                                   else ['SubmitOraclePrices'])) for h in range(0, 400)}
+        both, drain = self.run_drain(bodies, self.FEED + self.ATTEST)
+        self.assertEqual(both.returncode, 0, both.stderr)
+        self.assertTrue(drain['drained'], drain['reason'])
+        scan = drain['attest_live']['window_scan']
+        self.assertEqual(drain['attest_live']['window_restarts'], 0)
+        self.assertEqual(scan['allowed_kinds'], ['SubmitOraclePrices'])
+        self.assertGreater(scan['allowed'], 0)
+        self.assertEqual((scan['other'], scan['unread']), (0, 0))
+
+    def test_cli_oracle_submissions_without_feed_live_restart_the_window(self):
+        """The settle drain after the feed is paused (no --feed-live) stays
+        strict: an oracle submission executing there is not the feed's."""
+        bodies = {h: block_body(ATTEST_KIND, 'SubmitOraclePrices') for h in range(0, 400)}
+        live, drain = self.run_drain(bodies, self.ATTEST, timeout='6')
+        self.assertEqual(live.returncode, 1, live.stderr)
+        self.assertGreater(drain['attest_live']['window_restarts'], 0)
+        self.assertEqual(drain['attest_live']['window_scan']['allowed_kinds'], [])
+
+    def test_cli_feed_live_still_restarts_on_a_cancel(self):
+        bodies = {h: block_body('SubmitOraclePrices', 'CancelOrder') for h in range(0, 400)}
+        live, drain = self.run_drain(bodies, self.FEED + self.ATTEST, timeout='6')
+        self.assertEqual(live.returncode, 1, live.stderr)
+        self.assertGreater(drain['attest_live']['window_restarts'], 0)
+        self.assertGreater(drain['attest_live']['window_scan']['other'], 0)
+
     def test_cli_unreadable_bodies_never_drain(self):
         live, drain = self.run_drain({}, self.ATTEST, timeout='6')
         self.assertEqual(live.returncode, 1, live.stderr)

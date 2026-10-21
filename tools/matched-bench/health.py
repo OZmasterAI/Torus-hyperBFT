@@ -47,7 +47,8 @@ DEFAULT_FEED_MEMPOOL_MAX = 6  # 2 rounds x 3 validators x 1 chunk (<= 256 market
 #     action (CancelOrder / CancelAllOrders move books and margin but no order
 #     counter; oracle prices, transfers, ...) must not execute in the quiet
 #     window either: attest_window_step reads the window's block bodies by kind
-#     (attest_traffic.py; --attest-rpc) and restarts the window if one did;
+#     (attest_traffic.py; --attest-rpc) and restarts the window if one did
+#     (with --feed-live the running feed's SubmitOraclePrices are allowed);
 #   * pending: inside the window the native mempool may hold up to
 #     --attest-mempool-max entries, but the ACCEPTING sample needs it empty on
 #     every node (the feed's footprint with --feed-live): an entry there may be
@@ -55,6 +56,10 @@ DEFAULT_FEED_MEMPOOL_MAX = 6  # 2 rounds x 3 validators x 1 chunk (<= 256 market
 #     so an empty sample comes within seconds (9g-hn cells: 3 samples in 4).
 # The traffic over the quiet window is recorded (drain.json .attest_live).
 ATTEST_SUBMITTED = 'torus_state_hash_attestations_submitted_total'
+# NativeAction variant of the oracle feed's submissions (torus_getBlockBody
+# serde tag; run-cell's "$BENCH" oracle-feed): allowed in the --feed-live
+# --attest-live scan.
+ORACLE_KIND = 'SubmitOraclePrices'
 DEFAULT_ATTEST_MEMPOOL_MAX = 6  # 2 checkpoints x 3 validators
 FEED_LIVE_COLUMNS = ('elapsed_s', 'node', 'committed', 'exec_lag', 'mempool',
                      'chain_blocks', 'chain_ms', 'quiet_elapsed_s')
@@ -376,7 +381,12 @@ def wait_for_drain(urls, out, timeout_s, quiet_s, feed_live=False, max_lag=DEFAU
         extra += (ATTEST_SUBMITTED,)
         if scan is None:
             from attest_traffic import scan_window
-            scan = lambda lo, hi: scan_window(list(attest_rpcs or ()), lo, hi)
+            # --feed-live: the oracle feed keeps submitting through this
+            # drain, so its own kind is expected traffic like the
+            # attestations. Without it (the settle drain after the feed is
+            # paused) and in run-cell's digest window, nothing is allowed.
+            allowed = (ORACLE_KIND,) if feed_live else ()
+            scan = lambda lo, hi: scan_window(list(attest_rpcs or ()), lo, hi, allowed)
     if to_height is not None or attest_live:
         extra += (EXEC_HEIGHT,)
     last = None

@@ -199,7 +199,9 @@ python3 tools/matched-bench/test_harness.py
    than `AttestStateHash` executed in the quiet window (the window's block
    bodies are read by kind with `attest_traffic.py`, since no metric splits the
    native counter by kind; one restarts the window, an unreadable body keeps it
-   open); native mempool <= 2 checkpoints x 3 validators on top of any feed
+   open; an action is excused as skipped only if every node reports it
+   skipped; in the feed-live drain the running feed's `SubmitOraclePrices` are
+   allowed too, never in the settle re-drain or the digest window); native mempool <= 2 checkpoints x 3 validators on top of any feed
    footprint inside the window, but within the feed footprint alone (0 without
    the feed) on the accepting sample, because nothing tells a pending
    attestation from a stranded load action. `drain.json .attest_live` records

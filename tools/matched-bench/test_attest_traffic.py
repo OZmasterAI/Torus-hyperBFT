@@ -222,6 +222,87 @@ class ScanTest(unittest.TestCase):
         )
 
 
+
+class AllNodesSkipTest(unittest.TestCase):
+    """Codex re-review P2: a skipped non-attestation action is excused only if
+    EVERY node reports it skipped. The execution status is per node; one node
+    skipping a cancel its peers executed must not certify quiescence while the
+    peers' native counters moved."""
+
+    def nodes(self, statuses, height=5, kinds=("CancelOrder",)):
+        """One FakeRpc per status (a list per node), the same body kinds."""
+        return [
+            FakeRpc({h: body(*kinds, status=st) if h == height else body()
+                     for h in range(1, 10)})
+            for st in statuses
+        ]
+
+    def test_first_node_skipped_peers_executed_counts(self):
+        a, b, c = self.nodes([["skipped"], ["executed"], ["executed"]])
+        with a, b, c:
+            w = scan_window([a.url, b.url, c.url], 1, 9)
+        self.assertEqual((w["other"], w["other_heights"]), (1, [5]))
+        self.assertFalse(w["clean"])
+        self.assertEqual(w["status_split_heights"], [5])
+        self.assertTrue(b.calls and c.calls, "the peers were asked")
+
+    def test_skipped_on_every_node_is_excused(self):
+        a, b, c = self.nodes([["skipped"]] * 3)
+        with a, b, c:
+            w = scan_window([a.url, b.url, c.url], 1, 9)
+        self.assertEqual((w["other"], w["unread"], w["clean"]), (0, 0, True))
+        self.assertEqual(w["status_split_heights"], [])
+
+    def test_a_peer_not_executed_yet_or_unreachable_counts(self):
+        a, b, c = self.nodes([["skipped"], ["skipped"], None])
+        with a, b, c:
+            self.assertEqual(scan_window([a.url, b.url, c.url], 1, 9)["other"], 1)
+            self.assertEqual(scan_window([a.url, b.url, DEAD], 1, 9)["other"], 1)
+            # the first node down: read from the second, every node still asked
+            self.assertEqual(scan_window([DEAD, a.url, b.url], 1, 9)["other"], 1)
+            self.assertEqual(scan_window([a.url, b.url], 1, 9)["other"], 0)
+
+    def test_only_the_skipped_action_needs_every_node(self):
+        a, b, c = self.nodes(
+            [["executed", "skipped"], ["executed", "executed"], ["executed", "skipped"]],
+            kinds=(ATTEST_KIND, "CancelOrder"),
+        )
+        with a, b, c:
+            w = scan_window([a.url, b.url, c.url], 1, 9)
+        self.assertEqual((w["attest"], w["other"]), (1, 1))
+        # attestation-only heights are read from one node: the peers are only
+        # asked about the height with a skipped non-attestation action
+        self.assertEqual(
+            sorted(r["params"][0] for call in b.calls
+                   for r in (call if isinstance(call, list) else [call])),
+            [5],
+        )
+
+
+class AllowedKindsTest(unittest.TestCase):
+    """--feed-live drain: the running oracle feed's SubmitOraclePrices are
+    allowed traffic like the attestations; every other kind still counts."""
+
+    def test_allowed_kinds_are_counted_apart(self):
+        bodies = {h: body(ATTEST_KIND, "SubmitOraclePrices") for h in range(1, 10)}
+        with FakeRpc(bodies) as rpc:
+            strict = scan_window([rpc.url], 1, 9)
+            feed = scan_window([rpc.url], 1, 9, allowed=("SubmitOraclePrices",))
+        self.assertEqual((strict["other"], strict["clean"]), (9, False))
+        self.assertEqual(
+            (feed["attest"], feed["allowed"], feed["other"], feed["clean"]),
+            (9, 9, 0, True),
+        )
+        self.assertEqual(feed["allowed_kinds"], ["SubmitOraclePrices"])
+        self.assertEqual(strict["allowed_kinds"], [])
+
+    def test_a_cancel_still_counts_with_the_feed_allowed(self):
+        bodies = {h: body("SubmitOraclePrices") for h in range(1, 10)}
+        bodies[4] = body("SubmitOraclePrices", "CancelOrder")
+        with FakeRpc(bodies) as rpc:
+            w = scan_window([rpc.url], 1, 9, allowed=("SubmitOraclePrices",))
+        self.assertEqual((w["allowed"], w["other"], w["other_heights"]), (9, 1, [4]))
+
 class CliTest(unittest.TestCase):
     def run_cli(self, rpcs, lo, hi):
         r = subprocess.run(
@@ -255,6 +336,21 @@ class CliTest(unittest.TestCase):
             self.assertEqual((rc, w["unread"]), (2, 6))
         rc, w = self.run_cli([DEAD], 1, 2)
         self.assertEqual(rc, 2)
+
+    def test_digest_probe_skipped_on_one_node_only_is_not_quiescent(self):
+        """Codex re-review P2 probe: cancel_status=[skipped, executed,
+        executed] must not exit 0 (digest_quiescent) and the CLI never allows
+        the oracle feed's kind (the feed is paused for the digest)."""
+        def rpc(status):
+            return FakeRpc({h: body("CancelOrder", status=status) if h == 3 else body()
+                            for h in range(1, 6)})
+        with rpc("skipped") as a, rpc("executed") as b, rpc("executed") as c:
+            rc, w = self.run_cli([a.url, b.url, c.url], 1, 5)
+        self.assertEqual((rc, w["other"], w["allowed_kinds"]), (1, 1, []))
+        oracle = {h: body("SubmitOraclePrices") for h in range(1, 6)}
+        with FakeRpc(oracle) as d:
+            rc, w = self.run_cli([d.url], 1, 5)
+        self.assertEqual((rc, w["other"]), (1, 5))
 
     def test_usage_errors(self):
         for args in (
