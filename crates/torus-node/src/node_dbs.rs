@@ -305,7 +305,9 @@ fn test_crash_point() -> Result<(), String> {
 /// digest refuses a file that digests differently (before anything is
 /// written); an initialized one without a stored digest stores the file's
 /// ([`GenesisBinding::Legacy`]); a fresh one stores it and then is seeded
-/// ([`apply_genesis_if_fresh`]).
+/// ([`apply_genesis_if_fresh`]). The node runs the two halves around the
+/// retention rule ([`bind_genesis_and_retention`]); tests call this.
+#[cfg(test)]
 pub fn init_genesis(
     dbs: &NodeDbs,
     genesis: &torus_genesis::Genesis,
