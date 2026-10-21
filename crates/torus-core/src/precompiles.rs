@@ -21,7 +21,7 @@ use torus_types::{Address, Cloid, FixedPoint, MarketId, OrderId, U256};
 use crate::error::CoreError;
 use crate::lockbox::{wei_to_fp_floor, WEI_PER_NATIVE_UNIT};
 use crate::position::{
-    borsh_read_address, borsh_read_fp, borsh_write_address, borsh_write_fp, NativeBalance, Position,
+    borsh_read_address, borsh_read_fp, borsh_write_address, borsh_write_fp, NativeBalance,
 };
 
 // ============================================================================
@@ -2026,6 +2026,7 @@ pub fn write_order_book_snapshot(
 #[cfg(test)]
 mod r02_oracle_price_tests {
     use super::*;
+    use crate::position::Position;
     use torus_state::{AtomicWriteOp, StateError};
 
     #[derive(Clone)]
