@@ -11471,7 +11471,7 @@ impl NativeExecutor {
     /// Pre-testnet P1: the rejection of an order that is not reduce-only on a
     /// delisted market (reduce-only wind-down).
     fn delisted_rejection(market_id: MarketId) -> Rejection {
-        (FailureReason::MarketDelisted, format!("market {market_id} is delisted: only reduce-only orders"))
+        (FailureReason::MarketDelisted, torus_types::market_delisted_reason(market_id))
     }
 
     /// Pre-testnet P1: `Some(rejection)` for a placement that is not

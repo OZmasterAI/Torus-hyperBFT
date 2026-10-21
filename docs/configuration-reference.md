@@ -422,9 +422,20 @@ row is gone and the liquidator vault and both ADL escrows hold no position in it
 validators ignore that market's entries in `SubmitOraclePrices`: they are not stored, the rest of
 the submission is, and the action still succeeds. The block-start aggregation also skips the
 market. Until then (grace period, settlement walk, ADL drain) prices are accepted and aggregated as
-usual. The price feeder still publishes a delisted market while `torus_getMarkets` lists it, which
-is harmless (the entry is ignored). To save the work, remove the market from the feeder's
-`[[markets]]` config once it is settled.
+usual. The price feeder stops publishing a market once `torus_getMarkets` reports its settlement as
+`settled` (it re-reads the list every cycle, logs a startup warning and reports the market as
+omitted with reason `delist settled`); you can then remove it from the feeder's `[[markets]]`
+config.
+
+**What the node shows (node-local, no consensus effect).** RPC intake refuses an order that is not
+reduce-only on a delisted market (`PlaceOrder`, or any order of a `PlaceOrderBatch`) with the
+executor's text `market N is delisted: only reduce-only orders`, before signature checks; the
+executor still decides in consensus. `torus_getMarkets` adds per market: `status` (`active` or
+`delisted`), `delisted`, `delistHeight`, `closeAt` (the grace end; `null` once the settlement walk
+is done), `settlement` (`none`, `grace` before `closeAt`, `settling` from `closeAt` until complete,
+including waiting for a price and the ADL drain, `settled`), `closePrice` (the fixed settlement
+price while the settlement row exists; it is not kept in state after the walk),
+`governanceClosePrice` (a `SetDelistClosePrice` price not yet used) and `settledHeight`.
 
 **Relisting.** A delisted id is never listed again. List the asset again under a new id with a new
 `ListMarket` proposal.

@@ -1617,6 +1617,13 @@ pub fn market_delisted_key(market_id: MarketId) -> [u8; 9] {
     key
 }
 
+/// The rejection text of an order that is not reduce-only on a delisted
+/// market: the executor's (`FailureReason::MarketDelisted`) and RPC
+/// ingress's (node-local early answer), one source.
+pub fn market_delisted_reason(market_id: MarketId) -> String {
+    format!("market {market_id} is delisted: only reduce-only orders")
+}
+
 /// Delist decisions (owner s134, 3b): the `CF_NATIVE_MARKETS` key of a
 /// delisted market's oracle-closed marker: the 8-byte big-endian market id
 /// followed by `b'S'` (nine bytes, skipped by every market-row scan, like

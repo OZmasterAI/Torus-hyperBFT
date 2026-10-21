@@ -140,7 +140,9 @@ and the settlement. The settlement price is the mark, or the last aggregated pri
 the grace period, unless governance set a close price. Once the settlement is complete (no
 position, no ADL obligation and no settlement row left), every validator ignores that market's
 entries in `SubmitOraclePrices`. The rest of the submission is still stored, so nothing breaks.
-After that, remove the market from the feeder's `[[markets]]` config to save the work. Details:
+The feeder sees this in `torus_getMarkets` (`settlement: "settled"`) and stops publishing the
+market on its own (startup warning; omitted with reason `delist settled`). You can then remove it
+from the feeder's `[[markets]]` config. Details:
 [Configuration Reference](configuration-reference.md#market-delisting-governance).
 
 ## Operational Checklist
