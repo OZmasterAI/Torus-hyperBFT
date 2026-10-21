@@ -60,6 +60,22 @@
 //! - The body restore of a dispatched block runs on the worker, from the
 //!   durable body row dispatch wrote (from the block's actions when that row
 //!   did not land: then the job carries them).
+//!
+//! # The off-thread body write (T5.3)
+//!
+//! With the `CommitPersistWriter` the body row is written after dispatch,
+//! on the writer's thread. A job then carries the writer's ticket for its
+//! height, and the worker waits for it before the pass (the exec thread
+//! waits for the same ticket before it executes the height): the pass
+//! records the height only once its row landed, and its restore reloads a
+//! row that exists. A write that failed (or a writer that is gone) leaves
+//! the height unrecorded, as a failed dispatch-time write did, and the
+//! ticket hands the block's actions back for the restore. The writer writes
+//! in height order, so once a height's ticket settled every lower height's
+//! did too: a pass back-fills only heights whose writes settled. A
+//! coalesced height keeps the ticket of the highest one for its pass. A
+//! stop (or a crash) while the worker waits runs nothing more for the job:
+//! the height is unrecorded, and back-filled after the restart.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -70,6 +86,7 @@ use torus_mempool::Mempool;
 use torus_state::{DaGcOutcome, DaGcPassStats, StateDb};
 use torus_types::{SignedNativeAction, B256};
 
+use crate::app::PersistTicket;
 use crate::da_gc::{BlockTreeHistory, DaBodyGc, DA_GC_LIMITS};
 
 /// Most dispatched heights the handoff queue holds (about 5 KB each at 150
@@ -83,20 +100,46 @@ pub fn resolve_da_gc_inline(env: Option<&str>) -> bool {
     env.map(str::trim) == Some("1")
 }
 
+/// Whether a dispatched height's GC record is known (logs when it is not):
+/// a height whose body row did not land is not recorded at all (never as "no
+/// actions": that would drop its re-inclusion pins, Codex P1 round 2): the GC
+/// cursor stays at it, its pass deletes nothing, and the next pass
+/// back-fills it from the block tree. A native-empty block has nothing to
+/// pin: its empty record is the truth.
+pub(crate) fn record_height(height: u64, bodies: usize, body_durable: bool) -> bool {
+    let record = body_durable || bodies == 0;
+    if !record {
+        tracing::warn!(
+            height,
+            bodies,
+            "DA body GC: body row not durable, not recording this height \
+             (deleting nothing; the next pass back-fills it from the block tree)"
+        );
+    }
+    record
+}
+
 /// One dispatched height for the GC worker.
 pub(crate) struct DaGcJob {
     pub height: u64,
     /// The block's native-action hashes.
     pub hashes: Vec<B256>,
     /// `false`: the block's record is unknown (its body row did not land and
-    /// it has actions): the cursor stays at it.
+    /// it has actions): the cursor stays at it. Ignored with `persist`.
     pub record: bool,
     /// Erasure shards custodied per body.
     pub shard_count: u16,
     /// The block's actions, only when its body row did not land (the restore
-    /// cannot reload them then).
+    /// cannot reload them then). Ignored with `persist`.
     pub actions: Option<Vec<SignedNativeAction>>,
+    /// T5.3: the `CommitPersistWriter`'s ticket for this height's body row
+    /// write. The worker waits for it before the pass; `record` and the
+    /// restore's actions then follow from it.
+    pub persist: Option<PersistTicket>,
 }
+
+/// How often a worker waiting for a writer's ticket checks for a stop.
+const PERSIST_WAIT_SLICE: Duration = Duration::from_millis(20);
 
 /// Everything one GC pass needs, shared by the inline path and the worker.
 pub(crate) struct DaGcRunner {
@@ -410,6 +453,9 @@ struct Queue {
     jobs: VecDeque<DaGcJob>,
     /// The node is shutting down: no more jobs.
     closed: bool,
+    /// T5.3: the writer's ticket of the highest coalesced height (its
+    /// tree-read pass waits for it).
+    dropped_persist: Option<PersistTicket>,
 }
 
 /// State shared by the consensus thread and the worker.
@@ -536,7 +582,7 @@ impl DaGcWorker {
 
     /// Hand `job` to the worker: never touches the DB, never waits for a
     /// pass (the worker holds the queue's mutex only to take the jobs).
-    pub fn submit(&self, job: DaGcJob) -> Handoff {
+    pub fn submit(&self, mut job: DaGcJob) -> Handoff {
         let height = job.height;
         let shards = job.shard_count;
         let shared = &*self.shared;
@@ -557,7 +603,9 @@ impl DaGcWorker {
             shared
                 .dropped_shards
                 .store(u64::from(shards), Ordering::SeqCst);
-            shared.dropped_through.fetch_max(height, Ordering::SeqCst);
+            if shared.dropped_through.fetch_max(height, Ordering::SeqCst) <= height {
+                queue.dropped_persist = job.persist.take();
+            }
             (Handoff::Coalesced, Some(job))
         };
         drop(queue);
@@ -680,11 +728,28 @@ fn work(runner: &DaGcRunner, shared: &WorkerShared) {
             if shared.stop.load(Ordering::SeqCst) {
                 return;
             }
+            let (record, actions) = match &job.persist {
+                None => (job.record, job.actions),
+                Some(ticket) => {
+                    let Some(body_durable) = wait_persist(runner, shared, ticket) else {
+                        return;
+                    };
+                    let actions = if body_durable {
+                        None
+                    } else {
+                        ticket.take_unwritten_actions()
+                    };
+                    (
+                        record_height(job.height, job.hashes.len(), body_durable),
+                        actions,
+                    )
+                }
+            };
             runner.run(
                 job.height,
-                job.actions.as_deref(),
+                actions.as_deref(),
                 &job.hashes,
-                job.record,
+                record,
                 job.shard_count,
                 i == last,
             );
@@ -700,6 +765,14 @@ fn work(runner: &DaGcRunner, shared: &WorkerShared) {
         {
             let shards = shared.dropped_shards.load(Ordering::SeqCst);
             let shards = u16::try_from(shards).unwrap_or(u16::MAX);
+            // Its tree-read pass back-fills (and restores from) the rows of
+            // the coalesced heights: wait until the writer settled them.
+            let persist = shared.lock_queue().dropped_persist.clone();
+            if let Some(ref ticket) = persist {
+                if wait_persist(runner, shared, ticket).is_none() {
+                    return;
+                }
+            }
             loop {
                 #[cfg(test)]
                 if !runner.hooks.wait_gate() {
@@ -716,8 +789,37 @@ fn work(runner: &DaGcRunner, shared: &WorkerShared) {
                 }
             }
             finish(dropped);
+            let mut queue = shared.lock_queue();
+            if shared.dropped_through.load(Ordering::SeqCst)
+                <= shared.processed.load(Ordering::SeqCst)
+            {
+                queue.dropped_persist = None;
+            }
         }
         shared.busy.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Wait for a writer's `ticket`: `Some(body row written)`, or `None` on a stop
+/// (or a test crash) while waiting.
+fn wait_persist(
+    runner: &DaGcRunner,
+    shared: &WorkerShared,
+    ticket: &PersistTicket,
+) -> Option<bool> {
+    loop {
+        if shared.stop.load(Ordering::SeqCst) {
+            return None;
+        }
+        #[cfg(test)]
+        if runner.hooks.killed() {
+            return None;
+        }
+        #[cfg(not(test))]
+        let _ = runner;
+        if let Some(body) = ticket.wait_body_for(PERSIST_WAIT_SLICE) {
+            return Some(body);
+        }
     }
 }
 
@@ -825,6 +927,11 @@ impl DaGcTestHooks {
         gate.paused = false;
         gate.pause_after = None;
         self.gate_cv.notify_all();
+    }
+
+    /// Whether [`Self::kill`] ran.
+    fn killed(&self) -> bool {
+        self.gate.lock().unwrap().killed
     }
 
     /// A crash: the worker exits at its next job, running nothing more.

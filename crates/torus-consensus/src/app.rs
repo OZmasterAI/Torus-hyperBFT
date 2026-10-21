@@ -571,17 +571,33 @@ type HeaderHookSlot = Arc<std::sync::OnceLock<HeaderPersistedHook>>;
 
 /// T5.3: the commit-persist result of one height: filled by the
 /// [`CommitPersistWriter`] once the height's header + body write returned,
-/// awaited by the exec thread before it executes the height.
+/// awaited by the exec thread before it executes the height, and by the DA
+/// body GC before it records the height (RH4: its restore reloads the body
+/// row, see [`crate::da_gc_worker`]).
 #[derive(Clone, Default)]
-struct PersistTicket(Arc<(std::sync::Mutex<Option<DurableRows>>, std::sync::Condvar)>);
+pub(crate) struct PersistTicket(Arc<(std::sync::Mutex<TicketSlot>, std::sync::Condvar)>);
+
+/// What a [`PersistTicket`] holds.
+#[derive(Default)]
+struct TicketSlot {
+    rows: Option<DurableRows>,
+    /// The block's native actions when its body row did not land (the DA
+    /// body GC restores from them then; taken once).
+    unwritten_actions: Option<Vec<torus_types::SignedNativeAction>>,
+}
 
 impl PersistTicket {
-    /// Fill the ticket once (a second fill is ignored) and wake the waiter.
-    fn set(&self, rows: DurableRows) {
+    /// Fill the ticket once (a second fill is ignored) and wake the waiter,
+    /// handing the block's `actions` back when its body row did not land
+    /// (dropped otherwise).
+    fn settle(&self, rows: DurableRows, actions: Option<Vec<torus_types::SignedNativeAction>>) {
         let (slot, cv) = &*self.0;
         let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
-        if slot.is_none() {
-            *slot = Some(rows);
+        if slot.rows.is_none() {
+            slot.rows = Some(rows);
+            if !rows.body {
+                slot.unwritten_actions = actions.filter(|a| !a.is_empty());
+            }
             cv.notify_all();
         }
     }
@@ -591,19 +607,41 @@ impl PersistTicket {
         let (slot, cv) = &*self.0;
         let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            if let Some(rows) = *slot {
+            if let Some(rows) = slot.rows {
                 return rows;
             }
             slot = cv.wait(slot).unwrap_or_else(|e| e.into_inner());
         }
     }
+
+    /// Wait at most `timeout` for the ticket: `Some(body row written)` once
+    /// filled, `None` while the write is pending.
+    pub(crate) fn wait_body_for(&self, timeout: std::time::Duration) -> Option<bool> {
+        let (slot, cv) = &*self.0;
+        let slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+        let (slot, _) = cv
+            .wait_timeout_while(slot, timeout, |slot| slot.rows.is_none())
+            .unwrap_or_else(|e| e.into_inner());
+        slot.rows.map(|rows| rows.body)
+    }
+
+    /// The block's actions, once, if its body row did not land.
+    pub(crate) fn take_unwritten_actions(&self) -> Option<Vec<torus_types::SignedNativeAction>> {
+        let mut slot = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        slot.unwritten_actions.take()
+    }
 }
 
 #[cfg(test)]
 impl PersistTicket {
+    /// [`Self::settle`] without actions.
+    fn set(&self, rows: DurableRows) {
+        self.settle(rows, None);
+    }
+
     /// The filled rows, without waiting (`None` while the write is pending).
     fn peek(&self) -> Option<DurableRows> {
-        *self.0 .0.lock().unwrap_or_else(|e| e.into_inner())
+        self.0 .0.lock().unwrap_or_else(|e| e.into_inner()).rows
     }
 }
 
@@ -621,7 +659,8 @@ impl CommittedBlockMsg {
 /// T5.3: one queued commit-persist write. Dropped unwritten (the writer died,
 /// or it was stopped first) it fills its ticket with `DurableRows::default()`
 /// ("not durable"), so the exec thread never waits forever and writes the
-/// rows itself, as after a failed dispatch-time write.
+/// rows itself, as after a failed dispatch-time write; the block's actions
+/// go back with it (the DA body GC's restore source then).
 struct PersistJob {
     block: TorusBlock,
     ticket: PersistTicket,
@@ -629,7 +668,8 @@ struct PersistJob {
 
 impl Drop for PersistJob {
     fn drop(&mut self) {
-        self.ticket.set(DurableRows::default());
+        let actions = std::mem::take(&mut self.block.native_actions);
+        self.ticket.settle(DurableRows::default(), Some(actions));
     }
 }
 
@@ -683,7 +723,7 @@ impl CommitPersistWriter {
         std::thread::Builder::new()
             .name("torus-commit-persist".into())
             .spawn(move || {
-                for job in rx {
+                for mut job in rx {
                     let height = job.block.header.height;
                     let durable = persist_committed_block_durably_timed(
                         &state_db,
@@ -692,8 +732,11 @@ impl CommitPersistWriter {
                         false,
                     );
                     // Settle the ticket first: exec unblocks without waiting
-                    // on the publish below.
-                    job.ticket.set(durable);
+                    // on the publish below. A body that did not land hands
+                    // the actions back (the DA body GC restores from them).
+                    let unwritten =
+                        (!durable.body).then(|| std::mem::take(&mut job.block.native_actions));
+                    job.ticket.settle(durable, unwritten);
                     // The header row is readable now (the write returned Ok):
                     // publish the height (RPC height + WS head), so the commit
                     // handler's stale read (it may have run before this write)
@@ -8178,6 +8221,17 @@ impl TorusApp {
     /// re-inclusion pins and body restores, before anything is deleted. A
     /// height the tree cannot supply holds every deletion (logged,
     /// `torus_da_gc_held_passes{reason="gap"}`) until a later pass fills it.
+    /// T5.3: with the [`CommitPersistWriter`] the body row lands after this
+    /// call, and `persist` is its ticket (`body_durable` is then ignored).
+    /// The height is recorded, and its restore reloads the row, only once the
+    /// ticket settled: the worker waits for it before the pass, the inline
+    /// pass right here. A write that failed leaves the height unrecorded as
+    /// above, and the ticket hands back the block's actions for the restore.
+    /// A crash before the write lands leaves the height unrecorded (the
+    /// restart parks it from its manifest; its pass records it after the
+    /// healed write); one after the write but before the pass is back-filled
+    /// from the tree.
+    ///
     /// Timed on this thread by `torus_da_gc_handoff_seconds`; the pass by
     /// `torus_da_gc_seconds`.
     fn gc_da_bodies_after_dispatch(
@@ -8186,25 +8240,21 @@ impl TorusApp {
         actions: &[torus_types::SignedNativeAction],
         hashes: Vec<torus_types::B256>,
         body_durable: bool,
+        persist: Option<PersistTicket>,
     ) {
         let Some(runner) = self.da_gc_runner.clone() else {
             return;
         };
         let started = std::time::Instant::now();
-        // A height whose body row did not land is not recorded at all (never
-        // as "no actions": that would drop its re-inclusion pins, Codex P1
-        // round 2): the GC cursor stays at it, this pass deletes nothing, and
-        // the next pass back-fills it from the block tree. A native-empty
-        // block has nothing to pin: its empty record is the truth.
-        let record = body_durable || hashes.is_empty();
-        if !record {
-            tracing::warn!(
-                height,
-                bodies = hashes.len(),
-                "DA body GC: body row not durable at dispatch, not recording this height \
-                 (deleting nothing; the next pass back-fills it from the block tree)"
-            );
-        }
+        // T5.3: the writer's ticket settles whether the body row landed. The
+        // inline pass waits for it right here (the bisect lever then also
+        // waits for the write, as the pre-T5.3 dispatch did); the worker
+        // waits for it before the pass.
+        let body_durable = match (&persist, self.da_gc_inline) {
+            (Some(ticket), true) => ticket.wait().body,
+            _ => body_durable,
+        };
+        let record = || crate::da_gc_worker::record_height(height, hashes.len(), body_durable);
         // The shards custodied per body (`custody_native_shards_core`): none with
         // custody off, else `n` of the current set's erasure params.
         let shard_count = if shard_custody_enabled() {
@@ -8220,7 +8270,7 @@ impl TorusApp {
             0
         };
         if self.da_gc_inline {
-            runner.run(height, Some(actions), &hashes, record, shard_count, true);
+            runner.run(height, Some(actions), &hashes, record(), shard_count, true);
         } else {
             if self.da_gc_worker.is_none() && !self.da_gc_dead_logged {
                 match crate::da_gc_worker::DaGcWorker::spawn(
@@ -8238,14 +8288,27 @@ impl TorusApp {
                 }
             }
             if let Some(ref worker) = self.da_gc_worker {
-                let job = crate::da_gc_worker::DaGcJob {
-                    height,
-                    // The restore reloads a durable body row; only a block
-                    // whose row did not land carries its actions.
-                    actions: (!body_durable && !actions.is_empty()).then(|| actions.to_vec()),
-                    hashes,
-                    record,
-                    shard_count,
+                let job = match persist {
+                    // The worker settles `record` and the restore's source
+                    // from the ticket.
+                    Some(ticket) => crate::da_gc_worker::DaGcJob {
+                        height,
+                        actions: None,
+                        record: false,
+                        hashes,
+                        shard_count,
+                        persist: Some(ticket),
+                    },
+                    None => crate::da_gc_worker::DaGcJob {
+                        height,
+                        // The restore reloads a durable body row; only a
+                        // block whose row did not land carries its actions.
+                        actions: (!body_durable && !actions.is_empty()).then(|| actions.to_vec()),
+                        record: record(),
+                        hashes,
+                        shard_count,
+                        persist: None,
+                    },
                 };
                 if worker.submit(job) == crate::da_gc_worker::Handoff::Dead
                     && !self.da_gc_dead_logged
@@ -10727,11 +10790,10 @@ impl TorusApp {
             } else {
                 durable
             };
-            // A queued write counts as landing for the DA body GC record: a
-            // failed one is no worse than an unrecorded height, which the next
-            // GC pass back-fills (and records) from the block tree anyway, and
-            // the GC deletes only bodies whose retention window ended.
-            let body_written = durable.body || ticket.is_some();
+            // RH4 x T5.3: the DA body GC records the height only once its
+            // body row landed: with the writer it waits for this ticket
+            // (`gc_da_bodies_after_dispatch`), as the exec thread does.
+            let gc_persist = ticket.clone();
             self.exec_prepared_ticket = ticket;
 
             tracing::info!(
@@ -10773,7 +10835,8 @@ impl TorusApp {
                 height,
                 &torus_block.native_actions,
                 hashes,
-                body_written,
+                durable.body,
+                gc_persist,
             );
 
             // D4 (S392): pin the mempool's admission fee floor to the base fee
@@ -45286,14 +45349,14 @@ mod crash_recovery_tests {
         mempool
             .mirror_native_to_da(std::slice::from_ref(&x))
             .unwrap();
-        app.gc_da_bodies_after_dispatch(100, std::slice::from_ref(&x), vec![hx], true);
+        app.gc_da_bodies_after_dispatch(100, std::slice::from_ref(&x), vec![hx], true, None);
         for h in 101..=250 {
-            app.gc_da_bodies_after_dispatch(h, &[], vec![], true);
+            app.gc_da_bodies_after_dispatch(h, &[], vec![], true, None);
         }
         da_gc_settle(&app);
         assert!(da_has(&mempool, &x), "inside the window at 250");
         // 251..=260: dispatched before a crash, never recorded, not in the tree.
-        app.gc_da_bodies_after_dispatch(261, &[], vec![], true);
+        app.gc_da_bodies_after_dispatch(261, &[], vec![], true, None);
         da_gc_settle(&app);
         assert!(
             da_has(&mempool, &x),
@@ -45304,7 +45367,7 @@ mod crash_recovery_tests {
         let mut gap: Vec<TorusBlock> = (251..=261).map(|h| high_block(h, vec![])).collect();
         link_blocks(&mut gap);
         tree_commit_chain(&state_db, &gap);
-        app.gc_da_bodies_after_dispatch(262, &[], vec![], true);
+        app.gc_da_bodies_after_dispatch(262, &[], vec![], true, None);
         da_gc_settle(&app);
         assert!(!da_has(&mempool, &x), "back-filled 251..=261, row 100 went");
         assert_eq!(held_total(&metrics), 1);
@@ -45620,7 +45683,7 @@ mod crash_recovery_tests {
             "{what}: the held pass is counted, by its reason"
         );
         // The next pass back-fills 1228 from the tree: x moves to row 1228.
-        app.gc_da_bodies_after_dispatch(1229, &[], vec![], true);
+        app.gc_da_bodies_after_dispatch(1229, &[], vec![], true, None);
         da_gc_settle(&app);
         assert!(store.contains(&hx.0).unwrap(), "{what}: pinned by 1228");
         assert_eq!(metrics.da_bodies_gc_deleted.get(), 0, "{what}");
@@ -46485,7 +46548,11 @@ mod crash_recovery_tests {
             let mut app = boot(mempool);
             assert!(!app.is_exec_failed(), "{what}");
             if write_landed {
-                assert_eq!(app.exec_next_height, Some(1227), "{what}: 1226 replayed");
+                assert_eq!(
+                    read_native_applied_height(&state_db),
+                    Some(1226),
+                    "{what}: 1226 replayed from its rows"
+                );
             } else {
                 assert_eq!(
                     app.exec_next_height,
