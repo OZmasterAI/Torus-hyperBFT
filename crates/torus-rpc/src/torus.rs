@@ -1360,6 +1360,13 @@ impl TorusApiServer for RpcState {
                 lot_size: dec_fp(FixedPoint::from_raw(market.lot_size_raw)),
                 tick_size: dec_fp(FixedPoint::from_raw(market.tick_size_raw)),
                 status: "active".to_string(),
+                delisted: false,
+                delist_height: None,
+                close_at: None,
+                settlement: "none".to_string(),
+                close_price: None,
+                governance_close_price: None,
+                settled_height: None,
             });
 
             if markets.len() >= limit {
@@ -3185,6 +3192,97 @@ mod tick_lot_ingress_tests {
     }
 }
 
+/// Delist follow-up (node-local, no consensus change): ingress refuses an
+/// order that is not reduce-only on a governance-delisted market (its
+/// `market_delisted_key` row exists) with the executor's text
+/// (`FailureReason::MarketDelisted`), so the client learns it at submit time
+/// instead of from a rejected receipt. Reduce-only orders pass; the executor
+/// still decides in consensus.
+#[cfg(test)]
+mod delist_ingress_tests {
+    use super::*;
+    use torus_types::{MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
+
+    const NOW: u64 = 1_000_000;
+    const S: i128 = FixedPoint::SCALE;
+
+    fn db() -> (tempfile::TempDir, torus_state::StateDb) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = torus_state::StateDb::open(dir.path()).unwrap();
+        (dir, state)
+    }
+
+    fn list(state: &torus_state::StateDb, mid: MarketId) {
+        use borsh::BorshSerialize;
+        let mut row = Vec::new();
+        "BTC".to_string().serialize(&mut row).unwrap();
+        "USD".to_string().serialize(&mut row).unwrap();
+        S.serialize(&mut row).unwrap(); // lot 1
+        S.serialize(&mut row).unwrap(); // tick 1
+        (5 * S).serialize(&mut row).unwrap();
+        state.put_cf_raw(CF_NATIVE_MARKETS, &mid.to_be_bytes(), &row).unwrap();
+    }
+
+    fn delist(state: &torus_state::StateDb, mid: MarketId) {
+        state
+            .put_cf_raw(CF_NATIVE_MARKETS, &torus_types::market_delisted_key(mid), &100u64.to_be_bytes())
+            .unwrap();
+    }
+
+    fn order(mid: MarketId, reduce_only: bool) -> PlaceOrderParams {
+        PlaceOrderParams {
+            market_id: mid,
+            is_buy: true,
+            price: FixedPoint::from_raw(100 * S),
+            quantity: FixedPoint::from_raw(S),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only,
+            client_order_id: None,
+        }
+    }
+
+    #[test]
+    fn non_reduce_only_order_on_delisted_market_is_refused_with_executor_text() {
+        let (_d, state) = db();
+        list(&state, 1);
+        list(&state, 2);
+        delist(&state, 2);
+        let want = "market 2 is delisted: only reduce-only orders";
+        assert_eq!(torus_types::market_delisted_reason(2), want, "the executor's text");
+
+        let e = validate_known_markets(&NativeAction::PlaceOrder(order(2, false)), &state).unwrap_err();
+        assert_eq!(e, want);
+        // Reduce-only orders pass (the wind-down); a listed market is untouched.
+        validate_known_markets(&NativeAction::PlaceOrder(order(2, true)), &state).unwrap();
+        validate_known_markets(&NativeAction::PlaceOrder(order(1, false)), &state).unwrap();
+
+        // A batch is one signed action: one such order refuses all of it.
+        let batch = vec![order(1, false), order(2, true), order(2, false)];
+        let e = validate_known_markets(&NativeAction::PlaceOrderBatch(batch), &state).unwrap_err();
+        assert_eq!(e, want);
+        let batch = vec![order(1, false), order(2, true)];
+        validate_known_markets(&NativeAction::PlaceOrderBatch(batch), &state).unwrap();
+    }
+
+    /// Wired into the submit path (`verify_one_action`), before the signature.
+    #[test]
+    fn submit_path_refuses_it_before_signature_verify() {
+        let (_d, state) = db();
+        list(&state, 3);
+        delist(&state, 3);
+        let key = k256::ecdsa::SigningKey::from_slice(&[9; 32]).unwrap();
+        let sign = |p| {
+            let signed = torus_types::eip712::sign_native_action(NativeAction::PlaceOrder(p), NOW, &key);
+            format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap()))
+        };
+        let r = verify_one_action(&sign(order(3, false)), torus_types::eip712::TORUS_CHAIN_ID, &state, NOW);
+        assert_eq!(r.err().as_deref(), Some("market 3 is delisted: only reduce-only orders"));
+        let r = verify_one_action(&sign(order(3, true)), torus_types::eip712::TORUS_CHAIN_ID, &state, NOW);
+        assert!(r.is_ok(), "{:?}", r.err());
+    }
+}
+
 #[cfg(test)]
 mod order_book_decode_tests {
     //! S444 / S395 RED-first: `torus_getOrderBook` must decode the PRODUCTION
@@ -3786,3 +3884,7 @@ mod shed_peek_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "delist_rpc_tests.rs"]
+mod delist_rpc_tests;

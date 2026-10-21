@@ -18,6 +18,10 @@ pub struct MarketInfo {
     pub id: MarketId,
     pub base_asset: String,
     pub quote_asset: String,
+    /// Delist follow-up: the market's delist settlement is complete
+    /// (`getMarkets` `settlement: "settled"`): the chain ignores its oracle
+    /// prices, so the feeder stops submitting them.
+    pub oracle_closed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +57,7 @@ pub fn parse_markets_page(v: &Value) -> Result<Vec<MarketInfo>, String> {
                 id: hex_u64(m.get("marketId").unwrap_or(&Value::Null), "marketId")?,
                 base_asset: field(m, "baseAsset")?.to_string(),
                 quote_asset: field(m, "quoteAsset")?.to_string(),
+                oracle_closed: false,
             })
         })
         .collect()
@@ -241,10 +246,21 @@ mod tests {
         ]);
         let m = parse_markets_page(&page).unwrap();
         assert_eq!(m, vec![
-            MarketInfo { id: 1, base_asset: "BTC".into(), quote_asset: "USD".into() },
-            MarketInfo { id: 31, base_asset: "ETH".into(), quote_asset: "USD".into() },
+            MarketInfo { id: 1, base_asset: "BTC".into(), quote_asset: "USD".into(), oracle_closed: false },
+            MarketInfo { id: 31, base_asset: "ETH".into(), quote_asset: "USD".into(), oracle_closed: false },
         ]);
         assert!(parse_markets_page(&json!({"x": 1})).is_err());
+        // Delist follow-up: `settlement: "settled"` = the market's oracle is
+        // closed (the chain ignores its prices); other values and old nodes
+        // without the field: open.
+        let page = json!([
+            {"marketId": "0x2", "baseAsset": "ETH", "quoteAsset": "USD", "status": "delisted", "settlement": "settled"},
+            {"marketId": "0x3", "baseAsset": "SOL", "quoteAsset": "USD", "status": "delisted", "settlement": "settling"},
+            {"marketId": "0x4", "baseAsset": "XRP", "quoteAsset": "USD", "status": "delisted", "settlement": "grace"}
+        ]);
+        let closed: Vec<bool> = parse_markets_page(&page).unwrap().iter().map(|m| m.oracle_closed).collect();
+        assert_eq!(closed, vec![true, false, false]);
+        assert!(m.iter().all(|x| !x.oracle_closed));
         assert!(parse_markets_page(&json!([{"marketId": "zz", "baseAsset": "B", "quoteAsset": "USD"}])).is_err());
     }
 
@@ -255,7 +271,7 @@ mod tests {
             calls.lock().unwrap().push(offset);
             let n = if offset == 0 { MARKETS_PAGE } else { 3 };
             let page: Vec<MarketInfo> = (0..n as u64)
-                .map(|i| MarketInfo { id: offset as u64 + i, base_asset: "X".into(), quote_asset: "USD".into() })
+                .map(|i| MarketInfo { id: offset as u64 + i, base_asset: "X".into(), quote_asset: "USD".into(), oracle_closed: false })
                 .collect();
             async move { Ok(page) }
         })
@@ -300,7 +316,7 @@ symbols = {{ binance = "POLUSDT", okx = "POL-USDT", bybit = "POLUSDT" }}
     }
 
     fn market(id: u64, base: &str, quote: &str) -> MarketInfo {
-        MarketInfo { id, base_asset: base.into(), quote_asset: quote.into() }
+        MarketInfo { id, base_asset: base.into(), quote_asset: quote.into(), oracle_closed: false }
     }
 
     fn node(status: &str, signer: Option<&str>, markets: Vec<MarketInfo>) -> FakeNode {
@@ -349,6 +365,13 @@ symbols = {{ binance = "POLUSDT", okx = "POL-USDT", bybit = "POLUSDT" }}
         let r = startup_check(&cfg(), &node("active", Some(S), vec![market(1, "BTC", "USD")]), a(S)).await.unwrap();
         assert_eq!(r.listed, [1].into_iter().collect());
         assert!(r.warnings.iter().any(|w| w.contains("market 9")), "{:?}", r.warnings);
+
+        // Delist follow-up: a configured market whose delist settlement is
+        // complete is skipped with a warning (its prices are ignored on chain).
+        let closed = MarketInfo { oracle_closed: true, ..market(9, "MATIC", "USD") };
+        let r = startup_check(&cfg(), &node("active", Some(S), vec![market(1, "BTC", "USD"), closed]), a(S)).await.unwrap();
+        assert_eq!(r.listed, [1].into_iter().collect());
+        assert!(r.warnings.iter().any(|w| w.contains("market 9") && w.contains("settlement is complete")), "{:?}", r.warnings);
 
         // Node down: error.
         let n = node("active", Some(S), vec![]);

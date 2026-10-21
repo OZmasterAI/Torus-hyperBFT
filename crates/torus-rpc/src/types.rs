@@ -343,7 +343,37 @@ pub struct RpcMarketInfo {
     pub quote_asset: String,
     pub lot_size: String,
     pub tick_size: String,
+    /// `"active"`, or `"delisted"` once a governance delist executed.
     pub status: String,
+    /// Delist follow-up (node-local read): a governance delist executed (the
+    /// market is reduce-only, then settled).
+    #[serde(default)]
+    pub delisted: bool,
+    /// The height the delist executed (hex), when delisted.
+    #[serde(default)]
+    pub delist_height: Option<String>,
+    /// The grace end (hex): the settlement row's `close_at`, the first block
+    /// the settlement step works on the market. `null` before the delist and
+    /// once the settlement row is gone (walk complete).
+    #[serde(default)]
+    pub close_at: Option<String>,
+    /// `"none"` (not delisted), `"grace"` (reduce-only until `closeAt`),
+    /// `"settling"` (from `closeAt`: waiting for a price, closing positions,
+    /// or draining ADL obligations) or `"settled"` (complete: the oracle is
+    /// closed, prices for it are ignored).
+    #[serde(default)]
+    pub settlement: String,
+    /// The settlement price, once the settlement step fixed it (while the
+    /// settlement row exists; not kept in state after the walk completes).
+    #[serde(default)]
+    pub close_price: Option<String>,
+    /// A governance close price (`SetDelistClosePrice`) waiting to be used
+    /// as the settlement price at the first settlement block.
+    #[serde(default)]
+    pub governance_close_price: Option<String>,
+    /// The height the settlement completed (oracle-closed marker), hex.
+    #[serde(default)]
+    pub settled_height: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
