@@ -13,7 +13,7 @@ use torus_core::liquidation::{put_delist_settlement, DelistSettlement};
 use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
 use torus_mempool::{Mempool, MempoolConfig};
 use torus_state::cf::{CF_NATIVE_LIQUIDATION, CF_NATIVE_MARKETS};
-use torus_state::{StateBackend, StateDb};
+use torus_state::StateDb;
 use torus_types::{FixedPoint, MarketId};
 
 use crate::torus::TorusApiServer;
