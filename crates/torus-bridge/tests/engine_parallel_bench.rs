@@ -144,6 +144,12 @@ fn bench_one(sh: &Shape, threads: usize, iters: usize) -> (f64, f64, u32) {
     for it in 0..iters {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = StateDb::open(dir.path()).expect("open db");
+        // Pre-testnet P0 (main d78ea41b): orders on an unlisted market are
+        // rejected (`UnknownMarket`), so list every market first.
+        for m in 1..=sh.markets {
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed")
+                .unwrap();
+        }
         let mut ctx = make_ctx(db);
         for n in 1..=sh.senders {
             ctx.positions
@@ -160,15 +166,23 @@ fn bench_one(sh: &Shape, threads: usize, iters: usize) -> (f64, f64, u32) {
         let mut rng = Lcg(0xBE4C_4001 + it as u64);
         let seed = seed_batch(&mut rng, sh);
         let storm = storm_batch(&mut rng, sh);
-        NativeExecutor::execute_batch_engine_mode(&mut ctx, &seed, threads);
+        let r = NativeExecutor::execute_batch_engine_mode(&mut ctx, &seed, threads);
         assert!(ctx.fatal_error.is_none());
+        assert!(
+            r.results.iter().all(|r| r.success),
+            "seed order rejected: {:?}",
+            r.results.iter().find(|r| !r.success)
+        );
+        assert!(ctx.resting_order_count() > 0, "seed left an empty book");
+        let seed_trades = ctx.trade_index;
 
         let t0 = std::time::Instant::now();
         NativeExecutor::execute_batch_engine_mode(&mut ctx, &storm, threads);
         let dt = t0.elapsed();
         assert!(ctx.fatal_error.is_none());
         samples_ms.push(dt.as_secs_f64() * 1e3);
-        trades = ctx.trade_index;
+        trades = ctx.trade_index - seed_trades;
+        assert!(trades > 0, "storm filled nothing (empty book?)");
     }
     samples_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let min = samples_ms[0];

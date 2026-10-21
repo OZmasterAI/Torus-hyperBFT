@@ -54,6 +54,12 @@ fn build_actions() -> Vec<(Address, NativeAction)> {
 fn bench_execute_batch(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = StateDb::open(dir.path()).expect("open db");
+    // Pre-testnet P0 (main d78ea41b): orders on an unlisted market are
+    // rejected (`UnknownMarket`), so list the bench market(s) first.
+    for m in [MARKET] {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed")
+            .unwrap();
+    }
 
     // Fund senders once, directly in RocksDB (first touch per block still
     // falls through the overlay to the DB, as in prod).
@@ -71,6 +77,30 @@ fn bench_execute_batch(c: &mut Criterion) {
     }
 
     let actions = build_actions();
+
+    // One-time gate (outside the timed loop): every order is accepted and
+    // the book ends non-empty, so the bench times real resting orders.
+    {
+        let overlay = NativeStateOverlay::new(db.clone());
+        let mut ctx = NativeExecContext::new(
+            overlay,
+            1,
+            1_000_000,
+            0,
+            1000,
+            100,
+            Address::new([0xAA; 20]),
+            Address::new([0xBB; 20]),
+            Address::new([0xCC; 20]),
+        );
+        let out = NativeExecutor::execute_batch(&mut ctx, &actions);
+        assert!(
+        out.results.iter().all(|r| r.success),
+        "order rejected: {:?}",
+        out.results.iter().find(|r| !r.success)
+    );
+        assert!(ctx.resting_order_count() > 0, "empty book");
+    }
 
     c.bench_function("execute_batch/400orders_100senders_resting", |b| {
         b.iter_batched(
