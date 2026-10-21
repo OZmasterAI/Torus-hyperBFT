@@ -1429,6 +1429,176 @@ class StartNodeRetentionTest(unittest.TestCase):
         self.assertIsNone(argv, "the node must not start")
 
 
+class StartNodeAttestKeyTest(StartNodeRetentionTest):
+    """devnet/wsl/start-node.sh passes `--state-hash-attest-key=D/val<idx>.key`
+    only when STATE_HASH_ATTEST_KEY_DIR=D is set (run-cell.sh STATE_HASH_ATTEST=1).
+    Unset or empty = no flag, the argv of every earlier cell. The flag goes last
+    (after the retention flag), so crash-kill.sh's restart still accepts the node."""
+
+    def start(self, retention=None, key_dir=None):
+        old = os.environ.pop("STATE_HASH_ATTEST_KEY_DIR", None)
+        try:
+            if key_dir is not None:
+                os.environ["STATE_HASH_ATTEST_KEY_DIR"] = key_dir
+            return super().start(retention)
+        finally:
+            os.environ.pop("STATE_HASH_ATTEST_KEY_DIR", None)
+            if old is not None:
+                os.environ["STATE_HASH_ATTEST_KEY_DIR"] = old
+
+    def key_dir(self):
+        d = os.path.join(self.d, "attest-keys")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "val1.key"), "w") as f:
+            f.write("ab" * 32 + "\n")
+        os.chmod(os.path.join(d, "val1.key"), 0o600)
+        return d
+
+    def test_unset_or_empty_passes_no_attest_key(self):
+        r, argv = self.start()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse([a for a in argv if "attest" in a], argv)
+        r, empty = self.start(key_dir="")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(empty, argv)
+
+    def test_set_appends_the_attest_key_last(self):
+        _, plain = self.start()
+        d = self.key_dir()
+        r, argv = self.start(key_dir=d)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(argv, plain + ["--state-hash-attest-key=%s/val1.key" % d])
+        r, both = self.start("5000", key_dir=d)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(
+            both,
+            plain + ["--retention-blocks=5000", "--state-hash-attest-key=%s/val1.key" % d],
+        )
+        pids = os.path.join(self.d, "pids")
+        with open(pids, "w") as f:
+            f.write("1001\n")
+        g = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; shift; crash_target_ok "$@"',
+                "_",
+                CRASH_KILL_SH,
+                "1",
+                "1001",
+                " ".join([self.bin] + both),
+                self.d,
+                pids,
+            ],
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, CRASH_KILL_LIB="1"),
+            timeout=30,
+        )
+        self.assertEqual(g.returncode, 0, g.stderr)
+
+    def test_missing_key_file_refuses_to_start(self):
+        r, argv = self.start(key_dir=os.path.join(self.d, "nowhere"))
+        self.assertEqual(r.returncode, 7)
+        self.assertIn("has no readable val1.key", r.stderr)
+        self.assertIsNone(argv, "the node must not start")
+
+
+class StateHashAttestHarnessTest(unittest.TestCase):
+    """STATE_HASH_ATTEST=1: attest keys + live fail-stop on the nodes, a post-cell
+    h_n comparison (state_attest.py). Off (the default) the cell is unchanged."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(RUN_CELL_SH) as f:
+            cls.src = f.read()
+
+    def test_default_off_documented_and_allowlisted(self):
+        self.assertIn("STATE_HASH_ATTEST=${STATE_HASH_ATTEST:-0}", self.src)
+        head = self.src[: self.src.index("set -uo pipefail")]
+        self.assertIn("#   STATE_HASH_ATTEST=1", head)
+        with open(os.path.join(HERE, "campaign", "run_cell.py")) as f:
+            rc = f.read()
+        self.assertIn('"STATE_HASH_ATTEST",', rc)
+        self.assertIn('"BOOK_WINDOW_COMMIT",', rc)
+        with open(os.path.join(HERE, "resummarize.sh")) as f:
+            self.assertIn('"$T/state_attest.py" summary', f.read())
+
+    def test_every_step_is_gated(self):
+        for marker in (
+            "    export TORUS_STATE_HASH_FAILSTOP=1",
+            '    export STATE_HASH_ATTEST_KEY_DIR="$RUN_DIR/attest-keys"',
+            '"$SELF_DIR/state_attest.py" keys',
+            "--state-hash-attest-key=$STATE_HASH_ATTEST_KEY_DIR/val$i.key",
+            '"$SELF_DIR/state_attest.py" scan',
+            '"$SELF_DIR/state_attest.py" summary',
+            "jq -e '.state_attest.ok == true'",
+        ):
+            i = self.src.index(marker)
+            gate = self.src.rindex("if state_attest_on", 0, i)
+            self.assertNotIn("\nfi\n", self.src[gate:i], marker)
+        # an inherited key dir never reaches a cell that did not ask for it
+        self.assertIn("unset STATE_HASH_ATTEST_KEY_DIR\nif state_attest_on; then", self.src)
+
+    def test_order_failstop_before_extra_env_scan_before_stop(self):
+        s = self.src
+        fs = s.index("    export TORUS_STATE_HASH_FAILSTOP=1")
+        self.assertLess(s.index("for v in $(env | grep -oE '^TORUS_[A-Za-z0-9_]+'); do unset"), fs)
+        self.assertLess(fs, s.index('for kv in $EXTRA_ENV; do export "$kv"; done\n# HOTSTUFF_CPUS'))
+        self.assertLess(fs, s.index('NODE_ENV_JSON=$(env | grep'))  # recorded in the node env
+        argv = s.index("--state-hash-attest-key=$STATE_HASH_ATTEST_KEY_DIR/val$i.key")
+        self.assertLess(s.index('mapfile -t PIDS < "$RUN_DIR/pids"'), argv)
+        scan = s.index('"$SELF_DIR/state_attest.py" scan')
+        self.assertLess(s.index('cat "$OUT/agreement.jsonl" >> "$OUT/run.log"'), scan)
+        self.assertLess(
+            scan,
+            s.index("# ---------------------------------------------------------------- 9. stop + collect logs"),
+        )
+        summ = s.index('"$SELF_DIR/state_attest.py" summary')
+        self.assertLess(s.index('python3 "$TOOLS_DIR/summarize.py"'), summ)
+        self.assertLess(summ, s.index('log "done -> $OUT/summary.json"'))
+
+    def test_bad_env_fails_preflight(self):
+        tmp = tempfile.mkdtemp(prefix="attest-pre-")
+        try:
+            fake_target(tmp)
+            script, wt = sandbox_repo(tmp)
+            env0 = {k: v for k, v in os.environ.items() if k not in ("STATE_HASH_ACTIVATION", "STATE_HASH_ATTEST")}
+            env0.update(TARGET_DIR=tmp, RESULTS_ROOT=tmp, DATA_ROOT=tmp, BENCH_ALLOW_UNDETACHED="1")
+            cases = [
+                (dict(STATE_HASH_ATTEST="yes"), 2, "STATE_HASH_ATTEST must be unset, 0 or 1"),
+                (dict(STATE_HASH_ATTEST="1"), 2, "STATE_HASH_ATTEST=1 needs STATE_HASH_ACTIVATION"),
+                (dict(STATE_HASH_ATTEST="1", STATE_HASH_ACTIVATION="1"), 1, "state_attest.py"),
+            ]
+            for env, rc, msg in cases:
+                r = subprocess.run(
+                    [script, wt, "attest-pre-x"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=dict(env0, **env),
+                )
+                self.assertEqual(r.returncode, rc, r.stderr)
+                self.assertIn(msg, r.stderr)
+                self.assertFalse(os.path.exists(os.path.join(tmp, "attest-pre-x")), "must fail before any launch")
+            # with state_attest.py beside run-cell.sh: a worktree whose start-node.sh lacks the key dir is refused
+            shutil.copy2(os.path.join(HERE, "state_attest.py"), os.path.dirname(script))
+            with open(os.path.join(wt, "devnet", "wsl", "start-node.sh"), "w") as f:
+                f.write("start_node() { :; }\n")
+            r = subprocess.run(
+                [script, wt, "attest-pre-x"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=dict(env0, STATE_HASH_ATTEST="1", STATE_HASH_ACTIVATION="1"),
+            )
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertIn("does not pass --state-hash-attest-key", r.stderr)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "attest-pre-x")))
+        finally:
+            shutil.rmtree(tmp)
+
+
 # --------------------------------------------- run-cell.sh: which tools score
 class ToolsDirResolutionTest(unittest.TestCase):
     """A candidate is scored by ITS OWN summarize.py. run-cell.sh lives in the

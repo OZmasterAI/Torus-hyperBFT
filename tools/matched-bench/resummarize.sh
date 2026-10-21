@@ -49,3 +49,7 @@ if [ -n "$EVM_LOAD" ]; then
     python3 "$T/evm_load.py" summary --dir "$D" --rate "$(jq -r '.rate // ""' <<<"$EVM_LOAD")" \
         --senders "$(jq -r '.senders // 0' <<<"$EVM_LOAD")" --rc "$(jq -r '.rc // ""' <<<"$EVM_LOAD")"
 fi
+# STATE_HASH_ATTEST cells: .state_attest (and its REJECT fold) is re-derived from state-attest.json.
+if [ -f "$D/state-attest.json" ]; then
+    python3 -I "$T/state_attest.py" summary --dir "$D" >/dev/null
+fi

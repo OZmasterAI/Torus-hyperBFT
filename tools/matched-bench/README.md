@@ -281,7 +281,8 @@ for evm, verify, replay_guard, load_books, engine[phase1_actions/margin/match/
 settle(pass_a/pass_b/cache_flush)/post_engine_tail/engine_untimed],
 save_books, flush[root/state_write{build,db}/evm_resync], body_persist, residual;
 exec_thread_busy_fraction; wall ms per committed block), `agreement`, `cpu`,
-`cell` (env, bench cmd), `binaries`, `genesis`, `timing`, `bench_log_tail`.
+`cell` (env, bench cmd), `binaries`, `genesis`, `timing`, `bench_log_tail`;
+`state_attest` with `STATE_HASH_ATTEST=1` (full table: `state-attest.json`).
 Also written: `buckets.csv` (1 Hz histogram BUCKET samples in long format
 `ts,node,metric,le,count`) — the source of the p50/p95 columns below.
 
@@ -1239,3 +1240,61 @@ reason `pre-load failed: ...`), `.status` (INVALID) and `.headline.benchmark_acc
 cell stops before the load. `resummarize.sh` re-derives `.preload` and `.genesis.bulk_count`.
 Self-tests: `test_preload.py`, `test_harness.py` (`BulkCountAndPreloadHarnessTest`),
 `test_genesis_output.py` (BULK_COUNT), `cargo nextest run -p bench-throughput` (`preload::tests`).
+
+## Running state hash attestation in a cell (`STATE_HASH_ATTEST`)
+
+With `STATE_HASH_ACTIVATION` alone every node computes the running state hash h_n, but no node
+attests (the node attests only with `--state-hash-attest-key`): 0 attestations, no on-chain
+votes or quorum, so the quorum check never runs and the fail-stop has nothing to act on (the
+node logs `running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false`). A cell could
+only show equal hash entry counts and heights (perf section 120, bench 9g).
+
+`STATE_HASH_ATTEST=1` (harness env, default 0 = off: no key, flag, env, step or file) makes the
+check live and proves agreement value for value:
+
+- **Pre-flight.** Needs `STATE_HASH_ACTIVATION` (else FATAL, exit 2), `state_attest.py` beside
+  run-cell.sh, `devnet/wsl/bench-validator-keys.json`, and a `<worktree>/devnet/wsl/start-node.sh`
+  that reads `STATE_HASH_ATTEST_KEY_DIR` (else FATAL: a worktree older than this knob).
+- **Keys.** `state_attest.py keys` writes validator i's secp256k1 account key from
+  `bench-validator-keys.json` (the address `gen-3val-genesis.sh` registers it under, which the
+  oracle feed also signs with) to `$DATA_ROOT/run/attest-keys/val<i>.key` (0600, the node refuses
+  group/other access). No genesis change: the genesis key is unaffected.
+- **Nodes.** `STATE_HASH_ATTEST_KEY_DIR` makes `start-node.sh` append
+  `--state-hash-attest-key=<dir>/val<i>.key` (launch and crash restart alike); after launch every
+  node's argv must carry it. `TORUS_STATE_HASH_FAILSTOP=1` is exported before `EXTRA_ENV` (an
+  `EXTRA_ENV` override is allowed, and the scan then fails the cell): a node whose h_n differs
+  from the on-chain > 2/3 quorum hash latches its fail-stop and exits. Each node submits one
+  `AttestStateHash` per durable checkpoint (every 100 blocks).
+- **Scan** (`state_attest.py scan`, after the agreement block, before the devnet stops): waits up
+  to 90 s for every node's quorum on the newest common checkpoint, then reads
+  `torus_getStateHash(h)` on every node for every checkpoint all nodes retain (newest first, at
+  most 64 = 6,400 blocks): each node's `localHash` (its h_n), the on-chain votes and
+  `quorumHash`. Plus each node's `torus_state_hash_attestations_submitted_total`,
+  `torus_state_hash_mismatch_total`, `torus_state_hash_no_quorum_total`,
+  `torus_state_hash_height`, `torus_state_hash_unverified` and log lines (attest key address,
+  fail-stop `on=`, submitted / not admitted, `STATE HASH MISMATCH`, `FAIL-STOP`, no-quorum).
+- **Evidence.** `state-attest.json` (per height: every node's h_n, `agree`, quorum hash, voters;
+  per node: metrics and log counts), one `state attest: ok=1 compared N checkpoint(s) A..B on 3
+  nodes, h_n equal=yes (h_B=0x..); quorum N/N; votes val0=N val1=N val2=N; submitted ...;
+  fail-stop on true/true/true; ...` line in run.log, and `summary.json .state_attest`.
+- **Verdict.** Any problem fails the cell (folded into `.validity` REJECT, reason `state hash
+  attestation failed: ...`, `.status` INVALID, `.headline.benchmark_accepted` false): h_n
+  differs between nodes at any common height, a vote or quorum hash differs from a node's h_n,
+  a common checkpoint below the newest without a quorum (the newest is reported as pending), a
+  validator without a vote on a quorum checkpoint, a node that did not attest (log line or
+  metric) or attests under another address, fail-stop not on, any `STATE HASH MISMATCH` /
+  `FAIL-STOP` / no-quorum line or non-zero mismatch / no_quorum / unverified, an unreadable node.
+  A node that fail-stops mid-cell exits (exit 70) and the chain halts (all 3 votes are needed):
+  the campaign driver's node watch stops the cell (node-death.txt); a cell that still reaches the
+  scan reports the node unreadable and counts its `FAIL-STOP` line (val<i>.log.gz keeps it).
+  `resummarize.sh` re-derives `.state_attest`.
+
+With 3 equal-stake validators a quorum needs all 3 votes, so one node that stops attesting (or
+dies) leaves every later checkpoint without a quorum. Campaign: `"harness_env":
+{"STATE_HASH_ACTIVATION": "1", "STATE_HASH_ATTEST": "1"}` (L6.1 arms add `"BOOK_WINDOW_COMMIT":
+"1"`, which `gen-3val-genesis.sh` turns into `consensus.book_window_commit` and `genesis_cache.py`
+keys); `campaign/run_cell.py --runner-env` allowlists both.
+
+Self-tests: `test_state_attest.py` (stub RPC / metrics servers on ephemeral ports), `test_harness.py`
+(`StartNodeAttestKeyTest`, `StateHashAttestHarnessTest`), `test_genesis_output.py`
+(BOOK_WINDOW_COMMIT).
