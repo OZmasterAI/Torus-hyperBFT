@@ -10,7 +10,9 @@
 //! **What is digested.** The file parsed as JSON (any valid JSON value, before
 //! the typed [`crate::Genesis`] parse), written back in a canonical form:
 //! compact (no whitespace), object keys sorted by their UTF-8 bytes, arrays in
-//! file order, strings and numbers as `serde_json` writes them. So whitespace,
+//! file order, strings as `serde_json` writes them, numbers without precision
+//! loss (see [`canonical_number`]: as `serde_json` writes a u64 / i64 / f64 that
+//! holds the literal's value exactly, else an exact decimal form). So whitespace,
 //! indentation and key order do not change the digest; any value change does,
 //! including keys the typed parse ignores and an explicit value equal to a
 //! default. The typed struct is not digested, so a newer binary with more
@@ -26,6 +28,7 @@
 use std::collections::BTreeMap;
 
 use alloy_primitives::{keccak256, B256};
+use serde_json::value::RawValue;
 use serde_json::Value;
 
 use crate::GenesisError;
@@ -88,42 +91,176 @@ fn write_canonical(v: &Value, out: &mut Vec<u8>) {
     }
 }
 
+/// The value and sign / digits / exponent of a JSON number literal:
+/// `value = ±digits × 10^exponent`, `digits` without leading or trailing
+/// zeros (empty for zero). `None` when the exponent does not fit an i64.
+fn decimal_parts(lit: &str) -> Option<(bool, String, i64)> {
+    let (neg, rest) = match lit.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, lit),
+    };
+    let (mantissa, exp) = match rest.find(['e', 'E']) {
+        Some(i) => (&rest[..i], rest[i + 1..].parse::<i64>().ok()?),
+        None => (rest, 0),
+    };
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let mut digits = format!("{int}{frac}");
+    let mut exp = exp.checked_sub(i64::try_from(frac.len()).ok()?)?;
+    let trailing = digits.len() - digits.trim_end_matches('0').len();
+    digits.truncate(digits.len() - trailing);
+    exp = exp.checked_add(i64::try_from(trailing).ok()?)?;
+    let digits = digits.trim_start_matches('0').to_string();
+    if digits.is_empty() {
+        exp = 0;
+    }
+    Some((neg, digits, exp))
+}
+
+/// The canonical text of a JSON number literal, without precision loss
+/// (Codex review of phase 4, P2): what `serde_json` writes for the u64 / i64
+/// / f64 it parses the literal to when that holds the literal's value
+/// exactly (every number a phase 4 data dir digested keeps its form), else
+/// the exact decimal `±digits e exponent` (an integer beyond i64 / u64: the
+/// literal itself). Equal values written differently (`1.0`, `10e-1`) are
+/// one text; an integer and a float literal stay different, as before.
+pub fn canonical_number(lit: &str) -> String {
+    let lit = lit.trim();
+    if !lit.contains(['.', 'e', 'E']) {
+        if let Ok(n) = lit.parse::<u64>() {
+            return n.to_string();
+        }
+        if let Ok(n) = lit.parse::<i64>() {
+            return n.to_string();
+        }
+        // JSON integers have no leading zeros: the literal is canonical.
+        return lit.to_string();
+    }
+    let Some(exact) = decimal_parts(lit) else {
+        return lit.to_string();
+    };
+    if let Ok(f) = lit.parse::<f64>() {
+        if f.is_finite() {
+            let written = serde_json::to_string(&f).expect("a finite f64 serializes");
+            if decimal_parts(&written).as_ref() == Some(&exact) {
+                return written;
+            }
+        }
+    }
+    let (neg, digits, exp) = exact;
+    let digits = if digits.is_empty() { "0" } else { &digits };
+    format!("{}{digits}e{exp}", if neg { "-" } else { "" })
+}
+
+/// A JSON value with its scalars in canonical text (numbers without
+/// precision loss), parsed from the file text, not through `serde_json::Value`.
+enum Canon {
+    Scalar(Vec<u8>),
+    Array(Vec<Canon>),
+    Object(BTreeMap<String, Canon>),
+}
+
+impl Canon {
+    fn parse(raw: &RawValue) -> Result<Self, serde_json::Error> {
+        let text = raw.get();
+        Ok(match text.trim_start().as_bytes().first() {
+            Some(b'{') => {
+                // Duplicate keys: the last wins, as in `serde_json::Value`.
+                let map: BTreeMap<String, &RawValue> = serde_json::from_str(text)?;
+                Canon::Object(
+                    map.into_iter()
+                        .map(|(k, v)| Ok((k, Canon::parse(v)?)))
+                        .collect::<Result<_, serde_json::Error>>()?,
+                )
+            }
+            Some(b'[') => {
+                let items: Vec<&RawValue> = serde_json::from_str(text)?;
+                Canon::Array(items.into_iter().map(Canon::parse).collect::<Result<_, _>>()?)
+            }
+            Some(b'"' | b't' | b'f' | b'n') => {
+                let v: Value = serde_json::from_str(text)?;
+                Canon::Scalar(serde_json::to_vec(&v)?)
+            }
+            _ => Canon::Scalar(canonical_number(text).into_bytes()),
+        })
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        match self {
+            Canon::Scalar(bytes) => out.extend_from_slice(bytes),
+            Canon::Array(items) => {
+                out.push(b'[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    item.write(out);
+                }
+                out.push(b']');
+            }
+            Canon::Object(map) => {
+                // `String` orders by its UTF-8 bytes.
+                out.push(b'{');
+                for (i, (k, v)) in map.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    out.extend(serde_json::to_vec(k).expect("serialize a JSON string"));
+                    out.push(b':');
+                    v.write(out);
+                }
+                out.push(b'}');
+            }
+        }
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.write(&mut out);
+        out
+    }
+}
+
 impl GenesisDigest {
     /// Digest of a genesis file's text. `Err` when it is not JSON.
     pub fn of_json(json: &str) -> Result<Self, GenesisError> {
-        let value: Value = serde_json::from_str(json)?;
-        Ok(Self::of_value(&value))
+        let raw: &RawValue = serde_json::from_str(json)?;
+        Ok(Self::of_canon(&Canon::parse(raw)?))
     }
 
-    /// Digest of a parsed genesis JSON value.
+    /// Digest of a parsed genesis JSON value (its numbers are what
+    /// `serde_json` parsed; a file is digested with [`Self::of_json`]).
     pub fn of_value(value: &Value) -> Self {
-        let canonical = canonical_json(value);
+        Self::of_json(&value.to_string()).expect("a JSON value's text is JSON")
+    }
+
+    fn of_canon(value: &Canon) -> Self {
+        let canonical = value.bytes();
         let mut pre = Vec::with_capacity(DIGEST_DOMAIN.len() + canonical.len());
         pre.extend_from_slice(DIGEST_DOMAIN);
         pre.extend_from_slice(&canonical);
         let digest = keccak256(&pre);
         let mut fields = BTreeMap::new();
         match value {
-            Value::Object(top) => {
+            Canon::Object(top) => {
                 for (k, v) in top {
                     match v {
-                        Value::Object(inner) if inner.len() <= SPLIT_MAX_KEYS => {
+                        Canon::Object(inner) if inner.len() <= SPLIT_MAX_KEYS => {
                             if inner.is_empty() {
-                                fields.insert(k.clone(), keccak256(canonical_json(v)));
+                                fields.insert(k.clone(), keccak256(v.bytes()));
                             }
                             for (ik, iv) in inner {
-                                fields.insert(format!("{k}.{ik}"), keccak256(canonical_json(iv)));
+                                fields.insert(format!("{k}.{ik}"), keccak256(iv.bytes()));
                             }
                         }
                         _ => {
-                            fields.insert(k.clone(), keccak256(canonical_json(v)));
+                            fields.insert(k.clone(), keccak256(v.bytes()));
                         }
                     }
                 }
             }
             // Not an object: the typed parse refuses it anyway.
             other => {
-                fields.insert(String::new(), keccak256(canonical_json(other)));
+                fields.insert(String::new(), keccak256(other.bytes()));
             }
         }
         GenesisDigest { digest, fields }

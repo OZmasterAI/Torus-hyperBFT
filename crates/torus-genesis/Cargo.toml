@@ -11,7 +11,9 @@ torus-economics = { workspace = true }
 torus-core = { workspace = true }
 borsh = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# raw_value: the genesis digest reads number literals as written (no f64
+# rounding, Codex review of phase 4 P2).
+serde_json = { workspace = true, features = ["raw_value"] }
 alloy-primitives = { workspace = true }
 revm = { workspace = true }
 thiserror = { workspace = true }
