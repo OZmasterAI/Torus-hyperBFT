@@ -494,7 +494,9 @@ fn run_seeded(
                 .iter()
                 .filter(|w| w.0 == CF_NATIVE_POSITIONS && w.2.is_none())
                 .count();
-            let fatal = ctx.fatal_error.clone();
+            // The block's fail-stop as the committer sees it
+            // (`take_fatal_error`): `fatal_error`, else a reader fault (R02).
+            let fatal = ctx.fatal_error.clone().or_else(|| ctx.reader_fault.get().cloned());
             calls.push(CallOut {
                 writes,
                 results: r.results.iter().map(row).collect(),
@@ -508,7 +510,7 @@ fn run_seeded(
             }
         }
         stats.fallbacks += ctx.phase_accum.settle_fallbacks;
-        let fatal = ctx.fatal_error.is_some();
+        let fatal = ctx.fatal_error.is_some() || ctx.reader_fault.get().is_some();
         if !fatal {
             ctx.save_order_books();
         }
