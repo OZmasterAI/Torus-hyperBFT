@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# torus-clean-merged: find merged worktrees and unused cargo target dirs on 18c
+# and (with --apply) delete them. Dry run by default.
+#
+# Usage:
+#   tools/dev/torus-clean-merged                 # dry run: table + reclaimable total
+#   tools/dev/torus-clean-merged --apply         # delete what the table marks REMOVE
+#   options: --no-fetch   skip `git fetch -q origin`
+#            --idle-min N keep target dirs written in the last N minutes (default 120; 0 = off)
+#
+# Scope (all derived from $HOME, so tests can point HOME at a temp dir):
+#   repo       $TORUS_REPO (default $HOME/projects/Torus-hyperBFT)
+#   worktrees  registered worktrees directly under $HOME/projects/wt, plus sibling <name>-logs
+#   targets    $HOME/.cargo-target-*  (never $HOME/.cargo-target, never *sccache*)
+#
+# Worktree REMOVE needs: not locked, HEAD ancestor of origin/main, no uncommitted or
+# untracked changes, no commits missing from every remote, no process with cwd or an
+# open file inside it (or inside <name>-logs). A <name>-logs sibling is only deleted
+# if it is a plain dir (not a registered worktree, no .git anywhere inside).
+# Target dir REMOVE needs: no process with CARGO_TARGET_DIR pointing at it, no process
+# with cwd/open file inside it, nothing written in the last --idle-min minutes, and
+# every local branch / worktree branch that torus-target-dir maps to it is merged
+# into origin/main (a dir no live branch maps to counts as orphaned).
+# Process checks read /proc (own-user processes only) plus one `lsof` pass with a timeout.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tools/dev/torus-target-dir
+source "$SCRIPT_DIR/torus-target-dir"
+
+APPLY=0
+FETCH=1
+IDLE_MIN=120
+
+HOME_R="$(realpath -e "$HOME")"
+REPO="${TORUS_REPO:-$HOME_R/projects/Torus-hyperBFT}"
+WT_ROOT="$HOME_R/projects/wt"
+TGT_PREFIX="$HOME_R/.cargo-target-"
+PROC_FILE=""
+ENV_FILE=""
+WT_LIST=""
+ROWS=()
+TOTAL=0
+
+log() { printf '%s\n' "$*" >&2; }
+
+# Delete one directory. Refuses anything that is not a direct child of WT_ROOT or a
+# $HOME/.cargo-target-<name> dir, and anything reached through a symlink.
+safe_rm() {
+  local p="${1:?safe_rm: empty path}" r name
+  if [[ -L "$p" ]]; then log "REFUSE rm (symlink): $p"; return 1; fi
+  r="$(realpath -e -- "$p" 2>/dev/null)" || { log "REFUSE rm (missing): $p"; return 1; }
+  if [[ "$r" != "$p" ]]; then log "REFUSE rm (path not canonical): $p -> $r"; return 1; fi
+  if [[ -e "$r/.git" ]]; then log "REFUSE rm (contains .git; use git worktree remove): $r"; return 1; fi
+  case "$r" in
+    "$TGT_PREFIX"?*)
+      name="${r#"$TGT_PREFIX"}"
+      if [[ ! "$name" =~ ^[A-Za-z0-9._-]+$ || "$name" == *sccache* ]]; then
+        log "REFUSE rm (bad target name): $r"; return 1
+      fi ;;
+    "$WT_ROOT"/?*)
+      name="${r#"$WT_ROOT"/}"
+      if [[ ! "$name" =~ ^[A-Za-z0-9._-]+$ || "$name" == "." || "$name" == ".." ]]; then
+        log "REFUSE rm (not a direct child of $WT_ROOT): $r"; return 1
+      fi ;;
+    *) log "REFUSE rm (outside allowed roots): $r"; return 1 ;;
+  esac
+  rm -rf -- "${r:?}"
+}
+
+scan_procs() {
+  PROC_FILE="$(mktemp)"; ENV_FILE="$(mktemp)"
+  find /proc/[0-9]*/cwd /proc/[0-9]*/fd -maxdepth 1 -type l -printf '%l\n' 2>/dev/null \
+    | grep '^/' >"$PROC_FILE"
+  if command -v lsof >/dev/null 2>&1; then
+    timeout 30 lsof -nP -w -Fn 2>/dev/null | sed -n 's|^n\(/.*\)|\1|p' >>"$PROC_FILE" || true
+  fi
+  grep -zah '^CARGO_TARGET_DIR=' /proc/[0-9]*/environ 2>/dev/null | tr '\0' '\n' \
+    | sed -e 's/^CARGO_TARGET_DIR=//' -e 's|/*$||' >"$ENV_FILE"
+}
+
+cleanup() {
+  if [[ -n "$PROC_FILE" ]]; then rm -f -- "${PROC_FILE:?}"; fi
+  if [[ -n "$ENV_FILE" ]]; then rm -f -- "${ENV_FILE:?}"; fi
+  if [[ -n "$WT_LIST" ]]; then rm -f -- "${WT_LIST:?}"; fi
+}
+
+# prefix_hit <file> <dir>: true if any line of file is dir or below dir.
+prefix_hit() {
+  awk -v p="$2" '$0==p || index($0, p "/")==1 {found=1; exit} END {exit !found}' "$1"
+}
+
+path_in_use() { prefix_hit "$PROC_FILE" "$1" && echo "process has cwd/open file inside"; }
+target_env_in_use() { prefix_hit "$ENV_FILE" "$1" && echo "process has CARGO_TARGET_DIR=$1"; }
+
+size_of() {
+  local s=0 d n
+  for d in "$@"; do
+    [[ -e "$d" ]] || continue
+    n="$(timeout 300 du -sb -- "$d" 2>/dev/null | cut -f1)"
+    s=$(( s + ${n:-0} ))
+  done
+  echo "$s"
+}
+
+human() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "${1}B"; }
+
+add_row() { # path bytes verdict reason
+  ROWS+=("$1"$'\t'"$2"$'\t'"$3"$'\t'"$4")
+  if [[ "$3" == REMOVE ]]; then TOTAL=$(( TOTAL + $2 )); fi
+}
+
+# recent_write <dir>: prints a reason if anything at any depth was modified in the
+# last IDLE_MIN minutes, or if the full scan could not finish (treated as recent).
+recent_write() {
+  local hit rc
+  hit="$(timeout 300 find "$1" -mmin "-$IDLE_MIN" -print -quit 2>/dev/null)"; rc=$?
+  if [[ -n "$hit" ]]; then echo "written in the last $IDLE_MIN min"
+  elif (( rc == 124 )); then echo "idle check timed out"
+  fi
+}
+
+# A <name>-logs sibling is only deleted if it is a plain dir: not a symlink, not a
+# registered worktree, and with no .git entry anywhere in it (no repo/worktree inside).
+is_plain_logs_dir() {
+  local d="$1"
+  [[ -d "$d" && ! -L "$d" ]] || return 1
+  grep -qxF "worktree $d" "$WT_LIST" && return 1
+  [[ -z "$(find "$d" -name .git -print -quit 2>/dev/null)" ]]
+}
+
+is_merged() { git -C "$REPO" merge-base --is-ancestor "$1" origin/main 2>/dev/null; }
+
+check_worktree() { # path head branch locked
+  local p="$1" head="$2" branch="$3" locked="$4" logs="$1-logs" reason="" d u size
+  local paths=("$p")
+  if is_plain_logs_dir "$logs"; then paths+=("$logs"); fi
+  if [[ -n "$locked" ]]; then reason="worktree is locked"
+  elif [[ ! -d "$p" ]]; then reason="worktree dir missing (git worktree prune)"
+  elif ! git -C "$p" rev-parse -q --verify HEAD >/dev/null 2>&1 \
+       || [[ -n "$(git -C "$p" status --porcelain 2>/dev/null)" ]]; then
+    reason="uncommitted or untracked changes"
+  elif [[ -n "$(git -C "$p" rev-list -n1 HEAD --not --remotes 2>/dev/null)" ]]; then
+    reason="unpushed commits"
+  elif ! is_merged "$head"; then reason="HEAD not merged into origin/main"
+  else
+    for d in "${paths[@]}"; do
+      if u="$(path_in_use "$d")"; then reason="$u ${d##*/}"; break; fi
+    done
+  fi
+  size="$(size_of "${paths[@]}")"
+  if [[ -n "$reason" ]]; then add_row "$p" "$size" KEEP "$reason"; return; fi
+  local extra=""
+  if (( ${#paths[@]} > 1 )); then extra=" (+ ${logs##*/})"; fi
+  add_row "$p" "$size" REMOVE "merged ${branch:-detached} ${head:0:8}, clean${extra}"
+  if (( APPLY )); then
+    if git -C "$REPO" worktree remove -- "$p"; then
+      log "removed worktree $p"
+      if is_plain_logs_dir "$logs"; then safe_rm "$logs" && log "removed $logs"; fi
+    else
+      log "git worktree remove failed for $p (kept)"
+    fi
+  fi
+}
+
+check_targets() {
+  # Map every local branch (worktree branches are local branches too) to its dir.
+  local -A dir_unmerged=() dir_branches=()
+  local b d t reason u size
+  while IFS= read -r b; do
+    [[ -z "$b" ]] && continue
+    d="$(torus_target_dir_for "$b")"
+    dir_branches[$d]+="$b "
+    if ! is_merged "refs/heads/$b"; then dir_unmerged[$d]+="$b "; fi
+  done < <(git -C "$REPO" for-each-ref --format='%(refname:short)' refs/heads)
+  for t in "$TGT_PREFIX"*; do
+    [[ -e "$t" || -L "$t" ]] || continue
+    [[ "$t" == *sccache* ]] && continue
+    reason=""
+    if [[ -L "$t" || ! -d "$t" ]]; then reason="not a plain directory"
+    elif u="$(target_env_in_use "$t")"; then reason="$u"
+    elif u="$(path_in_use "$t")"; then reason="$u"
+    elif [[ -n "${dir_unmerged[$t]:-}" ]]; then reason="unmerged: ${dir_unmerged[$t]% }"
+    elif (( IDLE_MIN > 0 )); then
+      reason="$(recent_write "$t")"
+    fi
+    size="$(size_of "$t")"
+    if [[ -n "$reason" ]]; then add_row "$t" "$size" KEEP "$reason"; continue; fi
+    if [[ -n "${dir_branches[$t]:-}" ]]; then
+      add_row "$t" "$size" REMOVE "all mapped branches merged: ${dir_branches[$t]% }"
+    else
+      add_row "$t" "$size" REMOVE "orphaned: no local branch maps here"
+    fi
+    if (( APPLY )); then safe_rm "$t" && log "removed $t"; fi
+  done
+}
+
+print_table() {
+  local row p s v r mode=" (dry run; --apply to delete)"
+  if (( APPLY )); then mode=" (applied)"; fi
+  printf '%-52s %8s  %-7s %s\n' PATH SIZE VERDICT REASON
+  for row in "${ROWS[@]}"; do
+    IFS=$'\t' read -r p s v r <<<"$row"
+    printf '%-52s %8s  %-7s %s\n' "$p" "$(human "$s")" "$v" "$r"
+  done
+  printf 'Total reclaimable: %s%s\n' "$(human "$TOTAL")" "$mode"
+}
+
+main() {
+  while (( $# )); do
+    case "$1" in
+      --apply) APPLY=1 ;;
+      --no-fetch) FETCH=0 ;;
+      --idle-min) IDLE_MIN="${2:?--idle-min needs a value}"; shift ;;
+      -h|--help) sed -n '2,23p' "${BASH_SOURCE[0]}"; return 0 ;;
+      *) log "unknown argument: $1"; return 2 ;;
+    esac
+    shift
+  done
+  [[ "$IDLE_MIN" =~ ^[0-9]+$ ]] || { log "--idle-min must be a number"; return 2; }
+  git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || { log "not a git repo: $REPO"; return 2; }
+  cd / || return 2   # our own cwd must not mark a worktree as in use
+  if (( FETCH )); then
+    timeout 120 git -C "$REPO" fetch -q origin || log "warning: git fetch failed; using cached origin/main"
+  fi
+  git -C "$REPO" rev-parse -q --verify origin/main >/dev/null || { log "origin/main not found"; return 2; }
+  trap cleanup EXIT
+  scan_procs
+  WT_LIST="$(mktemp)"
+  git -C "$REPO" worktree list --porcelain >"$WT_LIST" || { log "git worktree list failed"; return 2; }
+
+  local line p="" head="" branch="" locked=""
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) p="${line#worktree }" ;;
+      "HEAD "*) head="${line#HEAD }" ;;
+      "branch "*) branch="${line#branch refs/heads/}" ;;
+      locked*) locked=1 ;;
+      "")
+        if [[ -n "$p" && "$p" == "$WT_ROOT"/* && "${p#"$WT_ROOT"/}" != */* ]]; then
+          check_worktree "$p" "$head" "$branch" "$locked"
+        fi
+        p=""; head=""; branch=""; locked="" ;;
+    esac
+  done < <(cat "$WT_LIST"; echo)
+  check_targets
+  if (( APPLY )); then git -C "$REPO" worktree prune; fi
+  print_table
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  set -uo pipefail
+  main "$@"
+fi
