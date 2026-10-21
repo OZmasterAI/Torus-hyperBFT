@@ -13909,7 +13909,10 @@ mod leader_state_tests {
         );
         for view in 1..100u64 {
             let leader = plain_iwrr(ls, view);
-            assert!(!excluded.contains(&leader), "view {view} selects {leader:?}");
+            assert!(
+                !excluded.contains(&leader),
+                "view {view} selects {leader:?}"
+            );
         }
     }
 
