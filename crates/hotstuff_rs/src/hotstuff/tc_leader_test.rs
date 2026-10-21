@@ -542,6 +542,92 @@ mod review {
         assert!(headers[0].has_validator_set_updates, "recovered VSU tip re-proposed with has_validator_set_updates=false");
     }
 
+    /// Validates the first `missing` calls as `MissingData` (out-of-band data
+    /// not there yet), then everything as valid without updates.
+    struct MissingThenValid {
+        missing: usize,
+        calls: usize,
+    }
+
+    impl App<MemKV> for MissingThenValid {
+        fn produce_block(&mut self, _: ProduceBlockRequest<MemKV>) -> ProduceBlockResponse {
+            unreachable!("re-proposal test")
+        }
+        fn validate_block(&mut self, _: ValidateBlockRequest<MemKV>) -> ValidateBlockResponse {
+            self.calls += 1;
+            if self.calls <= self.missing {
+                ValidateBlockResponse::MissingData
+            } else {
+                ValidateBlockResponse::Valid { app_state_updates: None, validator_set_updates: None }
+            }
+        }
+        fn validate_block_for_sync(&mut self, _: ValidateBlockRequest<MemKV>) -> ValidateBlockResponse {
+            unreachable!("re-proposal test")
+        }
+    }
+
+    fn response_for(x: &Block, the_tc: &TimeoutCertificate) -> ProposalResponse {
+        ProposalResponse {
+            chain_id: CHAIN_ID,
+            view: ViewNumber::new(VIEW),
+            proposal: Proposal { chain_id: CHAIN_ID, view: ViewNumber::new(VIEW), block: x.clone(), tc: Some(the_tc.clone()), nec: None },
+        }
+    }
+
+    /// Codex review of phase B [P2]: the recovered tip X is inserted, but its
+    /// justify (a Decide QC on the validator-set-updating block g) was never
+    /// applied: the leader's loopback header finds X in the tree and skips
+    /// the body path, so g's commit and its validator-set update are lost.
+    /// RED on 40cea7fc: power stays 1, nothing committed.
+    #[test]
+    fn case5_recovered_tip_applies_its_justify() {
+        let decide_g = pc_with_phase(3, &g(), Phase::Decide);
+        let x = Block::new(BlockHeight::new(1), decide_g, CryptoHash::new([82; 32]), Data::new(vec![]));
+        let the_tc = tc(VIEW - 1, Some(tip(&x, VIEW - 1)), None);
+        let mut l = recording_leader(&[], std::slice::from_ref(&g()), PhaseCertificate::genesis_pc(), Some(the_tc.clone()));
+        l.enter(&mut LeaderApp);
+        assert!(l.headers().is_empty(), "case 5 waits");
+        let origin = keys()[0].verifying_key();
+        l.hotstuff
+            .on_receive_msg(HotStuffMessage::ProposalResponse(response_for(&x, &the_tc)), &origin, &mut l.tree, &mut LeaderApp)
+            .unwrap();
+        assert_eq!(l.headers().len(), 1, "X re-proposed");
+        let power = l.tree.committed_validator_set().unwrap().power(&keys()[0].verifying_key()).map(|p| p.int());
+        let committed = l.tree.highest_committed_block_height().unwrap();
+        assert!(
+            power == Some(2) && committed == Some(BlockHeight::new(0)),
+            "X's Decide QC on g must commit g and apply its update: power={power:?} committed={committed:?}"
+        );
+    }
+
+    /// Codex review of phase B [P2]: a ProposalResponse whose block validates
+    /// `MissingData` was dropped with nothing scheduled to re-validate it, so
+    /// the leader stayed in recovery until its view timed out (unless a second
+    /// response came). It must be retried like any `MissingData` body (s63)
+    /// and re-proposed once the data is there. RED on 40cea7fc.
+    #[test]
+    fn case5_missing_data_response_is_retried_and_reproposed() {
+        let x = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(), CryptoHash::new([83; 32]), Data::new(vec![]));
+        let the_tc = tc(VIEW - 1, Some(tip(&x, VIEW - 1)), None);
+        let mut l = recording_leader(&[], &[], PhaseCertificate::genesis_pc(), Some(the_tc.clone()));
+        let mut app = MissingThenValid { missing: 1, calls: 0 };
+        l.enter(&mut app);
+        let origin = keys()[0].verifying_key();
+        l.hotstuff
+            .on_receive_msg(HotStuffMessage::ProposalResponse(response_for(&x, &the_tc)), &origin, &mut l.tree, &mut app)
+            .unwrap();
+        assert_eq!(app.calls, 1, "fixture: the response was validated once");
+        assert!(l.headers().is_empty(), "nothing to re-propose while the data is missing");
+        assert!(l.hotstuff.has_missing_data_retries(), "the recovered block must be scheduled for re-validation");
+        let later = Instant::now() + Duration::from_secs(1);
+        l.hotstuff.tick_missing_data_retries_at(&mut l.tree, &mut app, later).unwrap();
+        assert_eq!(app.calls, 2, "the retry tick re-validates the recovered block");
+        let headers = l.headers();
+        assert_eq!(headers.len(), 1, "X re-proposed once its data is there");
+        assert!(headers[0].block_hash == x.hash && headers[0].tc.is_some());
+        assert!(!l.hotstuff.has_missing_data_retries(), "nothing left to retry");
+    }
+
     /// [P2] genesis highest PC, but TC(v-1) is held and its high tip wins:
     /// re-propose the tip with the TC rather than a fresh height-0 block.
     #[test]
