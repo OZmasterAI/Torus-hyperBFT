@@ -501,6 +501,48 @@ fn position_liquidated_during_grace_is_skipped() {
     assert_eq!(row(&db), None);
 }
 
+/// ADL during the grace period: trader 13 (short 10 @100, collateral 50)
+/// goes bankrupt at mark 120; its short moves to the ADL escrow and the drain
+/// is held back (work 0), so the obligation is still open when the
+/// settlement runs. The settlement closes 14 against the vault (vault long
+/// 10 = minus the escrow's short: OI symmetric, no "OI asymmetry" fatal), and
+/// the next liquidation step's drain closes the escrow against the vault:
+/// nothing is left in the market, no obligation row remains.
+#[test]
+fn adl_obligation_open_at_settlement_drains_against_the_vault() {
+    let (_d, db) = setup(&[14]);
+    fund(&db, 13, 50);
+    set_grace(&db, 5);
+    open_pair(&db, M, 14, 13, 10, 100);
+    set_mark(&db, M, 100, H);
+    delist_m(&db);
+    set_mark(&db, M, 120, H + 2);
+    {
+        let mut ctx = ctx_at(db.clone(), H + 2);
+        let _ = NativeExecutor::run_liquidations_with(&mut ctx, 2_048, 64, 0);
+        assert_eq!(ctx.take_fatal_error(), None);
+    }
+    assert_eq!(pos(&db, 13, M), FixedPoint::ZERO, "13 ADL'd to the escrow");
+    assert_eq!(pos_of(&db, &liq::ADL_ESCROW_SHORT, M), fp(-10));
+    assert!(liq::next_obligation(&db, &[liq::ADL_OBLIGATION_TAG]).unwrap().is_some());
+    set_mark(&db, M, 120, H + 5);
+    let (_, s) = block(&db, H + 5, 1, &[]);
+    assert!(s.iter().all(|r| r.success), "{s:?}");
+    assert_eq!(pos(&db, 14, M), FixedPoint::ZERO, "14 closed at 120");
+    assert_eq!(bal(&db, &addr(14)).available, fp(FUND + 200));
+    assert_eq!(pos_of(&db, &LIQUIDATOR_VAULT, M), fp(10), "vault mirrors the escrow");
+    assert_eq!(net_oi(&db, M).0, FixedPoint::ZERO);
+    assert_eq!(row(&db), None, "walk done (protocol accounts are not walked)");
+    set_mark(&db, M, 120, H + 6);
+    {
+        let mut ctx = ctx_at(db.clone(), H + 6);
+        let _ = NativeExecutor::run_liquidations(&mut ctx);
+        assert_eq!(ctx.take_fatal_error(), None);
+    }
+    assert_eq!(net_oi(&db, M), (FixedPoint::ZERO, 0), "escrow closed against the vault");
+    assert!(liq::next_obligation(&db, &[liq::ADL_OBLIGATION_TAG]).unwrap().is_none());
+}
+
 /// An underwater account: its close at the settlement price leaves negative
 /// collateral; when flat it moves to the vault (D9, conserved), as after a
 /// liquidation.
@@ -578,7 +620,9 @@ fn classic_block<R>(db: &StateDb, h: u64, f: impl FnOnce(&mut NativeExecContext<
     out
 }
 
-fn dump(db: &StateDb) -> Vec<(&'static str, Vec<(Vec<u8>, Vec<u8>)>)> {
+type CfRows = Vec<(Vec<u8>, Vec<u8>)>;
+
+fn dump(db: &StateDb) -> Vec<(&'static str, CfRows)> {
     [
         CF_NATIVE_POSITIONS,
         CF_NATIVE_BALANCES,

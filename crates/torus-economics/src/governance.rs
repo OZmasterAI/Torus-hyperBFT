@@ -243,7 +243,9 @@ pub enum ExecutionPayload {
     /// Pre-testnet P1: delist `market_id`. Execution writes its delisted
     /// flag row ([`torus_types::market_delisted_key`]); the executor then
     /// cancels the market's resting orders and stops (refunding their
-    /// margin) and accepts only reduce-only orders there. Positions stay.
+    /// margin) and accepts only reduce-only orders there. Positions stay
+    /// for the grace period (`delist_grace_blocks`), then the executor's
+    /// settlement step force-closes them at the oracle mark (option C).
     MarketDelist { market_id: u64 },
     /// Pre-testnet P1: rewrite `market_id`'s row with a new lot, tick and
     /// initial margin (names kept), in the proposal's atomic write.
@@ -820,8 +822,11 @@ impl<T: StateBackend> GovernanceManager<T> {
             torus_types::EVM_BLOCK_GAS_LIMIT_PARAM
             | torus_types::EVM_BLOCK_INTERVAL_PARAM
             | torus_types::EVM_BIG_BLOCK_GAS_LIMIT_PARAM
-            | torus_types::CORE_WRITER_ORDER_DELAY_PARAM => {
+            | torus_types::CORE_WRITER_ORDER_DELAY_PARAM
+            // Delist option C: its own row, read when a delist executes.
+            | torus_types::DELIST_GRACE_PARAM => {
                 let range = match key {
+                    torus_types::DELIST_GRACE_PARAM => torus_types::DELIST_GRACE_BLOCKS_RANGE,
                     torus_types::EVM_BLOCK_GAS_LIMIT_PARAM => {
                         torus_types::EVM_BLOCK_GAS_LIMIT_RANGE
                     }

@@ -1,13 +1,49 @@
 //! Delist option C (owner, s131): the settlement of a governance-delisted
-//! market. Child module of `native_executor` (sees the private cancel helpers
-//! and `AccountReader`).
+//! market. Child module of `native_executor` (sees the private cancel helpers,
+//! `AccountReader` and the liquidation step's trader walk).
+//!
+//! - When a delist executes at height H (`apply_executed_market_proposal`),
+//!   the market's settlement row is written in the same block:
+//!   `close_at = H + N`, N = governance key [`torus_types::DELIST_GRACE_PARAM`]
+//!   read then (default 43,200 blocks). Until `close_at` the market is
+//!   reduce-only (the P1 wind-down).
+//! - From `close_at`, the block step [`NativeExecutor::run_delist_settlements`]
+//!   (after `process_governance`) settles it:
+//!   1. the settlement price is chosen ONCE, at the first settlement block,
+//!      and stored in the row: the usable oracle mark (block-start table),
+//!      else the last aggregated oracle price (stale but > 0), else none: the
+//!      row waits (an error result, retried every block);
+//!   2. every resting order and pending stop in the market is cancelled and
+//!      refunded (each settlement block: reduce-only orders placed between
+//!      settlement blocks never survive one);
+//!   3. the walk visits `CF_NATIVE_POSITIONS` traders in ascending address
+//!      order after the row's cursor (the liquidation step's C1 walk, from
+//!      R's sorted set when attached: identical result) and moves each
+//!      trader's whole position in the market to the liquidator vault at the
+//!      settlement price ([`liq::transfer`], the backstop primitive: PnL
+//!      realised to the trader's balance, Σ long == Σ short after every
+//!      block). A flat account left with negative collateral moves it to the
+//!      vault ([`liq::settle_flat_deficit`], D9). The vault and the ADL
+//!      escrows are not walked: the vault is the counterparty and ends
+//!      holding exactly minus the escrows' positions (flat without ADL rows),
+//!      which the ADL drain closes against it.
+//!   4. Bounded: at most `scan` traders visited and `close` positions closed
+//!      per block, across all settling markets (ascending market id). A cut
+//!      walk stores the last visited trader as the cursor; the next block
+//!      continues there. The row is deleted when the walk reaches the end.
+//!
+//! Every write goes through the block's state (one atomic batch per block).
+//! A storage error, or any error of the pass, fail-stops the node like the
+//! liquidation step (`fatal_error`).
 
 use super::*;
-use torus_core::liquidation as liq;
+use torus_core::liquidation::{self as liq, DelistSettlement, LIQUIDATOR_VAULT};
 
 impl NativeExecutor {
     /// Delist option C: the per-block settlement step (after
-    /// `process_governance`).
+    /// `process_governance`, so a delist with N = 0 settles in its own
+    /// block). One result per settling market that waited for a price or
+    /// worked this block.
     pub fn run_delist_settlements<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
     ) -> Vec<NativeActionResult> {
@@ -18,25 +54,151 @@ impl NativeExecutor {
         )
     }
 
-    /// [`Self::run_delist_settlements`] with explicit budgets (tests).
+    /// [`Self::run_delist_settlements`] with explicit budgets (tests): at most
+    /// `scan` traders visited and `close` positions closed this block.
     pub fn run_delist_settlements_with<T: StateBackend>(
-        _ctx: &mut NativeExecContext<T>,
-        _scan: usize,
-        _close: usize,
+        ctx: &mut NativeExecContext<T>,
+        scan: usize,
+        close: usize,
     ) -> Vec<NativeActionResult> {
-        Vec::new() // RED stub
+        match Self::delist_settlement_pass(ctx, scan, close) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.fatal_error.get_or_insert_with(|| format!("delist settlement step: {e}"));
+                Vec::new()
+            }
+        }
     }
 
-    /// Whether a settlement row is due at `height`.
+    /// Whether a settlement row is due at `height`: the block must run the
+    /// native phase even without other work (app.rs due-check).
     pub fn delist_settlement_due<T: StateBackend>(state: &T, height: u64) -> Result<bool, CoreError> {
         liq::delist_settlement_due(state, height)
     }
 
-    /// Writes the market's settlement row when its delist executes.
+    /// Writes `market_id`'s settlement row when its delist executes (in the
+    /// governance step, the proposal's block): `close_at = height + N`. A
+    /// failed read of N or a failed write is a local fault (fail-stop).
     pub(super) fn schedule_delist_settlement<T: StateBackend>(
-        _ctx: &mut NativeExecContext<T>,
-        _market_id: MarketId,
+        ctx: &mut NativeExecContext<T>,
+        market_id: MarketId,
     ) {
-        // RED stub
+        let stored = ctx
+            .state
+            .get_cf_raw(torus_state::cf::CF_FEE_CONFIG, torus_types::DELIST_GRACE_PARAM.as_bytes());
+        let res = stored.map_err(CoreError::from).and_then(|stored| {
+            let n = torus_types::delist_grace_blocks(stored.as_deref());
+            liq::put_delist_settlement(
+                &ctx.state,
+                &DelistSettlement {
+                    market: market_id,
+                    close_at: ctx.block_height.saturating_add(n),
+                    price: None,
+                    cursor: None,
+                },
+            )
+        });
+        if let Err(e) = res {
+            ctx.fatal_error.get_or_insert_with(|| format!("delist settlement schedule: {e}"));
+        }
+    }
+
+    /// The settlement price of `m` for a row that has none yet: the usable
+    /// mark, else the last aggregated oracle price when > 0 (stale), else
+    /// `None` (wait).
+    fn delist_settlement_price<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        m: MarketId,
+    ) -> Result<Option<FixedPoint>, CoreError> {
+        if let Some(mark) = AccountReader::of(ctx).mark(m) {
+            return Ok(Some(mark));
+        }
+        Ok(ctx
+            .oracle
+            .get_price_opt(m, ctx.timestamp)?
+            .map(|p| p.price)
+            .filter(|p| *p > FixedPoint::ZERO))
+    }
+
+    fn delist_settlement_pass<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        scan: usize,
+        close: usize,
+    ) -> Result<Vec<NativeActionResult>, CoreError> {
+        let due: Vec<DelistSettlement> = liq::delist_settlements(&ctx.state)?
+            .into_iter()
+            .filter(|s| s.close_at <= ctx.block_height)
+            .collect();
+        let mut results = Vec::new();
+        let (mut scan_left, mut close_left) = (scan, close);
+        for mut row in due {
+            if scan_left == 0 || close_left == 0 {
+                break; // the rest waits for the next block
+            }
+            let m = row.market;
+            let price = match row.price {
+                Some(p) => p,
+                None => match Self::delist_settlement_price(ctx, m)? {
+                    Some(p) => {
+                        tracing::info!(market = m, price = %p, height = ctx.block_height, "delist settlement: price fixed");
+                        p
+                    }
+                    None => {
+                        results.push(NativeActionResult::err(
+                            "delist_settlement",
+                            format!("delist settlement: market {m} has no oracle price: waiting"),
+                        ));
+                        continue;
+                    }
+                },
+            };
+            // No order survives a settlement block (reduce-only orders placed
+            // since the last one included).
+            Self::cancel_market_orders_and_stops(ctx, m);
+            if let Some(reason) = ctx.reader_fault.get() {
+                return Err(CoreError::InvalidInput(format!("order cancel: {reason}")));
+            }
+            // SCAN + 3: the vault and the two escrows are skipped (not
+            // charged to the budget), so a full fetch with the budget left
+            // means the walk has not reached the end.
+            let limit = scan_left.saturating_add(3);
+            let traders = Self::liq_traders_after(ctx, row.cursor, limit)?;
+            let (mut last, mut cut, mut closed) = (row.cursor, false, 0u64);
+            for t in &traders {
+                if *t == LIQUIDATOR_VAULT || liq::is_adl_escrow(t) {
+                    last = Some(*t);
+                    continue;
+                }
+                if scan_left == 0 || close_left == 0 {
+                    cut = true;
+                    break;
+                }
+                scan_left -= 1;
+                last = Some(*t);
+                let Some(p) = ctx.positions.get_position(t, m)? else { continue };
+                close_left -= 1;
+                closed += 1;
+                liq::transfer(&ctx.positions, t, &LIQUIDATOR_VAULT, m, p.size, price)?;
+                liq::settle_flat_deficit(&ctx.positions, t, &LIQUIDATOR_VAULT)?;
+                if ctx.positions.positions_for_trader(t)?.is_empty() {
+                    // Flat: the liquidation walk never visits it again.
+                    liq::clear_cooldown(&ctx.state, t)?;
+                    liq::set_pending(&ctx.state, t, false)?;
+                }
+                tracing::debug!(market = m, trader = %t, size = %p.size, %price, "delist settlement: position closed");
+            }
+            let done = !cut && traders.len() < limit;
+            if done {
+                liq::delete_delist_settlement(&ctx.state, m)?;
+                let vault = ctx.positions.get_position(&LIQUIDATOR_VAULT, m)?;
+                tracing::info!(market = m, height = ctx.block_height, vault_residual = ?vault.map(|p| (p.is_long, p.size)), "delist settlement: market settled");
+            } else {
+                row.price = Some(price);
+                row.cursor = last;
+                liq::put_delist_settlement(&ctx.state, &row)?;
+            }
+            results.push(NativeActionResult::ok("delist_settlement", 1000 + 3000 * closed));
+        }
+        Ok(results)
     }
 }
