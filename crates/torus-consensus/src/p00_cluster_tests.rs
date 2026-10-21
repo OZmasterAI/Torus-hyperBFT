@@ -220,6 +220,8 @@ impl Cluster {
             options,
         )
         .expect("TorusApp startup");
+        // A (re)started validator gets nothing sent while it was down.
+        self.networks[i].discard_pending();
         let node = &mut self.nodes[i];
         node.refusals = app.test_upgrade_refusals.clone();
         node.exec_failed = app.exec_failed_handle();
@@ -493,7 +495,8 @@ fn p00_crossing_every_node_switches_at_h_with_identical_running_hashes() {
 /// goes on with the three upgraded nodes, and the old node refuses the block
 /// (`UPGRADE REQUIRED` at insertion / before the vote) and stays at an applied
 /// height below `H` that no longer moves; its committed history is a prefix
-/// of the others' (no fork) and it never executes a block it cannot.
+/// of the others' (no fork) and it never executes a block it cannot. Upgraded
+/// (restarted on the new release), it catches up and agrees at every height.
 #[test]
 fn p00_mixed_binaries_three_of_four_go_on_and_the_old_node_halts_below_h() {
     const H: u64 = 6;
@@ -536,14 +539,23 @@ fn p00_mixed_binaries_three_of_four_go_on_and_the_old_node_halts_below_h() {
     }
     for i in NEW {
         assert!(c.refusals(i).is_empty(), "node {i}: {:?}", c.refusals(i));
+        assert!(
+            !c.nodes[i].exec_failed.load(Ordering::SeqCst),
+            "node {i} failed"
+        );
     }
     let top = c.min_applied(&NEW);
     c.assert_headers(&NEW, top, Some(H));
     c.assert_headers(&[0, 3], halted_committed, Some(H));
-    c.stop_all();
-    c.assert_agree(&NEW, top, Some(H));
-    c.assert_agree(&[0, 1, 2, 3], halted, Some(H));
+    // The operator upgrades the old node: it catches up from below H.
+    c.stop(3);
     assert!(c.nodes[3].writes.keys().all(|&h| h <= halted));
+    c.start(3, &Binary::new(H));
+    c.wait_applied(&ALL, top + 4);
+    let top = c.min_applied(&ALL);
+    c.assert_headers(&ALL, top, Some(H));
+    c.stop_all();
+    c.assert_agree(&ALL, top, Some(H));
 }
 
 /// Test plan 2 (mixed binaries, 2 of 4 upgraded): with two old nodes no block
@@ -610,7 +622,6 @@ fn crash_across_h_replay_matches(hold_at: u64) {
     });
     assert_eq!(c.applied(3), hold_at - 1, "node 3 executed up to the hold");
     let committed = c.committed(3);
-    hold.kill();
     c.stop(3);
     // Restart: the boot replay re-executes (applied, committed] across H.
     c.start(3, &Binary::new(H));
@@ -649,7 +660,8 @@ fn p00_crash_applied_above_h_replay_matches() {
 /// past `H` but executed only below it, and restarts on a release that does
 /// not know the test feature. Its boot replay executes up to `H - 1` and
 /// fail-stops before `H` (`UPGRADE REQUIRED`): nothing of `H` is executed or
-/// flushed, and the applied height stays `H - 1`.
+/// flushed, and the applied height stays `H - 1`. Upgraded again, it replays
+/// on from `H`, rejoins and agrees at every height.
 #[test]
 fn p00_crash_then_old_binary_replay_fail_stops_before_h() {
     const H: u64 = 8;
@@ -661,7 +673,6 @@ fn p00_crash_then_old_binary_replay_fail_stops_before_h() {
     c.start(3, &Binary::new(H).held(&hold));
     c.wait_until("node 3 commits past H", |c| c.committed(3) >= H + 3);
     assert_eq!(c.applied(3), H - 2);
-    hold.kill();
     c.stop(3);
     c.start(3, &Binary::old());
     assert!(
@@ -672,12 +683,19 @@ fn p00_crash_then_old_binary_replay_fail_stops_before_h() {
     let others = [0, 1, 2];
     c.wait_applied(&others, H + 4);
     assert_eq!(c.applied(3), H - 1, "the old node does not execute on");
-    c.stop_all();
-    c.assert_agree(&ALL, H - 1, Some(H));
+    c.stop(3);
     assert!(
         c.nodes[3].writes.keys().all(|&h| h < H),
         "nothing of H flushed"
     );
+    // The operator upgrades it: the replay runs on from H and it rejoins.
+    c.start(3, &Binary::new(H));
+    assert!(!c.nodes[3].exec_failed.load(Ordering::SeqCst));
+    let tip = c.min_applied(&others);
+    c.wait_applied(&ALL, tip + 4);
+    let top = c.min_applied(&ALL);
+    c.stop_all();
+    c.assert_agree(&ALL, top, Some(H));
 }
 
 /// Test plan 4 (replay from genesis with a newer binary that moves a future
@@ -746,7 +764,6 @@ fn p00_a_node_with_another_schedule_replays_by_the_header_bits_then_refuses() {
     c.start(3, &Binary::new(H).held(&hold));
     c.wait_until("node 3 commits past H", |c| c.committed(3) >= H + 3);
     let committed = c.committed(3);
-    hold.kill();
     c.stop(3);
     c.start(3, &Binary::new(900));
     assert!(

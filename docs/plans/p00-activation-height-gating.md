@@ -242,16 +242,26 @@ Each phase lands on its own branch with RED-first tests and full gates; each one
    and check the stored hash. Tests: (1) crossing at H: every node's headers carry the bit from exactly H,
    the rule row from H, identical write sets and `h_n` at every height; (2) 3 of 4 upgraded: the chain
    goes on, the old node refuses H (vote / insertion, `UPGRADE REQUIRED`), its applied and committed
-   heights stop below H, no fail-stop, its history is a prefix of the others'; 2 of 4: every node stalls
+   heights stop below H, no fail-stop, its history is a prefix of the others', and upgraded it catches up
+   and agrees; 2 of 4: every node stalls
    below H, no header at H anywhere, all headers equal (no fork); (3) crash with applied H-2, H-1, H+1 and
    committed past H: the boot replay crosses H by the stored headers and matches the uncrashed nodes;
    the same crash restarted on an old binary: the replay fail-stops before H (applied H-1, nothing of H
-   flushed); (4) every node upgrades to a release that moves a future height (900 -> above the tip), one
+   flushed), and upgraded again it replays on from H and rejoins; (4) every node upgrades to a release that moves a future height (900 -> above the tip), one
    from an empty data dir (block sync from genesis): every `h_n` from before the upgrade is unchanged and
    the feature switches on at the new height on all four; a node restarted with another schedule
    replays its committed gap by the header bits (no fail-stop, same `h_n`) and then inserts no block
    whose bits differ from its schedule. Mutations checked: execution reading the node's schedule
    instead of the header bits, and the execution fail-stop ignoring the known set, each fail a test.
-   nextest: `threads-required = 4` for these tests (view timers under a full parallel run).
+   nextest: `threads-required = 4` for these tests (view timers under a full parallel run). A held node is
+   killed by its app's drop (consensus side stopped first), as a killed process.
+   **Found (pre-existing, not P0.0, not fixed here):** once `exec_failed` is latched, `on_committed_block`
+   ignores each committed block (nothing persisted) but hotstuff's committed feed still advances
+   `APP_FED_BLOCK_HEIGHT` past it (`committed_feed.rs`), so after a restart that height is never
+   delivered again: the node's committed headers end below it and it never catches up (seen when the
+   test killed the execution thread while consensus ran on: one `FAIL-STOP, ignoring committed block`
+   at height 12, then committed stuck at 11 after the restart while the others reached ~300-670).
+   Live P0.0 paths do not reach it (an old binary refuses insertion at H, so nothing commits after its
+   fail-stop), but any execution fail-stop that a commit outruns before the process exits does.
 6. **Ops** (~0.5-1 d): features gauge, RPC schedule listing, upgrade runbook.
 7. **Governance `ScheduleActivation`** (before mainnet, 3-4 d) through `EpochRotationPlan`.

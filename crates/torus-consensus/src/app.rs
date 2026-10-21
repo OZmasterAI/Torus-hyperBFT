@@ -6955,6 +6955,10 @@ pub struct TorusApp {
     /// node, `(site, height)` with site `vote` / `insert` / `propose`.
     #[cfg(test)]
     pub(crate) test_upgrade_refusals: Arc<std::sync::Mutex<Vec<(&'static str, u64)>>>,
+    /// Test-only (P0.0 phase 5): the execution thread's [`ExecHold`]; a drop
+    /// (the node stopping) kills a held thread, as a killed process.
+    #[cfg(test)]
+    test_exec_hold: Option<Arc<ExecHold>>,
     staking: StakingManager,
     epoch_length: u64,
     last_validator_set: ValidatorSet,
@@ -7795,9 +7799,11 @@ impl Default for AppOptions {
 }
 
 /// Test-only (P0.0 phase 5): the execution thread waits before executing any
-/// height `>= from` until the test kills it ([`Self::kill`]: the thread exits
-/// there without executing, as a killed process; the fail-stop latch keeps
-/// the node from writing more).
+/// height `>= from` until it is killed ([`Self::kill`], which the app's drop
+/// calls: the node stops like a killed process, its consensus side first, so
+/// every block it was fed is durable and nothing is fed it ignores). The
+/// killed thread exits there without executing; the fail-stop latch keeps it
+/// from writing more.
 #[cfg(test)]
 pub(crate) struct ExecHold {
     pub(crate) from: u64,
@@ -8302,6 +8308,8 @@ impl TorusApp {
             known_features: options.known_features,
             #[cfg(test)]
             test_upgrade_refusals: Default::default(),
+            #[cfg(test)]
+            test_exec_hold: options.exec_hold.clone(),
             staking,
             epoch_length: config.epoch_length,
             last_validator_set: genesis_validator_set,
@@ -9463,6 +9471,12 @@ impl Drop for TorusApp {
         // thread latches the fail-stop when its channel closes below.
         if !std::thread::panicking() {
             self.exec_shutdown.store(true, Ordering::SeqCst);
+        }
+        // P0.0 phase 5 (test-only): a held execution thread dies where it
+        // waits (the node is stopping like a killed process).
+        #[cfg(test)]
+        if let Some(hold) = self.test_exec_hold.as_ref() {
+            hold.kill();
         }
         self.exec_tx.take();
         if let Some(handle) = self.exec_handle.take() {
