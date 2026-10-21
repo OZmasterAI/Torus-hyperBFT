@@ -78,6 +78,13 @@ commit_in "$WT/unpushed" local-only
 # merged + clean but a process sits inside -> KEEP
 mkwt busy perf/h2h-busy
 bash -c "cd '$WT/busy' && exec sleep 300" & PIDS+=($!)
+# merged + clean worktree whose "<name>-logs" sibling is itself a worktree with unsaved work
+mkwt sib feat/sib
+mkwt sib-logs feat/sib-logs
+echo unsaved >"$WT/sib-logs/unsaved.txt"
+# merged + clean worktree whose logs dir holds a nested git repo
+mkwt nest feat/nest
+mkdir -p "$WT/nest-logs/inner"; git init -q "$WT/nest-logs/inner"
 # a worktree outside WT is ignored
 g worktree add -q -b feat/outside "$TMP/outside" origin/main 2>/dev/null
 
@@ -170,6 +177,10 @@ GUARD="$(HOME="$HOME" bash -c "source '$TCM'; safe_rm '$HOME/.cargo-target'; ech
 [[ -d "$HOME/.cargo-target" && "$GUARD" == *REFUSE*rc=1* ]] && ok "safe_rm refuses default target" || bad "safe_rm refuses default target" "$GUARD"
 GUARD="$(HOME="$HOME" bash -c "source '$TCM'; safe_rm '$HOME/.cargo-target-link'; echo rc=\$?" 2>&1)"
 [[ -d "$HOME/.cargo-target-orphan" && "$GUARD" == *REFUSE*rc=1* ]] && ok "safe_rm refuses symlink" || bad "safe_rm refuses symlink" "$GUARD"
+mkdir -p "$HOME/.cargo-target-hasgit/.git"
+GUARD="$(HOME="$HOME" bash -c "source '$TCM'; safe_rm '$HOME/.cargo-target-hasgit'; echo rc=\$?" 2>&1)"
+[[ -d "$HOME/.cargo-target-hasgit/.git" && "$GUARD" == *REFUSE*rc=1* ]] && ok "safe_rm refuses dir with .git" || bad "safe_rm refuses dir with .git" "$GUARD"
+rmdir "$HOME/.cargo-target-hasgit/.git" "$HOME/.cargo-target-hasgit"
 GUARD="$(HOME="$HOME" bash -c "source '$TCM'; safe_rm ''; echo rc=\$?" 2>&1)"
 [[ "$GUARD" == *"empty path"* ]] && ok "safe_rm refuses empty" || bad "safe_rm refuses empty" "$GUARD"
 
@@ -186,6 +197,10 @@ for d in "$WT/unmerged" "$WT/dirty" "$WT/unpushed" "$WT/busy" "$HOME/.cargo-targ
 done
 if g worktree list --porcelain | grep -q "$WT/merged\$"; then bad "worktree unregistered"; else ok "worktree unregistered"; fi
 [[ -f "$WT/dirty/untracked.txt" ]] && ok "dirty file untouched" || bad "dirty file untouched"
+[[ ! -e "$WT/sib" ]] && ok "apply removed sib worktree" || bad "apply removed sib worktree"
+[[ -f "$WT/sib-logs/unsaved.txt" ]] && ok "sibling worktree named <name>-logs kept with unsaved file" \
+  || bad "sibling worktree named <name>-logs kept with unsaved file" "$OUT"
+[[ -d "$WT/nest-logs/inner/.git" ]] && ok "logs dir containing a git repo kept" || bad "logs dir containing a git repo kept"
 
 echo
 echo "passed: $PASS  failed: $FAIL"

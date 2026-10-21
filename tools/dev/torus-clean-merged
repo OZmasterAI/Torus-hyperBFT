@@ -15,7 +15,8 @@
 #
 # Worktree REMOVE needs: not locked, HEAD ancestor of origin/main, no uncommitted or
 # untracked changes, no commits missing from every remote, no process with cwd or an
-# open file inside it (or inside <name>-logs).
+# open file inside it (or inside <name>-logs). A <name>-logs sibling is only deleted
+# if it is a plain dir (not a registered worktree, no .git anywhere inside).
 # Target dir REMOVE needs: no process with CARGO_TARGET_DIR pointing at it, no process
 # with cwd/open file inside it, nothing written in the last --idle-min minutes, and
 # every local branch / worktree branch that torus-target-dir maps to it is merged
@@ -36,6 +37,7 @@ WT_ROOT="$HOME_R/projects/wt"
 TGT_PREFIX="$HOME_R/.cargo-target-"
 PROC_FILE=""
 ENV_FILE=""
+WT_LIST=""
 ROWS=()
 TOTAL=0
 
@@ -48,6 +50,7 @@ safe_rm() {
   if [[ -L "$p" ]]; then log "REFUSE rm (symlink): $p"; return 1; fi
   r="$(realpath -e -- "$p" 2>/dev/null)" || { log "REFUSE rm (missing): $p"; return 1; }
   if [[ "$r" != "$p" ]]; then log "REFUSE rm (path not canonical): $p -> $r"; return 1; fi
+  if [[ -e "$r/.git" ]]; then log "REFUSE rm (contains .git; use git worktree remove): $r"; return 1; fi
   case "$r" in
     "$TGT_PREFIX"?*)
       name="${r#"$TGT_PREFIX"}"
@@ -78,6 +81,7 @@ scan_procs() {
 cleanup() {
   if [[ -n "$PROC_FILE" ]]; then rm -f -- "${PROC_FILE:?}"; fi
   if [[ -n "$ENV_FILE" ]]; then rm -f -- "${ENV_FILE:?}"; fi
+  if [[ -n "$WT_LIST" ]]; then rm -f -- "${WT_LIST:?}"; fi
 }
 
 # prefix_hit <file> <dir>: true if any line of file is dir or below dir.
@@ -115,12 +119,21 @@ recent_write() {
   fi
 }
 
+# A <name>-logs sibling is only deleted if it is a plain dir: not a symlink, not a
+# registered worktree, and with no .git entry anywhere in it (no repo/worktree inside).
+is_plain_logs_dir() {
+  local d="$1"
+  [[ -d "$d" && ! -L "$d" ]] || return 1
+  grep -qxF "worktree $d" "$WT_LIST" && return 1
+  [[ -z "$(find "$d" -name .git -print -quit 2>/dev/null)" ]]
+}
+
 is_merged() { git -C "$REPO" merge-base --is-ancestor "$1" origin/main 2>/dev/null; }
 
 check_worktree() { # path head branch locked
   local p="$1" head="$2" branch="$3" locked="$4" logs="$1-logs" reason="" d u size
   local paths=("$p")
-  if [[ -d "$logs" && ! -L "$logs" ]]; then paths+=("$logs"); fi
+  if is_plain_logs_dir "$logs"; then paths+=("$logs"); fi
   if [[ -n "$locked" ]]; then reason="worktree is locked"
   elif [[ ! -d "$p" ]]; then reason="worktree dir missing (git worktree prune)"
   elif ! git -C "$p" rev-parse -q --verify HEAD >/dev/null 2>&1 \
@@ -142,7 +155,7 @@ check_worktree() { # path head branch locked
   if (( APPLY )); then
     if git -C "$REPO" worktree remove -- "$p"; then
       log "removed worktree $p"
-      if [[ -d "$logs" && ! -L "$logs" ]]; then safe_rm "$logs" && log "removed $logs"; fi
+      if is_plain_logs_dir "$logs"; then safe_rm "$logs" && log "removed $logs"; fi
     else
       log "git worktree remove failed for $p (kept)"
     fi
@@ -212,6 +225,8 @@ main() {
   git -C "$REPO" rev-parse -q --verify origin/main >/dev/null || { log "origin/main not found"; return 2; }
   trap cleanup EXIT
   scan_procs
+  WT_LIST="$(mktemp)"
+  git -C "$REPO" worktree list --porcelain >"$WT_LIST" || { log "git worktree list failed"; return 2; }
 
   local line p="" head="" branch="" locked=""
   while IFS= read -r line; do
@@ -226,7 +241,7 @@ main() {
         fi
         p=""; head=""; branch=""; locked="" ;;
     esac
-  done < <(git -C "$REPO" worktree list --porcelain; echo)
+  done < <(cat "$WT_LIST"; echo)
   check_targets
   if (( APPLY )); then git -C "$REPO" worktree prune; fi
   print_table
