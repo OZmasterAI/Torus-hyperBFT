@@ -999,6 +999,20 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    so wake-ups are not the cost (<= ~0.02 ms per park). Overlaps section 114's deep 1.044 [1.009, 1.081] at half the
    point estimate. Exec wall on / off 0.90 (65k) / 0.95 (16.8k), w17 0.857; pass B 1.07-1.33x on Q vs 1.47-1.66x on P
    (not from batching: Q batch 1 matches auto).**
+9i. **100k retention disk soak: archive vs prune-by-default** (18c s75, after RH4 merged to main `b452b4af`; after 9g,
+   ahead of the L2.1 deep rerun; ~4 h 30-5 h). Q9 (section 88) proved the GC at N = 1000; this checks the shipped
+   default N = 100,000 holds the DBs flat past the window. **One binary** main `b452b4af` (code defaults; custody 0
+   from `env.sh`). Q9 shape: 300 markets, hsdb-300m Classic, 15 s checkpoints, paced to 250 actions/s (Q9 ran ~26.5
+   blk/s, 0 margin rejects in 60 min; watch margin over 120 min). Arms, n = 1, A then B, one detached driver, FRESH
+   data dirs per cell, free-disk check first: **A** = archive, `TORUS_RETENTION_BLOCKS=0` via `EXTRA_ENV`; **B** =
+   nothing set (N = 100,000). Load >= 120 min, and B runs until >= 45 min past height 100,000 (cap 180 min = cell
+   fail); A's load matches B's length; then >= 10 min truly idle. Sampler every 60 s per node (Q9's columns):
+   `du -sb` consensus-db and state DB, per-CF sizes, SST / L0 counts, pending compaction bytes, open and
+   deleted-open fds, height, GC worker metrics (held passes, records, deletes, GC seconds). Validity: `retention=`
+   audit field (0 in A, 100000 in B), node md5 on all nodes, no fail-stop / hash mismatch / panicked lines. Report
+   per arm: DB sizes over time per CF / DB, B's first-delete height and time, B's slope after the window vs before,
+   GC worker metrics, matched/s, blocks/s, commit p50 / p99. Pass: B's consensus-db and state DB flat past the
+   window; A grows at the Q9 rate.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
