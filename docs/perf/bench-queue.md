@@ -1,5 +1,10 @@
 # Bench queue (archy)
 
+> **Harness note (s131, RH4 prune-by-default merge):** a cell without `TORUS_RETENTION_BLOCKS` now runs history
+> retention (N = 100,000: state pruner, block-tree pruner and DA GC worker on). Archive arms need
+> `TORUS_RETENTION_BLOCKS=0` in `EXTRA_ENV`, and any comparison with a pre-merge baseline (e.g. 9a / 9d, archive) must
+> set it explicitly; check the `retention=` field of each cell's `book_mode=` audit line.
+
 Benches run on archy only. 18c keeps this list current; archy reads it on pull. IDs (Q1, Q2, ...) stay fixed when an
 item moves between sections.
 Last archy benches: `ozarchy-p5s2` (step 8d, section 91), 2026-10-18; `ozarchy-campA` (campaign A + Q10 arm C, section 82), 2026-10-18; `ozarchy-q7m3s` + `ozarchy-q7cls` (Q7 run 2; run 1 `ozarchy-q7m3` + `ozarchy-q7cl`;

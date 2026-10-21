@@ -30,13 +30,22 @@
 //! | `cf_consensus_meta` | opaque (hotstuff_rs) | Block tree, PCs, TCs — consensus safety critical |
 //! | `cf_core_writer_queue` | varies | Core writer queue state |
 //!
-//! ## PRUNABLE — IMPLEMENTED (3 CFs — height is leading key prefix)
+//! ## PRUNABLE — IMPLEMENTED (4 CFs — height is leading key prefix)
 //!
-//! | CF | Key Format | Delete Strategy |
+//! | CF | Key Format | Range bound (`TORUS_PRUNE_MODE=range`) |
 //! |---|---|---|
-//! | `cf_block_bodies` | height(8 BE) | `delete_range_cf` on [0, cutoff) |
-//! | `cf_block_action_status` | height(8 BE) | `delete_range_cf` on [0, cutoff) |
-//! | `cf_receipts` | height(8 BE) + tx_index(4 BE) | `delete_range_cf` on [0, cutoff‖0×4) |
+//! | `cf_block_bodies` | height(8 BE) | [0, cutoff) |
+//! | `cf_block_action_status` | height(8 BE) | [0, cutoff) |
+//! | `cf_receipts` | height(8 BE) + tx_index(4 BE) | [0, cutoff‖0×4) |
+//! | `cf_core_writer_tx` | target block(8 BE) + seq(8 BE) | [0, cutoff‖0×8) |
+//!
+//! s132: the default mode (`TORUS_PRUNE_MODE=filter`) issues no delete at
+//! all: it persists the cutoff, raises the shared
+//! [`crate::prune_filter::PruneCutoff`] (reads hide the rows below it, a
+//! compaction filter drops them) and drops the SST files that lie entirely
+//! below it (`DeleteFilesInRange`). `range` keeps the `delete_range_cf` path
+//! above for the A/B. Reader audit, boot and crash handling:
+//! [`crate::prune_filter`].
 //!
 //! These are the largest disk consumers (block bodies contain full transaction
 //! data; receipts contain logs and execution results). Together they cover the
@@ -79,6 +88,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tracing::{debug, info, warn};
+
+use crate::prune_filter::{files_range_end, height_bound, PruneMode, HEIGHT_KEYED_CFS};
 
 use crate::cf::{
     CF_BLOCK_ACTION_STATUS, CF_BLOCK_BODIES, CF_BLOCK_HEADERS, CF_CONSENSUS_META,
@@ -140,6 +151,9 @@ pub struct StatePruner {
     trades_persisted: Option<u64>,
     /// Last block height at which we ran pruning.
     last_prune_height: u64,
+    /// s132: SST files `DeleteFilesInRange` dropped (filter mode), and their bytes.
+    files_dropped: u64,
+    file_bytes_dropped: u64,
 }
 
 impl StatePruner {
@@ -147,6 +161,15 @@ impl StatePruner {
     pub fn new(db: StateDb, config: PrunerConfig, pruned_up_to: Arc<AtomicU64>) -> Self {
         let stored = read_prune_meta(&db).unwrap_or(0);
         pruned_up_to.store(stored, Ordering::Release);
+        // s132: the read side was loaded at open; the filter is armed only
+        // here, by a pruner with retention on, from the persisted cutoff
+        // (never above it). Retention off (`u64::MAX`, trade-only) leaves it
+        // at 0: the filter drops nothing.
+        let cut = db.prune_cutoff();
+        cut.hide_below(stored);
+        if cut.mode() == PruneMode::Filter && config.retention_blocks != u64::MAX {
+            cut.arm_filter(stored);
+        }
         let trades_read = read_trades_pruned_height(&db)
             .map_err(|e| warn!(%e, "trade-history cutoff unreadable; re-read on the first pass"))
             .ok();
@@ -156,6 +179,7 @@ impl StatePruner {
             retention_blocks = config.retention_blocks,
             prune_interval = config.prune_interval_blocks,
             pruned_up_to = stored,
+            prune_mode = ?db.prune_cutoff().mode(),
             trade_retention_blocks = ?config.trade_retention_blocks,
             trades_pruned_up_to = trades_stored,
             "state pruner initialized"
@@ -169,7 +193,26 @@ impl StatePruner {
             trades_done: 0,
             trades_persisted: trades_read,
             last_prune_height: 0,
+            files_dropped: 0,
+            file_bytes_dropped: 0,
         }
+    }
+
+    /// s132: SST files of the height-keyed CFs `DeleteFilesInRange` dropped
+    /// since start (filter mode; `torus_pruner_files_dropped`).
+    pub fn files_dropped_total(&self) -> u64 {
+        self.files_dropped
+    }
+
+    /// s132: bytes of the files [`Self::files_dropped_total`] counts.
+    pub fn file_bytes_dropped_total(&self) -> u64 {
+        self.file_bytes_dropped
+    }
+
+    /// s132: the compaction filter's cutoff (0 = drops nothing;
+    /// `torus_pruner_filter_cutoff`).
+    pub fn filter_cutoff(&self) -> u64 {
+        self.db.prune_cutoff().filter_below()
     }
 
     /// Share the trade-history cutoff with the RPC readers
@@ -257,9 +300,12 @@ impl StatePruner {
     ///
     /// Batches deletions to avoid RocksDB compaction latency spikes. Between
     /// batches, yields to the tokio runtime so consensus and RPC are not starved.
-    fn prune_up_to(&self, from_height: u64, to_height: u64) -> Result<u64, StateError> {
+    fn prune_up_to(&mut self, from_height: u64, to_height: u64) -> Result<u64, StateError> {
         if to_height <= from_height {
             return Ok(0);
+        }
+        if self.db.prune_cutoff().mode() == PruneMode::Filter {
+            return self.prune_by_filter(from_height, to_height);
         }
 
         let total_blocks = to_height - from_height;
@@ -279,6 +325,9 @@ impl StatePruner {
             // Update progress
             self.pruned_up_to.store(batch_end, Ordering::Release);
             write_prune_meta(&self.db, batch_end)?;
+            // s132: reads hide below it too (no-op for rows the range delete
+            // removed; hides rows a filter-mode run left on disk).
+            self.db.prune_cutoff().hide_below(batch_end);
 
             let pruned_in_batch = batch_end - current;
             debug!(
@@ -298,6 +347,40 @@ impl StatePruner {
         );
 
         Ok(total_blocks)
+    }
+
+    /// s132 filter mode: prune `[from, to)` without a delete. Order matters:
+    /// 1. persist `to` with a synced WAL write, so a crash after a compaction
+    ///    dropped rows below `to` always restarts with `to` (no reader sees
+    ///    a half-pruned range);
+    /// 2. raise the read side and the filter (reads hide, compactions drop);
+    /// 3. `DeleteFilesInRange` drops the files entirely below `to`.
+    fn prune_by_filter(&mut self, from_height: u64, to_height: u64) -> Result<u64, StateError> {
+        let started = std::time::Instant::now();
+        write_prune_meta_synced(&self.db, to_height)?;
+        self.db.prune_cutoff().arm_filter(to_height);
+        self.pruned_up_to.store(to_height, Ordering::Release);
+        let (files, bytes) = match delete_files_below(&self.db, to_height) {
+            Ok(dropped) => dropped,
+            Err(e) => {
+                // The cutoff stands (persisted, hidden, filtered): only the
+                // whole-file shortcut is lost for this pass.
+                warn!(%e, cutoff = to_height, "DeleteFilesInRange failed; compactions filter instead");
+                (0, 0)
+            }
+        };
+        self.files_dropped += files;
+        self.file_bytes_dropped += bytes;
+        info!(
+            from = from_height,
+            to = to_height,
+            blocks = to_height - from_height,
+            files_dropped = files,
+            file_bytes_dropped = bytes,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "pruning complete (filter mode)"
+        );
+        Ok(to_height - from_height)
     }
 
     /// Delete a contiguous range of block bodies and receipts using RocksDB
@@ -474,12 +557,75 @@ pub fn prune_trades_below(
     Ok(stats)
 }
 
+/// s132: `DeleteFilesInRange` on `[bound(0), (cutoff-1)‖0xFF..]` of every
+/// height-keyed CF (its end is inclusive): drops the SST files (L1+) whose
+/// keys all lie below `cutoff`. Returns the files and bytes that went
+/// (live files before minus after; a file a concurrent compaction consumed
+/// counts too, rare).
+fn delete_files_below(db: &StateDb, cutoff: u64) -> Result<(u64, u64), StateError> {
+    let inner = db.inner();
+    let mut ranges = Vec::with_capacity(HEIGHT_KEYED_CFS.len());
+    for (cf, len) in HEIGHT_KEYED_CFS {
+        let Some(end) = files_range_end(cutoff, len) else {
+            return Ok((0, 0));
+        };
+        let (lo, n) = height_bound(0, len);
+        ranges.push((cf, lo[..n].to_vec(), end));
+    }
+    let candidates: std::collections::HashMap<String, u64> = inner
+        .live_files()?
+        .into_iter()
+        .filter(|f| {
+            f.level > 0
+                && ranges.iter().any(|(cf, lo, end)| {
+                    f.column_family_name == *cf
+                        && f.start_key.as_deref().is_some_and(|k| k >= &lo[..])
+                        && f.end_key.as_deref().is_some_and(|k| k <= &end[..])
+                })
+        })
+        .map(|f| (f.name, f.size as u64))
+        .collect();
+    if candidates.is_empty() {
+        return Ok((0, 0));
+    }
+    for (cf, lo, end) in &ranges {
+        inner.delete_file_in_range_cf(db.cf_handle(cf)?, lo, end)?;
+    }
+    let live: std::collections::HashSet<String> =
+        inner.live_files()?.into_iter().map(|f| f.name).collect();
+    Ok(candidates
+        .iter()
+        .filter(|(name, _)| !live.contains(*name))
+        .fold((0, 0), |(n, b), (_, size)| (n + 1, b + size)))
+}
+
+/// s132: [`write_prune_meta`] with a synced WAL (filter mode writes it
+/// before any row below it can be dropped).
+fn write_prune_meta_synced(db: &StateDb, height: u64) -> Result<(), StateError> {
+    let mut batch = rocksdb::WriteBatch::default();
+    batch.put_cf(
+        db.cf_handle(CF_BLOCK_HEADERS)?,
+        PRUNE_META_KEY,
+        height.to_be_bytes(),
+    );
+    let mut opts = rocksdb::WriteOptions::default();
+    opts.set_sync(true);
+    db.write_with(batch, &opts)
+}
+
 /// Read the pruned-up-to height from the database.
-fn read_prune_meta(db: &StateDb) -> Result<u64, StateError> {
+pub(crate) fn read_prune_meta(db: &StateDb) -> Result<u64, StateError> {
     match db.get_cf_raw(CF_BLOCK_HEADERS, PRUNE_META_KEY)? {
         Some(data) if data.len() == 8 => Ok(u64::from_be_bytes(data[..8].try_into().unwrap())),
         _ => Ok(0),
     }
+}
+
+/// The persisted state-pruner cutoff (bodies / receipts below it are
+/// pruned): 0 if the data dir was never pruned. The node's archive-upgrade
+/// check reads it before the pruner exists (`torus-node`, s131).
+pub fn read_pruned_up_to(db: &StateDb) -> Result<u64, StateError> {
+    read_prune_meta(db)
 }
 
 /// Write the pruned-up-to height to the database.
@@ -1232,6 +1378,634 @@ mod tests {
         assert_eq!(pruner.trades_pruned_height(), 5);
         pruner.maybe_prune(15).unwrap();
         assert_eq!(pruner.trades_pruned_height(), 5, "next pass at 20");
+    }
+
+    // ---- s132: filter mode (compaction filter + DeleteFilesInRange) ----
+
+    use crate::prune_filter::{PruneMode, HEIGHT_KEYED_CFS};
+
+    /// The keys of `cf` (key length `len`) at height `h`: one for the 8-byte
+    /// CFs, the lowest and highest suffix for the others (range edges).
+    fn keys_at(len: usize, h: u64) -> Vec<Vec<u8>> {
+        let k = |fill: u8| {
+            let mut k = h.to_be_bytes().to_vec();
+            k.resize(len, fill);
+            k
+        };
+        if len == 8 {
+            vec![k(0)]
+        } else {
+            vec![k(0x00), k(0xFF)]
+        }
+    }
+
+    fn row_value(cf: &str, key: &[u8], pad: usize) -> Vec<u8> {
+        let mut v = format!("{cf}-{key:?}").into_bytes();
+        // Incompressible padding (xorshift64 seeded by the key), like real
+        // bodies after LZ4 / ZSTD.
+        let mut x = key.iter().fold(0x9E37_79B9_7F4A_7C15u64, |a, &b| {
+            (a ^ b as u64).wrapping_mul(0x100_0000_01B3)
+        }) | 1;
+        v.extend((0..pad).map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        }));
+        v
+    }
+
+    /// Rows of every height-keyed CF for `heights` (+ `pad` value bytes).
+    fn write_rows(db: &StateDb, heights: std::ops::Range<u64>, pad: usize) {
+        let mut batch = rocksdb::WriteBatch::default();
+        for (cf, len) in HEIGHT_KEYED_CFS {
+            let handle = db.cf_handle(cf).unwrap();
+            for h in heights.clone() {
+                for k in keys_at(len, h) {
+                    batch.put_cf(handle, &k, row_value(cf, &k, pad));
+                }
+            }
+        }
+        db.write(batch).unwrap();
+    }
+
+    /// Physically present (bypasses the read-side cutoff).
+    fn raw_present(db: &StateDb, cf: &str, key: &[u8]) -> bool {
+        let h = db.cf_handle(cf).unwrap();
+        db.inner().get_cf(h, key).unwrap().is_some()
+    }
+
+    fn flush_all(db: &StateDb) {
+        for (cf, _) in HEIGHT_KEYED_CFS {
+            db.inner().flush_cf(db.cf_handle(cf).unwrap()).unwrap();
+        }
+    }
+
+    /// Full manual compaction of every height-keyed CF, bottommost included.
+    fn compact_all(db: &StateDb) {
+        let mut o = rocksdb::CompactOptions::default();
+        o.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::Force);
+        for (cf, _) in HEIGHT_KEYED_CFS {
+            db.inner().compact_range_cf_opt(
+                db.cf_handle(cf).unwrap(),
+                None::<&[u8]>,
+                None::<&[u8]>,
+                &o,
+            );
+        }
+    }
+
+    fn retention_cfg(retention: u64, batch: u64) -> PrunerConfig {
+        PrunerConfig {
+            retention_blocks: retention,
+            prune_interval_blocks: 1,
+            batch_size: batch,
+            trade_retention_blocks: None,
+        }
+    }
+
+    fn rows_per_height() -> u64 {
+        HEIGHT_KEYED_CFS
+            .iter()
+            .map(|&(_, len)| keys_at(len, 0).len() as u64)
+            .sum()
+    }
+
+    /// Filter mode: right after the pass the rows below the cutoff are still
+    /// on disk (lazy) but no read returns them; a forced compaction then drops
+    /// exactly those rows and keeps everything at and above the cutoff.
+    #[test]
+    fn filter_mode_drops_exactly_rows_below_cutoff_after_forced_compaction() {
+        let dir = TempDir::new().unwrap();
+        let db = StateDb::open_with_prune_mode(dir.path(), PruneMode::Filter).unwrap();
+        write_rows(&db, 0..40, 0);
+        set_applied(&db, 39);
+        flush_all(&db);
+        let mut pruner = StatePruner::new(
+            db.clone(),
+            retention_cfg(23, 5),
+            Arc::new(AtomicU64::new(0)),
+        );
+        assert_eq!(pruner.maybe_prune(40).unwrap(), 17);
+        assert_eq!(pruner.pruned_height(), 17);
+        assert_eq!(pruner.filter_cutoff(), 17, "filter armed at the cutoff");
+        assert_eq!(read_prune_meta(&db).unwrap(), 17, "cutoff persisted");
+
+        for (cf, len) in HEIGHT_KEYED_CFS {
+            for h in 0..40u64 {
+                for k in keys_at(len, h) {
+                    // One L0 file per CF straddles the cutoff: nothing dropped yet.
+                    assert!(raw_present(&db, cf, &k), "{cf} {h}: lazy, still on disk");
+                    assert_eq!(
+                        db.get_cf_raw(cf, &k).unwrap().is_some(),
+                        h >= 17,
+                        "{cf} {h} read"
+                    );
+                }
+            }
+        }
+        assert_eq!(db.prune_cutoff().filter_rows_dropped(), 0);
+
+        compact_all(&db);
+        for (cf, len) in HEIGHT_KEYED_CFS {
+            for h in 0..40u64 {
+                for k in keys_at(len, h) {
+                    assert_eq!(
+                        raw_present(&db, cf, &k),
+                        h >= 17,
+                        "{cf} {h} after compaction"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            db.prune_cutoff().filter_rows_dropped(),
+            17 * rows_per_height(),
+            "each row below the cutoff dropped once, nothing else"
+        );
+    }
+
+    /// Range mode is today's path: eager range deletes, no filter armed.
+    #[test]
+    fn range_mode_deletes_eagerly_and_never_arms_the_filter() {
+        let dir = TempDir::new().unwrap();
+        let db = StateDb::open_with_prune_mode(dir.path(), PruneMode::Range).unwrap();
+        write_rows(&db, 0..40, 0);
+        set_applied(&db, 39);
+        let mut pruner = StatePruner::new(
+            db.clone(),
+            retention_cfg(23, 5),
+            Arc::new(AtomicU64::new(0)),
+        );
+        assert_eq!(pruner.maybe_prune(40).unwrap(), 17);
+        assert_eq!(pruner.filter_cutoff(), 0);
+        assert_eq!(db.prune_cutoff().hidden_below(), 17);
+        for (cf, len) in HEIGHT_KEYED_CFS {
+            for h in 0..40u64 {
+                for k in keys_at(len, h) {
+                    assert_eq!(
+                        raw_present(&db, cf, &k),
+                        h >= 17,
+                        "{cf} {h} deleted eagerly"
+                    );
+                }
+            }
+        }
+        compact_all(&db);
+        assert_eq!(
+            db.prune_cutoff().filter_rows_dropped(),
+            0,
+            "no filter in range mode"
+        );
+        assert_eq!(pruner.files_dropped_total(), 0);
+    }
+
+    /// Every `StateDb` read of the height-keyed CFs answers the same in both
+    /// modes after every pass (all keys, iterators and prefix probes around
+    /// the cutoff).
+    fn assert_readers_equal(a: &StateDb, b: &StateDb, top: u64, cutoff: u64) {
+        use crate::StateBackend;
+        for (cf, len) in HEIGHT_KEYED_CFS {
+            let keys: Vec<Vec<u8>> = (0..=top + 1).flat_map(|h| keys_at(len, h)).collect();
+            for k in &keys {
+                let ctx = format!("{cf} {k:?} cutoff {cutoff}");
+                assert_eq!(
+                    a.get_cf_raw(cf, k).unwrap(),
+                    b.get_cf_raw(cf, k).unwrap(),
+                    "get {ctx}"
+                );
+                assert_eq!(
+                    a.exists_cf_raw(cf, k).unwrap(),
+                    b.exists_cf_raw(cf, k).unwrap(),
+                    "exists {ctx}"
+                );
+                assert_eq!(
+                    StateBackend::get_cf_len(a, cf, k).unwrap(),
+                    StateBackend::get_cf_len(b, cf, k).unwrap(),
+                    "len {ctx}"
+                );
+                assert_eq!(
+                    StateBackend::get_cf_raw(a, cf, k).unwrap(),
+                    StateBackend::get_cf_raw(b, cf, k).unwrap(),
+                    "backend get {ctx}"
+                );
+            }
+            let refs: Vec<&[u8]> = keys.iter().map(|k| &k[..]).collect();
+            assert_eq!(
+                a.multi_get_cf_raw(cf, &refs).unwrap(),
+                b.multi_get_cf_raw(cf, &refs).unwrap(),
+                "multi_get {cf}"
+            );
+            assert_eq!(
+                StateBackend::iterate_cf(a, cf, None).unwrap(),
+                StateBackend::iterate_cf(b, cf, None).unwrap(),
+                "iterate {cf} cutoff {cutoff}"
+            );
+            assert_eq!(
+                StateBackend::prefix_exists(a, cf, &[]).unwrap(),
+                StateBackend::prefix_exists(b, cf, &[]).unwrap()
+            );
+            assert_eq!(
+                StateBackend::iterate_cf_from(a, cf, &[], 3).unwrap(),
+                StateBackend::iterate_cf_from(b, cf, &[], 3).unwrap(),
+                "iterate_from start {cf}"
+            );
+            for h in cutoff.saturating_sub(3)..cutoff + 2 {
+                let p = h.to_be_bytes();
+                let ctx = format!("{cf} h {h} cutoff {cutoff}");
+                assert_eq!(
+                    StateBackend::iterate_cf(a, cf, Some(&p)).unwrap(),
+                    StateBackend::iterate_cf(b, cf, Some(&p)).unwrap(),
+                    "iterate prefix {ctx}"
+                );
+                assert_eq!(
+                    StateBackend::iterate_cf_from(a, cf, &p, 5).unwrap(),
+                    StateBackend::iterate_cf_from(b, cf, &p, 5).unwrap(),
+                    "iterate_from {ctx}"
+                );
+                assert_eq!(
+                    StateBackend::iterate_cf_prefix_from(a, cf, &p, &p, 10).unwrap(),
+                    StateBackend::iterate_cf_prefix_from(b, cf, &p, &p, 10).unwrap(),
+                    "iterate_prefix_from {ctx}"
+                );
+                assert_eq!(
+                    StateBackend::prefix_exists(a, cf, &p).unwrap(),
+                    StateBackend::prefix_exists(b, cf, &p).unwrap(),
+                    "prefix_exists {ctx}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn readers_answer_identically_in_range_and_filter_mode_over_repeated_prunes() {
+        let (da, dbb) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let range = StateDb::open_with_prune_mode(da.path(), PruneMode::Range).unwrap();
+        let filter = StateDb::open_with_prune_mode(dbb.path(), PruneMode::Filter).unwrap();
+        let cfg = retention_cfg(25, 7);
+        let mut pr = StatePruner::new(range.clone(), cfg.clone(), Arc::new(AtomicU64::new(0)));
+        let mut pf = StatePruner::new(filter.clone(), cfg, Arc::new(AtomicU64::new(0)));
+        let mut lazy_reads = 0u64;
+        for h in 0..240u64 {
+            for db in [&range, &filter] {
+                write_rows(db, h..h + 1, 0);
+                set_applied(db, h);
+            }
+            if h % 10 != 9 {
+                continue;
+            }
+            pr.maybe_prune(h).unwrap();
+            pf.maybe_prune(h).unwrap();
+            let cutoff = pr.pruned_height();
+            assert_eq!(pf.pruned_height(), cutoff);
+            // Rows just below the cutoff before any compaction ran on them.
+            for (cf, len) in HEIGHT_KEYED_CFS {
+                for k in keys_at(len, cutoff.saturating_sub(1)) {
+                    if cutoff > 0 && raw_present(&filter, cf, &k) {
+                        lazy_reads += 1;
+                    }
+                }
+            }
+            assert_readers_equal(&range, &filter, h, cutoff);
+            if h % 30 == 29 {
+                flush_all(&filter);
+            }
+            if h % 60 == 59 {
+                compact_all(&filter);
+                assert_readers_equal(&range, &filter, h, cutoff);
+            }
+        }
+        assert!(
+            lazy_reads > 0,
+            "the stream must exercise rows still on disk below the cutoff"
+        );
+        assert!(filter.prune_cutoff().filter_rows_dropped() > 0);
+    }
+
+    /// Crash/restart: the read side is restored inside `open` (before any
+    /// read); the filter drops nothing until a pruner with retention arms it
+    /// from the persisted cutoff, and never more than that; with retention
+    /// off (trade-only pruner, or none) it stays a no-op.
+    #[test]
+    fn restart_restores_cutoff_and_filter_arms_only_with_retention() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = StateDb::open_with_prune_mode(dir.path(), PruneMode::Filter).unwrap();
+            write_rows(&db, 0..40, 0);
+            set_applied(&db, 39);
+            let mut p = StatePruner::new(
+                db.clone(),
+                retention_cfg(23, 100),
+                Arc::new(AtomicU64::new(0)),
+            );
+            p.maybe_prune(40).unwrap();
+            assert_eq!(p.pruned_height(), 17);
+        }
+        let check = |db: &StateDb, on_disk_below: bool| {
+            for (cf, len) in HEIGHT_KEYED_CFS {
+                for h in 0..40u64 {
+                    for k in keys_at(len, h) {
+                        assert_eq!(
+                            db.get_cf_raw(cf, &k).unwrap().is_some(),
+                            h >= 17,
+                            "{cf} {h} read"
+                        );
+                        if h >= 17 || on_disk_below {
+                            assert!(raw_present(db, cf, &k), "{cf} {h} on disk");
+                        } else {
+                            assert!(!raw_present(db, cf, &k), "{cf} {h} dropped");
+                        }
+                    }
+                }
+            }
+        };
+
+        let db = StateDb::open_with_prune_mode(dir.path(), PruneMode::Filter).unwrap();
+        assert_eq!(
+            db.prune_cutoff().hidden_below(),
+            17,
+            "read side restored at open"
+        );
+        assert_eq!(
+            db.prune_cutoff().filter_below(),
+            0,
+            "filter not armed by open"
+        );
+        check(&db, true);
+        compact_all(&db);
+        check(&db, true);
+        assert_eq!(
+            db.prune_cutoff().filter_rows_dropped(),
+            0,
+            "unarmed filter drops nothing"
+        );
+
+        // Retention off (only trade retention): never armed.
+        let mut trades_only = StatePruner::new(
+            db.clone(),
+            trade_cfg(u64::MAX, Some(5), 100),
+            Arc::new(AtomicU64::new(0)),
+        );
+        trades_only.maybe_prune(40).unwrap();
+        assert_eq!(trades_only.filter_cutoff(), 0);
+        compact_all(&db);
+        check(&db, true);
+        assert_eq!(db.prune_cutoff().filter_rows_dropped(), 0);
+        drop(trades_only);
+
+        // Retention on, larger than before (target cutoff 40-30 = 10 < 17):
+        // armed at the persisted 17, never above it, never lowered.
+        let mut p = StatePruner::new(
+            db.clone(),
+            retention_cfg(30, 100),
+            Arc::new(AtomicU64::new(0)),
+        );
+        assert_eq!(p.filter_cutoff(), 17, "armed from the persisted cutoff");
+        p.maybe_prune(40).unwrap();
+        assert_eq!(p.filter_cutoff(), 17);
+        compact_all(&db);
+        check(&db, false);
+        drop((p, db));
+
+        // A later restart in range mode keeps the cutoff (reads unchanged).
+        let db = StateDb::open_with_prune_mode(dir.path(), PruneMode::Range).unwrap();
+        assert_eq!(db.prune_cutoff().hidden_below(), 17);
+        check(&db, false);
+    }
+
+    /// Lingering rows from a filter-mode run stay hidden after a restart in
+    /// range mode (which only range-deletes above the stored cutoff).
+    #[test]
+    fn filter_then_range_restart_keeps_lingering_rows_hidden() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = StateDb::open_with_prune_mode(dir.path(), PruneMode::Filter).unwrap();
+            write_rows(&db, 0..40, 0);
+            set_applied(&db, 39);
+            StatePruner::new(
+                db.clone(),
+                retention_cfg(23, 100),
+                Arc::new(AtomicU64::new(0)),
+            )
+            .maybe_prune(40)
+            .unwrap();
+            assert!(raw_present(&db, CF_BLOCK_BODIES, &3u64.to_be_bytes()));
+        }
+        let db = StateDb::open_with_prune_mode(dir.path(), PruneMode::Range).unwrap();
+        assert!(
+            raw_present(&db, CF_BLOCK_BODIES, &3u64.to_be_bytes()),
+            "still on disk"
+        );
+        assert!(!body_exists(&db, 3), "hidden");
+        let mut p = StatePruner::new(
+            db.clone(),
+            retention_cfg(23, 100),
+            Arc::new(AtomicU64::new(0)),
+        );
+        set_applied(&db, 50);
+        p.maybe_prune(50).unwrap();
+        assert_eq!(p.pruned_height(), 27);
+        assert!(
+            !raw_present(&db, CF_BLOCK_BODIES, &20u64.to_be_bytes()),
+            "range-deleted"
+        );
+        assert!(!body_exists(&db, 3) && !body_exists(&db, 20) && body_exists(&db, 27));
+    }
+
+    /// Push the rows of `heights` out of L0 into their own bottom-level file
+    /// per CF (one manual compaction of just that key range).
+    fn write_file_chunk(db: &StateDb, heights: std::ops::Range<u64>, pad: usize) {
+        write_rows(db, heights.clone(), pad);
+        flush_all(db);
+        for (cf, _) in HEIGHT_KEYED_CFS {
+            db.inner().compact_range_cf(
+                db.cf_handle(cf).unwrap(),
+                Some(&heights.start.to_be_bytes()[..]),
+                Some(&heights.end.to_be_bytes()[..]),
+            );
+        }
+    }
+
+    fn live_files_of(db: &StateDb, cf: &str) -> Vec<rocksdb::LiveFile> {
+        db.inner()
+            .live_files()
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.column_family_name == cf)
+            .collect()
+    }
+
+    /// `DeleteFilesInRange`: whole files below the cutoff go at once (no
+    /// compaction, no tombstone); a file straddling it stays, its old rows
+    /// hidden until a compaction filters them.
+    #[test]
+    fn filter_mode_drops_whole_files_below_the_cutoff() {
+        let dir = TempDir::new().unwrap();
+        let db = StateDb::open_with_prune_mode(dir.path(), PruneMode::Filter).unwrap();
+        for chunk in 0..6u64 {
+            write_file_chunk(&db, chunk * 10..chunk * 10 + 10, 0);
+        }
+        set_applied(&db, 59);
+        for (cf, _) in HEIGHT_KEYED_CFS {
+            let files = live_files_of(&db, cf);
+            assert_eq!(files.len(), 6, "{cf}: one file per chunk {files:?}");
+            assert!(files.iter().all(|f| f.level > 0), "{cf}: out of L0");
+        }
+        let mut p = StatePruner::new(
+            db.clone(),
+            retention_cfg(25, 100),
+            Arc::new(AtomicU64::new(0)),
+        );
+        p.maybe_prune(60).unwrap();
+        assert_eq!(p.pruned_height(), 35);
+        assert_eq!(
+            p.files_dropped_total(),
+            3 * HEIGHT_KEYED_CFS.len() as u64,
+            "chunks 0-2 per CF"
+        );
+        assert!(p.file_bytes_dropped_total() > 0);
+        assert_eq!(
+            db.prune_cutoff().filter_rows_dropped(),
+            0,
+            "no compaction needed"
+        );
+        for (cf, len) in HEIGHT_KEYED_CFS {
+            assert_eq!(live_files_of(&db, cf).len(), 3, "{cf}");
+            for h in 0..60u64 {
+                for k in keys_at(len, h) {
+                    // 0..30 gone with their files, 30..35 lingering in the
+                    // straddling file, 35.. kept.
+                    assert_eq!(raw_present(&db, cf, &k), h >= 30, "{cf} {h} on disk");
+                    assert_eq!(
+                        db.get_cf_raw(cf, &k).unwrap().is_some(),
+                        h >= 35,
+                        "{cf} {h} read"
+                    );
+                }
+            }
+        }
+    }
+
+    /// No tombstone in filter mode: after a pass and a flush, the height-keyed
+    /// CFs' files carry no deletion entry; the range mode's carry its range
+    /// tombstones.
+    #[test]
+    fn filter_mode_writes_no_tombstones() {
+        let deletions = |mode| {
+            let dir = TempDir::new().unwrap();
+            let db = StateDb::open_with_prune_mode(dir.path(), mode).unwrap();
+            write_rows(&db, 0..100, 0);
+            set_applied(&db, 99);
+            flush_all(&db);
+            let mut p = StatePruner::new(
+                db.clone(),
+                retention_cfg(20, 10),
+                Arc::new(AtomicU64::new(0)),
+            );
+            p.maybe_prune(100).unwrap();
+            flush_all(&db);
+            HEIGHT_KEYED_CFS
+                .iter()
+                .flat_map(|&(cf, _)| live_files_of(&db, cf))
+                .map(|f| f.num_deletions)
+                .sum::<u64>()
+        };
+        assert_eq!(deletions(PruneMode::Filter), 0);
+        // 8 batches x 4 CFs range deletes.
+        assert!(deletions(PruneMode::Range) >= 32);
+    }
+
+    /// Wait until no compaction runs or is pending on any CF (RocksDB's own
+    /// background compactions, not forced ones).
+    fn wait_compactions_idle(db: &StateDb) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let running = db
+                .inner()
+                .property_int_value("rocksdb.num-running-compactions")
+                .unwrap()
+                .unwrap_or(0);
+            let pending = HEIGHT_KEYED_CFS.iter().any(|&(cf, _)| {
+                db.inner()
+                    .property_int_value_cf(db.cf_handle(cf).unwrap(), "rocksdb.compaction-pending")
+                    .unwrap()
+                    .unwrap_or(0)
+                    > 0
+            });
+            if (running == 0 && !pending) || std::time::Instant::now() > deadline {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// s132 microbench (ignored; `cargo nextest run ... --run-ignored only
+    /// -E 'test(/bench_prune_range_vs_filter/)' --no-capture`): one synthetic
+    /// stream per mode, rows of every height-keyed CF with 1 KiB values, a
+    /// flush every 100 heights (an L0 file per CF), a pruning pass every 500
+    /// heights keeping 2,000; RocksDB compacts on its own. Prints the state
+    /// DB's compaction bytes and CPU, what stays on disk, and the deletion
+    /// entries in the live files of those CFs.
+    #[test]
+    #[ignore]
+    fn bench_prune_range_vs_filter_compaction() {
+        let heights: u64 = std::env::var("S132_BENCH_HEIGHTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20_000);
+        for mode in [PruneMode::Range, PruneMode::Filter] {
+            let dir = TempDir::new().unwrap();
+            let db = StateDb::open_with_prune_mode(dir.path(), mode).unwrap();
+            let mut p = StatePruner::new(
+                db.clone(),
+                retention_cfg(2_000, 10_000),
+                Arc::new(AtomicU64::new(0)),
+            );
+            let t0 = db
+                .runtime_stats()
+                .tickers
+                .expect("TORUS_ROCKSDB_STATS >= 1");
+            let started = std::time::Instant::now();
+            for h in 0..heights {
+                write_rows(&db, h..h + 1, 1024);
+                if h % 100 == 99 {
+                    set_applied(&db, h);
+                    flush_all(&db);
+                }
+                if h % 500 == 499 {
+                    p.maybe_prune(h + 1).unwrap();
+                }
+            }
+            wait_compactions_idle(&db);
+            let wall = started.elapsed();
+            let t1 = db.runtime_stats().tickers.unwrap();
+            let files: Vec<_> = HEIGHT_KEYED_CFS
+                .iter()
+                .flat_map(|&(cf, _)| live_files_of(&db, cf))
+                .collect();
+            let l0 = files.iter().filter(|f| f.level == 0).count();
+            let live_bytes: usize = files.iter().map(|f| f.size).sum();
+            let deletions: u64 = files.iter().map(|f| f.num_deletions).sum();
+            let mib = |b: u64| b as f64 / (1u64 << 20) as f64;
+            println!(
+                "S132BENCH mode={mode:?} heights={heights} cutoff={} wall_s={:.2} \
+                 compact_read_mib={:.1} compact_write_mib={:.1} compaction_cpu_ms={} \
+                 flush_mib={:.1} live_files={} l0_files={l0} live_mib={:.1} \
+                 deletion_entries={deletions} files_dropped={} file_mib_dropped={:.1} \
+                 filter_rows_dropped={}",
+                p.pruned_height(),
+                wall.as_secs_f64(),
+                mib(t1.compact_read_bytes - t0.compact_read_bytes),
+                mib(t1.compact_write_bytes - t0.compact_write_bytes),
+                (t1.compaction_cpu_micros - t0.compaction_cpu_micros) / 1000,
+                mib(t1.flush_write_bytes - t0.flush_write_bytes),
+                files.len(),
+                mib(live_bytes as u64),
+                p.files_dropped_total(),
+                mib(p.file_bytes_dropped_total()),
+                db.prune_cutoff().filter_rows_dropped(),
+            );
+        }
     }
 
     #[test]

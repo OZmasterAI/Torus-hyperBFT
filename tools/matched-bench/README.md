@@ -96,14 +96,24 @@ python3 tools/matched-bench/test_harness.py
    `EXTRA_ENV='TORUS_BOOK_ROWS=3'` (or the arm's `env` in a driver spec), `=2`
    for mode 2, `=1` for OrderRows.
    After the env is final, run.log gets one audit line per cell:
-   `cell=<label> book_mode=classic|mode1|mode2|mode3 TORUS_BOOK_ROWS='...'
+   `cell=<label> book_mode=classic|mode1|mode2|mode3
+   retention=100000(default)|archive|<N>|invalid TORUS_BOOK_ROWS='...'
    TORUS_BOOK_FAST_ENCODE='...' TORUS_SETTLE_NO_MERGE='...'
    TORUS_EVM_FAST_PATH='...' TORUS_BOOK_COALESCE='...'
    TORUS_CHECKPOINT_INTERVAL_MS='...'`, each value `unset (default)`,
    `empty (default)` or the value (book mode parsed like the node:
    trimmed `1`/`2`/`3`, anything else Classic). summary.json records the same
-   as `cell.book_mode` and `cell.node_flags` (both `null` when the cell has no
-   recorded node env). Check A/B arms against this line before analysis.
+   as `cell.book_mode`, `cell.retention` and `cell.node_flags` (all `null` when
+   the cell has no recorded node env). Check A/B arms against this line before
+   analysis.
+   **History retention is ON by default (RH4 merge, s131).** A cell without
+   `TORUS_RETENTION_BLOCKS` runs the node default, keep the last 100,000
+   blocks: the state pruner, the block-tree pruner and the DA body GC worker
+   all run (`retention=100000(default)`). An archive arm needs
+   `EXTRA_ENV='TORUS_RETENTION_BLOCKS=0'` (`retention=archive`), and every
+   comparison with a pre-merge baseline (9a, 9d and older are archive) must
+   set it explicitly on both arms. `retention=` states the merged default; a
+   binary from before the merge reads unset as archive.
    Verifies via `/proc/<pid>/environ` that all 3 nodes got the same env.
    `BLOCK_CAP=N` (block-cap-raise sweep) exports the coherent proposer-local
    bundle between the two: `TORUS_NATIVE_TOTAL_BLOCK_CAP=N`,

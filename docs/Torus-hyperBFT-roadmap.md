@@ -38,7 +38,7 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
 - **Liquidator-vault deficit (P5):** monitoring is done. Owner s131 (as decided s99): for the testnet, seed the liquidator vault with capital in the genesis, with ADL as the backstop once the vault runs dry; an HLP-style deposit vault before mainnet. Still open: the seed amount. Tracked in P5.
 - **Aliased opaque position rows in the parallel settle:** answer "can they exist?" first, then fix before the testnet genesis. Tracked in Pre-testnet decisions.
 - **EVM proposer concentration (Q12):** decided s131: keep N = 11 for the testnet (coprime to 3 / 4 validators); revisit before mainnet. Tracked in Pre-testnet decisions.
-- **Retention default (prune by default or not):** GC-pass logging, from-block-1 check and an 8h rerun first; perf doc sections 95 and 103.6. Tracked in Pre-testnet decisions.
+- **Retention default (prune by default or not):** decided s131: prune by default, N = 100,000 blocks, archive nodes opt out with `--archive` (RH4 GC worker + compaction filter merged, perf doc sections 103 and 112). Still open: which testnet node runs as the archive node; revisit N if the trial testnet's catch-up or disk numbers say so. Tracked in Pre-testnet decisions.
 - **Book storage mode for the genesis (Classic vs mode 3):** bench 8p / 8s and owner decision. Tracked in Pre-testnet decisions and `docs/perf/bench-queue.md`.
 - **Running state hash in the genesis:** whether the testnet genesis sets `consensus.state_hash_activation_height` (absent = running hash off; `docs/plans/running-state-hash-impl.md`). Owner decision before the genesis.
 - **WAN measurements:** PE on WAN, push-manifest threshold, header re-send and the T2.5 cap of 400 were all measured on one host only. The trial testnet doubles as the WAN test. Tracked in Pre-testnet decisions.
@@ -488,6 +488,14 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
   **Status s131: OPEN** (owner decision pending). Perf doc section 103.6 (8r attribution): the cost both retention
   arms share is state-DB compaction of `cf_block_bodies` from the state pruner's range deletes, not the DA GC; the
   blocks/s link is unresolved.
+  **Status s131: DONE (prune by default, N = 100,000; owner s131).** Branch `merge/rh4-prune-default`: RH4 GC worker
+  (section 103: removes the consensus-thread GC cost) and the state-pruner compaction filter (`TORUS_PRUNE_MODE=filter`
+  default; section 112, bench 8w: retention 1000 with the filter vs none p50 1.003, CPU-s per 1M 1.003, exec on-CPU
+  1.003, matched/s 0.999, blocks/s 0.963 [0.906, 1.025] unresolved, mostly the pre-filter window) merged; a node
+  without `--archive` now keeps the last 100,000 blocks (state pruner N, block tree max(N, 1000), DA body GC
+  max(N, 1000) + 128). Opt out: `--archive` or `--retention-blocks 0`. Still open: at least one archive node per
+  network as the genesis-sync source (no state sync; which testnet node), and revisit N if catch-up or disk numbers
+  say so.
 - **Trial testnet before the real testnet (owner s131; after the current work).** Three validators: archy and cachy
   (the owner's home PCs, same house, wired, 1 Gbit internet) and the 18c server. No router setup: archy and cachy
   peer over the LAN with explicit `--p2p-peers` LAN addresses, and both dial out to 18c (public), so every pair is

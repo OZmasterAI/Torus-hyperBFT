@@ -131,6 +131,7 @@ fn pre_manifest_consensus_db_opens_read_only_and_gains_the_cf_read_write() {
             &[CF_CONSENSUS_META, CF_NATIVE_PENDING, CF_NATIVE_SHARDS],
             CONSENSUS_DB_WRITE_BUFFER_BYTES,
             CONSENSUS_BLOCK_CACHE_BYTES,
+            crate::prune_filter::PruneMode::Range,
         )
         .unwrap();
         old.put_cf_raw(CF_CONSENSUS_META, &[5], b"vset").unwrap();

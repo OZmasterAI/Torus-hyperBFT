@@ -353,6 +353,10 @@ pub struct StateDb {
     /// [`Self::sync_wal`] syncs before this DB's own (set once by
     /// [`Self::attach_wal_peer`], shared by every clone).
     wal_peer: Arc<OnceLock<Arc<DB>>>,
+    /// s132: the prune cutoff of the height-keyed history CFs
+    /// ([`crate::prune_filter`]): reads hide rows below it, the compaction
+    /// filter (filter mode) drops them. Shared by every clone.
+    prune_cutoff: Arc<crate::prune_filter::PruneCutoff>,
 }
 
 /// Section 71.8 option A: directory of the consensus DB inside the node's
@@ -679,6 +683,24 @@ impl StateDb {
             ALL_CF_NAMES,
             db_write_buffer_bytes(),
             STATE_BLOCK_CACHE_BYTES,
+            crate::prune_filter::prune_mode_from_env(),
+        )
+    }
+
+    /// [`Self::open`] with the prune mode explicit instead of read from
+    /// `TORUS_PRUNE_MODE` (tests / tooling).
+    pub fn open_with_prune_mode(
+        path: &Path,
+        mode: crate::prune_filter::PruneMode,
+    ) -> Result<Self, StateError> {
+        Self::open_cfs(
+            path,
+            &DbTuning::from_env(),
+            book_cf_target_file_bytes(),
+            ALL_CF_NAMES,
+            db_write_buffer_bytes(),
+            STATE_BLOCK_CACHE_BYTES,
+            mode,
         )
     }
 
@@ -700,6 +722,7 @@ impl StateDb {
             &CONSENSUS_DB_CFS,
             CONSENSUS_DB_WRITE_BUFFER_BYTES,
             CONSENSUS_BLOCK_CACHE_BYTES,
+            crate::prune_filter::PruneMode::Range,
         )
     }
 
@@ -730,7 +753,9 @@ impl StateDb {
         cfs: &[&str],
         write_buffer_budget: usize,
         block_cache_bytes: usize,
+        prune_mode: crate::prune_filter::PruneMode,
     ) -> Result<Self, StateError> {
+        let prune_cutoff = Arc::new(crate::prune_filter::PruneCutoff::new(prune_mode));
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
@@ -860,6 +885,16 @@ impl StateDb {
                 if *name == CF_NATIVE_ORDER_BOOKS {
                     opts.set_target_file_size_base(book_cf_target_file);
                 }
+                // s132: filter mode drops pruned height-keyed rows during
+                // compaction ([`crate::prune_filter`]); range mode installs
+                // nothing (exact-today).
+                if prune_mode == crate::prune_filter::PruneMode::Filter {
+                    if let Some(len) = crate::prune_filter::height_keyed_key_len(name) {
+                        opts.set_compaction_filter_factory(
+                            crate::prune_filter::PruneFilterFactory::new(prune_cutoff.clone(), len),
+                        );
+                    }
+                }
                 if APPEND_ONLY_CFS.contains(name) {
                     match tuning.append_cf_codec {
                         AppendCfCodec::Today => {}
@@ -877,24 +912,52 @@ impl StateDb {
             .collect();
 
         let db = DB::open_cf_descriptors(&opts, path, cf_descriptors)?;
-        Ok(Self {
+        let db = Self {
             db: Arc::new(db),
             opts: (tuning.stats_level >= 1).then(|| Arc::new(opts)),
             stats_level: tuning.stats_level,
             range_compaction: Arc::default(),
             wal_peer: Arc::default(),
-        })
+            prune_cutoff,
+        };
+        db.load_prune_cutoff()?;
+        Ok(db)
     }
 
     /// Wrap an already-opened RocksDB instance (e.g., a read-only snapshot DB).
     pub fn from_existing_db(db: DB) -> Self {
-        Self {
+        let db = Self {
             db: Arc::new(db),
             opts: None,
             stats_level: 0,
             range_compaction: Arc::default(),
             wal_peer: Arc::default(),
+            prune_cutoff: Arc::new(crate::prune_filter::PruneCutoff::new(
+                crate::prune_filter::PruneMode::Range,
+            )),
+        };
+        if let Err(e) = db.load_prune_cutoff() {
+            tracing::warn!(%e, "prune cutoff unreadable on a wrapped DB; nothing hidden");
         }
+        db
+    }
+
+    /// s132: load the persisted prune cutoff into the read side before the
+    /// handle is returned (no read runs without it). The filter side stays 0
+    /// until a pruner with retention arms it ([`crate::prune_filter`]).
+    fn load_prune_cutoff(&self) -> Result<(), StateError> {
+        if self.db.cf_handle(CF_BLOCK_HEADERS).is_none() {
+            return Ok(()); // the consensus DB: no pruned CFs
+        }
+        let stored = crate::pruner::read_prune_meta(self)?;
+        self.prune_cutoff.hide_below(stored);
+        Ok(())
+    }
+
+    /// s132: the prune cutoff shared with the pruner and the compaction
+    /// filters ([`crate::prune_filter`]).
+    pub fn prune_cutoff(&self) -> &Arc<crate::prune_filter::PruneCutoff> {
+        &self.prune_cutoff
     }
 
     /// r3 exec-write-stall-attribution: one DB-wide runtime snapshot — the
@@ -1324,6 +1387,10 @@ impl StateDb {
     pub fn get_cf_raw(&self, cf_name: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
         crate::tripwire::check("get_cf_raw");
         let cf = self.cf(cf_name)?;
+        // s132: a pruned row still on disk (filter mode) reads as absent.
+        if self.prune_cutoff.is_hidden(cf_name, key) {
+            return Ok(None);
+        }
         Ok(self.db.get_cf(cf, key)?)
     }
 
@@ -1342,10 +1409,18 @@ impl StateDb {
             return Ok(Vec::new());
         }
         let cf = self.cf(cf_name)?;
+        let hidden = self.prune_cutoff.hidden_for(cf_name);
         self.db
             .multi_get_cf(keys.iter().map(|k| (cf, *k)))
             .into_iter()
-            .map(|r| r.map_err(StateError::from))
+            .zip(keys)
+            .map(|(r, key)| match hidden {
+                // s132: pruned rows still on disk read as absent.
+                Some((cutoff, len)) if crate::prune_filter::below_cutoff(key, len, cutoff) => {
+                    Ok(None)
+                }
+                _ => r.map_err(StateError::from),
+            })
             .collect()
     }
 
@@ -1355,6 +1430,9 @@ impl StateDb {
     pub fn exists_cf_raw(&self, cf_name: &str, key: &[u8]) -> Result<bool, StateError> {
         crate::tripwire::check("exists_cf_raw");
         let cf = self.cf(cf_name)?;
+        if self.prune_cutoff.is_hidden(cf_name, key) {
+            return Ok(false);
+        }
         Ok(self.db.get_pinned_cf(cf, key)?.is_some())
     }
 

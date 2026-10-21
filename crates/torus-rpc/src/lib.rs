@@ -828,29 +828,50 @@ where
 ///
 /// FIX 9 (EVM-FIND-14): Previous implementation scanned from block 0 upward (O(N)).
 /// Now uses a reverse iterator to find the last key in O(1).
+///
+/// Infallible: any read failure reads as 0 (fresh DB). Callers that must not
+/// mistake a read failure for an empty chain use [`try_find_latest_height`].
 pub fn find_latest_height(state: &StateDb) -> u64 {
-    let Ok(cf) = state.cf_handle(CF_BLOCK_HEADERS) else {
-        return 0;
-    };
+    try_find_latest_height(state).unwrap_or(0)
+}
+
+/// Bound on the non-height entries [`try_find_latest_height`] skips at the
+/// end of CF_BLOCK_HEADERS; today there is exactly one (the pruner's meta key).
+const MAX_TRAILING_META_KEYS: usize = 8;
+
+/// [`find_latest_height`] that reports failure instead of reading it as 0:
+/// a missing CF_BLOCK_HEADERS handle, an iterator error, or more than
+/// [`MAX_TRAILING_META_KEYS`] non-height entries at the end of the CF (the
+/// tip cannot be located) are `Err`. `Ok(0)` means the CF holds no height key
+/// (fresh DB). Used by the archive-upgrade probe, where 0 would let the
+/// retention safeguard pass (Codex P2, s131).
+pub fn try_find_latest_height(state: &StateDb) -> Result<u64, String> {
+    let cf = state
+        .cf_handle(CF_BLOCK_HEADERS)
+        .map_err(|e| format!("open {CF_BLOCK_HEADERS}: {e}"))?;
     // Non-height entries (e.g. the pruner's `__prune_meta__` key) sort AFTER
     // the 8-byte big-endian height keys, so skip past them instead of bailing
     // to 0 — on a pruned DB the meta key is the last entry and bailing froze
-    // eth_blockNumber at 0 and short-circuited on_commit_block (s334). The
-    // take(8) bounds the scan; today there is exactly one meta key.
-    for entry in state
-        .inner()
-        .iterator_cf(cf, rocksdb::IteratorMode::End)
-        .take(8)
-    {
+    // eth_blockNumber at 0 and short-circuited on_commit_block (s334).
+    let mut skipped = 0usize;
+    for entry in state.inner().iterator_cf(cf, rocksdb::IteratorMode::End) {
         match entry {
             Ok((key, _)) if key.len() == 8 => {
-                return u64::from_be_bytes(key[..8].try_into().unwrap());
+                return Ok(u64::from_be_bytes(key[..8].try_into().unwrap()));
             }
-            Ok(_) => continue,
-            Err(_) => return 0,
+            Ok(_) => {
+                skipped += 1;
+                if skipped >= MAX_TRAILING_META_KEYS {
+                    return Err(format!(
+                        "no height key among the last {MAX_TRAILING_META_KEYS} entries of \
+                         {CF_BLOCK_HEADERS}"
+                    ));
+                }
+            }
+            Err(e) => return Err(format!("iterate {CF_BLOCK_HEADERS}: {e}")),
         }
     }
-    0
+    Ok(0)
 }
 
 /// Public helper to update latest height after committing a new block.
@@ -1237,6 +1258,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(find_latest_height(&state), 5);
+        assert_eq!(try_find_latest_height(&state), Ok(5));
+    }
+
+    /// The fallible probe: `Ok(0)` only for a CF with no height key; a CF
+    /// whose tail is all non-height keys (tip not locatable) is `Err`, while
+    /// the infallible wrapper keeps reading that as 0.
+    #[test]
+    fn try_find_latest_height_reports_an_unlocatable_tip() {
+        let dir = TempDir::new().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        assert_eq!(try_find_latest_height(&state), Ok(0));
+        state.put_cf_raw(CF_BLOCK_HEADERS, &3u64.to_be_bytes(), b"hdr").unwrap();
+        for i in 0..8u8 {
+            state
+                .put_cf_raw(CF_BLOCK_HEADERS, &[b'~', b'm', b'e', b't', b'a', i], b"x")
+                .unwrap();
+        }
+        let err = try_find_latest_height(&state).unwrap_err();
+        assert!(err.contains("no height key"), "{err}");
+        assert_eq!(find_latest_height(&state), 0, "infallible semantics unchanged");
     }
 
     /// A `CF_BLOCK_HEADERS` row as the node writes it: 32-byte hash, then
@@ -4310,6 +4351,76 @@ mod tests {
             serde_json::to_value(&body.native_actions[0]).unwrap()
         );
         handle.stop().unwrap();
+    }
+
+    /// s132: with `TORUS_PRUNE_MODE=filter` the pruned rows stay on disk
+    /// until a compaction drops them; the body RPCs must answer exactly as
+    /// with the eager range delete, heights just below the cutoff included.
+    #[tokio::test]
+    async fn pruned_history_rpcs_answer_identically_in_range_and_filter_mode() {
+        use jsonrpsee::core::client::ClientT;
+        use std::sync::atomic::AtomicU64;
+        use torus_state::prune_filter::PruneMode;
+        use torus_state::{PrunerConfig, StatePruner};
+        let mut answers = Vec::new();
+        for mode in [PruneMode::Range, PruneMode::Filter] {
+            let dir = TempDir::new().unwrap();
+            let state = StateDb::open_with_prune_mode(dir.path(), mode).unwrap();
+            let body = TorusBlockBody {
+                native_actions: vec![],
+                evm_transactions: vec![],
+                core_writer_actions: vec![],
+            };
+            for h in 1..=12u64 {
+                store_header(&state, &test_header(h, 0, 1_000_000_000));
+                store_body(&state, h, &body);
+                state
+                    .put_cf_raw(
+                        torus_state::cf::CF_BLOCK_ACTION_STATUS,
+                        &h.to_be_bytes(),
+                        &torus_state::action_status::BlockActionStatus::default().encode(),
+                    )
+                    .unwrap();
+            }
+            store_applied_height(&state, 12);
+            let cfg = PrunerConfig {
+                retention_blocks: 4,
+                prune_interval_blocks: 1,
+                batch_size: 3,
+                trade_retention_blocks: None,
+            };
+            let mut pruner = StatePruner::new(state.clone(), cfg, Arc::new(AtomicU64::new(0)));
+            assert_eq!(pruner.maybe_prune(12).unwrap(), 8, "cutoff 8");
+            let cf = state.cf_handle(CF_BLOCK_BODIES).unwrap();
+            let on_disk = state.inner().get_cf(cf, 7u64.to_be_bytes()).unwrap().is_some();
+            assert_eq!(on_disk, mode == PruneMode::Filter, "{mode:?}: height 7 on disk");
+
+            let mempool = Arc::new(Mempool::new(state.clone(), MempoolConfig::default()));
+            let executor = Arc::new(EvmExecutor::new(TORUS_CHAIN_ID));
+            let (handle, addr) = start_server(state, mempool, executor).await;
+            let client = jsonrpsee::http_client::HttpClientBuilder::default()
+                .build(format!("http://{addr}"))
+                .unwrap();
+            let mut got = Vec::new();
+            for h in 1..=12u64 {
+                let body: serde_json::Value = client
+                    .request("torus_getBlockBody", jsonrpsee::rpc_params![h])
+                    .await
+                    .unwrap();
+                assert_eq!(body.is_null(), h < 8, "{mode:?}: body {h}");
+                got.push(body);
+                let block: Result<serde_json::Value, _> = client
+                    .request(
+                        "eth_getBlockByNumber",
+                        jsonrpsee::rpc_params![format!("{h:#x}"), true],
+                    )
+                    .await;
+                got.push(block.unwrap_or_else(|e| serde_json::Value::String(e.to_string())));
+            }
+            handle.stop().unwrap();
+            answers.push(got);
+        }
+        assert_eq!(answers[0], answers[1], "range vs filter answers");
     }
 
     /// s84 decision 1: `torus_getBlockBody` reports each native action's and

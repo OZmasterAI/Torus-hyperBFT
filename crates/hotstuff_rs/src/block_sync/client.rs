@@ -283,6 +283,27 @@ impl<N: Network> BlockSyncClient<N> {
                     return;
                 }
                 log::info!("block_sync: worker returned {} blocks", blocks.len());
+                // RH4 claude-review P1 (s131): a server that committed the
+                // start height but pruned it answers with its uncommitted tip
+                // only; those blocks cannot link to ours. Backfill keeps its
+                // own path ("peer returned no fillable blocks").
+                if let (false, Some(start)) = (session.is_backfill, session.last_fetch_start_height)
+                {
+                    let advertised = self
+                        .block_sync_client_state
+                        .available_sync_servers
+                        .get(&peer)
+                        .map(|h| h.int());
+                    if response_skips_unretained_height(
+                        start.int(),
+                        blocks.first().map(|b| b.height.int()),
+                        advertised,
+                    ) {
+                        self.note_unretained_height(peer, start);
+                        self.end_session();
+                        return;
+                    }
+                }
                 session.pending_blocks.extend(blocks);
                 session.highest_pc = Some(highest_pc);
                 session.awaiting_fetch = false;
@@ -733,10 +754,14 @@ impl<N: Network> BlockSyncClient<N> {
             start_height,
             highest_committed_block_height,
         );
-        let peer = match self
-            .block_sync_client_state
-            .random_sync_server(&peer_min_height)
-        {
+        let server = if is_backfill {
+            self.block_sync_client_state
+                .random_sync_server(&peer_min_height)
+        } else {
+            self.block_sync_client_state
+                .random_sync_server_for(&peer_min_height, start_height)
+        };
+        let peer = match server {
             Some(p) => p,
             None => {
                 // s428 BACKFILL FIX: do NOT go silent. Schedule a short bounded
@@ -826,6 +851,51 @@ impl<N: Network> BlockSyncClient<N> {
                     "block_sync: cannot sync ({}) — {} consecutive attempts; retrying shortly.",
                     reason,
                     attempts,
+                );
+            }
+        }
+    }
+
+    /// RH4 claude-review P1 (s131). A tip-sync server answered `start` with its
+    /// uncommitted tip only while advertising a committed height at or above
+    /// it: it no longer retains `start` (history retention pruned it). Remember
+    /// that (no blacklist: the server is honest), retry another peer soon, and
+    /// once every peer that committed past `start` lacks it, say plainly that
+    /// only an archive validator can serve it (sync servers are validators,
+    /// there is no state sync). Throttled, never silent.
+    fn note_unretained_height(&mut self, peer: VerifyingKey, start: BlockHeight) {
+        let st = &mut self.block_sync_client_state;
+        let floor = st.unretained.entry(peer).or_insert(start);
+        if *floor < start {
+            *floor = start;
+        }
+        let now = Instant::now();
+        match st.peers_retaining_none_of(start) {
+            Some(peers) => {
+                let due = match st.last_unretained_log {
+                    None => true,
+                    Some(t) => now.duration_since(t) >= BACKFILL_STUCK_LOG_INTERVAL,
+                };
+                if due {
+                    st.last_unretained_log = Some(now);
+                    log::warn!(
+                        "block_sync: cannot sync: requested height {} is below every peer's \
+                         retained range ({} peers committed past it and pruned it; each served \
+                         only its uncommitted tip) — needs an archive validator peer (a \
+                         validator started with --archive; an --rpc-only archive node does not \
+                         serve block sync). Still retrying.",
+                        start.int(),
+                        peers,
+                    );
+                }
+            }
+            None => {
+                // Another peer may still have it: try one soon.
+                st.no_server_retry_at = Some(now + NO_SERVER_RETRY_INTERVAL);
+                log::info!(
+                    "block_sync: peer no longer retains height {} (pruned; it served only its \
+                     uncommitted tip) — trying another peer",
+                    start.int(),
                 );
             }
         }
@@ -1012,6 +1082,13 @@ struct BlockSyncClientState {
     /// node backfills below the frontier even while it commits at the tip. Set
     /// after a futile backfill attempt; cleared on backfill progress.
     next_backfill_attempt_at: Option<Instant>,
+    /// RH4 (s131). Per sync server, the highest tip-sync start height it
+    /// answered with its uncommitted tip only while advertising a committed
+    /// height at or above it ([`response_skips_unretained_height`]): it no
+    /// longer retains that height, nor any below (a prune floor only rises).
+    unretained: HashMap<VerifyingKey, BlockHeight>,
+    /// RH4 (s131). Last "below every peer's retained range" warning.
+    last_unretained_log: Option<Instant>,
 }
 
 impl BlockSyncClientState {
@@ -1028,7 +1105,52 @@ impl BlockSyncClientState {
             last_backfill_stuck_log: None,
             backfill_contiguous_through: None,
             next_backfill_attempt_at: None,
+            unretained: HashMap::new(),
+            last_unretained_log: None,
         }
+    }
+
+    /// RH4 (s131). `peer` is known not to retain `height` (pruned).
+    fn peer_lacks_height(&self, peer: &VerifyingKey, height: BlockHeight) -> bool {
+        self.unretained.get(peer).is_some_and(|floor| height <= *floor)
+    }
+
+    /// RH4 (s131). `Some(n)` when every available server that advertised a
+    /// committed height at or above `height` (n of them, n > 0) is known not to
+    /// retain it; `None` when one of them may still have it, or none is past it.
+    fn peers_retaining_none_of(&self, height: BlockHeight) -> Option<usize> {
+        let mut past = 0usize;
+        for (vk, committed) in &self.available_sync_servers {
+            if *committed >= height {
+                if !self.peer_lacks_height(vk, height) {
+                    return None;
+                }
+                past += 1;
+            }
+        }
+        (past > 0).then_some(past)
+    }
+
+    /// RH4 (s131). [`Self::random_sync_server`] for a tip-sync from `start`,
+    /// preferring a server not known to have pruned `start`; falls back to any
+    /// eligible server so the client keeps retrying (an archive validator may
+    /// join, or the knowledge may be stale after a blacklist expiry).
+    fn random_sync_server_for(
+        &self,
+        min_highest_committed_block_height: &Option<BlockHeight>,
+        start: BlockHeight,
+    ) -> Option<VerifyingKey> {
+        let eligible = |vk: &&VerifyingKey| match min_highest_committed_block_height {
+            None => true,
+            Some(min) => self.available_sync_servers.get(*vk).is_some_and(|h| h >= min),
+        };
+        self.available_sync_servers
+            .keys()
+            .filter(eligible)
+            .filter(|vk| !self.peer_lacks_height(vk, start))
+            .choose(&mut rand::thread_rng())
+            .copied()
+            .or_else(|| self.random_sync_server(min_highest_committed_block_height))
     }
 
     fn blacklist_contains_server_address(&self, sync_server: &VerifyingKey) -> bool {
@@ -1137,6 +1259,26 @@ fn warrants_blacklist(response: &ValidateBlockResponse) -> bool {
 /// end the session instead (the server was honest — do NOT blacklist).
 fn refetch_would_repeat(prev_start: Option<u64>, next_start: u64) -> bool {
     prev_start == Some(next_start)
+}
+
+/// RH4 claude-review P1 (s131, pure, testable). Whether a sync response shows
+/// the server no longer retains the requested `start` height. The server's
+/// `blocks_from_height_to_newest` serves committed blocks from `start` and then
+/// its uncommitted tail (which begins right above its committed tip, or later
+/// if a body is missing). So a first block above `start` (`first_block_height`)
+/// from a server that advertised a committed height at or above `start`
+/// (`advertised_committed`) means it has no committed block at `start` any
+/// more: pruned by history retention. Facts only: an empty response, a missing
+/// advertisement, or a server committed below `start` is never this case.
+fn response_skips_unretained_height(
+    start: u64,
+    first_block_height: Option<u64>,
+    advertised_committed: Option<u64>,
+) -> bool {
+    match (first_block_height, advertised_committed) {
+        (Some(first), Some(committed)) => first > start && committed >= start,
+        _ => false,
+    }
 }
 
 /// Trigger-timeout multiplier after `consecutive_futile` sync sessions that synced
@@ -1847,6 +1989,170 @@ mod fatal_violation_wiring_tests {
             cli.block_sync_client_state.no_server_retry_at.is_some(),
             "a no-server trigger MUST schedule a short retry (never go silent) — the iter-3 bug"
         );
+    }
+
+    /// The client with the worker-result sender kept (to feed responses).
+    fn client_with_results() -> (BlockSyncClient<NullNetwork>, mpsc::Sender<super::SyncResult>) {
+        let (wc_tx, _wc_rx) = mpsc::channel();
+        let (wr_tx, wr_rx) = mpsc::channel();
+        let config = BlockSyncClientConfiguration {
+            chain_id: CHAIN_ID,
+            request_limit: 32,
+            response_timeout: Duration::from_secs(1),
+            blacklist_expiry_time: Duration::from_secs(1),
+            block_sync_trigger_min_view_difference: 2,
+            block_sync_trigger_timeout: Duration::from_secs(60),
+        };
+        let cli = BlockSyncClient::new(
+            config,
+            wc_tx,
+            wr_rx,
+            ValidatorSetUpdateHandle::new(NullNetwork),
+            None,
+        );
+        (cli, wr_tx)
+    }
+
+    fn peer(b: u8) -> VerifyingKey {
+        SigningKey::from_bytes(&[b; 32]).verifying_key()
+    }
+
+    fn fetching(peer: VerifyingKey, start: u64, is_backfill: bool) -> PendingSyncSession {
+        PendingSyncSession {
+            peer,
+            pending_blocks: VecDeque::new(),
+            highest_pc: None,
+            blocks_synced: 0,
+            init_height: BlockHeight::new(start.saturating_sub(1)),
+            fetch_iterations: 1,
+            session_start: Instant::now(),
+            awaiting_fetch: true,
+            last_fetch_start_height: Some(BlockHeight::new(start)),
+            is_backfill,
+        }
+    }
+
+    fn tip_blocks(heights: &[u64]) -> Vec<Block> {
+        heights
+            .iter()
+            .map(|h| {
+                Block::new(
+                    BlockHeight::new(*h),
+                    PhaseCertificate::genesis_pc(),
+                    CryptoHash::new([*h as u8; 32]),
+                    Data::new(vec![]),
+                )
+            })
+            .collect()
+    }
+
+    /// RH4 claude-review P1 (s131): `blocks_from_height_to_newest` answers a
+    /// start height it committed but no longer keeps (pruned) with only its
+    /// uncommitted tip. Detected only from facts: the first block is above the
+    /// requested start AND the server advertised a committed height at or
+    /// above it. Anything else (first block at the start, a server behind the
+    /// start, no advertisement, an empty response) is not this case.
+    #[test]
+    fn tip_only_response_detected_only_for_a_committed_unretained_start() {
+        use super::response_skips_unretained_height as f;
+        assert!(f(10, Some(15), Some(20)));
+        assert!(f(10, Some(21), Some(20)));
+        assert!(f(10, Some(11), Some(10)));
+        assert!(!f(10, Some(10), Some(20)), "served from the start");
+        assert!(!f(10, Some(9), Some(8)), "server behind: its tail starts below");
+        assert!(!f(10, Some(12), Some(9)), "server committed below the start");
+        assert!(!f(10, Some(15), None), "no advertisement: unknown, not guessed");
+        assert!(!f(10, None, Some(20)), "empty response");
+    }
+
+    /// A tip-sync whose server returns a tip-only response for a pruned start:
+    /// the session ends without queueing the unlinkable blocks and without
+    /// blacklisting; the peer is remembered as not retaining the height, and
+    /// once every peer that committed past it is, the client knows it needs an
+    /// archive validator. Selection prefers a peer not known to have pruned it.
+    #[test]
+    fn tip_only_response_for_a_pruned_height_marks_the_peer() {
+        let (a, b) = (peer(1), peer(2));
+        let (mut cli, results) = client_with_results();
+        let st = &mut cli.block_sync_client_state;
+        st.register_or_update_sync_server(a, BlockHeight::new(500));
+        st.register_or_update_sync_server(b, BlockHeight::new(500));
+        // A third peer at our height cannot serve the start either way.
+        st.register_or_update_sync_server(peer(3), BlockHeight::new(9));
+
+        cli.pending_sync = Some(fetching(a, 10, false));
+        results
+            .send(super::SyncResult::Blocks {
+                peer: a,
+                blocks: tip_blocks(&[501, 502]),
+                highest_pc: PhaseCertificate::genesis_pc(),
+            })
+            .unwrap();
+        cli.poll_worker_results();
+        assert!(cli.pending_sync.is_none(), "the session ends");
+        let st = &cli.block_sync_client_state;
+        assert!(st.available_sync_servers.contains_key(&a), "not blacklisted");
+        assert!(!st.blacklist_contains_server_address(&a));
+        assert!(st.peer_lacks_height(&a, BlockHeight::new(10)));
+        assert!(st.peer_lacks_height(&a, BlockHeight::new(3)), "a pruned floor only rises");
+        assert!(!st.peer_lacks_height(&a, BlockHeight::new(11)));
+        assert_eq!(st.peers_retaining_none_of(BlockHeight::new(10)), None, "b may still have it");
+        for _ in 0..32 {
+            let pick = st.random_sync_server_for(&Some(BlockHeight::new(9)), BlockHeight::new(10));
+            assert!(pick.is_some() && pick != Some(a), "prefer a peer not known to have pruned it");
+        }
+
+        // b answers the same way: every peer that committed past 10 pruned it.
+        cli.pending_sync = Some(fetching(b, 10, false));
+        results
+            .send(super::SyncResult::Blocks {
+                peer: b,
+                blocks: tip_blocks(&[501]),
+                highest_pc: PhaseCertificate::genesis_pc(),
+            })
+            .unwrap();
+        cli.poll_worker_results();
+        let st = &cli.block_sync_client_state;
+        assert_eq!(st.peers_retaining_none_of(BlockHeight::new(10)), Some(2));
+        assert!(st.last_unretained_log.is_some(), "the archive-peer warning was logged");
+        // Still retrying (falls back to any eligible peer), never silent.
+        assert!(st
+            .random_sync_server_for(&Some(BlockHeight::new(9)), BlockHeight::new(10))
+            .is_some());
+    }
+
+    /// A response that does start at the requested height is normal, and a
+    /// BACKFILL keeps its own path ("peer returned no fillable blocks"): no
+    /// peer is marked either way.
+    #[test]
+    fn served_start_and_backfill_responses_mark_nothing() {
+        let a = peer(1);
+        let (mut cli, results) = client_with_results();
+        cli.block_sync_client_state
+            .register_or_update_sync_server(a, BlockHeight::new(500));
+        cli.pending_sync = Some(fetching(a, 10, false));
+        results
+            .send(super::SyncResult::Blocks {
+                peer: a,
+                blocks: tip_blocks(&[10, 11]),
+                highest_pc: PhaseCertificate::genesis_pc(),
+            })
+            .unwrap();
+        cli.poll_worker_results();
+        assert_eq!(cli.pending_sync.as_ref().unwrap().pending_blocks.len(), 2);
+        assert!(!cli.block_sync_client_state.peer_lacks_height(&a, BlockHeight::new(10)));
+
+        cli.pending_sync = Some(fetching(a, 10, true));
+        results
+            .send(super::SyncResult::Blocks {
+                peer: a,
+                blocks: tip_blocks(&[501]),
+                highest_pc: PhaseCertificate::genesis_pc(),
+            })
+            .unwrap();
+        cli.poll_worker_results();
+        assert_eq!(cli.pending_sync.as_ref().unwrap().pending_blocks.len(), 1);
+        assert!(!cli.block_sync_client_state.peer_lacks_height(&a, BlockHeight::new(10)));
     }
 
     /// s428 BACKFILL FIX: `compute_sync_start` detects the lowest hole below the

@@ -1324,8 +1324,9 @@ class CrashKillGuardTest(unittest.TestCase):
 # ------------------------------- start-node.sh: optional history retention (Q9)
 class StartNodeRetentionTest(unittest.TestCase):
     """devnet/wsl/start-node.sh passes `--retention-blocks=N` only when
-    TORUS_RETENTION_BLOCKS is set. Unset or empty = archive, the argv of every
-    earlier cell, byte for byte. The flag goes last, so crash-kill.sh's
+    TORUS_RETENTION_BLOCKS is set. Unset or empty = no flag, the argv of every
+    earlier cell, byte for byte (since s131 that means the node default,
+    prune by default with N = 100,000; TORUS_RETENTION_BLOCKS=0 = archive). The flag goes last, so crash-kill.sh's
     `--data-dir=` match (and with it the restart) still accepts the node."""
 
     START_NODE_SH = os.path.join(
@@ -5536,6 +5537,20 @@ BOOK_MODE_CASES = (
 )
 
 
+# TORUS_RETENTION_BLOCKS -> the effective history retention of the cell
+# (devnet/wsl/start-node.sh passes --retention-blocks=V when V is non-empty;
+# torus-node: 0 = archive, unset = the default N = 100,000 since s131).
+RETENTION_CASES = [
+    (None, "100000(default)"),
+    ("", "100000(default)"),
+    ("0", "archive"),
+    ("000", "archive"),
+    ("1000", "1000"),
+    ("0100", "100"),
+    ("12x", "invalid"),
+]
+
+
 class BookModeNotPinnedTest(unittest.TestCase):
     """s131 (bench 8y, perf doc section 110): RECORD_ENV pinned
     TORUS_BOOK_ROWS=3, so a cell was mode 3 unless its campaign overrode the
@@ -5607,6 +5622,47 @@ class BookModeNotPinnedTest(unittest.TestCase):
         # the order is fixed, so two arms' lines diff cleanly
         pos = [line.index(" %s='" % k) for k in AUDITED_FLAGS]
         self.assertEqual(pos, sorted(pos), line)
+
+    def test_flag_line_records_the_effective_retention(self):
+        """claude-review P2 (s131): since prune by default a cell without
+        TORUS_RETENTION_BLOCKS runs retention (N = 100,000, DA GC worker and
+        pruner on), so the line names the effective retention per cell."""
+        for extra, want in [
+            ("TORUS_X=1", "retention=100000(default)"),
+            ("TORUS_RETENTION_BLOCKS=0", "retention=archive"),
+            ("TORUS_RETENTION_BLOCKS=1000", "retention=1000"),
+        ]:
+            with self.subTest(extra=extra):
+                r, log = self.run_cell(extra, TORUS_RETENTION_BLOCKS="7")  # ambient: must not leak
+                lines = self.flags_line(log)
+                self.assertEqual(len(lines), 1, r.stdout + r.stderr + log)
+                self.assertIn(" book_mode=", lines[0])
+                self.assertIn(" " + want + " ", lines[0])
+
+    def test_bash_retention_mirrors_start_node_and_the_node(self):
+        fn = self.node_flags_fn()
+        for v, want in RETENTION_CASES:
+            with self.subTest(v=v):
+                env = {k: x for k, x in os.environ.items() if not k.startswith("TORUS_")}
+                if v is not None:
+                    env["TORUS_RETENTION_BLOCKS"] = v
+                r = subprocess.run(["bash", "-c", fn + "\nnode_flags_line"],
+                                   capture_output=True, text=True, timeout=10, env=env)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn(" retention=%s " % want, r.stdout, (v, r.stdout))
+
+    def test_summary_records_the_effective_retention(self):
+        d = tempfile.mkdtemp(prefix="retention-sum-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        write_cell(d, 1_000, 1_000)
+        write_agreement(d, ["same"] * 3)
+        for v, want in RETENTION_CASES:
+            with self.subTest(v=v):
+                env = {} if v is None else {"TORUS_RETENTION_BLOCKS": v}
+                s, _ = run_summarize(d, extra=["--node-env", json.dumps(env)])
+                self.assertEqual(s["cell"]["retention"], want)
+        s, _ = run_summarize(d)
+        self.assertIsNone(s["cell"]["retention"])
 
     def node_flags_fn(self):
         with open(RUN_CELL_SH) as f:

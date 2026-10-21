@@ -41,7 +41,8 @@ start_node() {
     # Optional history retention (Q9 data-dir growth soak): TORUS_RETENTION_BLOCKS=N
     # passes --retention-blocks=N (state pruner + block-tree pruner; the DA body
     # GC window derives from it, see torus_consensus::da_gc). Unset or empty =
-    # archive, exactly as before. Appended last so the --data-dir match in
+    # no flag: the node default (since s131 prune by default, N = 100,000);
+    # TORUS_RETENTION_BLOCKS=0 = archive. Appended last so the --data-dir match in
     # crash-kill.sh is unchanged; launch and restart read the same variable.
     if [ -n "${TORUS_RETENTION_BLOCKS:-}" ]; then
         case "$TORUS_RETENTION_BLOCKS" in
