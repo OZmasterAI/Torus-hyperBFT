@@ -41894,7 +41894,8 @@ mod crash_recovery_tests {
         );
 
         // Right after a close: nothing owed, a plain rebuild.
-        let (config, db) = p2_fixture();
+        let (mut config, db) = p2_fixture();
+        config.activations = Default::default(); // `l31_blocks`: no running hash
         l31_seed(&db);
         let mut ctx = ctx_for(&config, &db, ckpt_every(5));
         ctx.attach_flush_worker(None);
