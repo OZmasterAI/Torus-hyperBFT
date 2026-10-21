@@ -10653,7 +10653,7 @@ impl NativeExecutor {
                 (std::time::Duration::ZERO, std::time::Duration::ZERO);
             let mut panic = None;
             let parks_before = crate::exec_pool::stream_parks_on_this_thread().0;
-            for i in 0..n {
+            for (i, &id) in ids.iter().enumerate() {
                 let wait_start = std::time::Instant::now();
                 let got = rx.take(i);
                 if decided == Some(true) {
@@ -10670,7 +10670,7 @@ impl NativeExecutor {
                     // per-market containment.
                     Err(_) => {
                         panic = Some(crate::market_workers::MarketWorkerPanic {
-                            market_id: ids[i],
+                            market_id: id,
                             message: "worker thread died outside contained matching".to_string(),
                         });
                         break;
