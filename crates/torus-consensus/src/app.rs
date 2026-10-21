@@ -3281,12 +3281,30 @@ fn insertion_link_response(
 }
 
 /// [`insertion_link_response`] for the block whose datum is `datum` and
-/// whose hotstuff block commits to `data_hash`.
+/// whose hotstuff block commits to `data_hash`. An unknown feature bit is
+/// `UnsupportedUpgrade` (block sync does not blacklist the serving peer) only
+/// for a datum bound to its block: the bytes hash to `data_hash` (Codex
+/// review of phase 2, P2). Otherwise a peer could add an unknown bit to
+/// tampered data and escape the blacklist; tampered data is `Invalid`. The
+/// link checks before the bit (height, parent hash, timestamp) have run; the
+/// rules after it (the schedule's bits, the EVM header values) may be what
+/// the unknown feature changes, so they are not judged here.
 fn insertion_link_response_for_datum(
     link: Result<BlockDataCheck, UpgradeRequired>,
-    _datum: &[u8],
-    _data_hash: &CryptoHash,
+    datum: &[u8],
+    data_hash: &CryptoHash,
 ) -> Option<ValidateBlockResponse> {
+    if let Err(UpgradeRequired { feature }) = link {
+        if CryptoHash::new(TorusApp::hash_datum(datum)) != *data_hash {
+            tracing::warn!(
+                feature,
+                datum_len = datum.len(),
+                "validate_block: REJECTED -- data_hash mismatch (a datum with an unknown feature \
+                 bit is not an upgrade unless the block commits to it)"
+            );
+            return Some(ValidateBlockResponse::Invalid);
+        }
+    }
     insertion_link_response(link)
 }
 

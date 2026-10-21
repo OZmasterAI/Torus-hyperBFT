@@ -155,6 +155,11 @@ Each phase lands on its own branch with RED-first tests and full gates; each one
    moving to Prague with bit 0 as a stand-in. Also on this branch, the Codex review P2 of phase 1:
    an unknown bit at insertion is `ValidateBlockResponse::UnsupportedUpgrade` (not inserted, block
    sync logs UPGRADE REQUIRED and ends the session without blacklisting the peer).
+   Codex review of phase 2 (P2), fixed on `feat/p00-phase3`: `UnsupportedUpgrade` only for a datum whose bytes
+   hash to the block's `data_hash` (`insertion_link_response_for_datum`; tampered data with an unknown bit is
+   `Invalid`, so the peer is blacklisted), and block sync ends such a session without counting it as futile (the
+   global trigger backoff does not grow); the peer cools down for `blacklist_expiry_time` (not picked,
+   advertisements ignored) and another peer is tried after the short no-server retry.
 3. **Running-hash migration** (~0.5-1 d): `configure_activation` checks the header bit from the start height;
    `ChainConfig.state_hash_activation_height` comes only from the schedule.
    Built s134 on `feat/p00-phase3` (from phase 2 8a5632a6). The running hash follows the committed headers,

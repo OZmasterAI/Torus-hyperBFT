@@ -628,6 +628,7 @@ impl<N: Network> BlockSyncClient<N> {
         if self
             .block_sync_client_state
             .blacklist_contains_server_address(origin)
+            || self.block_sync_client_state.cooling_down(origin)
         {
             return Ok(());
         }
@@ -648,6 +649,7 @@ impl<N: Network> BlockSyncClient<N> {
         if self
             .block_sync_client_state
             .blacklist_contains_server_address(origin)
+            || self.block_sync_client_state.cooling_down(origin)
         {
             return Ok(());
         }
@@ -1007,21 +1009,41 @@ impl<N: Network> BlockSyncClient<N> {
     /// binary does not know. The block is valid for upgraded nodes: this node
     /// must upgrade, the peer is not at fault (no blacklist). Sync cannot pass
     /// this height until then.
+    ///
+    /// Codex review of phase 2 (P2): the session ends WITHOUT counting as a
+    /// futile one, so such replies (a peer can send them repeatedly) never
+    /// stretch the global trigger backoff (60 s up to 480 s). Instead that
+    /// peer cools down for `blacklist_expiry_time` (not picked, its
+    /// advertisements ignored) and the next attempt, with another peer, comes
+    /// after the short no-server retry.
     fn on_unsupported_upgrade(&mut self, peer: VerifyingKey, height: BlockHeight) {
         log::error!(
             "block_sync: UPGRADE REQUIRED -- block at height {} from {:?} uses a feature this \
-             binary does not know; NOT blacklisting the peer, ending the sync session",
+             binary does not know; NOT blacklisting the peer (cooling it down for {:?}), ending \
+             the sync session without growing the sync backoff",
             height.int(),
-            peer
+            peer,
+            self.config.blacklist_expiry_time
         );
-        self.end_session();
+        self.block_sync_client_state
+            .cool_down_sync_server(peer, self.config.blacklist_expiry_time);
+        self.finish_session(false);
+        self.block_sync_client_state.no_server_retry_at =
+            Some(Instant::now() + NO_SERVER_RETRY_INTERVAL);
     }
 
     fn end_session(&mut self) {
+        self.finish_session(true);
+    }
+
+    /// End the pending session. `futile_counts`: a zero-block session feeds
+    /// the trigger backoff (every caller but [`Self::on_unsupported_upgrade`]).
+    fn finish_session(&mut self, futile_counts: bool) {
         if let Some(session) = self.pending_sync.take() {
             // s350 FIX C: zero-block sessions feed the trigger backoff; any
             // productive session resets it so a lagging replica stays fast.
-            if session.blocks_synced == 0 {
+            // P0.0: an unsupported-upgrade reply (`!futile_counts`) changes neither.
+            if session.blocks_synced == 0 && futile_counts {
                 self.block_sync_client_state.consecutive_futile_sessions = self
                     .block_sync_client_state
                     .consecutive_futile_sessions
@@ -1037,7 +1059,7 @@ impl<N: Network> BlockSyncClient<N> {
                         Some(Instant::now() + BACKFILL_RETRY_INTERVAL);
                     self.note_backfill_stuck(true, start, "peer returned no fillable blocks");
                 }
-            } else {
+            } else if session.blocks_synced > 0 {
                 self.block_sync_client_state.consecutive_futile_sessions = 0;
                 // s428 BACKFILL FIX: backfill made progress — clear the stuck
                 // counters/gates so the next hole (if any) is attacked at once.
@@ -1137,6 +1159,15 @@ impl BlockSyncClientState {
         self.upgrade_cooldown.iter().any(|(vk, _)| vk == sync_server)
     }
 
+    /// P0.0: stop picking `sync_server` (and ignore its advertisements) for
+    /// `expiry`: it served a block with a feature this binary does not know.
+    fn cool_down_sync_server(&mut self, sync_server: VerifyingKey, expiry: Duration) {
+        let _ = self.available_sync_servers.remove(&sync_server);
+        self.upgrade_cooldown.retain(|(vk, _)| *vk != sync_server);
+        self.upgrade_cooldown
+            .push_back((sync_server, Instant::now() + expiry));
+    }
+
     /// RH4 (s131). `peer` is known not to retain `height` (pruned).
     fn peer_lacks_height(&self, peer: &VerifyingKey, height: BlockHeight) -> bool {
         self.unretained.get(peer).is_some_and(|floor| height <= *floor)
@@ -1212,6 +1243,14 @@ impl BlockSyncClientState {
             .is_some_and(|(_, expiry)| expiry <= &now)
         {
             let _ = self.blacklist.pop_front();
+        }
+        // P0.0: upgrade cooldowns (one entry per peer, all the same length).
+        while self
+            .upgrade_cooldown
+            .front()
+            .is_some_and(|(_, expiry)| expiry <= &now)
+        {
+            let _ = self.upgrade_cooldown.pop_front();
         }
     }
 
