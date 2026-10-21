@@ -97,7 +97,7 @@ mv <your-data-dir> <your-data-dir>.bak-$(date +%s)
   --log-level info,hotstuff_rs=warn
 ```
 
-- Keep `--retention-blocks 100000` — without it the DB grows forever.
+- Keep `--retention-blocks 100000` — the default since s131 (prune by default); keeping it explicit also passes the archive-upgrade check on an old data dir.
 - Do **not** pass `--native-gossip=false`.
 - **The peer list changed:** `84.32.108.220` (val1) was dropped from the set. If your
   old service file still lists it, remove it.

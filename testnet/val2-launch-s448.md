@@ -106,6 +106,10 @@ serving the old chain undoes the whole relaunch.
   --log-level info,hotstuff_rs=warn
 ```
 - `--archive` keeps full history — do **not** also pass `--retention-blocks`.
+  Since s131 a node without it prunes (keeps the last 100,000 blocks), so this
+  flag is what keeps val2 the network's archive **validator**: block sync is
+  served by validators only, and a node behind every validator's retained range
+  can catch up only from it (an `--rpc-only` archive node does not serve block sync).
 - RPC/metrics stay on **loopback** — never expose them.
 - Confirm in the log: `pubkey=537f761858…` and height climbing.
 

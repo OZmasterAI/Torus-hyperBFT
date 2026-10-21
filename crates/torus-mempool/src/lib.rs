@@ -206,6 +206,10 @@ pub struct Mempool {
     read_view: RwLock<Option<torus_state::ReadView>>,
     /// Durable, nonce-gate-decoupled native-action body store (out-of-band DA).
     da_store: NativeDaStore,
+    /// RH4: the fence between the DA body GC worker's deletes and the body
+    /// checks of proposals and validation ([`torus_state::DaGcFence`]; off
+    /// unless the GC runs on its worker).
+    da_gc_fence: std::sync::Arc<torus_state::DaGcFence>,
     /// Coalesced ingress DA mirrors (T2.2): per-action ingest puts are buffered
     /// briefly and flushed as ONE `WriteBatch` (by size/age, and ALWAYS before
     /// selection or a DA read), instead of one RocksDB write per ingress body.
@@ -304,6 +308,7 @@ impl Mempool {
             state,
             read_view: RwLock::new(None),
             da_store,
+            da_gc_fence: std::sync::Arc::default(),
             da_pending: std::sync::Mutex::new(PendingDaMirrors {
                 actions: Vec::new(),
                 first_at: None,
@@ -1741,6 +1746,22 @@ impl Mempool {
     /// shards a proposer OR a validating peer custodied.
     pub fn get_shard(&self, hash: &B256, index: u16) -> Option<StoredShard> {
         self.da_store.get_shard(&hash.0, index).ok().flatten()
+    }
+
+    /// RH4: the fence between the DA body GC worker and the body checks
+    /// ([`torus_state::DaGcFence`]). A check pins a block's hashes with
+    /// [`Self::pin_native_da`] before reading their bodies.
+    pub fn da_gc_fence(&self) -> &std::sync::Arc<torus_state::DaGcFence> {
+        &self.da_gc_fence
+    }
+
+    /// RH4: pin `hashes`, referenced by a block at `height`, against the DA
+    /// body GC worker BEFORE checking their bodies; returns the ones a GC pass
+    /// is deleting right now, which the caller must treat as missing. A
+    /// no-op (empty) unless the GC runs on its worker. See
+    /// [`torus_state::DaGcFence`].
+    pub fn pin_native_da(&self, height: u64, hashes: &[B256]) -> Vec<B256> {
+        self.da_gc_fence.pin(height, hashes)
     }
 
     /// RH4: one durable DA body GC pass for a dispatched committed height,

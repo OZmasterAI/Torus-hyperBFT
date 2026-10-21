@@ -7,6 +7,9 @@ j() { jq -r "$@" "$D/summary.json"; }
 # EVM_LOAD_RATE cells: summarize.py rewrites summary.json without .evm_load;
 # it is re-derived below from the retained evm-load-* artifacts.
 EVM_LOAD=$(jq -c '.evm_load // empty' "$D/summary.json")
+# STATE_HASH_ATTEST cells: likewise without .state_attest (and its REJECT); a cell whose scan wrote no
+# state-attest.json must stay rejected, so its old .state_attest also triggers the re-derive below.
+STATE_ATTEST=$(jq -c '.state_attest // empty' "$D/summary.json")
 # ... nor .genesis.evm_block_interval (run-cell.sh records it after summarize.py).
 EVM_N=$(jq -r '.genesis.evm_block_interval // empty' "$D/summary.json")
 # ... nor .genesis.bulk_count (BULK_COUNT, bench queue 8f; run-cell.sh records it after summarize.py).
@@ -58,4 +61,9 @@ fi
 if [ -n "$EVM_LOAD" ]; then
     python3 "$T/evm_load.py" summary --dir "$D" --rate "$(jq -r '.rate // ""' <<<"$EVM_LOAD")" \
         --senders "$(jq -r '.senders // 0' <<<"$EVM_LOAD")" --rc "$(jq -r '.rc // ""' <<<"$EVM_LOAD")"
+fi
+# STATE_HASH_ATTEST cells: .state_attest (and its REJECT fold) is re-derived from state-attest.json
+# (no file but an old .state_attest: summary writes ok=false and keeps the cell rejected).
+if [ -f "$D/state-attest.json" ] || [ -n "$STATE_ATTEST" ]; then
+    python3 -I "$T/state_attest.py" summary --dir "$D" >/dev/null
 fi

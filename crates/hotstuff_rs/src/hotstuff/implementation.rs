@@ -39,7 +39,7 @@ use crate::{
             ProposalRequest, ProposalResponse,
         },
         roles::{is_phase_voter, new_view_recipients_with_reputation, view_leader_with_reputation},
-        types::{valid_nec, NECollector, Phase, PhaseVoteCollector},
+        types::{valid_proposal_certificates, NECollector, Phase, PhaseVoteCollector},
     },
     networking::{
         network::{Network, ValidatorSetUpdateHandle},
@@ -1309,54 +1309,30 @@ impl<N: Network> HotStuff<N> {
                 .insert(proposal_key, proposal.block.hash);
         }
 
-        // MonadBFT B2: validate NEC if present.
-        // Check NEC BEFORE reproposal — per paper Alg 5 VALIDPROPOSAL line 15,
-        // IsFreshProposal is checked first. A valid NEC makes the proposal fresh
-        // regardless of tc.high_tip_is_winner.
-        let has_valid_nec = if let Some(ref nec) = proposal.nec {
-            if !valid_nec(nec, block_tree)? {
-                match self.proposal_status {
-                    ProposalStatus::WaitingForProposal => {
-                        self.proposal_status = ProposalStatus::OneLeaderProposed { leader: *origin }
-                    }
-                    ProposalStatus::OneLeaderProposed { leader: _ } => {
-                        self.proposal_status = ProposalStatus::AllLeadersProposed
-                    }
-                    _ => {}
+        // MonadBFT VALIDPROPOSAL (paper Alg 5): the TC/NEC the proposal carries.
+        // A valid NEC makes the proposal fresh regardless of tc.high_tip_is_winner.
+        // The header-first path runs the same check.
+        if !valid_proposal_certificates(
+            self.view_info.view,
+            &proposal.block.hash,
+            proposal.tc.as_ref(),
+            proposal.nec.as_ref(),
+            block_tree,
+        )? {
+            log::warn!(
+                "dropping proposal: invalid TC/NEC, view={}",
+                self.view_info.view.int()
+            );
+            match self.proposal_status {
+                ProposalStatus::WaitingForProposal => {
+                    self.proposal_status = ProposalStatus::OneLeaderProposed { leader: *origin }
                 }
-                return Ok(());
-            }
-            true
-        } else {
-            false
-        };
-
-        // MonadBFT: validate reproposal TC if present.
-        // Skip this check if the proposal has a valid NEC (it's fresh, not a reproposal).
-        if !has_valid_nec && proposal.is_reproposal() {
-            if let Some(ref tc) = proposal.tc {
-                let tc_valid = tc.is_correct(block_tree)?
-                    && self.view_info.view == tc.view + 1
-                    && tc
-                        .high_tip
-                        .as_ref()
-                        .is_some_and(|tip| tip.block_hash == proposal.block.hash);
-                if !tc_valid {
-                    match self.proposal_status {
-                        ProposalStatus::WaitingForProposal => {
-                            self.proposal_status =
-                                ProposalStatus::OneLeaderProposed { leader: *origin }
-                        }
-                        ProposalStatus::OneLeaderProposed { leader: _ } => {
-                            self.proposal_status = ProposalStatus::AllLeadersProposed
-                        }
-                        _ => {}
-                    }
-                    return Ok(());
+                ProposalStatus::OneLeaderProposed { leader: _ } => {
+                    self.proposal_status = ProposalStatus::AllLeadersProposed
                 }
-            } else {
-                return Ok(());
+                _ => {}
             }
+            return Ok(());
         }
 
         // 1. Check if block is correct and safe.
@@ -2219,6 +2195,33 @@ impl<N: Network> HotStuff<N> {
             return Ok(());
         }
 
+        // The TC/NEC the header carries: the same check as the full-proposal
+        // path (re-proposals and NEC proposals travel header-first).
+        if !valid_proposal_certificates(
+            header.view,
+            &header.block_hash,
+            header.tc.as_ref(),
+            header.nec.as_ref(),
+            block_tree,
+        )? {
+            log::warn!(
+                "dropping proposal header: invalid TC/NEC, view={}",
+                header.view.int()
+            );
+            if header_is_current {
+                match self.proposal_status {
+                    ProposalStatus::WaitingForProposal => {
+                        self.proposal_status = ProposalStatus::OneLeaderProposed { leader: *origin }
+                    }
+                    ProposalStatus::OneLeaderProposed { leader } if leader != *origin => {
+                        self.proposal_status = ProposalStatus::AllLeadersProposed
+                    }
+                    _ => {}
+                }
+            }
+            return Ok(());
+        }
+
         // Header passed integrity checks: this is the proposal-arrival moment of
         // the hash-only pipeline (the body may still be in flight).
         Event::ReceiveProposalHeader(crate::events::ReceiveProposalHeaderEvent {
@@ -2360,7 +2363,8 @@ impl<N: Network> HotStuff<N> {
         // (leader, integrity, safe justify, lock updated above) asks the
         // pacemaker to enter w; the algorithm loop then re-dispatches this
         // header, which votes through the ordinary current-view path below.
-        // A header carrying a TC/NEC never skips: this path validates neither.
+        // A header carrying a TC/NEC never skips: round-skip is for steady-state
+        // catch-up, not for entering a view through a view change.
         if self.round_skip
             && header.view > self.view_info.view
             && header.tc.is_none()
@@ -3982,7 +3986,7 @@ mod sync_recovery_tests {
         use crate::pacemaker::types::TimeoutCertificate;
         use crate::types::data_types::SignatureSet;
 
-        // The header path validates neither a TC nor an NEC: such headers never skip.
+        // Headers carrying a TC or an NEC never skip (these invalid ones are dropped first).
         let mut c = skip_case(1, 5);
         let mut with_tc = c.header.clone();
         with_tc.tc = Some(TimeoutCertificate {

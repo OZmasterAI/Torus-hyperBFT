@@ -1154,6 +1154,22 @@ def book_mode(node_env):
     return None if d is None else "classic" if d == "0" else "mode" + d
 
 
+def retention(node_env):
+    """The cell's effective history retention (run-cell.sh cell_retention):
+    devnet/wsl/start-node.sh passes --retention-blocks=V for a non-empty
+    TORUS_RETENTION_BLOCKS (digits only), the node reads 0 as archive and no
+    flag as the prune-by-default N = 100,000 (s131). None when the cell
+    recorded no node env (legacy): unknown, not guessed."""
+    if not isinstance(node_env, dict):
+        return None
+    v = node_env.get("TORUS_RETENTION_BLOCKS")
+    if v is None or v == "":
+        return "100000(default)"
+    if not v.isascii() or not v.isdigit():
+        return "invalid"
+    return "archive" if int(v) == 0 else str(int(v))
+
+
 def node_flags(node_env):
     if not isinstance(node_env, dict):
         return None
@@ -1450,6 +1466,8 @@ summary = {
              # s131: the effective book mode and default-changed flags (None = no node env recorded).
              "book_mode": book_mode(NODE_ENV if A.node_env else None),
              "node_flags": node_flags(NODE_ENV if A.node_env else None),
+             # s131: the effective history retention (prune by default since the RH4 merge).
+             "retention": retention(NODE_ENV if A.node_env else None),
              "extra_env": A.extra_env, "node_env": NODE_ENV,
              "env_digests_per_node": A.env_digests.split(), "bench_cmd": A.bench_cmd, "node_pids": A.pids.split()},
     "timing": {"t_bench0": t0, "t_bench1": t1, "t_drain": td, "bench_wall_s": t1 - t0, "drain_s": td - t1,

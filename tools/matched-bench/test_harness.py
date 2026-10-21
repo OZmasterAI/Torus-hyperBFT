@@ -1324,8 +1324,9 @@ class CrashKillGuardTest(unittest.TestCase):
 # ------------------------------- start-node.sh: optional history retention (Q9)
 class StartNodeRetentionTest(unittest.TestCase):
     """devnet/wsl/start-node.sh passes `--retention-blocks=N` only when
-    TORUS_RETENTION_BLOCKS is set. Unset or empty = archive, the argv of every
-    earlier cell, byte for byte. The flag goes last, so crash-kill.sh's
+    TORUS_RETENTION_BLOCKS is set. Unset or empty = no flag, the argv of every
+    earlier cell, byte for byte (since s131 that means the node default,
+    prune by default with N = 100,000; TORUS_RETENTION_BLOCKS=0 = archive). The flag goes last, so crash-kill.sh's
     `--data-dir=` match (and with it the restart) still accepts the node."""
 
     START_NODE_SH = os.path.join(
@@ -1428,7 +1429,213 @@ class StartNodeRetentionTest(unittest.TestCase):
         self.assertIsNone(argv, "the node must not start")
 
 
+class StartNodeAttestKeyTest(StartNodeRetentionTest):
+    """devnet/wsl/start-node.sh passes `--state-hash-attest-key=D/val<idx>.key`
+    only when STATE_HASH_ATTEST_KEY_DIR=D is set (run-cell.sh STATE_HASH_ATTEST=1).
+    Unset or empty = no flag, the argv of every earlier cell. The flag goes last
+    (after the retention flag), so crash-kill.sh's restart still accepts the node."""
+
+    def start(self, retention=None, key_dir=None):
+        old = os.environ.pop("STATE_HASH_ATTEST_KEY_DIR", None)
+        try:
+            if key_dir is not None:
+                os.environ["STATE_HASH_ATTEST_KEY_DIR"] = key_dir
+            return super().start(retention)
+        finally:
+            os.environ.pop("STATE_HASH_ATTEST_KEY_DIR", None)
+            if old is not None:
+                os.environ["STATE_HASH_ATTEST_KEY_DIR"] = old
+
+    def key_dir(self):
+        d = os.path.join(self.d, "attest-keys")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "val1.key"), "w") as f:
+            f.write("ab" * 32 + "\n")
+        os.chmod(os.path.join(d, "val1.key"), 0o600)
+        return d
+
+    def test_unset_or_empty_passes_no_attest_key(self):
+        r, argv = self.start()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse([a for a in argv if "attest" in a], argv)
+        r, empty = self.start(key_dir="")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(empty, argv)
+
+    def test_set_appends_the_attest_key_last(self):
+        _, plain = self.start()
+        d = self.key_dir()
+        r, argv = self.start(key_dir=d)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(argv, plain + ["--state-hash-attest-key=%s/val1.key" % d])
+        r, both = self.start("5000", key_dir=d)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(
+            both,
+            plain + ["--retention-blocks=5000", "--state-hash-attest-key=%s/val1.key" % d],
+        )
+        pids = os.path.join(self.d, "pids")
+        with open(pids, "w") as f:
+            f.write("1001\n")
+        g = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; shift; crash_target_ok "$@"',
+                "_",
+                CRASH_KILL_SH,
+                "1",
+                "1001",
+                " ".join([self.bin] + both),
+                self.d,
+                pids,
+            ],
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, CRASH_KILL_LIB="1"),
+            timeout=30,
+        )
+        self.assertEqual(g.returncode, 0, g.stderr)
+
+    def test_missing_key_file_refuses_to_start(self):
+        r, argv = self.start(key_dir=os.path.join(self.d, "nowhere"))
+        self.assertEqual(r.returncode, 7)
+        self.assertIn("has no readable val1.key", r.stderr)
+        self.assertIsNone(argv, "the node must not start")
+
+
+class StateHashAttestHarnessTest(unittest.TestCase):
+    """STATE_HASH_ATTEST=1: attest keys + live fail-stop on the nodes, a post-cell
+    h_n comparison (state_attest.py). Off (the default) the cell is unchanged."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(RUN_CELL_SH) as f:
+            cls.src = f.read()
+
+    def test_default_off_documented_and_allowlisted(self):
+        self.assertIn("STATE_HASH_ATTEST=${STATE_HASH_ATTEST:-0}", self.src)
+        head = self.src[: self.src.index("set -uo pipefail")]
+        self.assertIn("#   STATE_HASH_ATTEST=1", head)
+        with open(os.path.join(HERE, "campaign", "run_cell.py")) as f:
+            rc = f.read()
+        self.assertIn('"STATE_HASH_ATTEST",', rc)
+        self.assertIn('"BOOK_WINDOW_COMMIT",', rc)
+        with open(os.path.join(HERE, "resummarize.sh")) as f:
+            self.assertIn('"$T/state_attest.py" summary', f.read())
+
+    def test_every_step_is_gated(self):
+        for marker in (
+            "    export TORUS_STATE_HASH_FAILSTOP=1",
+            '    export STATE_HASH_ATTEST_KEY_DIR="$RUN_DIR/attest-keys"',
+            '"$SELF_DIR/state_attest.py" keys',
+            "--state-hash-attest-key=$STATE_HASH_ATTEST_KEY_DIR/val$i.key",
+            '"$SELF_DIR/state_attest.py" scan',
+            '"$SELF_DIR/state_attest.py" summary',
+            "jq -e '.state_attest.ok == true'",
+        ):
+            i = self.src.index(marker)
+            gate = self.src.rindex("if state_attest_on", 0, i)
+            self.assertNotIn("\nfi\n", self.src[gate:i], marker)
+        # an inherited key dir never reaches a cell that did not ask for it
+        self.assertIn("unset STATE_HASH_ATTEST_KEY_DIR\nif state_attest_on; then", self.src)
+
+    def test_order_failstop_before_extra_env_scan_before_stop(self):
+        s = self.src
+        fs = s.index("    export TORUS_STATE_HASH_FAILSTOP=1")
+        self.assertLess(s.index("for v in $(env | grep -oE '^TORUS_[A-Za-z0-9_]+'); do unset"), fs)
+        self.assertLess(fs, s.index('for kv in $EXTRA_ENV; do export "$kv"; done\n# HOTSTUFF_CPUS'))
+        self.assertLess(fs, s.index('NODE_ENV_JSON=$(env | grep'))  # recorded in the node env
+        argv = s.index("--state-hash-attest-key=$STATE_HASH_ATTEST_KEY_DIR/val$i.key")
+        self.assertLess(s.index('mapfile -t PIDS < "$RUN_DIR/pids"'), argv)
+        scan = s.index('"$SELF_DIR/state_attest.py" scan')
+        self.assertLess(s.index('cat "$OUT/agreement.jsonl" >> "$OUT/run.log"'), scan)
+        self.assertLess(
+            scan,
+            s.index("# ---------------------------------------------------------------- 9. stop + collect logs"),
+        )
+        summ = s.index('"$SELF_DIR/state_attest.py" summary')
+        self.assertLess(s.index('python3 "$TOOLS_DIR/summarize.py"'), summ)
+        self.assertLess(summ, s.index('log "done -> $OUT/summary.json"'))
+
+    def test_bad_env_fails_preflight(self):
+        tmp = tempfile.mkdtemp(prefix="attest-pre-")
+        try:
+            fake_target(tmp)
+            script, wt = sandbox_repo(tmp)
+            env0 = {k: v for k, v in os.environ.items() if k not in ("STATE_HASH_ACTIVATION", "STATE_HASH_ATTEST")}
+            env0.update(TARGET_DIR=tmp, RESULTS_ROOT=tmp, DATA_ROOT=tmp, BENCH_ALLOW_UNDETACHED="1")
+            cases = [
+                (dict(STATE_HASH_ATTEST="yes"), 2, "STATE_HASH_ATTEST must be unset, 0 or 1"),
+                (dict(STATE_HASH_ATTEST="1"), 2, "STATE_HASH_ATTEST=1 needs STATE_HASH_ACTIVATION"),
+                (dict(STATE_HASH_ATTEST="1", STATE_HASH_ACTIVATION="1"), 1, "state_attest.py"),
+            ]
+            for env, rc, msg in cases:
+                r = subprocess.run(
+                    [script, wt, "attest-pre-x"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=dict(env0, **env),
+                )
+                self.assertEqual(r.returncode, rc, r.stderr)
+                self.assertIn(msg, r.stderr)
+                self.assertFalse(os.path.exists(os.path.join(tmp, "attest-pre-x")), "must fail before any launch")
+            # with state_attest.py beside run-cell.sh: a worktree whose start-node.sh lacks the key dir is refused
+            shutil.copy2(os.path.join(HERE, "state_attest.py"), os.path.dirname(script))
+            with open(os.path.join(wt, "devnet", "wsl", "start-node.sh"), "w") as f:
+                f.write("start_node() { :; }\n")
+            r = subprocess.run(
+                [script, wt, "attest-pre-x"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=dict(env0, STATE_HASH_ATTEST="1", STATE_HASH_ACTIVATION="1"),
+            )
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertIn("does not pass --state-hash-attest-key", r.stderr)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "attest-pre-x")))
+        finally:
+            shutil.rmtree(tmp)
+
+
 # --------------------------------------------- run-cell.sh: which tools score
+class ResummarizeStateAttestTest(unittest.TestCase):
+    """[claude-review] P2: summarize.py rewrites summary.json without .state_attest; a cell whose scan
+    wrote no state-attest.json must come back REJECT from resummarize.sh, not ACCEPT."""
+
+    def cell(self):
+        d = tempfile.mkdtemp(prefix="attest-resum-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        write_cell(d, 1000, 1000, dur=120)
+        write_agreement(d, ["0xaa"] * 3)
+        run_summarize(d, dur=120)
+        return d
+
+    def resummarize(self, d):
+        r = subprocess.run(["bash", os.path.join(HERE, "resummarize.sh"), d],
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(d, "summary.json")) as f:
+            return json.load(f)
+
+    def attest_summary(self, d):
+        r = subprocess.run([sys.executable, "-I", os.path.join(HERE, "state_attest.py"), "summary", "--dir", d],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_scan_without_file_stays_rejected(self):
+        d = self.cell()
+        self.attest_summary(d)  # no state-attest.json: ok=false, REJECT
+        s = self.resummarize(d)
+        self.assertIs(s["state_attest"]["ok"], False)
+        self.assertEqual(s["validity"]["verdict"], "REJECT")
+
+    def test_cell_without_attest_is_untouched(self):
+        s = self.resummarize(self.cell())
+        self.assertNotIn("state_attest", s)
+
+
 class ToolsDirResolutionTest(unittest.TestCase):
     """A candidate is scored by ITS OWN summarize.py. run-cell.sh lives in the
     integration repo but is handed a candidate worktree; resolving the scoring
@@ -4097,16 +4304,30 @@ class DetachTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.d, "data")))
 
     def _detach(self, name, script, extra_env=None):
+        """Start SCRIPT through detach.sh in unit bench-NAME. HOME is a temp dir without projects/wt, so the unit
+        takes no build lock (detach.sh: "No $HOME/projects/wt: no lock"; DetachBuildLockTest covers the lock):
+        under the real ~/projects/wt/.cargo-heavy.lock a builder holding it made these tests wait out the 20 s
+        deadline, fail, and leave the unit queued on the lock. The unit is stopped on cleanup either way."""
         log = os.path.join(self.d, "out.log")
+        home = os.path.join(self.d, "home")
+        os.makedirs(home, exist_ok=True)
+        unit = "bench-%s.service" % re.sub(r"[^A-Za-z0-9_.-]", "-", name)
+        self.addCleanup(
+            subprocess.run,
+            ["systemctl", "--user", "stop", unit],
+            capture_output=True,
+            timeout=30,
+        )
         r = subprocess.run(
             ["bash", DETACH_SH, name, log, "bash", "-c", script],
             capture_output=True,
             text=True,
             timeout=30,
-            env=dict(os.environ, DETACH_PROBE="carried", **(extra_env or {})),
+            env=dict(os.environ, HOME=home, DETACH_PROBE="carried", **(extra_env or {})),
             cwd=self.d,
         )
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("holds the build lock", r.stdout, "the test unit must not queue on the shared build lock")
         deadline = time.time() + 20
         text = None
         while time.time() < deadline:
@@ -4130,10 +4351,7 @@ class DetachTest(unittest.TestCase):
         )
         kv = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
         self.assertTrue(kv["CG"].endswith("/bench-%s.service" % name), kv["CG"])
-        if kv["PARENT"] == "flock":  # build lock holder (~/projects/wt exists)
-            self.assertEqual(kv["GRANDPARENT"], "systemd")
-        else:
-            self.assertEqual(kv["PARENT"], "systemd")
+        self.assertEqual(kv["PARENT"], "systemd")  # no build lock (_detach): no flock in between
         self.assertEqual(
             kv["PROBE"], "carried", "caller's exported env must carry over"
         )
@@ -5585,6 +5803,20 @@ BOOK_MODE_CASES = (
 )
 
 
+# TORUS_RETENTION_BLOCKS -> the effective history retention of the cell
+# (devnet/wsl/start-node.sh passes --retention-blocks=V when V is non-empty;
+# torus-node: 0 = archive, unset = the default N = 100,000 since s131).
+RETENTION_CASES = [
+    (None, "100000(default)"),
+    ("", "100000(default)"),
+    ("0", "archive"),
+    ("000", "archive"),
+    ("1000", "1000"),
+    ("0100", "100"),
+    ("12x", "invalid"),
+]
+
+
 class BookModeNotPinnedTest(unittest.TestCase):
     """s131 (bench 8y, perf doc section 110): RECORD_ENV pinned
     TORUS_BOOK_ROWS=3, so a cell was mode 3 unless its campaign overrode the
@@ -5656,6 +5888,47 @@ class BookModeNotPinnedTest(unittest.TestCase):
         # the order is fixed, so two arms' lines diff cleanly
         pos = [line.index(" %s='" % k) for k in AUDITED_FLAGS]
         self.assertEqual(pos, sorted(pos), line)
+
+    def test_flag_line_records_the_effective_retention(self):
+        """claude-review P2 (s131): since prune by default a cell without
+        TORUS_RETENTION_BLOCKS runs retention (N = 100,000, DA GC worker and
+        pruner on), so the line names the effective retention per cell."""
+        for extra, want in [
+            ("TORUS_X=1", "retention=100000(default)"),
+            ("TORUS_RETENTION_BLOCKS=0", "retention=archive"),
+            ("TORUS_RETENTION_BLOCKS=1000", "retention=1000"),
+        ]:
+            with self.subTest(extra=extra):
+                r, log = self.run_cell(extra, TORUS_RETENTION_BLOCKS="7")  # ambient: must not leak
+                lines = self.flags_line(log)
+                self.assertEqual(len(lines), 1, r.stdout + r.stderr + log)
+                self.assertIn(" book_mode=", lines[0])
+                self.assertIn(" " + want + " ", lines[0])
+
+    def test_bash_retention_mirrors_start_node_and_the_node(self):
+        fn = self.node_flags_fn()
+        for v, want in RETENTION_CASES:
+            with self.subTest(v=v):
+                env = {k: x for k, x in os.environ.items() if not k.startswith("TORUS_")}
+                if v is not None:
+                    env["TORUS_RETENTION_BLOCKS"] = v
+                r = subprocess.run(["bash", "-c", fn + "\nnode_flags_line"],
+                                   capture_output=True, text=True, timeout=10, env=env)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn(" retention=%s " % want, r.stdout, (v, r.stdout))
+
+    def test_summary_records_the_effective_retention(self):
+        d = tempfile.mkdtemp(prefix="retention-sum-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        write_cell(d, 1_000, 1_000)
+        write_agreement(d, ["same"] * 3)
+        for v, want in RETENTION_CASES:
+            with self.subTest(v=v):
+                env = {} if v is None else {"TORUS_RETENTION_BLOCKS": v}
+                s, _ = run_summarize(d, extra=["--node-env", json.dumps(env)])
+                self.assertEqual(s["cell"]["retention"], want)
+        s, _ = run_summarize(d)
+        self.assertIsNone(s["cell"]["retention"])
 
     def node_flags_fn(self):
         with open(RUN_CELL_SH) as f:

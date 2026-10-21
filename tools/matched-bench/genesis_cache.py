@@ -30,7 +30,7 @@ The inputs (test_genesis_cache.py checks that every env name the generator scrip
 EXEMPT_ENV): the generator scripts and their data (KEY_FILES, incl. the weighted-full base genesis and its params
 sidecar), the cell's MARKETS / BULK_COUNT / TIMEOUT_BASE_MS / EVM_BLOCK_INTERVAL (the generator's knobs) and
 LIQ_THIN / LIQ_THIN_AVAIL (run-cell.sh patches the genesis after the generator), the ambient env the generator
-reads (STATE_HASH_ACTIVATION, gen-weighted-genesis.sh's BASE / BULK_OFFSET / NATIVE_AVAIL / EVM_WEI) and the
+reads (STATE_HASH_ACTIVATION, BOOK_WINDOW_COMMIT, gen-weighted-genesis.sh's BASE / BULK_OFFSET / NATIVE_AVAIL / EVM_WEI) and the
 md5 of the BASE file. FUNDED_BULK_END is a bench-throughput (load) argument, not a genesis input.
 """
 
@@ -69,6 +69,7 @@ PARAMS = (
 # the scripts read them as ${NAME:-default})
 AMBIENT_ENV = (
     "STATE_HASH_ACTIVATION",
+    "BOOK_WINDOW_COMMIT",
     "BASE",
     "BULK_OFFSET",
     "NATIVE_AVAIL",

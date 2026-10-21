@@ -185,6 +185,15 @@ if [ -n "${STATE_HASH_ACTIVATION:-}" ]; then
     tmp=$(mktemp) && jq --argjson h "$STATE_HASH_ACTIVATION" '.consensus.state_hash_activation_height = $h' "$OUT" > "$tmp" && mv "$tmp" "$OUT"
 fi
 
+# 6. Optional L6.1 window-committed Classic books (docs/plans/l61-window-committed-books.md).
+#    CHAIN-WIDE genesis field; needs STATE_HASH_ACTIVATION (the node refuses it otherwise).
+if [ "${BOOK_WINDOW_COMMIT:-0}" = 1 ]; then
+    [ -n "${STATE_HASH_ACTIVATION:-}" ] \
+        || { echo "FATAL: BOOK_WINDOW_COMMIT=1 needs STATE_HASH_ACTIVATION" >&2; exit 1; }
+    tmp=$(mktemp) && jq '.consensus.book_window_commit = true' "$OUT" > "$tmp" && mv "$tmp" "$OUT"
+    echo "  book_window_commit = on (L6.1)"
+fi
+
 echo "wrote $OUT"
 # One jq pass for the whole summary (each pass parses the full genesis, ~3 s at 1M accounts).
 jq -r '

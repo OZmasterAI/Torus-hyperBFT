@@ -6,9 +6,9 @@
 
 - **Disk**: RocksDB stores all chain state across 33 column families. Disk usage
   grows linearly with block count. The primary consumers are block bodies and
-  receipts. With pruning enabled (`--retention-blocks`), disk growth is bounded
-  to approximately the retention window. Without pruning (archive mode), plan for
-  continuous growth.
+  receipts. With pruning (the default since s131, `--retention-blocks`, N =
+  100,000), disk growth is bounded to approximately the retention window.
+  Without pruning (`--archive`), plan for continuous growth.
 - **RAM**: RocksDB uses memory-mapped files and block cache. Minimum 4 GB
   recommended; 8+ GB for validators under load.
 - **CPU**: Block building involves EVM execution and state root computation.
@@ -65,8 +65,8 @@ The binary is at `target/release/torus-node`.
 | `--p2p-peers` | string | none | Comma-separated bootstrap peer multiaddrs |
 | `--rpc-addr` | addr | `0.0.0.0:8545` | JSON-RPC listen address |
 | `--log-level` | string | `info` | Log level: trace, debug, info, warn, error |
-| `--archive` | flag | off | Archive mode: retain all historical data |
-| `--retention-blocks` | u64 | none | Enable pruning: keep last N blocks of history |
+| `--archive` | flag | off | Archive mode: retain all historical data. Run it on at least one **validator** per network (block sync is served by validators only) |
+| `--retention-blocks` | u64 | 100000 | History retention, on by default since s131: keep the last N blocks of history; `0` = archive. An existing archive data dir past N must be restarted with `--archive` or an explicit `--retention-blocks N` (see `pruning-guide.md`) |
 
 ### Subcommands
 

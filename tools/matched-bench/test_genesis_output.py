@@ -59,7 +59,8 @@ for i in $(seq "$3" $(( $3 + $5 - 1 ))); do printf '%s 0x%040x\\n' "$i" "$i"; do
         environment = dict(os.environ)
         for name in ('BASE', 'BIN', 'OUT', 'FORCE', 'MARKETS', 'TIMEOUT_BASE_MS',
                      'BULK_OFFSET', 'BULK_COUNT', 'NATIVE_AVAIL', 'EVM_WEI',
-                     'EVM_BLOCK_INTERVAL', 'STATE_HASH_ACTIVATION', 'BOOK_MODE'):
+                     'EVM_BLOCK_INTERVAL', 'STATE_HASH_ACTIVATION', 'BOOK_MODE',
+                     'BOOK_WINDOW_COMMIT'):
             environment.pop(name, None)
         environment.update(OUT=str(self.output), BENCH_BIN=str(self.binary), MARKETS='3',
                            FORCE='1' if force else '0', BULK_OFFSET='60', BULK_COUNT='2',
@@ -222,6 +223,19 @@ for i in $(seq "$3" $(( $3 + $5 - 1 ))); do printf '%s 0x%040x\\n' "$i" "$i"; do
     # ---- EVM_BLOCK_INTERVAL (bench Q12, item 7 step 3 option S): the genesis
     # EVM cadence N, `.evm.block_interval` (EvmConfig.block_interval; absent =
     # torus_types::DEFAULT_EVM_BLOCK_INTERVAL = 11).
+
+    def test_book_window_commit_needs_the_state_hash_and_sets_the_consensus_flag(self):
+        # L6.1 (ported from perf/l61-window-books 9930fc60): chain-wide genesis field
+        final = self.generate(STATE_HASH_ACTIVATION='1', BOOK_WINDOW_COMMIT='1')[1]
+        self.assertEqual(final['consensus']['state_hash_activation_height'], 1)
+        self.assertIs(final['consensus']['book_window_commit'], True)
+        for value in (None, '', '0'):
+            with self.subTest(value=value):
+                final = self.generate(STATE_HASH_ACTIVATION='1', BOOK_WINDOW_COMMIT=value)[1]
+                self.assertNotIn('book_window_commit', final.get('consensus', {}))
+        result = self.run_script(BOOK_WINDOW_COMMIT='1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('BOOK_WINDOW_COMMIT=1 needs STATE_HASH_ACTIVATION', result.stderr)
 
     def test_evm_block_interval_sets_the_final_genesis_only(self):
         # MARKETS=3 > the base's 2: the synthesis branch, which is the one the

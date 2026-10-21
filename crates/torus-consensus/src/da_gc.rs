@@ -5,7 +5,10 @@
 //! `cf_native_pending`, and with shard custody on (`TORUS_SHARD_CUSTODY=1`,
 //! off by default since s128) as erasure shards in `cf_native_shards`. Before RH4 nothing deleted them.
 //! The GC itself is [`torus_state::NativeDaStore::gc_committed`], run once per
-//! dispatched committed height from `TorusApp::dispatch_to_exec`.
+//! dispatched committed height: `TorusApp::dispatch_to_exec` hands the height
+//! to the GC worker thread ([`crate::da_gc_worker`]; `TORUS_DA_GC_INLINE=1`:
+//! the pass runs inside the dispatch, as before). See "Where the passes run"
+//! below.
 //!
 //! # Why bodies follow the block tree
 //!
@@ -104,6 +107,9 @@
 //!   block of every commit, where the held rows go (up to [`DA_GC_LIMITS`]
 //!   rows per pass). In the opt-in non-blocking dispatch, steady
 //!   backpressure can hold it for long: visible as `reason="dispatch_behind"`.
+//!   On the worker, a pass that runs while later heights are still queued
+//!   only records (see "Where the passes run"), so the queue alone never
+//!   holds a pass.
 //! - A due body a block ABOVE the committed tip references stays (claude
 //!   review r4 / Codex r3 P2, torus issue 282de5bb): the tree holds and
 //!   block-syncs its uncommitted tail, and a tail block may commit on a node
@@ -112,8 +118,9 @@
 //!   from the DA store; dispatch's restore runs only after that rebuild. At
 //!   the first due row the pass reads the tail ([`BlockTreeHistory`]:
 //!   [`uncommitted_native_hashes_in_tree`], every branch, normally 2-3
-//!   blocks) and skips the hashes it references: the row goes, the body, its
-//!   reference and shards stay. If the tail block commits, its record owns
+//!   blocks; read from the committed tip the pass read, so a block committed
+//!   in between is read too) and skips the hashes it references: the row
+//!   goes, the body, its reference and shards stay. If the tail block commits, its record owns
 //!   the body; if it never does, the body stays for good (it takes a faulty
 //!   leader re-including a ~window-old action as its row expires). A tail
 //!   block that cannot be read or decoded (or a tail over
@@ -128,7 +135,7 @@
 //! labelled with the first rule that held it
 //! ([`torus_state::DaGcHoldReason`]: `gap`, `backfilling`, `unrecorded`,
 //! `pre_cursor`, `pruned_gap`, `dispatch_behind`, `tip_unreadable`,
-//! `tail_unreadable`, `store_error`; P3, claude-review r4).
+//! `tail_unreadable`, `store_error`, `fence_full`; P3, claude-review r4).
 //!
 //! A fresh store (no GC state, so no row a lost pin could matter for)
 //! establishes the cursor at its first recorded height. A store a pre-cursor
@@ -146,6 +153,48 @@
 //! a fresh store at its first dispatched height) have no row and stay for
 //! good. Testnet starts from a fresh genesis, so none exist there.
 //!
+//! # Where the passes run (bench 8o, s132)
+//!
+//! Inline, the pass cost 1.4-1.7 ms per native block on the hotstuff
+//! algorithm thread, with 51-189 ms stalls (95% the DB write). It now runs on
+//! one worker thread ([`crate::da_gc_worker`]). The consensus thread only
+//! builds a job (the dispatched height, the action hashes dispatch already
+//! computed, moved; the shard count; the actions only if the body row did
+//! not land) and pushes it on a bounded queue
+//! ([`crate::da_gc_worker::DA_GC_QUEUE_CAP`]): no DB read or write, no body
+//! lookup, no wait for a pass (`torus_da_gc_handoff_seconds`). The worker restores,
+//! records, scans and writes, in height order, by the rules above.
+//!
+//! - Full queue: the height is kept, the job dropped (counted,
+//!   `torus_da_gc_coalesced_heights`); its record is back-filled from the
+//!   block tree by the cursor rule, as after a crash. A crash with jobs
+//!   queued or a pass half done is the same case.
+//! - A batch the worker drains: every job but the last only records; the
+//!   last runs the full pass. Deletion lags dispatch by the queue, never
+//!   leads the inline rule: every bound is read when the pass runs, and the
+//!   cursor rule still holds deletion until every dispatched height up to
+//!   the pass is recorded.
+//! - Concurrent body checks: a block can be validated (its bodies found
+//!   present) after the pass read the tail and before its delete batch
+//!   lands. Every check (proposal check, validation, the proposer's mirror)
+//!   pins its block's hashes first in the mempool's
+//!   [`torus_state::DaGcFence`]; right before its write the pass drops the
+//!   pinned bodies (row goes, body stays: `torus_da_gc_fence_kept`) and marks
+//!   the rest as being deleted, and a check that meets a mark treats the
+//!   body as missing. The fence lock is held for set operations only, never
+//!   across DB I/O. Pins go once the worker passed their height. The fence
+//!   is bounded: one height entry per pinned hash, at most
+//!   `DA_GC_FENCE_MAX_PINS` hashes (a hash refused at the cap makes every
+//!   pass hold, `reason="fence_full"`, until the worker passed its height;
+//!   new hashes are pinned again as soon as there is room), released in
+//!   bounded chunks so no fence lock hold grows with the pins,
+//!   and no pin above the committed tip plus `DA_GC_FENCE_HEIGHT_WINDOW` (a
+//!   speculative far-future datum): such a check reads its bodies as missing
+//!   (`torus_da_gc_fence_refused_pins`).
+//! - Queue depth, lag and fence size: `torus_da_gc_queue_depth`,
+//!   `torus_da_gc_lag_heights`, `torus_da_gc_fence_pins`. The slow-pass warn
+//!   line and the pass metrics are unchanged (they time the worker's pass).
+//!
 //! # Design alternative not chosen (s128)
 //!
 //! After three review rounds (each finding a way the cursor + record
@@ -161,9 +210,9 @@ use hotstuff_rs::block_tree::accessors::public::BlockTreeCamera;
 use hotstuff_rs::block_tree::pluggables::{KVGetError, Key};
 use hotstuff_rs::block_tree::variables::BLOCK_TREE_PRUNED_HEIGHT;
 use hotstuff_rs::hotstuff::types::PhaseCertificate;
-use hotstuff_rs::types::data_types::BlockHeight;
+use hotstuff_rs::types::data_types::{BlockHeight, CryptoHash};
 use torus_state::cf::CF_CONSENSUS_META;
-use torus_state::{DaGcHistory, DaGcLimits, StateDb, StateError};
+use torus_state::{DaGcFence, DaGcHistory, DaGcLimits, StateDb, StateError};
 use torus_types::{compute_action_hash, CompactBlock, SignedNativeAction, TorusBlock, B256};
 
 use crate::kv_store::RocksKVStore;
@@ -180,21 +229,23 @@ pub const DA_GC_MARGIN_BLOCKS: u64 = 128;
 /// well past the push-race and normal follower lag.
 pub const MIN_DA_BODY_RETENTION: u64 = 128;
 
-/// Per-pass bounds on the consensus thread. Steady state is one row per pass
+/// Per-pass bounds (the pass runs on the GC worker; inline on the consensus
+/// thread). Steady state is one row per pass
 /// (one block: at most the proposer cap of 400 actions by default, each one
 /// body key plus one key per shard). The bounds only bite on a backlog (a
 /// smaller window after a restart, or a burst of dispatches), which then
-/// drains at up to 7 heights per dispatch.
+/// drains at up to 7 heights per full pass.
 pub const DA_GC_LIMITS: DaGcLimits = DaGcLimits {
     max_rows: 8,
     max_deletes: 16_384,
 };
 
 /// A GC pass that takes at least this long (ms) logs one warn line with its
-/// phases (`TorusApp::gc_da_bodies_after_dispatch`) and counts
+/// phases (`crate::da_gc_worker::DaGcRunner`) and counts
 /// `torus_da_gc_slow_passes`; `TORUS_DA_GC_SLOW_MS` overrides it
 /// ([`resolve_da_gc_slow_ms`]). 8h saw rare 51-205 ms passes on the
-/// consensus thread with nothing recorded to explain them.
+/// consensus thread with nothing recorded to explain them; the line is now
+/// logged by the worker (`DaGcRunner`).
 pub const DA_GC_SLOW_PASS_MS: u64 = 50;
 
 /// The slow-pass log threshold in ms from `TORUS_DA_GC_SLOW_MS` (`env`):
@@ -202,14 +253,6 @@ pub const DA_GC_SLOW_PASS_MS: u64 = 50;
 pub fn resolve_da_gc_slow_ms(env: Option<&str>) -> u64 {
     env.and_then(|raw| raw.trim().parse().ok())
         .unwrap_or(DA_GC_SLOW_PASS_MS)
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Test hook: [`BlockTreeHistory`]'s tail read sleeps this long first,
-    /// so a test can make one GC phase slow.
-    pub(crate) static TEST_TAIL_DELAY: std::cell::Cell<std::time::Duration> =
-        const { std::cell::Cell::new(std::time::Duration::ZERO) };
 }
 
 /// The DA body GC window in blocks, `None` = GC off.
@@ -292,6 +335,13 @@ pub fn tree_served_from(pointer: Option<u64>) -> Option<u64> {
 /// `db` (`None` = nothing committed). An unreadable tip is an error, never
 /// "nothing committed".
 pub fn read_tree_committed_tip(db: &StateDb) -> Result<Option<u64>, StateError> {
+    read_tree_committed_tip_block(db).map(|tip| tip.map(|(_, height)| height))
+}
+
+/// [`read_tree_committed_tip`], with the tip block's hash.
+pub fn read_tree_committed_tip_block(
+    db: &StateDb,
+) -> Result<Option<(CryptoHash, u64)>, StateError> {
     let tree_err = |e| StateError::InvalidData(format!("block tree committed tip: {e:?}"));
     let camera = BlockTreeCamera::new(RocksKVStore::new(db.db_arc()));
     let snapshot = camera.snapshot();
@@ -303,7 +353,7 @@ pub fn read_tree_committed_tip(db: &StateDb) -> Result<Option<u64>, StateError> 
             "block tree: the highest committed block has no height".into(),
         ));
     };
-    Ok(Some(torus_height_of(height.int()).unwrap_or(u64::MAX)))
+    Ok(Some((hash, torus_height_of(height.int()).unwrap_or(u64::MAX))))
 }
 
 /// RH4 DA body GC settings of a node ([`crate::app::TorusApp::set_da_body_gc`]).
@@ -407,13 +457,27 @@ pub fn uncommitted_native_hashes_in_tree(db: &StateDb) -> Result<Vec<B256>, Stat
 
 /// [`uncommitted_native_hashes_in_tree`], and how many tail blocks it read.
 pub fn uncommitted_native_tail_in_tree(db: &StateDb) -> Result<(Vec<B256>, usize), StateError> {
+    uncommitted_native_tail_from(db, None)
+}
+
+/// [`uncommitted_native_tail_in_tree`] from the descendants of `from` (a
+/// committed block, e.g. the tip a GC pass read earlier: then the blocks
+/// committed since are read too) instead of the current committed tip;
+/// `None` = the current committed tip.
+pub fn uncommitted_native_tail_from(
+    db: &StateDb,
+    from: Option<CryptoHash>,
+) -> Result<(Vec<B256>, usize), StateError> {
     let tree_err = |e| StateError::InvalidData(format!("block tree tail read: {e:?}"));
     let camera = BlockTreeCamera::new(RocksKVStore::new(db.db_arc()));
     let snapshot = camera.snapshot();
-    let root = snapshot
-        .highest_committed_block()
-        .map_err(tree_err)?
-        .unwrap_or(PhaseCertificate::genesis_pc().block);
+    let root = match from {
+        Some(block) => block,
+        None => snapshot
+            .highest_committed_block()
+            .map_err(tree_err)?
+            .unwrap_or(PhaseCertificate::genesis_pc().block),
+    };
     let mut stack = vec![root];
     let mut hashes = Vec::new();
     let mut read = 0usize;
@@ -470,6 +534,14 @@ pub struct BlockTreeHistory<'a> {
     /// Tail blocks the last [`DaGcHistory::uncommitted_hashes`] read
     /// (slow-pass log).
     tail_blocks: std::cell::Cell<usize>,
+    /// The committed tip block [`DaGcHistory::committed_through`] read: the
+    /// tail is read from it, so a block committed between the two reads
+    /// (the pass runs off the consensus thread) is still read as tail.
+    tip_block: std::cell::Cell<Option<CryptoHash>>,
+    /// The fence against concurrent body checks (the GC worker's passes).
+    fence: Option<&'a DaGcFence>,
+    #[cfg(test)]
+    hooks: Option<&'a crate::da_gc_worker::DaGcTestHooks>,
 }
 
 impl<'a> BlockTreeHistory<'a> {
@@ -482,7 +554,24 @@ impl<'a> BlockTreeHistory<'a> {
             db,
             restore,
             tail_blocks: std::cell::Cell::new(0),
+            tip_block: std::cell::Cell::new(None),
+            fence: None,
+            #[cfg(test)]
+            hooks: None,
         }
+    }
+
+    /// Fence the pass's deletes against concurrent body checks
+    /// ([`DaGcFence`]; a pass off the consensus thread).
+    pub fn with_fence(mut self, fence: Option<&'a DaGcFence>) -> Self {
+        self.fence = fence;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_hooks(mut self, hooks: &'a crate::da_gc_worker::DaGcTestHooks) -> Self {
+        self.hooks = Some(hooks);
+        self
     }
 
     /// Blocks the last tail read walked (0 when none was read).
@@ -506,15 +595,38 @@ impl DaGcHistory for BlockTreeHistory<'_> {
     }
 
     fn committed_through(&self) -> Result<Option<u64>, StateError> {
-        read_tree_committed_tip(self.db)
+        let tip = read_tree_committed_tip_block(self.db)?;
+        self.tip_block.set(tip.map(|(hash, _)| hash));
+        Ok(tip.map(|(_, height)| height))
     }
 
     fn uncommitted_hashes(&self) -> Result<Vec<B256>, StateError> {
         #[cfg(test)]
-        std::thread::sleep(TEST_TAIL_DELAY.with(|d| d.get()));
-        let (hashes, blocks) = uncommitted_native_tail_in_tree(self.db)?;
+        if let Some(hooks) = self.hooks {
+            hooks.tail_read();
+        }
+        let (hashes, blocks) = uncommitted_native_tail_from(self.db, self.tip_block.get())?;
         self.tail_blocks.set(blocks);
         Ok(hashes)
+    }
+
+    fn begin_delete(&self, bodies: &mut Vec<([u8; 32], u16)>) -> u64 {
+        let kept = self.fence.map_or(0, |fence| fence.begin_delete(bodies));
+        #[cfg(test)]
+        if let Some(hooks) = self.hooks {
+            hooks.before_delete_write();
+        }
+        kept
+    }
+
+    fn end_delete(&self) {
+        if let Some(fence) = self.fence {
+            fence.end_delete();
+        }
+    }
+
+    fn fence_full(&self) -> bool {
+        self.fence.is_some_and(|fence| fence.is_full())
     }
 }
 

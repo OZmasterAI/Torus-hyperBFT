@@ -331,7 +331,8 @@
 #                testnet/genesis-weighted-full.json + params sidecar and the
 #                base genesis), this script, MARKETS, BULK_COUNT, the
 #                TIMEOUT_BASE_MS / EVM_BLOCK_INTERVAL of EXTRA_ENV, LIQ_THIN,
-#                LIQ_THIN_AVAIL, the ambient STATE_HASH_ACTIVATION / BASE /
+#                LIQ_THIN_AVAIL, the ambient STATE_HASH_ACTIVATION /
+#                BOOK_WINDOW_COMMIT / BASE /
 #                BULK_OFFSET / NATIVE_AVAIL / EVM_WEI, jq's version. A cached
 #                entry (<key>.genesis, its md5 re-checked on the copy) replaces
 #                the generator, weighted_full_check and the jq checks (their
@@ -351,6 +352,33 @@
 #                cell-endpass.sh, which the driver runs once after the
 #                campaign's last cell (deferred-scans.json marks the cell
 #                until then). Validity scans stay in-line. Default 0.
+#   STATE_HASH_ATTEST=1  running state hash attestation proof (needs the
+#                ambient STATE_HASH_ACTIVATION, else FATAL). Unset/0 (default) =
+#                off: no key, flag, env or step changes. When 1: state_attest.py
+#                keys writes each validator's secp256k1 ACCOUNT key (from
+#                $MAINREPO/devnet/wsl/bench-validator-keys.json, the address
+#                the genesis registers it under) to $RUN_DIR/attest-keys/val<i>.key
+#                (0600); STATE_HASH_ATTEST_KEY_DIR makes $WT/devnet/wsl/start-node.sh
+#                pass --state-hash-attest-key (launch and crash restart alike;
+#                a WT whose start-node.sh lacks it is FATAL at pre-flight), so
+#                every node signs AttestStateHash for each durable checkpoint
+#                (every 100 blocks) and the chain records the votes and the
+#                > 2/3 quorum hash; TORUS_STATE_HASH_FAILSTOP=1 is exported
+#                before EXTRA_ENV (fail-stop live: a node whose h_n differs
+#                from the on-chain quorum stops). After launch every node's
+#                argv must carry the flag. Before the devnet stops,
+#                state_attest.py scan compares every node's h_n (torus_getStateHash
+#                localHash) value for value at every checkpoint all nodes
+#                retain (up to 64, newest first, after waiting up to 90 s for
+#                the newest quorum), the on-chain votes and quorum hash, each
+#                node's state-hash metrics and log lines (attest key address,
+#                fail-stop on=true, submitted, MISMATCH / FAIL-STOP /
+#                no-quorum). Artifacts: state-attest.json (per height: every
+#                node's h_n, quorum, voters), the "state attest:" run.log line,
+#                summary.json .state_attest. Any problem (h_n differs, a vote
+#                or quorum differs, a missing quorum, a node that did not
+#                attest or whose fail-stop is off, a MISMATCH / FAIL-STOP line,
+#                an unreadable node) = validity REJECT and the cell FAILS.
 #   PRELOAD=N    bench queue 8f: after node ready (and fresh oracle marks)
 #                and BEFORE the metrics-before snapshot, the samplers and the
 #                load, `bench-throughput preload` places N non-crossing resting
@@ -472,6 +500,7 @@ KILL_NODE=${KILL_NODE:-val1}
 HOTSTUFF_CPUS=${HOTSTUFF_CPUS:-}
 SCHED_THREADS="hotstuff-algo torus-execution torus-flush-worker"
 ORACLE_FEED=${ORACLE_FEED:-0}
+STATE_HASH_ATTEST=${STATE_HASH_ATTEST:-0}
 ORACLE_PRICE=${ORACLE_PRICE:-30000}
 ORACLE_INTERVAL_MS=${ORACLE_INTERVAL_MS:-2000}
 ORACLE_WALK_BP=${ORACLE_WALK_BP:-0}
@@ -546,8 +575,9 @@ RECORD_ENV=(
 
 # Per-cell audit of the node settings whose default is not obvious from the
 # cell (s131): the book mode and the flags whose compiled default changed.
-# Logged as "cell=<label> book_mode=<m> K='v' ..." after the node env is final;
-# summarize.py records the same as summary.json cell.book_mode / cell.node_flags.
+# Logged as "cell=<label> book_mode=<m> retention=<r> K='v' ..." after the node
+# env is final; summarize.py records the same as summary.json cell.book_mode /
+# cell.retention / cell.node_flags.
 # The order is fixed so two arms' lines diff cleanly.
 NODE_FLAGS_AUDIT=(
     TORUS_BOOK_ROWS
@@ -557,6 +587,24 @@ NODE_FLAGS_AUDIT=(
     TORUS_BOOK_COALESCE
     TORUS_CHECKPOINT_INTERVAL_MS
 )
+# retention: the cell's effective history retention (claude-review P2, s131).
+# Since prune by default (merge/rh4-prune-default) a node without
+# --retention-blocks keeps the last 100,000 blocks: state pruner, block tree
+# and the RH4 DA body GC worker all run. devnet/wsl/start-node.sh passes
+# --retention-blocks=V when TORUS_RETENTION_BLOCKS=V is non-empty (digits only,
+# else it refuses), and the node reads 0 as archive. So: unset / empty ->
+# '100000(default)', 0 -> 'archive', N -> N, else 'invalid'. An archive arm (or
+# any comparison with a pre-merge, archive baseline such as 9a / 9d) needs
+# EXTRA_ENV='TORUS_RETENTION_BLOCKS=0'. A binary from before the merge reads
+# unset as archive: the line states the merged default, not that binary's.
+cell_retention() {
+    local v=${TORUS_RETENTION_BLOCKS-}
+    case "$v" in
+        '') echo '100000(default)' ;;
+        *[!0-9]*) echo invalid ;;
+        *) v=${v#"${v%%[!0]*}"}; echo "${v:-archive}" ;;
+    esac
+}
 # node_flags_line <genesis book mode>: book_mode= is the cell genesis'
 # consensus.book_mode (what every node runs; s131), classic / order_rows /
 # level_authority / level_authority_chunked -> classic/mode1/mode2/mode3.
@@ -571,6 +619,7 @@ node_flags_line() {
         *) mode=classic ;;
     esac
     printf 'book_mode=%s' "$mode"
+    printf ' retention=%s' "$(cell_retention)"
     for k in "${NODE_FLAGS_AUDIT[@]}"; do
         if [ -z "${!k+x}" ]; then printf " %s='unset (default)'" "$k"
         elif [ -z "${!k}" ]; then printf " %s='empty (default)'" "$k"
@@ -830,6 +879,23 @@ case "$ORACLE_FEED" in
         ;;
     *) echo "FATAL: ORACLE_FEED must be unset, 0 or 1 (got '$ORACLE_FEED')" >&2; exit 2 ;;
 esac
+
+# ---- running state hash attestation (STATE_HASH_ATTEST=1) pre-flight. Every
+# step below sits in an `if state_attest_on` block: off (the default), the cell
+# runs exactly as before.
+case "$STATE_HASH_ATTEST" in
+    0) ;;
+    1)
+        [ -n "${STATE_HASH_ACTIVATION:-}" ] \
+            || { echo "FATAL: STATE_HASH_ATTEST=1 needs STATE_HASH_ACTIVATION (the genesis running state hash; without it no node hashes or attests)" >&2; exit 2; }
+        [ -f "$SELF_DIR/state_attest.py" ] || { echo "FATAL: STATE_HASH_ATTEST=1 needs $SELF_DIR/state_attest.py" >&2; exit 1; }
+        [ -s "$ORACLE_KEYS" ] || { echo "FATAL: STATE_HASH_ATTEST=1 needs the validator key file $ORACLE_KEYS" >&2; exit 1; }
+        grep -q 'STATE_HASH_ATTEST_KEY_DIR' "$WSL/start-node.sh" 2>/dev/null \
+            || { echo "FATAL: STATE_HASH_ATTEST=1 but $WSL/start-node.sh does not pass --state-hash-attest-key (STATE_HASH_ATTEST_KEY_DIR): run the cell from a worktree whose devnet/wsl/start-node.sh has it" >&2; exit 1; }
+        ;;
+    *) echo "FATAL: STATE_HASH_ATTEST must be unset, 0 or 1 (got '$STATE_HASH_ATTEST')" >&2; exit 2 ;;
+esac
+state_attest_on() { [ "$STATE_HASH_ATTEST" = 1 ]; }
 
 # ---- EVM load (EVM_LOAD_RATE) pre-flight. Every EVM-load step below sits in an
 # `if evm_load_on` block: off (the default), the cell runs exactly as before.
@@ -1356,6 +1422,17 @@ if [ -n "$MAX_IN_FLIGHT" ]; then
     export TORUS_RPC_MAX_RESPONSE_MB=64
     log "MAX_IN_FLIGHT=$MAX_IN_FLIGHT: TORUS_RPC_MAX_RESPONSE_MB=64 on the nodes (loaded torus_getBlockBody replies pass the 10 MiB default)"
 fi
+# STATE_HASH_ATTEST=1: fail-stop live (before EXTRA_ENV, which may override it:
+# the scan then fails the cell) and each node's attest key (start-node.sh reads
+# STATE_HASH_ATTEST_KEY_DIR; not a TORUS_* var, so it is logged on its own).
+unset STATE_HASH_ATTEST_KEY_DIR
+if state_attest_on; then
+    export TORUS_STATE_HASH_FAILSTOP=1
+    ATTEST_ADDRS=$(python3 -I "$SELF_DIR/state_attest.py" keys --keys "$ORACLE_KEYS" --dir "$RUN_DIR/attest-keys" 2>&1) \
+        || die "STATE_HASH_ATTEST=1: attest keys not written: $ATTEST_ADDRS"
+    export STATE_HASH_ATTEST_KEY_DIR="$RUN_DIR/attest-keys"
+    log "state hash attestation: STATE_HASH_ACTIVATION=$STATE_HASH_ACTIVATION, keys in $STATE_HASH_ATTEST_KEY_DIR ($ATTEST_ADDRS), TORUS_STATE_HASH_FAILSTOP=1 before EXTRA_ENV"
+fi
 for kv in $EXTRA_ENV; do export "$kv"; done
 # HOTSTUFF_CPUS is a HARNESS knob (taskset, not read by the node) but is logged
 # alongside the node env so a pinned cell is recognisable from its summary.
@@ -1372,6 +1449,13 @@ log "node pids: ${PIDS[*]}"
 # verify the env actually reached each node process (fleet-uniform)
 ENV_VERIFY=$(for p in "${PIDS[@]}"; do tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -E '^TORUS_' | sort | md5sum | cut -c1-8; done | sort -u | tr '\n' ' ')
 log "per-node TORUS_* env digest(s): $ENV_VERIFY (must be a single value)"
+if state_attest_on; then
+    for i in 0 1 2; do
+        tr '\0' ' ' < "/proc/${PIDS[$i]}/cmdline" 2>/dev/null | grep -qF -- "--state-hash-attest-key=$STATE_HASH_ATTEST_KEY_DIR/val$i.key" \
+            || die "STATE_HASH_ATTEST=1: val$i (pid ${PIDS[$i]}) was started without --state-hash-attest-key=$STATE_HASH_ATTEST_KEY_DIR/val$i.key"
+    done
+    log "state hash attestation: every node's argv carries --state-hash-attest-key"
+fi
 
 # ---------------------------------------------------------------- 4. health
 scrape_one() { curl -fsS -m 3 "http://127.0.0.1:$1/metrics"; }
@@ -1946,6 +2030,22 @@ if evm_load_on; then
     log "EVM load: tx-flood $(jq -c '{sent,accepted,rejected,throttled,missed,reject_reasons,stopped_by,elapsed_s}' "$OUT/evm-load-stats.json" 2>/dev/null || echo 'stats=MISSING')"
 fi
 
+# STATE_HASH_ATTEST=1: every node's h_n at every checkpoint all nodes retain,
+# compared value for value, plus the on-chain votes / quorum and each node's
+# state-hash metrics and log lines, while the devnet still runs (idle blocks
+# carry the newest checkpoint's votes). state-attest.json; the verdict is
+# folded into summary.json below (state_attest.py summary).
+if state_attest_on; then
+    STATE_ATTEST_LINE=$(python3 -I "$SELF_DIR/state_attest.py" scan \
+        --rpc "${RPCS[0]}" --rpc "${RPCS[1]}" --rpc "${RPCS[2]}" \
+        --metrics "http://127.0.0.1:${METS[0]}/metrics" --metrics "http://127.0.0.1:${METS[1]}/metrics" \
+        --metrics "http://127.0.0.1:${METS[2]}/metrics" \
+        --log "$RUN_DIR/val0.log" --log "$RUN_DIR/val1.log" --log "$RUN_DIR/val2.log" \
+        --keys "$ORACLE_KEYS" --wait-s 90 --activation "$STATE_HASH_ACTIVATION" --out "$OUT/state-attest.json" 2>&1) \
+        || STATE_ATTEST_LINE="state attest: ok=0 scan failed: $(tail -c 400 <<<"$STATE_ATTEST_LINE")"
+    log "$STATE_ATTEST_LINE"
+fi
+
 # ---------------------------------------------------------------- 9. stop + collect logs
 "$WSL/stop-3val.sh" >>"$OUT/run.log" 2>&1
 # Body-dissemination / exec-pacing accounting per node (block-cap-raise sweep:
@@ -2064,6 +2164,10 @@ with open(p, 'w') as f:
     json.dump(d, f, indent=1)
 PYS
 fi
+# summary.json .state_attest (+ its REJECT fold): from state-attest.json.
+if state_attest_on && [ "$rc" = 0 ]; then
+    python3 -I "$SELF_DIR/state_attest.py" summary --dir "$OUT" >/dev/null || log "WARNING: summary.json .state_attest not written"
+fi
 # summary.json .evm_load: tx-flood stats + the scan + per-node torus_exec_evm_seconds deltas.
 if evm_load_on && [ "$rc" = 0 ]; then
     python3 "$SELF_DIR/evm_load.py" summary --dir "$OUT" --rate "$EVM_LOAD_RATE" --senders "$EVM_LOAD_SENDERS" --rc "$EVM_RC" \
@@ -2080,6 +2184,13 @@ log "done -> $OUT/summary.json"
 if evm_load_on && ! jq -e '.evm_load.ok == true' "$OUT/summary.json" >/dev/null 2>&1; then
     log "EVM load: cell NOT accepted: $(jq -c '.evm_load.problems // ["no .evm_load in summary.json"]' "$OUT/summary.json" 2>/dev/null || echo '["summary.json unreadable"]')"
     jq -e '.evm_load' "$OUT/summary.json" >/dev/null 2>&1 || exit 1
+fi
+# STATE_HASH_ATTEST=1: a cell whose h_n agreement / attestation check failed is
+# rejected (state_attest.py summary folded .state_attest.problems into .validity,
+# so health.py below exits 2); without .state_attest at all nothing was folded.
+if state_attest_on && ! jq -e '.state_attest.ok == true' "$OUT/summary.json" >/dev/null 2>&1; then
+    log "state hash attestation: cell NOT accepted: $(jq -c '.state_attest.problems // ["no .state_attest in summary.json"]' "$OUT/summary.json" 2>/dev/null || echo '["summary.json unreadable"]')"
+    jq -e '.state_attest' "$OUT/summary.json" >/dev/null 2>&1 || exit 1
 fi
 # A successful report write is not benchmark acceptance. Preserve artifacts and
 # return nonzero for stalled, undrained, inconsistent or unverified cells.

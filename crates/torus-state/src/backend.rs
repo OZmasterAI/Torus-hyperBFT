@@ -219,6 +219,16 @@ pub(crate) fn prefix_read_options(prefix: &[u8]) -> rocksdb::ReadOptions {
 // StateBackend for StateDb — thin delegation to existing methods
 // ============================================================================
 
+/// s132: is `key` a pruned row still on disk (filter mode) that the
+/// `StateDb` reads skip? `hidden` = [`crate::prune_filter::PruneCutoff`]'s
+/// cutoff and key length for the CF, `None` = nothing hidden there. The
+/// iterators skip such rows one by one: no production reader iterates the
+/// height-keyed CFs (see [`crate::prune_filter`]).
+#[inline]
+fn is_pruned(hidden: Option<(u64, usize)>, key: &[u8]) -> bool {
+    hidden.is_some_and(|(cutoff, len)| crate::prune_filter::below_cutoff(key, len, cutoff))
+}
+
 impl StateBackend for StateDb {
     fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
         StateDb::get_cf_raw(self, cf, key)
@@ -231,6 +241,9 @@ impl StateBackend for StateDb {
         let cf_handle = db
             .cf_handle(cf)
             .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
+        if self.prune_cutoff().is_hidden(cf, key) {
+            return Ok(None);
+        }
         Ok(db.get_pinned_cf(cf_handle, key)?.map(|v| v.len()))
     }
 
@@ -251,10 +264,14 @@ impl StateBackend for StateDb {
             .cf_handle(cf)
             .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
         let mode = rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward);
+        let hidden = self.prune_cutoff().hidden_for(cf);
         for item in db.iterator_cf_opt(cf_handle, prefix_read_options(prefix), mode) {
             let (key, value) = item?;
             if !key.starts_with(prefix) {
                 break;
+            }
+            if is_pruned(hidden, &key) {
+                continue;
             }
             out.push((key.to_vec(), value.to_vec()));
             if out.len() == limit {
@@ -283,6 +300,7 @@ impl StateBackend for StateDb {
             .cf_handle(cf)
             .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
         let mut results = Vec::new();
+        let hidden = self.prune_cutoff().hidden_for(cf);
         match prefix {
             Some(pfx) => {
                 let iter = crate::db::prefix_iter(db, &cf_handle, pfx);
@@ -291,6 +309,9 @@ impl StateBackend for StateDb {
                     if !key.starts_with(pfx) {
                         break;
                     }
+                    if is_pruned(hidden, &key) {
+                        continue;
+                    }
                     results.push((key.to_vec(), value.to_vec()));
                 }
             }
@@ -298,6 +319,9 @@ impl StateBackend for StateDb {
                 let iter = db.iterator_cf(cf_handle, rocksdb::IteratorMode::Start);
                 for item in iter {
                     let (key, value) = item?;
+                    if is_pruned(hidden, &key) {
+                        continue;
+                    }
                     results.push((key.to_vec(), value.to_vec()));
                 }
             }
@@ -322,8 +346,12 @@ impl StateBackend for StateDb {
             .cf_handle(cf)
             .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
         let mode = rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward);
+        let hidden = self.prune_cutoff().hidden_for(cf);
         for item in db.iterator_cf(cf_handle, mode) {
             let (key, value) = item?;
+            if is_pruned(hidden, &key) {
+                continue;
+            }
             out.push((key.to_vec(), value.to_vec()));
             if out.len() == limit {
                 break;
@@ -340,10 +368,18 @@ impl StateBackend for StateDb {
         let cf_handle = db
             .cf_handle(cf)
             .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
-        match crate::db::prefix_iter(db, &cf_handle, prefix).next() {
-            Some(item) => Ok(item?.0.starts_with(prefix)),
-            None => Ok(false),
+        let hidden = self.prune_cutoff().hidden_for(cf);
+        for item in crate::db::prefix_iter(db, &cf_handle, prefix) {
+            let (key, _) = item?;
+            if !key.starts_with(prefix) {
+                return Ok(false);
+            }
+            // s132: skip pruned rows still on disk (filter mode).
+            if !is_pruned(hidden, &key) {
+                return Ok(true);
+            }
         }
+        Ok(false)
     }
 
     fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {
