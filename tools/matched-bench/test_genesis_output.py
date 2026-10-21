@@ -277,6 +277,8 @@ for i in $(seq "$3" $(( $3 + $5 - 1 ))); do printf '%s 0x%040x\\n' "$i" "$i"; do
 
     def test_book_mode_sets_the_final_genesis_only(self):
         for value, name in self.BOOK_MODES:
+            if name == 'classic':
+                continue  # absent: test_explicit_classic_is_the_absent_field
             with self.subTest(value=value):
                 result = self.run_script(BOOK_MODE=value)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -294,6 +296,19 @@ for i in $(seq "$3" $(( $3 + $5 - 1 ))); do printf '%s 0x%040x\\n' "$i" "$i"; do
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.output.read_bytes(), unset_bytes)
         self.assertIn('book_mode  = absent (classic)', result.stdout)
+
+    def test_explicit_classic_is_the_absent_field(self):
+        """Review rec (b): Classic is never written; classic / 0 leave the
+        field absent, so OUT is byte-identical to a run without BOOK_MODE
+        (one Classic chain, one genesis md5)."""
+        self.generate(BOOK_MODE=None)
+        unset_bytes = self.output.read_bytes()
+        for value in ('classic', '0'):
+            with self.subTest(value=value):
+                result = self.run_script(BOOK_MODE=value)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.output.read_bytes(), unset_bytes)
+                self.assertIn('book_mode  = absent (classic)', result.stdout)
 
     def test_no_stale_book_mode_between_runs(self):
         self.assertEqual(self.generate(BOOK_MODE='3')[1]['consensus']['book_mode'], 'level_authority_chunked')

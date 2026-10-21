@@ -379,7 +379,9 @@ class RunCellReuseTest(unittest.TestCase):
         self.repo = repo
         tools = os.path.join(repo, "tools", "matched-bench")
         os.makedirs(tools)
-        for f in ("run-cell.sh", "genesis_cache.py", "log-scans.sh"):
+        # summarize.py + health.py: run-cell.sh asks the summarizer (--help) whether
+        # it scores the genesis book mode, at preflight
+        for f in ("run-cell.sh", "genesis_cache.py", "log-scans.sh", "summarize.py", "health.py"):
             shutil.copy2(os.path.join(HERE, f), tools)
         self.script = os.path.join(tools, "run-cell.sh")
         for rel in (
@@ -562,6 +564,12 @@ class RunCellReuseTest(unittest.TestCase):
         self.assertEqual(self.calls_n(), 2, "same genesis mode, same entry")
         self.assertIn("genesis reused (key ", log4)
         self.assertIn("genesis consensus.book_mode=level_authority_chunked (BOOK_MODE=level_authority_chunked)", log4)
+        # an explicit Classic is the absent field: the no-knob entry, reused
+        for kv in ("BOOK_MODE=classic", "TORUS_BOOK_ROWS=0"):
+            log5 = self.run_cell(extra_env=kv)
+            self.assertEqual(self.calls_n(), 2, kv + " reuses the Classic entry:\n" + log5)
+            self.assertIn("genesis reused (key ", log5)
+            self.assertIn("genesis consensus.book_mode=classic (%s)" % kv, log5)
 
     def test_no_cache_dir_builds_every_cell(self):
         for _ in range(2):

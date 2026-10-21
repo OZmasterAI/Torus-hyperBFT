@@ -23,12 +23,36 @@ for a in ["out", "label", "worktree", "commit", "dirty", "markets", "dur", "rate
           "env-digests", "extra-env", "bench-cmd", "pids", "evicted", "bench-submitted",
           "block-cap", "dissem", "digest-secs", "digest-heights", "digest-quiescent",
           "drain-timeout", "markets-per-sender", "max-in-flight", "open-order-budget",
-          "in-flight-tail", "liq-thin", "liq-thin-avail"]:
+          "in-flight-tail", "liq-thin", "liq-thin-avail", "genesis-book-mode"]:
     ap.add_argument("--" + a, default="")
 A = ap.parse_args()
 OUT = A.out
 t0, t1, td = int(A.t_bench0), int(A.t_bench1), int(A.t_drain)
 NODE_ENV = json.loads(A.node_env) if A.node_env else {}
+
+# s131: the order-book mode is the genesis field consensus.book_mode, what
+# every node runs (the node refuses a TORUS_BOOK_ROWS that disagrees). The cell
+# genesis' value (run-cell.sh --genesis-book-mode: a name or 0-3; classic for
+# an absent field) decides the label and the checkpoint default below; the
+# node env TORUS_BOOK_ROWS is only the fallback for cells that predate it.
+GENESIS_BOOK_MODES = {"classic": "0", "order_rows": "1", "level_authority": "2",
+                      "level_authority_chunked": "3"}
+
+
+def genesis_book_mode_digit(v):
+    """--genesis-book-mode -> "0".."3"; None when not given (empty). A value
+    that is not a mode exits: a mislabeled arm must not be scored."""
+    v = (v or "").strip()
+    if not v:
+        return None
+    d = GENESIS_BOOK_MODES.get(v, v)
+    if d not in ("0", "1", "2", "3"):
+        sys.exit("summarize.py: --genesis-book-mode %r is not a book mode "
+                 "(classic, order_rows, level_authority, level_authority_chunked or 0-3)" % v)
+    return d
+
+
+GENESIS_BOOK_MODE = genesis_book_mode_digit(A.genesis_book_mode)
 
 # ---------------------------------------------------------------- load sampler
 rows = {"val0": [], "val1": [], "val2": []}
@@ -1059,8 +1083,10 @@ else:
 #     (exec_pipeline.rs `effective_checkpoint_interval` + app.rs):
 #     TORUS_EXEC_PIPELINE=0 -> off (checkpoints need W);
 #     TORUS_CHECKPOINT_INTERVAL_MS set -> that value (0 or garbage -> off);
-#     unset -> the validator default 15 s, unless TORUS_BOOK_ROWS=2/3 (a
-#     deferred book save turns the default off).
+#     unset -> the validator default 15 s, unless the book mode is 2/3 (a
+#     deferred book save turns the default off): the genesis
+#     consensus.book_mode (--genesis-book-mode), else the legacy node env
+#     TORUS_BOOK_ROWS.
 #
 # Bench 8l (perf doc 107.6): 15 s checkpoints, a 27-block replay (23 beyond the
 # queue) with agreeing digests was REJECTed by the old constant bound of 2.
@@ -1107,14 +1133,25 @@ NODE_FLAGS_AUDIT = (
 )
 
 
-def book_mode(node_env):
-    """torus_bridge::native_executor::parse_book_rows_mode: trimmed "1"/"2"/"3"
-    -> mode1/mode2/mode3, anything else (incl. unset/empty) -> classic. None
-    when the cell recorded no node env (legacy): unknown, not guessed."""
+def book_mode_digit(node_env):
+    """The cell's book mode "0".."3": the genesis consensus.book_mode when
+    given (what the nodes run), else the legacy node env TORUS_BOOK_ROWS
+    (torus_types::book_mode::parse_book_rows_legacy: trimmed "1"/"2"/"3", any
+    other value incl. unset/empty -> classic); None when neither is known
+    (no genesis mode, no node env recorded)."""
+    if GENESIS_BOOK_MODE is not None:
+        return GENESIS_BOOK_MODE
     if not isinstance(node_env, dict):
         return None
     v = rust_trim(node_env.get("TORUS_BOOK_ROWS"))
-    return "mode" + v if v in ("1", "2", "3") else "classic"
+    return v if v in ("1", "2", "3") else "0"
+
+
+def book_mode(node_env):
+    """Label classic / mode1 / mode2 / mode3 of book_mode_digit; None =
+    unknown, not guessed."""
+    d = book_mode_digit(node_env)
+    return None if d is None else "classic" if d == "0" else "mode" + d
 
 
 def node_flags(node_env):
@@ -1139,7 +1176,7 @@ def checkpoint_interval_s(node_env):
     if raw:
         ms = rust_parse_u64(raw)
         return ms / 1000.0 if ms else None
-    if rust_trim(node_env.get("TORUS_BOOK_ROWS")) in ("2", "3"):
+    if book_mode_digit(node_env) in ("2", "3"):
         return None
     return VALIDATOR_CHECKPOINT_INTERVAL_S
 

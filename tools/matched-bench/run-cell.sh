@@ -304,7 +304,12 @@
 #                order_rows | level_authority | level_authority_chunked | 0-3
 #                sets the genesis only. Both set and different, or a value that
 #                is not a mode = FATAL at preflight. Neither = classic, the field
-#                absent (genesis byte-identical). The cell refuses a genesis
+#                absent (genesis byte-identical); an explicit classic / 0 is the
+#                same genesis (and genesis-cache entry): Classic is never
+#                written. summarize.py scores the genesis mode
+#                (--genesis-book-mode: label, crash-gate checkpoint default); a
+#                BOOK_MODE=-only non-Classic cell refuses at preflight with a
+#                summarizer that lacks it. The cell refuses a genesis
 #                whose mode is not the one it asked for, logs it ("genesis
 #                consensus.book_mode=..."), labels the cell= line book_mode=
 #                classic|mode1|mode2|mode3 from it and records summary.json
@@ -772,6 +777,9 @@ if [ "$BM_KNOB_SET" = 1 ]; then
     GEN_BOOK_MODE=$BM_NAME
     GEN_BOOK_MODE_SRC="BOOK_MODE=$BM_KNOB${GEN_BOOK_MODE_SRC:+, $GEN_BOOK_MODE_SRC}"
 fi
+# Classic is the absent field: an explicit classic / 0 builds (and caches) the
+# same genesis as no knob, so one Classic chain has one genesis md5.
+if [ "$GEN_BOOK_MODE" = classic ]; then GEN_BOOK_MODE=""; fi
 for v in EXPECT_NODE_MD5 EXPECT_BENCH_MD5; do
     [[ -z "${!v}" || "${!v}" =~ ^[0-9a-f]{8,32}$ ]] || { echo "FATAL: $v must be 8-32 lowercase hex chars of an md5 (got '${!v}')" >&2; exit 2; }
 done
@@ -914,6 +922,16 @@ summarizer_has_liq_opts() {
     case "$h" in *--liq-thin-avail*) return 0 ;; esac
     return 1
 }
+# summarizer_has_genesis_book_mode: the selected summarize.py accepts
+# --genesis-book-mode (s131), so it scores the cell's book mode (label and the
+# crash gate's checkpoint default) from the genesis. An older one reads only
+# the node env TORUS_BOOK_ROWS.
+summarizer_has_genesis_book_mode() {
+    local h
+    h=$(python3 "$TOOLS_DIR/summarize.py" --help 2>/dev/null) || return 1
+    case "$h" in *--genesis-book-mode*) return 0 ;; esac
+    return 1
+}
 # digest_has_position_accounts: the selected digest-node.sh digests the
 # position accounts it is handed as 7th argument (`--capabilities` lists
 # `position-accounts`). An older one ignores that argument silently, so the
@@ -949,6 +967,20 @@ if liq_stress_on; then
     }
     DIGEST_HAS_POS=1
     SUMMARIZE_LIQ_ARGS=(--liq-thin "$LIQ_THIN" --liq-thin-avail "$LIQ_THIN_AVAIL")
+fi
+# Book mode (s131): the summarizer scores the genesis mode. An older one only
+# sees TORUS_BOOK_ROWS in the node env, which a BOOK_MODE=-only non-Classic
+# cell does not set: it would score the cell as Classic (crash gate bound 202
+# instead of 2), so refuse that combination here, before the run.
+SUMMARIZER_HAS_BOOK_MODE=0
+if summarizer_has_genesis_book_mode; then
+    SUMMARIZER_HAS_BOOK_MODE=1
+elif [ -n "$GEN_BOOK_MODE" ] && [ -z "$BM_ROWS" ]; then
+    echo "FATAL: BOOK_MODE=$BM_KNOB (genesis consensus.book_mode=$GEN_BOOK_MODE, no TORUS_BOOK_ROWS on the nodes)" \
+        "needs a summarizer that accepts --genesis-book-mode, and $TOOLS_DIR/summarize.py does not: it would" \
+        "score the cell as Classic (TOOLS_FROM_WORKTREE=$TOOLS_FROM_WORKTREE; use this harness's own tools:" \
+        "TOOLS_FROM_WORKTREE=0, or set TORUS_BOOK_ROWS=<0-3> in EXTRA_ENV instead)" >&2
+    exit 1
 fi
 # liq_thin_patch <genesis> <n> <available>: native `available` = <available> on
 # the balances noted "bulk-test 60" .. "bulk-test 60+n-1" (load senders
@@ -1969,6 +2001,8 @@ for i in 0 1 2; do
       echo "== phase60 val$i"; awk -f "$TOOLS_DIR/phase60.awk" "$OUT/phase-val$i.csv"; } > "$OUT/analysis-val$i.txt" 2>&1
 done
 
+SUMMARIZE_BOOK_ARGS=()
+[ "$SUMMARIZER_HAS_BOOK_MODE" = 1 ] && SUMMARIZE_BOOK_ARGS=(--genesis-book-mode "$GEN_BOOK_MODE_GOT")
 python3 "$TOOLS_DIR/summarize.py" \
     --out "$OUT" --label "$LABEL" --worktree "$WT" --commit "$WT_COMMIT" --dirty "$WT_DIRTY" \
     --markets "$MARKETS" --dur "$DUR" --rate "$RATE" --senders "$SENDERS" \
@@ -1983,6 +2017,7 @@ python3 "$TOOLS_DIR/summarize.py" \
     --max-in-flight "${MAX_IN_FLIGHT:-}" --open-order-budget "${OPEN_ORDER_BUDGET:-}" \
     --in-flight-tail "${IN_FLIGHT_TAIL:-}" \
     "${SUMMARIZE_LIQ_ARGS[@]}" \
+    "${SUMMARIZE_BOOK_ARGS[@]}" \
     --digest-quiescent "$DIGEST_QUIESCENT" --digest-secs "${DIGSECS[*]}" --digest-heights "${DHGT[*]}" \
     | tee -a "$OUT/run.log"
 rc=${PIPESTATUS[0]}

@@ -47,8 +47,9 @@
 #               disagrees). classic | order_rows | level_authority |
 #               level_authority_chunked, or 0-3 (written as the name); else
 #               FATAL before anything is written. Patches only OUT, never the
-#               reused weighted-full genesis. Unset or empty = the field stays
-#               absent (Classic) and OUT is byte-identical to a run without it.
+#               reused weighted-full genesis. Unset, empty, classic or 0 = the
+#               field stays absent (absent is Classic, so one Classic chain has
+#               one genesis) and OUT is byte-identical to a run without it.
 #   BENCH_BIN=  bench-throughput binary (default: cargo-bin resolution, which
 #               honours CARGO_TARGET_DIR, then <repo>/target/release).
 set -euo pipefail
@@ -66,11 +67,12 @@ if [ -n "${EVM_BLOCK_INTERVAL:-}" ]; then
     [[ "$EVM_BLOCK_INTERVAL" =~ ^[1-9][0-9]{0,2}$ ]] && [ "$EVM_BLOCK_INTERVAL" -ge 2 ] && [ "$EVM_BLOCK_INTERVAL" -le 100 ] \
         || { echo "FATAL: EVM_BLOCK_INTERVAL must be an integer in 2..=100 (torus_types::EVM_BLOCK_INTERVAL_RANGE) (got '$EVM_BLOCK_INTERVAL')" >&2; exit 1; }
 fi
-# BOOK_MODE -> the genesis name (torus_types::book_mode::BookMode::name).
+# BOOK_MODE -> the genesis name (torus_types::book_mode::BookMode::name);
+# empty for Classic (the field stays absent).
 BOOK_MODE_NAME=""
 if [ -n "${BOOK_MODE:-}" ]; then
     case "$BOOK_MODE" in
-        0|classic) BOOK_MODE_NAME=classic ;;
+        0|classic) BOOK_MODE_NAME="" ;;  # absent = Classic: never written explicitly
         1|order_rows) BOOK_MODE_NAME=order_rows ;;
         2|level_authority) BOOK_MODE_NAME=level_authority ;;
         3|level_authority_chunked) BOOK_MODE_NAME=level_authority_chunked ;;

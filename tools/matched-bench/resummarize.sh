@@ -34,7 +34,8 @@ python3 "$T/summarize.py" --out "$D" --label "$(j .label)" --worktree "$(j .work
   --drain-timeout "$(j '.timing.drain_timeout_s // ""')" \
   --digest-quiescent "$(j 'if .agreement.state_digest_quiescent == false then "0" else "1" end')" \
   --digest-secs "$(j '(.agreement.state_digest_seconds_per_node // [])|map(tostring)|join(" ")')" \
-  --digest-heights "$(j '(.agreement.state_digest_heights // [])|map(tostring)|join(" ")')"
+  --digest-heights "$(j '(.agreement.state_digest_heights // [])|map(tostring)|join(" ")')" \
+  ${BOOK_MODE:+--genesis-book-mode "$BOOK_MODE"}
 if [ -n "$EVM_N" ]; then
     tmp="$D/summary.json.evm-n.tmp"
     jq --argjson n "$EVM_N" '.genesis.evm_block_interval = $n' "$D/summary.json" > "$tmp" && mv -f "$tmp" "$D/summary.json"

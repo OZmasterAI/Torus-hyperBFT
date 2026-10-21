@@ -102,7 +102,9 @@ python3 tools/matched-bench/test_harness.py
    `BOOK_MODE=level_authority_chunked` (or `3`; genesis only, no node env).
    `=2` / `level_authority` for mode 2, `=1` / `order_rows` for OrderRows.
    Both set and different, or a value that is not a mode, fails at preflight
-   (exit 2). The genesis cache keys on the mode. The cell refuses a genesis
+   (exit 2). An explicit Classic (`BOOK_MODE=classic` / `0`,
+   `TORUS_BOOK_ROWS=0`) is the absent field: the same genesis and cache entry
+   as no knob. The genesis cache keys on the mode. The cell refuses a genesis
    whose mode is not the one it asked for and logs
    `genesis consensus.book_mode=<name> (<source>)`.
    After the env is final, run.log gets one audit line per cell:
@@ -115,6 +117,12 @@ python3 tools/matched-bench/test_harness.py
    `cell.book_mode` (the label, written by run-cell.sh after summarize.py and
    kept by resummarize.sh) and `cell.node_flags` (`null` when the cell has no
    recorded node env; older cells keep the env-derived `cell.book_mode`).
+   summarize.py scores the genesis mode (`--genesis-book-mode`, from
+   run-cell.sh and resummarize.sh): the label and the crash gate's
+   checkpoint default (modes 2 / 3 turn the 15 s default off, rewind bound 2),
+   so a `BOOK_MODE=`-only cell is scored like a `TORUS_BOOK_ROWS=` one. A
+   `BOOK_MODE=`-only non-Classic cell refuses at preflight (exit 1) when the
+   selected summarize.py (e.g. an older worktree's) lacks the option.
    Check A/B arms against this line before analysis.
    Verifies via `/proc/<pid>/environ` that all 3 nodes got the same env.
    `BLOCK_CAP=N` (block-cap-raise sweep) exports the coherent proposer-local
