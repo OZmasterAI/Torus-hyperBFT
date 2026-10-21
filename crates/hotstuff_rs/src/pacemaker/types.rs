@@ -106,7 +106,7 @@ impl TipInfo {
             return false;
         }
         let leader_in = |set: &ValidatorSet| {
-            (set.len() > 0 && set.total_power().int() > 0).then(|| match reputation {
+            (!set.is_empty() && set.total_power().int() > 0).then(|| match reputation {
                 Some(rep) => select_leader_with_reputation(self.view, set, rep),
                 None => select_leader(self.view, set),
             })
