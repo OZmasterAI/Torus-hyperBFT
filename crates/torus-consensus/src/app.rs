@@ -15797,7 +15797,7 @@ mod crash_recovery_tests {
             }
             let datum = bincode::serialize(&make_block(1, vec![])).unwrap();
             let committed = Block::new(
-                hotstuff_rs::types::data_types::BlockHeight::new(1),
+                BlockHeight::new(1),
                 PhaseCertificate::genesis_pc(),
                 CryptoHash::new(TorusApp::hash_datum(&datum)),
                 Data::new(vec![Datum::new(datum)]),
@@ -16181,7 +16181,7 @@ mod crash_recovery_tests {
             let block = make_block(1, vec![]);
             let datum = bincode::serialize(&block).unwrap();
             let committed = Block::new(
-                BlockHeight::new(1),
+                hotstuff_rs::types::data_types::BlockHeight::new(1),
                 PhaseCertificate::genesis_pc(),
                 CryptoHash::new(TorusApp::hash_datum(&datum)),
                 Data::new(vec![Datum::new(datum)]),
