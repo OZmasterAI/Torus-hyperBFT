@@ -368,8 +368,9 @@ fn screen_payload(
 /// RPC-only ingress guard (non-consensus; O2 design Open Question 2): reject
 /// PlaceOrder / PlaceOrderBatch actions referencing a market_id with no row
 /// in CF_NATIVE_MARKETS — closing the phantom-book trap where a typo'd id
-/// "succeeds" into a tick=1/lot=1 book conjured at exec
-/// (native_executor.rs:656; exec-side fix is a separate consensus item).
+/// "succeeds" into a tick=1/lot=1 book conjured at exec. Pre-testnet P0: the
+/// executor now rejects the same actions in consensus (`FailureReason::
+/// UnknownMarket`, same text), so this check only answers the client early.
 /// Point-gets on the 8-byte BE market key; the order-id counter row in the
 /// same CF has a 24-byte key (NEXT_GLOBAL_ORDER_ID_KEY) so it never collides.
 /// Cheap: runs BEFORE signature verify; batches read each market row once.
@@ -2415,6 +2416,8 @@ fn map_proposal(p: torus_economics::governance::Proposal) -> RpcProposal {
         ProposalType::TextProposal => "TextProposal",
         ProposalType::ValidatorRegistration => "ValidatorRegistration",
         ProposalType::PermanentUnlock => "PermanentUnlock",
+        ProposalType::MarketDelist => "MarketDelist",
+        ProposalType::MarketParamsUpdate => "MarketParamsUpdate",
     };
 
     let status = match p.status {

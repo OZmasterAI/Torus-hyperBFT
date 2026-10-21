@@ -24,8 +24,8 @@ use torus_evm::EvmExecutor;
 use torus_genesis::Genesis;
 use torus_mempool::{Mempool, MempoolConfig};
 use torus_network::{LibP2PNetwork, NetworkConfig};
-use torus_rpc::{find_latest_height, BlockNotifier, RpcServer};
-use torus_state::cf::{CF_BLOCK_HEADERS, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT};
+use torus_rpc::{find_latest_height, BlockNotifier, HeadPublisher, RpcServer};
+use torus_state::cf::{CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT};
 use torus_state::{PrunerConfig, StateDb, StatePruner};
 use torus_types::ChainConfig;
 
@@ -736,10 +736,35 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         ?checkpoint_interval,
         "checkpoint interval (TORUS_CHECKPOINT_INTERVAL_MS; default 15 s on validators, 0 on --rpc-only)"
     );
+    // T5.3: the commit manifest's home (the consensus DB by default; the A/B
+    // switch keeps the pre-T5.3 state-DB layout). Rows left in the other DB
+    // move at boot, so a hole they guard is never ignored.
+    let manifest_in_state_db = torus_consensus::app::parse_manifest_in_state_db(
+        std::env::var(torus_consensus::app::ENV_MANIFEST_IN_STATE_DB)
+            .ok()
+            .as_deref(),
+    );
+    let manifest_db = if manifest_in_state_db {
+        let moved = torus_consensus::app::migrate_commit_manifests(&dbs.consensus, &state_db)?;
+        if moved > 0 {
+            warn!(
+                moved,
+                "moved leftover commit-manifest rows from the consensus DB into the state DB"
+            );
+        }
+        state_db.clone()
+    } else {
+        dbs.consensus.clone()
+    };
+    info!(
+        manifest_in_state_db,
+        "commit manifest home (TORUS_MANIFEST_IN_STATE_DB=1: state DB, pre-T5.3; default: consensus DB)"
+    );
     // R02 branch 8 (D1): a startup storage fault (e.g. the validator rows
     // cannot be read to resolve the proposer address) stops the node here.
-    let mut app = TorusApp::try_new(
+    let mut app = TorusApp::try_new_with_manifest_db(
         state_db.clone(),
+        manifest_db,
         &chain_config,
         Some(metrics.clone()),
         Some(mempool.clone()),
@@ -954,6 +979,46 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             "block-tree pruner enabled (cf_consensus_meta)"
         );
     }
+    // RH4 durable DA body GC: committed bodies (and their shards) stay as long
+    // as block sync can still hand their block to a lagging peer: a body goes
+    // once its window (block-tree window + 128, or TORUS_DA_BODY_RETENTION;
+    // 0 = off) has passed AND the block tree's durable prune pointer is 128
+    // past it. Archive (no --retention-blocks): no GC. The pointer is read
+    // from the consensus DB, where the DA store writes too (one WAL). See
+    // torus_consensus::da_gc.
+    let tree_retention = hotstuff_rs::block_tree::block_tree_retention();
+    let da_retention_env = std::env::var("TORUS_DA_BODY_RETENTION").ok();
+    let da_retention = torus_consensus::da_gc::resolve_da_body_retention(
+        da_retention_env.as_deref(),
+        tree_retention,
+    );
+    app.set_da_body_gc(
+        da_retention.map(|retention| torus_consensus::da_gc::DaBodyGc {
+            retention,
+            block_tree_db: dbs.consensus.clone(),
+        }),
+    );
+    match (da_retention, tree_retention) {
+        (None, None) => info!(
+            env = ?da_retention_env,
+            "DA body GC off: archive node (no --retention-blocks), every committed body is kept"
+        ),
+        (None, Some(_)) => {
+            info!("DA body GC off (TORUS_DA_BODY_RETENTION=0): every committed body is kept")
+        }
+        (Some(window), Some(tree)) if window <= tree => info!(
+            window,
+            block_tree_retention = tree,
+            "DA body GC on: TORUS_DA_BODY_RETENTION is below the block-tree window, so bodies \
+             still stay until the block tree has pruned their block (+128)"
+        ),
+        (Some(window), tree) => info!(
+            window,
+            block_tree_retention = ?tree,
+            "DA body GC on: committed bodies deleted {window} dispatched blocks after commit, \
+             once the block tree pruned their block (+128)"
+        ),
+    }
 
     // S470: commit-lag backoff cap — genesis-sourced, env-overridable for
     // devnets (TORUS_COMMIT_LAG_BACKOFF_CAP). Fleet-uniform: see
@@ -991,7 +1056,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // 7. Block notifier + shared height counter (consensus replica <-> RPC server)
     let notifier = BlockNotifier::new();
-    let notifier_for_replica = notifier.clone();
     // s80: newTrades / userFills are fed from execution (each executed block's
     // fills), not read back from the DB at commit; fills are recorded only
     // while a stream subscriber exists. Set before the replica starts.
@@ -1012,6 +1076,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
     let state_db_for_handler = state_db.clone();
     let mempool_for_handler = mempool.clone();
+    let metrics_for_handler = metrics.clone();
     // Item 7 option 0 (task 4.1, decision 2): with `TORUS_EVM_FAST_PATH` the commit prune
     // reads the published ingress view; without it today's raw-DB prune (read once here, as
     // the exec context reads it once at construction).
@@ -1019,7 +1084,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let latest_height_shared = Arc::new(std::sync::atomic::AtomicU64::new(find_latest_height(
         &state_db,
     )));
-    let latest_height_for_handler = latest_height_shared.clone();
+    // T5.3: one publisher of the RPC height + WS heads, fed by the commit
+    // handler (the header frontier after each commit) and by the consensus
+    // header-persisted hook (each height once its off-thread header write
+    // landed, which can be after its commit event): the last committed height
+    // becomes visible even when no commit follows. In order, each height once.
+    let head_publisher = Arc::new(HeadPublisher::new(
+        state_db.clone(),
+        notifier.clone(),
+        latest_height_shared.clone(),
+    ));
+    let head_publisher_for_hook = head_publisher.clone();
+    app.set_header_persisted_hook(Arc::new(move |height: u64| {
+        head_publisher_for_hook.publish_up_to(height);
+    }));
 
     // 8. Start replica with on_commit_block handler for WebSocket subscriptions.
     // View-phase timing: one recorder clone per lifecycle event, timestamps taken
@@ -1106,37 +1184,27 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             rec_timeout.view_timeout(ev.timestamp);
         })
         .on_commit_block(move |event: &CommitBlockEvent| {
+            // T5.3 part 0: the whole handler, timed (event-bus thread).
+            let handler_timer = std::time::Instant::now();
+            let handler_metrics = &metrics_for_handler;
+            let _observe_handler = scopeguard_observe(move || {
+                handler_metrics
+                    .on_commit_block_handler_seconds
+                    .observe(handler_timer.elapsed().as_secs_f64());
+            });
             rec_commit.commit_block(event.timestamp);
             let height = find_latest_height(&state_db_for_handler);
             info!(height, "on_commit_block fired");
             if height == 0 {
                 return;
             }
-            if prune_on_view {
-                // Item 7 option 0 (task 4.1, R9): the view's height, then its nonces, through
-                // one handle (the DB marker and DB nonces when no view is published).
-                mempool_for_handler.prune_committed_txs_on_view();
-            } else {
-                // Item 7 step 2 (decision 7): the raw DB's applied marker (absent = 0), read
-                // before the state nonces the prune reads from the same DB. Not `height`: the
-                // header row is written at commit, before execution.
-                let executed = state_db_for_handler
-                    .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
-                    .ok()
-                    .flatten()
-                    .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
-                    .map_or(0, u64::from_be_bytes);
-                mempool_for_handler.prune_committed_txs(executed);
-            }
-            latest_height_for_handler.store(height, std::sync::atomic::Ordering::Relaxed);
-            match state_db_for_handler.get_cf_raw(CF_BLOCK_HEADERS, &height.to_be_bytes()) {
-                Ok(Some(data)) if data.len() > 32 => {
-                    if let Ok(header) = serde_json::from_slice::<serde_json::Value>(&data[32..]) {
-                        notifier_for_replica.notify_new_block(header);
-                    }
-                }
-                _ => {}
-            }
+            prune_committed_after_commit(
+                &state_db_for_handler,
+                &mempool_for_handler,
+                prune_on_view,
+                Some(&metrics_for_handler),
+            );
+            head_publisher.publish_up_to(height);
         })
         .build()
         .start();
@@ -1876,10 +1944,59 @@ fn install_fail_stop_panic_hook(exit: fn(i32)) {
     }));
 }
 
+/// T5.3 part 0: the on_commit_block handler's mempool prune, timed
+/// (`torus_commit_handler_prune_seconds`, marker read included).
+///
+/// Item 7 step 2 (decision 7): the raw DB's applied marker (absent = 0), read
+/// before the state nonces the prune reads from the same DB. Not the header
+/// height: the header row is written at commit, before execution.
+fn prune_committed_after_commit(
+    state_db: &StateDb,
+    mempool: &Mempool,
+    prune_on_view: bool,
+    metrics: Option<&torus_telemetry::Metrics>,
+) {
+    let timer = std::time::Instant::now();
+    if prune_on_view {
+        // Item 7 option 0 (task 4.1, R9): the view's height, then its nonces, through
+        // one handle (the DB marker and DB nonces when no view is published).
+        mempool.prune_committed_txs_on_view();
+    } else {
+        // Item 7 step 2 (decision 7): the raw DB's applied marker (absent = 0), read
+        // before the state nonces the prune reads from the same DB. Not `height`: the
+        // header row is written at commit, before execution.
+        let executed = state_db
+            .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
+            .ok()
+            .flatten()
+            .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+            .map_or(0, u64::from_be_bytes);
+        mempool.prune_committed_txs(executed);
+    }
+    if let Some(m) = metrics {
+        m.commit_handler_prune_seconds
+            .observe(timer.elapsed().as_secs_f64());
+    }
+}
+
+/// Runs `f` when dropped (every return path of a handler).
+fn scopeguard_observe<F: FnOnce()>(f: F) -> impl Drop {
+    struct Guard<F: FnOnce()>(Option<F>);
+    impl<F: FnOnce()> Drop for Guard<F> {
+        fn drop(&mut self) {
+            if let Some(f) = self.0.take() {
+                f();
+            }
+        }
+    }
+    Guard(Some(f))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+    use torus_state::cf::CF_BLOCK_HEADERS;
 
     /// R19 follow-up (owner s112): a genesis with a duplicate validator or an
     /// address in both accounts[] and evm_alloc refuses to start, naming the
@@ -1944,6 +2061,38 @@ mod tests {
         let err = res.unwrap_err();
         assert!(err.contains('f') && err.contains('s'), "{err}");
         assert_eq!(flush_then_sync(|| Ok(()), || Ok(())), Ok(()));
+    }
+
+    /// T5.3 part 0: the on_commit_block handler's mempool prune (with its
+    /// applied-marker read) is timed once per call.
+    #[test]
+    fn commit_handler_prune_is_timed_once_per_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        state
+            .put_cf_raw(
+                CF_CONSENSUS_META,
+                META_NATIVE_APPLIED_HEIGHT,
+                &3u64.to_be_bytes(),
+            )
+            .unwrap();
+        let mempool = Mempool::new(state.clone(), MempoolConfig::default());
+        let metrics = torus_telemetry::Metrics::new();
+        prune_committed_after_commit(&state, &mempool, false, Some(&metrics));
+        let text = metrics.encode();
+        assert!(
+            text.contains("torus_commit_handler_prune_seconds_count 1"),
+            "one prune observation per handler call:\n{text}"
+        );
+        // Metrics are optional (no panic, nothing to observe).
+        prune_committed_after_commit(&state, &mempool, false, None);
+        // The option 0 view prune (no view published: the DB marker) is timed too.
+        prune_committed_after_commit(&state, &mempool, true, Some(&metrics));
+        let text = metrics.encode();
+        assert!(
+            text.contains("torus_commit_handler_prune_seconds_count 2"),
+            "the view prune is timed as well:\n{text}"
+        );
     }
 
     /// Section 71.8 option A: the graceful stop flushes the consensus DB's

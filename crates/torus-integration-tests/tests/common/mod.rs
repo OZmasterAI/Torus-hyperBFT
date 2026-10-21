@@ -106,6 +106,17 @@ impl TestHarness {
             .unwrap();
     }
 
+    /// Pre-testnet P0: list `ids` with placeholder rows (tick / lot 1, no
+    /// margin config: the book an order on an unlisted market used to get),
+    /// so orders on them are not rejected as unknown markets.
+    pub fn list_markets(&self, ids: impl IntoIterator<Item = MarketId>) {
+        for m in ids {
+            self.state_db
+                .put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed")
+                .unwrap();
+        }
+    }
+
     /// Persist an OrderBookSnapshot to CF_NATIVE_ORDER_BOOKS.
     pub fn persist_order_book(&self, market_id: MarketId, snapshot: &OrderBookSnapshot) {
         let data = borsh::to_vec(snapshot).unwrap();

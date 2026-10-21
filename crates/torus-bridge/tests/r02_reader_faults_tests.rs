@@ -82,6 +82,11 @@ type Ctx = NativeExecContext<FailingRead>;
 fn setup(market_row: Option<&[u8]>) -> (tempfile::TempDir, StateDb, FailingRead, Ctx) {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
+    // Pre-testnet P0: orders need a listed market (placeholder rows,
+    // tick / lot 1, as the old implicit book).
+    for m in 1..=64u64 {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+    }
     if let Some(row) = market_row {
         db.put_cf_raw(CF_NATIVE_MARKETS, &M.to_be_bytes(), row).unwrap();
     }
@@ -312,21 +317,26 @@ fn r02_position_reads_without_fault_unchanged() {
 // ---------------------------------------------------------------------------
 
 /// `market_shape` (no book yet): the market row read fails. RED before
-/// R02: the book was created with `(ONE, ONE)`.
+/// R02: the book was created with `(ONE, ONE)`. Pre-testnet P0: the same
+/// row is read first by the listed-market check (`market registry read`),
+/// which fail-stops the same way.
 #[test]
 fn r02_market_shape_read_fault_fail_stops() {
     for mode in MODES {
         let (_d, _db, backend, mut ctx) = setup(Some(b"listed"));
         backend.arm(CF_NATIVE_MARKETS, &M.to_be_bytes());
         exec(&mut ctx, mode, &[order(1, true, 100, 1, TimeInForce::GTC, false)]);
-        assert_injected(ctx.take_fatal_error(), "market shape read", &format!("mode {mode:?}"));
+        assert_injected(ctx.take_fatal_error(), "market registry read", &format!("mode {mode:?}"));
     }
 }
 
-/// Regression: no market row and an undecodable one (the deterministic
-/// decode policy of `market_row_shape`: every validator holds the same
-/// row) create the book with `(ONE, ONE)`, as today: a 1-lot bid at 100
-/// rests, a 0.5-lot one is rejected (below the lot). No fail-stop.
+/// Regression: an undecodable market row (the deterministic decode policy
+/// of `market_row_shape`: every validator holds the same row) creates the
+/// book with `(ONE, ONE)`, as today: a 1-lot bid at 100 rests, a 0.5-lot
+/// one is rejected (below the lot). No fail-stop. (Pre-testnet P0: `setup`
+/// lists markets 1..=64 with placeholder rows, so `None` is the fixture's
+/// placeholder; a market with no row at all is rejected,
+/// `unknown_market_tests`.)
 #[test]
 fn r02_market_shape_absent_or_undecodable_unchanged() {
     for mode in MODES {

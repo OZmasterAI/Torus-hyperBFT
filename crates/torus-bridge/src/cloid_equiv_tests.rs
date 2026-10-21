@@ -274,6 +274,11 @@ fn fnv(s: &str) -> u64 {
 fn seeded_run(seed: u64, mode: BookMode, run: Run) -> (u64, usize, usize) {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
+    // Pre-testnet P0: orders need a listed market (placeholder rows,
+    // tick / lot 1, as the old implicit book).
+    for m in 1..=512u64 {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+    }
     let mut holder = ResidentBooks::default();
     let ctx = ctx_at(&db, 1, mode, None);
     for n in 1..=TRADERS {
@@ -381,6 +386,11 @@ fn a_second_order_with_the_cloid_in_the_same_book_and_call_is_a_duplicate() {
         let what = format!("path {path}");
         let dir = tempfile::tempdir().unwrap();
         let db = StateDb::open(dir.path()).unwrap();
+        // Pre-testnet P0: orders need a listed market (placeholder rows,
+        // tick / lot 1, as the old implicit book).
+        for m in 1..=512u64 {
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+        }
         let mut ctx = ctx_at(&db, 1, BookMode::Classic, None);
         for n in 1..=2 {
             let bal = NativeBalance {

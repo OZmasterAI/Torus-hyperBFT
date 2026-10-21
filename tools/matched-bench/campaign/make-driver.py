@@ -56,6 +56,7 @@ TOP_OPTIONAL = {
     "expect",
     "analysis",
     "max_load",
+    "max_busy_pct",
     "samplers",
     "host_checks",
     "checks",
@@ -87,9 +88,15 @@ RESERVED_HARNESS = {
     "EXPECT_BENCH_MD5",
     "BENCH_ALLOW_UNDETACHED",
 }
+# set by the driver from its preflight (preflight_post), after every spec / arm / harness env on run-cell.sh's env
+# line, in both directions: DEFER_REPORT_SCANS = DEFER_SCANS (in-line 0, deferred 1), GENESIS_CACHE_DIR = the run's
+# genesis cache or empty (Codex round 6 on bb2a727f: an arm's DEFER_REPORT_SCANS=1 deferred the scans an in-line
+# campaign's expectation read). Refused in every env object: harness env (the driver's value wins anyway) and node
+# env (run-cell.sh's EXTRA_ENV, exported mid-run, would overwrite run-cell.sh's own; run-cell.sh refuses it too)
+DRIVER_OWNED = {"DEFER_REPORT_SCANS", "GENESIS_CACHE_DIR"}
 # every name the generated config assigns (render() unsets them first; driver-body.sh DRIVER_VARS lists them)
 CONFIG_VARS = (
-    "CAMPAIGN R RUN P WT_H TOOLS DEVNET MARKETS RATE MAX_LOAD NODES BASELINE BDIR BMD5 BBMD5 BWRAP ABIN AENV AXE"
+    "CAMPAIGN R RUN P WT_H TOOLS DEVNET MARKETS RATE MAX_BUSY_PCT NODES BASELINE BDIR BMD5 BBMD5 BWRAP ABIN AENV AXE"
     " AHENV ARMS ENV_NAMES PROC_REC_RE EXP_ARM EXP_FILE EXP_RE EXP_MIN EXP_MAX CELLS SMOKE_CELL ANALYSIS_CMD"
     " ANALYSIS_METRIC SAMPLERS HOST_CHECKS MIN_MEM_AVAIL_KB SYSCTL_WANT GATE_TAGS CHECKS_SOURCE CHECK_FNS"
 ).split()
@@ -165,6 +172,11 @@ def env_obj(d, where, harness=False):
             not BAD_VALUE_RE.search(v),
             "%s: %s=%r: no whitespace, quotes, backslash or $ in values"
             % (where, k, v),
+        )
+        need(
+            k not in DRIVER_OWNED,
+            "%s: %s is set by the driver from its preflight (report scans in-line or deferred, genesis reuse),"
+            " after every spec and arm env: drop the key" % (where, k),
         )
         if harness:
             need(
@@ -355,12 +367,21 @@ def validate(spec):
     p["duration_s"] = int_ge(spec["duration_s"], 10, "duration_s")
     p["markets"] = int_ge(spec["markets"], 1, "markets")
     p["rate"] = int_ge(spec.get("rate", 76000), 1, "rate")
+    # quiet() gates on a QUIET_SAMPLE_S (5 s) CPU busy sample, below max_busy_pct (s131: the 1-min load average
+    # it used to read, below max_load, lagged ~2.4 min behind a host already idle after a cell). max_load: older
+    # specs still validate; it gates nothing (main says so)
     ml = spec.get("max_load", 2)
     need(
         isinstance(ml, (int, float)) and not isinstance(ml, bool) and ml > 0,
         "max_load must be a number > 0",
     )
-    p["max_load"] = ml
+    p["max_load_ignored"] = "max_load" in spec
+    mb = spec.get("max_busy_pct", 10)
+    need(
+        isinstance(mb, (int, float)) and not isinstance(mb, bool) and 0 < mb <= 100,
+        "max_busy_pct must be a number in (0, 100] (got %r)" % (mb,),
+    )
+    p["max_busy_pct"] = mb
     # the Job 4 driver's samplers and host checks (default on); its watchers run on every cell regardless
     sp = spec.get("samplers", True)
     need(isinstance(sp, bool), "samplers must be true or false (got %r)" % (sp,))
@@ -606,7 +627,7 @@ def render(p, spec, spec_path):
         "DEVNET=%s" % q(p["devnet_dir"]),
         "MARKETS=%d" % p["markets"],
         "RATE=%d" % p["rate"],
-        "MAX_LOAD=%s" % p["max_load"],
+        "MAX_BUSY_PCT=%s   # quiet(): CPU busy %% over a QUIET_SAMPLE_S sample must be below this" % p["max_busy_pct"],
         "NODES=3",
         "BASELINE=%s" % q(p["baseline"]),
         "declare -A BDIR BMD5 BBMD5 BWRAP",
@@ -708,6 +729,12 @@ def main():
     except SpecError as ex:
         print("SPEC ERROR: %s" % ex, file=sys.stderr)
         return 2
+    if p["max_load_ignored"]:
+        print(
+            "NOTE: spec max_load (%s) is ignored: quiet() gates on a CPU busy sample below max_busy_pct (%s)"
+            % (spec["max_load"], p["max_busy_pct"]),
+            file=sys.stderr,
+        )
     txt = render(p, spec, os.path.abspath(a.spec))
     tmp = a.out + ".tmp"
     with open(tmp, "w") as f:

@@ -29,6 +29,19 @@
 # sourced from frames without locals and its variables kept (load_checks); each check runs through _run_check,
 # which unsets every other visible name and re-declares the file's. The prefix _DRV_ is the driver's (preflight
 # refuses a checks file that uses it). Limits: load_checks' header.
+# Post-cell work (bench queue pacing rule, s131): what decides the next cell runs right after each cell (POST_INLINE);
+# with the report scans deferred (DEFER_SCANS=1, preflight_post) the report-only scans (POST_ENDPASS) run once, in
+# end_pass, after the campaign's last cell (main cells, reruns, or a CAMPAIGN STOP) and before campaign.done, from
+# each cell's preserved logs: run-cell.sh DEFER_REPORT_SCANS=1 leaves the ingest eviction counts and
+# val<i>.log.excerpt to $TOOLS/cell-endpass.sh, and hardscan / soakchk move there too. In-line (DEFER_SCANS=0; owner
+# rule s131): every cell runs exactly the pre-end-pass driver's steps in its order with the same inputs (hardscan and
+# soakchk in cell(), before run_spec's cell_step, whose analysis may read their lines) and end_pass does nothing.
+# Genesis reuse: each cell gets GENESIS_CACHE_DIR=$RUN/genesis-cache (run-cell.sh: an unchanged genesis key reuses
+# the cached genesis, "genesis reused (key ..., md5 ...)"). Both need a run-cell.sh that has them (preflight_post;
+# an older frozen copy runs as before). The driver owns both variables (Codex round 6): cell() sets
+# DEFER_REPORT_SCANS=$DEFER_SCANS and GENESIS_CACHE_DIR (the cache or empty) after the arm's harness env on
+# run-cell.sh's env line, so no arm, spec or inherited value overrides the preflight; make-driver.py refuses them in
+# every spec env object (harness and node env).
 # Test-only overrides: DRIVER_PROC (a fake /proc: node exe/environ, meminfo), DRIVER_DETACH (a fake detach.sh).
 set -u
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
@@ -36,9 +49,20 @@ PROC=${DRIVER_PROC:-/proc}
 HARNESS=$TOOLS/run-cell.sh
 DETACH=${DRIVER_DETACH:-$TOOLS/campaign/detach.sh}
 SOAKPY=$TOOLS/soak-sampler.py   # samplers: the hand drivers' 1 Hz sidecar (tools/matched-bench/soak-sampler.py)
+ENDPASS=$TOOLS/cell-endpass.sh  # end_pass: a cell's deferred report-only node-log scans (run-cell.sh DEFER_REPORT_SCANS=1)
+DEFER_SCANS=0           # 1 = cells run with DEFER_REPORT_SCANS=1 (preflight_post: run-cell.sh has it, nothing in-line reads them)
+GENESIS_REUSE=0         # 1 = cells run with GENESIS_CACHE_DIR=$RUN/genesis-cache (preflight_post: run-cell.sh has it)
+ENDPASS_LABELS=()       # every started cell, in order: end_pass runs cell-endpass.sh on those with deferred-scans.json
+END_SCANS=()            # DEFER_SCANS=1: label:dur of each cell that reached its report scans (hardscan, soakchk): end_pass runs them
+# post-cell work, classified (show_plan POSTCELL; test_make_driver.py checks cell() and end_pass against these lists).
+# In-line: validity and stop decisions, records of state the next cell overwrites, the cells.tsv row / rerun queue
+POST_INLINE="node-death md5chk envchk marketchk expectchk campaignchecks sysctlchk warmgatechk fdsum savelog cell_step"
+# End pass: report-only (HARD FINDING / CHECK SOAK lines, run-cell.sh's REPORT_SCANS via cell-endpass.sh)
+POST_ENDPASS="cell-endpass hardscan soakchk"
 UNIT_NAME=$CAMPAIGN
 MIN_FREE_MB=${MIN_FREE_MB:-20000}
 QUIET_WAIT_S=${QUIET_WAIT_S:-3600}
+QUIET_SAMPLE_S=5        # quiet(): the CPU busy sample's length (MAX_BUSY_PCT)
 SMOKE=          # 1 = the smoke run (apply_smoke); the driver's own, never the caller's
 GENESIS_ROOT=   # run-cell.sh's MAINREPO = $TOOLS/../.. (preflight_genesis)
 DD=${DEVNET:-}          # the devnet data root (data/val<i>, run/pids, run/val<i>.log), the Job 4 helpers' name for it
@@ -53,11 +77,12 @@ SYSCTL_PIN="vm.dirty_bytes vm.dirty_background_bytes"
 # Every name the driver keeps state in (generated config + this body). scrub_env un-exports these and never
 # unsets them: a caller that exported RUN, ARMS, ... must not delete (or, exported, leak) driver config.
 # test_make_driver.py checks that each name the config or the body assigns at top level is listed.
-DRIVER_VARS="CAMPAIGN R RUN P WT_H TOOLS DEVNET MARKETS RATE MAX_LOAD NODES BASELINE BDIR BMD5 BBMD5 BWRAP
+DRIVER_VARS="CAMPAIGN R RUN P WT_H TOOLS DEVNET MARKETS RATE MAX_BUSY_PCT NODES BASELINE BDIR BMD5 BBMD5 BWRAP
  ABIN AENV AXE AHENV ARMS ENV_NAMES PROC_REC_RE EXP_ARM EXP_FILE EXP_RE EXP_MIN EXP_MAX CELLS SMOKE_CELL
  ANALYSIS_CMD ANALYSIS_METRIC SAMPLERS HOST_CHECKS MIN_MEM_AVAIL_KB SYSCTL_WANT SELF PROC HARNESS DETACH SOAKPY
- UNIT_NAME MIN_FREE_MB QUIET_WAIT_S SMOKE GENESIS_ROOT DD METS FD_STOP CRASHCELL SYSCTL_REC SYSCTL_PIN GENESIS_INPUTS MODE SM
- TAGS STARTED_LABEL CELL_FAIL GATE_TAGS CHECKS_SOURCE CHECK_FNS DRIVER_VARS"
+ UNIT_NAME MIN_FREE_MB QUIET_WAIT_S QUIET_SAMPLE_S SMOKE GENESIS_ROOT DD METS FD_STOP CRASHCELL SYSCTL_REC SYSCTL_PIN GENESIS_INPUTS MODE SM
+ TAGS STARTED_LABEL CELL_FAIL GATE_TAGS CHECKS_SOURCE CHECK_FNS ENDPASS DEFER_SCANS GENESIS_REUSE ENDPASS_LABELS END_SCANS
+ POST_INLINE POST_ENDPASS DRIVER_VARS"
 # run-cell.sh generates each cell's genesis from ITS OWN repo root ($TOOLS/../..), not from the harness worktree
 # it is handed (which only launches the nodes): a frozen tools copy must carry these, equal to the harness's
 GENESIS_INPUTS="devnet/wsl/gen-3val-genesis.sh devnet/wsl/bench-validator-keys.json devnet/genesis.json
@@ -102,6 +127,8 @@ show_plan() { # [smoke]: the plan as tables (make-driver tests compare these wit
     fi
     if [ -n "$GATE_TAGS" ]; then echo "WARMGATE on $GATE_TAGS"; else echo "WARMGATE off"; fi
     if [ -n "$CHECKS_SOURCE" ]; then echo "CHECKS $CHECKS_SOURCE $CHECK_FNS"; else echo "CHECKS none"; fi
+    echo "POSTCELL inline $POST_INLINE"
+    echo "POSTCELL endpass $POST_ENDPASS (once, after the last cell, before campaign.done)"
     if [ "$HOST_CHECKS" = 1 ]; then
         echo "HOSTCHECK on min_mem_avail_kb=$MIN_MEM_AVAIL_KB"
         for k in $(sysctl_names); do echo "SYSCTL $k ${SYSCTL_WANT[$k]:-pinned}"; done
@@ -126,13 +153,28 @@ anahits() { # host checks: heavy analysis processes (perf record/report/script, 
     [ "$HOST_CHECKS" = 1 ] || return 0
     local p; for p in $(pgrep -f '^(\S*/)?(perf|inferno-\S+|flamegraph\S*|jeprof|addr2line|llvm-addr2line)( |$)|^perl \S*(stackcollapse|flamegraph)'); do printf '%s:%s ' "$(cat /proc/$p/comm 2>/dev/null)" "$p"; done
 }
-quiet() { # no build, no node or bench left over, no heavy analysis (host checks), 1-min load < MAX_LOAD; waits up to QUIET_WAIT_S
-    local t=0 l1
+cpustat() { # "total idle" jiffies of $PROC/stat's aggregate cpu line: total = user..steal (guest, guest_nice are
+    # already in user, nice), idle = idle + iowait
+    awk '$1 == "cpu" { print $2+$3+$4+$5+$6+$7+$8+$9, $5+$6; exit }' "$PROC/stat" 2>/dev/null
+}
+cpubusy() { # CPU busy % over a QUIET_SAMPLE_S sample: 100 * (dtotal - didle - diowait) / dtotal; empty = unreadable
+    local a b
+    a=$(cpustat); sleep "$QUIET_SAMPLE_S"; b=$(cpustat)
+    awk -v a="$a" -v b="$b" 'BEGIN { if (split(a, x, " ") != 2 || split(b, y, " ") != 2 || y[1] <= x[1]) exit
+        printf "%.1f\n", 100 * ((y[1] - x[1]) - (y[2] - x[2])) / (y[1] - x[1]) }'
+}
+quiet() { # no build, no node or bench left over, no heavy analysis (host checks), then CPU busy < MAX_BUSY_PCT over a
+    # QUIET_SAMPLE_S sample (cpubusy; s131: the 1-min load average this read before lagged ~2.4 min behind a host
+    # already idle after a cell); waits up to QUIET_WAIT_S
+    local t=0 nl=300 h b
     while :; do
-        read -r l1 _ < /proc/loadavg
-        if [ -z "$(buildhits)$(benchhits)$(anahits)" ] && awk -v l="$l1" -v m="$MAX_LOAD" 'BEGIN{exit !(l<m)}'; then return 0; fi
-        [ $((t % 300)) = 0 ] && [ $t -gt 0 ] && log "waiting for a quiet host ${t}s (load $l1; $(buildhits)$(benchhits)$(anahits))"
-        t=$((t+10)); [ $t -ge "$QUIET_WAIT_S" ] && { log "host not quiet after ${QUIET_WAIT_S}s (load $l1; $(buildhits)$(benchhits)$(anahits))"; return 1; }
+        h=$(buildhits)$(benchhits)$(anahits); b=
+        if [ -z "$h" ]; then
+            b=$(cpubusy); t=$((t + QUIET_SAMPLE_S))
+            awk -v b="$b" -v m="$MAX_BUSY_PCT" 'BEGIN{exit !(b != "" && b + 0 < m + 0)}' && return 0
+        fi
+        [ $t -ge $nl ] && { log "waiting for a quiet host ${t}s (cpu busy ${b:-?}%; load $(cut -d' ' -f1 /proc/loadavg); $h)"; nl=$((nl + 300)); }
+        t=$((t+10)); [ $t -ge "$QUIET_WAIT_S" ] && { log "host not quiet after ${QUIET_WAIT_S}s (cpu busy ${b:-?}%; load $(cut -d' ' -f1 /proc/loadavg); $h)"; return 1; }
         sleep 10
     done
 }
@@ -573,6 +615,10 @@ cell() { # tag arm dur kind killat. return 0 = go on, 1 = stop the campaign (a s
     # a non-empty dir without it; this function refused an existing cell dir above (the spec may only repeat it)
     E=(TARGET_DIR="${BDIR[$b]}" TOOLS_DIR="$TOOLS" DATA_ROOT="$DEVNET" RESULTS_ROOT="$R" OVERWRITE=1)
     for kv in ${AHENV[$arm]}; do E+=("$kv"); done
+    # driver-owned, after the arm's harness env (env: the last one wins) and over any inherited value: the
+    # preflight decision is run-cell.sh's only source of these two, both ways (make-driver.py refuses them in a spec)
+    E+=(DEFER_REPORT_SCANS="$DEFER_SCANS")
+    if [ "$GENESIS_REUSE" = 1 ]; then E+=(GENESIS_CACHE_DIR="$RUN/genesis-cache"); else E+=(GENESIS_CACHE_DIR=); fi
     [ "${BWRAP[$b]}" = 1 ] || E+=(EXPECT_NODE_MD5="${BMD5[$b]}")
     [ -z "${BBMD5[$b]}" ] || E+=(EXPECT_BENCH_MD5="${BBMD5[$b]}")
     "$DETACH" "$label" "$R/$label.campaign.log" bash -c 'rcf=$1; shift; env "$@"; echo "rc=$?" > "$rcf"' cellwrap "$rcf" \
@@ -628,9 +674,13 @@ cell() { # tag arm dur kind killat. return 0 = go on, 1 = stop the campaign (a s
         warmgatechk "$label" "$rc" || crc=1
     fi
     [ "$crc" = 0 ] || { CELL_FAIL=check; return 1; }
-    hardscan "$label"
-    if [ "$SAMPLERS" = 1 ]; then
-        soakchk "$label" "$dur"
+    if [ "$DEFER_SCANS" = 1 ]; then
+        END_SCANS+=("$label:$dur")   # hardscan, soakchk: report-only, end_pass runs them after the campaign's last cell
+    else   # in-line: where the pre-end-pass driver ran them (an analysis.cmd or check may read their lines)
+        hardscan "$label"
+        if [ "$SAMPLERS" = 1 ]; then
+            soakchk "$label" "$dur"
+        fi
     fi
     [ "$rc" = 0 ] || log "CELL FAIL $label: run-cell rc=$rc -> recorded (cells.tsv row + rerun), continuing"
     if [ "$fdok" = 1 ]; then log "STOP: a node held > $FD_STOP open fds in $label"; CELL_FAIL=stop-fd; return 1; fi
@@ -645,6 +695,7 @@ run_spec() { # SPEC [SUFFIX]: one cell, then its write-up step (cells.tsv row, C
     STARTED_LABEL= CELL_FAIL=
     cell "$tg" "$arm" "$dur" "$kind" "$killat"; crc=$?
     if [ "$STARTED_LABEL" = "$label" ]; then
+        ENDPASS_LABELS+=("$label")
         [ "$crc" = 0 ] || { xr=${CELL_FAIL:-check}; log "$label failed the campaign (cell rc $crc): step flags it bad:$xr"; }
         CELL_STEP_SUMMARY_MD5=$(step_summary_md5 "$arm") \
             cell_step "$RUN" "$R/$label" "$label" "$tg" "$arm" "${tg%%-*}" "${BMD5[${ABIN[$arm]}]}" "$spec" "$xr"
@@ -659,6 +710,54 @@ run_cells() { # the campaign: each of CELLS through run_spec in order; 1 = stopp
     for c in "${CELLS[@]}"; do
         run_spec "$c" || { log "CAMPAIGN STOP at ${c%%:*} (queued reruns not run: $RUN/rerun-queue.tsv)"; return 1; }
     done
+}
+
+end_pass() { # once, after the campaign's last cell (no cell runs any more), before campaign.done: each started cell's
+    # deferred report-only node-log scans (cell-endpass.sh, on the cells with deferred-scans.json), then hardscan and
+    # soakchk of the cells that reached them (END_SCANS), cell by cell. Never fails the campaign: a failed cell scan
+    # is an END PASS FAIL line and keeps its marker (rerun by hand: cell-endpass.sh <cell dir>). Nothing deferred
+    # (DEFER_SCANS=0: the scans ran in-line, no cell has a marker) = nothing at all, not even a line
+    local label c dur t0 n=0 bad=0 r
+    [ ${#END_SCANS[@]} -gt 0 ] || for label in "${ENDPASS_LABELS[@]}"; do
+        [ ! -e "$R/$label/deferred-scans.json" ] || { n=1; break; }
+    done
+    [ ${#END_SCANS[@]} -gt 0 ] || [ "$n" = 1 ] || return 0
+    n=0
+    t0=$(date +%s)
+    log "END PASS start: ${#ENDPASS_LABELS[@]} cells (report-only scans: $POST_ENDPASS)"
+    for label in "${ENDPASS_LABELS[@]}"; do
+        if [ -e "$R/$label/deferred-scans.json" ]; then
+            n=$((n + 1)); "$ENDPASS" "$R/$label"; r=$?
+            [ "$r" = 0 ] || { bad=$((bad + 1)); log "END PASS FAIL $label: $ENDPASS rc=$r (marker kept)"; }
+        fi
+        for c in "${END_SCANS[@]}"; do
+            [ "${c%:*}" = "$label" ] || continue
+            dur=${c##*:}
+            hardscan "$label"
+            if [ "$SAMPLERS" = 1 ]; then
+                soakchk "$label" "$dur"
+            fi
+        done
+    done
+    log "END PASS done in $(( $(date +%s) - t0 ))s: $n cells with deferred scans ($bad failed), ${#END_SCANS[@]} hardscans"
+}
+
+run_campaign() { # the cells, the rerun pass (not in smoke), then the end pass; the EXIT trap writes campaign.done after
+    # this returns. 1 = stopped
+    local rc=0
+    if run_cells; then
+        log "MAIN CELLS END"
+        if [ "${SMOKE:-0}" != 1 ]; then
+            cell_step_rerun_pass "$RUN" run_spec || { log "CAMPAIGN STOP in the rerun pass"; rc=1; }
+        fi
+    else
+        rc=1
+    fi
+    end_pass
+    [ "$rc" = 0 ] || return 1
+    log "CAMPAIGN END"
+    [ -s "$RUN/cells.tsv" ] && awk -F'\t' 'NR > 1 {n++; if ($8 != "ok") b++} END {printf "cells.tsv: %d rows, %d bad\n", n, b}' "$RUN/cells.tsv"
+    return 0
 }
 
 # ---- preflight ----
@@ -740,10 +839,81 @@ preflight_genesis() { # the genesis inputs under run-cell.sh's repo root GENESIS
     return 0
 }
 
+cmd_words() { # cmd_words CMD: CMD split as cell_step.py runs it (shlex.split), NUL-terminated words; rc 1 = it
+    # does not split (e.g. an unclosed quote)
+    python3 -I -c 'import shlex, sys
+sys.stdout.write("".join(w + "\0" for w in shlex.split(sys.argv[1])))' "$1" 2>/dev/null
+}
+
+script_cmd() { # script_cmd CMD: CMD split as cell_step.py runs it (shlex.split) minus each -c command string (the
+    # word after -c or a cluster ending in c: bash -c '...', bash -lc, sh -ec, python3 -c; a string of shell or python
+    # code, no script path), re-joined (shlex.join) for analysis-words / cmd_words; rc 1 = CMD does not split
+    python3 -I -c 'import re, shlex, sys
+out, skip = [], False
+for w in shlex.split(sys.argv[1]):
+    if skip:
+        skip = False
+        continue
+    skip = re.fullmatch("-[A-Za-z]*c", w) is not None
+    out.append(w)
+sys.stdout.write(shlex.join(out))' "$1" 2>/dev/null
+}
+
+deferred_readers() { # the in-line readers that keep the report scans in-line, one "<reader>;" line each; empty =
+    # none, the scans defer. The deferred outputs (log-scans.sh REPORT_SCANS, cell-endpass.sh): summary.json
+    # .ingest.mempool_nonce_expired_evictions_per_node ([] until the end pass), run.log's ingest line (the "ingest
+    # scan deferred" line until then), val<i>.log.excerpt (absent until then), deferred-scans.json (until then).
+    # No guessing which regex, check or script reads which of them (Codex P2s on 0f2ca85b and bcc95fab: sample
+    # lines and keyword tests missed valid readers, a quoted script path hid the script). A reader is:
+    #   any expectation (spec-wide or per arm) on one of those files, any checks file (campaignchecks), any
+    #   analysis.cmd (cell_step runs it in-line)
+    # Checked, reads none: marketchk (summary.json cell.markets), warmgatechk and cell_step.py (validity,
+    # agreement, liveness, headline, crash, binaries), md5chk / envchk / sysctlchk / fdsum / savelog (their own files).
+    local i
+    for i in "${!EXP_FILE[@]}"; do
+        case ${EXP_FILE[$i]##*/} in
+            run.log|summary.json|*excerpt*|deferred-scans.json)
+                echo "expectation '${EXP_RE[$i]}' (arm ${EXP_ARM[$i]}) on ${EXP_FILE[$i]};" ;;
+        esac
+    done
+    [ -z "$CHECKS_SOURCE" ] || echo "checks file $CHECKS_SOURCE;"
+    [ -z "$ANALYSIS_CMD" ] || echo "analysis.cmd '$ANALYSIS_CMD';"
+    return 0
+}
+
+preflight_post() { # what run-cell.sh in TOOLS supports: the end pass (DEFER_REPORT_SCANS) and genesis reuse
+    # (GENESIS_CACHE_DIR). An older frozen run-cell.sh has neither: the cells run as before. One PREFLIGHT NOTE
+    # names where the report scans run and why
+    local f why scans
+    DEFER_SCANS=0; GENESIS_REUSE=0
+    if grep -q 'DEFER_REPORT_SCANS' "$HARNESS" 2>/dev/null; then
+        for f in "$TOOLS/log-scans.sh" "$ENDPASS"; do
+            [ -f "$f" ] || PF "$f missing: $HARNESS needs it (copy it from tools/matched-bench into tools_dir)"
+        done
+        scans=$(sed -n 's/^REPORT_SCANS="\(.*\)"$/\1/p' "$TOOLS/log-scans.sh")
+        why=$(deferred_readers | paste -sd' ')
+        if [ -n "$why" ]; then
+            echo "PREFLIGHT NOTE: report scans: in-line because ${why%;} ($scans; run-cell.sh defers them together)"
+        else
+            DEFER_SCANS=1
+            echo "PREFLIGHT NOTE: report scans: deferred to the campaign end pass ($scans; no expectation on run.log," \
+                "summary.json, an excerpt or deferred-scans.json, no checks file, no analysis.cmd)"
+        fi
+    else
+        echo "PREFLIGHT NOTE: report scans: in-line because $HARNESS has no DEFER_REPORT_SCANS (an older run-cell.sh)"
+    fi
+    if grep -q 'GENESIS_CACHE_DIR' "$HARNESS" 2>/dev/null; then
+        [ -f "$TOOLS/genesis_cache.py" ] || PF "$TOOLS/genesis_cache.py missing: $HARNESS needs it (copy it from tools/matched-bench into tools_dir)"
+        GENESIS_REUSE=1
+    fi
+    return 0
+}
+
 preflight_static() { # preflight_paths, then the spec checks (load_checks), from this frame: it has no locals, which
     # the checks file would see at source time or set instead of its own variables (load_checks)
     preflight_paths
     load_checks
+    preflight_post
 }
 
 preflight_paths() { # paths, tools, genesis inputs, staged md5s (a wrapper's md5 = the md5 of the node it execs)
@@ -775,8 +945,58 @@ preflight_paths() { # paths, tools, genesis inputs, staged md5s (a wrapper's md5
             [ "$m" = "${BBMD5[$b]}" ] || PF "binary $b: bench-throughput md5 ${m:-missing} != staged ${BBMD5[$b]}"
         fi
     done
-    for f in $ANALYSIS_CMD; do case $f in */*.py|*/*.sh) [ -f "$f" ] || PF "analysis script $f missing";; esac; done
+    [ -z "$ANALYSIS_CMD" ] || preflight_analysis_notes
     return 0
+}
+
+preflight_analysis_notes() { # advisory only (owner s131, after Codex P2s on 9f30ce12/c2b72397): a PREFLIGHT NOTE per
+    # analysis.cmd script word that is no file, never a FAIL, so preflight accepts every spec the pre-0f2ca85b
+    # driver accepted. The words as cell_step runs them (shlex.split: a quoted path is a path), minus each -c command
+    # string (script_cmd: bash -c '...', bash -lc, python3 -c), filled for every cell it can run by the frozen
+    # cell_step.py (analysis-words); an older one without it: split only, a word with a placeholder is not checked
+    local f cmd filled words cells
+    if ! cmd=$(script_cmd "$ANALYSIS_CMD"); then
+        echo "PREFLIGHT NOTE: analysis.cmd does not split as cell_step splits it (shlex.split; not checked further):" \
+            "$ANALYSIS_CMD"
+        return 0
+    fi
+    if grep -q 'analysis-words' "$TOOLS/cell_step.py" 2>/dev/null; then
+        filled=1
+        mapfile -d '' -t cells < <(analysis_cells)
+        mapfile -d '' -t words < <(python3 -I "$TOOLS/cell_step.py" analysis-words --run-dir "$RUN" \
+            --analysis-cmd="$cmd" "${cells[@]}" < /dev/null; echo -n "rc=$?")
+    else
+        filled=0
+        mapfile -d '' -t words < <(cmd_words "$cmd"; echo -n "rc=$?")
+    fi
+    if [ "${words[-1]:-}" != rc=0 ]; then
+        echo "PREFLIGHT NOTE: analysis.cmd cannot be filled for each cell as cell_step fills it (not checked further):" \
+            "$ANALYSIS_CMD"
+        return 0
+    fi
+    for f in "${words[@]:0:${#words[@]}-1}"; do
+        case $f in */*.py|*/*.sh)
+            if [ "$filled" = 0 ] && [[ $f =~ \{(out|prefix|tag|arm|label|cell|run)\} ]]; then
+                echo "PREFLIGHT NOTE: analysis script $f not checked: $TOOLS/cell_step.py has no analysis-words" \
+                    "(an older copy), so preflight cannot fill its placeholders as each cell's cell_step does"
+            elif [ ! -f "$f" ]; then
+                echo "PREFLIGHT NOTE: analysis script $f not found (not checked further)"
+            fi ;;
+        esac
+    done
+    return 0
+}
+
+analysis_cells() { # the analysis-words --cell args (NUL-terminated): each cell cell_step can run, as run_spec hands
+    # it over (label $P-<tag>, cell dir $R/<label>), then each one's -rerun (cell_step_rerun_pass; none in smoke)
+    local c tg arm rest sfx
+    for sfx in "" -rerun; do
+        [ -n "$sfx" ] && [ "${SMOKE:-0}" = 1 ] && continue
+        for c in "${CELLS[@]}"; do
+            IFS=: read -r tg arm rest <<< "$c"
+            printf '%s\0' --cell "$R/$P-$tg$sfx" "$P-$tg$sfx" "$tg$sfx" "$arm"
+        done
+    done
 }
 
 preflight_host() { # run mode only: inside a bench unit, nothing else running, no old attempt; host checks: memory,
@@ -801,7 +1021,8 @@ preflight_host() { # run mode only: inside a bench unit, nothing else running, n
 
 host_str() { # the PREFLIGHT OK line's warm-up gate / campaign checks / samplers / host checks part
     local k g=${GATE_TAGS// /,} c=${CHECK_FNS// /,}
-    printf 'warmgate=%s checks=%s samplers=%s host_checks=%s' "${g:-off}" "${c:-none}" "$SAMPLERS" "$HOST_CHECKS"
+    printf 'warmgate=%s checks=%s samplers=%s host_checks=%s end_pass=%s genesis_reuse=%s' "${g:-off}" "${c:-none}" \
+        "$SAMPLERS" "$HOST_CHECKS" "$DEFER_SCANS" "$GENESIS_REUSE"
     [ "$HOST_CHECKS" = 1 ] || return 0
     printf ' min_mem_avail_kb=%s' "$MIN_MEM_AVAIL_KB"
     for k in $(sysctl_names); do printf ' %s=%s' "$k" "${SYSCTL_WANT[$k]:-pinned}"; done
@@ -858,11 +1079,5 @@ export CELL_STEP_TIMEOUT=${CELL_STEP_TIMEOUT:-900} CELL_STEP_ANALYSIS_TIMEOUT=${
 # shellcheck source=../cell-step.sh
 source "$TOOLS/cell-step.sh" || PF "cannot source $TOOLS/cell-step.sh"
 log "PREFLIGHT OK CAMPAIGN=$UNIT_NAME driver=$SELF RUN=$RUN P=$P genesis_root=$GENESIS_ROOT arms=${ARMS[*]} baseline=$BASELINE markets=$MARKETS rate=$RATE $(host_str) cells=${#CELLS[@]}: $TAGS"
-run_cells || exit 1
-log "MAIN CELLS END"
-if [ "${SMOKE:-0}" != 1 ]; then
-    cell_step_rerun_pass "$RUN" run_spec || { log "CAMPAIGN STOP in the rerun pass"; exit 1; }
-fi
-log "CAMPAIGN END"
-[ -s "$RUN/cells.tsv" ] && awk -F'\t' 'NR > 1 {n++; if ($8 != "ok") b++} END {printf "cells.tsv: %d rows, %d bad\n", n, b}' "$RUN/cells.tsv"
+run_campaign || exit 1
 exit 0

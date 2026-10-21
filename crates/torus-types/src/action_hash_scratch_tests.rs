@@ -740,3 +740,116 @@ fn trust_cache_scratch_reuses_capacity_and_commits_each_signature_field() {
         assert_ne!(key, original);
     }
 }
+
+// ---- section 92 step 8e: one absorb of the canonical bytes for both keys ----
+
+/// The frozen anti-MEV sort hash: keccak of the frozen canonical encoding.
+fn legacy_sort_hash(action: &NativeAction) -> B256 {
+    alloy_primitives::keccak256(legacy_canonical_bytes(action))
+}
+
+#[test]
+fn one_absorb_keys_match_frozen_separate_hashes_for_all_actions_and_signatures() {
+    let mut scratch = vec![0xc3; 512];
+    for (i, action) in actions().into_iter().enumerate() {
+        for session in [false, true] {
+            for nonce in [0, 1, u64::MAX] {
+                let envelope = signed(action.clone(), session, nonce);
+                let (sort, cache) =
+                    sort_hash_and_verified_cache_key_with_scratch(&envelope, &mut scratch);
+                assert_eq!(sort, legacy_sort_hash(&envelope.action), "sort {i}");
+                assert_eq!(cache, legacy_verified_cache_key(&envelope), "cache {i}");
+                assert_eq!(cache, verified_cache_key(&envelope), "wrapper {i}");
+                // Dirty scratch must not leak into the next action's keys.
+                scratch.extend_from_slice(&[0x3c; 23]);
+            }
+        }
+    }
+}
+
+/// Randomized: batch sizes put the canonical length on every residue of the
+/// Keccak rate (136 bytes), so the shared-prefix split lands at every offset
+/// inside a block, and the 73-byte signature tail crosses block boundaries.
+#[test]
+fn one_absorb_keys_match_frozen_separate_hashes_randomized() {
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut residues = std::collections::BTreeSet::new();
+    let mut sides = std::collections::BTreeSet::new();
+    let mut scratch = Vec::new();
+    for round in 0..600 {
+        let n = (next() % 320) as usize;
+        let action = match round % 4 {
+            0 => NativeAction::PlaceOrderBatch((0..n).map(|j| order_params(j + round)).collect()),
+            1 => NativeAction::PlaceOrder(order_params(next() as usize % 1000)),
+            2 => NativeAction::CancelOrder {
+                order_id: u128::from(next()) << 64 | u128::from(next()),
+            },
+            _ => NativeAction::SubmitOraclePrices(OracleSubmission {
+                prices: (0..n)
+                    .map(|j| (next(), FixedPoint::from_raw(j as i128 - next() as i128)))
+                    .collect(),
+                timestamp: next(),
+            }),
+        };
+        let len = legacy_canonical_bytes(&action).len();
+        residues.insert(len % 136);
+        sides.insert(len >= SHARED_ABSORB_MIN_BYTES);
+        let session = next() % 5 == 0;
+        let mut envelope = signed(action, session, next());
+        if let ActionSignature::Eip712(sig) = &mut envelope.signature {
+            sig.v = 27 + (next() % 2) as u8;
+            sig.r.iter_mut().for_each(|b| *b = next() as u8);
+            sig.s.iter_mut().for_each(|b| *b = next() as u8);
+        }
+        let (sort, cache) = sort_hash_and_verified_cache_key_with_scratch(&envelope, &mut scratch);
+        assert_eq!(sort, legacy_sort_hash(&envelope.action), "round {round}");
+        assert_eq!(cache, legacy_verified_cache_key(&envelope), "round {round}");
+    }
+    assert!(residues.len() > 100, "rate residues covered: {}", residues.len());
+    assert_eq!(sides.len(), 2, "one-shot and shared-absorb paths both covered");
+}
+
+/// Picks `SHARED_ABSORB_MIN_BYTES`: per canonical length, two one-shot
+/// keccaks (C, then C || 73-byte tail) vs one absorb of C forked for both.
+/// `#[ignore]` (perf); `cargo test --release -p torus-types --lib
+/// shared_absorb_crossover_ubench -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn shared_absorb_crossover_ubench() {
+    use std::time::Instant;
+    let tail = [7u8; 73];
+    for len in [40usize, 100, 200, 300, 400, 544, 816, 1088, 2176, 10_800] {
+        let c = vec![0x5au8; len];
+        let mut buf = Vec::with_capacity(len + 73);
+        let iters = 2_000_000 / (len / 64 + 1);
+        let t = Instant::now();
+        for _ in 0..iters {
+            buf.clear();
+            buf.extend_from_slice(std::hint::black_box(&c));
+            let a = alloy_primitives::keccak256(&buf);
+            buf.extend_from_slice(&tail);
+            let b = alloy_primitives::keccak256(&buf);
+            std::hint::black_box((a, b));
+        }
+        let two = t.elapsed().as_nanos() as f64 / iters as f64;
+        let t = Instant::now();
+        for _ in 0..iters {
+            buf.clear();
+            buf.extend_from_slice(std::hint::black_box(&c));
+            let mut h = alloy_primitives::Keccak256::new();
+            h.update(&buf);
+            let a = h.clone().finalize();
+            h.update(tail);
+            let b = h.finalize();
+            std::hint::black_box((a, b));
+        }
+        let fork = t.elapsed().as_nanos() as f64 / iters as f64;
+        println!("len {len:6}: two one-shot {two:8.1} ns  fork {fork:8.1} ns");
+    }
+}

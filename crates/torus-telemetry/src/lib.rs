@@ -14,6 +14,49 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+/// A gauge holding the largest value observed since the previous scrape:
+/// encoding it reads the value and resets it to 0, so a 1 Hz scraper sees
+/// each second's maximum (a spike between scrapes is never overwritten by a
+/// later, smaller value). Non-negative values only (the bits of a
+/// non-negative `f64` order like the value). Meant for one scraper: with
+/// two, each scrape resets what the other has not read yet.
+#[derive(Clone, Debug, Default)]
+pub struct MaxSinceScrape(Arc<std::sync::atomic::AtomicU64>);
+
+impl MaxSinceScrape {
+    /// Raise the value to `v` if it is larger (NaN and negatives ignored).
+    pub fn observe(&self, v: f64) {
+        if v > 0.0 {
+            self.0
+                .fetch_max(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The current value, without resetting it.
+    pub fn peek(&self) -> f64 {
+        f64::from_bits(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl prometheus_client::metrics::TypedMetric for MaxSinceScrape {
+    const TYPE: prometheus_client::metrics::MetricType =
+        prometheus_client::metrics::MetricType::Gauge;
+}
+
+impl prometheus_client::encoding::EncodeMetric for MaxSinceScrape {
+    fn encode(
+        &self,
+        mut encoder: prometheus_client::encoding::MetricEncoder,
+    ) -> Result<(), std::fmt::Error> {
+        let bits = self.0.swap(0, std::sync::atomic::Ordering::Relaxed);
+        encoder.encode_gauge(&f64::from_bits(bits))
+    }
+
+    fn metric_type(&self) -> prometheus_client::metrics::MetricType {
+        prometheus_client::metrics::MetricType::Gauge
+    }
+}
+
 /// Global metrics for the Torus node.
 ///
 /// Metric handles are `Clone + Send + Sync` (internally Arc-based).
@@ -352,9 +395,19 @@ pub struct Metrics {
     /// End-of-`execute_batch` position + balance cache `flush_all` into the
     /// overlay (nested inside `exec_phase_settle_seconds`).
     pub exec_cache_flush_seconds: Histogram,
+    /// 8k L2.2 (`TORUS_SETTLE_NO_MERGE=1`): end-of-call position flushes
+    /// whose per-market caches were not provably disjoint (an opaque row put
+    /// one market's key in another's cache), so they were merged in order
+    /// and `flush_all`-ed like the flag-off path. Expected 0.
+    pub exec_settle_no_merge_fallbacks: Counter,
     /// Post-engine tail on the exec thread: core-writer drain, governance,
     /// fee distribution and the epoch boundary.
     pub exec_post_engine_tail_seconds: Histogram,
+    /// The liquidation step inside the post-engine tail, on the exec thread:
+    /// the whole `run_liquidations` call (the pass, its node-local telemetry
+    /// reads and the optional value-sum walk), one observation per native
+    /// block. `torus_liquidation_step_seconds` times the pass alone.
+    pub exec_liquidation_step_seconds: Histogram,
     /// The residual: engine wall clock minus (phase1 + margin + match +
     /// settle + tail). Whatever this holds is the next thing to instrument.
     pub exec_engine_untimed_seconds: Histogram,
@@ -515,9 +568,54 @@ pub struct Metrics {
     /// Consensus thread: whole `on_committed_block` hook (manifest persist,
     /// durable block persist, mempool prune, exec dispatch).
     pub on_committed_block_seconds: Histogram,
+    /// T5.3: the commit-manifest put inside `on_committed_block` (section 106:
+    /// the in-window commit-hook stall, waiting behind the checkpoint batch
+    /// while the manifest lived in the state DB).
+    pub commit_manifest_seconds: Histogram,
+    /// T5.3: one background manifest prune pass (pruner thread, at most 1/s):
+    /// state-DB WAL fsync, then the delete of the dispatched heights' manifests
+    /// in the consensus DB. Not observed with the manifest in the state DB (its
+    /// prune rides the commit-persist batch).
+    pub commit_manifest_prune_seconds: Histogram,
+    /// T5.3: how long the exec thread waits, before executing a block, for its
+    /// header + body write on the commit-persist writer thread (that write keeps
+    /// the `torus_commit_persist_*` timers, now observed on the writer).
+    pub exec_commit_persist_wait_seconds: Histogram,
+    /// T5.3: the whole `on_commit_block` event handler (event-bus thread:
+    /// height lookup, mempool prune, header read, WS notify).
+    pub on_commit_block_handler_seconds: Histogram,
+    /// T5.3: the handler's applied-marker read + `prune_committed_txs`.
+    pub commit_handler_prune_seconds: Histogram,
     /// Consensus thread: `remove_committed_native` (mempool write-lock + prune)
     /// inside the commit dispatch.
     pub mempool_remove_committed_seconds: Histogram,
+    /// RH4: committed native-action bodies deleted from the DA store
+    /// (`cf_native_pending`) after leaving the retention window. Without the
+    /// GC the store only grew.
+    pub da_bodies_gc_deleted: Counter,
+    /// RH4, consensus thread: one DA body GC pass inside the commit dispatch
+    /// (record the height's row, delete aged bodies and shards: one batch).
+    pub da_gc_seconds: Histogram,
+    /// RH4, `torus_da_gc_last_pass_max_seconds`: the longest DA body GC pass
+    /// since the previous scrape (each scrape reads and resets it to 0). The
+    /// 1 Hz bench sampler sees every slow pass in the second it ran; a
+    /// second scraper would split the passes between the two.
+    pub da_gc_last_pass_max: MaxSinceScrape,
+    /// RH4: DA body GC passes at or over the slow-pass threshold
+    /// (`TORUS_DA_GC_SLOW_MS`, default 50 ms); each also logs one warn line
+    /// with its phases.
+    pub da_gc_slow_passes: Counter,
+    /// RH4: DA body GC passes that deleted nothing, by `reason`
+    /// (`torus_state::DaGcHoldReason::as_str`): `gap` (bookkeeping behind,
+    /// not back-fillable from the block tree), `backfilling` (behind by more
+    /// than one pass back-fills), `unrecorded` (the height's body row did not
+    /// land), `pre_cursor` (a pre-cursor store's replay), `pruned_gap` (a
+    /// skipped pruned height not due yet), `dispatch_behind` (dispatch is
+    /// behind the committed tip, e.g. backpressure in non-blocking dispatch),
+    /// `tip_unreadable`, `tail_unreadable` (a block above the committed tip
+    /// cannot be read or decoded), `store_error` (the pass failed). The
+    /// bodies stay; the next pass retries.
+    pub da_gc_held_passes: Family<Vec<(String, String)>, Counter>,
     /// PROFILER (s470): total resting orders across all books, sampled once per
     /// block right after the load/rebuild. Book-depth axis for the
     /// depth-vs-cost correlation (the funnel `orders_resting` counter is a
@@ -661,6 +759,18 @@ pub struct Metrics {
     /// Item 6 Phase 3: since-checkpoint layer bytes (keys + values, a
     /// tombstone counts its key) per checkpoint.
     pub exec_checkpoint_layer_bytes: Histogram,
+    /// 8k L3.1 (`TORUS_BOOK_COALESCE`): Classic books whose per-block
+    /// whole-book encode was skipped (summed over pipelined blocks; each is
+    /// encoded once at its window's close instead). 0 with the flag off.
+    pub exec_book_coalesce_skipped: Counter,
+    /// 8k L3.1: exec-thread wall time of one window close's coalesced book
+    /// encode (every unsaved book encoded from the resident holder and put
+    /// into the closing layer), one observation per close with at least one
+    /// unsaved book. The spike E pays once per window.
+    pub exec_book_coalesce_close_seconds: Histogram,
+    /// 8k L3.1: books encoded per window close (same observations as
+    /// `exec_book_coalesce_close_seconds`).
+    pub exec_book_coalesce_close_books: Histogram,
     /// Item 6 Phase 3: the layer was still shared when the exec thread took
     /// it back to merge (deep copy instead; expected 0).
     pub exec_checkpoint_layer_shared: Counter,
@@ -712,6 +822,13 @@ pub struct Metrics {
     /// Item 6 Phase 3: flush-worker wall time per checkpoint job (the one
     /// batch: build, root, write, EVM resync).
     pub flush_worker_checkpoint_seconds: Histogram,
+    /// T5.3: the checkpoint's state-DB `write` alone (WAL + memtable), one
+    /// observation per checkpoint.
+    pub exec_checkpoint_db_write_seconds: Histogram,
+    /// T5.3: wall clock (unix ms) at which the latest checkpoint DB write
+    /// started / ended, to cut in-window intervals without a /proc sampler.
+    pub exec_checkpoint_db_write_start_ms: Gauge,
+    pub exec_checkpoint_db_write_end_ms: Gauge,
     /// Item 7 option 0 (task 4.2): the flush worker's EVM trie step (the
     /// hashed mirror and trie nodes of a fast-path EVM block at interval 0,
     /// of a checkpoint window holding one otherwise), inside
@@ -1867,12 +1984,25 @@ impl Metrics {
             "Exec sub-phase: position + balance cache flush_all into the overlay (inside settle)",
             exec_cache_flush_seconds.clone(),
         );
+        let exec_settle_no_merge_fallbacks = Counter::default();
+        registry.register(
+            "torus_exec_settle_no_merge_fallbacks",
+            "TORUS_SETTLE_NO_MERGE=1 position flushes whose per-market caches were not provably disjoint, so merged + flush_all-ed (expected 0)",
+            exec_settle_no_merge_fallbacks.clone(),
+        );
 
         let exec_post_engine_tail_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_exec_post_engine_tail_seconds",
             "Exec sub-phase: core-writer drain + governance + fee distribution + epoch boundary",
             exec_post_engine_tail_seconds.clone(),
+        );
+
+        let exec_liquidation_step_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 16));
+        registry.register(
+            "torus_exec_liquidation_step_seconds",
+            "Exec sub-phase: the liquidation step (whole run_liquidations call, inside the post-engine tail)",
+            exec_liquidation_step_seconds.clone(),
         );
 
         let exec_engine_untimed_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
@@ -2233,11 +2363,74 @@ impl Metrics {
             "Consensus thread: whole on_committed_block hook (persist + prune + dispatch)",
             on_committed_block_seconds.clone(),
         );
+        let commit_manifest_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_commit_manifest_seconds",
+            "Consensus thread: commit-manifest put inside on_committed_block (T5.3)",
+            commit_manifest_seconds.clone(),
+        );
+        let commit_manifest_prune_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_commit_manifest_prune_seconds",
+            "Pruner thread: state-WAL fsync + commit-manifest delete in the consensus DB, per pass (T5.3)",
+            commit_manifest_prune_seconds.clone(),
+        );
+        let exec_commit_persist_wait_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 16));
+        registry.register(
+            "torus_exec_commit_persist_wait_seconds",
+            "Exec thread: wait for the block's off-thread header + body write before executing it (T5.3)",
+            exec_commit_persist_wait_seconds.clone(),
+        );
+        let on_commit_block_handler_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_on_commit_block_handler_seconds",
+            "Event-bus thread: whole on_commit_block handler (T5.3)",
+            on_commit_block_handler_seconds.clone(),
+        );
+        let commit_handler_prune_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_commit_handler_prune_seconds",
+            "Event-bus thread: applied-marker read + prune_committed_txs in on_commit_block (T5.3)",
+            commit_handler_prune_seconds.clone(),
+        );
         let mempool_remove_committed_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
         registry.register(
             "torus_mempool_remove_committed_seconds",
             "Consensus thread: remove_committed_native inside the commit dispatch",
             mempool_remove_committed_seconds.clone(),
+        );
+        let da_bodies_gc_deleted = Counter::default();
+        registry.register(
+            "torus_da_bodies_gc_deleted",
+            "Committed native-action bodies deleted from the DA store after the retention window (RH4)",
+            da_bodies_gc_deleted.clone(),
+        );
+        // 0.1 ms .. 1.64 s: 8h saw passes up to the old top bucket (0.82 s).
+        let da_gc_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 15));
+        registry.register(
+            "torus_da_gc_seconds",
+            "Consensus thread: one DA body GC pass inside the commit dispatch (RH4)",
+            da_gc_seconds.clone(),
+        );
+        let da_gc_last_pass_max = MaxSinceScrape::default();
+        registry.register(
+            "torus_da_gc_last_pass_max_seconds",
+            "Longest DA body GC pass since the previous scrape; a scrape resets it (RH4)",
+            da_gc_last_pass_max.clone(),
+        );
+        let da_gc_slow_passes = Counter::default();
+        registry.register(
+            "torus_da_gc_slow_passes",
+            "DA body GC passes at or over TORUS_DA_GC_SLOW_MS (default 50 ms); each logs one \
+             warn line (RH4)",
+            da_gc_slow_passes.clone(),
+        );
+        let da_gc_held_passes = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "torus_da_gc_held_passes",
+            "DA body GC passes that deleted nothing, by reason (gap / backfilling / unrecorded / \
+             pre_cursor / pruned_gap / dispatch_behind / tip_unreadable / tail_unreadable / store_error) (RH4)",
+            da_gc_held_passes.clone(),
         );
 
         let exec_resting_orders = Gauge::default();
@@ -2472,6 +2665,24 @@ impl Metrics {
             "Item 6 Phase 3: since-checkpoint layer bytes per checkpoint",
             exec_checkpoint_layer_bytes.clone(),
         );
+        let exec_book_coalesce_skipped = Counter::default();
+        registry.register(
+            "torus_exec_book_coalesce_skipped",
+            "8k L3.1: Classic books whose per-block encode was skipped (encoded once at the window close)",
+            exec_book_coalesce_skipped.clone(),
+        );
+        let exec_book_coalesce_close_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 16));
+        registry.register(
+            "torus_exec_book_coalesce_close_seconds",
+            "8k L3.1: exec-thread time of one window close's coalesced book encode",
+            exec_book_coalesce_close_seconds.clone(),
+        );
+        let exec_book_coalesce_close_books = Histogram::new(exponential_buckets(1.0, 2.0, 14));
+        registry.register(
+            "torus_exec_book_coalesce_close_books",
+            "8k L3.1: books encoded per window close",
+            exec_book_coalesce_close_books.clone(),
+        );
         let exec_checkpoint_layer_shared = Counter::default();
         registry.register(
             "torus_exec_checkpoint_layer_shared",
@@ -2539,6 +2750,24 @@ impl Metrics {
             "torus_flush_worker_checkpoint_seconds",
             "Item 6 Phase 3: flush worker wall time per checkpoint job",
             flush_worker_checkpoint_seconds.clone(),
+        );
+        let exec_checkpoint_db_write_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 16));
+        registry.register(
+            "torus_exec_checkpoint_db_write_seconds",
+            "T5.3: the checkpoint's state-DB write alone (WAL + memtable)",
+            exec_checkpoint_db_write_seconds.clone(),
+        );
+        let exec_checkpoint_db_write_start_ms = Gauge::default();
+        registry.register(
+            "torus_exec_checkpoint_db_write_start_ms",
+            "T5.3: unix ms at which the latest checkpoint DB write started",
+            exec_checkpoint_db_write_start_ms.clone(),
+        );
+        let exec_checkpoint_db_write_end_ms = Gauge::default();
+        registry.register(
+            "torus_exec_checkpoint_db_write_end_ms",
+            "T5.3: unix ms at which the latest checkpoint DB write ended",
+            exec_checkpoint_db_write_end_ms.clone(),
         );
         let flush_worker_evm_trie_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
         registry.register(
@@ -3015,7 +3244,9 @@ impl Metrics {
             exec_settle_pass_a_seconds,
             exec_settle_pass_b_seconds,
             exec_cache_flush_seconds,
+            exec_settle_no_merge_fallbacks,
             exec_post_engine_tail_seconds,
+            exec_liquidation_step_seconds,
             exec_engine_untimed_seconds,
             exec_save_books_seconds,
             exec_flush_seconds,
@@ -3069,7 +3300,17 @@ impl Metrics {
             validate_block_da_wait_seconds,
             validate_block_attest_lookup_seconds,
             on_committed_block_seconds,
+            commit_manifest_seconds,
+            commit_manifest_prune_seconds,
+            exec_commit_persist_wait_seconds,
+            on_commit_block_handler_seconds,
+            commit_handler_prune_seconds,
             mempool_remove_committed_seconds,
+            da_bodies_gc_deleted,
+            da_gc_seconds,
+            da_gc_last_pass_max,
+            da_gc_slow_passes,
+            da_gc_held_passes,
             exec_resting_orders,
             exec_resident_rebuilds,
             exec_resident_rows,
@@ -3104,6 +3345,9 @@ impl Metrics {
             exec_checkpoints,
             exec_checkpoint_wait_seconds,
             exec_checkpoint_layer_bytes,
+            exec_book_coalesce_skipped,
+            exec_book_coalesce_close_seconds,
+            exec_book_coalesce_close_books,
             exec_checkpoint_layer_shared,
             exec_checkpoint_settle_wait_seconds,
             exec_checkpoint_deferred_join_seconds,
@@ -3115,6 +3359,9 @@ impl Metrics {
             exec_checkpoint_read_views_live,
             exec_checkpoint_oldest_live_age_blocks,
             flush_worker_checkpoint_seconds,
+            exec_checkpoint_db_write_seconds,
+            exec_checkpoint_db_write_start_ms,
+            exec_checkpoint_db_write_end_ms,
             flush_worker_evm_trie_seconds,
             order_age_admit_seconds,
             order_age_commit_seconds,
@@ -3355,11 +3602,15 @@ pub enum OrderRejectReason {
     Other,
     /// s114 cloid: the order's cloid is live for its trader (any market).
     DuplicateCloid,
+    /// Pre-testnet P0: the order names a market that is not listed.
+    UnknownMarket,
+    /// Pre-testnet P1: a non-reduce-only order on a delisted market.
+    MarketDelisted,
 }
 
 impl OrderRejectReason {
     /// Number of reasons (labels).
-    pub const COUNT: usize = 17;
+    pub const COUNT: usize = 19;
 
     /// Every reason in discriminant order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -3380,6 +3631,8 @@ impl OrderRejectReason {
         Self::Fill,
         Self::Other,
         Self::DuplicateCloid,
+        Self::UnknownMarket,
+        Self::MarketDelisted,
     ];
 
     /// The label value (the `FailureReason` names of torus-state where one
@@ -3403,6 +3656,8 @@ impl OrderRejectReason {
             Self::Fill => "fill",
             Self::Other => "other",
             Self::DuplicateCloid => "duplicate_cloid",
+            Self::UnknownMarket => "unknown_market",
+            Self::MarketDelisted => "market_delisted",
         }
     }
 }
@@ -3742,12 +3997,65 @@ mod tests {
             "torus_validate_block_da_wait_seconds",
             "torus_validate_block_attest_lookup_seconds",
             "torus_on_committed_block_seconds",
+            "torus_commit_manifest_seconds",
+            "torus_commit_manifest_prune_seconds",
+            "torus_exec_commit_persist_wait_seconds",
+            "torus_on_commit_block_handler_seconds",
+            "torus_commit_handler_prune_seconds",
             "torus_mempool_remove_committed_seconds",
+            "torus_da_bodies_gc_deleted_total",
+            "torus_da_gc_seconds",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }
         assert!(text.contains("torus_validate_block_seconds_count 1"), "{text}");
         assert!(text.contains("torus_mempool_native_size 3"), "{text}");
+    }
+
+    /// RH4 slow-pass observability (8h: rare 51-205 ms GC passes, the old
+    /// buckets topped out at 0.82 s and nothing showed which pass): the
+    /// pass histogram reaches past 1 s, the longest pass since the previous
+    /// scrape is a gauge that the scrape resets, and slow passes are counted.
+    #[test]
+    fn da_gc_slow_pass_metrics_register() {
+        let m = Metrics::new();
+        let text = m.encode();
+        for name in [
+            "torus_da_gc_last_pass_max_seconds",
+            "torus_da_gc_slow_passes_total",
+            "torus_da_gc_seconds",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+        let top_bucket = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("torus_da_gc_seconds_bucket{le=\""))
+            .filter_map(|l| l.split('"').next())
+            .filter_map(|le| le.parse::<f64>().ok())
+            .filter(|le| le.is_finite())
+            .fold(0.0f64, f64::max);
+        assert!(
+            top_bucket >= 1.0,
+            "top finite bucket {top_bucket} s:\n{text}"
+        );
+
+        let gauge = |text: &str| -> f64 {
+            text.lines()
+                .find_map(|l| l.strip_prefix("torus_da_gc_last_pass_max_seconds "))
+                .expect("gauge line")
+                .parse()
+                .unwrap()
+        };
+        m.da_gc_last_pass_max.observe(0.002);
+        m.da_gc_last_pass_max.observe(0.15);
+        m.da_gc_last_pass_max.observe(0.01);
+        m.da_gc_slow_passes.inc();
+        let text = m.encode();
+        assert_eq!(gauge(&text), 0.15, "the longest pass since the last scrape");
+        assert!(text.contains("torus_da_gc_slow_passes_total 1"), "{text}");
+        assert_eq!(gauge(&m.encode()), 0.0, "a scrape resets it");
+        m.da_gc_last_pass_max.observe(0.004);
+        assert_eq!(gauge(&m.encode()), 0.004);
     }
 
     /// s68: the leader's `produce_block` phases, so the ~180 ms loaded
@@ -3785,6 +4093,9 @@ mod tests {
             "torus_exec_checkpoint_wait_seconds",
             "torus_exec_checkpoint_layer_bytes",
             "torus_exec_checkpoint_layer_shared",
+            "torus_exec_book_coalesce_skipped",
+            "torus_exec_book_coalesce_close_seconds",
+            "torus_exec_book_coalesce_close_books",
             "torus_exec_checkpoint_settle_wait_seconds",
             "torus_exec_checkpoint_deferred_join_seconds",
             "torus_exec_checkpoint_deferred_read_waits",
@@ -3795,6 +4106,9 @@ mod tests {
             "torus_exec_checkpoint_read_views_live",
             "torus_exec_checkpoint_oldest_live_age_blocks",
             "torus_flush_worker_checkpoint_seconds",
+            "torus_exec_checkpoint_db_write_seconds",
+            "torus_exec_checkpoint_db_write_start_ms",
+            "torus_exec_checkpoint_db_write_end_ms",
             "torus_exec_save_books_drain_seconds",
             "torus_exec_save_books_write_seconds",
             "torus_flush_worker_save_books_write_seconds",
@@ -3847,10 +4161,18 @@ mod tests {
             "torus_exec_settle_pass_b_seconds",
             "torus_exec_cache_flush_seconds",
             "torus_exec_post_engine_tail_seconds",
+            "torus_exec_liquidation_step_seconds",
             "torus_exec_engine_untimed_seconds",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }
+        // 8k L2.2: the no-merge fallback counter (a `_total` series).
+        m.exec_settle_no_merge_fallbacks.inc();
+        let text = m.encode();
+        assert!(
+            text.contains("torus_exec_settle_no_merge_fallbacks_total 1\n"),
+            "{text}"
+        );
     }
 
     /// L3 level-hash sponge cache stats (perf/l3-cache-stats): the aggregated

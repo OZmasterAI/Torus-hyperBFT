@@ -12,7 +12,7 @@ A validator with `TORUS_CHECKPOINT_INTERVAL_MS` above 0 (the default, 15 s) writ
 disk once per checkpoint, not per block. A checkpoint lands as one atomic batch with the marker, at
 the interval, every 100th block, the byte cap, a barrier or shutdown.
 
-With the EVM fast path on (`TORUS_EVM_FAST_PATH=1`, item 7 option 0), a block with EVM txs is no
+With the EVM fast path on (the default since s131; `TORUS_EVM_FAST_PATH=0` turns it off; item 7 option 0), a block with EVM txs is no
 exception. Its EVM state (accounts, storage, code), its receipts, its tx index (hash -> location),
 its block hash index and its CoreWriter tx links ride the same checkpoint batch as its marker.
 So:
@@ -34,7 +34,7 @@ So:
 - `eth_call`, `eth_estimateGas`, `eth_getBalance`, `eth_getCode` and `eth_getStorageAt` answer at
   the eth head (an older or newer block is `HistoricalStateUnavailable`).
 
-With the flag off (the default until bench Q11 passes), every block with EVM txs first drains
+With the flag off (`TORUS_EVM_FAST_PATH=0`; on by default since s131), every block with EVM txs first drains
 everything to disk and then writes its own state and receipts with its marker. The eth head then
 reaches each EVM block right after it executes. The native-only blocks between EVM heights still lag
 by up to one interval.

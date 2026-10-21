@@ -33,6 +33,7 @@ fn call_data(signature: &str, words: &[[u8; 32]]) -> Vec<u8> {
 /// tests are about the drain, not the delay, and expect orders in the next block.
 fn harness_k1() -> TestHarness {
     let h = TestHarness::new();
+    h.list_markets(1..=64);
     h.state_db
         .put_cf_raw(
             torus_state::cf::CF_FEE_CONFIG,
@@ -134,6 +135,7 @@ fn test_core_writer_precompile_call() {
 #[test]
 fn test_core_writer_staking_delayed_delegation() {
     let h = TestHarness::new();
+    h.list_markets(1..=64);
     let delegator = TestHarness::addr(3);
     let validator = TestHarness::addr(99);
     let current_block = 15u64;
