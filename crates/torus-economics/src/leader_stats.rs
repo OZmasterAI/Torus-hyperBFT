@@ -174,7 +174,11 @@ pub fn put_leader_exclusion_plan<T: StateBackend>(
     state: &T,
     plan: &LeaderExclusionPlan,
 ) -> Result<()> {
-    state.put_cf_raw(CF_CONSENSUS_META, &lx_plan_key(plan.boundary), &encode(plan)?)?;
+    state.put_cf_raw(
+        CF_CONSENSUS_META,
+        &lx_plan_key(plan.boundary),
+        &encode(plan)?,
+    )?;
     Ok(())
 }
 
@@ -225,7 +229,11 @@ pub fn attribution_rows<T: StateBackend>(
                 0 => 0,
                 l => (height.saturating_sub(1) / l) * l,
             };
-            for address in attr.signers.iter().filter(|a| index.binary_search(a).is_ok()) {
+            for address in attr
+                .signers
+                .iter()
+                .filter(|a| index.binary_search(a).is_ok())
+            {
                 let st = entry(&mut touched, state, address)?;
                 if st.seen_at.is_none_or(|seen| seen <= window_start) {
                     st.seen_at = Some(height);
@@ -632,7 +640,11 @@ mod tests {
         exec(&mgr, 1, &missed(&[4, 3, 4, 3, 4, 3], 1, 9));
         let mut view = 9;
         quiet(&mgr, 2, 4, &mut view);
-        assert_eq!(excluded(&plan(&mgr, 8).unwrap()), vec![addr(3)], "tie: lower address");
+        assert_eq!(
+            excluded(&plan(&mgr, 8).unwrap()),
+            vec![addr(3)],
+            "tie: lower address"
+        );
     }
 
     /// A2 cap, bench stakes 2/2/1: the dead stake-1 node can be excluded (4 of 5 >= quorum),
@@ -649,7 +661,11 @@ mod tests {
         exec(&mgr, 1, &missed(&[2, 2, 2], 1, 4));
         let mut view = 4;
         quiet(&mgr, 2, 4, &mut view);
-        assert_eq!(leader_stats(mgr.state(), &addr(2)).unwrap().miss_run, 3, "K reached");
+        assert_eq!(
+            leader_stats(mgr.state(), &addr(2)).unwrap().miss_run,
+            3,
+            "K reached"
+        );
         assert_eq!(plan(&mgr, 8), None, "eligible 3M < quorum 3,333,334");
         assert_eq!(quorum_power(5_000_000), 3_333_334);
     }
@@ -679,15 +695,28 @@ mod tests {
         quiet(&mgr, 13, 13, &mut view);
         view += 1;
         exec(&mgr, 14, &signed(1, view, &[1, 2, 4]));
-        assert_eq!(leader_stats(mgr.state(), &addr(4)).unwrap().seen_at, Some(14));
+        assert_eq!(
+            leader_stats(mgr.state(), &addr(4)).unwrap().seen_at,
+            Some(14)
+        );
         quiet(&mgr, 15, 16, &mut view);
         let p = plan(&mgr, 20).expect("re-admission plan for 20");
         assert!(p.excluded.is_empty());
-        assert_eq!((p.exclude.clone(), p.readmit.clone()), (vec![], vec![pk(4)]));
+        assert_eq!(
+            (p.exclude.clone(), p.readmit.clone()),
+            (vec![], vec![pk(4)])
+        );
         quiet(&mgr, 17, 20, &mut view);
         assert!(installed_leader_exclusions(mgr.state()).unwrap().is_empty());
-        assert_eq!(leader_excluded_index(mgr.state()).unwrap(), Vec::<[u8; 20]>::new());
-        assert_eq!(leader_stats(mgr.state(), &addr(4)).unwrap().j, 1, "j kept until a success");
+        assert_eq!(
+            leader_excluded_index(mgr.state()).unwrap(),
+            Vec::<[u8; 20]>::new()
+        );
+        assert_eq!(
+            leader_stats(mgr.state(), &addr(4)).unwrap().j,
+            1,
+            "j kept until a success"
+        );
     }
 
     /// A3 2^j floor and its reset: excluded again without a success in between, the floor
@@ -708,8 +737,8 @@ mod tests {
         quiet(&mgr, 18, 20, &mut view);
         let st = leader_stats(mgr.state(), &addr(4)).unwrap();
         assert_eq!((st.excluded_at, st.readmit_after, st.j), (Some(24), 32, 2));
-        // Seen in (24, 28]: boundary 28 may not re-admit (28 + L = 32 >= 32 holds: it does);
-        // seen in (20, 24]: boundary 24 may not (24 + L = 28 < 32).
+        // Seen at 22, in (20, 24]: boundary 24 may not re-admit (24 + L = 28 < floor 32).
+        // Seen again at 25, in (24, 28]: boundary 28 does (28 + L = 32 >= 32).
         quiet(&mgr, 21, 21, &mut view);
         view += 1;
         exec(&mgr, 22, &signed(1, view, &[4]));
@@ -736,7 +765,11 @@ mod tests {
             ..LeaderStats::default()
         };
         mgr.state()
-            .put_cf_raw(CF_CONSENSUS_META, &validator_key(&addr(4)), &encode(&row).unwrap())
+            .put_cf_raw(
+                CF_CONSENSUS_META,
+                &validator_key(&addr(4)),
+                &encode(&row).unwrap(),
+            )
             .unwrap();
         let mut view = 0;
         quiet(&mgr, 1, 4, &mut view);
@@ -790,7 +823,10 @@ mod tests {
         assert!(!members.contains(&addr(5)), "left the set");
         assert!(installed_leader_exclusions(mgr.state()).unwrap().is_empty());
         assert!(leader_excluded_index(mgr.state()).unwrap().is_empty());
-        assert_eq!(leader_stats(mgr.state(), &addr(5)).unwrap().excluded_at, None);
+        assert_eq!(
+            leader_stats(mgr.state(), &addr(5)).unwrap().excluded_at,
+            None
+        );
     }
 
     /// Feature off (`params` = None): attribution rows may exist, but no plan is written.
@@ -847,7 +883,10 @@ mod tests {
                 }
             }
             assert_eq!(meta_dump(&a), meta_dump(&b), "seed {seed}");
-            assert!(planned > 0, "seed {seed}: the chain must exercise exclusion plans");
+            assert!(
+                planned > 0,
+                "seed {seed}: the chain must exercise exclusion plans"
+            );
         }
     }
 }

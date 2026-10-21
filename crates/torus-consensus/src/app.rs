@@ -9893,15 +9893,16 @@ impl TorusApp {
         }
         let plan = self.epoch_plan(height)?;
         // Dead-leader skip (A4): the exclusion plan the same execution wrote next to `plan`.
-        let exclusions =
-            match torus_economics::leader_stats::leader_exclusion_plan(self.staking.state(), height)
-            {
-                Ok(lx) => lx.filter(|lx| !lx.exclude.is_empty() || !lx.readmit.is_empty()),
-                Err(e) => {
-                    tracing::error!(%e, height, "failed to read the leader exclusion plan");
-                    return Err(EpochPlanNotReady);
-                }
-            };
+        let exclusions = match torus_economics::leader_stats::leader_exclusion_plan(
+            self.staking.state(),
+            height,
+        ) {
+            Ok(lx) => lx.filter(|lx| !lx.exclude.is_empty() || !lx.readmit.is_empty()),
+            Err(e) => {
+                tracing::error!(%e, height, "failed to read the leader exclusion plan");
+                return Err(EpochPlanNotReady);
+            }
+        };
         let mut updates = match plan {
             Some(plan) if plan.changed => {
                 let mut updates = ValidatorSetUpdates::new();
@@ -11117,11 +11118,7 @@ impl App<RocksKVStore> for TorusApp {
         // Dead-leader skip (A1): the justify QC's evidence, node-local, BEFORE the block can
         // reach execution (which needs it, also in a crash replay: the row is in the state DB
         // ahead of the block's header row, so a durable header implies a durable row).
-        if self
-            .leader_skip_config
-            .dead_leader_skip(&header)
-            .is_some()
-        {
+        if self.leader_skip_config.dead_leader_skip(&header).is_some() {
             let evidence = crate::leader_skip::LeaderEvidence::of(&block.justify);
             if let Err(e) =
                 crate::leader_skip::persist_leader_evidence(&self.state_db, height, &evidence)
@@ -16140,7 +16137,10 @@ mod crash_recovery_tests {
         let (set, _) = dls_hs_set();
         let dead = dls_leader(3);
         LeaderEvidence {
-            view: (1u64..).filter(|v| v % 4 != 3).nth((h - 2) as usize).unwrap(),
+            view: (1u64..)
+                .filter(|v| v % 4 != 3)
+                .nth((h - 2) as usize)
+                .unwrap(),
             phase: QC_GENERIC,
             signers: set.validators().map(|v| *v != dead).collect(),
         }
@@ -16168,7 +16168,10 @@ mod crash_recovery_tests {
         for h in from..=to {
             crate::leader_skip::persist_leader_evidence(db, h, &dls_evidence(h)).unwrap();
             ctx.execute_committed_block(&make_block(h, vec![]), vec![]);
-            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "height {h} fail-stopped");
+            assert!(
+                !ctx.exec_failed.load(Ordering::SeqCst),
+                "height {h} fail-stopped"
+            );
         }
     }
 
@@ -16215,7 +16218,11 @@ mod crash_recovery_tests {
         assert_eq!(rows, dls_rows(&replayed), "full replay");
         assert_eq!(rows, dls_rows(&half), "replay of 9..=16");
         for db in [&serial, &replayed, &half] {
-            assert_eq!(dls_evidence_rows(db), 0, "evidence rows go with their block");
+            assert_eq!(
+                dls_evidence_rows(db),
+                0,
+                "evidence rows go with their block"
+            );
             let installed: Vec<[u8; 20]> =
                 torus_economics::leader_stats::installed_leader_exclusions(db)
                     .unwrap()
@@ -16246,7 +16253,10 @@ mod crash_recovery_tests {
         for h in 1..=16 {
             crate::leader_skip::persist_leader_evidence(&piped, h, &dls_evidence(h)).unwrap();
             dispatch_and_execute(&ctx, &piped, &make_block(h, vec![]));
-            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "height {h} fail-stopped");
+            assert!(
+                !ctx.exec_failed.load(Ordering::SeqCst),
+                "height {h} fail-stopped"
+            );
         }
         let paths = ctx.test_paths.lock().unwrap().clone();
         drop(ctx); // drains + joins W
@@ -16296,7 +16306,9 @@ mod crash_recovery_tests {
         ctx.execute_committed_block(&make_block(1, vec![]), vec![]);
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
         assert_eq!(read_native_applied_height(&db), Some(1));
-        assert!(dls_rows(&db).iter().all(|(k, _)| !k.starts_with(b"leader_stats:")));
+        assert!(dls_rows(&db)
+            .iter()
+            .all(|(k, _)| !k.starts_with(b"leader_stats:")));
     }
 
     /// The commit path writes the justify QC's evidence row before dispatching the block (on),

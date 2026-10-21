@@ -2112,7 +2112,11 @@ mod tests {
             (3, 10, true),
             (3, 11, false),
         ] {
-            assert_eq!(DeadLeaderParams::check(k, cap).is_ok(), ok, "K {k} cap {cap}");
+            assert_eq!(
+                DeadLeaderParams::check(k, cap).is_ok(),
+                ok,
+                "K {k} cap {cap}"
+            );
         }
         let json = serde_json::json!({
             "chain_id": 1, "chain_name": "t", "evm_gas_limit": 1, "base_fee_per_gas": 1,
@@ -2149,7 +2153,10 @@ mod tests {
         };
         assert_eq!(
             config.dead_leader_skip(&header),
-            Some(DeadLeaderParams { miss_threshold: 3, exclusion_cap: 6 })
+            Some(DeadLeaderParams {
+                miss_threshold: 3,
+                exclusion_cap: 6
+            })
         );
         config.leader_exclusion_cap = 11;
         assert!(config.validate().is_err());
