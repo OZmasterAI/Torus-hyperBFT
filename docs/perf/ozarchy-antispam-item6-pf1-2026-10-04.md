@@ -18290,6 +18290,190 @@ p99 ~126 ms; 9e's close is ~10% slower at the mean, on the same order.
   `ozarchy-9e-run/contention-main.tsv`; spec, checks and driver `ozarchy-9e-tools/{9e-spec.json,9e-checks.sh,
   ozarchy-9e-campaign.sh,9e-chain.sh}`; build `ozarchy-9e-stage/build/`.
 
+## 118. Step 9f, b1 Classic gap: `qc_to_advance` sub-timers and a b0 / b1 bisect: three binaries carrying one identical timers-only commit, O = `perf/qca-timers-o` `bd09feb7` (`f8a45a2d` + timers) vs B0 = `perf/qca-timers-b0` `cc123463` (`f8a45a2d` + b0 + timers) vs B = `perf/qca-timers-b` `feebce0f` (`ab4ded4e` = b0 + b1, + timers), Classic, 15 s checkpoints, nothing set, no EVM load, standard shape, O B0 B B B0 O, 300 s cells, n = 2 (campaign ozarchy-9f, archy, 2026-10-21)
+
+**Section 111's gap did not reproduce; it reversed. With the timers in all three binaries, B is the fastest arm and
+O the slowest: native blocks/s O 8.03 / B0 9.40 / B 11.64, B / O 1.449 [1.051, 1.997] (14.3 pooled sd; 8z: O 14.4,
+B 10.7, B / O 0.746). `qc_to_advance` is O 40.6 / B0 34.8 / B 28.2 ms per advanced view (8z: O 21.1, B 30.6). No step
+carries a B-specific cost. In every arm `commit_feed_app` (the synchronous commit callback: decode, commit-manifest
+persist, `enqueue_for_execution` with the blocking exec send) holds 94-96% of `qc_to_advance`, and all of it scales
+with block size: `qc_to_advance` per 1k fills is 1.373 / 1.358 / 1.363 ms (B / O 0.992) and per second 219 / 217 /
+218 ms. The other 14 steps sum to 1.59-1.68 ms per view in every arm. So the timers cannot say whether b0 or b1 owns
+section 111's gap: no arm here has a fixed per-view excess. B pays a small per-fill cost: matched/s 0.980 [0.973,
+0.988] (46.6 sd), exec on-CPU per 1k fills 1.014 [0.985, 1.043], CPU-s per 1M 1.012. The O arm itself fell from 8z's
+14.4 to 8.0 blocks/s with the same env, genesis and load. The leading reading is a cadence equilibrium that moves
+with the binary, not a b1 code path.**
+
+Question (bench queue step 9f, owner s131): section 111 / 111.8 found Classic on b1 (`ab4ded4e`) at 0.746x O's
+native blocks/s with equal per-fill cost. Its `qc_to_advance` rose 21.1 -> 30.6 ms per view (~+30 ms per view,
+independent of block size), and a clean rebuild was byte-identical (8z2 part 2). Which `qc_to_advance` step carries
+B's extra time, and is it b0 (B0 vs O) or b1 (B vs B0)?
+
+### 118.1 Setup
+
+* Spec: `docs/perf/bench-queue.md` entry 9f on main.
+* Binaries: one timers-only commit (git patch-id `99630016` on all three, per the handoff) on three bases. Worktrees
+  `wt/9f-{o-bd09feb7,b0-cc123463,b-feebce0f}`, fresh targets `~/.cargo-target-9f-{o,b0,b}`, plain `release --locked`,
+  one package at a time, clang + mold. Node md5s: O `f1a096ce5fa7ba0ac026f1d72cc11a3a`, B0
+  `62b8dc827d017cad1e541a398a9aa039`, B `b7ab3c4859e246be37e1b99686e4e931`. Bench-throughput is per arm (O
+  `d9a5054b`, B0 `d97f6974`, B `01a6cc4c`); 8z ran one bench build (`ec15372b`) on both arms. Flood `dd59d50d` on all
+  arms (`~/bench-results-matched/ozarchy-9f-stage/build/md5s.txt`).
+* Tools frozen from main `913613eb` (harness `wt/9f-h-913613eb`) in `ozarchy-9f-tools/standard`.
+* Shape: standard, 100k genesis `d694b81b` (8z's), 300 markets, rate 76,000, 5,000 senders, BLOCK_CAP 400,
+  MAX_IN_FLIGHT 4, commit tail. Classic (`TORUS_BOOK_ROWS` empty), 15 s checkpoints (code default), custody 0, state
+  hash off, no EVM load. No arm env. `TORUS_EVM_FAST_PATH`, `TORUS_BOOK_FAST_ENCODE` (L3.3) and `TORUS_SETTLE_NO_MERGE`
+  (L2.2) are unset on every node, and all three bases predate those defaults. Node env records match 8z's r1-O
+  field for field, except the pids.
+* Order: w1 (O, 120 s, warm-up gate), then O B0 B B B0 O at 300 s, n = 2 per arm. Campaign 02:43-03:24.
+* Cells: `~/bench-results-matched/ozarchy-9f-{w1,r1-O,r1-B0,r1-B,r2-B,r2-B0,r2-O}`. Smokes (60 s, one per arm):
+  `ozarchy-9f-run/campaign/smoke`, `ozarchy-9fo-run/campaign/smoke`, `ozarchy-9fb0-run/campaign/smoke`.
+* Per view = sum / count of each `torus_qc_advance_<step>_seconds` over the bench window (metrics-1hz snapshots at
+  `t_bench0` / `t_bench1`, node mean). One sample comes per collector view that advanced: 5.4-7.9 per s per node, about
+  66% of commits. Per block = the `torus_commit_feed_*` / `torus_exec_dispatch_send_seconds` sum / count (one per
+  committed block).
+
+### 118.2 Validity
+
+* 7 / 7 cells rc 0, ACCEPT / AGREE / PASS, 0 panic and 0 fail-stop lines. Node md5 re-checked from
+  `node-environ-trie.txt`: 3 / 3 nodes on the arm's md5 in every cell. 57 CHECK OK, 0 CHECK FAIL, no CELL-FLAG, rerun
+  pass empty.
+* Timer check (`qcachk` in the campaign, re-checked here): in every cell and node each step's count equals
+  `torus_qc_advance_total_seconds_count` (max mismatch 0), and the 15 steps sum to the total to 4 significant figures
+  per view. `torus_view_qc_to_advance_seconds` per view matches the new total within 0.01 ms.
+* Contention (30 s sampler, FOREIGN CPU rule, `ozarchy-9f-run/contention-main.tsv`): no foreign app averaged over
+  0.1 core or peaked over 0.5 core in any cell. The largest was claude at 0.046 avg in r1-B0 and 0.101 max in r2-B. No
+  Telegram samples. Foreign total per cell was 0.10-0.14 core avg (max 0.268, r1-O), nonbench 1.33-1.42 cores. No
+  rerun.
+
+### 118.3 Per cell (run order; node mean)
+
+| cell | arm | matched/s | native blk/s | fills/blk | block p50 / p99 ms | timeouts | CPU-s / 1M | exec on-CPU ms / 1k fills | qc_to_advance ms / view | commit_feed_app ms / view | dispatch send ms / blk |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 | O | 267,568 | 8.557 | 23,177 | 25 / 903 | 0 | 22.35 | 2.749 | 43.09 | 41.29 | 15.91 |
+| r1 | O | 267,766 | 8.059 | 29,503 | 37 / 917 | 1 | 22.46 | 2.753 | 39.08 | 37.38 | 12.99 |
+| r1 | B0 | 265,920 | 9.834 | 24,634 | 24 / 860 | 0 | 22.72 | 2.782 | 33.81 | 32.14 | 10.59 |
+| r1 | B | 262,357 | 11.386 | 21,284 | 17 / 853 | 0 | 22.86 | 2.797 | 30.26 | 28.69 | 9.01 |
+| r2 | B | 262,530 | 11.888 | 20,119 | 15 / 839 | 4 | 22.87 | 2.806 | 26.23 | 24.63 | 7.01 |
+| r2 | B0 | 267,536 | 8.967 | 26,667 | 27 / 892 | 1 | 22.61 | 2.779 | 35.82 | 34.14 | 10.81 |
+| r2 | O | 267,622 | 8.000 | 29,550 | 37 / 919 | 0 | 22.73 | 2.775 | 42.02 | 40.35 | 13.76 |
+
+Per minute (native blocks/s): O 8.19 8.76 8.15 6.81 8.11 and 7.76 8.81 8.12 7.13 8.38 (steady); B 9.91-12.73 and
+10.67-12.99; B0 8.29 10.52 11.66 8.94 8.86 (r1 swings inside the cell) and 8.15-9.94. Drift: O is flat r1 -> r2 (8.06
+-> 8.00) at both ends of the campaign, so no campaign trend explains the arm order. B0's r1 / r2 spread (9.83 / 8.97)
+is the largest of the three.
+
+### 118.4 Arm means and ratios (ratio = geomean of the 2 per-round ratios, 95% t CI, 1 df; step / pooled sd)
+
+| metric | O | B0 | B | B / O [95% CI] | sd | B0 / O [95% CI] | sd | B / B0 [95% CI] | sd |
+|---|---|---|---|---|---|---|---|---|---|
+| matched/s | 267,694 | 266,728 | 262,444 | **0.980 [0.973, 0.988]** | -46.6 | 0.996 [0.956, 1.039] | -1.2 | 0.984 [0.951, 1.018] | -5.3 |
+| native blocks/s | 8.029 | 9.401 | 11.637 | **1.449 [1.051, 1.997]** | 14.3 | 1.170 [0.682, 2.006] | 3.2 | 1.239 [0.524, 2.929] | 4.5 |
+| fills per native block | 29,527 | 25,651 | 20,702 | 0.701 [0.485, 1.012] | -15.1 | 0.868 [0.530, 1.422] | -3.8 | 0.807 [0.341, 1.911] | -4.2 |
+| block p50 ms | 37.0 | 25.6 | 16.1 | 0.434 [0.160, 1.180] | -16.8 | 0.690 [0.282, 1.686] | -6.2 | 0.630 [0.095, 4.186] | -4.3 |
+| block p99 ms | 918 | 876 | 846 | 0.921 [0.817, 1.039] | -10.2 | 0.954 [0.771, 1.182] | -2.6 | 0.965 [0.691, 1.348] | -1.8 |
+| timeouts per 1k native blocks | 0.21 (1) | 0.19 (1) | 0.55 (4) | CI n/a (0 in a cell) | | | | | |
+| CPU-s per 1M fills | 22.60 | 22.66 | 22.86 | 1.012 [0.942, 1.087] | 2.0 | 1.003 [0.902, 1.115] | 0.5 | 1.009 [0.974, 1.044] | 3.5 |
+| exec-thread on-CPU ms per 1k fills | 2.764 | 2.780 | 2.802 | 1.014 [0.985, 1.043] | 3.3 | 1.006 [0.952, 1.063] | 1.5 | 1.008 [0.982, 1.035] | 4.6 |
+| exec busy share | 0.876 | 0.899 | 0.905 | 1.034 [0.955, 1.119] | 4.7 | 1.026 [0.913, 1.153] | 2.6 | 1.007 [0.970, 1.046] | 0.6 |
+| mean commit interval ms | 122.7 | 106.0 | 85.4 | 0.696 [0.494, 0.980] | -17.5 | 0.863 [0.526, 1.418] | -3.8 | 0.806 [0.348, 1.866] | -4.2 |
+| of which in intervals > 128 ms (bucket mid) | 104.1 | 87.5 | 66.5 | 0.639 [0.435, 0.938] | -19.6 | 0.839 [0.447, 1.574] | -3.7 | 0.761 [0.276, 2.097] | -4.3 |
+| of which in intervals > 256 ms | 84.2 | 69.4 | 52.3 | 0.621 [0.509, 0.757] | -25.0 | 0.822 [0.302, 2.240] | -2.9 | 0.756 [0.227, 2.510] | -3.3 |
+| intervals > 256 ms per 1k commits | 206 | 173 | 129 | 0.628 [0.470, 0.838] | -8.4 | 0.839 [0.237, 2.968] | -2.4 | 0.748 [0.158, 3.528] | -3.2 |
+| **qc_to_advance ms per view (= 15-step sum)** | **40.55** | **34.81** | **28.24** | 0.695 [0.177, 2.730] | -4.9 | 0.859 [0.782, 0.943] | -3.2 | 0.810 [0.226, 2.896] | -2.9 |
+| qc_to_advance ms per 1k fills | 1.373 | 1.358 | 1.363 | 0.992 [0.365, 2.696] | -0.1 | 0.989 [0.550, 1.779] | -0.3 | 1.003 [0.663, 1.516] | 0.1 |
+| qc_to_advance ms per s | 218.7 | 217.2 | 217.8 | 0.995 | -0.1 | 0.994 | -0.2 | 1.002 | 0.1 |
+| commit interval minus qc_to_advance ms | 82.2 | 71.2 | 57.1 | 0.696 [0.591, 0.818] | -20.9 | 0.866 [0.394, 1.902] | -3.1 | 0.803 [0.430, 1.500] | -4.2 |
+
+**The 15 steps, ms per advanced view** (sum = `qc_to_advance`; `commit_feed_app` share 0.958 / 0.952 / 0.944):
+
+| step | O | B0 | B | B / O [95% CI] | sd |
+|---|---|---|---|---|---|
+| **commit_feed_app** | **38.87** | **33.14** | **26.66** | 0.684 [0.160, 2.935] | -4.9 |
+| advance_rx | 0.510 | 0.510 | 0.498 | 0.975 [0.913, 1.041] | -0.9 |
+| commit_feed_tree | 0.199 | 0.180 | 0.163 | 0.803 [0.051, 12.56] | -1.2 |
+| wait_busy | 0.148 | 0.139 | 0.133 | 0.899 [0.763, 1.059] | -7.9 |
+| tree_update | 0.139 | 0.136 | 0.125 | 0.894 [0.770, 1.038] | -5.6 |
+| wait_recv | 0.131 | 0.136 | 0.135 | 1.032 [0.200, 5.310] | 0.3 |
+| post_commit | 0.128 | 0.129 | 0.119 | 0.937 [0.489, 1.795] | -1.8 |
+| pc_check | 0.105 | 0.103 | 0.103 | 0.978 [0.701, 1.365] | -1.1 |
+| enter_new_view | 0.104 | 0.106 | 0.105 | 1.015 [0.807, 1.277] | 1.2 |
+| loop_to_enter | 0.094 | 0.092 | 0.094 | 0.998 [0.758, 1.313] | -0.1 |
+| highest_pc | 0.059 | 0.072 | 0.055 | 0.928 [0.222, 3.877] | -0.9 |
+| enter_view_write | 0.037 | 0.047 | 0.036 | 0.991 [0.796, 1.234] | -0.7 |
+| advance_send | 0.016 | 0.013 | 0.012 | 0.764 [0.172, 3.394] | -2.3 |
+| wait_msg | 0.013 | 0.011 | 0.010 | 0.768 [0.018, 33.2] | -1.2 |
+| enter_start | 0.001 | 0.001 | 0.001 | 1.079 [0.308, 3.777] | 0.7 |
+| all but commit_feed_app | 1.683 | 1.674 | 1.587 | 0.943 [0.715, 1.245] | -3.7 |
+
+Side timers: own AdvanceView loopback 0.353 / 0.347 / 0.335 ms, swarm command wait 0.143 / 0.139 / 0.121 ms. Views
+advanced by own AdvanceView 61.6 / 62.6 / 64.5% (rest by a peer's, ~0.03% other), messages handled while waiting
+0.043 / 0.035 / 0.034 per view, committed blocks per advance 0.999 in every arm.
+
+**Commit feed, ms per committed block:**
+
+| timer | O | B0 | B | B / O [95% CI] | sd |
+|---|---|---|---|---|---|
+| commit_feed_decode | 2.461 | 2.114 | 1.675 | 0.680 [0.483, 0.957] | -21.1 |
+| commit_feed_evm | 0.003 | 0.003 | 0.003 | 0.920 | |
+| commit_feed_manifest | 3.918 | 3.118 | 2.899 | 0.741 [0.175, 3.137] | -3.5 |
+| commit_feed_enqueue | 29.93 | 25.13 | 19.33 | 0.644 [0.240, 1.728] | -8.3 |
+| of which exec_dispatch_send (blocked on the exec channel) | 13.38 | 10.70 | 8.01 | 0.594 [0.083, 4.238] | -5.0 |
+| enqueue minus send | 16.56 | 14.44 | 11.31 | 0.683 [0.515, 0.907] | -25.1 |
+| enqueue minus send, ms per 1k fills | 0.561 | 0.563 | 0.547 | 0.975 [0.895, 1.061] | -1.9 |
+| exec_dispatch_send, ms per 1k fills | 0.453 | 0.418 | 0.386 | 0.848 [0.172, 4.186] | -1.7 |
+| commit_event_handler | 0.148 | 0.145 | 0.142 | 0.959 [0.901, 1.021] | -1.2 |
+
+`commit_feed_app` minus the four feed timers is 2.6-2.8 ms per view in every arm (r1 / r2 1.9-3.4).
+
+### 118.5 Verdict
+
+* **The 8z direction did not reproduce (high confidence).** B is 1.45x O's native blocks/s here (14.3 pooled sd;
+  per-round 1.41 / 1.49). In 8z it was 0.746x. B0 sits between them at 1.17x (3.2 sd, CI spans 1).
+  `qc_to_advance` is highest on O (40.6 ms), not B (28.2). The O-B commit-interval gap, now O slower, again sits in
+  the long intervals: > 128 ms carries 37.6 of the 37.3 ms (101%), > 256 ms 31.9 ms (86%).
+* **No step carries a size-independent excess in any arm (high confidence).** `commit_feed_app` is 94-96% of
+  `qc_to_advance`. Per view, every other step is 0.5 ms or less, and together they come to 1.59-1.68 ms in all three
+  arms (B - O -0.10 ms). The blocking exec send is 8-13 ms per block, and the rest of `enqueue_for_execution` is 0.55
+  ms per 1k fills in every arm (B / O 0.975, 1.9 sd). `qc_to_advance` per 1k fills is flat (B / O 0.992, 0.1 sd), and
+  so is the time the hotstuff thread spends in it (218 ms per s). The ~+30 ms per view that 111.8 fitted does not
+  show here. Every per-view difference between the arms is its block-size difference.
+* **b0 vs b1: not attributable from this campaign.** The question assumed B carries a per-view excess. It does not
+  here, so neither b0 nor b1 owns one. B's one cost that stays per fill: matched/s -2.0% [-2.7, -1.2] (46.6 sd, both
+  rounds), exec on-CPU per 1k fills +1.4% and CPU-s per 1M +1.2% (CIs span 1). B0 shows little of it (matched/s 0.996,
+  exec on-CPU 1.006, CIs span 1).
+* **Mechanism, sized.** The collector's `qc_to_advance` sits on the commit cadence (28-41 ms of an 85-123 ms
+  interval, 33% in every arm). Nearly all of it is commit-callback work that grows with block size. The rest of the
+  interval also scales (82 / 71 / 57 ms, 0.696 like the interval). Matched/s is pinned near the offered load and
+  exec runs 0.88-0.91 busy, so block size and cadence feed each other: a slower view gives bigger blocks, and those
+  slow the next commit callback. The equilibrium is then set by small fixed costs and is easily moved. That reading
+  fits:
+  * O's own drop from 8z's 14.4 to 8.0 blocks/s (same env, genesis and load; different build, the timers commit and
+    a per-arm bench client);
+  * B0's in-cell swing (8.3 -> 11.7 -> 8.9 per minute in r1);
+  * the reversal against 8z.
+
+  This reading is medium-low confidence: nothing here isolates the fixed cost that picks the equilibrium.
+* **Next cells that would resolve it (~50 min):** one campaign with 8z's exact nodes O `74598d33` and B `f19d9385`,
+  plus 9f's O `f1a096ce` (and B `b7ab3c48`). Use one bench client (`ec15372b`) on every arm, standard Classic as
+  here, 300 s, ABBA-style n = 2. If 8z's pair still shows B / O 0.75 while 9f's pair shows 1.45, the cadence depends
+  on the binary build or layout, not on b0 / b1 code, and b1 is cleared on Classic. If 9f's O also runs ~14 blocks/s
+  with the 8z client, the bench client is the variable.
+
+### 118.6 Limits and data
+
+* n = 2 per arm, 1 df: the per-view and blocks/s CIs are wide whenever the two rounds differ (B / O per-round
+  `qc_to_advance` 0.774 / 0.624). The pooled-sd steps are the sharper test.
+* The timers sample only the collector views that advanced (~66% of commits), and the per-view figures are means
+  over them. Timeout counts are tiny (1 / 1 / 4).
+* 8z (section 111) is another campaign with other builds of the same bases, and 9f adds the timers commit; the 8z
+  figures are references, not a paired arm.
+* Analysis: `~/bench-results-matched/ozarchy-9f-tools/analyst/9f-cells.json` (`9f-analyse.py`: bench-window deltas
+  via `8z2-extract.py`, headline via `8x-headline.py`), `9f-tables.tsv` (`9f-tables.py`), and per-minute series
+  `9f-series.tsv` / `9f-8zcols.tsv` (`8z-analyse.py`).
+* Campaign: `~/bench-results-matched/ozarchy-9f-run/campaign/` (`campaign.log`, `cells.tsv`, `handoff.json`),
+  `ozarchy-9f-run/contention-main.tsv`; spec, checks and driver `ozarchy-9f-tools/{9f-spec.json,9f-checks.sh,
+  ozarchy-9f-campaign.sh,9f-chain.sh}`; build `ozarchy-9f-stage/build/`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
