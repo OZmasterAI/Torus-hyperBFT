@@ -828,29 +828,50 @@ where
 ///
 /// FIX 9 (EVM-FIND-14): Previous implementation scanned from block 0 upward (O(N)).
 /// Now uses a reverse iterator to find the last key in O(1).
+///
+/// Infallible: any read failure reads as 0 (fresh DB). Callers that must not
+/// mistake a read failure for an empty chain use [`try_find_latest_height`].
 pub fn find_latest_height(state: &StateDb) -> u64 {
-    let Ok(cf) = state.cf_handle(CF_BLOCK_HEADERS) else {
-        return 0;
-    };
+    try_find_latest_height(state).unwrap_or(0)
+}
+
+/// Bound on the non-height entries [`try_find_latest_height`] skips at the
+/// end of CF_BLOCK_HEADERS; today there is exactly one (the pruner's meta key).
+const MAX_TRAILING_META_KEYS: usize = 8;
+
+/// [`find_latest_height`] that reports failure instead of reading it as 0:
+/// a missing CF_BLOCK_HEADERS handle, an iterator error, or more than
+/// [`MAX_TRAILING_META_KEYS`] non-height entries at the end of the CF (the
+/// tip cannot be located) are `Err`. `Ok(0)` means the CF holds no height key
+/// (fresh DB). Used by the archive-upgrade probe, where 0 would let the
+/// retention safeguard pass (Codex P2, s131).
+pub fn try_find_latest_height(state: &StateDb) -> Result<u64, String> {
+    let cf = state
+        .cf_handle(CF_BLOCK_HEADERS)
+        .map_err(|e| format!("open {CF_BLOCK_HEADERS}: {e}"))?;
     // Non-height entries (e.g. the pruner's `__prune_meta__` key) sort AFTER
     // the 8-byte big-endian height keys, so skip past them instead of bailing
     // to 0 — on a pruned DB the meta key is the last entry and bailing froze
-    // eth_blockNumber at 0 and short-circuited on_commit_block (s334). The
-    // take(8) bounds the scan; today there is exactly one meta key.
-    for entry in state
-        .inner()
-        .iterator_cf(cf, rocksdb::IteratorMode::End)
-        .take(8)
-    {
+    // eth_blockNumber at 0 and short-circuited on_commit_block (s334).
+    let mut skipped = 0usize;
+    for entry in state.inner().iterator_cf(cf, rocksdb::IteratorMode::End) {
         match entry {
             Ok((key, _)) if key.len() == 8 => {
-                return u64::from_be_bytes(key[..8].try_into().unwrap());
+                return Ok(u64::from_be_bytes(key[..8].try_into().unwrap()));
             }
-            Ok(_) => continue,
-            Err(_) => return 0,
+            Ok(_) => {
+                skipped += 1;
+                if skipped >= MAX_TRAILING_META_KEYS {
+                    return Err(format!(
+                        "no height key among the last {MAX_TRAILING_META_KEYS} entries of \
+                         {CF_BLOCK_HEADERS}"
+                    ));
+                }
+            }
+            Err(e) => return Err(format!("iterate {CF_BLOCK_HEADERS}: {e}")),
         }
     }
-    0
+    Ok(0)
 }
 
 /// Public helper to update latest height after committing a new block.
@@ -1130,6 +1151,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(find_latest_height(&state), 5);
+        assert_eq!(try_find_latest_height(&state), Ok(5));
+    }
+
+    /// The fallible probe: `Ok(0)` only for a CF with no height key; a CF
+    /// whose tail is all non-height keys (tip not locatable) is `Err`, while
+    /// the infallible wrapper keeps reading that as 0.
+    #[test]
+    fn try_find_latest_height_reports_an_unlocatable_tip() {
+        let dir = TempDir::new().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        assert_eq!(try_find_latest_height(&state), Ok(0));
+        state.put_cf_raw(CF_BLOCK_HEADERS, &3u64.to_be_bytes(), b"hdr").unwrap();
+        for i in 0..8u8 {
+            state
+                .put_cf_raw(CF_BLOCK_HEADERS, &[b'~', b'm', b'e', b't', b'a', i], b"x")
+                .unwrap();
+        }
+        let err = try_find_latest_height(&state).unwrap_err();
+        assert!(err.contains("no height key"), "{err}");
+        assert_eq!(find_latest_height(&state), 0, "infallible semantics unchanged");
     }
 
     async fn start_server(

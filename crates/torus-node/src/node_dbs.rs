@@ -208,10 +208,25 @@ pub struct RetentionProbe {
     pub ran_with_retention: bool,
 }
 
-/// Read the [`RetentionProbe`] of a state DB.
+/// Read the [`RetentionProbe`] of a state DB. The tip comes from the
+/// fallible [`torus_rpc::try_find_latest_height`]: a header-read failure is
+/// an `Err` (startup aborts), never tip 0, which would pass the upgrade rule
+/// and record [`META_HISTORY_RETENTION`] on an unpruned archive dir (Codex
+/// P2, s131).
 pub fn probe_retention(state: &StateDb) -> Result<RetentionProbe, String> {
+    probe_retention_with_tip(state, torus_rpc::try_find_latest_height(state))
+}
+
+/// [`probe_retention`] over an already-read tip (the seam the tests inject a
+/// header-read error through).
+fn probe_retention_with_tip(
+    state: &StateDb,
+    tip: Result<u64, String>,
+) -> Result<RetentionProbe, String> {
     Ok(RetentionProbe {
-        tip: torus_rpc::find_latest_height(state),
+        tip: tip.map_err(|e| {
+            format!("cannot read the block-header tip for the history-retention check: {e}")
+        })?,
         pruned_up_to: torus_state::read_pruned_up_to(state)
             .map_err(|e| format!("read the saved prune cutoff: {e}"))?,
         ran_with_retention: state
@@ -265,7 +280,19 @@ pub fn enforce_history_retention(
     explicit: bool,
     data_dir: &Path,
 ) -> Result<(), String> {
-    check_retention_upgrade(probe_retention(state)?, retention, explicit, data_dir)?;
+    enforce_with_probe(state, probe_retention(state), retention, explicit, data_dir)
+}
+
+/// [`enforce_history_retention`] over an already-read probe. A failed probe
+/// returns before anything is written.
+fn enforce_with_probe(
+    state: &StateDb,
+    probe: Result<RetentionProbe, String>,
+    retention: Option<u64>,
+    explicit: bool,
+    data_dir: &Path,
+) -> Result<(), String> {
+    check_retention_upgrade(probe?, retention, explicit, data_dir)?;
     match retention {
         Some(_) => state.put_cf_raw(CF_CONSENSUS_META, META_HISTORY_RETENTION, &[1]),
         None => state.delete_cf_raw(CF_CONSENSUS_META, META_HISTORY_RETENTION),
@@ -774,6 +801,55 @@ mod tests {
         let db = history_db(dir.path(), 20);
         enforce_history_retention(&db, Some(10), false, dir.path())
             .expect("the marker says this dir already ran with retention on");
+    }
+
+    /// Codex P2 (s131): a header-read error in the upgrade probe must abort
+    /// the start, never read as tip 0. An archive dir past N whose tip read
+    /// fails is refused with a clear error, and the retention marker is NOT
+    /// written (it would let a later healthy start skip the safeguard).
+    #[test]
+    fn header_read_error_in_the_upgrade_probe_aborts_and_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = history_db(dir.path(), 20);
+        let probe = probe_retention_with_tip(&db, Err("injected iterator error".into()));
+        let err = enforce_with_probe(&db, probe, Some(10), false, dir.path())
+            .expect_err("an unreadable tip must abort the start");
+        assert!(err.contains("block-header tip"), "names what failed: {err}");
+        assert!(err.contains("injected iterator error"), "carries the cause: {err}");
+        assert!(
+            db.get_cf_raw(CF_CONSENSUS_META, META_HISTORY_RETENTION).unwrap().is_none(),
+            "an aborted start records nothing"
+        );
+        // The same error aborts on a young dir too (the tip is unknown, not 0),
+        // and an explicit choice does not paper over it either.
+        let young = tempfile::tempdir().unwrap();
+        let ydb = history_db(young.path(), 3);
+        let probe = probe_retention_with_tip(&ydb, Err("injected".into()));
+        assert!(enforce_with_probe(&ydb, probe, Some(10), false, young.path()).is_err());
+        let probe = probe_retention_with_tip(&ydb, Err("injected".into()));
+        assert!(enforce_with_probe(&ydb, probe, Some(10), true, young.path()).is_err());
+        assert!(ydb.get_cf_raw(CF_CONSENSUS_META, META_HISTORY_RETENTION).unwrap().is_none());
+        // Healthy probe afterwards: the safeguard still refuses the archive dir.
+        assert!(enforce_history_retention(&db, Some(10), false, dir.path()).is_err());
+    }
+
+    /// The healthy fallible probe reads the real tip (past the pruner's meta
+    /// key) and a fresh / young dir starts and is marked.
+    #[test]
+    fn healthy_probe_reads_the_tip_and_young_dirs_start_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = history_db(dir.path(), 20);
+        db.put_cf_raw(CF_BLOCK_HEADERS, b"__prune_meta__", b"x").unwrap();
+        assert_eq!(probe_retention(&db).unwrap().tip, 20);
+        let fresh = tempfile::tempdir().unwrap();
+        let fdb = StateDb::open(fresh.path()).unwrap();
+        assert_eq!(probe_retention(&fdb).unwrap().tip, 0);
+        enforce_history_retention(&fdb, Some(10), false, fresh.path()).expect("fresh dir starts");
+        assert!(fdb.get_cf_raw(CF_CONSENSUS_META, META_HISTORY_RETENTION).unwrap().is_some());
+        let young = tempfile::tempdir().unwrap();
+        let ydb = history_db(young.path(), 10);
+        enforce_history_retention(&ydb, Some(10), false, young.path()).expect("tip == N starts");
+        assert!(ydb.get_cf_raw(CF_CONSENSUS_META, META_HISTORY_RETENTION).unwrap().is_some());
     }
 
     #[test]
