@@ -1,7 +1,7 @@
 //! EVM execution engine for the Torus-hyperBFT blockchain.
 //!
-//! Wraps [revm](https://crates.io/crates/revm) (v36, Cancun spec) to execute
-//! EVM transactions against a [`torus_state::StateDb`] backend.
+//! Wraps [revm](https://crates.io/crates/revm) (v36; each block runs at the spec of
+//! its feature bits, Cancun in this binary) to execute EVM transactions against a [`torus_state::StateDb`] backend.
 //!
 //! # Public API
 //!

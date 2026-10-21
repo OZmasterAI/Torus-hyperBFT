@@ -87,8 +87,16 @@ pub struct EvmSpecRule {
 impl EvmSpecRule {
     /// The spec a block with `features` runs at.
     pub fn spec(&self, features: u128) -> SpecId {
-        let _ = features;
-        self.base
+        self.upgrades
+            .iter()
+            .filter(|(feature, _)| features & feature.bit() != 0)
+            .fold(self.base, |spec, &(_, upgrade)| {
+                if upgrade.is_enabled_in(spec) {
+                    upgrade
+                } else {
+                    spec
+                }
+            })
     }
 }
 
@@ -98,10 +106,6 @@ pub const BUILTIN_EVM_SPEC_RULE: EvmSpecRule = EvmSpecRule {
     base: SpecId::CANCUN,
     upgrades: &[],
 };
-
-/// The EVM spec every execution here runs at (blocks, eth_call,
-/// eth_estimateGas).
-const EVM_SPEC: SpecId = SpecId::CANCUN;
 
 /// Least gas limit revm accepts for `tx` before execution at `spec`: the
 /// intrinsic gas (21000 / 53000 base, calldata, access list, authorizations)
@@ -126,16 +130,19 @@ pub fn intrinsic_gas_for(
     access_list_accounts: u64,
     access_list_storage_keys: u64,
 ) -> u64 {
-    let _ = spec;
-    revm::context_interface::cfg::gas::calculate_initial_tx_gas(
-        EVM_SPEC,
+    let gas = revm::context_interface::cfg::gas::calculate_initial_tx_gas(
+        spec,
         input,
         is_create,
         access_list_accounts,
         access_list_storage_keys,
         0,
-    )
-    .initial_gas
+    );
+    if spec.is_enabled_in(SpecId::PRAGUE) {
+        gas.initial_gas.max(gas.floor_gas)
+    } else {
+        gas.initial_gas
+    }
 }
 
 /// Default block gas limit (30M).
@@ -239,7 +246,8 @@ pub struct CoreWriterOrigin {
 
 /// EVM executor configured for the Torus chain.
 ///
-/// Wraps revm with Cancun spec and the specified chain ID.
+/// Wraps revm with the specified chain ID; each block runs at the spec of its
+/// feature bits ([`EvmSpecRule`], Cancun in this binary).
 /// Executes transactions against a [`StateDb`] backend without
 /// modifying the underlying database — state changes are returned
 /// as a [`BundleState`] for the caller to commit.
@@ -309,9 +317,11 @@ impl EvmExecutor {
             .build();
 
         let chain_id = self.chain_id;
+        // P0.0 phase 2: the spec of the block's feature bits.
+        let spec = self.spec_rule.spec(block_cfg.features);
         let ctx = Context::mainnet()
             .modify_cfg_chained(|cfg| {
-                cfg.set_spec_and_mainnet_gas_params(EVM_SPEC);
+                cfg.set_spec_and_mainnet_gas_params(spec);
                 cfg.chain_id = chain_id;
                 if call_mode {
                     cfg.disable_base_fee = true;
@@ -330,7 +340,7 @@ impl EvmExecutor {
         // succeeds, so an EVM revert also reverts native side effects.
         let journal = NativeStateOverlay::new(state_db.clone());
         let precompiles = TorusPrecompiles::with_mode(
-            EVM_SPEC,
+            spec,
             journal.clone(),
             block_cfg.number,
             block_cfg.timestamp,
@@ -417,9 +427,11 @@ impl EvmExecutor {
             .build();
 
         let chain_id = self.chain_id;
+        // P0.0 phase 2: the spec of the block's feature bits.
+        let spec = self.spec_rule.spec(block_cfg.features);
         let ctx = Context::mainnet()
             .modify_cfg_chained(|cfg| {
-                cfg.set_spec_and_mainnet_gas_params(EVM_SPEC);
+                cfg.set_spec_and_mainnet_gas_params(spec);
                 cfg.chain_id = chain_id;
             })
             .modify_block_chained(|b| apply_block_env(b, block_cfg))
@@ -433,7 +445,7 @@ impl EvmExecutor {
         // here, so a block that errors part-way (or a crash before the bundle
         // commit) leaves no queued action behind.
         let precompiles =
-            TorusPrecompiles::new(EVM_SPEC, journal.clone(), block_cfg.number, block_cfg.timestamp);
+            TorusPrecompiles::new(spec, journal.clone(), block_cfg.number, block_cfg.timestamp);
         // R02 branch 5: the provider's local-fault cell (see `local_fault_or`).
         let local_fault = precompiles.local_fault();
         let mut evm = ctx
@@ -586,9 +598,11 @@ impl EvmExecutor {
             .build();
 
         let chain_id = self.chain_id;
+        // P0.0 phase 2: the spec of the block's feature bits.
+        let spec = self.spec_rule.spec(block_cfg.features);
         let ctx = Context::mainnet()
             .modify_cfg_chained(|cfg| {
-                cfg.set_spec_and_mainnet_gas_params(EVM_SPEC);
+                cfg.set_spec_and_mainnet_gas_params(spec);
                 cfg.chain_id = chain_id;
             })
             .modify_block_chained(|b| apply_block_env(b, block_cfg))
@@ -599,7 +613,7 @@ impl EvmExecutor {
         // F1 (s515): block-scoped, returned in `native_writes` (see `execute_block`).
         let journal = NativeStateOverlay::new(overlay.base().clone());
         let precompiles =
-            TorusPrecompiles::new(EVM_SPEC, journal.clone(), block_cfg.number, block_cfg.timestamp);
+            TorusPrecompiles::new(spec, journal.clone(), block_cfg.number, block_cfg.timestamp);
         // R02 branch 5: the provider's local-fault cell (see `local_fault_or`).
         let local_fault = precompiles.local_fault();
         let mut evm = ctx

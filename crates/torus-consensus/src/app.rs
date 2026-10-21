@@ -5510,6 +5510,9 @@ impl ExecutionContext {
             ctx.metrics = self.metrics.clone();
             ctx.evm_fee_window = fee_window;
             ctx.evm_gas = evm_gas;
+            // P0.0 phase 2: execution gates features on the committed header's bits,
+            // never this node's schedule (crash replay runs the stored header).
+            ctx.features = torus_block.header.features;
             #[cfg(test)]
             self.test_exec_features
                 .lock()
@@ -7951,6 +7954,9 @@ impl TorusApp {
         // Item 7 step 2: the pools follow the last committed header at boot too, so a restarted
         // node admits by the current lanes and fees before its first commit.
         if let Some(ref m) = mempool {
+            // P0.0 phase 2: admission and RPC simulation run at the bits this schedule
+            // expects one height above the committed tip.
+            m.set_activations(config.activations.clone());
             m.set_evm_header(&last_header);
         }
 
@@ -25799,7 +25805,11 @@ mod crash_recovery_tests {
                 .unwrap();
                 let mut ctx = make_exec_ctx(&config, &db);
                 ctx.evm_executor = EvmExecutor::with_spec_rule(config.chain_id, PRAGUE_WITH_BIT_0);
-                let mut blocks = vec![make_block(1, vec![]), make_block(2, vec![])];
+                // A native action, so block 2 builds a native context whatever its EVM part.
+                let mut blocks = vec![
+                    make_block(1, vec![]),
+                    make_block(2, vec![sign_claim_rewards(0)]),
+                ];
                 blocks[1].evm_transactions = vec![floor_tx(&key, 0)];
                 blocks[1].header.evm_tx_count = 1;
                 blocks[1].header.features = bits;

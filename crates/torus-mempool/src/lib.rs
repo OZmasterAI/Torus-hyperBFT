@@ -1243,8 +1243,7 @@ impl Mempool {
 
     /// P0.0 phase 2: the feature bits the schedule expects at `height`.
     pub fn expected_features(&self, height: u64) -> u128 {
-        let _ = height;
-        0
+        self.activations.read().unwrap().active_at(height)
     }
 
     /// P0.0 phase 2: the bits admission checks a tx at: those expected at the

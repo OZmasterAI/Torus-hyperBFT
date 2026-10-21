@@ -139,6 +139,22 @@ Each phase lands on its own branch with RED-first tests and full gates; each one
    zero bits left out of the JSON the old golden passed).
 2. **Execution reads the bits** (~1 d): executor context `features`, EVM `SpecId` from the bits,
    mempool / RPC admission with the expected bits for tip+1.
+   Built s134 on `feat/p00-phase2` (from phase 1 75cab960). torus-evm: `EvmSpecRule { base, upgrades:
+   &[(Feature, SpecId)] }` (the highest active upgrade wins), `BUILTIN_EVM_SPEC_RULE` = Cancun with no
+   upgrade (a release moving the spec adds a feature and a row), `BlockEnvCfg.features`, every
+   executor entry runs at `spec_rule.spec(block_cfg.features)`, `intrinsic_gas(tx, spec)` /
+   `intrinsic_gas_for` (EIP-7623 floor from Prague). The validator (strict, catch-up, overlay) takes
+   the bits from the executed header and the proposer from the bits it stamps;
+   `NativeExecContext.features` (+ `feature_active`) is set by the block pipeline from the
+   committed header (live and crash replay), not from the node's schedule. Mempool:
+   `set_activations` (from `ChainConfig::activations` at `TorusApp` boot), admission at
+   `active_at(committed tip + 1)` (`admission_spec`); RPC eth_call / eth_estimateGas run at
+   the bits expected at eth head + 1 (state reads only exist at the head). Choices: the spec
+   rule is binary code, not node config (a test rule only through `EvmExecutor::with_spec_rule` /
+   `Mempool::set_evm_spec_rule`); no feature changes execution yet, so the tests use a rule
+   moving to Prague with bit 0 as a stand-in. Also on this branch, the Codex review P2 of phase 1:
+   an unknown bit at insertion is `ValidateBlockResponse::UnsupportedUpgrade` (not inserted, block
+   sync logs UPGRADE REQUIRED and ends the session without blacklisting the peer).
 3. **Running-hash migration** (~0.5-1 d): `configure_activation` checks the header bit from the start height;
    `ChainConfig.state_hash_activation_height` comes only from the schedule.
 4. **Genesis digest** (~0.5 d, owner decision): store a digest of the applied genesis at first boot, refuse to

@@ -94,14 +94,15 @@ impl BlockProposer {
         let decoded_txs = decode_all_txs(&evm_transactions)?;
         let tx_envs: Vec<_> = decoded_txs.iter().map(|d| d.tx_env.clone()).collect();
 
-        // 3. Build block environment.
+        // 3. Build block environment. P0.0 phase 2: at the bits this header carries.
+        let features = self.activations.active_at(block_height);
         let block_cfg = BlockEnvCfg {
             number: block_height,
             timestamp,
             beneficiary: proposer,
             gas_limit,
             base_fee: next_base_fee,
-            features: 0,
+            features,
         };
 
         // 4. Execute EVM transactions (skip invalid — don't abort block for one bad tx).
@@ -173,7 +174,7 @@ impl BlockProposer {
                 ),
                 validator_set_hash: parent.validator_set_hash,
                 // P0.0: the bits validators require at this height.
-                features: self.activations.active_at(block_height),
+                features,
                 sig_attestation: [0u8; 64],
             },
             native_actions: vec![],
