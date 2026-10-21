@@ -41789,7 +41789,8 @@ mod crash_recovery_tests {
         };
 
         // Mid-window: the rebuild fail-stops.
-        let (config, db) = p2_fixture();
+        let (mut config, db) = p2_fixture();
+        config.activations = Default::default(); // `l31_blocks`: no running hash
         l31_seed(&db);
         let mut ctx = ctx_for(&config, &db, ckpt_never());
         ctx.attach_flush_worker(None);
