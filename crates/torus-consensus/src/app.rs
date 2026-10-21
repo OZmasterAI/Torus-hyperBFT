@@ -40878,11 +40878,12 @@ mod crash_recovery_tests {
             max_bytes: Some(1),
             ..ckpt_every(5)
         };
+        let never = ckpt_never();
         let rows = book_coalesce_blocker_for(BookMode::OrderRows, true, true);
-        let reason = |req, ckpt, hash, book| book_coalesce_off_reason(req, ckpt, hash, book);
+        let reason = book_coalesce_off_reason;
         assert_eq!(reason(true, Some(&every), None, None), None, "all hold: on");
         assert_eq!(
-            reason(true, Some(&ckpt_never()), None, None),
+            reason(true, Some(&never), None, None),
             None,
             "checkpoint policy without an interval but present: on"
         );
