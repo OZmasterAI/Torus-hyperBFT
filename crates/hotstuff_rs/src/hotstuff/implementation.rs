@@ -752,7 +752,12 @@ impl<N: Network> HotStuff<N> {
         // L2.
         match self.create_proposal_based_on_tc(&tc, block_tree, app)? {
             TcProposal::Repropose(proposal) => {
-                self.broadcast_proposal_as_header(&proposal, false, block_tree);
+                // The header tells validators which phase to vote (Prepare for
+                // a validator-set update), so keep the tip's own flag.
+                let has_validator_set_updates = block_tree
+                    .validator_set_updates_status(&proposal.block.hash)?
+                    .contains_updates();
+                self.broadcast_proposal_as_header(&proposal, has_validator_set_updates, block_tree);
                 Event::Propose(ProposeEvent {
                     timestamp: SystemTime::now(),
                     proposal: *proposal,
@@ -1953,7 +1958,7 @@ impl<N: Network> HotStuff<N> {
         resp: ProposalResponse,
         _origin: &VerifyingKey,
         block_tree: &mut BlockTreeSingleton<K>,
-        _app: &mut impl App<K>,
+        app: &mut impl App<K>,
     ) -> Result<(), HotStuffError> {
         if resp.view != self.view_info.view {
             return Ok(());
@@ -1984,6 +1989,29 @@ impl<N: Network> HotStuff<N> {
             return Ok(());
         }
 
+        // The header must carry the tip's validator-set-update flag (validators
+        // vote Prepare on it), which only the app can tell for a block this
+        // leader did not hold: validate and insert it first, as the
+        // full-proposal path does. Without its parent the block cannot be
+        // validated yet; stay in recovery (another response or an NEC may
+        // still complete the view).
+        let block = &resp.proposal.block;
+        if !block_tree.contains(&block.hash) {
+            let parent = (!block.justify.is_genesis_pc()).then_some(block.justify.block);
+            if parent.is_some_and(|parent| !block_tree.contains(&parent)) {
+                return Ok(());
+            }
+            let request = ValidateBlockRequest::new(block, block_tree.app_view(parent.as_ref())?);
+            let ValidateBlockResponse::Valid { app_state_updates, validator_set_updates } = app.validate_block(request)
+            else {
+                return Ok(());
+            };
+            block_tree.insert(block, app_state_updates.as_ref(), validator_set_updates.as_ref())?;
+            Event::InsertBlock(InsertBlockEvent { timestamp: SystemTime::now(), block: block.clone() })
+                .publish(&self.event_publisher);
+        }
+        let has_validator_set_updates = block_tree.validator_set_updates_status(&block.hash)?.contains_updates();
+
         // Cancel recovery — we got the block. Repropose it (Case 4).
         let tc = if let RecoveryState::Recovering { ref tc, .. } = self.recovery_state {
             tc.clone()
@@ -1999,7 +2027,7 @@ impl<N: Network> HotStuff<N> {
             tc: Some(tc),
             nec: None,
         };
-        self.broadcast_proposal_as_header(&proposal, false, block_tree);
+        self.broadcast_proposal_as_header(&proposal, has_validator_set_updates, block_tree);
         Event::Propose(ProposeEvent {
             timestamp: SystemTime::now(),
             proposal,
