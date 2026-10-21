@@ -5160,6 +5160,39 @@ impl ExecutionContext {
             inflight,
         );
 
+        // Dead-leader skip (docs/plans/dead-leader-skip.md, A1): this block's leader-statistics
+        // rows, from the evidence row the commit path wrote for its justify QC (node-local,
+        // read from the DB) and the leader rows of its pre-state (through the overlay: the
+        // pipelined parent's rows may not be durable yet). They ride the block's own flush
+        // (the native overlay, or the marker set of a block without a native phase), with the
+        // delete of the evidence row. A missing row is never guessed: fail-stop.
+        let leader_params = self.leader_skip.params(&torus_block.header);
+        let mut leader_rows = match leader_params {
+            None => Vec::new(),
+            Some(_) => match crate::leader_skip::block_leader_rows(
+                &overlay,
+                &self.state_db,
+                height,
+                self.epoch_length,
+                &self.leader_skip.cache,
+            ) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::error!(
+                        height,
+                        %e,
+                        "FATAL: dead-leader skip: leader statistics of this block cannot be \
+                         computed — halting execution pipeline (fail-stop)"
+                    );
+                    self.exec_failed.store(true, Ordering::SeqCst);
+                    if fold_header {
+                        persist_block_header(&self.state_db, torus_block);
+                    }
+                    return;
+                }
+            },
+        };
+
         // ---- EVM execution ----
         // PROFILER (s470): time the whole EVM section (validate + commit bundle +
         // block metadata) so it is attributed rather than sitting in the block
@@ -5635,6 +5668,18 @@ impl ExecutionContext {
             // session owner); `None` marks an invalid signature. Reused below so we
             // never recover the same action twice.
             overlay.set_hash_extras(hash_extras.take().unwrap_or_default());
+            // Dead-leader skip (A1): before the native context reads them (the boundary's
+            // A2 / A3 plan reads this block's attribution).
+            for (key, value) in &leader_rows {
+                let put = match value {
+                    Some(v) => overlay.put_cf_raw(CF_CONSENSUS_META, key, v),
+                    None => overlay.delete_cf_raw(CF_CONSENSUS_META, key),
+                };
+                if let Err(e) = put {
+                    self.fail_stop_on_fault(torus_block, fold_header, "leader statistics rows", &e);
+                    return;
+                }
+            }
             // D12: no nonce this block can consume lies in the pruned range
             // (the window check rejects anything below the cutoff), so the
             // deletes and the nonce puts below never touch the same key.
@@ -6022,6 +6067,7 @@ impl ExecutionContext {
             }
             ctx.metrics = self.metrics.clone();
             ctx.evm_fee_window = fee_window;
+            ctx.leader_skip = leader_params;
             ctx.evm_gas = evm_gas;
             // P0.0 phase 2: execution gates features on the committed header's bits,
             // never this node's schedule (crash replay runs the stored header).
@@ -6900,11 +6946,12 @@ impl ExecutionContext {
                 // batch on W (a direct put here would land before batch(N−1) and be
                 // overwritten by it), and must be visible through the next overlay's
                 // parent layer (design §2.1 step 10).
-                let pending = Arc::new(
-                    torus_state::FrozenPending::marker_only(height)
-                        .with_deletes(torus_state::cf::CF_NATIVE_NONCES, &expired_nonces)
-                        .with_hash_extras(hash_extras.take().unwrap_or_default()),
-                );
+                let mut pending = torus_state::FrozenPending::marker_only(height)
+                    .with_deletes(torus_state::cf::CF_NATIVE_NONCES, &expired_nonces)
+                    .with_hash_extras(hash_extras.take().unwrap_or_default());
+                // Dead-leader skip (A1): the block's leader rows ride its marker set.
+                pending.put_rows(CF_CONSENSUS_META, std::mem::take(&mut leader_rows));
+                let pending = Arc::new(pending);
                 // Item 7 option 0 (task 3.3, plan F2, decision 11): a
                 // fast-path EVM block without a native phase executed no tx
                 // (its section failed, or every tx was skipped). Its Marker
@@ -6959,12 +7006,12 @@ impl ExecutionContext {
                         }
                     }
                 }
-                if !self.flush_marker_only(
-                    prefix,
-                    torus_state::FrozenPending::marker_only(height)
-                        .with_deletes(torus_state::cf::CF_NATIVE_NONCES, &expired_nonces)
-                        .with_hash_extras(hash_extras.take().unwrap_or_default()),
-                ) {
+                let mut pending = torus_state::FrozenPending::marker_only(height)
+                    .with_deletes(torus_state::cf::CF_NATIVE_NONCES, &expired_nonces)
+                    .with_hash_extras(hash_extras.take().unwrap_or_default());
+                // Dead-leader skip (A1): the block's leader rows ride its marker set.
+                pending.put_rows(CF_CONSENSUS_META, std::mem::take(&mut leader_rows));
+                if !self.flush_marker_only(prefix, pending) {
                     // As the native flush failure: the header did not land
                     // with the batch; keep the pre-fold contract.
                     if fold_header {
@@ -9845,7 +9892,17 @@ impl TorusApp {
             }
         }
         let plan = self.epoch_plan(height)?;
-        let updates = match plan {
+        // Dead-leader skip (A4): the exclusion plan the same execution wrote next to `plan`.
+        let exclusions =
+            match torus_economics::leader_stats::leader_exclusion_plan(self.staking.state(), height)
+            {
+                Ok(lx) => lx.filter(|lx| !lx.exclude.is_empty() || !lx.readmit.is_empty()),
+                Err(e) => {
+                    tracing::error!(%e, height, "failed to read the leader exclusion plan");
+                    return Err(EpochPlanNotReady);
+                }
+            };
+        let mut updates = match plan {
             Some(plan) if plan.changed => {
                 let mut updates = ValidatorSetUpdates::new();
                 for m in &plan.members {
@@ -9873,6 +9930,26 @@ impl TorusApp {
             }
             _ => None,
         };
+        if let Some(lx) = exclusions {
+            let delta = updates.get_or_insert_with(ValidatorSetUpdates::new);
+            for pk in &lx.exclude {
+                if let Ok(vk) = VerifyingKey::from_bytes(pk) {
+                    delta.exclude_leader(vk);
+                }
+            }
+            for pk in &lx.readmit {
+                if let Ok(vk) = VerifyingKey::from_bytes(pk) {
+                    delta.readmit_leader(vk);
+                }
+            }
+            tracing::info!(
+                height,
+                exclude = lx.exclude.len(),
+                readmit = lx.readmit.len(),
+                excluded = lx.excluded.len(),
+                "epoch boundary: leader exclusion delta from the execution plan"
+            );
+        }
         self.cached_vs_updates = Some((height, updates.clone()));
         Ok(updates)
     }
@@ -11035,6 +11112,28 @@ impl App<RocksKVStore> for TorusApp {
             let _manifest_span =
                 ObserveOnDrop::new(self.metrics.clone(), |m| &m.commit_manifest_seconds);
             persist_commit_manifest(&self.manifest_db, height, datum_bytes);
+        }
+
+        // Dead-leader skip (A1): the justify QC's evidence, node-local, BEFORE the block can
+        // reach execution (which needs it, also in a crash replay: the row is in the state DB
+        // ahead of the block's header row, so a durable header implies a durable row).
+        if self
+            .leader_skip_config
+            .dead_leader_skip(&header)
+            .is_some()
+        {
+            let evidence = crate::leader_skip::LeaderEvidence::of(&block.justify);
+            if let Err(e) =
+                crate::leader_skip::persist_leader_evidence(&self.state_db, height, &evidence)
+            {
+                tracing::error!(
+                    %e,
+                    height,
+                    "FATAL: dead-leader skip: leader evidence row write failed — fail-stop"
+                );
+                self.exec_failed.store(true, Ordering::SeqCst);
+                return;
+            }
         }
 
         // Committed: these hashes leave the in-flight window. The mempool prunes
@@ -16129,6 +16228,40 @@ mod crash_recovery_tests {
             .unwrap()
             .expect("written by boundary 12");
         assert_eq!(plan16.exclude, vec![dls_leader(3).to_bytes()]);
+    }
+
+    /// Determinism, pipelined execution: with a flush worker the empty blocks take the fast
+    /// path, their leader rows riding the Marker set (read back by the next block through the
+    /// parent layer before W lands them); the rows equal the serial run's.
+    #[test]
+    fn dead_leader_rows_identical_serial_and_pipelined() {
+        let (config, serial) = dls_fixture();
+        let ctx = make_exec_ctx(&config, &serial);
+        dls_execute(&ctx, &serial, 1, 16);
+        drop(ctx);
+
+        let (config, piped) = dls_fixture();
+        let mut ctx = make_exec_ctx(&config, &piped);
+        ctx.attach_flush_worker(None);
+        for h in 1..=16 {
+            crate::leader_skip::persist_leader_evidence(&piped, h, &dls_evidence(h)).unwrap();
+            dispatch_and_execute(&ctx, &piped, &make_block(h, vec![]));
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "height {h} fail-stopped");
+        }
+        let paths = ctx.test_paths.lock().unwrap().clone();
+        drop(ctx); // drains + joins W
+        assert!(
+            paths.get("block.pipelined").copied().unwrap_or(0) > 0,
+            "fixture must take the fast path: {paths:?}"
+        );
+        assert_eq!(dls_rows(&serial), dls_rows(&piped));
+        assert_eq!(dls_evidence_rows(&piped), 0);
+        assert_eq!(
+            torus_economics::leader_stats::installed_leader_exclusions(&piped)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     /// K is not reached by two misses: blocks 1..=8 miss the dead slot twice (views 3, 7): no

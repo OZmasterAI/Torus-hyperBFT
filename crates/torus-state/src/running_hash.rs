@@ -85,6 +85,9 @@ pub const META_CONSENSUS_PREFIXES: &[&[u8]] = &[
     b"validator_whitelist:",
     b"epoch_vset:",
     b"evm_epoch_gas",
+    // Dead-leader skip (docs/plans/dead-leader-skip.md, b1): per-validator leader statistics,
+    // the attribution cursor and the exclusion index, written by execution.
+    b"leader_stats:",
 ];
 
 /// Hash `cf_id` of a column family, `None` if the CF is never hashed.

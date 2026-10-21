@@ -1878,8 +1878,20 @@ impl DeadLeaderParams {
     /// Genesis range check: K is 0 (off) or in [`LEADER_MISS_THRESHOLD_RANGE`], the cap in
     /// [`LEADER_EXCLUSION_CAP_RANGE`].
     pub fn check(miss_threshold: u32, exclusion_cap: u32) -> Result<(), String> {
-        // RED stub (phase 2 test commit).
-        let _ = (miss_threshold, exclusion_cap);
+        if miss_threshold != 0 && !LEADER_MISS_THRESHOLD_RANGE.contains(&miss_threshold) {
+            return Err(format!(
+                "leader_miss_threshold {miss_threshold} out of range: 0 (off) or {}..={}",
+                LEADER_MISS_THRESHOLD_RANGE.start(),
+                LEADER_MISS_THRESHOLD_RANGE.end()
+            ));
+        }
+        if !LEADER_EXCLUSION_CAP_RANGE.contains(&exclusion_cap) {
+            return Err(format!(
+                "leader_exclusion_cap {exclusion_cap} out of range: {}..={}",
+                LEADER_EXCLUSION_CAP_RANGE.start(),
+                LEADER_EXCLUSION_CAP_RANGE.end()
+            ));
+        }
         Ok(())
     }
 }
@@ -1969,9 +1981,11 @@ impl ChainConfig {
     /// emits no exclusion delta, as no plan carries one).
     ///
     /// THE activation hook (P0.0, docs/plans/p00-activation-height-gating.md): this ships in the
-    /// genesis, so it reads only the genesis parameters. If it lands after a genesis, AND the
-    /// feature bit of `header.features` here, the one place every execution and commit-path
-    /// caller goes through.
+    /// genesis, so it reads only the genesis parameters. If it lands after a genesis, add a
+    /// `torus_types::Feature::DeadLeaderSkip` (P0.0 registry, `features.rs` on main) and AND
+    /// `header.features & Feature::DeadLeaderSkip.bit() != 0` here: every caller passes the
+    /// header of the block concerned (execution: the executed block; the commit path: the
+    /// committed block), so the bits each height was agreed under decide, also in a replay.
     ///
     /// Off as well with reputation-weighted leader selection (B3): execution derives leader(v)
     /// with plain IWRR over the installed set, which B3's local inputs would not match.
