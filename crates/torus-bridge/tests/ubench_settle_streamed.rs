@@ -6,20 +6,28 @@
 //! of 8 one-lot makers per side, and the measured call is a storm of IOC
 //! takers of 3 lots crossing the ladder (3 fills each, alternating sides, so
 //! positions open, extend and close). Every repetition builds a fresh DB and
-//! ladder (not timed) and times the storm call only; arms interleave ABBA.
+//! ladder (not timed) and times the storm call only; arms rotate per
+//! repetition. Arms: flag off, then flag on at each wake batch of
+//! `UBENCH_BATCHES` (default `1,auto`: a wake-up per market as before the
+//! batching, and the built-in policy). Per arm: exec wall, the exec (calling)
+//! thread's on-CPU and runqueue wait from `/proc/thread-self/schedstat`, and
+//! its parks waiting for streamed results.
 //! `#[ignore]` (perf, not a gate); run in release:
 //!
 //! ```text
 //! cargo test --release -p torus-bridge --test ubench_settle_streamed -- --ignored --nocapture
 //! ```
 //!
-//! Env: `UBENCH_REPS` (default 8 per arm and shape).
+//! Env: `UBENCH_REPS` (default 8 per arm and shape), `UBENCH_BATCHES`
+//! (comma list of wake batches, `auto` = the policy; default `1,auto`),
+//! `UBENCH_L22` (`off`, `on` or `both`, the default).
 
 use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
 use torus_bridge::native_executor::{
-    with_settle_no_merge, with_settle_streamed, NativeExecContext, NativeExecutor,
+    settle_stream_parks_on_this_thread, with_settle_no_merge, with_settle_stream_wake_batch,
+    with_settle_streamed, NativeExecContext, NativeExecutor,
 };
 use torus_core::position::{NativeBalance, PositionManager};
 use torus_state::{NativeStateOverlay, StateDb};
@@ -118,7 +126,22 @@ struct Sample {
     match_ns: u128,
     settle_ns: u128,
     pass_b_ns: u128,
+    /// The calling (exec) thread's on-CPU and runqueue wait over the call.
+    cpu_ns: u64,
+    runq_ns: u64,
+    /// Its parks waiting for streamed results, and the time parked.
+    parks: u64,
+    parked_ns: u64,
     fingerprint: (u64, usize, usize),
+}
+
+/// This thread's (on-CPU ns, runqueue wait ns) from schedstat.
+fn schedstat() -> (u64, u64) {
+    let s = std::fs::read_to_string("/proc/thread-self/schedstat").expect("schedstat");
+    let mut it = s
+        .split_whitespace()
+        .map(|v| v.parse::<u64>().expect("number"));
+    (it.next().expect("run"), it.next().expect("wait"))
 }
 
 fn one(ladder: &[(Address, NativeAction)], storm: &[(Address, NativeAction)]) -> Sample {
@@ -153,9 +176,13 @@ fn one(ladder: &[(Address, NativeAction)], storm: &[(Address, NativeAction)]) ->
     let fills_before = ctx.take_pending_trade_fills().len();
     assert_eq!(fills_before, 0, "the ladder does not cross");
     let accum = ctx.phase_accum;
+    let (parks0, parked0) = settle_stream_parks_on_this_thread();
+    let (cpu0, runq0) = schedstat();
     let t = Instant::now();
     let r = NativeExecutor::execute_batch_settle_workers(&mut ctx, storm, true, None);
     let wall = t.elapsed();
+    let (cpu1, runq1) = schedstat();
+    let (parks1, parked1) = settle_stream_parks_on_this_thread();
     assert!(ctx.fatal_error.is_none());
     let fills = ctx.take_pending_trade_fills().len();
     let ok = r.results.iter().filter(|a| a.success).count();
@@ -165,6 +192,10 @@ fn one(ladder: &[(Address, NativeAction)], storm: &[(Address, NativeAction)]) ->
         match_ns: ctx.phase_accum.match_ns - accum.match_ns,
         settle_ns: ctx.phase_accum.settle_ns - accum.settle_ns,
         pass_b_ns: ctx.phase_accum.settle_pass_b_ns - accum.settle_pass_b_ns,
+        cpu_ns: cpu1 - cpu0,
+        runq_ns: runq1 - runq0,
+        parks: parks1 - parks0,
+        parked_ns: parked1 - parked0,
         fingerprint: (r.total_gas, ok, overlay.dirty_native_keys().len()),
     }
 }
@@ -196,72 +227,83 @@ fn ubench_settle_streamed_exec_wall() {
         ladder.len(),
         std::thread::available_parallelism().map_or(1, |n| n.get())
     );
+    // Arms: flag off (None), then flag on at each wake batch (Some(pin)).
+    let batches: Vec<Option<usize>> = std::env::var("UBENCH_BATCHES")
+        .unwrap_or_else(|_| "1,auto".to_string())
+        .split(',')
+        .map(|b| match b.trim() {
+            "auto" => None,
+            v => Some(v.parse().expect("UBENCH_BATCHES: numbers or auto")),
+        })
+        .collect();
+    let arms: Vec<Option<Option<usize>>> = std::iter::once(None)
+        .chain(batches.iter().map(|b| Some(*b)))
+        .collect();
+    let label = |arm: &Option<Option<usize>>| match arm {
+        None => "off".to_string(),
+        Some(None) => "on batch auto".to_string(),
+        Some(Some(b)) => format!("on batch {b}"),
+    };
+    let run = |arm: &Option<Option<usize>>, no_merge: bool, storm: &[(Address, NativeAction)]| {
+        with_settle_no_merge(no_merge, || {
+            with_settle_streamed(arm.is_some(), || {
+                with_settle_stream_wake_batch(arm.flatten(), || one(&ladder, storm))
+            })
+        })
+    };
     for (shape, per_market) in [("16.8k", 19usize), ("65k", 72)] {
         let storm = storm(per_market);
-        for no_merge in [false, true] {
-            let mut arms: [Vec<Sample>; 2] = [Vec::new(), Vec::new()];
+        let l22: &[bool] = match std::env::var("UBENCH_L22").as_deref() {
+            Ok("off") => &[false],
+            Ok("on") => &[true],
+            _ => &[false, true],
+        };
+        for &no_merge in l22 {
+            let mut samples: Vec<Vec<Sample>> = arms.iter().map(|_| Vec::new()).collect();
             // Warm-up (pool threads, allocator), one per arm, not counted.
-            for on in [false, true] {
-                with_settle_no_merge(no_merge, || {
-                    with_settle_streamed(on, || one(&ladder, &storm))
-                });
+            for arm in &arms {
+                run(arm, no_merge, &storm);
             }
             for k in 0..reps {
-                // ABBA
-                let order = if k % 2 == 0 {
-                    [false, true]
-                } else {
-                    [true, false]
-                };
-                for on in order {
-                    let s = with_settle_no_merge(no_merge, || {
-                        with_settle_streamed(on, || one(&ladder, &storm))
-                    });
-                    arms[usize::from(on)].push(s);
+                // Rotate the arm order each repetition.
+                for j in 0..arms.len() {
+                    let a = (j + k) % arms.len();
+                    samples[a].push(run(&arms[a], no_merge, &storm));
                 }
             }
-            let fp0 = arms[0][0].fingerprint;
-            for s in arms.iter().flatten() {
+            let fp0 = samples[0][0].fingerprint;
+            for s in samples.iter().flatten() {
                 assert_eq!(
                     s.fingerprint, fp0,
                     "same gas, successes and overlay set in every run"
                 );
             }
-            let row = |v: &[Sample]| {
-                (
-                    median(v.iter().map(|s| s.wall.as_secs_f64() * 1e3).collect()),
-                    median(v.iter().map(|s| ms(s.match_ns)).collect()),
-                    median(v.iter().map(|s| ms(s.settle_ns)).collect()),
-                    median(v.iter().map(|s| ms(s.pass_b_ns)).collect()),
-                    v[0].fills,
-                )
-            };
-            let (off, on) = (row(&arms[0]), row(&arms[1]));
+            let med = |v: &[Sample], f: &dyn Fn(&Sample) -> f64| median(v.iter().map(f).collect());
+            let off_wall = med(&samples[0], &|s| s.wall.as_secs_f64() * 1e3);
+            let off_cpu = med(&samples[0], &|s| s.cpu_ns as f64 / 1e6);
             println!(
-                "shape {shape} (fills {}), L2.2 {no_merge}: wall ms off {:.2} on {:.2} (on - off {:+.2}, on / off {:.3}); \
-                 match ms {:.2} -> {:.2}; settle ms {:.2} -> {:.2}; pass B ms {:.2} -> {:.2}",
-                off.4,
-                off.0,
-                on.0,
-                on.0 - off.0,
-                on.0 / off.0,
-                off.1,
-                on.1,
-                off.2,
-                on.2,
-                off.3,
-                on.3,
+                "shape {shape} (fills {}), L2.2 {no_merge}:",
+                samples[0][0].fills
             );
-            let walls = |v: &[Sample]| {
-                let mut w: Vec<f64> = v.iter().map(|s| s.wall.as_secs_f64() * 1e3).collect();
-                w.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                w.iter()
-                    .map(|x| format!("{x:.1}"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            };
-            println!("    off walls: {}", walls(&arms[0]));
-            println!("    on  walls: {}", walls(&arms[1]));
+            for (arm, v) in arms.iter().zip(&samples) {
+                let wall = med(v, &|s| s.wall.as_secs_f64() * 1e3);
+                let cpu = med(v, &|s| s.cpu_ns as f64 / 1e6);
+                println!(
+                    "    {:<14} wall ms {:7.2} (/ off {:.3}); exec on-CPU ms {:7.2} (/ off {:.3}); \
+                     runq ms {:6.2}; parks {:5.0}, parked ms {:6.2}; match ms {:6.2}; settle ms {:6.2}; pass B ms {:6.2}",
+                    label(arm),
+                    wall,
+                    wall / off_wall,
+                    cpu,
+                    cpu / off_cpu,
+                    med(v, &|s| s.runq_ns as f64 / 1e6),
+                    med(v, &|s| s.parks as f64),
+                    med(v, &|s| s.parked_ns as f64 / 1e6),
+                    med(v, &|s| ms(s.match_ns)),
+                    med(v, &|s| ms(s.settle_ns)),
+                    med(v, &|s| ms(s.pass_b_ns)),
+                );
+            }
         }
     }
 }

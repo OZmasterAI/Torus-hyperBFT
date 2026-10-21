@@ -1056,6 +1056,23 @@ pub fn settle_streamed_early_on_this_thread() -> u64 {
     SETTLE_STREAMED_EARLY.with(std::cell::Cell::get)
 }
 
+/// 8k L2.1: (parks, nanoseconds parked) of this thread's waits for
+/// streamed job results so far (perf probe; the exec thread is this thread
+/// when it runs `execute_batch`).
+#[doc(hidden)]
+pub fn settle_stream_parks_on_this_thread() -> (u64, u64) {
+    crate::exec_pool::stream_parks_on_this_thread()
+}
+
+/// 8k L2.1 test / bench seam: runs `f` with the streamed settle's wake
+/// batch pinned to `batch` on this thread (`None`: the built-in policy,
+/// `Some(1)`: a wake-up per market as before the batching). Results do not
+/// depend on it.
+#[doc(hidden)]
+pub fn with_settle_stream_wake_batch<R>(batch: Option<usize>, f: impl FnOnce() -> R) -> R {
+    crate::exec_pool::with_wake_batch(batch, f)
+}
+
 /// 8k L2.1: plan-failure fallbacks this thread hit after a streamed prefix
 /// (the prefix undone, flag off's fallback replayed).
 #[doc(hidden)]
@@ -6084,6 +6101,8 @@ struct StreamedOut {
     applied: Vec<AppliedMarket>,
     /// Of those, applied while a later market's job was still running.
     early: u64,
+    /// Times the exec thread parked waiting for a market's job.
+    parks: u64,
     /// Exec-thread time in pass B and waiting for plans (settle time).
     pass_b: std::time::Duration,
     plan_wait: std::time::Duration,
@@ -10426,7 +10445,8 @@ impl NativeExecutor {
             let plan = settle_gate(matched).then(|| plan_of(&mbr));
             Ok((mbr, plan))
         };
-        crate::exec_pool::run_streamed(items, jobs, probe.jitter_seed, &work, |rx| {
+        let batch = crate::exec_pool::wake_batch(n);
+        crate::exec_pool::run_streamed(items, jobs, batch, probe.jitter_seed, &work, |rx| {
             let mut pending: VecDeque<(crate::market_workers::MarketBatchResult, Plan)> =
                 VecDeque::with_capacity(n);
             let mut decided: Option<bool> = None;
@@ -10437,6 +10457,7 @@ impl NativeExecutor {
             let (mut pass_b, mut plan_wait) =
                 (std::time::Duration::ZERO, std::time::Duration::ZERO);
             let mut panic = None;
+            let parks_before = crate::exec_pool::stream_parks_on_this_thread().0;
             for i in 0..n {
                 let wait_start = std::time::Instant::now();
                 let got = rx.take(i);
@@ -10559,6 +10580,7 @@ impl NativeExecutor {
                 rest: pending.into(),
                 applied,
                 early,
+                parks: crate::exec_pool::stream_parks_on_this_thread().0 - parks_before,
                 pass_b,
                 plan_wait,
             }
@@ -10670,6 +10692,7 @@ impl NativeExecutor {
             m.exec_settle_streamed_markets
                 .inc_by(so.applied.len() as u64);
             m.exec_settle_streamed_early_markets.inc_by(so.early);
+            m.exec_settle_streamed_parks.inc_by(so.parks);
         }
         if let Some((reason, fault)) = fallback {
             debug_assert!(so.applied.is_empty(), "the prefix was undone");

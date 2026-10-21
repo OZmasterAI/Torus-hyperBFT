@@ -406,6 +406,9 @@ pub struct Metrics {
     /// 8k L2.1: of those, markets applied while a later market's job was
     /// still running (the overlap the flag buys).
     pub exec_settle_streamed_early_markets: Counter,
+    /// 8k L2.1: times the exec thread parked waiting for a streamed market's
+    /// pool job (woken once per batch of up to 8 ready markets).
+    pub exec_settle_streamed_parks: Counter,
     /// 8k L2.1: parallel-settle fallbacks after a streamed prefix (a plan
     /// failed after pass B began: the prefix is undone and flag off's
     /// sequential fallback replayed). Expected 0.
@@ -1964,6 +1967,12 @@ impl Metrics {
             "TORUS_SETTLE_STREAMED=1 markets whose settle pass B ran while a later market's job was still running",
             exec_settle_streamed_early_markets.clone(),
         );
+        let exec_settle_streamed_parks = Counter::default();
+        registry.register(
+            "torus_exec_settle_streamed_parks",
+            "TORUS_SETTLE_STREAMED=1 times the exec thread parked waiting for a market's pool job",
+            exec_settle_streamed_parks.clone(),
+        );
         let exec_settle_streamed_resumed_fallbacks = Counter::default();
         registry.register(
             "torus_exec_settle_streamed_resumed_fallbacks",
@@ -3146,6 +3155,7 @@ impl Metrics {
             exec_settle_no_merge_fallbacks,
             exec_settle_streamed_markets,
             exec_settle_streamed_early_markets,
+            exec_settle_streamed_parks,
             exec_settle_streamed_resumed_fallbacks,
             exec_post_engine_tail_seconds,
             exec_engine_untimed_seconds,
@@ -4044,11 +4054,13 @@ mod tests {
         // 8k L2.1: the streamed settle counters.
         m.exec_settle_streamed_markets.inc_by(3);
         m.exec_settle_streamed_early_markets.inc_by(2);
+        m.exec_settle_streamed_parks.inc_by(4);
         m.exec_settle_streamed_resumed_fallbacks.inc();
         let text = m.encode();
         for line in [
             "torus_exec_settle_streamed_markets_total 3\n",
             "torus_exec_settle_streamed_early_markets_total 2\n",
+            "torus_exec_settle_streamed_parks_total 4\n",
             "torus_exec_settle_streamed_resumed_fallbacks_total 1\n",
         ] {
             assert!(text.contains(line), "{line}: {text}");

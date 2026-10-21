@@ -16,7 +16,7 @@
 //! nothing else runs on it. Thread names `torus-exec-pool-<i>` are not in the
 //! node's fail-stop list, as the unnamed scoped threads were not.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 /// Size: the largest of the sites' caps at first use (`TORUS_MATCH_WORKERS`,
@@ -63,15 +63,83 @@ where
         .collect()
 }
 
+/// 8k L2.1: [`StreamRx`]'s "no wait announced" value of `waiting`.
+const NO_WAIT: u64 = u64::MAX;
+
+/// 8k L2.1: a wait announcement, `need` (the item the caller takes next)
+/// and `target` (the last item of the batch it waits for).
+fn pack_wait(need: usize, target: usize) -> u64 {
+    ((need as u64) << 32) | target as u64
+}
+
+fn unpack_wait(w: u64) -> (usize, usize) {
+    ((w >> 32) as usize, (w & 0xFFFF_FFFF) as usize)
+}
+
+/// 8k L2.1 wake batch: at most this many items per wake-up of the caller.
+/// Bench 9b (perf doc section 114) put a park / unpark per market on the
+/// exec thread (+4.4% exec-thread on-CPU per 1k fills on the deep book):
+/// the exec thread's pass B outruns the pool, so it parked on nearly every
+/// market. Waiting for a batch of `WAKE_BATCH_MAX` items cuts the parks
+/// about that many times; the cost is a tail of at most `batch - 1`
+/// markets' pass B after the last job ends.
+const WAKE_BATCH_MAX: usize = 8;
+
+/// 8k L2.1: calls with fewer items than `WAKE_BATCH_DIV` times the batch
+/// get a smaller batch (`n / WAKE_BATCH_DIV`, at least 1), so a call with
+/// few markets keeps its overlap (batch 1: a wake per item, as before).
+const WAKE_BATCH_DIV: usize = 8;
+
+thread_local! {
+    /// 8k L2.1 test seam: [`with_wake_batch`]'s per-thread pin of the wake
+    /// batch (`None`: [`wake_batch`]'s policy).
+    static WAKE_BATCH_PIN: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// 8k L2.1: this thread's parks in [`StreamRx::take`] so far: (parks,
+    /// nanoseconds parked).
+    static STREAM_PARKS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// 8k L2.1: the wake batch of a streamed call over `n` items: the pin if
+/// set (at least 1), else `min(WAKE_BATCH_MAX, max(1, n / WAKE_BATCH_DIV))`.
+/// Scheduling only: results and their order do not depend on it.
+pub(crate) fn wake_batch(n: usize) -> usize {
+    match WAKE_BATCH_PIN.with(std::cell::Cell::get) {
+        Some(b) => b.max(1),
+        None => (n / WAKE_BATCH_DIV).clamp(1, WAKE_BATCH_MAX),
+    }
+}
+
+/// 8k L2.1 test seam: runs `f` with the wake batch pinned to `batch` on
+/// this thread (`None`: the policy); the previous pin comes back when `f`
+/// returns or unwinds.
+pub(crate) fn with_wake_batch<R>(batch: Option<usize>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WAKE_BATCH_PIN.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(WAKE_BATCH_PIN.with(|c| c.replace(batch)));
+    f()
+}
+
+/// 8k L2.1: (parks, nanoseconds parked) of this thread's
+/// [`StreamRx::take`] calls so far.
+pub(crate) fn stream_parks_on_this_thread() -> (u64, u64) {
+    STREAM_PARKS.with(std::cell::Cell::get)
+}
+
 /// 8k L2.1 (`TORUS_SETTLE_STREAMED`): the results of [`run_streamed`]'s
 /// items, taken by the calling thread in item order while the pool still
 /// works on later items.
 pub(crate) struct StreamRx<'s, R> {
     slots: &'s [StreamSlot<R>],
-    /// The item the caller is parked on (`usize::MAX`: none).
-    waiting: &'s AtomicUsize,
+    /// The caller's wait: [`pack_wait`]`(need, target)`, or [`NO_WAIT`].
+    waiting: &'s AtomicU64,
     /// Items finished so far.
     done: &'s AtomicUsize,
+    /// Wake batch (>= 1): see [`wake_batch`].
+    batch: usize,
 }
 
 /// One item's result: `ready` is set (SeqCst) after the value is stored.
@@ -83,22 +151,50 @@ struct StreamSlot<R> {
 impl<R> StreamRx<'_, R> {
     /// Item `i`'s result (its value, or its panic payload), blocking until
     /// its job has stored it. Each item can be taken once.
+    ///
+    /// When item `i` is not ready, the caller parks until item `i` AND item
+    /// `target = min(i + batch - 1, last)` are both ready, so one wake-up
+    /// usually hands it a run of about `batch` ready items (taken without
+    /// parking) instead of one item per wake-up. Results and their order are
+    /// the same for every batch; only when the caller wakes changes.
     pub(crate) fn take(&self, i: usize) -> std::thread::Result<R> {
-        loop {
-            if let Some(r) = self.try_take(i) {
-                return r;
-            }
-            // Announce the wait, then re-check: a worker stores `ready`
-            // before it reads `waiting` (both SeqCst), so either it sees this
-            // wait and unparks, or this re-check sees its result.
-            self.waiting.store(i, Ordering::SeqCst);
-            if let Some(r) = self.try_take(i) {
-                self.waiting.store(usize::MAX, Ordering::SeqCst);
-                return r;
-            }
-            std::thread::park();
-            self.waiting.store(usize::MAX, Ordering::SeqCst);
+        if let Some(r) = self.try_take(i) {
+            return r;
         }
+        let target = i.saturating_add(self.batch - 1).min(self.slots.len() - 1);
+        let wait = pack_wait(i, target);
+        loop {
+            // Announce the wait, then re-check: a worker stores `ready`
+            // before it reads `waiting` (all SeqCst), so the worker that
+            // finishes the later of `i` and `target` either sees this wait
+            // (and both items ready) and unparks, or this re-check sees both
+            // ready.
+            self.waiting.store(wait, Ordering::SeqCst);
+            if self.batch_ready(i, target) {
+                self.waiting.store(NO_WAIT, Ordering::SeqCst);
+                break;
+            }
+            let parked = std::time::Instant::now();
+            std::thread::park();
+            let ns = u64::try_from(parked.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            STREAM_PARKS.with(|c| {
+                let (n, t) = c.get();
+                c.set((n + 1, t.saturating_add(ns)));
+            });
+            self.waiting.store(NO_WAIT, Ordering::SeqCst);
+            // Spurious wake-ups (`park` may return early; a stale unpark of
+            // an earlier wait) re-announce and park again.
+            if self.batch_ready(i, target) {
+                break;
+            }
+        }
+        self.try_take(i)
+            .expect("L2.1: item i is ready after the wait")
+    }
+
+    fn batch_ready(&self, i: usize, target: usize) -> bool {
+        self.slots[i].ready.load(Ordering::SeqCst)
+            && self.slots[target].ready.load(Ordering::SeqCst)
     }
 
     fn try_take(&self, i: usize) -> Option<std::thread::Result<R>> {
@@ -131,11 +227,14 @@ impl<R> StreamRx<'_, R> {
 /// item is that item's `Err` (payload kept; never unwinds into the pool or
 /// the caller, and the other items still run). Returns when `body` has
 /// returned AND every job has ended (rayon `in_place_scope`), so items may
-/// borrow the caller's data. `jitter` (test seam, 0 = off) sleeps each item
-/// a pseudo-random 0-255 us before its work, to vary completion orders.
+/// borrow the caller's data. `batch` (>= 1; see [`wake_batch`]): a caller
+/// that has to wait is woken once per run of about `batch` ready items.
+/// `jitter` (test seam, 0 = off) sleeps each item a pseudo-random 0-255 us
+/// before its work, to vary completion orders.
 pub(crate) fn run_streamed<I, R, B>(
     items: Vec<I>,
     jobs: usize,
+    batch: usize,
     jitter: u64,
     work: &(dyn Fn(usize, I) -> R + Sync),
     body: impl FnOnce(&StreamRx<'_, R>) -> B,
@@ -145,6 +244,10 @@ where
     R: Send,
 {
     let n = items.len();
+    assert!(
+        n < u32::MAX as usize,
+        "L2.1: item indices fit the wait word"
+    );
     let inputs: Vec<std::sync::Mutex<Option<I>>> = items
         .into_iter()
         .map(|i| std::sync::Mutex::new(Some(i)))
@@ -156,13 +259,14 @@ where
         })
         .collect();
     let cursor = AtomicUsize::new(0);
-    let waiting = AtomicUsize::new(usize::MAX);
+    let waiting = AtomicU64::new(NO_WAIT);
     let done = AtomicUsize::new(0);
     let caller = std::thread::current();
     let rx = StreamRx {
         slots: &slots,
         waiting: &waiting,
         done: &done,
+        batch: batch.max(1),
     };
     let worker = || loop {
         let i = cursor.fetch_add(1, Ordering::Relaxed);
@@ -185,8 +289,17 @@ where
         // run ahead of `ready` by an item: it only labels a pass B early.
         done.fetch_add(1, Ordering::SeqCst);
         slots[i].ready.store(true, Ordering::SeqCst);
-        if waiting.load(Ordering::SeqCst) == i {
-            caller.unpark();
+        // Wake the caller only when this item completes its announced wait
+        // (the later of `need` and `target` to finish), not on every item.
+        let w = waiting.load(Ordering::SeqCst);
+        if w != NO_WAIT {
+            let (need, target) = unpack_wait(w);
+            if (i == need || i == target)
+                && slots[need].ready.load(Ordering::SeqCst)
+                && slots[target].ready.load(Ordering::SeqCst)
+            {
+                caller.unpark();
+            }
         }
     };
     let worker = &worker;
@@ -271,13 +384,17 @@ mod tests {
     }
 
     /// 8k L2.1: every item's result comes back by index, in order, whatever
-    /// the job count and the completion order (jitter); a panicking item is
-    /// its own `Err` and the others still run; items borrow caller data; the
-    /// caller sees `all_done` once everything finished.
+    /// the job count, the wake batch and the completion order (jitter); a
+    /// panicking item is its own `Err` and the others still run; items
+    /// borrow caller data; the caller sees `all_done` once everything
+    /// finished.
     #[test]
     fn run_streamed_hands_out_results_in_item_order() {
         let base: Vec<u64> = (0..200).collect();
-        for jobs in [1usize, 2, 7, 64] {
+        for (jobs, batch) in [1usize, 2, 7, 64]
+            .into_iter()
+            .flat_map(|j| [1usize, 3, 8, 500].map(|b| (j, b)))
+        {
             for jitter in [0u64, 0xC0FFEE, 0x5EED] {
                 let work = |i: usize, x: &u64| {
                     if i == 77 {
@@ -286,7 +403,7 @@ mod tests {
                     (i as u64) * 1000 + *x
                 };
                 let items: Vec<&u64> = base.iter().collect();
-                let (got, done_at_end) = run_streamed(items, jobs, jitter, &work, |rx| {
+                let (got, done_at_end) = run_streamed(items, jobs, batch, jitter, &work, |rx| {
                     let mut got = Vec::new();
                     for i in 0..200 {
                         got.push(rx.take(i).map_err(|p| {
@@ -299,7 +416,7 @@ mod tests {
                 });
                 assert!(
                     done_at_end,
-                    "jobs {jobs}: every item finished before the last take"
+                    "jobs {jobs} batch {batch}: every item finished before the last take"
                 );
                 for (i, r) in got.into_iter().enumerate() {
                     if i == 77 {
@@ -308,7 +425,7 @@ mod tests {
                         assert_eq!(
                             r,
                             Ok(i as u64 * 1001),
-                            "jobs {jobs} jitter {jitter:#x} item {i}"
+                            "jobs {jobs} batch {batch} jitter {jitter:#x} item {i}"
                         );
                     }
                 }
@@ -329,7 +446,7 @@ mod tests {
             finished.fetch_add(1, Ordering::SeqCst);
             i
         };
-        let early = run_streamed(vec![(); 16], 4, 0, &work, |rx| {
+        let early = run_streamed(vec![(); 16], 4, 1, 0, &work, |rx| {
             let first = rx.take(0).unwrap();
             assert_eq!(first, 0);
             // Item 15 sleeps 50 ms: not everything is done yet.
@@ -343,7 +460,49 @@ mod tests {
         );
         // An empty item list runs the body with nothing to take.
         let work = |_: usize, x: u8| x;
-        assert!(run_streamed(Vec::<u8>::new(), 4, 0, &work, |rx| rx.all_done()));
+        assert!(run_streamed(Vec::<u8>::new(), 4, 1, 0, &work, |rx| rx.all_done()));
+    }
+
+    /// 8k L2.1 wake batching: a caller that outruns the pool parks at most
+    /// about once per `batch` items (same results), and the policy scales
+    /// the batch with the item count.
+    #[test]
+    fn run_streamed_batches_the_callers_wake_ups() {
+        let parks = |batch: usize| {
+            let work = |i: usize, _: ()| {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+                i
+            };
+            let before = stream_parks_on_this_thread().0;
+            let got = run_streamed(vec![(); 64], 1, batch, 0, &work, |rx| {
+                (0..64).map(|i| rx.take(i).unwrap()).collect::<Vec<_>>()
+            });
+            assert_eq!(
+                got,
+                (0..64).collect::<Vec<_>>(),
+                "batch {batch}: item order"
+            );
+            stream_parks_on_this_thread().0 - before
+        };
+        // Upper bounds only (how often the caller has to wait at all depends
+        // on scheduling). With one job, items finish in order, so a real
+        // wake-up of a batch-`b` wait finds the whole run `need..=target`
+        // ready and the caller takes it without parking: at most
+        // `ceil(64 / b)` waits. Each wait parks at most twice (a leftover
+        // unpark token from a wait the re-check satisfied makes one `park`
+        // return at once).
+        for batch in [1usize, 8, 64] {
+            let bound = 2 * 64usize.div_ceil(batch) as u64;
+            let got = parks(batch);
+            assert!(got <= bound, "batch {batch}: {got} parks > bound {bound}");
+        }
+        assert_eq!(wake_batch(0), 1);
+        assert_eq!(wake_batch(4), 1);
+        assert_eq!(wake_batch(16), 2);
+        assert_eq!(wake_batch(300), WAKE_BATCH_MAX);
+        assert_eq!(with_wake_batch(Some(5), || wake_batch(300)), 5);
+        assert_eq!(with_wake_batch(Some(0), || wake_batch(300)), 1);
+        assert_eq!(wake_batch(300), WAKE_BATCH_MAX, "pin restored");
     }
 
     /// Jobs may borrow the caller's data (as scoped threads could).

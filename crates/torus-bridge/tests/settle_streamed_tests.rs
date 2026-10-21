@@ -39,8 +39,8 @@ use torus_bridge::native_executor::{
     in_maker_snapshot_read_on_this_thread, parse_settle_streamed,
     settle_streamed_calls_on_this_thread, settle_streamed_early_on_this_thread,
     settle_streamed_hybrid_on_this_thread, with_settle_no_merge, with_settle_stream_probe,
-    with_settle_streamed, BookMode, NativeActionResult, NativeExecContext, NativeExecutor,
-    ResidentBooks, SettleStreamProbe,
+    with_settle_stream_wake_batch, with_settle_streamed, BookMode, NativeActionResult,
+    NativeExecContext, NativeExecutor, ResidentBooks, SettleStreamProbe,
 };
 use torus_bridge::state_root::compute_native_state_root;
 use torus_core::position::{position_key, MarginType, NativeBalance, Position};
@@ -751,9 +751,16 @@ fn assert_same(off: &RunOut, on: &RunOut, label: &str) {
 /// The fault of a run, chosen from a fault-free flag-off run.
 type FaultPick<'a> = &'a dyn Fn(&RunOut, &RunStats) -> LastBlockFault;
 
+/// Wake batches the flag-on arm cycles through, one per jitter seed (the
+/// `k`-th seed runs under `WAKE_BATCHES[k % 5]`; `None`: the policy, which
+/// is already above 1 for 16+ markets). Scheduling only: every batch must
+/// give the same results.
+const WAKE_BATCHES: [Option<usize>; 5] = [None, Some(1), Some(2), Some(5), Some(64)];
+
 /// Flag off vs on, for L2.2 off and on, over `blocks` with `r`'s settings
 /// and each jitter seed of `jitters` (the flag-on arm only: the flag-off arm
-/// does not stream). Returns `(L2.2 on?, flag-off stats, flag-on stats per
+/// does not stream), each seed under the next wake batch of
+/// [`WAKE_BATCHES`]. Returns `(L2.2 on?, flag-off stats, flag-on stats per
 /// jitter)`.
 fn assert_streamed_equivalent(
     blocks: &[Block],
@@ -779,10 +786,15 @@ fn assert_streamed_equivalent(
             "{label}: flag off never streams"
         );
         let mut ons = Vec::new();
-        for &jitter in jitters {
-            let label = format!("{label}, jitter {jitter:#x}");
+        for (k, &jitter) in jitters.iter().enumerate() {
+            let batch = WAKE_BATCHES[k % WAKE_BATCHES.len()];
+            let label = format!("{label}, jitter {jitter:#x}, wake batch {batch:?}");
             let (on, on_stats) = with_settle_no_merge(no_merge, || {
-                with_settle_streamed(true, || run(blocks, Run { jitter, ..r }, &fault))
+                with_settle_streamed(true, || {
+                    with_settle_stream_wake_batch(batch, || {
+                        run(blocks, Run { jitter, ..r }, &fault)
+                    })
+                })
             });
             assert_same(&off, &on, &label);
             assert_eq!(
