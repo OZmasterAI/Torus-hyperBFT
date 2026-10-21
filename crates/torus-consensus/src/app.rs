@@ -541,11 +541,200 @@ struct CommittedBlockMsg {
     /// the same bytes would land in the same key. `Default` (both `false`) =
     /// "not known durable" ⇒ execution writes them, exactly as before.
     durable: DurableRows,
+    /// T5.3: the header + body write runs on the [`CommitPersistWriter`]
+    /// instead of the consensus thread; the exec thread waits for this ticket
+    /// (and uses its rows instead of `durable`) before it executes the block.
+    /// `None` = `durable` is final (the write already ran in the dispatch).
+    persist: Option<PersistTicket>,
     /// Exec-aware admission: the normal actions this block added to the
     /// committed-but-unexecuted count (`Mempool::note_exec_committed`); the
     /// exec thread releases exactly this after executing it. 0 with the
     /// knob off (the exec thread then touches nothing).
     committed_unexecuted: usize,
+}
+
+/// T5.3: called with a committed height once its `CF_BLOCK_HEADERS` row is
+/// readable (the node publishes the RPC height + the WS head from it). With the
+/// [`CommitPersistWriter`] the header lands after the commit event, so the
+/// commit handler alone would publish one height behind and never catch up
+/// once commits stop. Called on the writer thread (after the row's write
+/// returned and the height's ticket filled, so exec never waits on it), in height order, at most once
+/// per height there; or on the exec thread for a height whose writer write
+/// failed (exec wrote the row). Must be quick and must not panic. Never called
+/// with the manifest in the state DB (the dispatch writes the row before the
+/// commit event there).
+pub type HeaderPersistedHook = Arc<dyn Fn(u64) + Send + Sync>;
+
+/// T5.3: the [`HeaderPersistedHook`] slot, shared by `TorusApp`, the
+/// [`CommitPersistWriter`] and the exec thread; empty = nobody is told.
+type HeaderHookSlot = Arc<std::sync::OnceLock<HeaderPersistedHook>>;
+
+/// T5.3: the commit-persist result of one height: filled by the
+/// [`CommitPersistWriter`] once the height's header + body write returned,
+/// awaited by the exec thread before it executes the height.
+#[derive(Clone, Default)]
+struct PersistTicket(Arc<(std::sync::Mutex<Option<DurableRows>>, std::sync::Condvar)>);
+
+impl PersistTicket {
+    /// Fill the ticket once (a second fill is ignored) and wake the waiter.
+    fn set(&self, rows: DurableRows) {
+        let (slot, cv) = &*self.0;
+        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(rows);
+            cv.notify_all();
+        }
+    }
+
+    /// Block until the ticket is filled.
+    fn wait(&self) -> DurableRows {
+        let (slot, cv) = &*self.0;
+        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(rows) = *slot {
+                return rows;
+            }
+            slot = cv.wait(slot).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+#[cfg(test)]
+impl PersistTicket {
+    /// The filled rows, without waiting (`None` while the write is pending).
+    fn peek(&self) -> Option<DurableRows> {
+        *self.0 .0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[cfg(test)]
+impl CommittedBlockMsg {
+    /// The rows the exec thread uses: the queued write's once it returned,
+    /// else `durable`.
+    fn settled_durable(&self) -> DurableRows {
+        self.persist
+            .as_ref()
+            .map_or(self.durable, PersistTicket::wait)
+    }
+}
+
+/// T5.3: one queued commit-persist write. Dropped unwritten (the writer died,
+/// or it was stopped first) it fills its ticket with `DurableRows::default()`
+/// ("not durable"), so the exec thread never waits forever and writes the
+/// rows itself, as after a failed dispatch-time write.
+struct PersistJob {
+    block: TorusBlock,
+    ticket: PersistTicket,
+}
+
+impl Drop for PersistJob {
+    fn drop(&mut self) {
+        self.ticket.set(DurableRows::default());
+    }
+}
+
+/// T5.3: the thread (`torus-commit-persist`) that writes each dispatched
+/// height's header + body to the state DB ([`persist_committed_block_durably_timed`],
+/// same batch, same timers) instead of the consensus thread, so a commit no
+/// longer waits behind a state checkpoint batch in the state DB's write queue.
+///
+/// Contract: one FIFO queue, so the writes land in height order; the exec thread
+/// waits for a height's [`PersistTicket`] before executing it, so the rows are
+/// written before the block executes (as when the dispatch wrote them); the
+/// height's commit manifest (consensus DB, written synchronously by the commit
+/// hook) is the crash backstop until then: a crash before the write lands
+/// leaves a manifest-backed height above the header frontier, which boot parks
+/// and heals (FIX 6 / F-1); and the manifest goes only after a state-WAL sync
+/// made the write durable (the owned [`ManifestPruner`], noted after each
+/// write with a body).
+struct CommitPersistWriter {
+    tx: Option<std::sync::mpsc::Sender<PersistJob>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    /// Test seam ([`Self::held`]): queued jobs stay here, unwritten.
+    #[cfg(test)]
+    _held: Option<std::sync::mpsc::Receiver<PersistJob>>,
+}
+
+impl CommitPersistWriter {
+    fn spawn(
+        state_db: StateDb,
+        pruner: ManifestPruner,
+        metrics: Option<Arc<torus_telemetry::Metrics>>,
+        header_hook: HeaderHookSlot,
+    ) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<PersistJob>();
+        let worker = std::thread::Builder::new()
+            .name("torus-commit-persist".into())
+            .spawn(move || {
+                for job in rx {
+                    let height = job.block.header.height;
+                    let durable = persist_committed_block_durably_timed(
+                        &state_db,
+                        &job.block,
+                        metrics.as_deref(),
+                        false,
+                    );
+                    // Settle the ticket first: exec unblocks without waiting
+                    // on the publish below.
+                    job.ticket.set(durable);
+                    // The header row is readable now (the write returned Ok):
+                    // publish the height (RPC height + WS head), so the commit
+                    // handler's stale read (it may have run before this write)
+                    // is repaired even if no commit follows.
+                    if durable.header {
+                        if let Some(hook) = header_hook.get() {
+                            hook(height);
+                        }
+                    }
+                    if durable.body {
+                        pruner.note(height);
+                    }
+                }
+                // `pruner` drops here: its last pass, then its thread joins.
+            })
+            .expect("spawn the commit-persist writer");
+        Self {
+            tx: Some(tx),
+            worker: Some(worker),
+            #[cfg(test)]
+            _held: None,
+        }
+    }
+
+    /// Test seam: a writer that queues jobs and never writes them (a crash
+    /// before the off-thread write lands); dropping it drops them unwritten.
+    #[cfg(test)]
+    fn held() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<PersistJob>();
+        Self {
+            tx: Some(tx),
+            worker: None,
+            _held: Some(rx),
+        }
+    }
+
+    /// Queue `block`'s header + body write; the ticket fills once it returned.
+    fn submit(&self, block: TorusBlock) -> PersistTicket {
+        let ticket = PersistTicket::default();
+        let job = PersistJob {
+            block,
+            ticket: ticket.clone(),
+        };
+        if let Some(tx) = &self.tx {
+            // A dead writer hands the job back; dropping it fills the ticket.
+            let _ = tx.send(job);
+        }
+        ticket
+    }
+}
+
+impl Drop for CommitPersistWriter {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 /// Which of a committed block's node-local durable rows are known to be on
@@ -1243,6 +1432,9 @@ struct ExecutionContext {
     /// without streams. Set before consensus starts;
     /// boot replay runs before it can be set, so replayed blocks never reach it.
     fill_sink: Arc<std::sync::OnceLock<Arc<dyn torus_state::trade_rows::FillSink>>>,
+    /// T5.3: the header-persisted hook slot (see [`HeaderPersistedHook`]); the
+    /// exec thread calls it for a height whose commit-persist write failed.
+    header_hook: HeaderHookSlot,
     /// Running state hash: attestation submitter (shared with `TorusApp`).
     state_hash: Arc<crate::state_hash::StateHashMonitor>,
     /// L3 flush-pipe (b): background writer for the exec-time block-body persist
@@ -1868,19 +2060,29 @@ impl Drop for ObserveOnDrop {
 ///   boot-replay / block-sync / RPC readers see exactly the coverage they had
 ///   before. The EVM arm's `commit_block_metadata` (receipts/indices, only
 ///   known post-execution) is untouched.
+///
+/// Test shorthand with the manifest in the state DB (the pre-T5.3 layout,
+/// `TORUS_MANIFEST_IN_STATE_DB=1`): the height's manifest is pruned in the
+/// same batch.
 #[cfg(test)]
 fn persist_committed_block_durably(state_db: &StateDb, block: &TorusBlock) -> DurableRows {
-    persist_committed_block_durably_timed(state_db, block, None)
+    persist_committed_block_durably_timed(state_db, block, None, true)
 }
 
 /// [`persist_committed_block_durably`] with the consensus-thread timers
 /// (`torus_commit_persist_seconds` = whole call, `torus_commit_body_encode_seconds`
 /// = the body-record encode alone, `torus_commit_persist_write_seconds` = the
 /// WriteBatch write alone).
+///
+/// `prune_manifest_in_batch`: the commit manifest lives in this state DB (the
+/// pre-T5.3 layout), so its row is deleted in the same batch as the body.
+/// With the manifest in the consensus DB the caller hands the height to the
+/// [`ManifestPruner`], which deletes the row only after a state-WAL sync.
 fn persist_committed_block_durably_timed(
     state_db: &StateDb,
     block: &TorusBlock,
     metrics: Option<&torus_telemetry::Metrics>,
+    prune_manifest_in_batch: bool,
 ) -> DurableRows {
     let persist_timer = std::time::Instant::now();
     let height_key = block.header.height.to_be_bytes();
@@ -1929,8 +2131,8 @@ fn persist_committed_block_durably_timed(
     // `CF_COMMIT_MANIFEST` stays bounded to the committed-but-not-yet-dispatched
     // window. Only when the body is actually in the batch: a still-missing body
     // keeps its manifest for the heal pull. (A missing manifest CF is harmless:
-    // the CF merely grows.)
-    if body {
+    // the CF merely grows.) T5.3: only while the manifest lives in this DB.
+    if body && prune_manifest_in_batch {
         if let Ok(cf) = state_db.cf_handle(CF_COMMIT_MANIFEST) {
             batch.delete_cf(cf, height_key);
         }
@@ -1987,7 +2189,9 @@ fn sync_committed_wal(state_db: &StateDb, enabled: bool) -> bool {
 }
 
 /// FIX (heal-channel crash-safety). Persist the committed consensus DATUM
-/// verbatim, keyed by height, to [`CF_COMMIT_MANIFEST`]. Called as the FIRST
+/// verbatim, keyed by height, to [`CF_COMMIT_MANIFEST`] in `manifest_db` (T5.3:
+/// the node's consensus DB, see [`TorusApp::try_new_with_manifest_db`]; the
+/// state DB in the pre-T5.3 layout). Called as the FIRST
 /// durable action on every commit callback (`on_committed_block`), BEFORE the
 /// body is reconstructed or the block enters the execution pipeline.
 ///
@@ -2004,14 +2208,252 @@ fn sync_committed_wal(state_db: &StateDb, enabled: bool) -> bool {
 /// [`recovery_exec_source`]). Best-effort: a write failure is loud but never
 /// aborts the commit (it degrades to the same un-healable-but-loud hole, never a
 /// silent state loss).
-fn persist_commit_manifest(state_db: &StateDb, height: u64, datum_bytes: &[u8]) {
-    if let Err(e) = state_db.put_cf_raw(CF_COMMIT_MANIFEST, &height.to_be_bytes(), datum_bytes) {
+///
+/// Durability (T5.3): a default write (WAL on, not fsynced), as in the state
+/// DB before. With `TORUS_SYNC_WAL_ON_COMMIT` the commit-persist write's
+/// `sync_wal` (on the [`CommitPersistWriter`] thread since T5.3, so after the
+/// commit hook returned) syncs the consensus DB's WAL (the state DB's
+/// attached peer) first. In the
+/// consensus DB the row also shares a WAL with the HotStuff app-fed height,
+/// advanced after this callback returns, so the row cannot be lost while that
+/// advance survives (before T5.3 they sat in different WALs).
+fn persist_commit_manifest(manifest_db: &StateDb, height: u64, datum_bytes: &[u8]) {
+    if let Err(e) = manifest_db.put_cf_raw(CF_COMMIT_MANIFEST, &height.to_be_bytes(), datum_bytes) {
         tracing::error!(
             %e,
             height,
             "failed to persist commit manifest at commit time (a boot-parked hole here could not heal from peers)"
         );
     }
+}
+
+/// T5.3: at most one [`manifest_prune_pass`] per this interval (one state-WAL
+/// fsync per second on the pruner thread, never on the consensus thread).
+const MANIFEST_PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// T5.3: one prune pass over dispatched `heights` whose header + body
+/// `dispatch_to_exec` wrote to the state DB. Syncs the state DB's WAL FIRST, so
+/// those writes are durable even across a power loss, and only then deletes the
+/// heights' manifest rows from the consensus DB. The two DBs have separate WALs:
+/// a delete that became durable while the unsynced body write was lost would
+/// leave a committed height with neither body nor manifest, an unhealable hole.
+/// (Before T5.3 the delete rode the body's own batch.) `Err` keeps the rows.
+fn manifest_prune_pass(
+    state_db: &StateDb,
+    manifest_db: &StateDb,
+    heights: &[u64],
+) -> Result<(), String> {
+    if heights.is_empty() {
+        return Ok(());
+    }
+    state_db
+        .inner()
+        .flush_wal(true)
+        .map_err(|e| format!("sync the state WAL: {e}"))?;
+    let cf = manifest_db
+        .cf_handle(CF_COMMIT_MANIFEST)
+        .map_err(|e| format!("commit manifest CF: {e}"))?;
+    let mut batch = rocksdb::WriteBatch::default();
+    for h in heights {
+        batch.delete_cf(cf, h.to_be_bytes());
+    }
+    manifest_db
+        .write(batch)
+        .map_err(|e| format!("delete commit manifests: {e}"))
+}
+
+/// T5.3: the background thread (`torus-manifest-prune`) that prunes the
+/// consensus-DB commit manifests: `dispatch_to_exec` hands it every height
+/// whose body it wrote ([`Self::note`], a channel send), and it runs
+/// [`manifest_prune_pass`] over them at most once per
+/// [`MANIFEST_PRUNE_INTERVAL`], so a row outlives its body's state-WAL sync
+/// and the consensus thread never fsyncs. Dropping it runs a last pass over
+/// what is pending and joins the thread. Rows of executed heights that a
+/// crash leaves behind go at boot ([`prune_commit_manifests_through`]).
+struct ManifestPruner {
+    tx: Option<std::sync::mpsc::Sender<u64>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ManifestPruner {
+    fn spawn(
+        state_db: StateDb,
+        manifest_db: StateDb,
+        interval: std::time::Duration,
+        metrics: Option<Arc<torus_telemetry::Metrics>>,
+    ) -> Self {
+        use std::sync::mpsc::RecvTimeoutError;
+        let (tx, rx) = std::sync::mpsc::channel::<u64>();
+        let worker = std::thread::Builder::new()
+            .name("torus-manifest-prune".into())
+            .spawn(move || {
+                let mut pending: Vec<u64> = Vec::new();
+                let mut next = std::time::Instant::now();
+                loop {
+                    let got = if pending.is_empty() {
+                        rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
+                    } else {
+                        rx.recv_timeout(next.saturating_duration_since(std::time::Instant::now()))
+                    };
+                    let closed = match got {
+                        Ok(h) => {
+                            pending.push(h);
+                            pending.extend(rx.try_iter());
+                            if std::time::Instant::now() < next {
+                                continue;
+                            }
+                            false
+                        }
+                        Err(RecvTimeoutError::Timeout) => false,
+                        Err(RecvTimeoutError::Disconnected) => true,
+                    };
+                    if !pending.is_empty() {
+                        let timer = std::time::Instant::now();
+                        match manifest_prune_pass(&state_db, &manifest_db, &pending) {
+                            Ok(()) => pending.clear(),
+                            Err(e) => tracing::error!(
+                                %e,
+                                rows = pending.len(),
+                                "commit manifest prune pass failed (rows kept for the next pass)"
+                            ),
+                        }
+                        if let Some(m) = &metrics {
+                            m.commit_manifest_prune_seconds
+                                .observe(timer.elapsed().as_secs_f64());
+                        }
+                        next = std::time::Instant::now() + interval;
+                    }
+                    if closed {
+                        return;
+                    }
+                }
+            })
+            .expect("spawn the commit manifest pruner");
+        Self {
+            tx: Some(tx),
+            worker: Some(worker),
+        }
+    }
+
+    /// Test seam: a pruner that only records the heights on `tx` (no pass).
+    #[cfg(test)]
+    fn detached(tx: std::sync::mpsc::Sender<u64>) -> Self {
+        Self {
+            tx: Some(tx),
+            worker: None,
+        }
+    }
+
+    /// `height`'s header + body were written to the state DB.
+    fn note(&self, height: u64) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(height);
+        }
+    }
+}
+
+impl Drop for ManifestPruner {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// T5.3 boot cleanup: delete the manifest rows at or below `applied` (executed
+/// heights never need the heal channel). Only the deferred consensus-DB prune
+/// leaves such rows (a crash before its pass).
+/// Returns how many went.
+fn prune_commit_manifests_through(manifest_db: &StateDb, applied: u64) -> usize {
+    let db = manifest_db.inner();
+    let Some(cf) = db.cf_handle(CF_COMMIT_MANIFEST) else {
+        return 0;
+    };
+    let mut batch = rocksdb::WriteBatch::default();
+    let mut n = 0;
+    for item in db.iterator_cf(cf, rocksdb::IteratorMode::Start) {
+        let Ok((key, _)) = item else { continue };
+        let Ok(h) = <[u8; 8]>::try_from(key.as_ref()).map(u64::from_be_bytes) else {
+            continue;
+        };
+        if h > applied {
+            break; // keys are BE heights: ascending
+        }
+        batch.delete_cf(cf, &key);
+        n += 1;
+    }
+    if n > 0 {
+        if let Err(e) = manifest_db.write(batch) {
+            tracing::error!(%e, applied, "boot: failed to drop executed commit-manifest rows");
+            return 0;
+        }
+    }
+    n
+}
+
+/// T5.3: move every commit-manifest row from `from` to `to` (the manifest's
+/// home changed: the consensus DB since T5.3, the state DB under
+/// `TORUS_MANIFEST_IN_STATE_DB=1`). Run at boot before the manifest is read,
+/// so a leftover row (a committed-but-not-dispatched height of the previous
+/// run, possibly a hole that can only heal from it) is never ignored. A row
+/// already in `to` is kept. The copy is made durable (WAL fsync) before the
+/// source rows are deleted, so a crash in between leaves the row in both
+/// DBs and the next boot repeats the move. Returns how many rows moved;
+/// `Err` (a boot error) when they cannot be moved.
+pub fn migrate_commit_manifests(from: &StateDb, to: &StateDb) -> Result<usize, String> {
+    let src = from.inner();
+    let Some(from_cf) = src.cf_handle(CF_COMMIT_MANIFEST) else {
+        return Ok(0);
+    };
+    let mut rows = Vec::new();
+    for item in src.iterator_cf(from_cf, rocksdb::IteratorMode::Start) {
+        let (k, v) = item.map_err(|e| format!("read leftover commit manifests: {e}"))?;
+        rows.push((k, v));
+    }
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let to_cf = to
+        .cf_handle(CF_COMMIT_MANIFEST)
+        .map_err(|e| format!("commit manifest target DB: {e}"))?;
+    let mut copy = rocksdb::WriteBatch::default();
+    for (k, v) in &rows {
+        let present = to
+            .get_cf_raw(CF_COMMIT_MANIFEST, k)
+            .map_err(|e| format!("read commit manifest target: {e}"))?
+            .is_some();
+        if !present {
+            copy.put_cf(to_cf, k, v);
+        }
+    }
+    to.write(copy)
+        .map_err(|e| format!("copy leftover commit manifests: {e}"))?;
+    to.inner()
+        .flush_wal(true)
+        .map_err(|e| format!("sync copied commit manifests: {e}"))?;
+    let mut delete = rocksdb::WriteBatch::default();
+    for (k, _) in &rows {
+        delete.delete_cf(from_cf, k);
+    }
+    from.write(delete)
+        .map_err(|e| format!("drop moved commit manifests: {e}"))?;
+    Ok(rows.len())
+}
+
+/// T5.3 A/B switch: `TORUS_MANIFEST_IN_STATE_DB=1` keeps the commit manifest in
+/// the state DB (the pre-T5.3 layout, its prune back in the commit-persist
+/// batch); unset = the consensus DB. Node-local, perf-only: the manifest is not
+/// consensus state. Leftover rows move at boot either way
+/// ([`migrate_commit_manifests`]).
+pub const ENV_MANIFEST_IN_STATE_DB: &str = "TORUS_MANIFEST_IN_STATE_DB";
+
+/// Parse [`ENV_MANIFEST_IN_STATE_DB`]: `1` / `true` / `on` / `yes` = state DB.
+pub fn parse_manifest_in_state_db(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    )
 }
 
 /// FIX 6 / F-1 (S443): heights present in [`CF_COMMIT_MANIFEST`] strictly above
@@ -2021,8 +2463,8 @@ fn persist_commit_manifest(state_db: &StateDb, height: u64, datum_bytes: &[u8]) 
 /// left them recoverable ONLY from the manifest, and boot crash-recovery
 /// (`replay_committed`, keyed off the header frontier) can't see them. Boot
 /// reconciliation scans them here to park+heal.
-fn manifest_heights_above(state_db: &StateDb, floor: u64) -> Vec<u64> {
-    let db = state_db.inner();
+fn manifest_heights_above(manifest_db: &StateDb, floor: u64) -> Vec<u64> {
+    let db = manifest_db.inner();
     let Some(cf) = db.cf_handle(CF_COMMIT_MANIFEST) else {
         return vec![];
     };
@@ -2042,8 +2484,8 @@ fn manifest_heights_above(state_db: &StateDb, floor: u64) -> Vec<u64> {
 }
 
 /// Load a committed height's durable datum from [`CF_COMMIT_MANIFEST`], if present.
-fn load_commit_manifest(state_db: &StateDb, height: u64) -> Option<Vec<u8>> {
-    match state_db.get_cf_raw(CF_COMMIT_MANIFEST, &height.to_be_bytes()) {
+fn load_commit_manifest(manifest_db: &StateDb, height: u64) -> Option<Vec<u8>> {
+    match manifest_db.get_cf_raw(CF_COMMIT_MANIFEST, &height.to_be_bytes()) {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(%e, height, "crash recovery: failed to read commit manifest");
@@ -2063,8 +2505,8 @@ fn load_commit_manifest(state_db: &StateDb, height: u64) -> Option<Vec<u8>> {
 /// A FULL-block datum decodes to `ExecSource::Ready` (bodies inline — no pull
 /// needed). Only when NO manifest exists (legacy pre-fix DBs) does this fall back
 /// to `ExecSource::Durable`, which can heal solely from a local durable body.
-fn recovery_exec_source(state_db: &StateDb, height: u64) -> ExecSource {
-    if let Some(datum) = load_commit_manifest(state_db, height) {
+fn recovery_exec_source(manifest_db: &StateDb, height: u64) -> ExecSource {
+    if let Some(datum) = load_commit_manifest(manifest_db, height) {
         if let Ok(full) = bincode::deserialize::<TorusBlock>(&datum) {
             return ExecSource::Ready(full);
         }
@@ -5904,9 +6346,32 @@ fn execution_loop(rx: std::sync::mpsc::Receiver<CommittedBlockMsg>, ctx: Executi
             torus_block,
             pending_slashes,
             durable,
+            persist,
             committed_unexecuted,
         } = msg;
         let height = torus_block.header.height;
+        // T5.3: the writer's header write failed (or was dropped): execution
+        // writes the row, so the exec thread publishes the height after it.
+        let mut header_from_exec = false;
+        // T5.3: the header + body write runs on the commit-persist writer; the
+        // block executes only once it returned (timed: how long exec waits).
+        let durable = match persist {
+            Some(ticket) => {
+                let wait = std::time::Instant::now();
+                let rows = ticket.wait();
+                header_from_exec = !rows.header;
+                if let Some(ref m) = ctx.metrics {
+                    m.exec_commit_persist_wait_seconds
+                        .observe(wait.elapsed().as_secs_f64());
+                }
+                if exec_rewrite_durable_rows() {
+                    DurableRows::default()
+                } else {
+                    rows
+                }
+            }
+            None => durable,
+        };
         // T1.5: contain execution panics — a panic here must become a
         // controlled fail-stop (latch + loop exit), not silent thread death
         // with consensus zombie-advancing while state is frozen.
@@ -5916,6 +6381,12 @@ fn execution_loop(rx: std::sync::mpsc::Receiver<CommittedBlockMsg>, ctx: Executi
         if result.is_err() {
             ctx.exec_failed.store(true, Ordering::SeqCst);
             tracing::error!(height, "execution pipeline PANICKED executing committed block");
+        }
+        // The hook's receiver checks the row is readable before publishing.
+        if header_from_exec && !ctx.exec_failed.load(Ordering::SeqCst) {
+            if let Some(hook) = ctx.header_hook.get() {
+                hook(height);
+            }
         }
         // Paired with the inc() at the `exec_tx.send` site: dec AFTER execution
         // so the gauge counts queued + in-flight blocks (pinned near the channel
@@ -6010,6 +6481,20 @@ impl InFlightHashLedger {
 pub struct TorusApp {
     #[allow(dead_code)]
     state_db: StateDb,
+    /// T5.3: the DB holding `CF_COMMIT_MANIFEST`: the node's consensus DB
+    /// (own WAL and write queue, so the commit hook's manifest put never waits
+    /// behind a state checkpoint batch), or `state_db` itself in the pre-T5.3
+    /// layout ([`Self::try_new`], `TORUS_MANIFEST_IN_STATE_DB=1`).
+    manifest_db: StateDb,
+    /// T5.3: `manifest_db` is `state_db` (the pre-T5.3 path: the dispatch
+    /// writes header + body itself and the manifest prune rides that batch).
+    manifest_in_state_db: bool,
+    /// T5.3: writes each dispatched height's header + body off this thread
+    /// and owns the manifest pruner; `None` with the manifest in the state DB.
+    commit_persist: Option<CommitPersistWriter>,
+    /// T5.3: the ticket of `exec_prepared_height`'s queued write (reused by a
+    /// rank-2 retry of the same height).
+    exec_prepared_ticket: Option<PersistTicket>,
     #[allow(dead_code)]
     proposer: BlockProposer,
     #[allow(dead_code)]
@@ -6142,6 +6627,9 @@ pub struct TorusApp {
     exec_prepared_durable: DurableRows,
     /// s80: the execution thread's fill sink slot (see `set_fill_sink`).
     fill_sink: Arc<std::sync::OnceLock<Arc<dyn torus_state::trade_rows::FillSink>>>,
+    /// T5.3: the header-persisted hook slot (see `set_header_persisted_hook`),
+    /// shared with the commit-persist writer and the exec thread.
+    header_hook: HeaderHookSlot,
     /// Running state hash monitor, shared with the execution thread.
     state_hash: Arc<crate::state_hash::StateHashMonitor>,
 }
@@ -6847,6 +7335,10 @@ impl TorusApp {
     /// rows to resolve the signing key's proposer address (a local storage
     /// fault) — startup stops instead of proposing as `Address::ZERO`. A key
     /// that is not a validator (`Ok(None)`) still yields `Address::ZERO`.
+    ///
+    /// The commit manifest lives in `state_db` (the pre-T5.3 layout, for
+    /// embedders without a consensus DB); the node uses
+    /// [`Self::try_new_with_manifest_db`].
     pub fn try_new(
         state_db: StateDb,
         config: &ChainConfig,
@@ -6854,6 +7346,39 @@ impl TorusApp {
         mempool: Option<Arc<Mempool>>,
         signing_key: Option<ed25519_dalek::SigningKey>,
     ) -> Result<Self, String> {
+        let manifest_db = state_db.clone();
+        Self::try_new_with_manifest_db(state_db, manifest_db, config, metrics, mempool, signing_key)
+    }
+
+    /// [`Self::try_new`] with the commit manifest (`CF_COMMIT_MANIFEST`) in
+    /// `manifest_db`: the node's consensus DB (T5.3), or `state_db` itself
+    /// (the pre-T5.3 layout). With a separate `manifest_db`, rows left in the
+    /// state DB's manifest CF by a pre-T5.3 run (or by
+    /// `TORUS_MANIFEST_IN_STATE_DB=1`) are moved into it before boot recovery
+    /// reads it ([`migrate_commit_manifests`]), so a hole they guard still
+    /// heals; `Err` when `manifest_db` has no manifest CF or the move fails.
+    pub fn try_new_with_manifest_db(
+        state_db: StateDb,
+        manifest_db: StateDb,
+        config: &ChainConfig,
+        metrics: Option<Arc<torus_telemetry::Metrics>>,
+        mempool: Option<Arc<Mempool>>,
+        signing_key: Option<ed25519_dalek::SigningKey>,
+    ) -> Result<Self, String> {
+        let manifest_in_state_db = Arc::ptr_eq(&state_db.db_arc(), &manifest_db.db_arc());
+        if !manifest_in_state_db {
+            manifest_db
+                .cf_handle(CF_COMMIT_MANIFEST)
+                .map_err(|e| format!("commit manifest DB: {e}"))?;
+            let moved = migrate_commit_manifests(&state_db, &manifest_db)?;
+            if moved > 0 {
+                tracing::warn!(
+                    moved,
+                    "T5.3: moved leftover commit-manifest rows from the state DB into the \
+                     consensus DB before boot recovery"
+                );
+            }
+        }
         let staking = StakingManager::new(state_db.clone());
         let mut proposer = BlockProposer::new(
             config.chain_id,
@@ -6896,6 +7421,8 @@ impl TorusApp {
         // s80: fill-sink slot, shared with the exec thread (see `set_fill_sink`).
         let fill_sink: Arc<std::sync::OnceLock<Arc<dyn torus_state::trade_rows::FillSink>>> =
             Default::default();
+        // T5.3: header-persisted hook slot (see `set_header_persisted_hook`).
+        let header_hook: HeaderHookSlot = Default::default();
         let state_hash = Arc::new(crate::state_hash::StateHashMonitor::new());
 
         // Execution pipeline context — owns its own copies for thread safety.
@@ -6927,6 +7454,7 @@ impl TorusApp {
             // execution thread (backpressure) instead of ballooning memory.
             trade_history: trade_history_enabled(),
             fill_sink: fill_sink.clone(),
+            header_hook: header_hook.clone(),
             state_hash: state_hash.clone(),
             trade_writer: Some(torus_state::BackgroundCfWriter::spawn(
                 state_db.clone(),
@@ -7185,8 +7713,25 @@ impl TorusApp {
             m.set_evm_header(&last_header);
         }
 
+        let commit_persist = (!manifest_in_state_db).then(|| {
+            CommitPersistWriter::spawn(
+                state_db.clone(),
+                ManifestPruner::spawn(
+                    state_db.clone(),
+                    manifest_db.clone(),
+                    MANIFEST_PRUNE_INTERVAL,
+                    metrics.clone(),
+                ),
+                metrics.clone(),
+                header_hook.clone(),
+            )
+        });
         let mut app = Self {
             state_db,
+            commit_persist,
+            exec_prepared_ticket: None,
+            manifest_db,
+            manifest_in_state_db,
             proposer,
             validator,
             evm_executor: EvmExecutor::new(config.chain_id),
@@ -7233,6 +7778,7 @@ impl TorusApp {
             exec_prepared_height: None,
             exec_prepared_durable: DurableRows::default(),
             fill_sink,
+            header_hook,
             state_hash,
         };
 
@@ -7263,7 +7809,7 @@ impl TorusApp {
                 // record with no manifest falls back to `Durable(h)` (local-body
                 // heal only). This is the difference between a hole that heals and
                 // one that stalls forever at `missing=0` (t12-r3-full h1165).
-                let source = recovery_exec_source(&app.state_db, h);
+                let source = recovery_exec_source(&app.manifest_db, h);
                 app.park_deferred(h, source, Vec::new());
             }
             app.exec_next_height = Some(hole);
@@ -7301,7 +7847,17 @@ impl TorusApp {
                     break 'reconcile;
                 }
             };
-            let manifest_heights = manifest_heights_above(&app.state_db, applied);
+            // T5.3: rows at or below `applied` are executed heights whose
+            // consensus-DB prune did not land before a crash; drop them.
+            let dropped = prune_commit_manifests_through(&app.manifest_db, applied);
+            if dropped > 0 {
+                tracing::info!(
+                    dropped,
+                    applied,
+                    "boot: dropped commit-manifest rows of executed heights"
+                );
+            }
+            let manifest_heights = manifest_heights_above(&app.manifest_db, applied);
             if let Some(&manifest_max) = manifest_heights.iter().max() {
                 let first = applied + 1;
                 // Park ONLY heights that actually carry a durable manifest —
@@ -7317,7 +7873,7 @@ impl TorusApp {
                     // Preserve any FIX 1b entry already parked at this height
                     // (the old `.entry(h).or_insert_with(...)` semantics).
                     if !app.deferred_exec.contains_key(&h) {
-                        let source = recovery_exec_source(&app.state_db, h);
+                        let source = recovery_exec_source(&app.manifest_db, h);
                         app.park_deferred(h, source, Vec::new());
                     }
                 }
@@ -7742,6 +8298,17 @@ impl TorusApp {
         }
     }
 
+    /// T5.3: install the [`HeaderPersistedHook`] (the node publishes the RPC
+    /// height + the WS head from it once a height's header row is readable).
+    /// Set before consensus starts. A second call is ignored (logged). With the
+    /// manifest in the state DB it is never called (the commit handler sees the
+    /// row the dispatch already wrote).
+    pub fn set_header_persisted_hook(&self, hook: HeaderPersistedHook) {
+        if self.header_hook.set(hook).is_err() {
+            tracing::warn!("header-persisted hook already set; ignoring the second one");
+        }
+    }
+
     /// Item 7 step 2 (decision 7): the EVM forward the commit path re-sends with (set once at
     /// startup, before consensus starts).
     pub fn set_evm_forward(&mut self, forward: EvmForward) {
@@ -7831,13 +8398,26 @@ impl TorusApp {
         self.shard_fetcher = Some(f);
     }
 
-    /// Create a stub `TorusApp` without a database (for consensus-only tests).
+    /// Create a stub `TorusApp` on scratch databases (for consensus-only
+    /// tests), laid out as on a node: the commit manifest in its own
+    /// consensus DB (T5.3).
     pub fn stub() -> Self {
-        Self::stub_on(StateDb::open(&scratch_db_dir("torus-stub")).expect("open stub state db"))
+        let state_db = StateDb::open(&scratch_db_dir("torus-stub")).expect("open stub state db");
+        let consensus_db = StateDb::open_consensus(&scratch_db_dir("torus-stub-cdb"))
+            .expect("open stub consensus db");
+        Self::stub_with(state_db, consensus_db)
     }
 
-    /// [`Self::stub`] on a given database (a restart test reopens one).
+    /// [`Self::stub`] on a given database (a restart test reopens one), the
+    /// commit manifest in it (the pre-T5.3 layout).
+    #[cfg(test)]
     fn stub_on(state_db: StateDb) -> Self {
+        let manifest_db = state_db.clone();
+        Self::stub_with(state_db, manifest_db)
+    }
+
+    /// [`Self::stub`] with the commit manifest in `manifest_db`.
+    fn stub_with(state_db: StateDb, manifest_db: StateDb) -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -7869,7 +8449,15 @@ impl TorusApp {
         let mut seed = [0u8; 32];
         seed[..8].copy_from_slice(&id.to_le_bytes());
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
-        Self::new(state_db, &config, None, None, Some(signing_key))
+        Self::try_new_with_manifest_db(
+            state_db,
+            manifest_db,
+            &config,
+            None,
+            None,
+            Some(signing_key),
+        )
+        .unwrap_or_else(|e| panic!("TorusApp startup failed: {e}"))
     }
 
     /// Crash recovery: replay committed blocks whose execution was interrupted.
@@ -9337,7 +9925,11 @@ impl App<RocksKVStore> for TorusApp {
         // durable (`dispatch_to_exec`). Without this, a SIGKILL in the
         // commit->persist window strands the hole with no way to pull bodies
         // (`missing=0`, t12-r3-full h1165).
-        persist_commit_manifest(&self.state_db, height, datum_bytes);
+        {
+            let _manifest_span =
+                ObserveOnDrop::new(self.metrics.clone(), |m| &m.commit_manifest_seconds);
+            persist_commit_manifest(&self.manifest_db, height, datum_bytes);
+        }
 
         // Committed: these hashes leave the in-flight window. The mempool prunes
         // them via `remove_committed_native` when the block actually executes.
@@ -9855,8 +10447,8 @@ impl TorusApp {
             // benign. This also converts any unknown cousin of F-1 from silent to a
             // loud, budget-bounded heal.
             let Some(entry) = self.deferred_exec.remove(&next) else {
-                if load_commit_manifest(&self.state_db, next).is_some() {
-                    let source = recovery_exec_source(&self.state_db, next);
+                if load_commit_manifest(&self.manifest_db, next).is_some() {
+                    let source = recovery_exec_source(&self.manifest_db, next);
                     self.park_deferred(next, source, Vec::new());
                     tracing::error!(
                         height = next,
@@ -10021,20 +10613,46 @@ impl TorusApp {
             // failed here is still rewritten at exec, as before.
             // `TORUS_EXEC_REWRITE_DURABLE_ROWS=1` forces the pre-skip rewrite (bisect).
             // The commit manifest that guarded the heal channel for this height is
-            // pruned INSIDE the same WriteBatch (redundant once the body is durable),
-            // keeping `CF_COMMIT_MANIFEST` bounded to the committed-but-not-yet-
-            // dispatched window; a still-parked hole never reaches here, so its
-            // manifest is retained for the pull.
-            let durable = persist_committed_block_durably_timed(
-                &self.state_db,
-                &torus_block,
-                self.metrics.as_deref(),
-            );
+            // pruned once the body is durable (redundant then), keeping
+            // `CF_COMMIT_MANIFEST` bounded to the committed-but-not-yet-dispatched
+            // window; a still-parked hole never reaches here, so its manifest is
+            // retained for the pull.
+            //
+            // T5.3 (manifest in the consensus DB): the write runs on the
+            // `CommitPersistWriter` thread instead (a state-DB write here waited
+            // behind the checkpoint batch); the exec thread waits for its ticket
+            // before executing the block, so the rows still land first, in height
+            // order. Until they land, the height's manifest (written synchronously by
+            // the commit hook) is the crash backstop, and the writer's
+            // `ManifestPruner` deletes it only after a state-WAL sync made the write
+            // durable. The pre-T5.3 layout (manifest in the state DB) keeps the
+            // synchronous write here, the manifest prune in its batch.
+            let (durable, ticket) = match &self.commit_persist {
+                Some(writer) => (
+                    DurableRows::default(),
+                    Some(writer.submit(torus_block.clone())),
+                ),
+                None => (
+                    persist_committed_block_durably_timed(
+                        &self.state_db,
+                        &torus_block,
+                        self.metrics.as_deref(),
+                        self.manifest_in_state_db,
+                    ),
+                    None,
+                ),
+            };
             self.exec_prepared_durable = if exec_rewrite_durable_rows() {
                 DurableRows::default()
             } else {
                 durable
             };
+            // A queued write counts as landing for the DA body GC record: a
+            // failed one is no worse than an unrecorded height, which the next
+            // GC pass back-fills (and records) from the block tree anyway, and
+            // the GC deletes only bodies whose retention window ended.
+            let body_written = durable.body || ticket.is_some();
+            self.exec_prepared_ticket = ticket;
 
             tracing::info!(
                 height,
@@ -10075,7 +10693,7 @@ impl TorusApp {
                 height,
                 &torus_block.native_actions,
                 &hashes,
-                durable.body,
+                body_written,
             );
 
             // D4 (S392): pin the mempool's admission fee floor to the base fee
@@ -10107,6 +10725,7 @@ impl TorusApp {
                 torus_block,
                 pending_slashes,
                 durable: self.exec_prepared_durable,
+                persist: self.exec_prepared_ticket.clone(),
                 committed_unexecuted,
             };
             // inc BEFORE the (possibly blocking) send so a consensus thread stalled
@@ -10138,6 +10757,7 @@ impl TorusApp {
                             torus_block,
                             pending_slashes,
                             durable: _,
+                            persist: _,
                             committed_unexecuted: _,
                         } = msg;
                         return DispatchOutcome::Full(torus_block, pending_slashes);
@@ -11779,7 +12399,7 @@ mod exec_dispatch_tests {
         let a1 = vec![signed(151, t), cancel(152, t), cancel(153, t)];
         let b1 = block(1, a1.clone());
         let datum = bincode::serialize(&CompactBlock::from_block(&b1)).unwrap();
-        persist_commit_manifest(&app.state_db, 1, &datum);
+        persist_commit_manifest(&app.manifest_db, 1, &datum);
         app.exec_next_height = Some(1);
 
         app.drain_exec_queue();
@@ -11824,7 +12444,7 @@ mod exec_dispatch_tests {
         let a3 = vec![signed(164, t)];
         let b2 = block(2, a2.clone());
         let datum = bincode::serialize(&CompactBlock::from_block(&block(3, a3.clone()))).unwrap();
-        persist_commit_manifest(&app.state_db, 3, &datum);
+        persist_commit_manifest(&app.manifest_db, 3, &datum);
 
         app.enqueue_for_execution(1, ExecSource::Ready(b1), vec![]);
         app.enqueue_for_execution(
@@ -13389,7 +14009,6 @@ mod crash_recovery_tests {
     /// artifact carrying the committed height's action hashes.
     #[test]
     fn commit_manifest_persists_native_action_hashes_at_commit() {
-        let (_config, state_db) = make_test_config_and_db();
         let actions: Vec<SignedNativeAction> = (0..20).map(sign_claim_rewards).collect();
         // Height 5 (small: `make_block` links parent hashes recursively — the real
         // h1165 recurses too deep for a test stack; the height is cosmetic here).
@@ -13397,10 +14016,16 @@ mod crash_recovery_tests {
 
         // Exactly what the commit callback ships: the compact consensus datum.
         let datum = encode_proposal_datum(&block, true);
-        persist_commit_manifest(&state_db, 5, &datum);
+        // T5.3: in the consensus DB, and durable across a reopen of it.
+        let dir = scratch_db_dir("torus-manifest-reopen");
+        {
+            let cdb = StateDb::open_consensus(&dir).unwrap();
+            persist_commit_manifest(&cdb, 5, &datum);
+        }
+        let cdb = StateDb::open_consensus(&dir).unwrap();
 
         // Survives the kill window: reload + decode yields the reconstruction key.
-        let loaded = load_commit_manifest(&state_db, 5).expect("manifest durable at commit");
+        let loaded = load_commit_manifest(&cdb, 5).expect("manifest durable at commit");
         let compact: CompactBlock =
             bincode::deserialize(&loaded).expect("manifest decodes to the committed CompactBlock");
         let want: Vec<_> = actions.iter().map(torus_types::compute_action_hash).collect();
@@ -13430,13 +14055,14 @@ mod crash_recovery_tests {
 
         // Kill-window state: header + manifest durable at commit; body NEVER landed.
         persist_header_only_for_test(&state_db, &block);
-        persist_commit_manifest(&state_db, 5, &encode_proposal_datum(&block, true));
+        let cdb = make_test_consensus_db();
+        persist_commit_manifest(&cdb, 5, &encode_proposal_datum(&block, true));
         // Mark applied so `TorusApp::new`'s replay is a no-op (this test drives the
         // recovery/reconstruct seams directly, not the boot park path).
         write_native_applied_height(&state_db, 5);
 
         // The heal-channel seed decodes the manifest to a Compact source.
-        let source = recovery_exec_source(&state_db, 5);
+        let source = recovery_exec_source(&cdb, 5);
         let compact = match source {
             ExecSource::Compact(c) => c,
             _ => panic!("a manifest-backed boot hole must seed ExecSource::Compact"),
@@ -13719,7 +14345,8 @@ mod crash_recovery_tests {
             drop(app);
 
             let ctx = make_exec_ctx(&config, &db);
-            ctx.execute_committed_block_with(&msg.torus_block, msg.pending_slashes, msg.durable);
+            let durable = msg.settled_durable();
+            ctx.execute_committed_block_with(&msg.torus_block, msg.pending_slashes, durable);
             assert!(!ctx.exec_failed.load(Ordering::SeqCst));
             drop(ctx);
             db
@@ -14277,7 +14904,7 @@ mod crash_recovery_tests {
             bincode::serialize(&committed).unwrap()
         );
         assert_eq!(
-            msg.durable,
+            msg.settled_durable(),
             DurableRows { header: true, body: true }
         );
         let durable_body = load_replay_body(&state_db, 5).expect("body durable before dispatch");
@@ -15804,19 +16431,22 @@ mod crash_recovery_tests {
 
         // But height 5 was committed pre-crash: its datum lives ONLY in the durable
         // commit manifest (headers/bodies never persisted — the crash-in-hole window).
+        // T5.3: the manifest lives in the consensus DB.
         let datum = bincode::serialize(&make_block(5, vec![])).unwrap();
-        state_db
-            .put_cf_raw(
-                torus_state::cf::CF_COMMIT_MANIFEST,
-                &5u64.to_be_bytes(),
-                &datum,
-            )
-            .unwrap();
+        let cdb = make_test_consensus_db();
+        cdb.put_cf_raw(
+            torus_state::cf::CF_COMMIT_MANIFEST,
+            &5u64.to_be_bytes(),
+            &datum,
+        )
+        .unwrap();
 
         // Sanity: replay itself sees no gap (frontier == applied == 4).
         assert_eq!(find_last_committed_height(&state_db), Some(4));
 
-        let app = TorusApp::new(state_db.clone(), &config, None, None, None);
+        let app =
+            TorusApp::try_new_with_manifest_db(state_db.clone(), cdb, &config, None, None, None)
+                .unwrap();
 
         assert_eq!(
             app.exec_next_height,
@@ -15858,10 +16488,19 @@ mod crash_recovery_tests {
         };
         let actions = vec![sign_claim_rewards(5), cancel(6), cancel(7)];
         let b5 = make_block(5, actions.clone());
-        persist_commit_manifest(&state_db, 5, &encode_proposal_datum(&b5, true));
+        let cdb = make_test_consensus_db();
+        persist_commit_manifest(&cdb, 5, &encode_proposal_datum(&b5, true));
 
         let mempool = exec_aware_mempool(&state_db);
-        let app = TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
+        let app = TorusApp::try_new_with_manifest_db(
+            state_db.clone(),
+            cdb,
+            &config,
+            None,
+            Some(mempool.clone()),
+            None,
+        )
+        .unwrap();
         assert!(matches!(
             app.deferred_exec.get(&5).map(|e| &e.source),
             Some(ExecSource::Compact(_))
@@ -15955,6 +16594,7 @@ mod crash_recovery_tests {
             trade_writer: None,
             trade_history: true,
             fill_sink: Default::default(),
+            header_hook: Default::default(),
             state_hash: Default::default(),
             // None -> exec-time body write is synchronous (exact-today). Tests that
             // exercise the async stage build their own writer explicitly.
@@ -18837,6 +19477,21 @@ mod crash_recovery_tests {
         )
     }
 
+    /// [`committed_compact_block`] with the FULL datum (bodies inline): it
+    /// dispatches without a DA store.
+    fn committed_full_block(block: &TorusBlock) -> hotstuff_rs::types::block::Block {
+        use hotstuff_rs::hotstuff::types::PhaseCertificate;
+        use hotstuff_rs::types::data_types::BlockHeight;
+        let datum = encode_proposal_datum(block, false);
+        let hash = TorusApp::hash_datum(&datum);
+        hotstuff_rs::types::block::Block::new(
+            BlockHeight::new(block.header.height),
+            PhaseCertificate::genesis_pc(),
+            CryptoHash::new(hash),
+            Data::new(vec![Datum::new(datum)]),
+        )
+    }
+
     /// T1.2 (a) RED-first: a STALE same-height `pending_proposals` entry (fewer
     /// actions than the committed block) must NEVER be executed in place of the
     /// committed datum. The body handed to execution must carry the COMMITTED
@@ -18918,7 +19573,7 @@ mod crash_recovery_tests {
         app.on_committed_block(&committed, committed.hash);
 
         assert!(
-            load_commit_manifest(&app.state_db, 5).is_none(),
+            load_commit_manifest(&app.manifest_db, 5).is_none(),
             "a benign re-delivery below the exec frontier must NOT re-write its commit \
              manifest (pruned at dispatch; re-writing leaks it forever)"
         );
@@ -19033,7 +19688,16 @@ mod crash_recovery_tests {
             state_db.clone(),
             torus_mempool::MempoolConfig::default(),
         ));
-        let mut app = TorusApp::new(state_db.clone(), config, None, Some(mempool.clone()), None);
+        // T5.3: laid out as on a node (manifest in its own consensus DB).
+        let mut app = TorusApp::try_new_with_manifest_db(
+            state_db.clone(),
+            make_test_consensus_db(),
+            config,
+            None,
+            Some(mempool.clone()),
+            None,
+        )
+        .unwrap();
         let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(64);
         app.replace_exec_tx(tx);
         (app, rx, mempool)
@@ -19068,6 +19732,886 @@ mod crash_recovery_tests {
         );
     }
 
+    /// T5.3 part 0: the commit-manifest put is timed on its own, once per
+    /// commit (section 106: the consensus thread's in-window commit-hook stall
+    /// is inferred to be this put, waiting behind the checkpoint batch).
+    #[test]
+    fn commit_manifest_put_is_timed_once_per_commit() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, rx, mempool) = app_with_recording_exec(&config, &state_db);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        app.metrics = Some(metrics.clone());
+
+        let a5 = vec![sign_claim_rewards(5)];
+        let _ = mempool.mirror_native_to_da(&a5);
+        let b5 = make_block(5, a5);
+        app.exec_next_height = Some(5);
+        let c5 = committed_compact_block(&b5);
+        app.on_committed_block(&c5, c5.hash);
+        rx.try_recv().expect("height 5 must reach execution");
+
+        let text = metrics.encode();
+        assert!(
+            text.contains("torus_commit_manifest_seconds_count 1"),
+            "one manifest-put observation per commit:\n{text}"
+        );
+        assert!(
+            text.contains("torus_on_committed_block_seconds_count 1"),
+            "the whole hook is timed once:\n{text}"
+        );
+    }
+
+    /// T5.3: a scratch consensus DB (the node's manifest home).
+    fn make_test_consensus_db() -> StateDb {
+        StateDb::open_consensus(&scratch_db_dir("torus-crash-cdb")).expect("open test consensus db")
+    }
+
+    /// T5.3 RED-first: the commit hook writes the manifest (the committed
+    /// datum, verbatim) to the CONSENSUS DB only; dispatch prunes it there
+    /// after the durable body write; the state DB's manifest CF is never
+    /// touched. RED on main: no consensus-DB manifest home exists.
+    #[test]
+    fn commit_manifest_lands_in_consensus_db_and_is_pruned_there_at_dispatch() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, rx, mempool) = app_with_recording_exec(&config, &state_db);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        app.metrics = Some(metrics.clone());
+        assert!(
+            !app.manifest_in_state_db,
+            "node layout: manifest in the consensus DB"
+        );
+        let cdb = app.manifest_db.clone();
+        let key = 5u64.to_be_bytes();
+
+        let a5 = vec![sign_claim_rewards(5)];
+        let b5 = make_block(5, a5.clone());
+        app.exec_next_height = Some(5);
+        let c5 = committed_compact_block(&b5);
+        // Body not in the DA store yet: height 5 parks and keeps its manifest.
+        app.on_committed_block(&c5, c5.hash);
+        assert!(rx.try_recv().is_err(), "a missing body parks height 5");
+        assert_eq!(
+            cdb.get_cf_raw(CF_COMMIT_MANIFEST, &key).unwrap().as_deref(),
+            Some(c5.data.vec()[0].bytes().as_slice()),
+            "the committed datum, verbatim, in the consensus DB"
+        );
+        assert!(
+            state_db
+                .get_cf_raw(CF_COMMIT_MANIFEST, &key)
+                .unwrap()
+                .is_none(),
+            "nothing in the state DB"
+        );
+
+        mempool.mirror_native_to_da(&a5).unwrap();
+        app.drain_exec_queue();
+        let msg = rx.try_recv().expect("healed height 5 reaches execution");
+        assert_eq!(
+            msg.settled_durable(),
+            DurableRows {
+                header: true,
+                body: true
+            }
+        );
+        assert!(
+            wait_manifest_pruned(&cdb, 5),
+            "pruned from the consensus DB by the background pass after dispatch"
+        );
+        assert!(state_db
+            .get_cf_raw(CF_COMMIT_MANIFEST, &key)
+            .unwrap()
+            .is_none());
+    }
+
+    /// T5.3: run the commit hook for a height that parks (so the manifest put
+    /// is the hook's only DB write) while another thread's large state-DB
+    /// write (a stand-in for the checkpoint batch on the flush worker) is in
+    /// flight. Returns `(hook s, s of that write left when the hook started)`,
+    /// or `None` when the write was too short to measure against.
+    ///
+    /// With `dispatch_via` (the app's mempool), the height's body is in the
+    /// DA store and it is the next to execute, so the hook also runs
+    /// `dispatch_to_exec` (its commit-persist write goes to the state DB).
+    fn commit_hook_during_state_write(
+        app: &mut TorusApp,
+        state_db: &StateDb,
+        entries: u64,
+        height: u64,
+        dispatch_via: Option<&Mempool>,
+    ) -> Option<(f64, f64)> {
+        let actions = vec![sign_claim_rewards(height)];
+        // DA bodies first: in tests the DA store is on the state DB, so the
+        // mirror must not itself queue behind the held write.
+        if let Some(mempool) = dispatch_via {
+            mempool.mirror_native_to_da(&actions).unwrap();
+        }
+        let db = state_db.clone();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut batch = rocksdb::WriteBatch::default();
+            {
+                let cf = db.cf_handle(torus_state::cf::CF_NATIVE_ORDERS).unwrap();
+                for i in 0..entries {
+                    batch.put_cf(cf, i.to_be_bytes(), [7u8; 100]);
+                }
+            }
+            go_tx.send(()).unwrap();
+            db.write(batch).unwrap();
+            std::time::Instant::now()
+        });
+        go_rx.recv().unwrap();
+        // Let the write enter RocksDB's write queue first.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let block = make_block(height, actions);
+        let committed = committed_compact_block(&block);
+        app.exec_next_height = match dispatch_via {
+            Some(_) => Some(height),  // dispatched in the hook
+            None => Some(height - 1), // parks: no dispatch
+        };
+        let t0 = std::time::Instant::now();
+        app.on_committed_block(&committed, committed.hash);
+        let hook = t0.elapsed().as_secs_f64();
+        let write_end = writer.join().unwrap();
+        let left = write_end.saturating_duration_since(t0).as_secs_f64();
+        assert_eq!(
+            app.deferred_exec.contains_key(&height),
+            dispatch_via.is_none(),
+            "height {height} parked iff not dispatched"
+        );
+        eprintln!(
+            "T5.3 commit hook {:.1} ms (dispatch: {}); held state-DB write had {:.1} ms left \
+             ({entries} entries, manifest in state DB: {})",
+            hook * 1e3,
+            dispatch_via.is_some(),
+            left * 1e3,
+            app.manifest_in_state_db
+        );
+        (left >= 0.15).then_some((hook, left))
+    }
+
+    fn measure_commit_hook_during_state_write(
+        app: &mut TorusApp,
+        state_db: &StateDb,
+        dispatch_via: Option<&Mempool>,
+    ) -> (f64, f64) {
+        for (entries, height) in [(400_000u64, 7u64), (1_600_000, 17)] {
+            if let Some(r) =
+                commit_hook_during_state_write(app, state_db, entries, height, dispatch_via)
+            {
+                return r;
+            }
+        }
+        panic!("the held state-DB write was too short to measure against, even at 1.6M entries");
+    }
+
+    /// T5.3 RED-first (section 106): with the manifest in the consensus DB the
+    /// commit hook does not wait for a state-DB write in flight on another
+    /// thread. RED on main (manifest in the state DB): the put queues in the
+    /// state DB's write queue until that write ends; the control test below
+    /// pins that for the pre-T5.3 layout in this binary.
+    #[test]
+    fn commit_hook_does_not_wait_behind_a_state_db_write() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, _rx, _mempool) = app_with_recording_exec(&config, &state_db);
+        assert!(!app.manifest_in_state_db);
+        let (hook, left) = measure_commit_hook_during_state_write(&mut app, &state_db, None);
+        assert!(
+            hook < left * 0.25,
+            "the commit hook took {:.1} ms while the held state-DB write had {:.1} ms left: it \
+             waited behind it",
+            hook * 1e3,
+            left * 1e3
+        );
+    }
+
+    /// T5.3 control: in the pre-T5.3 layout (manifest in the state DB, also
+    /// `TORUS_MANIFEST_IN_STATE_DB=1`) the commit hook DOES wait behind the
+    /// held state-DB write: the mechanism section 106 inferred.
+    #[test]
+    fn commit_hook_with_state_db_manifest_waits_behind_a_state_db_write() {
+        let (config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let mut app = TorusApp::new(state_db.clone(), &config, None, Some(mempool), None);
+        assert!(app.manifest_in_state_db);
+        let (hook, left) = measure_commit_hook_during_state_write(&mut app, &state_db, None);
+        assert!(
+            hook > left * 0.5,
+            "the commit hook took {:.1} ms but the held state-DB write had {:.1} ms left: the \
+             state-DB manifest put did not wait behind it",
+            hook * 1e3,
+            left * 1e3
+        );
+    }
+
+    /// T5.3 (Codex WARN 2) RED-first: a commit that dispatches in its hook
+    /// does not wait behind a held state-DB write either: the header + body
+    /// write runs on the commit-persist writer thread. RED on the first part-1
+    /// cut (1,502 ms behind a 1,502 ms held write): `dispatch_to_exec` wrote
+    /// them to the state DB on the consensus thread.
+    #[test]
+    fn commit_dispatch_does_not_wait_behind_a_state_db_write() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, _rx, mempool) = app_with_recording_exec(&config, &state_db);
+        let (hook, left) =
+            measure_commit_hook_during_state_write(&mut app, &state_db, Some(&mempool));
+        assert!(
+            hook < left * 0.25,
+            "commit + dispatch took {:.1} ms while the held state-DB write had {:.1} ms left: \
+             the dispatch's commit-persist write waited behind it",
+            hook * 1e3,
+            left * 1e3
+        );
+    }
+
+    /// Wait (up to 10 s) until the background pruner deleted `height`'s
+    /// manifest from `manifest_db`.
+    fn wait_manifest_pruned(manifest_db: &StateDb, height: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if load_commit_manifest(manifest_db, height).is_none() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// T5.3 (Codex WARN 1) RED-first: the manifest of a dispatched height is
+    /// NOT deleted before the state DB's WAL is synced (the two DBs have
+    /// separate WALs; a delete that becomes durable while the unsynced body
+    /// write is lost on power loss would leave an unhealable hole). Until the
+    /// sync, losing the header + body (simulated by deleting the rows) still
+    /// leaves the manifest, and boot parks the height from it and heals it.
+    /// A prune pass syncs the state WAL first, then deletes. RED on the first
+    /// part-1 cut: the manifest was deleted right after the unsynced body write.
+    #[test]
+    fn manifest_outlives_unsynced_body_write_and_heals_after_its_loss() {
+        let (config, state_db) = make_test_config_and_db();
+        let cdb = make_test_consensus_db();
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 4);
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let boot = || {
+            TorusApp::try_new_with_manifest_db(
+                state_db.clone(),
+                cdb.clone(),
+                &config,
+                None,
+                Some(mempool.clone()),
+                None,
+            )
+            .unwrap()
+        };
+        let mut app = boot();
+        // Hold the pruner: it records the heights but runs no pass.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        app.commit_persist = Some(CommitPersistWriter::spawn(
+            state_db.clone(),
+            ManifestPruner::detached(held_tx),
+            None,
+            app.header_hook.clone(),
+        ));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+        app.replace_exec_tx(tx);
+        let a5 = vec![sign_claim_rewards(5)];
+        mempool.mirror_native_to_da(&a5).unwrap();
+        let b5 = make_block(5, a5);
+        app.exec_next_height = Some(5);
+        let c5 = committed_compact_block(&b5);
+        app.on_committed_block(&c5, c5.hash);
+        let msg = rx.try_recv().expect("dispatched");
+        assert!(msg.settled_durable().body, "the off-thread write landed");
+        assert_eq!(
+            held_rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(5),
+            "handed to the pruner after the write"
+        );
+        assert!(
+            load_commit_manifest(&cdb, 5).is_some(),
+            "kept until the state WAL is synced"
+        );
+
+        // Power loss before any state-WAL sync: the unsynced header + body go.
+        let key = 5u64.to_be_bytes();
+        state_db.delete_cf_raw(CF_BLOCK_HEADERS, &key).unwrap();
+        state_db.delete_cf_raw(CF_BLOCK_BODIES, &key).unwrap();
+        drop(app);
+
+        let mut app = boot();
+        assert_eq!(app.exec_next_height, Some(5), "parked from the manifest");
+        assert!(matches!(
+            app.deferred_exec.get(&5).map(|e| &e.source),
+            Some(ExecSource::Compact(_))
+        ));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+        app.replace_exec_tx(tx);
+        app.drain_exec_queue();
+        let msg = rx.try_recv().expect("heals from the manifest + DA bodies");
+        assert_eq!(msg.torus_block.header.height, 5);
+        // Wait for the healed height's off-thread write (its ticket) first.
+        assert!(msg.settled_durable().body, "the healed write landed");
+        assert!(load_replay_body(&state_db, 5).is_some(), "body rewritten");
+
+        // A prune pass: the state WAL sync first, then the delete.
+        let syncs = state_db.wal_sync_count();
+        manifest_prune_pass(&state_db, &cdb, &[5]).unwrap();
+        if let (Some(before), Some(after)) = (syncs, state_db.wal_sync_count()) {
+            assert!(after > before, "the pass synced the state WAL");
+        }
+        assert!(load_commit_manifest(&cdb, 5).is_none());
+    }
+
+    /// T5.3: a recording [`HeaderPersistedHook`]: each call's height and
+    /// whether its `CF_BLOCK_HEADERS` row was readable at the call.
+    #[allow(clippy::type_complexity)]
+    fn recording_header_hook(
+        state_db: &StateDb,
+    ) -> (HeaderPersistedHook, Arc<std::sync::Mutex<Vec<(u64, bool)>>>) {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (db, sink) = (state_db.clone(), calls.clone());
+        let hook: HeaderPersistedHook = Arc::new(move |h: u64| {
+            let readable = db
+                .get_cf_raw(CF_BLOCK_HEADERS, &h.to_be_bytes())
+                .unwrap()
+                .is_some();
+            sink.lock().unwrap().push((h, readable));
+        });
+        (hook, calls)
+    }
+
+    /// T5.3 (Codex P2) RED-first: with the header + body write off the
+    /// consensus thread, the commit handler can run before the height's header
+    /// exists, so the node needs a signal once it does: the header-persisted
+    /// hook fires for each dispatched height, in order, exactly once, after its
+    /// row is readable. RED on 173f9a12: nothing tells the node, and the last
+    /// committed height stays unpublished once commits stop. The hook runs
+    /// after the ticket settles (see the test below), so the test waits for
+    /// the hook's call itself (a channel; no sleeps).
+    #[test]
+    fn header_persisted_hook_fires_once_per_height_after_its_off_thread_write() {
+        let (config, state_db) = make_test_config_and_db();
+        let cdb = make_test_consensus_db();
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 4);
+        let mut app =
+            TorusApp::try_new_with_manifest_db(state_db.clone(), cdb, &config, None, None, None)
+                .unwrap();
+        assert!(app.commit_persist.is_some(), "the off-thread writer");
+        let (record, calls) = recording_header_hook(&state_db);
+        let (fired_tx, fired_rx) = std::sync::mpsc::channel::<u64>();
+        let fired_tx = std::sync::Mutex::new(fired_tx);
+        let hook: HeaderPersistedHook = Arc::new(move |h: u64| {
+            record(h);
+            let _ = fired_tx.lock().unwrap().send(h);
+        });
+        app.set_header_persisted_hook(hook);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(8);
+        app.replace_exec_tx(tx);
+        app.exec_next_height = Some(5);
+        for h in 5..=7u64 {
+            let c = committed_full_block(&make_block(h, vec![]));
+            app.on_committed_block(&c, c.hash);
+            let msg = rx.try_recv().expect("dispatched");
+            assert_eq!(msg.torus_block.header.height, h);
+            assert!(msg.persist.is_some(), "queued on the writer");
+            assert!(msg.settled_durable().header, "the write landed");
+            assert_eq!(fired_rx.recv().unwrap(), h, "the hook fired for h");
+            assert_eq!(
+                calls.lock().unwrap().last().copied(),
+                Some((h, true)),
+                "published once its row was readable"
+            );
+        }
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(5, true), (6, true), (7, true)],
+            "in order, each height once"
+        );
+    }
+
+    /// T5.3 (review P3) RED-first: the writer settles a height's ticket (exec
+    /// unblocks) BEFORE it runs the header-persisted hook, so the publish work
+    /// (lock, row read, header parse, broadcast) is not added to exec's wait.
+    /// Deterministic: the hook reports its entry and then blocks until the test
+    /// releases it; while it is blocked, the ticket is already filled. RED on
+    /// 0036f1f3: the hook ran first, so the ticket was still empty.
+    #[test]
+    fn writer_settles_the_ticket_before_the_header_persisted_hook() {
+        let (config, state_db) = make_test_config_and_db();
+        let cdb = make_test_consensus_db();
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 4);
+        let mut app =
+            TorusApp::try_new_with_manifest_db(state_db.clone(), cdb, &config, None, None, None)
+                .unwrap();
+        assert!(app.commit_persist.is_some(), "the off-thread writer");
+        let (record, calls) = recording_header_hook(&state_db);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<u64>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new((entered_tx, release_rx));
+        let hook: HeaderPersistedHook = Arc::new(move |h: u64| {
+            record(h);
+            let gate = gate.lock().unwrap();
+            let _ = gate.0.send(h);
+            // Held until the test releases it (or drops `release_tx`).
+            let _ = gate.1.recv();
+        });
+        app.set_header_persisted_hook(hook);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(8);
+        app.replace_exec_tx(tx);
+        app.exec_next_height = Some(5);
+        // Declared after `app`: dropped first on a failed assert, which frees
+        // a held hook so the writer's join in `app`'s drop cannot hang.
+        let release_tx = release_tx;
+        for h in 5..=6u64 {
+            let c = committed_full_block(&make_block(h, vec![]));
+            app.on_committed_block(&c, c.hash);
+            let msg = rx.try_recv().expect("dispatched");
+            assert_eq!(msg.torus_block.header.height, h);
+            let ticket = msg.persist.as_ref().expect("queued on the writer");
+            assert_eq!(entered_rx.recv().unwrap(), h, "the hook is running");
+            let settled = ticket.peek();
+            assert!(
+                settled.is_some_and(|rows| rows.header),
+                "the ticket settled before the hook ran (exec is not held by it)"
+            );
+            release_tx.send(()).unwrap();
+        }
+        drop(release_tx);
+        assert_eq!(*calls.lock().unwrap(), vec![(5, true), (6, true)]);
+    }
+
+    /// T5.3: `TORUS_MANIFEST_IN_STATE_DB=1` (pre-T5.3 layout) is unchanged: the
+    /// dispatch writes the header itself, before the commit event, so the
+    /// commit handler sees it; the hook is never called.
+    #[test]
+    fn header_persisted_hook_is_not_used_with_the_manifest_in_the_state_db() {
+        let (config, state_db) = make_test_config_and_db();
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 4);
+        let mut app = TorusApp::try_new(state_db.clone(), &config, None, None, None).unwrap();
+        assert!(app.commit_persist.is_none(), "no off-thread writer");
+        let (hook, calls) = recording_header_hook(&state_db);
+        app.set_header_persisted_hook(hook);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(8);
+        app.replace_exec_tx(tx);
+        app.exec_next_height = Some(5);
+        let c = committed_full_block(&make_block(5, vec![]));
+        app.on_committed_block(&c, c.hash);
+        let msg = rx.try_recv().expect("dispatched");
+        assert!(msg.persist.is_none(), "written in the dispatch");
+        assert!(msg.durable.header);
+        assert!(state_db
+            .get_cf_raw(CF_BLOCK_HEADERS, &5u64.to_be_bytes())
+            .unwrap()
+            .is_some());
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// T5.3: a height whose off-thread write failed (ticket settled "nothing
+    /// durable") gets its header row from execution; the exec thread then fires
+    /// the hook for it, after executing it. A height the writer did write is
+    /// not re-signalled by exec, nor is one written in the dispatch.
+    #[test]
+    fn header_persisted_hook_fires_from_exec_when_the_off_thread_write_failed() {
+        let (config, state_db) = make_test_config_and_db();
+        let ctx = make_exec_ctx(&config, &state_db);
+        let (hook, calls) = recording_header_hook(&state_db);
+        assert!(ctx.header_hook.set(hook).is_ok());
+        ctx.exec_shutdown.store(true, Ordering::SeqCst);
+        let latch = ctx.exec_failed.clone();
+        let settled = |rows: DurableRows| {
+            let ticket = PersistTicket::default();
+            ticket.set(rows);
+            ticket
+        };
+        let both = DurableRows {
+            header: true,
+            body: true,
+        };
+        let b1 = make_block(1, vec![]);
+        let b2 = make_block(2, vec![]);
+        let b3 = make_block(3, vec![]);
+        // Heights 2 and 3 were written before exec (writer / dispatch).
+        persist_block_for_test(&state_db, &b2);
+        persist_block_for_test(&state_db, &b3);
+        let msg = |block: TorusBlock, durable, persist| CommittedBlockMsg {
+            torus_block: block,
+            pending_slashes: vec![],
+            durable,
+            persist,
+            committed_unexecuted: 0,
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(8);
+        tx.send(msg(
+            b1,
+            DurableRows::default(),
+            Some(settled(DurableRows::default())),
+        ))
+        .unwrap();
+        tx.send(msg(b2, DurableRows::default(), Some(settled(both))))
+            .unwrap();
+        tx.send(msg(b3, both, None)).unwrap();
+        drop(tx);
+        std::thread::spawn(move || execution_loop(rx, ctx))
+            .join()
+            .unwrap();
+        assert!(!latch.load(Ordering::SeqCst), "executes cleanly");
+        assert_eq!(read_native_applied_height(&state_db), Some(3));
+        assert_eq!(*calls.lock().unwrap(), vec![(1, true)]);
+    }
+
+    /// T5.3 crash window (a): killed after the commit (manifest durable in the
+    /// consensus DB) but before the off-thread header + body write landed. The
+    /// state DB has nothing for the height; boot parks it from the manifest
+    /// (FIX 6 / F-1) and heals it from the DA bodies, in order.
+    #[test]
+    fn crash_before_the_off_thread_persist_lands_heals_from_the_manifest() {
+        let (config, state_db) = make_test_config_and_db();
+        let cdb = make_test_consensus_db();
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 4);
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let boot = || {
+            TorusApp::try_new_with_manifest_db(
+                state_db.clone(),
+                cdb.clone(),
+                &config,
+                None,
+                Some(mempool.clone()),
+                None,
+            )
+            .unwrap()
+        };
+        let mut app = boot();
+        app.commit_persist = Some(CommitPersistWriter::held());
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+        app.replace_exec_tx(tx);
+        let a5 = vec![sign_claim_rewards(5)];
+        mempool.mirror_native_to_da(&a5).unwrap();
+        let b5 = make_block(5, a5);
+        app.exec_next_height = Some(5);
+        let c5 = committed_compact_block(&b5);
+        app.on_committed_block(&c5, c5.hash);
+        let msg = rx.try_recv().expect("dispatched; its write is queued");
+        let key = 5u64.to_be_bytes();
+        assert!(state_db
+            .get_cf_raw(CF_BLOCK_HEADERS, &key)
+            .unwrap()
+            .is_none());
+        assert!(state_db
+            .get_cf_raw(CF_BLOCK_BODIES, &key)
+            .unwrap()
+            .is_none());
+        assert!(
+            load_commit_manifest(&cdb, 5).is_some(),
+            "the crash backstop"
+        );
+        drop(app); // the "kill": the queued write is dropped unwritten
+        assert_eq!(
+            msg.settled_durable(),
+            DurableRows::default(),
+            "a dropped write reports nothing durable (exec would write the rows)"
+        );
+        drop(msg);
+
+        let mut app = boot();
+        assert_eq!(app.exec_next_height, Some(5), "parked from the manifest");
+        assert!(matches!(
+            app.deferred_exec.get(&5).map(|e| &e.source),
+            Some(ExecSource::Compact(_))
+        ));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+        app.replace_exec_tx(tx);
+        app.drain_exec_queue();
+        let msg = rx.try_recv().expect("heals from the manifest + DA bodies");
+        assert_eq!(msg.torus_block.header.height, 5);
+        assert_eq!(
+            msg.settled_durable(),
+            DurableRows {
+                header: true,
+                body: true
+            }
+        );
+        assert!(load_replay_body(&state_db, 5).is_some());
+        assert!(
+            wait_manifest_pruned(&cdb, 5),
+            "pruned after the healed write"
+        );
+    }
+
+    /// T5.3 crash window (b): killed after the off-thread header + body write
+    /// landed but before the manifest prune (and before execution). Boot replays
+    /// the height once from its durable rows, drops the now-executed manifest,
+    /// parks nothing, and a re-delivered commit of it is skipped (no manifest
+    /// re-write, nothing dispatched).
+    #[test]
+    fn crash_after_the_off_thread_persist_before_the_prune_replays_once() {
+        let (config, state_db) = make_test_config_and_db();
+        let cdb = make_test_consensus_db();
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 4);
+        let boot = || {
+            TorusApp::try_new_with_manifest_db(
+                state_db.clone(),
+                cdb.clone(),
+                &config,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let mut app = boot();
+        let (held_tx, _held_rx) = std::sync::mpsc::channel();
+        app.commit_persist = Some(CommitPersistWriter::spawn(
+            state_db.clone(),
+            ManifestPruner::detached(held_tx),
+            None,
+            app.header_hook.clone(),
+        ));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+        app.replace_exec_tx(tx);
+        let b5 = make_block(5, vec![sign_claim_rewards(5)]);
+        app.exec_next_height = Some(5);
+        let c5 = committed_full_block(&b5);
+        app.on_committed_block(&c5, c5.hash);
+        let msg = rx.try_recv().expect("dispatched");
+        assert!(msg.settled_durable().body, "the write landed");
+        drop(msg);
+        drop(app); // the "kill": executed nothing, pruned nothing
+        assert!(load_commit_manifest(&cdb, 5).is_some());
+        assert_eq!(read_native_applied_height(&state_db), Some(4));
+
+        let mut app = boot();
+        assert_eq!(
+            read_native_applied_height(&state_db),
+            Some(5),
+            "boot replayed height 5 from its durable rows"
+        );
+        assert!(app.deferred_exec.is_empty(), "nothing parked");
+        assert!(
+            load_commit_manifest(&cdb, 5).is_none(),
+            "the executed height's manifest is dropped at boot"
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+        app.replace_exec_tx(tx);
+        let c5 = committed_full_block(&b5);
+        app.on_committed_block(&c5, c5.hash);
+        assert!(
+            rx.try_recv().is_err(),
+            "a re-delivery is not dispatched again"
+        );
+        assert!(
+            load_commit_manifest(&cdb, 5).is_none(),
+            "nor its manifest re-written"
+        );
+    }
+
+    /// T5.3 (FIX 1b path): a boot gap hole (header durable, body lost in the
+    /// commit->persist window) parks from its manifest in the CONSENSUS DB as
+    /// a Compact source carrying the real action hashes (the peer-pull key),
+    /// and heals in order once its bodies reach the DA store; the dispatch
+    /// then prunes the manifest there.
+    #[test]
+    fn boot_parks_a_hole_from_its_consensus_db_manifest_and_heals_it() {
+        let (config, state_db) = make_test_config_and_db();
+        let cdb = make_test_consensus_db();
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 4);
+        let a5 = vec![sign_claim_rewards(5)];
+        let b5 = make_block(5, a5.clone());
+        persist_header_only_for_test(&state_db, &b5);
+        persist_commit_manifest(&cdb, 5, &encode_proposal_datum(&b5, true));
+
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let mut app = TorusApp::try_new_with_manifest_db(
+            state_db.clone(),
+            cdb.clone(),
+            &config,
+            None,
+            Some(mempool.clone()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(app.exec_next_height, Some(5), "parked at the hole");
+        match app.deferred_exec.get(&5).map(|e| &e.source) {
+            Some(ExecSource::Compact(c)) => assert_eq!(
+                c.native_action_hashes,
+                vec![torus_types::compute_action_hash(&a5[0])],
+                "the consensus-DB manifest names the bodies to pull"
+            ),
+            _ => panic!("the hole must park from its consensus-DB manifest as a Compact source"),
+        }
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+        app.replace_exec_tx(tx);
+        mempool.mirror_native_to_da(&a5).unwrap();
+        app.drain_exec_queue();
+        let msg = rx
+            .try_recv()
+            .expect("the hole heals from peer-delivered bodies");
+        assert_eq!(msg.torus_block.header.height, 5);
+        assert_eq!(app.exec_next_height, Some(6));
+        assert!(
+            wait_manifest_pruned(&cdb, 5),
+            "pruned from the consensus DB after dispatch"
+        );
+    }
+
+    /// T5.3 leftover rows: a manifest row left in the STATE DB (a pre-T5.3
+    /// run, or `TORUS_MANIFEST_IN_STATE_DB=1`) moves into the consensus DB at
+    /// boot and its height still parks for heal: never silently ignored.
+    #[test]
+    fn boot_moves_leftover_state_db_manifests_into_the_consensus_db() {
+        let (config, state_db) = make_test_config_and_db();
+        let cdb = make_test_consensus_db();
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 4);
+        let datum = bincode::serialize(&make_block(5, vec![])).unwrap();
+        persist_commit_manifest(&state_db, 5, &datum);
+
+        let app = TorusApp::try_new_with_manifest_db(
+            state_db.clone(),
+            cdb.clone(),
+            &config,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            app.exec_next_height,
+            Some(5),
+            "the leftover row still parks its height"
+        );
+        assert!(app.deferred_exec.contains_key(&5));
+        assert_eq!(load_commit_manifest(&cdb, 5), Some(datum));
+        assert!(
+            load_commit_manifest(&state_db, 5).is_none(),
+            "moved, not copied"
+        );
+    }
+
+    /// T5.3: the A/B switch's direction (consensus DB -> state DB) moves rows
+    /// too; a row already in the target is kept; a second move is a no-op.
+    #[test]
+    fn migrate_commit_manifests_moves_rows_and_keeps_existing_targets() {
+        let (_config, state_db) = make_test_config_and_db();
+        let cdb = make_test_consensus_db();
+        persist_commit_manifest(&cdb, 7, b"seven");
+        persist_commit_manifest(&cdb, 8, b"eight-from-cdb");
+        persist_commit_manifest(&state_db, 8, b"eight-in-target");
+        assert_eq!(migrate_commit_manifests(&cdb, &state_db), Ok(2));
+        assert_eq!(
+            load_commit_manifest(&state_db, 7).as_deref(),
+            Some(&b"seven"[..])
+        );
+        assert_eq!(
+            load_commit_manifest(&state_db, 8).as_deref(),
+            Some(&b"eight-in-target"[..])
+        );
+        assert!(manifest_heights_above(&cdb, 0).is_empty());
+        assert_eq!(
+            migrate_commit_manifests(&cdb, &state_db),
+            Ok(0),
+            "nothing left"
+        );
+    }
+
+    /// T5.3: the consensus-DB prune is its own write after the body write, so
+    /// a crash in between leaves rows of executed heights: boot drops them and
+    /// keeps (and parks) the rows above the applied height.
+    #[test]
+    fn boot_drops_consensus_db_manifests_of_executed_heights() {
+        let (config, state_db) = make_test_config_and_db();
+        let cdb = make_test_consensus_db();
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 4);
+        for h in 3..=5u64 {
+            persist_commit_manifest(
+                &cdb,
+                h,
+                &bincode::serialize(&make_block(h, vec![])).unwrap(),
+            );
+        }
+        let app = TorusApp::try_new_with_manifest_db(
+            state_db.clone(),
+            cdb.clone(),
+            &config,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(manifest_heights_above(&cdb, 0), vec![5]);
+        assert!(app.deferred_exec.contains_key(&5));
+    }
+
+    /// T5.3: a separate manifest DB without the manifest CF is a boot error,
+    /// not a silent per-commit write failure.
+    #[test]
+    fn manifest_db_without_the_manifest_cf_is_a_boot_error() {
+        let (config, state_db) = make_test_config_and_db();
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let old = rocksdb::DB::open_cf(&opts, scratch_db_dir("torus-old-cdb"), [CF_CONSENSUS_META])
+            .unwrap();
+        let err = TorusApp::try_new_with_manifest_db(
+            state_db,
+            StateDb::from_existing_db(old),
+            &config,
+            None,
+            None,
+            None,
+        )
+        .err()
+        .expect("boot must refuse");
+        assert!(err.contains("commit manifest DB"), "{err}");
+    }
+
+    #[test]
+    fn manifest_in_state_db_switch_parses_truthy_spellings() {
+        assert!(!parse_manifest_in_state_db(None));
+        for v in ["", "0", "false", "off", "no", "2"] {
+            assert!(!parse_manifest_in_state_db(Some(v)), "{v:?}");
+        }
+        for v in ["1", " 1 ", "true", "TRUE", "on", "yes"] {
+            assert!(parse_manifest_in_state_db(Some(v)), "{v:?}");
+        }
+    }
+
     #[test]
     fn dispatch_reports_durable_rows_after_persisting_them() {
         let (config, state_db) = make_test_config_and_db();
@@ -19084,7 +20628,7 @@ mod crash_recovery_tests {
         let msg = rx.try_recv().expect("height 5 must reach execution");
         assert_eq!(msg.torus_block.header.height, 5);
         assert_eq!(
-            msg.durable,
+            msg.settled_durable(),
             DurableRows {
                 header: true,
                 body: true
@@ -19093,14 +20637,17 @@ mod crash_recovery_tests {
         );
         let key = 5u64.to_be_bytes();
         assert!(
-            state_db.get_cf_raw(CF_BLOCK_HEADERS, &key).unwrap().is_some(),
-            "header row must already be durable when the message is sent"
+            state_db
+                .get_cf_raw(CF_BLOCK_HEADERS, &key)
+                .unwrap()
+                .is_some(),
+            "header row durable once the exec thread may execute the block"
         );
-        let body = load_replay_body(&state_db, 5).expect("body row must already be durable");
+        let body = load_replay_body(&state_db, 5).expect("body row durable before execution");
         assert_eq!(body.native_actions.len(), 1);
         assert!(
-            state_db.get_cf_raw(CF_COMMIT_MANIFEST, &key).unwrap().is_none(),
-            "commit manifest pruned at dispatch (same batch as the durable body)"
+            wait_manifest_pruned(&app.manifest_db, 5),
+            "commit manifest pruned after dispatch (consensus DB, after a state-WAL sync)"
         );
     }
 
@@ -20221,6 +21768,7 @@ mod crash_recovery_tests {
                 torus_block: b.clone(),
                 pending_slashes: vec![],
                 durable,
+                persist: None,
                 committed_unexecuted: 0,
             };
             if tx.send(msg).is_err() {
@@ -20507,6 +22055,7 @@ mod crash_recovery_tests {
                 torus_block: b.clone(),
                 pending_slashes: vec![],
                 durable,
+                persist: None,
                 committed_unexecuted,
             })
             .unwrap();
@@ -28980,6 +30529,92 @@ mod crash_recovery_tests {
                 assert_eq!(r02_evm_nonce(db, &key), 1, "the EVM tx ran");
                 assert_eq!(r02_receipt_status(db, 2), Some(true));
             },
+        );
+    }
+
+    /// T5.3 x item 7 option 0 (merge of main into T5.3): a fast-path EVM
+    /// block's header + body go through the commit-persist writer like any
+    /// other block. The exec thread's rows come from the writer's ticket (both
+    /// durable), so the EVM block still takes the pipelined path (not
+    /// `evm.serial_flag_on.nondurable`); its rows are in the state DB before
+    /// it executes; the writer hands each height to the manifest pruner; and
+    /// the state DB ends identical to the dispatch-time write.
+    #[test]
+    fn t53_evm_fast_path_block_rows_come_from_the_commit_persist_writer() {
+        let key = k256::ecdsa::SigningKey::from_slice(&[0x58; 32]).unwrap();
+        let (blocks, _b) = r02_evm_blocks(
+            &key,
+            alloy_primitives::TxKind::Create,
+            vec![0x60, 0x01, 0x60, 0x00, 0x55],
+        );
+        // Reference: the dispatch-time write (manifest in the state DB).
+        let (_c, db_ref) = make_test_config_and_db();
+        r02_fund(&db_ref, &key);
+        let mut ctx = pipeline_ctx(&db_ref, true, None);
+        ctx.evm_fast_path = true;
+        for b in &blocks {
+            dispatch_and_execute(&ctx, &db_ref, b);
+        }
+        assert!(ctx.pipeline_barrier());
+        drop(ctx);
+
+        let (_c, db) = make_test_config_and_db();
+        r02_fund(&db, &key);
+        let mut ctx = pipeline_ctx(&db, true, None);
+        ctx.evm_fast_path = true;
+        let (pruned_tx, pruned_rx) = std::sync::mpsc::channel();
+        let writer = CommitPersistWriter::spawn(
+            db.clone(),
+            ManifestPruner::detached(pruned_tx),
+            None,
+            HeaderHookSlot::default(),
+        );
+        for b in &blocks {
+            let h = b.header.height;
+            let rows = writer.submit(b.clone()).wait();
+            assert_eq!(
+                rows,
+                DurableRows {
+                    header: true,
+                    body: true
+                },
+                "the writer landed {h}"
+            );
+            assert!(
+                db.get_cf_raw(CF_BLOCK_HEADERS, &h.to_be_bytes())
+                    .unwrap()
+                    .is_some(),
+                "header of {h} before it executes"
+            );
+            assert!(
+                load_replay_body(&db, h).is_some(),
+                "body of {h} before it executes"
+            );
+            assert_eq!(
+                pruned_rx.recv_timeout(std::time::Duration::from_secs(10)),
+                Ok(h),
+                "{h} handed to the manifest pruner"
+            );
+            ctx.execute_committed_block_with(b, vec![], rows);
+        }
+        drop(writer);
+        assert!(ctx.pipeline_barrier());
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        {
+            let paths = ctx.test_paths.lock().unwrap();
+            assert_eq!(paths.get("block.pipelined.evm"), Some(&1), "{paths:?}");
+            assert_eq!(
+                paths.get("evm.serial_flag_on.nondurable"),
+                None,
+                "{paths:?}"
+            );
+        }
+        drop(ctx);
+        assert_eq!(r02_receipt_status(&db, 2), Some(true));
+        assert_dumps_equal(
+            &dump_all_cfs(&db_ref),
+            &dump_all_cfs(&db),
+            "writer path vs dispatch-time write",
         );
     }
 
@@ -41400,6 +43035,11 @@ mod crash_recovery_tests {
         (ctx, mempool, db, blocks)
     }
 
+    /// How long the retention tests wait for the threads behind E (dropper,
+    /// merge, slice) to settle before counting. Polled: idle it takes ms; on a
+    /// loaded host those threads can be off-CPU for seconds.
+    const SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
     /// The retention gauges once a block is done: (live objects, live bytes,
     /// read views, oldest live age in blocks).
     fn retention_gauges(ctx: &ExecutionContext) -> (i64, i64, i64, i64) {
@@ -41510,8 +43150,11 @@ mod crash_recovery_tests {
             drop(view);
             // The dropper and the merge / slice threads run behind E: give
             // them a moment before counting (they never hold more than a
-            // block or two).
-            let deadline = Instant::now() + Duration::from_secs(5);
+            // block or two). The loop ends as soon as both hold (ms when
+            // idle); the deadline only bounds a real leak. 5 s was too short
+            // on a loaded host (seen: "h519: stats 1 live / 2 views vs 2 seen
+            // alive" under a full-workspace run, passes alone).
+            let deadline = Instant::now() + SETTLE_DEADLINE;
             let bounded = |s: &[u64], l: &[u64]| {
                 s.iter()
                     .chain(l.iter())
@@ -41603,7 +43246,7 @@ mod crash_recovery_tests {
         let (ctx, mempool, db, blocks) = retention_fixture(62, EVERY);
         let stats = ctx.ckpt.lock().unwrap().retention.clone();
         let settle = |want_views: i64| {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + SETTLE_DEADLINE;
             while stats.read_views() != want_views && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(2));
             }

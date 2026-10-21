@@ -360,10 +360,18 @@ pub struct StateDb {
 pub const CONSENSUS_DB_DIR: &str = "consensus-db";
 
 /// The consensus DB's column families: the HotStuff store (`RocksKVStore`,
-/// all of its traffic) and the DA store (`NativeDaStore`). The state DB
-/// keeps its own `cf_consensus_meta` for the state meta keys the
-/// checkpoint batch writes (applied marker, running hash, epoch plan, ...).
-pub const CONSENSUS_DB_CFS: [&str; 3] = [CF_CONSENSUS_META, CF_NATIVE_PENDING, CF_NATIVE_SHARDS];
+/// all of its traffic), the DA store (`NativeDaStore`) and, since T5.3, the
+/// commit manifest (`CF_COMMIT_MANIFEST`, written by the consensus thread's
+/// commit hook, so that put no longer waits behind a state checkpoint batch).
+/// The state DB keeps its own `cf_consensus_meta` for the state meta keys the
+/// checkpoint batch writes (applied marker, running hash, epoch plan, ...),
+/// and its own (normally empty) `cf_commit_manifest` for the pre-T5.3 layout.
+pub const CONSENSUS_DB_CFS: [&str; 4] = [
+    CF_CONSENSUS_META,
+    CF_NATIVE_PENDING,
+    CF_NATIVE_SHARDS,
+    CF_COMMIT_MANIFEST,
+];
 
 /// `<data_dir>/consensus-db`.
 pub fn consensus_db_path(data_dir: &Path) -> PathBuf {
@@ -698,9 +706,13 @@ impl StateDb {
     /// Open the consensus DB read-only (offline tooling, `torus-unwedge
     /// --inspect`); as [`Self::open_read_only`], a live primary is seen as
     /// of its last flush.
+    /// Only the [`CONSENSUS_DB_CFS`] that exist are opened: a consensus DB
+    /// written before T5.3 has no `cf_commit_manifest` and still opens.
     pub fn open_consensus_read_only(path: &Path) -> Result<Self, StateError> {
+        let existing = DB::list_cf(&Options::default(), path)?;
         let cf_descriptors: Vec<ColumnFamilyDescriptor> = CONSENSUS_DB_CFS
             .iter()
+            .filter(|name| existing.iter().any(|e| e == *name))
             .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
             .collect();
         let db =
