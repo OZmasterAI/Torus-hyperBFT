@@ -1013,6 +1013,17 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    per arm: DB sizes over time per CF / DB, B's first-delete height and time, B's slope after the window vs before,
    GC worker metrics, matched/s, blocks/s, commit p50 / p99. Pass: B's consensus-db and state DB flat past the
    window; A grows at the Q9 rate.
+   **Done s75 (ozarchy-9i, section 121; main `b452b4af`, node md5 `cf0f7a05` on 3 / 3 nodes, 2 / 2 cells rc 0 ACCEPT
+   AGREE PASS, retention=archive / 100000(default), 0 panic / fail-stop / hash mismatch lines): PASS. B's first GC
+   delete at height 100,464-100,465 (13:01:37, load min 63.4); 3,436 s past height 100,000 (26.29 blk/s). SST
+   GB/min per node, consensus-db / state DB: B 0.0231 / 0.0205 before the window, 0.0012 / 0.0002 after (min
+   73.4-120); A 0.0201 / 0.0175 over the same minutes, 0.0219 / 0.0204 before (Q9 0.0222 / 0.0203). Bench-end SST A
+   2.49 + 2.39 GB, B 1.59 + 1.44 GB. GC worker per node: 215,652-215,653 passes, 3,904-5,282 held, 1,106,392-
+   1,106,462 deleted, 70.8-76.6 s (0.33-0.36 ms per pass), handoff 0.004 ms per pass; 0 deleted-open fds. matched/s
+   B / A 0.9998, blocks/s 0.9987, block p50 / p99 8.27 / 479.8 vs 8.22 / 479.8 ms (paced, n = 1: equal by
+   construction). Headline 43.1k matched/s (Q9 49.7k) = margin exhaustion in both arms: 49.6-50.3k for min 0-100,
+   ~0 fills in min 110-120 (13.3% margin rejects, `n9irejchk` WARN); A's growth is unchanged in that tail.
+   `cf_block_headers` grows in both arms (0.048 GB at 120 min).**
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
