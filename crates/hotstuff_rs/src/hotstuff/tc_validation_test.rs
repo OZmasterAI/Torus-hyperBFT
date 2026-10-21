@@ -1121,6 +1121,9 @@ fn tip_signing_cost_report() {
     time("Block::hash recompute (3-of-4 QC justify)", &mut || {
         assert!(Block::hash(b.height, &b.justify, &b.data_hash) == b.hash);
     });
+    time("block_tree.validator_set_state() read (MemKV)", &mut || {
+        let _ = tree.validator_set_state().unwrap();
+    });
     let t = TipInfo::from_header(&header);
     time("F2 TipInfo::is_correct (per vote tip, per TC high tip)", &mut || {
         assert!(t.is_correct(CHAIN_ID, &tree).unwrap());

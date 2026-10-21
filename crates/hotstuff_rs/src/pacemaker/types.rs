@@ -11,9 +11,11 @@ use ed25519_dalek::Verifier;
 
 use crate::hotstuff::{
     messages::{is_header_signed_by, Proposal, ProposalHeader},
-    types::PhaseCertificate,
+    types::{LeaderReputation, PhaseCertificate},
 };
-use crate::pacemaker::implementation::{select_leader, select_leader_with_reputation};
+use crate::pacemaker::implementation::{
+    reputation_leader_selection_enabled, select_leader, select_leader_with_reputation,
+};
 use crate::types::block::Block;
 
 use crate::{
@@ -88,22 +90,42 @@ impl TipInfo {
         chain_id: ChainID,
         block_tree: &BlockTreeSingleton<K>,
     ) -> Result<bool, BlockTreeError> {
-        if Block::hash(self.block_height, &self.block_justify, &self.block_data_hash) != self.block_hash {
-            return Ok(false);
-        }
         let validator_set_state = block_tree.validator_set_state()?;
-        let reputation = block_tree.leader_reputation().ok();
+        Ok(self.is_correct_under(chain_id, &validator_set_state, tip_leader_reputation(block_tree).as_ref()))
+    }
+
+    /// [`is_correct`](Self::is_correct) under a validator-set state (and leader reputation, see
+    /// [`tip_leader_reputation`]) the caller already read.
+    pub(crate) fn is_correct_under(
+        &self,
+        chain_id: ChainID,
+        validator_set_state: &ValidatorSetState,
+        reputation: Option<&LeaderReputation>,
+    ) -> bool {
+        if Block::hash(self.block_height, &self.block_justify, &self.block_data_hash) != self.block_hash {
+            return false;
+        }
         let leader_in = |set: &ValidatorSet| {
-            (set.len() > 0 && set.total_power().int() > 0).then(|| match reputation.as_ref() {
+            (set.len() > 0 && set.total_power().int() > 0).then(|| match reputation {
                 Some(rep) => select_leader_with_reputation(self.view, set, rep),
                 None => select_leader(self.view, set),
             })
         };
         let committed = leader_in(validator_set_state.committed_validator_set());
         let previous = leader_in(validator_set_state.previous_validator_set()).filter(|leader| Some(*leader) != committed);
-        Ok([committed, previous].into_iter().flatten().any(|leader| {
+        [committed, previous].into_iter().flatten().any(|leader| {
             is_header_signed_by(chain_id, self.view, &self.block_hash, &self.leader_signature, &leader)
-        }))
+        })
+    }
+}
+
+/// The leader reputation a tip's leader is selected with: read only while reputation-weighted
+/// selection is on (off by default), as the proposer check does.
+pub(crate) fn tip_leader_reputation<K: KVStore>(block_tree: &BlockTreeSingleton<K>) -> Option<LeaderReputation> {
+    if reputation_leader_selection_enabled() {
+        block_tree.leader_reputation().ok()
+    } else {
+        None
     }
 }
 
@@ -210,7 +232,8 @@ impl Certificate for TimeoutCertificate {
         // F2: the high tip is a real header (its view, which the signers signed, is the one its
         // leader signed).
         if let Some(tip) = &self.high_tip {
-            if !tip.is_correct(self.chain_id, block_tree)? {
+            let reputation = tip_leader_reputation(block_tree);
+            if !tip.is_correct_under(self.chain_id, &validator_set_state, reputation.as_ref()) {
                 return Ok(false);
             }
         }

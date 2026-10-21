@@ -28,7 +28,7 @@ use crate::{
     networking::{messages::Message, network::Network, sending::SenderHandle},
     pacemaker::{
         messages::{AdvanceView, PacemakerMessage, ProgressCertificate, TimeoutVote},
-        types::TimeoutVoteCollector,
+        types::{tip_leader_reputation, TimeoutVoteCollector},
     },
     types::{
         crypto_primitives::Keypair,
@@ -294,10 +294,14 @@ impl<N: Network> Pacemaker<N> {
                 Some(qc) => *qc == block_tree.highest_pc()? || qc.is_correct(block_tree)?,
                 None => true,
             }
-            && match &timeout_vote.local_tip {
-                Some(tip) => tip.view <= timeout_vote.view && tip.is_correct(self.config.chain_id, block_tree)?,
-                None => true,
-            };
+            && timeout_vote.local_tip.as_ref().is_none_or(|tip| {
+                tip.view <= timeout_vote.view
+                    && tip.is_correct_under(
+                        self.config.chain_id,
+                        &validator_set_state,
+                        tip_leader_reputation(block_tree).as_ref(),
+                    )
+            });
         if vote_ok {
             // MonadBFT Bracha amplification: accumulate voting power per view.
             if timeout_vote.view >= self.view_info.view {
