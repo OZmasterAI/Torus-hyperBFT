@@ -240,13 +240,16 @@ pub fn check_genesis_binding(
     genesis_path: &Path,
     data_dir: &Path,
 ) -> Result<GenesisPlan, String> {
-    if !genesis_applied(dbs)? {
-        return Ok(GenesisPlan::Fresh);
-    }
+    let applied = genesis_applied(dbs)?;
     match read_genesis_digest(&dbs.state)? {
-        Some(stored) if stored.digest == file_digest.digest => Ok(GenesisPlan::Matched),
+        // A fresh boot stores the digest before it seeds the genesis, so a
+        // dir with a digest and no genesis crashed in between: still bound.
+        Some(stored) if stored.digest == file_digest.digest => {
+            Ok(if applied { GenesisPlan::Matched } else { GenesisPlan::Fresh })
+        }
         Some(stored) => Err(genesis_changed_error(&stored, file_digest, genesis_path, data_dir)),
-        None => Ok(GenesisPlan::Legacy),
+        None if applied => Ok(GenesisPlan::Legacy),
+        None => Ok(GenesisPlan::Fresh),
     }
 }
 
@@ -264,9 +267,14 @@ pub fn write_genesis_binding(
             Ok(GenesisBinding::Legacy)
         }
         GenesisPlan::Fresh => {
-            apply_genesis_if_fresh(dbs, genesis)?;
-            test_crash_point()?;
+            // The binding first, durably (`store_genesis_digest` syncs the
+            // WAL): a crash anywhere in the seeding leaves a dir bound to
+            // this file, never one a later boot takes as Legacy (Codex review
+            // of phase 4, P2). Re-storing the same digest after a crash is a
+            // no-op.
             store_genesis_digest(&dbs.state, file_digest)?;
+            test_crash_point()?;
+            apply_genesis_if_fresh(dbs, genesis)?;
             test_crash_point()?;
             Ok(GenesisBinding::Fresh)
         }
@@ -293,11 +301,11 @@ fn test_crash_point() -> Result<(), String> {
     Ok(())
 }
 
-/// Boot step 4 with a genesis file (P0.0 phase 4): an initialized data dir
-/// with a stored digest refuses a file that digests differently (before
-/// anything is written); one without a stored digest stores the file's
-/// ([`GenesisBinding::Legacy`]); a fresh one is seeded
-/// ([`apply_genesis_if_fresh`]) and then stores it.
+/// Boot step 4 with a genesis file (P0.0 phase 4): a data dir with a stored
+/// digest refuses a file that digests differently (before anything is
+/// written); an initialized one without a stored digest stores the file's
+/// ([`GenesisBinding::Legacy`]); a fresh one stores it and then is seeded
+/// ([`apply_genesis_if_fresh`]).
 pub fn init_genesis(
     dbs: &NodeDbs,
     genesis: &torus_genesis::Genesis,
