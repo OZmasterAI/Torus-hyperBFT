@@ -3,38 +3,71 @@
 ## Overview
 
 Torus-hyperBFT stores all blockchain state in RocksDB across 33 column families.
-By default, the node operates in **archive mode**: all historical data is retained
-indefinitely. Operators can enable **pruning** to automatically remove old block
-bodies and receipts, reducing disk usage.
+**Since s131 the node prunes by default**: a node started without `--archive`
+keeps the last **100,000 blocks** of history (`--retention-blocks` default) and
+removes older block bodies, receipts and DA bodies in the background. Archive
+nodes (`--archive`, or `--retention-blocks 0`) keep everything and are the
+source a fresh node syncs from genesis.
 
 ## Archive vs. Pruned Mode
 
 | | Archive Mode | Pruned Mode |
 |---|---|---|
-| **CLI** | Default (no flags needed) | `--retention-blocks N` |
+| **CLI** | `--archive` (or `--retention-blocks 0`) | Default (N = 100,000), or `--retention-blocks N` |
 | **Historical queries** | All blocks available | Only last N blocks |
 | **Disk usage** | Grows indefinitely | Bounded by retention window |
 | **Explorer indexing** | Can serve full history | Cannot serve old blocks |
 | **State queries** | Always available | Always available |
 
-## Enabling Pruning
+## Default Retention (prune by default, owner s131)
 
 ```bash
 ./torus-node \
   --keystore validator.keystore \
-  --genesis genesis.json \
-  --retention-blocks 100000
+  --genesis genesis.json
 ```
 
-This keeps the last 100,000 blocks of historical data. Everything older is
-deleted in background. The pruner runs every 30 seconds and processes blocks
-in batches to avoid latency spikes.
+With no retention flag this keeps the last 100,000 blocks of historical data
+(the same as `--retention-blocks 100000`). Everything older is removed in the
+background. The pruner runs every 30 seconds and processes blocks in batches
+to avoid latency spikes. One retention N drives all three pruners:
+
+| Pruner | Keeps | With the default |
+|---|---|---|
+| State pruner (bodies, receipts, action status, CoreWriter links; `TORUS_PRUNE_MODE=filter` by default) | the last N blocks, never at or above the durable applied height | 100,000 |
+| Block-tree pruner (hotstuff `cf_consensus_meta`) | max(N, 1000) heights | 100,000 |
+| RH4 DA body GC (committed native-action bodies and shards) | max(N, 1000) + 128 dispatched blocks, and only once the block tree pruned the block 128 heights ago (`TORUS_DA_BODY_RETENTION` overrides the window, `0` = off) | 100,128 |
+
+Why 100,000: a validator that was offline can catch up by block sync only
+while its peers still hold the blocks it missed (there is no state sync).
+100,000 blocks is about 5-9 hours at the benched block rates (roadmap,
+"Validator history retention"); the production N is revisited after Q9.
+
+Other windows:
+
+```bash
+./torus-node ... --retention-blocks 500000   # keep more history
+./torus-node ... --archive                   # keep everything (archive node)
+./torus-node ... --retention-blocks 0        # the same as --archive
+```
+
+The config file takes the same settings (`archive = true`,
+`retention-blocks = N`); the command line wins over the file.
+
+**Run at least one archive node per network.** Block sync serves bodies only
+from nodes that still hold them, so a node joining after the first 100,000
+blocks (or a validator offline longer than the window) can only sync from an
+archive peer.
+
+Bench and devnet harnesses: `devnet/wsl/start-node.sh` and
+`devnet/docker-compose.yml` pass `--retention-blocks=$TORUS_RETENTION_BLOCKS`
+when it is set; unset now means the node default (100,000), and
+`TORUS_RETENTION_BLOCKS=0` reproduces the archive arm of earlier benches.
 
 ### Mutual Exclusion
 
 `--archive` cannot be combined with `--retention-blocks` or
-`--trade-retention-blocks`. If no retention flag is specified, the node
-defaults to archive mode.
+`--trade-retention-blocks`.
 
 ## Trade-History Retention (D13)
 
@@ -196,7 +229,7 @@ If you need historical data after pruning, the only option is to re-sync:
 
 1. Stop the node
 2. Delete the data directory
-3. Restart with `--archive` mode (or `--retention-blocks` with a larger window)
+3. Restart with `--archive` (or a larger `--retention-blocks` window)
 4. The node will sync from peers, downloading all blocks
 
 ### Restore from Snapshot

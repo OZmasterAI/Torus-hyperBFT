@@ -1324,8 +1324,9 @@ class CrashKillGuardTest(unittest.TestCase):
 # ------------------------------- start-node.sh: optional history retention (Q9)
 class StartNodeRetentionTest(unittest.TestCase):
     """devnet/wsl/start-node.sh passes `--retention-blocks=N` only when
-    TORUS_RETENTION_BLOCKS is set. Unset or empty = archive, the argv of every
-    earlier cell, byte for byte. The flag goes last, so crash-kill.sh's
+    TORUS_RETENTION_BLOCKS is set. Unset or empty = no flag, the argv of every
+    earlier cell, byte for byte (since s131 that means the node default,
+    prune by default with N = 100,000; TORUS_RETENTION_BLOCKS=0 = archive). The flag goes last, so crash-kill.sh's
     `--data-dir=` match (and with it the restart) still accepts the node."""
 
     START_NODE_SH = os.path.join(

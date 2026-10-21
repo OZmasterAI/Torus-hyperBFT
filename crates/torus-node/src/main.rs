@@ -152,12 +152,14 @@ struct Cli {
     #[arg(long, default_value = "info")]
     log_level: String,
 
-    /// Archive mode: retain all historical data (default). Mutually exclusive with --retention-blocks.
+    /// Archive mode: retain all historical data (no pruning). Without it the node prunes
+    /// by default (see --retention-blocks). Mutually exclusive with --retention-blocks.
     #[arg(long)]
     archive: bool,
 
-    /// Enable pruning: keep only the last N blocks of historical data (block bodies and receipts).
-    /// Older data is removed to save disk space. Cannot be used with --archive.
+    /// History retention: keep only the last N blocks of historical data (block bodies,
+    /// receipts, DA bodies). Default 100000 (prune by default, s131) unless --archive.
+    /// 0 = keep everything (the same as --archive). Cannot be used with --archive.
     #[arg(long)]
     retention_blocks: Option<u64>,
 
@@ -358,23 +360,55 @@ fn apply_config_defaults(cli: &mut Cli, cfg: ConfigFile) {
     }
 }
 
-/// The background pruner's settings from the retention flags, or `None` when
-/// neither `--retention-blocks` nor `--trade-retention-blocks` is set (archive:
-/// nothing pruned). Each flag prunes only its own data: bodies / receipts
-/// without `--retention-blocks` get `u64::MAX` (cutoff 0, kept), trade history
-/// without `--trade-retention-blocks` gets `None` (kept).
-fn pruner_config(cli: &Cli) -> Result<Option<PrunerConfig>, String> {
+/// History retention of a node started without `--archive` or
+/// `--retention-blocks` (prune by default, owner s131): about 5-9 h a validator
+/// can be offline and still catch up by block sync (roadmap, "Validator
+/// history retention").
+const DEFAULT_RETENTION_BLOCKS: u64 = 100_000;
+
+/// The history retention this node runs with, after the config file was
+/// applied: `Some(n)` keeps the last `n` blocks (state pruner, block tree,
+/// RH4 DA body GC), `None` keeps everything (an archive node). `--archive`, or
+/// `--retention-blocks 0`, is the archive node; an explicit
+/// `--retention-blocks N` is N; neither is [`DEFAULT_RETENTION_BLOCKS`].
+fn history_retention(cli: &Cli) -> Result<Option<u64>, String> {
     if cli.archive && cli.retention_blocks.is_some() {
         return Err("cannot set both --archive and --retention-blocks".into());
     }
+    if cli.archive {
+        return Ok(None);
+    }
+    Ok(match cli.retention_blocks {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None => Some(DEFAULT_RETENTION_BLOCKS),
+    })
+}
+
+/// The hotstuff block-tree window for a history retention: clamped to >= 1000
+/// so consensus lookbacks and the speculative window are never at risk;
+/// `None` (archive) keeps the whole tree. The RH4 DA body GC window derives
+/// from it (`torus_consensus::da_gc::resolve_da_body_retention`: + 128).
+fn block_tree_window(retention: Option<u64>) -> Option<u64> {
+    retention.map(|r| r.max(1000))
+}
+
+/// The background pruner's settings from the retention flags, or `None` when
+/// neither history retention ([`history_retention`]: on by default) nor
+/// `--trade-retention-blocks` is on (an archive node: nothing pruned). Each
+/// prunes only its own data: bodies / receipts with history retention off get
+/// `u64::MAX` (cutoff 0, kept), trade history without
+/// `--trade-retention-blocks` gets `None` (kept).
+fn pruner_config(cli: &Cli) -> Result<Option<PrunerConfig>, String> {
+    let retention = history_retention(cli)?;
     if cli.archive && cli.trade_retention_blocks.is_some() {
         return Err("cannot set both --archive and --trade-retention-blocks".into());
     }
-    if cli.retention_blocks.is_none() && cli.trade_retention_blocks.is_none() {
+    if retention.is_none() && cli.trade_retention_blocks.is_none() {
         return Ok(None);
     }
     Ok(Some(PrunerConfig {
-        retention_blocks: cli.retention_blocks.unwrap_or(u64::MAX),
+        retention_blocks: retention.unwrap_or(u64::MAX),
         trade_retention_blocks: cli.trade_retention_blocks,
         ..PrunerConfig::default()
     }))
@@ -572,8 +606,22 @@ fn load_genesis(path: &std::path::Path) -> Result<Genesis, String> {
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    // Validate pruning flags
+    // Validate pruning flags. History retention is on by default (s131): an
+    // archive node needs --archive (or --retention-blocks 0).
     let pruner_settings = pruner_config(&cli)?;
+    let retention = history_retention(&cli)?;
+    match retention {
+        Some(n) if cli.retention_blocks.is_none() => info!(
+            retention_blocks = n,
+            "history retention: default, keeping the last {n} blocks (prune by default; \
+             --archive or --retention-blocks 0 keeps every block)"
+        ),
+        Some(n) => info!(
+            retention_blocks = n,
+            "history retention: keeping the last {n} blocks"
+        ),
+        None => info!("history retention off: archive node, every block is kept"),
+    }
     // 2. Load validator key (keystore preferred, raw hex deprecated)
     let signing_key = if let Some(keystore_path) = &cli.keystore {
         let passphrase = if let Some(pf) = &cli.passphrase_file {
@@ -944,12 +992,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Block-tree pruner (S391): bound hotstuff's cf_consensus_meta growth with the
     // same retention knob as the state pruner. Node-local storage policy (not
     // consensus-critical); clamped to >= 1000 so consensus lookbacks and the
-    // speculative window are never at risk. Archive nodes (no --retention-blocks)
-    // keep everything and remain the genesis-sync source.
-    hotstuff_rs::block_tree::set_block_tree_retention(cli.retention_blocks.map(|r| r.max(1000)));
-    if let Some(r) = cli.retention_blocks {
+    // speculative window are never at risk. Archive nodes (--archive or
+    // --retention-blocks 0) keep everything and remain the genesis-sync source.
+    let tree_window = block_tree_window(retention);
+    hotstuff_rs::block_tree::set_block_tree_retention(tree_window);
+    if let Some(r) = tree_window {
         info!(
-            retention_blocks = r.max(1000),
+            retention_blocks = r,
             "block-tree pruner enabled (cf_consensus_meta)"
         );
     }
@@ -957,7 +1006,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // as block sync can still hand their block to a lagging peer: a body goes
     // once its window (block-tree window + 128, or TORUS_DA_BODY_RETENTION;
     // 0 = off) has passed AND the block tree's durable prune pointer is 128
-    // past it. Archive (no --retention-blocks): no GC. The pointer is read
+    // past it. Archive (--archive or --retention-blocks 0): no GC. The pointer is read
     // from the consensus DB, where the DA store writes too (one WAL). See
     // torus_consensus::da_gc.
     let tree_retention = hotstuff_rs::block_tree::block_tree_retention();
@@ -975,7 +1024,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match (da_retention, tree_retention) {
         (None, None) => info!(
             env = ?da_retention_env,
-            "DA body GC off: archive node (no --retention-blocks), every committed body is kept"
+            "DA body GC off: archive node (--archive or --retention-blocks 0), every committed \
+             body is kept"
         ),
         (None, Some(_)) => {
             info!("DA body GC off (TORUS_DA_BODY_RETENTION=0): every committed body is kept")
@@ -1381,7 +1431,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // 11. Background pruner (if pruning enabled)
     if let Some(pruner_config) = pruner_settings {
         info!(
-            retention_blocks = ?cli.retention_blocks,
+            retention_blocks = ?retention,
             trade_retention_blocks = ?cli.trade_retention_blocks,
             "background pruner enabled"
         );
@@ -2440,12 +2490,14 @@ mod tests {
         );
     }
 
+    /// Prune by default (owner s131): neither flag set -> the node keeps the
+    /// last [`DEFAULT_RETENTION_BLOCKS`] blocks, not archive mode.
     #[test]
-    fn default_is_archive_mode() {
+    fn default_is_pruning_mode() {
         let cli = Cli::try_parse_from(["torus-node", "--keystore", "k.keystore"]).unwrap();
         assert!(!cli.archive);
         assert!(cli.retention_blocks.is_none());
-        // Neither flag -> archive mode (no pruning)
+        assert_eq!(history_retention(&cli), Ok(Some(DEFAULT_RETENTION_BLOCKS)));
     }
 
     #[test]
@@ -2514,13 +2566,112 @@ mod tests {
         Cli::try_parse_from(all).unwrap()
     }
 
+    /// Prune by default (owner s131): a validator (and an RPC node) started
+    /// without a retention flag keeps the last 100,000 blocks: the state
+    /// pruner runs with N = 100,000, the block tree keeps 100,000 heights and
+    /// the RH4 DA body GC window is 100,000 + 128.
+    #[test]
+    fn default_retention_is_100k_on_a_validator() {
+        assert_eq!(DEFAULT_RETENTION_BLOCKS, 100_000);
+        for args in [&[][..], &["--rpc-only"][..]] {
+            let c = cli(args);
+            assert_eq!(history_retention(&c), Ok(Some(100_000)), "{args:?}");
+            let p = pruner_config(&c).unwrap().expect("pruner on by default");
+            assert_eq!(
+                (p.retention_blocks, p.trade_retention_blocks),
+                (100_000, None)
+            );
+            let tree = block_tree_window(history_retention(&c).unwrap());
+            assert_eq!(tree, Some(100_000));
+            assert_eq!(
+                torus_consensus::da_gc::resolve_da_body_retention(None, tree),
+                Some(100_000 + torus_consensus::da_gc::DA_GC_MARGIN_BLOCKS)
+            );
+        }
+    }
+
+    /// An archive node (`--archive`, or `archive = true` in the config file)
+    /// keeps every block: no state pruner, no block-tree pruner, no DA GC.
+    #[test]
+    fn archive_node_keeps_every_block() {
+        let c = cli(&["--archive"]);
+        assert_eq!(history_retention(&c), Ok(None));
+        assert!(pruner_config(&c).unwrap().is_none());
+        assert_eq!(block_tree_window(None), None);
+        assert_eq!(
+            torus_consensus::da_gc::resolve_da_body_retention(None, None),
+            None
+        );
+
+        let cfg: ConfigFile = toml::from_str("archive = true").unwrap();
+        let mut c = cli(&[]);
+        apply_config_defaults(&mut c, cfg);
+        assert_eq!(history_retention(&c), Ok(None));
+        assert!(pruner_config(&c).unwrap().is_none());
+
+        // --archive with a retention flag stays an error.
+        assert!(history_retention(&cli(&["--archive", "--retention-blocks", "5"])).is_err());
+    }
+
+    /// An explicit retention wins over the default: `--retention-blocks N`
+    /// (or `retention-blocks = N` in the config file; the command line wins
+    /// over the file) keeps N blocks, the block tree max(N, 1000) and the DA
+    /// GC max(N, 1000) + 128; `--retention-blocks 0` turns pruning off (the
+    /// same as `--archive`).
+    #[test]
+    fn explicit_retention_override_is_respected() {
+        let c = cli(&["--retention-blocks", "5000"]);
+        assert_eq!(history_retention(&c), Ok(Some(5000)));
+        assert_eq!(pruner_config(&c).unwrap().unwrap().retention_blocks, 5000);
+        assert_eq!(block_tree_window(Some(5000)), Some(5000));
+        // Below the block tree's floor: the tree and the DA GC keep 1000 (+128).
+        assert_eq!(block_tree_window(Some(500)), Some(1000));
+        assert_eq!(
+            torus_consensus::da_gc::resolve_da_body_retention(None, block_tree_window(Some(500))),
+            Some(1000 + torus_consensus::da_gc::DA_GC_MARGIN_BLOCKS)
+        );
+
+        // 0 = off: archive.
+        let c = cli(&["--retention-blocks", "0"]);
+        assert_eq!(history_retention(&c), Ok(None));
+        assert!(pruner_config(&c).unwrap().is_none());
+        // 0 with trade retention: the pruner runs for trades only, bodies kept.
+        let p = pruner_config(&cli(&[
+            "--retention-blocks",
+            "0",
+            "--trade-retention-blocks",
+            "9",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (p.retention_blocks, p.trade_retention_blocks),
+            (u64::MAX, Some(9))
+        );
+
+        // Config file, and the command line over the file.
+        let cfg: ConfigFile = toml::from_str("retention-blocks = 7000").unwrap();
+        let mut c = cli(&[]);
+        apply_config_defaults(&mut c, cfg);
+        assert_eq!(history_retention(&c), Ok(Some(7000)));
+        let cfg: ConfigFile = toml::from_str("retention-blocks = 7000").unwrap();
+        let mut c = cli(&["--retention-blocks", "0"]);
+        apply_config_defaults(&mut c, cfg);
+        assert_eq!(history_retention(&c), Ok(None));
+    }
+
     /// D13: `--trade-retention-blocks` is unset by default (keep every trade
     /// row, exactly today) and is its own pruner trigger.
     #[test]
     fn trade_retention_blocks_flag_and_pruner_config() {
-        // Neither: archive, no pruner.
+        // Neither: the default body retention (prune by default, s131),
+        // trade history kept.
         assert!(cli(&[]).trade_retention_blocks.is_none());
-        assert!(pruner_config(&cli(&[])).unwrap().is_none());
+        let c = pruner_config(&cli(&[])).unwrap().unwrap();
+        assert_eq!(
+            (c.retention_blocks, c.trade_retention_blocks),
+            (DEFAULT_RETENTION_BLOCKS, None)
+        );
 
         // Bodies only: trade history kept.
         let c = pruner_config(&cli(&["--retention-blocks", "5000"]))
@@ -2528,8 +2679,14 @@ mod tests {
             .unwrap();
         assert_eq!((c.retention_blocks, c.trade_retention_blocks), (5000, None));
 
-        // Trades only: bodies kept (u64::MAX = cutoff 0).
-        let parsed = cli(&["--trade-retention-blocks", "200000"]);
+        // Trades only (body pruning off, `--retention-blocks 0`): bodies kept
+        // (u64::MAX = cutoff 0).
+        let parsed = cli(&[
+            "--retention-blocks",
+            "0",
+            "--trade-retention-blocks",
+            "200000",
+        ]);
         assert_eq!(parsed.trade_retention_blocks, Some(200000));
         let c = pruner_config(&parsed).unwrap().unwrap();
         assert_eq!(

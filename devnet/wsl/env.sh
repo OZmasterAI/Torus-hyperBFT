@@ -84,11 +84,12 @@ if [ "${HEADER_RESEND_UNSET:-0}" = 1 ]; then
 else
     export TORUS_HEADER_RESEND_MS="${TORUS_HEADER_RESEND_MS:-250}"
 fi
-# History retention (Q9 data-dir growth soak), unset here on purpose = archive,
-# as every earlier cell ran. TORUS_RETENTION_BLOCKS=N (caller's env) makes
-# start-node.sh pass --retention-blocks=N: the state pruner, the block-tree
-# pruner and the DA body GC (window = max(N, 1000) + 128 dispatched blocks,
-# RH4) all turn on. TORUS_DA_BODY_RETENTION=N (node env) sets the DA body GC
+# History retention, unset here on purpose = the node default (since s131:
+# prune by default, N = 100,000; cells before that ran archive).
+# TORUS_RETENTION_BLOCKS=N (caller's env) makes start-node.sh pass
+# --retention-blocks=N: the state pruner, the block-tree pruner and the DA body
+# GC (window = max(N, 1000) + 128 dispatched blocks, RH4) follow N;
+# TORUS_RETENTION_BLOCKS=0 = archive (the earlier cells' argv). TORUS_DA_BODY_RETENTION=N (node env) sets the DA body GC
 # window alone (0 = off; below the block-tree window a peer lagging further
 # cannot get bodies from that node).
 
