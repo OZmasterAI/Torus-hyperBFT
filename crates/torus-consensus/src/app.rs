@@ -3587,6 +3587,64 @@ impl ExecutionContext {
         );
     }
 
+    /// P0.0 phase 3: where the `RunningStateHash` bit turned on, for the first
+    /// block (`height`, bit on) this context executes. The parent's stored
+    /// header first (a pipelined parent may not be durable yet: drain once);
+    /// without the bit, `height` itself. Otherwise the stored activation or
+    /// stored chain start, if the stored headers confirm it (the bit at it,
+    /// not below), else `running_hash::header_activation`'s binary search.
+    /// Stored headers that cannot be read (a DB without its old header rows)
+    /// leave the stored value, else 1 (logged): with no chain stored that
+    /// only makes this node hash-unverified. `None`: the fail-stop latched.
+    fn derive_running_hash_activation(&self, height: u64) -> Option<u64> {
+        use torus_state::running_hash::{
+            header_activation, read_activation_height, read_configured_activation,
+        };
+        let rsh = torus_types::Feature::RunningStateHash.bit();
+        let bit_at = |h: u64| header_at(&self.state_db, h).map(|p| p.features & rsh != 0);
+        if height <= 1 {
+            return Some(1);
+        }
+        let parent_on = match bit_at(height - 1) {
+            Ok(on) => Some(on),
+            Err(_) => {
+                if !self.pipeline_barrier() {
+                    return None;
+                }
+                bit_at(height - 1).ok()
+            }
+        };
+        if parent_on == Some(false) {
+            return Some(height);
+        }
+        let stored = read_configured_activation(&self.state_db).filter(|a| *a <= height);
+        let start = read_activation_height(&self.state_db).filter(|s| *s <= height);
+        let starts_at = |a: u64| -> Result<bool, torus_state::StateError> {
+            let on = a == height || bit_at(a)?;
+            Ok(on && (a == 1 || !bit_at(a - 1)?))
+        };
+        for hint in [stored, start].into_iter().flatten() {
+            if let Ok(true) = starts_at(hint) {
+                return Some(hint);
+            }
+        }
+        match header_activation(height, true, bit_at) {
+            Ok(found) => found,
+            Err(e) => {
+                let fallback = stored.or(start).unwrap_or(1);
+                tracing::warn!(
+                    %e,
+                    height,
+                    fallback,
+                    "running state hash: the stored headers do not say where the RunningStateHash \
+                     bit turned on; using the stored activation (with no stored chain this node is \
+                     hash-unverified)"
+                );
+                Some(fallback)
+            }
+        }
+    }
+
     /// P0.0 phase 3: the running state hash follows the committed headers'
     /// `RunningStateHash` bit, never this node's schedule: it starts at the
     /// first header carrying the bit (`h_{H-1}` = zeros), on every node, live
@@ -3601,7 +3659,7 @@ impl ExecutionContext {
     /// (a stored chain of another definition is discarded). `false`: the
     /// fail-stop is latched; execute nothing.
     fn follow_running_hash_bit(&self, header: &TorusBlockHeader) -> bool {
-        use torus_state::running_hash::{configure_activation, header_activation, read_configured_activation};
+        use torus_state::running_hash::{configure_activation, read_configured_activation};
         let rsh = torus_types::Feature::RunningStateHash.bit();
         let height = header.height;
         let on = header.features & rsh != 0;
@@ -3617,35 +3675,12 @@ impl ExecutionContext {
             }
             // The parent (executed by this context) had no bit: H is here.
             (Some((prev, None)), true) if prev + 1 == height => Some(height),
-            _ => {
-                // First block of this context (or a bit that went off again):
-                // the stored headers below say where the bit turned on. A
-                // pipelined parent may not be durable yet: drain once, retry.
-                let derive = || {
-                    header_activation(height, on, |h| {
-                        header_at(&self.state_db, h).map(|p| p.features & rsh != 0)
-                    })
-                };
-                match derive().or_else(|_| {
-                    if self.pipeline_barrier() {
-                        derive()
-                    } else {
-                        Err(torus_state::StateError::InvalidData("pipeline barrier failed".into()))
-                    }
-                }) {
-                    Ok(want) => want,
-                    Err(e) => {
-                        tracing::error!(
-                            %e,
-                            height,
-                            "FATAL: running state hash: cannot read the committed headers below this \
-                             block to find where the RunningStateHash bit turned on (fail-stop)"
-                        );
-                        self.exec_failed.store(true, Ordering::SeqCst);
-                        return false;
-                    }
-                }
-            }
+            (_, false) => None,
+            // First block of this context with the bit on (or the bit came back).
+            (_, true) => match self.derive_running_hash_activation(height) {
+                Some(want) => Some(want),
+                None => return false,
+            },
         };
         let stored = read_configured_activation(&self.state_db);
         if stored != want {
@@ -8748,7 +8783,15 @@ impl TorusApp {
             commit_lag_backoff_cap: 0,
             reputation_leader_selection: false,
             exec_trust_cache: false,
-            activations: Default::default(),
+            // P0.0: the running state hash from block 1, as the test fixtures'
+            // headers (`make_block`) carry it.
+            activations: torus_types::ActivationSchedule::merge(
+                &[(torus_types::Feature::RunningStateHash, 1)]
+                    .into_iter()
+                    .collect(),
+                &[],
+            )
+            .expect("a one-feature schedule"),
         };
         let mut seed = [0u8; 32];
         seed[..8].copy_from_slice(&id.to_le_bytes());
@@ -13576,10 +13619,18 @@ mod crash_recovery_tests {
         let (mut config, state_db) = make_test_config_and_db();
         config.evm_gas_limit = 3_000_000;
         config.evm_block_interval = 5;
-        let genesis = torus_bridge::genesis_parent_header(3_000_000, 5);
+        // P0.0: with block 1's bits (`make_test_config_and_db`'s schedule).
+        let genesis = TorusBlockHeader {
+            features: TEST_FEATURES,
+            ..torus_bridge::genesis_parent_header(3_000_000, 5)
+        };
         let hash_3m = alloy_primitives::keccak256(genesis.canonical_header_bytes());
         let hash_30m = alloy_primitives::keccak256(
-            torus_bridge::genesis_parent_header(30_000_000, 5).canonical_header_bytes(),
+            TorusBlockHeader {
+                features: TEST_FEATURES,
+                ..torus_bridge::genesis_parent_header(30_000_000, 5)
+            }
+            .canonical_header_bytes(),
         );
         let latch = AtomicBool::new(false);
         assert!(!detect_parent_link_violation(
@@ -23910,33 +23961,44 @@ mod crash_recovery_tests {
         );
     }
 
-    /// Review finding 1: the activation height is CHAIN-WIDE (chain config):
-    /// nodes that ran a pre-upgrade binary (no running hash) up to different
-    /// applied heights below it — serial or pipelined — and a node synced
-    /// from genesis all hold the identical hash from the activation height
-    /// on. A node whose DB is already above it is hash-unverified.
+    /// Review finding 1, P0.0 phase 3: the activation height is CHAIN-WIDE,
+    /// the first header carrying the `RunningStateHash` bit: nodes stopped at
+    /// different heights below or above it and restarted — serial or
+    /// pipelined — and a node run from genesis all hold the identical hash
+    /// from the activation height on. A node whose DB lost its chain rows
+    /// (restored without them) above it is hash-unverified; it finds the
+    /// activation from the stored headers.
     #[test]
     fn running_hash_chain_wide_activation_nodes_upgraded_at_different_heights_agree() {
         use torus_bridge::native_executor::BookMode;
         use torus_state::running_hash::{
-            configure_activation, read_activation_height, read_running_hash, read_unverified_since,
+            configure_activation, read_activation_height, read_configured_activation,
+            read_running_hash, read_unverified_since,
         };
         let mode = BookMode::LevelAuthorityChunked;
         let act = 6u64;
-        let blocks = book_fixture_blocks();
-        let node = |upgraded_at: usize, on: bool| {
+        let mut blocks: Vec<TorusBlock> = book_fixture_blocks()
+            .into_iter()
+            .map(|b| {
+                let bits = if b.header.height >= act { TEST_FEATURES } else { 0 };
+                with_features(b, bits)
+            })
+            .collect();
+        link_blocks(&mut blocks);
+        let node = |stop_at: usize, on: bool, lose_chain: bool| {
             let (_c, db) = make_test_config_and_db();
-            configure_activation(&db, None).unwrap(); // pre-upgrade binary
             fund_book_fixture(&db);
             let ctx = book_pipeline_ctx(&db, on, None, mode);
-            for b in &blocks[..upgraded_at] {
+            for b in &blocks[..stop_at] {
                 dispatch_and_execute(&ctx, &db, b);
             }
             drop(ctx);
-            configure_activation(&db, Some(act)).unwrap(); // upgrade + restart
+            if lose_chain {
+                configure_activation(&db, None).unwrap(); // the chain rows are gone
+            }
             torus_state::running_hash::capture_begin(&db);
             let ctx = book_pipeline_ctx(&db, on, None, mode);
-            for b in &blocks[upgraded_at..] {
+            for b in &blocks[stop_at..] {
                 dispatch_and_execute(&ctx, &db, b);
             }
             assert!(!ctx.exec_failed.load(Ordering::SeqCst));
@@ -23944,22 +24006,23 @@ mod crash_recovery_tests {
             let captured = torus_state::running_hash::capture_take(&db);
             (db, captured)
         };
-        let (genesis_node, captured) = node(0, false);
+        let (genesis_node, captured) = node(0, false, false);
         assert_eq!(captured.first().map(|(h, _)| *h), Some(act), "first hashed height = activation");
         assert_eq!(read_activation_height(&genesis_node), Some(act));
         let reference = read_running_hash(&genesis_node).unwrap();
         assert_eq!(reference, fold_captured(&captured), "h_act chains from zeros");
         assert_eq!(reference.0, 13);
-        for (upgraded_at, on) in [(2, false), (3, true), (5, false), (5, true)] {
-            let (db, _) = node(upgraded_at, on);
-            assert_eq!(read_running_hash(&db), Some(reference), "upgraded at {upgraded_at} on={on}");
+        for (stop_at, on) in [(2, false), (3, true), (5, false), (5, true), (6, true), (9, false)] {
+            let (db, _) = node(stop_at, on, false);
+            assert_eq!(read_running_hash(&db), Some(reference), "stopped at {stop_at} on={on}");
             assert_eq!(read_unverified_since(&db), None);
         }
-        // DB above the activation height at upgrade: no valid h_{act..}.
-        let (late, captured) = node(8, false);
+        // Chain rows lost above the activation height: no valid h_{act..}.
+        let (late, captured) = node(8, false, true);
         assert!(captured.is_empty(), "never hashed");
         assert_eq!(read_running_hash(&late), None);
         assert_eq!(read_unverified_since(&late), Some(9));
+        assert_eq!(read_configured_activation(&late), Some(act), "found in the stored headers");
     }
 
     /// Task 4: kill after flushing N (committed blocks N+1.. durable, not yet
@@ -24295,32 +24358,35 @@ mod crash_recovery_tests {
         Arc::new(Mempool::new(db.clone(), torus_mempool::MempoolConfig::default()))
     }
 
-    /// Review finding 1: a hash-unverified node (DB above the activation
-    /// height when it upgraded) never attests and reports itself unverified;
-    /// one upgraded below the activation height attests every checkpoint.
+    /// Review finding 1: a hash-unverified node (no valid chain above the
+    /// activation height) never attests and reports itself unverified; one
+    /// with a valid chain across a restart attests every checkpoint.
     #[test]
     fn state_hash_unverified_node_never_attests() {
         use torus_state::running_hash::{configure_activation, read_unverified_since};
         let key = k256::ecdsa::SigningKey::from_slice(&[73u8; 32]).unwrap();
-        for (upgraded_at, attests) in [(30u64, true), (60, false)] {
+        // P0.0 phase 3: hashing from block 1 (the headers' bit); a node whose
+        // chain rows are lost at 60 (restored without them) is unverified.
+        for (restart_at, lose_chain, attests) in [(30u64, false, true), (60, true, false)] {
             let (config, db) = make_test_config_and_db();
             seed_active_validators(&db, &[&key]);
-            configure_activation(&db, None).unwrap();
             let ctx = make_exec_ctx(&config, &db);
-            run_empty_blocks(&ctx, &db, 1, upgraded_at);
+            run_empty_blocks(&ctx, &db, 1, restart_at);
             drop(ctx);
-            configure_activation(&db, Some(50)).unwrap();
+            if lose_chain {
+                configure_activation(&db, None).unwrap();
+            }
             let pool = mempool_for(&db);
             let mut ctx = make_exec_ctx_with_mempool(&config, &db, Some(pool.clone()), false);
             let metrics = Arc::new(torus_telemetry::Metrics::new());
             ctx.metrics = Some(metrics.clone());
             ctx.state_hash.set_attest_key(key.clone());
-            run_empty_blocks(&ctx, &db, upgraded_at + 1, 250);
+            run_empty_blocks(&ctx, &db, restart_at + 1, 250);
             let mut heights: Vec<u64> = pooled_attestations(&pool).iter().map(|(_, h, _)| *h).collect();
             heights.sort();
             let gauge = metric_value(&metrics.encode(), "torus_state_hash_unverified");
             if attests {
-                assert_eq!(heights, vec![100, 200], "upgraded below the activation height: attests");
+                assert_eq!(heights, vec![100, 200], "a valid chain: attests");
                 assert_eq!(gauge, 0.0);
             } else {
                 assert_eq!(read_unverified_since(&db), Some(61));
@@ -25392,6 +25458,8 @@ mod crash_recovery_tests {
         let mut b = make_block(h, vec![]);
         b.header.parent_hash = alloy_primitives::keccak256(parent.header.canonical_header_bytes());
         b.header.timestamp = ts;
+        // P0.0: the parent's feature bits (a bitless parent: a bitless child).
+        b.header.features = parent.header.features;
         b
     }
 
@@ -25609,6 +25677,14 @@ mod crash_recovery_tests {
         block
     }
 
+    /// Link `blocks` (from height 1) to the genesis parent header of `config`
+    /// (its block-1 bits) and to each other.
+    fn link_from_genesis(config: &ChainConfig, blocks: &mut [TorusBlock]) {
+        let genesis = torus_bridge::genesis_parent_header_for(config);
+        blocks[0].header.parent_hash = alloy_primitives::keccak256(genesis.canonical_header_bytes());
+        link_blocks(blocks);
+    }
+
     /// P0.0 header rule: `features` must equal the voter's own
     /// `schedule.active_at(height)`, before the vote (`check_proposal_data`)
     /// and at insertion (`validate_block`'s `check_parent_link`): missing the
@@ -25618,7 +25694,7 @@ mod crash_recovery_tests {
     #[test]
     fn header_feature_bits_must_equal_the_schedule_before_the_vote_and_at_insertion() {
         let rsh = torus_types::Feature::RunningStateHash.bit();
-        let parent = tip_2000(); // height 4, no bits
+        let parent = with_features(tip_2000(), 0); // height 4, no bits
         let mut app = gated_app(2_010, rsh_at(5));
         let cases: [(&str, u128, BlockDataCheck); 4] = [
             ("honest: bit from height 5", rsh, BlockDataCheck::Held),
@@ -25686,7 +25762,7 @@ mod crash_recovery_tests {
     /// child it cannot execute. RED before phase 1: voted, inserted, proposed.
     #[test]
     fn unknown_feature_bit_refuses_the_vote_insertion_and_proposal() {
-        let parent = tip_2000();
+        let parent = with_features(tip_2000(), 0); // height 4, no bits
         let mut old = gated_app(2_010, torus_types::ActivationSchedule::default());
         let newer = with_features(child_of(&parent, 2_000), UNKNOWN_BIT);
         assert_eq!(
@@ -25733,7 +25809,7 @@ mod crash_recovery_tests {
     #[test]
     fn unknown_feature_bit_at_insertion_is_an_unsupported_upgrade_not_invalid() {
         let rsh = torus_types::Feature::RunningStateHash.bit();
-        let parent = tip_2000(); // height 4, no bits
+        let parent = with_features(tip_2000(), 0); // height 4, no bits
         let mut old = gated_app(2_010, torus_types::ActivationSchedule::default());
         let link = |app: &TorusApp, block: &TorusBlock| {
             let hs_parent = hs_block(&parent, PhaseCertificate::genesis_pc());
@@ -25844,15 +25920,15 @@ mod crash_recovery_tests {
         for (bits, fails) in [(rsh, false), (UNKNOWN_BIT, true), (rsh | UNKNOWN_BIT, true)] {
             for replay in [false, true] {
                 let what = format!("bits {bits:#x}, replay={replay}");
-                let (config, db) = make_test_config_and_db();
-                assert_eq!(config.activations, Default::default(), "own schedule: none");
+                let (mut config, db) = make_test_config_and_db();
+                config.activations = Default::default(); // own schedule: none
                 let ctx = make_exec_ctx(&config, &db);
                 let mut blocks = vec![
-                    make_block(1, vec![]),
+                    with_features(make_block(1, vec![]), 0),
                     with_features(make_block(2, vec![]), bits),
                     with_features(make_block(3, vec![]), bits),
                 ];
-                link_blocks(&mut blocks);
+                link_from_genesis(&config, &mut blocks);
                 if replay {
                     for b in &blocks {
                         persist_committed_block_durably(&db, b);
@@ -25929,13 +26005,13 @@ mod crash_recovery_tests {
                 ctx.evm_executor = EvmExecutor::with_spec_rule(config.chain_id, PRAGUE_WITH_BIT_0);
                 // A native action, so block 2 builds a native context whatever its EVM part.
                 let mut blocks = vec![
-                    make_block(1, vec![]),
+                    with_features(make_block(1, vec![]), 0),
                     make_block(2, vec![sign_claim_rewards(0)]),
                 ];
                 blocks[1].evm_transactions = vec![floor_tx(&key, 0)];
                 blocks[1].header.evm_tx_count = 1;
                 blocks[1].header.features = bits;
-                link_blocks(&mut blocks);
+                link_from_genesis(&config, &mut blocks);
                 if replay {
                     for b in &blocks {
                         persist_committed_block_durably(&db, b);
@@ -40843,7 +40919,12 @@ mod crash_recovery_tests {
         probe: Option<&BlockProbe>,
         fast: Option<bool>,
     ) -> P2Run {
-        let (config, db) = p2_fixture();
+        let (mut config, db) = p2_fixture();
+        // P0.0: a fixture whose headers carry no running-hash bit runs on a
+        // chain without it (its genesis parent header has no bits).
+        if blocks.first().is_some_and(|b| b.header.features == 0) {
+            config.activations = Default::default();
+        }
         seed(&db);
         torus_state::running_hash::capture_begin(&db);
         let metrics = Arc::new(torus_telemetry::Metrics::new());
@@ -41445,9 +41526,20 @@ mod crash_recovery_tests {
     /// never closed by time is still open at shutdown.
     const L31_BLOCKS: u64 = 260;
 
-    /// The deep P2 stream (reduce-only places on) over `L31_BLOCKS` heights.
+    /// The deep P2 stream (reduce-only places on) over `L31_BLOCKS` heights,
+    /// on a chain without the running state hash (L3.1 runs only with it off;
+    /// P0.0 phase 3: the hash follows the header bit, so no header carries it
+    /// and `p2_run_full` runs them on a genesis without it).
     fn l31_blocks() -> Vec<TorusBlock> {
-        p2_blocks_len(L31_BLOCKS, true, false, true).0
+        let mut blocks: Vec<TorusBlock> = p2_blocks_len(L31_BLOCKS, true, false, true)
+            .0
+            .into_iter()
+            .map(|b| with_features(b, 0))
+            .collect();
+        let (mut config, _) = make_test_config_and_db();
+        config.activations = Default::default();
+        link_from_genesis(&config, &mut blocks);
+        blocks
     }
 
     /// The deep traders, and the running state hash NOT configured (L3.1
