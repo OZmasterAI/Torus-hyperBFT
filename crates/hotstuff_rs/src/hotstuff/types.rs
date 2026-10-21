@@ -461,10 +461,16 @@ pub fn valid_nec<K: KVStore>(
 pub(crate) fn valid_proposal_certificates<K: KVStore>(
     view: ViewNumber,
     block_hash: &CryptoHash,
+    justify: &PhaseCertificate,
     tc: Option<&TimeoutCertificate>,
     nec: Option<&NoEndorsementCertificate>,
     block_tree: &BlockTreeSingleton<K>,
 ) -> Result<bool, BlockTreeError> {
+    // EXPERIMENT strict VALIDPROPOSAL
+    if tc.is_none() && !justify.is_genesis_pc() && justify.view.int().checked_add(1) != Some(view.int()) {
+        log::warn!("EXPERIMENT strict: no TC, justify.view={} view={}", justify.view.int(), view.int());
+        return Ok(false);
+    }
     if let Some(nec) = nec {
         let over_tc_tip = tc
             .and_then(|tc| tc.high_tip.as_ref())

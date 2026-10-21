@@ -911,11 +911,14 @@ impl<N: Network> HotStuff<N> {
             self.process_update_result(update_result, block_tree, app);
             None
         };
+        let tc = block_tree
+            .highest_tc()?
+            .filter(|tc| tc.view.int().checked_add(1) == Some(self.view_info.view.int()));
         let proposal = Proposal {
             chain_id: self.config.chain_id,
             view: self.view_info.view,
             block,
-            tc: None,
+            tc,
             nec: None,
         };
         self.broadcast_proposal_as_header(&proposal, has_validator_set_updates, block_tree);
@@ -1315,6 +1318,7 @@ impl<N: Network> HotStuff<N> {
         if !valid_proposal_certificates(
             self.view_info.view,
             &proposal.block.hash,
+            &proposal.block.justify,
             proposal.tc.as_ref(),
             proposal.nec.as_ref(),
             block_tree,
@@ -2200,6 +2204,7 @@ impl<N: Network> HotStuff<N> {
         if !valid_proposal_certificates(
             header.view,
             &header.block_hash,
+            &header.justify,
             header.tc.as_ref(),
             header.nec.as_ref(),
             block_tree,
