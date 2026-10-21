@@ -160,6 +160,17 @@ impl EpochRotationPlan {
     }
 }
 
+/// The raw bytes of the installed set row (`None` before genesis records one), for callers that
+/// cache what they derive from it (dead-leader skip: the leader set).
+pub fn installed_set_raw<T: StateBackend>(state: &T) -> Result<Option<Vec<u8>>> {
+    Ok(state.get_cf_raw(CF_CONSENSUS_META, CURRENT_KEY)?)
+}
+
+/// Decode an installed set row ([`installed_set_raw`]).
+pub fn decode_plan_members(bytes: &[u8]) -> Result<Vec<PlanMember>> {
+    decode(bytes)
+}
+
 fn plan_key(boundary: u64) -> Vec<u8> {
     let mut key = PLAN_PREFIX.to_vec();
     key.extend_from_slice(&boundary.to_be_bytes());

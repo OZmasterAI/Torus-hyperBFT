@@ -189,13 +189,62 @@ pub fn quorum_power(total: u128) -> u128 {
 /// once per epoch window `(H - L, H]`); the cursor is written. Rows that would not change are not
 /// returned.
 pub fn attribution_rows<T: StateBackend>(
-    _state: &T,
-    _height: u64,
-    _epoch_length: u64,
-    _attr: &BlockAttribution,
+    state: &T,
+    height: u64,
+    epoch_length: u64,
+    attr: &BlockAttribution,
 ) -> Result<Vec<LeaderRow>> {
-    // RED stub (phase 2 test commit).
-    Ok(Vec::new())
+    // (pre-state, post-state) of every validator this block touches, in address order.
+    let mut touched: BTreeMap<[u8; 20], (LeaderStats, LeaderStats)> = BTreeMap::new();
+    fn entry<'a, T: StateBackend>(
+        touched: &'a mut BTreeMap<[u8; 20], (LeaderStats, LeaderStats)>,
+        state: &T,
+        address: &[u8; 20],
+    ) -> Result<&'a mut LeaderStats> {
+        if !touched.contains_key(address) {
+            let st = leader_stats(state, address)?;
+            touched.insert(*address, (st.clone(), st));
+        }
+        Ok(&mut touched.get_mut(address).expect("inserted").1)
+    }
+    // The gap's views come before the certified one: misses first, then the success.
+    for address in &attr.misses {
+        let st = entry(&mut touched, state, address)?;
+        st.miss_run = st.miss_run.saturating_add(1);
+    }
+    if let Some(address) = &attr.success {
+        let st = entry(&mut touched, state, address)?;
+        st.miss_run = 0;
+        st.j = 0;
+    }
+    if !attr.signers.is_empty() {
+        let index = leader_excluded_index(state)?;
+        if !index.is_empty() {
+            // A3 reads "seen in (H - L, H]" at boundary H: one record per such window.
+            let window_start = match epoch_length {
+                0 => 0,
+                l => (height.saturating_sub(1) / l) * l,
+            };
+            for address in attr.signers.iter().filter(|a| index.binary_search(a).is_ok()) {
+                let st = entry(&mut touched, state, address)?;
+                if st.seen_at.is_none_or(|seen| seen <= window_start) {
+                    st.seen_at = Some(height);
+                }
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    for (address, (before, after)) in touched {
+        if before != after {
+            rows.push((validator_key(&address), Some(encode(&after)?)));
+        }
+    }
+    if let Some(cursor) = attr.cursor {
+        if leader_cursor(state)? != Some(cursor) {
+            rows.push((CURSOR_KEY.to_vec(), Some(encode(&cursor)?)));
+        }
+    }
+    Ok(rows)
 }
 
 /// Apply `rows` to `state` (puts and deletes in `CF_CONSENSUS_META`).
@@ -216,18 +265,179 @@ impl EpochManager {
     /// exclusions of members), then with `params` (the feature on) write the plan for
     /// `height + epoch_length`: A3 re-admissions and A2 exclusions.
     pub fn execute_leader_exclusions<T: StateBackend>(
-        _staking: &StakingManager<T>,
-        _height: u64,
-        _epoch_length: u64,
-        _params: Option<DeadLeaderParams>,
+        staking: &StakingManager<T>,
+        height: u64,
+        epoch_length: u64,
+        params: Option<DeadLeaderParams>,
     ) -> Result<()> {
-        // RED stub (phase 2 test commit).
+        let state = staking.state();
+        // Kept until the next boundary executes, as the member plan: consensus may re-read
+        // plan(height) until then.
+        if height >= epoch_length {
+            let previous = lx_plan_key(height - epoch_length);
+            if state.get_cf_raw(CF_CONSENSUS_META, &previous)?.is_some() {
+                state.delete_cf_raw(CF_CONSENSUS_META, &previous)?;
+            }
+        }
+
+        // Install: the plan for `height`, else the installed exclusions of the members that
+        // stay (hotstuff drops a deleted key's exclusion with the key).
+        let members_now = staking.current_epoch_set()?.unwrap_or_default();
+        let before = installed_leader_exclusions(state)?;
+        let installed = match leader_exclusion_plan(state, height)? {
+            Some(plan) => plan.excluded,
+            None => before
+                .iter()
+                .filter(|m| {
+                    members_now
+                        .iter()
+                        .any(|x| x.address == m.address && x.pubkey == m.pubkey)
+                })
+                .copied()
+                .collect(),
+        };
+        if installed != before {
+            if installed.is_empty() {
+                state.delete_cf_raw(CF_CONSENSUS_META, LX_CURRENT_KEY)?;
+            } else {
+                state.put_cf_raw(CF_CONSENSUS_META, LX_CURRENT_KEY, &encode(&installed)?)?;
+            }
+        }
+
+        let Some(params) = params else {
+            return Ok(());
+        };
+        let next = height.saturating_add(epoch_length);
+        let Some(next_plan) = staking.epoch_rotation_plan(next)? else {
+            return Ok(());
+        };
+        let members = &next_plan.members;
+        let index = leader_excluded_index(state)?;
+        let mut lifecycle: BTreeSet<[u8; 20]> = index.iter().copied().collect();
+        let mut writes: BTreeMap<[u8; 20], LeaderStats> = BTreeMap::new();
+        let mut kept: Vec<&PlanMember> = Vec::new();
+        let mut candidates: Vec<(LeaderStats, &PlanMember)> = Vec::new();
+        let window_floor = height.saturating_sub(epoch_length);
+        for m in members {
+            let st = leader_stats(state, &m.address)?;
+            if st.excluded_at.is_some() {
+                // A3: a committed QC of (H - L, H] carried its signature, and the floor
+                // `excluded_at + L * 2^j` is reached when the re-admission takes effect.
+                let seen = st.seen_at.is_some_and(|seen| seen > window_floor);
+                if seen && next >= st.readmit_after {
+                    writes.insert(
+                        m.address,
+                        LeaderStats {
+                            excluded_at: None,
+                            readmit_after: 0,
+                            seen_at: None,
+                            ..st
+                        },
+                    );
+                    lifecycle.remove(&m.address);
+                } else {
+                    kept.push(m);
+                }
+            } else if st.miss_run >= params.miss_threshold {
+                candidates.push((st, m));
+            }
+        }
+        // A validator leaving the set leaves the exclusion lifecycle (hotstuff drops its
+        // exclusion with its key).
+        for address in &index {
+            if !members.iter().any(|m| m.address == *address) {
+                let st = leader_stats(state, address)?;
+                writes.insert(
+                    *address,
+                    LeaderStats {
+                        excluded_at: None,
+                        readmit_after: 0,
+                        seen_at: None,
+                        ..st
+                    },
+                );
+                lifecycle.remove(address);
+            }
+        }
+
+        // A2: most misses first, then by address, while the eligible power stays >= quorum.
+        candidates.sort_by(|(a, ma), (b, mb)| {
+            b.miss_run
+                .cmp(&a.miss_run)
+                .then_with(|| ma.address.cmp(&mb.address))
+        });
+        let total: u128 = members.iter().map(|m| m.power as u128).sum();
+        let quorum = quorum_power(total);
+        let mut excluded_power: u128 = kept.iter().map(|m| m.power as u128).sum();
+        let mut desired: Vec<ExcludedMember> = kept
+            .iter()
+            .map(|m| ExcludedMember {
+                address: m.address,
+                pubkey: m.pubkey,
+            })
+            .collect();
+        for (st, m) in candidates {
+            let after = excluded_power + m.power as u128;
+            if total.saturating_sub(after) < quorum {
+                continue;
+            }
+            excluded_power = after;
+            let exponent = st.j.min(params.exclusion_cap);
+            let floor = epoch_length.saturating_mul(1u64 << exponent.min(63));
+            writes.insert(
+                m.address,
+                LeaderStats {
+                    miss_run: 0,
+                    j: st.j.saturating_add(1).min(params.exclusion_cap),
+                    excluded_at: Some(next),
+                    readmit_after: next.saturating_add(floor),
+                    seen_at: None,
+                },
+            );
+            lifecycle.insert(m.address);
+            desired.push(ExcludedMember {
+                address: m.address,
+                pubkey: m.pubkey,
+            });
+        }
+        desired.sort();
+
+        for (address, st) in &writes {
+            state.put_cf_raw(CF_CONSENSUS_META, &validator_key(address), &encode(st)?)?;
+        }
+        let lifecycle: Vec<[u8; 20]> = lifecycle.into_iter().collect();
+        if lifecycle != index {
+            if lifecycle.is_empty() {
+                state.delete_cf_raw(CF_CONSENSUS_META, EXCLUDED_KEY)?;
+            } else {
+                state.put_cf_raw(CF_CONSENSUS_META, EXCLUDED_KEY, &encode(&lifecycle)?)?;
+            }
+        }
+
+        // The hotstuff delta from the set installed now to `desired` at `next`.
+        let installed_keys: BTreeSet<[u8; 32]> = installed.iter().map(|m| m.pubkey).collect();
+        let member_keys: BTreeSet<[u8; 32]> = members.iter().map(|m| m.pubkey).collect();
+        let desired_keys: BTreeSet<[u8; 32]> = desired.iter().map(|m| m.pubkey).collect();
+        let exclude: Vec<[u8; 32]> = desired_keys.difference(&installed_keys).copied().collect();
+        let readmit: Vec<[u8; 32]> = installed_keys
+            .intersection(&member_keys)
+            .filter(|k| !desired_keys.contains(*k))
+            .copied()
+            .collect();
+        if !exclude.is_empty() || !readmit.is_empty() {
+            put_leader_exclusion_plan(
+                state,
+                &LeaderExclusionPlan {
+                    boundary: next,
+                    excluded: desired,
+                    exclude,
+                    readmit,
+                },
+            )?;
+        }
         Ok(())
     }
 }
-
-#[allow(dead_code)]
-fn _unused(_: BTreeMap<u8, u8>, _: BTreeSet<u8>, _: PlanMember) {}
 
 #[cfg(test)]
 mod tests {

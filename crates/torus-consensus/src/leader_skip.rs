@@ -23,7 +23,6 @@ use hotstuff_rs::types::validator_set::ValidatorSet;
 use torus_economics::leader_stats::{
     self, BlockAttribution, LeaderCursor, LeaderRow, MAX_ATTRIBUTED_GAP,
 };
-use torus_economics::StakingManager;
 use torus_state::cf::CF_CONSENSUS_META;
 use torus_state::StateBackend;
 
@@ -141,33 +140,131 @@ impl LeaderSkipExec {
 /// A1: the attribution of a block whose justify QC is `evidence`, against `state` (the block's
 /// pre-state).
 pub fn attribute<T: StateBackend>(
-    _state: &T,
-    _evidence: &LeaderEvidence,
-    _cache: &LeaderSetCache,
+    state: &T,
+    evidence: &LeaderEvidence,
+    cache: &LeaderSetCache,
 ) -> Result<BlockAttribution, LeaderSkipError> {
-    // RED stub (phase 2 test commit).
-    Ok(BlockAttribution::default())
+    let mut attr = BlockAttribution {
+        cursor: Some(LeaderCursor {
+            view: evidence.view,
+            skip_next: evidence.phase != QC_GENERIC,
+        }),
+        ..BlockAttribution::default()
+    };
+    // The gap rule: a phased-mode QC (a validator-set update's later phases ran in views that
+    // are no leader slots) or the genesis QC attributes nothing.
+    if evidence.phase != QC_GENERIC {
+        return Ok(attr);
+    }
+    let previous = leader_stats::leader_cursor(state).map_err(fault)?;
+    let mut guard = cache.0.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(set) = LeaderSet::load(state, &mut guard)? else {
+        // No installed set (a DB not built from a genesis): nobody to attribute to.
+        return Ok(attr);
+    };
+    // A generic QC certifies a block after the last update block, so it is signed by the
+    // committed set, which is the installed set (its positions are the bitmap's).
+    if evidence.signers.len() == set.by_position.len() {
+        attr.signers = set
+            .by_position
+            .iter()
+            .zip(&evidence.signers)
+            .filter(|(_, signed)| **signed)
+            .map(|(address, _)| *address)
+            .collect();
+    }
+    match previous {
+        Some(c) if c.skip_next || evidence.view <= c.view => {}
+        Some(c) => {
+            let from = (c.view + 1).max(evidence.view.saturating_sub(MAX_ATTRIBUTED_GAP));
+            attr.misses = (from..evidence.view).map(|v| set.leader(v)).collect();
+            attr.success = Some(set.leader(evidence.view));
+        }
+        None => attr.success = Some(set.leader(evidence.view)),
+    }
+    Ok(attr)
+}
+
+fn fault(e: torus_economics::EconomicsError) -> LeaderSkipError {
+    LeaderSkipError::Fault(e.to_string())
+}
+
+impl LeaderSet {
+    /// The installed set from `state` (cached by the bytes of its two rows); `None` without one.
+    fn load<'a, T: StateBackend>(
+        state: &T,
+        slot: &'a mut Option<LeaderSet>,
+    ) -> Result<Option<&'a LeaderSet>, LeaderSkipError> {
+        let Some(members_raw) = torus_economics::epoch_plan::installed_set_raw(state).map_err(fault)?
+        else {
+            return Ok(None);
+        };
+        let excluded_raw =
+            leader_stats::installed_leader_exclusions_raw(state).map_err(fault)?;
+        let mut key = (members_raw.len() as u64).to_be_bytes().to_vec();
+        key.extend_from_slice(&members_raw);
+        key.extend_from_slice(excluded_raw.as_deref().unwrap_or_default());
+        if slot.as_ref().is_none_or(|s| s.key != key) {
+            let members =
+                torus_economics::epoch_plan::decode_plan_members(&members_raw).map_err(fault)?;
+            let excluded = leader_stats::installed_leader_exclusions(state).map_err(fault)?;
+            let mut set = ValidatorSet::new();
+            let mut address_of = HashMap::new();
+            // As consensus builds the hotstuff updates from a plan: a key that does not decode
+            // is in neither.
+            for m in &members {
+                if let Ok(vk) = VerifyingKey::from_bytes(&m.pubkey) {
+                    set.put(&vk, Power::new(m.power));
+                    address_of.insert(vk, m.address);
+                }
+            }
+            for m in &excluded {
+                if let Ok(vk) = VerifyingKey::from_bytes(&m.pubkey) {
+                    set.exclude_leader(&vk);
+                }
+            }
+            let by_position = set.validators().map(|vk| address_of[vk]).collect();
+            *slot = Some(LeaderSet {
+                key,
+                set,
+                address_of,
+                by_position,
+            });
+        }
+        let set = slot.as_ref().expect("filled above");
+        if set.set.is_empty() || set.set.total_power().int() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(set))
+    }
+
+    /// leader(view): `select_leader` over the installed set, exclusions included.
+    fn leader(&self, view: u64) -> [u8; 20] {
+        self.address_of[&select_leader(ViewNumber::new(view), &self.set)]
+    }
 }
 
 /// The leader-statistics rows of block `height` (A1) read through `state`, plus the delete of
 /// its evidence row, read from `evidence_db` (the node-local row, written at commit).
 pub fn block_leader_rows<T: StateBackend, E: StateBackend>(
-    _state: &T,
-    _evidence_db: &E,
-    _height: u64,
-    _epoch_length: u64,
-    _cache: &LeaderSetCache,
+    state: &T,
+    evidence_db: &E,
+    height: u64,
+    epoch_length: u64,
+    cache: &LeaderSetCache,
 ) -> Result<Vec<LeaderRow>, LeaderSkipError> {
-    // RED stub (phase 2 test commit).
-    Ok(Vec::new())
-}
-
-#[allow(dead_code)]
-fn _unused(_: LeaderCursor, _: Power, _: ViewNumber, _: u64) -> u64 {
-    let _ = select_leader;
-    let _ = leader_stats::leader_cursor::<torus_state::StateDb>;
-    let _: Option<StakingManager> = None;
-    MAX_ATTRIBUTED_GAP
+    let key = leader_qc_key(height);
+    let raw = evidence_db
+        .get_cf_raw(CF_CONSENSUS_META, &key)
+        .map_err(|e| LeaderSkipError::Fault(e.to_string()))?
+        .ok_or(LeaderSkipError::MissingEvidence(height))?;
+    let evidence = LeaderEvidence::try_from_slice(&raw)
+        .map_err(|e| LeaderSkipError::Fault(format!("leader evidence row {height}: {e}")))?;
+    let attr = attribute(state, &evidence, cache)?;
+    let mut rows =
+        leader_stats::attribution_rows(state, height, epoch_length, &attr).map_err(fault)?;
+    rows.push((key, None));
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -175,6 +272,7 @@ mod tests {
     use super::*;
     use alloy_primitives::Address;
     use hotstuff_rs::types::data_types::{BlockHeight, ChainID, CryptoHash, SignatureSet};
+    use torus_economics::StakingManager;
     use torus_state::StateDb;
     use torus_types::{PublicKey, ValidatorInfo};
 

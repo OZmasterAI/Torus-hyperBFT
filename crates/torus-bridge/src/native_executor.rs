@@ -5619,6 +5619,10 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// Item 7 step 2 (F3): at an epoch boundary, the EVM header values of the closing epoch (the
     /// boundary's parent header); `None` off a boundary. Set by the block pipeline.
     pub evm_fee_window: Option<torus_types::EvmHeaderValues>,
+    /// Dead-leader skip (docs/plans/dead-leader-skip.md, A2 / A3): the parameters in force for
+    /// this block (`ChainConfig::dead_leader_skip`); `None` = off: a boundary only installs an
+    /// exclusion plan already written, it writes none.
+    pub leader_skip: Option<torus_types::DeadLeaderParams>,
     /// Item 7 step 2 (F3): this block's EVM gas, `(small lane, big lane)`.
     pub evm_gas: (u64, u64),
 
@@ -6229,6 +6233,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             metrics: None,
             liq_value_sum: false,
             evm_fee_window: None,
+            leader_skip: None,
             evm_gas: (0, 0),
             fatal_error: load_error,
             reader_fault: std::sync::OnceLock::new(),
@@ -14530,6 +14535,17 @@ impl NativeExecutor {
                 ctx.evm_fee_window,
             ) {
                 Ok(new_set) => {
+                    // Dead-leader skip: install the exclusion plan for this boundary, write the
+                    // next one (after the member plans, which it reads).
+                    if let Err(e) = EpochManager::execute_leader_exclusions(
+                        &ctx.staking,
+                        ctx.block_height,
+                        ctx.epoch_length,
+                        ctx.leader_skip,
+                    ) {
+                        tracing::error!(%e, height = ctx.block_height, "leader exclusion plan failed");
+                        Self::latch_local_fault(ctx, "leader_exclusions", &e);
+                    }
                     if let Some(ref m) = ctx.metrics {
                         m.epoch_number.set(
                             EpochManager::epoch_for_block(ctx.block_height, ctx.epoch_length) as i64,
