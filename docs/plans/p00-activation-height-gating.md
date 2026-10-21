@@ -220,6 +220,14 @@ Each phase lands on its own branch with RED-first tests and full gates; each one
    new genesis, start from a fresh data dir. Bench harness: none affected (run-cell.sh starts every cell with
    `launch-3val.sh CLEAN=1`, fresh data dirs; the genesis edits (`LIQ_THIN`, cache fetch) happen before the
    launch; crash-kill restarts reuse the same file).
+   Codex review of phase 4 (3 x P2), fixed on `feat/p00-phase5`: (1) the genesis binding is checked
+   (read-only, `check_genesis_binding`) before any boot-time write: the history-retention marker and the
+   genesis writes come after it (`bind_genesis_and_retention`), so a refused start leaves the dir as it
+   was; (2) a fresh boot stores the digest (WAL-synced) before it seeds the genesis, and a dir with a
+   digest but no genesis is still bound (a crash in between no longer leaves a dir a later boot takes as
+   Legacy); (3) numbers are digested without precision loss: the file is parsed over `RawValue`, a number
+   is written as `serde_json` writes the u64 / i64 / f64 holding it exactly (unchanged digests), else as an
+   exact decimal (an integer beyond 64 bits: the literal).
 5. **Integration tests 1-4** (~2-3 d): needs a test-only feature with a state-visible rule.
 6. **Ops** (~0.5-1 d): features gauge, RPC schedule listing, upgrade runbook.
 7. **Governance `ScheduleActivation`** (before mainnet, 3-4 d) through `EpochRotationPlan`.
