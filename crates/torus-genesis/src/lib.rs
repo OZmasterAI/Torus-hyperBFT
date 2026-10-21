@@ -413,7 +413,28 @@ impl Genesis {
     /// Both alias spellings with different heights, or a built-in height that
     /// differs from the genesis one, refuse to start.
     pub fn activation_schedule(&self) -> Result<torus_types::ActivationSchedule, GenesisError> {
-        let activations = self.consensus.activations.clone();
+        use torus_types::Feature::RunningStateHash;
+        let mut activations = self.consensus.activations.clone();
+        if let Some(alias) = self.consensus.state_hash_activation_height {
+            if alias == 0 {
+                return Err(GenesisError::InvalidActivations(
+                    "state_hash_activation_height must be >= 1".into(),
+                ));
+            }
+            match activations.get(&RunningStateHash) {
+                // 0 and 1 are both block 1.
+                Some(&h) if h.max(1) != alias => {
+                    return Err(GenesisError::InvalidActivations(format!(
+                        "state_hash_activation_height = {alias} but activations.{} = {h}",
+                        RunningStateHash.name()
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    activations.insert(RunningStateHash, alias);
+                }
+            }
+        }
         torus_types::ActivationSchedule::for_chain(self.chain_id, &activations)
             .map_err(GenesisError::InvalidActivations)
     }
@@ -723,7 +744,13 @@ impl Genesis {
     }
 
     /// Build a [`ChainConfig`] from the genesis parameters.
+    ///
+    /// Panics on an activation schedule that does not merge; `from_json`
+    /// already refused such a genesis (the node does not start).
     pub fn chain_config(&self) -> ChainConfig {
+        let activations = self
+            .activation_schedule()
+            .unwrap_or_else(|e| panic!("genesis not loaded through from_json: {e}"));
         ChainConfig {
             chain_id: self.chain_id,
             chain_name: self.chain_name.clone(),
@@ -760,11 +787,11 @@ impl Genesis {
             // Node-local perf toggle; never sourced from genesis. Enabled per-node
             // via the `--exec-trust-cache` CLI flag.
             exec_trust_cache: false,
-            state_hash_activation_height: self.consensus.state_hash_activation_height,
-            // `from_json` already refused a schedule that does not merge.
-            activations: self
-                .activation_schedule()
-                .unwrap_or_else(|e| panic!("genesis not loaded through from_json: {e}")),
+            // P0.0: derived from the schedule (the old field is its alias).
+            state_hash_activation_height: activations
+                .height_of(torus_types::Feature::RunningStateHash)
+                .map(|h| h.max(1)),
+            activations,
         }
     }
 
@@ -1108,13 +1135,19 @@ mod tests {
         let none = with(&|_| {}).unwrap().chain_config();
         assert_eq!(none.activations, torus_types::ActivationSchedule::default());
 
-        let g = with(&|j| j["consensus"]["activations"] = serde_json::json!({"running_state_hash": 300}))
-            .unwrap();
+        let g = with(&|j| {
+            j["consensus"]["activations"] = serde_json::json!({"running_state_hash": 300})
+        })
+        .unwrap();
         let config = g.chain_config();
         assert_eq!(config.activations.height_of(RunningStateHash), Some(300));
         assert_eq!(config.activations.active_at(299), 0);
         assert_eq!(config.activations.active_at(300), RunningStateHash.bit());
-        assert_eq!(config.state_hash_activation_height, Some(300), "derived from the schedule");
+        assert_eq!(
+            config.state_hash_activation_height,
+            Some(300),
+            "derived from the schedule"
+        );
 
         let err = with(&|j| j["consensus"]["activations"] = serde_json::json!({"warp_drive": 3}))
             .expect_err("unknown feature name refuses to start");
@@ -1123,7 +1156,10 @@ mod tests {
         // The alias alone schedules the feature.
         let g = with(&|j| j["consensus"]["state_hash_activation_height"] = serde_json::json!(40))
             .unwrap();
-        assert_eq!(g.chain_config().activations.height_of(RunningStateHash), Some(40));
+        assert_eq!(
+            g.chain_config().activations.height_of(RunningStateHash),
+            Some(40)
+        );
         assert_eq!(g.chain_config().state_hash_activation_height, Some(40));
 
         // Both, same height: fine; different: refused.
@@ -1138,8 +1174,10 @@ mod tests {
         let err = both(40, 41).expect_err("alias conflict refuses to start");
         assert!(matches!(err, GenesisError::InvalidActivations(_)), "{err}");
         // Height 0 through the old field stays refused (it never meant block 1).
-        assert!(with(&|j| j["consensus"]["state_hash_activation_height"] = serde_json::json!(0))
-            .is_err());
+        assert!(
+            with(&|j| j["consensus"]["state_hash_activation_height"] = serde_json::json!(0))
+                .is_err()
+        );
     }
 
     /// Consensus bug (b): genesis records the hotstuff genesis set as the

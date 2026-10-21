@@ -171,7 +171,8 @@ impl BlockProposer {
                     self.epoch_length,
                 ),
                 validator_set_hash: parent.validator_set_hash,
-                features: 0,
+                // P0.0: the bits validators require at this height.
+                features: self.activations.active_at(block_height),
                 sig_attestation: [0u8; 64],
             },
             native_actions: vec![],
@@ -236,6 +237,9 @@ pub fn genesis_parent_header_for(config: &torus_types::ChainConfig) -> TorusBloc
     let mut header = genesis_parent_header(config.evm_gas_limit, config.evm_block_interval);
     header.evm_big_block_interval = config.evm_big_block_interval;
     header.evm_big_gas_limit = config.evm_big_gas_limit;
+    // P0.0: block 1's bits (features at 0 or 1), so another genesis set fails
+    // block 1's parent link.
+    header.features = config.activations.active_at(0);
     header
 }
 

@@ -81,6 +81,16 @@ pub fn builtin_activations(chain_id: u64) -> &'static [(Feature, u64)] {
         .map_or(&[], |(_, activations)| activations)
 }
 
+/// Heights 0 and 1 are both block 1 (the genesis parent header at 0 carries
+/// block 1's bits).
+const fn first_block(height: u64) -> u64 {
+    if height == 0 {
+        1
+    } else {
+        height
+    }
+}
+
 /// When each feature switches on: genesis `consensus.activations` (with the
 /// old `state_hash_activation_height` alias) united with the built-in table
 /// for the chain id. Heights 0 and 1 both mean "from block 1", and those bits
@@ -101,7 +111,19 @@ impl ActivationSchedule {
     ) -> Result<Self, String> {
         let mut heights = genesis.clone();
         for &(feature, height) in builtin {
-            heights.entry(feature).or_insert(height);
+            match heights.get(&feature) {
+                Some(&g) if first_block(g) != first_block(height) => {
+                    return Err(format!(
+                        "feature {} is at height {g} in the genesis and at {height} in this \
+                         binary's built-in table",
+                        feature.name()
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    heights.insert(feature, height);
+                }
+            }
         }
         Ok(Self { heights })
     }
@@ -113,8 +135,12 @@ impl ActivationSchedule {
 
     /// The bitmap a header at `height` must carry. Height 0 (the genesis parent
     /// header) carries the bits of block 1.
-    pub fn active_at(&self, _height: u64) -> u128 {
-        0
+    pub fn active_at(&self, height: u64) -> u128 {
+        let height = first_block(height);
+        self.heights
+            .iter()
+            .filter(|(_, at)| first_block(**at) <= height)
+            .fold(0, |bits, (feature, _)| bits | feature.bit())
     }
 
     /// The scheduled height of `feature` as configured (None = never).

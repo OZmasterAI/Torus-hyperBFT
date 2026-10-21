@@ -633,6 +633,8 @@ impl TorusBlockHeader {
         buf.extend_from_slice(&self.big_base_fee_per_gas.to_be_bytes());
         buf.extend_from_slice(&self.epoch.to_be_bytes());
         buf.extend_from_slice(self.validator_set_hash.as_slice());
+        // P0.0: the feature bits are agreed per block (`check_parent_link`).
+        buf.extend_from_slice(&self.features.to_be_bytes());
         buf
     }
 

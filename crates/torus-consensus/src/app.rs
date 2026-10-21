@@ -3087,6 +3087,44 @@ fn datum_evm_transactions(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
     }
 }
 
+/// P0.0: the feature-bit rule at execution (live and crash replay) of a
+/// committed block. Execution runs by the header's bits, never this node's
+/// schedule, so history replays under the rules it was agreed under:
+/// - a bit outside `KNOWN_FEATURES` (a newer release's feature): log
+///   `UPGRADE REQUIRED`, latch the fail-stop and return `true` (the caller
+///   executes and flushes nothing; the applied height stays below it);
+/// - known bits that differ from `schedule.active_at(height)` (another binary
+///   moved a height): log ERROR, return `false` (execute by the header).
+fn feature_bits_fail_stop(
+    header: &TorusBlockHeader,
+    schedule: &torus_types::ActivationSchedule,
+    exec_failed: &std::sync::atomic::AtomicBool,
+) -> bool {
+    if let Some(id) = torus_types::features::first_unknown_feature(header.features) {
+        tracing::error!(
+            height = header.height,
+            feature = id,
+            features = header.features,
+            "UPGRADE REQUIRED: feature {id} at {} -- this binary cannot execute the committed \
+             block (fail-stop)",
+            header.height
+        );
+        exec_failed.store(true, Ordering::SeqCst);
+        return true;
+    }
+    let own = schedule.active_at(header.height);
+    if header.features != own {
+        tracing::error!(
+            height = header.height,
+            features = header.features,
+            own_schedule = own,
+            "committed header feature bits differ from this node's activation schedule -- \
+             executing by the header"
+        );
+    }
+    false
+}
+
 /// s84 decision 2: the link a block's torus header must have to its parent's
 /// before a replica votes for the block or inserts it: `height` = parent
 /// height + 1 and `parent_hash` = keccak of the parent's canonical header
@@ -3105,6 +3143,10 @@ fn datum_evm_transactions(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
 /// where they equal the epoch plan's values (`boundary`, `PlanEvm::resolve`;
 /// an unset value or no plan: the parent's). A plan this node cannot read yet
 /// is `Missing`, like the validator-set plan in `finish_validate`.
+///
+/// P0.0: the header's `features` equal `schedule.active_at(height)` (this
+/// node's activation schedule); a bit outside `KNOWN_FEATURES` is refused with
+/// `UPGRADE REQUIRED`.
 fn check_parent_link(
     header: &TorusBlockHeader,
     justify: &PhaseCertificate,
@@ -3142,6 +3184,30 @@ fn check_parent_link(
             claimed_parent = %header.parent_hash,
             expected_parent = %expected,
             "REJECTED -- header does not link to its parent block's header (ancestry violation)"
+        );
+        return BlockDataCheck::Invalid;
+    }
+    // P0.0: the feature bits are this node's schedule at this height. A bit this binary does not
+    // know is a newer release's feature: no vote, no insertion (owner decision: an old binary
+    // stops). After the link check, so a bogus height is Invalid first.
+    if let Some(id) = torus_types::features::first_unknown_feature(header.features) {
+        tracing::error!(
+            height = header.height,
+            feature = id,
+            features = header.features,
+            "UPGRADE REQUIRED: feature {id} at {} -- refusing a header with a feature this binary \
+             does not know",
+            header.height
+        );
+        return BlockDataCheck::Invalid;
+    }
+    let want = schedule.active_at(header.height);
+    if header.features != want {
+        tracing::warn!(
+            height = header.height,
+            features = header.features,
+            expected = want,
+            "REJECTED -- header feature bits differ from this node's activation schedule"
         );
         return BlockDataCheck::Invalid;
     }
@@ -4284,6 +4350,12 @@ impl ExecutionContext {
             &self.genesis_header,
             &self.exec_failed,
         ) {
+            return;
+        }
+
+        // P0.0: execution runs by the committed header's bits (crash replay
+        // too). A bit this binary does not know: fail-stop BEFORE executing.
+        if feature_bits_fail_stop(&torus_block.header, &self.activations, &self.exec_failed) {
             return;
         }
 
@@ -9627,6 +9699,17 @@ impl TorusApp {
         parent_header: TorusBlockHeader,
         ancestry: &dyn ProposalAncestry,
     ) -> ProduceBlockResponse {
+        // P0.0: a parent carrying a feature this binary does not know cannot be
+        // executed here; refuse to build on it (owner decision: an old binary stops).
+        if let Some(id) = torus_types::features::first_unknown_feature(parent_header.features) {
+            tracing::error!(
+                parent_height = parent_header.height,
+                feature = id,
+                "UPGRADE REQUIRED: feature {id} at {} -- refusing to propose on it",
+                parent_header.height
+            );
+            return refused_proposal();
+        }
         // Bug (b): a planned boundary block needs this node's execution at the
         // previous boundary — check before touching the mempool.
         let next_height = parent_header.height + 1;
@@ -9741,7 +9824,8 @@ impl TorusApp {
                 big_base_fee_per_gas: evm.big_base_fee,
                 epoch: parent_header.epoch,
                 validator_set_hash: parent_header.validator_set_hash,
-                features: 0,
+                // P0.0: the bits every voter requires at this height (`check_parent_link`).
+                features: self.activations.active_at(next_height),
                 sig_attestation,
             },
             native_actions,
@@ -25359,29 +25443,61 @@ mod crash_recovery_tests {
         let mut app = gated_app(2_010, rsh_at(5));
         let cases: [(&str, u128, BlockDataCheck); 4] = [
             ("honest: bit from height 5", rsh, BlockDataCheck::Held),
-            ("bit missing at the activation height", 0, BlockDataCheck::Invalid),
-            ("extra unknown bit", rsh | UNKNOWN_BIT, BlockDataCheck::Invalid),
+            (
+                "bit missing at the activation height",
+                0,
+                BlockDataCheck::Invalid,
+            ),
+            (
+                "extra unknown bit",
+                rsh | UNKNOWN_BIT,
+                BlockDataCheck::Invalid,
+            ),
             ("only an unknown bit", UNKNOWN_BIT, BlockDataCheck::Invalid),
         ];
         for (what, features, want) in cases {
             let b5 = with_features(child_of(&parent, 2_000), features);
             assert_eq!(pre_vote(&mut app, &parent, &b5), want, "pre-vote: {what}");
-            assert_eq!(insertion_link(&app, &parent, &b5), want, "insertion: {what}");
+            assert_eq!(
+                insertion_link(&app, &parent, &b5),
+                want,
+                "insertion: {what}"
+            );
         }
         // Past H the bit stays on.
         let b5 = with_features(child_of(&parent, 2_000), rsh);
         for (features, want) in [(rsh, BlockDataCheck::Held), (0, BlockDataCheck::Invalid)] {
             let b6 = with_features(child_of(&b5, 2_000), features);
-            assert_eq!(pre_vote(&mut app, &b5, &b6), want, "height 6, bits {features}");
-            assert_eq!(insertion_link(&app, &b5, &b6), want, "height 6 insertion, bits {features}");
+            assert_eq!(
+                pre_vote(&mut app, &b5, &b6),
+                want,
+                "height 6, bits {features}"
+            );
+            assert_eq!(
+                insertion_link(&app, &b5, &b6),
+                want,
+                "height 6 insertion, bits {features}"
+            );
         }
         // One height early (the voter schedules it at 6): refused.
         let mut later = gated_app(2_010, rsh_at(6));
         let early = with_features(child_of(&parent, 2_000), rsh);
-        assert_eq!(pre_vote(&mut later, &parent, &early), BlockDataCheck::Invalid, "early");
-        assert_eq!(insertion_link(&later, &parent, &early), BlockDataCheck::Invalid, "early");
+        assert_eq!(
+            pre_vote(&mut later, &parent, &early),
+            BlockDataCheck::Invalid,
+            "early"
+        );
+        assert_eq!(
+            insertion_link(&later, &parent, &early),
+            BlockDataCheck::Invalid,
+            "early"
+        );
         let on_time = child_of(&parent, 2_000);
-        assert_eq!(pre_vote(&mut later, &parent, &on_time), BlockDataCheck::Held, "below H");
+        assert_eq!(
+            pre_vote(&mut later, &parent, &on_time),
+            BlockDataCheck::Held,
+            "below H"
+        );
     }
 
     /// P0.0, owner decision (open question 4): an old binary stops at a
@@ -25394,8 +25510,16 @@ mod crash_recovery_tests {
         let parent = tip_2000();
         let mut old = gated_app(2_010, torus_types::ActivationSchedule::default());
         let newer = with_features(child_of(&parent, 2_000), UNKNOWN_BIT);
-        assert_eq!(pre_vote(&mut old, &parent, &newer), BlockDataCheck::Invalid, "no vote");
-        assert_eq!(insertion_link(&old, &parent, &newer), BlockDataCheck::Invalid, "no insert");
+        assert_eq!(
+            pre_vote(&mut old, &parent, &newer),
+            BlockDataCheck::Invalid,
+            "no vote"
+        );
+        assert_eq!(
+            insertion_link(&old, &parent, &newer),
+            BlockDataCheck::Invalid,
+            "no insert"
+        );
         assert_eq!(
             pre_vote(&mut old, &parent, &child_of(&parent, 2_000)),
             BlockDataCheck::Held,
@@ -25403,10 +25527,19 @@ mod crash_recovery_tests {
         );
 
         let resp = old.build_proposal(parent.header.clone());
-        assert!(!resp.data.vec().is_empty(), "control: a known parent gets a proposal");
+        assert!(
+            !resp.data.vec().is_empty(),
+            "control: a known parent gets a proposal"
+        );
         let resp = old.build_proposal(newer.header.clone());
-        assert!(resp.data.vec().is_empty(), "parent with an unknown bit: refused proposal");
-        assert!(!old.pending_proposals.contains_key(&6), "nothing built on it");
+        assert!(
+            resp.data.vec().is_empty(),
+            "parent with an unknown bit: refused proposal"
+        );
+        assert!(
+            !old.pending_proposals.contains_key(&6),
+            "nothing built on it"
+        );
     }
 
     /// P0.0: the proposer stamps the schedule's bits, the genesis parent header
@@ -25453,7 +25586,10 @@ mod crash_recovery_tests {
         let mut parent = make_block(1, vec![]);
         parent.header.timestamp = unix_now_secs();
         let _ = at_3.build_proposal(parent.header.clone());
-        assert_eq!(at_3.pending_proposals[&2].block.header.features, 0, "height 2");
+        assert_eq!(
+            at_3.pending_proposals[&2].block.header.features, 0,
+            "height 2"
+        );
     }
 
     /// P0.0 replay rule: execution and crash replay run each committed block

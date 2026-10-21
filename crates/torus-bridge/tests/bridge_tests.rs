@@ -348,7 +348,10 @@ fn proposer_and_genesis_header_carry_the_scheduled_feature_bits() {
         .unwrap()
     };
     let genesis_later = torus_bridge::genesis_parent_header_for(&config);
-    assert_eq!(genesis_later.features, 0, "feature at 2: not in the genesis parent header");
+    assert_eq!(
+        genesis_later.features, 0,
+        "feature at 2: not in the genesis parent header"
+    );
     config.activations = at(1);
     let genesis_block1 = torus_bridge::genesis_parent_header_for(&config);
     assert_eq!(genesis_block1.features, Feature::RunningStateHash.bit());
@@ -369,7 +372,11 @@ fn proposer_and_genesis_header_carry_the_scheduled_feature_bits() {
         .build_block(&db, &executor, &b1.header, vec![], 2, Address::ZERO)
         .unwrap()
         .block;
-    assert_eq!(b2.header.features, Feature::RunningStateHash.bit(), "height 2");
+    assert_eq!(
+        b2.header.features,
+        Feature::RunningStateHash.bit(),
+        "height 2"
+    );
 }
 
 // 5. Multi-block chain — state carries forward
