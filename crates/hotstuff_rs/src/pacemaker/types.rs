@@ -94,7 +94,7 @@ impl TimeoutCertificate {
             None => max_qc.is_none(),
         };
         let winner = match (&self.high_tip, &self.high_qc) {
-            (Some(tip), Some(qc)) => tip.view > qc.view,
+            (Some(tip), Some(qc)) => tip.view >= qc.view,
             (Some(_), None) => true,
             _ => false,
         };

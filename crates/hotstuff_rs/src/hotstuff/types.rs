@@ -433,19 +433,16 @@ pub fn valid_nec<K: KVStore>(
     }
 
     // Condition 2: verify 2f+1 valid signatures.
-    // FIX CONS-FIND-15: During validator set transition, validate against the
-    // validator set that was active when the NEC was produced. The previous code
-    // had a dead branch returning committed_validator_set() in both cases.
+    // During a validator-set change (update committed, not yet decided) both
+    // sets are active, as for TCs (`TimeoutCertificate::is_correct`): the
+    // leader's NE collector uses the committed set, so an honest NEC is signed
+    // by it, and an NEC from the previous set is also accepted. CONS-FIND-15
+    // first checked only the committed set, then only the previous set; the
+    // latter rejected every honest NEC in that window.
     let validator_set_state = block_tree.validator_set_state()?;
-    let validator_set = if validator_set_state.update_decided() {
-        validator_set_state.committed_validator_set()
-    } else {
-        // During transition, use the previous validator set (the one that was
-        // active when the NEC was produced).
-        validator_set_state.previous_validator_set()
-    };
-
-    Ok(is_nec_correctly_signed(nec, validator_set))
+    Ok(is_nec_correctly_signed(nec, validator_set_state.committed_validator_set())
+        || (!validator_set_state.update_decided()
+            && is_nec_correctly_signed(nec, validator_set_state.previous_validator_set())))
 }
 
 /// VALIDPROPOSAL's certificate part: whether the TC and NEC a proposal for

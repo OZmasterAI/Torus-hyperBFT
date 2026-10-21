@@ -2198,7 +2198,7 @@ impl<N: Network> HotStuff<N> {
         // The TC/NEC the header carries: the same check as the full-proposal
         // path (re-proposals and NEC proposals travel header-first).
         if !valid_proposal_certificates(
-            header.view,
+            self.view_info.view,
             &header.block_hash,
             header.tc.as_ref(),
             header.nec.as_ref(),
