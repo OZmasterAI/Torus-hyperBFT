@@ -61,6 +61,12 @@ All metrics are prefixed with `torus_`:
 | `torus_liquidation_adl_dust` | Gauge | Cumulative (since start) escrow dust swept to the liquidator vault, signed tokens; each sweep logs `liquidation: ADL escrow dust to the vault` (error line at ≥ 1 token) |
 | `torus_liquidation_adl_pairing` | Gauge | Cumulative (since start) liquidator-vault amounts of escrow-vs-escrow pairings (real counterparties exhausted), signed tokens; each logs `liquidation: ADL escrow pairing` |
 | `torus_liquidation_value_sum` | Gauge | Proof-only, `TORUS_LIQ_VALUE_SUM=1`: Σ over all accounts of available + order margin + UPnL at the step's marks (tokens), after each step, also logged as `liquidation: value sum` (height, value_sum). Walks every balance and position row per native block: off in production |
+| `torus_exec_evm_blocks_total` | Counter | Executed blocks with EVM txs, on either path (an all-skipped EVM section included); node-local |
+| `torus_exec_evm_fast_path_blocks_total` | Counter | Blocks with EVM txs executed pipelined (`TORUS_EVM_FAST_PATH` with the exec pipeline; no drain). Divided by `torus_exec_evm_blocks_total`: the pipelined share at EVM heights. 0 with the flag off |
+| `torus_exec_evm_idle_before_seconds` | Histogram | Per EVM block: the exec thread's time from the previous block's end to this block's execution start, its drain (forced checkpoint + flush-worker wait) included; also the wait for the block when execution is caught up |
+| `torus_exec_evm_block_seconds` | Histogram | `torus_exec_block_seconds` of the blocks with EVM txs only (exec time at EVM heights vs the rest) |
+| `torus_exec_evm_seconds` | Histogram | The EVM section on the exec thread (validate, plus on the serial path the bundle commit and block metadata), observed every block |
+| `torus_flush_worker_evm_trie_seconds` | Histogram | The flush worker's EVM trie step (hashed mirror + trie nodes) per fast-path EVM block at interval 0, or per checkpoint whose window holds one. Never observed with `TORUS_EVM_FAST_PATH` off (the EVM root runs on the exec thread) |
 | `torus_peers_connected` | Gauge | Number of connected P2P peers |
 | `torus_db_size_bytes` | Gauge | Total RocksDB data directory size in bytes |
 

@@ -10,11 +10,15 @@ pub mod corewriter_tx;
 pub mod db;
 pub mod erasure;
 pub mod error;
+pub mod evm_block_state;
 pub mod incremental;
 pub mod native_da;
 pub mod native_trie;
 pub mod nonce_window;
 pub mod overlay;
+/// Item 7 option 0 step 0: test-only overlay read probes (`test-probes`).
+#[cfg(feature = "test-probes")]
+pub mod probes;
 pub mod pruner;
 pub mod read_view;
 pub mod resident_rows;
@@ -26,6 +30,8 @@ pub mod spawn_count;
 pub mod trade_rows;
 pub mod trie;
 pub mod trie_cursor;
+/// Item 7 option 0 (task 1.6): the raw-DB tripwire (debug / test-probes builds).
+pub mod tripwire;
 
 pub use backend::{
     AtomicWriteOp, FrozenPending, HashExtras, NativeFlushStats, NativeStateOverlay,
@@ -38,6 +44,7 @@ pub use db::{
     RocksdbTickers, StateDb, CONSENSUS_DB_CFS, CONSENSUS_DB_DIR,
 };
 pub use error::StateError;
+pub use evm_block_state::{EvmBlockState, LayeredEvmDb};
 pub use native_da::{
     DaGcHistory, DaGcHoldReason, DaGcLimits, DaGcOutcome, DaGcPassStats, DaReadTiming,
     NativeDaStore, NoDaGcHistory,

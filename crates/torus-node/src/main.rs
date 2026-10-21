@@ -1076,6 +1076,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let state_db_for_handler = state_db.clone();
     let mempool_for_handler = mempool.clone();
     let metrics_for_handler = metrics.clone();
+    // Item 7 option 0 (task 4.1, decision 2): with `TORUS_EVM_FAST_PATH` the commit prune
+    // reads the published ingress view; without it today's raw-DB prune (read once here, as
+    // the exec context reads it once at construction).
+    let prune_on_view = torus_consensus::exec_pipeline::evm_fast_path_enabled();
     let latest_height_shared = Arc::new(std::sync::atomic::AtomicU64::new(find_latest_height(
         &state_db,
     )));
@@ -1196,6 +1200,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             prune_committed_after_commit(
                 &state_db_for_handler,
                 &mempool_for_handler,
+                prune_on_view,
                 Some(&metrics_for_handler),
             );
             head_publisher.publish_up_to(height);
@@ -1947,16 +1952,26 @@ fn install_fail_stop_panic_hook(exit: fn(i32)) {
 fn prune_committed_after_commit(
     state_db: &StateDb,
     mempool: &Mempool,
+    prune_on_view: bool,
     metrics: Option<&torus_telemetry::Metrics>,
 ) {
     let timer = std::time::Instant::now();
-    let executed = state_db
-        .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
-        .ok()
-        .flatten()
-        .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
-        .map_or(0, u64::from_be_bytes);
-    mempool.prune_committed_txs(executed);
+    if prune_on_view {
+        // Item 7 option 0 (task 4.1, R9): the view's height, then its nonces, through
+        // one handle (the DB marker and DB nonces when no view is published).
+        mempool.prune_committed_txs_on_view();
+    } else {
+        // Item 7 step 2 (decision 7): the raw DB's applied marker (absent = 0), read
+        // before the state nonces the prune reads from the same DB. Not `height`: the
+        // header row is written at commit, before execution.
+        let executed = state_db
+            .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
+            .ok()
+            .flatten()
+            .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+            .map_or(0, u64::from_be_bytes);
+        mempool.prune_committed_txs(executed);
+    }
     if let Some(m) = metrics {
         m.commit_handler_prune_seconds
             .observe(timer.elapsed().as_secs_f64());
@@ -2054,18 +2069,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = StateDb::open(dir.path()).unwrap();
         state
-            .put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &3u64.to_be_bytes())
+            .put_cf_raw(
+                CF_CONSENSUS_META,
+                META_NATIVE_APPLIED_HEIGHT,
+                &3u64.to_be_bytes(),
+            )
             .unwrap();
         let mempool = Mempool::new(state.clone(), MempoolConfig::default());
         let metrics = torus_telemetry::Metrics::new();
-        prune_committed_after_commit(&state, &mempool, Some(&metrics));
+        prune_committed_after_commit(&state, &mempool, false, Some(&metrics));
         let text = metrics.encode();
         assert!(
             text.contains("torus_commit_handler_prune_seconds_count 1"),
             "one prune observation per handler call:\n{text}"
         );
         // Metrics are optional (no panic, nothing to observe).
-        prune_committed_after_commit(&state, &mempool, None);
+        prune_committed_after_commit(&state, &mempool, false, None);
+        // The option 0 view prune (no view published: the DB marker) is timed too.
+        prune_committed_after_commit(&state, &mempool, true, Some(&metrics));
+        let text = metrics.encode();
+        assert!(
+            text.contains("torus_commit_handler_prune_seconds_count 2"),
+            "the view prune is timed as well:\n{text}"
+        );
     }
 
     /// Section 71.8 option A: the graceful stop flushes the consensus DB's

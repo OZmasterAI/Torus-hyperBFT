@@ -226,6 +226,7 @@ impl StateBackend for StateDb {
 
     /// Pinned get: the value stays in RocksDB's block, only its length is read.
     fn get_cf_len(&self, cf: &str, key: &[u8]) -> Result<Option<usize>, StateError> {
+        crate::tripwire::check("get_cf_len");
         let db = self.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -240,6 +241,7 @@ impl StateBackend for StateDb {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        crate::tripwire::check("iterate_cf_prefix_from");
         let mut out = Vec::new();
         if limit == 0 {
             return Ok(out);
@@ -275,6 +277,7 @@ impl StateBackend for StateDb {
         cf: &str,
         prefix: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        crate::tripwire::check("iterate_cf");
         let db = self.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -309,6 +312,7 @@ impl StateBackend for StateDb {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        crate::tripwire::check("iterate_cf_from");
         let mut out = Vec::new();
         if limit == 0 {
             return Ok(out);
@@ -331,6 +335,7 @@ impl StateBackend for StateDb {
     /// First key at/after `prefix` only (keys are sorted: if it does not
     /// start with `prefix`, none does).
     fn prefix_exists(&self, cf: &str, prefix: &[u8]) -> Result<bool, StateError> {
+        crate::tripwire::check("prefix_exists");
         let db = self.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -1172,6 +1177,14 @@ impl FrozenPending {
         })
     }
 
+    /// Item 7 option 0 (task 2.2): this set's row for `(cf, key)`:
+    /// `Some(Some(v))` a write, `Some(None)` a tombstone, `None` untouched
+    /// (or an unregistered CF). Hash extras excluded.
+    pub fn lookup_row(&self, cf: &str, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        let id = intern_cf(cf)?;
+        self.state.lookup(id, key).map(|v| v.map(<[u8]>::to_vec))
+    }
+
     /// Number of pending writes + tombstones in this set.
     pub fn entry_count(&self) -> usize {
         self.state
@@ -1267,8 +1280,36 @@ impl FrozenPending {
         member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
         memo: Option<&mut crate::running_hash::ChainMemo>,
     ) -> Result<NativeFlushStats, StateError> {
-        flush_pending_after_batch(
+        self.flush_on_worker_after_batch(
             WriteBatch::default(),
+            sidecar,
+            target,
+            applied_height,
+            trie_cache,
+            member_cache,
+            memo,
+        )
+    }
+
+    /// Item 7 option 0 (task 2.2): [`Self::flush_on_worker`] whose batch
+    /// starts with `prefix` (the flush worker's EVM trie step: the hashed
+    /// mirror and the trie nodes, `crate::incremental::EvmWindowDelta`).
+    /// `CF_HASHED_*` / `CF_TRIE_*` are never in a pending set, so the order
+    /// is free; the prefix is neither digested nor a native-root input. An
+    /// empty prefix is exactly [`Self::flush_on_worker`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn flush_on_worker_after_batch(
+        &self,
+        prefix: WriteBatch,
+        sidecar: Option<&FrozenPending>,
+        target: &StateDb,
+        applied_height: Option<u64>,
+        trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
+        member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
+        memo: Option<&mut crate::running_hash::ChainMemo>,
+    ) -> Result<NativeFlushStats, StateError> {
+        flush_pending_after_batch(
+            prefix,
             &self.state,
             sidecar.map(|s| &s.state),
             target,
@@ -1369,6 +1410,16 @@ pub struct NativeStateOverlay {
     /// Item 6 Phase 3: the checkpoint in flight C (handed to the flush worker,
     /// not durable yet), read after L and before the DB.
     inflight: Option<Arc<crate::checkpoint_layer::CheckpointLayer>>,
+    /// Item 7 option 0 step 0 (test-only `test-probes`): the layers a planted
+    /// fault makes this overlay's reads skip (none without a probe).
+    #[cfg(feature = "test-probes")]
+    skip: crate::probes::Skip,
+    /// Item 7 option 0 (step 3, test-only): the planted enqueue bypass
+    /// (`Plant::BypassEnqueue`, plan 5.4) of a journal: its CF_FEE_CONFIG /
+    /// CF_CORE_WRITER_QUEUE reads skip the layers (own pending, then the
+    /// raw DB, tripping the armed tripwire).
+    #[cfg(feature = "test-probes")]
+    bypass_enqueue: bool,
 }
 
 impl std::fmt::Debug for NativeStateOverlay {
@@ -1389,6 +1440,11 @@ fn resident_slot_of(id: CfId) -> Option<usize> {
         .iter()
         .position(|x| *x == id)
 }
+
+/// `test-probes`: one frozen layer's effective rows (key, value; `None` = a
+/// tombstone), see `NativeStateOverlay::effective_rows`.
+#[cfg(feature = "test-probes")]
+type LayerRows<'a> = Vec<(&'a [u8], Option<&'a [u8]>)>;
 
 impl NativeStateOverlay {
     pub fn new(db: StateDb) -> Self {
@@ -1434,7 +1490,57 @@ impl NativeStateOverlay {
             layer,
             deferred,
             inflight,
+            #[cfg(feature = "test-probes")]
+            skip: crate::probes::skip(),
+            #[cfg(feature = "test-probes")]
+            bypass_enqueue: false,
         }
+    }
+
+    /// Item 7 option 0 (task 1.5): a fresh overlay over this one's DB and
+    /// frozen layers (parent, L in its two parts, C), with an empty pending
+    /// set of its own and WITHOUT the resident rows R: the block's
+    /// writer-precompile journal ([`crate::EvmBlockState`]). Clones the layer
+    /// handles (no rows are copied).
+    pub fn journal_over_layers(&self) -> Self {
+        Self {
+            db: self.db.clone(),
+            pending: Arc::new(RwLock::new(PendingState::new())),
+            parent: self.parent.clone(),
+            resident: None,
+            layer: self.layer.clone(),
+            deferred: self.deferred.clone(),
+            inflight: self.inflight.clone(),
+            #[cfg(feature = "test-probes")]
+            skip: self.skip,
+            #[cfg(feature = "test-probes")]
+            bypass_enqueue: crate::probes::planted(crate::probes::Plant::BypassEnqueue),
+        }
+    }
+
+    /// `test-probes` (plan 5.4, `Plant::BypassEnqueue`): for a planted
+    /// journal's enqueue CFs, the same overlay without its layers (own
+    /// pending, then the DB); the bypass's own entry trips an armed
+    /// tripwire like a raw `StateDb` read.
+    #[cfg(feature = "test-probes")]
+    fn enqueue_bypass(&self, cf: &str) -> Option<Self> {
+        if !self.bypass_enqueue
+            || !(cf == crate::cf::CF_FEE_CONFIG || cf == crate::cf::CF_CORE_WRITER_QUEUE)
+        {
+            return None;
+        }
+        crate::tripwire::check_planted("planted enqueue bypass");
+        Some(Self {
+            db: self.db.clone(),
+            pending: self.pending.clone(),
+            parent: None,
+            resident: None,
+            layer: None,
+            deferred: None,
+            inflight: None,
+            skip: self.skip,
+            bypass_enqueue: false,
+        })
     }
 
     #[cfg(test)]
@@ -1458,10 +1564,31 @@ impl NativeStateOverlay {
     #[inline]
     fn lower(&self, id: CfId) -> Result<[Option<&PendingState>; 3], StateError> {
         Ok([
-            self.parent.as_deref().map(|p| &p.state),
+            self.parent_for_reads().map(|p| &p.state),
             self.layer_for(id)?,
-            self.inflight.as_deref().map(|c| c.pending_state()),
+            self.inflight_for_reads().map(|c| c.pending_state()),
         ])
+    }
+
+    /// The parent layer as reads see it (a `test-probes` planted fault can
+    /// hide it; the field itself is untouched).
+    #[inline]
+    fn parent_for_reads(&self) -> Option<&FrozenPending> {
+        #[cfg(feature = "test-probes")]
+        if self.skip.parent {
+            return None;
+        }
+        self.parent.as_deref()
+    }
+
+    /// C as reads see it (see [`Self::parent_for_reads`]).
+    #[inline]
+    fn inflight_for_reads(&self) -> Option<&crate::checkpoint_layer::CheckpointLayer> {
+        #[cfg(feature = "test-probes")]
+        if self.skip.checkpoint {
+            return None;
+        }
+        self.inflight.as_deref()
     }
 
     /// L as CF `id` sees it: for a deferred CF (with L split) the deferred
@@ -1469,6 +1596,13 @@ impl NativeStateOverlay {
     #[inline]
     fn layer_for(&self, id: CfId) -> Result<Option<&PendingState>, StateError> {
         match &self.deferred {
+            #[cfg(feature = "test-probes")]
+            Some(_)
+                if self.skip.deferred
+                    && crate::checkpoint_layer::is_deferred_slot(id.0 as usize) =>
+            {
+                Ok(None)
+            }
             Some(d) if crate::checkpoint_layer::is_deferred_slot(id.0 as usize) => {
                 d.read().map(|l| Some(l.pending_state())).ok_or_else(|| {
                     StateError::Io(std::io::Error::other(
@@ -1486,14 +1620,273 @@ impl NativeStateOverlay {
     /// deferred part still being merged (Codex P3, p3 merge wait r1).
     #[inline]
     fn lookup_lower(&self, id: CfId, key: &[u8]) -> Result<Option<Option<&[u8]>>, StateError> {
-        if let Some(hit) = self.parent.as_deref().and_then(|p| p.state.lookup(id, key)) {
+        self.lookup_lower_as::<false>(id, key)
+    }
+
+    /// [`Self::lookup_lower`] for a caller that observes `LEN`gths only
+    /// (`get_cf_len`): the `test-probes` counters then compare lengths, so a
+    /// layer row of the DB row's length counts as a hit, not in flight
+    /// (Codex round 2 P2 on 84ce3a57). The answer is the same either way.
+    #[inline]
+    fn lookup_lower_as<const LEN: bool>(
+        &self,
+        id: CfId,
+        key: &[u8],
+    ) -> Result<Option<Option<&[u8]>>, StateError> {
+        if let Some(hit) = self
+            .parent_for_reads()
+            .and_then(|p| p.state.lookup(id, key))
+        {
+            #[cfg(feature = "test-probes")]
+            self.probe_point::<LEN>(id, key, crate::probes::Layer::Parent, hit);
             return Ok(Some(hit));
         }
-        let rest = [
-            self.layer_for(id)?,
-            self.inflight.as_deref().map(|c| c.pending_state()),
-        ];
-        Ok(rest.into_iter().flatten().find_map(|l| l.lookup(id, key)))
+        if let Some(hit) = self.layer_for(id)?.and_then(|l| l.lookup(id, key)) {
+            #[cfg(feature = "test-probes")]
+            self.probe_point::<LEN>(id, key, self.l_tag(id), hit);
+            return Ok(Some(hit));
+        }
+        let hit = self
+            .inflight_for_reads()
+            .and_then(|c| c.pending_state().lookup(id, key));
+        #[cfg(feature = "test-probes")]
+        if let Some(hit) = hit {
+            self.probe_point::<LEN>(id, key, crate::probes::Layer::Checkpoint, hit);
+        }
+        Ok(hit)
+    }
+
+    /// `test-probes`: L's tag for CF `id` (main, or the deferred part).
+    #[cfg(feature = "test-probes")]
+    fn l_tag(&self, id: CfId) -> crate::probes::Layer {
+        if self.deferred.is_some() && crate::checkpoint_layer::is_deferred_slot(id.0 as usize) {
+            crate::probes::Layer::LDeferred
+        } else {
+            crate::probes::Layer::LMain
+        }
+    }
+
+    /// `test-probes`: count a point read `layer` answered with `hit`
+    /// (`None`: a tombstone); in flight iff the DB answers otherwise now,
+    /// in what the caller observes: the bytes, or with `LEN` the length.
+    #[cfg(feature = "test-probes")]
+    fn probe_point<const LEN: bool>(
+        &self,
+        id: CfId,
+        key: &[u8],
+        layer: crate::probes::Layer,
+        hit: Option<&[u8]>,
+    ) {
+        crate::probes::record_point(
+            id.name(),
+            key,
+            layer,
+            || hit.is_some(),
+            || {
+                let db = self.db.get_cf_raw(id.name(), key).ok().flatten();
+                if LEN {
+                    db.as_deref().map(<[u8]>::len) != hit.map(<[u8]>::len)
+                } else {
+                    db.as_deref() != hit
+                }
+            },
+        );
+    }
+
+    /// `test-probes`: the probe tags of `lower`'s slots (parent, L, C).
+    #[cfg(feature = "test-probes")]
+    fn lower_tags(&self, id: CfId) -> [crate::probes::Layer; 3] {
+        [
+            crate::probes::Layer::Parent,
+            self.l_tag(id),
+            crate::probes::Layer::Checkpoint,
+        ]
+    }
+
+    /// `test-probes`: the DB answers `key` otherwise than `v` now.
+    #[cfg(feature = "test-probes")]
+    fn db_differs(&self, id: CfId, key: &[u8], v: Option<&[u8]>) -> bool {
+        self.db.get_cf_raw(id.name(), key).ok().flatten().as_deref() != v
+    }
+
+    /// `test-probes`: the effective rows of each frozen layer of `lower`
+    /// (parent, L, C, newest first) under the overlay's own set `own`: its
+    /// writes and tombstones from `start` while `within` holds, minus the
+    /// keys a newer layer (own, or an earlier slot) also holds.
+    #[cfg(feature = "test-probes")]
+    fn effective_rows<'a>(
+        id: CfId,
+        own: &PendingState,
+        lower: &[Option<&'a PendingState>; 3],
+        start: &[u8],
+        within: impl Fn(&[u8]) -> bool,
+    ) -> [LayerRows<'a>; 3] {
+        std::array::from_fn(|i| {
+            let Some(layer) = lower[i] else {
+                return Vec::new();
+            };
+            let shadowed = |k: &[u8]| {
+                own.lookup(id, k).is_some()
+                    || lower[..i]
+                        .iter()
+                        .flatten()
+                        .any(|s| s.lookup(id, k).is_some())
+            };
+            let cfp = layer.cf(id);
+            let from = (std::ops::Bound::Included(start), std::ops::Bound::Unbounded);
+            let writes = cfp
+                .writes
+                .range::<[u8], _>(from)
+                .map(|(k, v)| (k.as_slice(), Some(v.as_slice())))
+                .take_while(|(k, _)| within(k));
+            let deletes = cfp
+                .deletes
+                .range::<[u8], _>(from)
+                .map(|k| (k.as_slice(), None))
+                .take_while(|(k, _)| within(k));
+            writes
+                .chain(deletes)
+                .filter(|(k, _)| !shadowed(k))
+                .collect()
+        })
+    }
+
+    /// `test-probes`: count a range read (the iterators) over the frozen
+    /// layers `lower` by the rows that determined its answer (Codex P2 on
+    /// 543980f0): a layer's row counts iff no newer layer holds its key
+    /// (precedence) and the key lies in the window the read resolved: keys
+    /// `in_range` from `start` and, when the limit cut the read, at most
+    /// `upto` (the last returned key). There a write is a returned item and
+    /// a tombstone a hidden one. A layer with such a row is one hit, in
+    /// flight iff one of them answers otherwise in the DB now (with only
+    /// the DB below: iff skipping the layer changes the answer). The DB
+    /// iterator is one DB hit.
+    #[cfg(feature = "test-probes")]
+    fn probe_range(
+        &self,
+        id: CfId,
+        own: &PendingState,
+        lower: &[Option<&PendingState>; 3],
+        start: &[u8],
+        in_range: impl Fn(&[u8]) -> bool,
+        upto: Option<&[u8]>,
+    ) {
+        if !crate::probes::active() {
+            return;
+        }
+        let within = |k: &[u8]| in_range(k) && upto.is_none_or(|u| k <= u);
+        self.probe_scan_watch(id, own, lower, |k: &[u8]| k >= start && within(k));
+        let rows = Self::effective_rows(id, own, lower, start, within);
+        for (rows, tag) in rows.iter().zip(self.lower_tags(id)) {
+            if !rows.is_empty() {
+                crate::probes::record(id.name(), tag, || {
+                    rows.iter().any(|(k, v)| self.db_differs(id, k, *v))
+                });
+            }
+        }
+        crate::probes::record(id.name(), crate::probes::Layer::Db, || false);
+    }
+
+    /// `test-probes` (item 7 option 0 task 1.2, F8): log a range read that
+    /// covers watched keys ([`crate::probes::Probe::watch_scans`]), each at
+    /// the layer holding its effective row.
+    #[cfg(feature = "test-probes")]
+    fn probe_scan_watch(
+        &self,
+        id: CfId,
+        own: &PendingState,
+        lower: &[Option<&PendingState>; 3],
+        covers: impl Fn(&[u8]) -> bool,
+    ) {
+        let tags = self.lower_tags(id);
+        crate::probes::record_scan(id.name(), covers, |key| {
+            if let Some(hit) = own.lookup(id, key) {
+                return (crate::probes::Layer::Own, hit.is_some());
+            }
+            for (layer, tag) in lower.iter().zip(tags) {
+                if let Some(hit) = layer.and_then(|l| l.lookup(id, key)) {
+                    return (tag, hit.is_some());
+                }
+            }
+            let found = self.db.get_cf_raw(id.name(), key).ok().flatten().is_some();
+            (crate::probes::Layer::Db, found)
+        });
+    }
+
+    /// `test-probes`: count a `prefix_exists` read that answered `exists`
+    /// by the rows that determined it. `true`: the layer of the first live
+    /// key under `prefix` (key order, precedence resolved) is one hit, in
+    /// flight iff the answer turns `false` with that layer's effective rows
+    /// read from the DB instead. `false`: each layer with an effective
+    /// tombstone under `prefix` is one hit, in flight iff the DB holds one
+    /// of those keys. The DB walk is one DB hit.
+    #[cfg(feature = "test-probes")]
+    fn probe_exists(
+        &self,
+        id: CfId,
+        own: &PendingState,
+        lower: &[Option<&PendingState>; 3],
+        prefix: &[u8],
+        exists: bool,
+    ) {
+        if !crate::probes::active() {
+            return;
+        }
+        self.probe_scan_watch(id, own, lower, |k: &[u8]| k.starts_with(prefix));
+        let rows = Self::effective_rows(id, own, lower, prefix, |k: &[u8]| k.starts_with(prefix));
+        let tags = self.lower_tags(id);
+        let in_db = |k: &[u8]| self.db.get_cf_raw(id.name(), k).ok().flatten().is_some();
+        if exists {
+            // The first live key and the layer it came from (None: own or DB).
+            let own_first = writes_under(&own.cf(id).writes, prefix).next();
+            let first_write = |i: usize| {
+                rows[i]
+                    .iter()
+                    .filter(|(_, v)| v.is_some())
+                    .map(|(k, _)| *k)
+                    .min()
+            };
+            // The DB's first key no layer holds (a held key resolves above).
+            let held = |k: &[u8]| {
+                own.lookup(id, k).is_some()
+                    || lower.iter().flatten().any(|s| s.lookup(id, k).is_some())
+            };
+            let db_first = self.db.inner().cf_handle(id.name()).and_then(|h| {
+                crate::db::prefix_iter(self.db.inner(), &h, prefix)
+                    .map_while(|item| item.ok())
+                    .map(|(k, _)| k)
+                    .take_while(|k| k.starts_with(prefix))
+                    .find(|k| !held(k))
+            });
+            let mut first: Option<(&[u8], Option<usize>)> = own_first.map(|k| (k.as_slice(), None));
+            for i in 0..3 {
+                if let Some(k) = first_write(i) {
+                    if first.is_none_or(|(f, _)| k < f) {
+                        first = Some((k, Some(i)));
+                    }
+                }
+            }
+            if let Some(k) = db_first.as_deref() {
+                if first.is_none_or(|(f, _)| k < f) {
+                    first = None;
+                }
+            }
+            if let Some((_, Some(i))) = first {
+                crate::probes::record(id.name(), tags[i], || {
+                    let other_live = own_first.is_some()
+                        || db_first.is_some()
+                        || (0..3).any(|j| j != i && first_write(j).is_some());
+                    !other_live && !rows[i].iter().any(|(k, _)| in_db(k))
+                });
+            }
+        } else {
+            for (rows, tag) in rows.iter().zip(tags) {
+                if !rows.is_empty() {
+                    crate::probes::record(id.name(), tag, || rows.iter().any(|(k, _)| in_db(k)));
+                }
+            }
+        }
+        crate::probes::record(id.name(), crate::probes::Layer::Db, || false);
     }
 
     /// Item 6 Phase 3: the layered parent (the previous block's frozen set).
@@ -1736,28 +2129,135 @@ impl NativeStateOverlay {
         }
     }
 
-    /// Pre-populate CF_ACCOUNTS from an EVM BundleState so that native execution
-    /// (specifically Lockbox) can read EVM account changes from this block.
-    pub fn seed_from_bundle(&self, bundle: &revm::database::BundleState) {
-        use crate::cf::CF_ACCOUNTS;
-        use crate::db::encode_account_info;
-        for (address, bundle_acct) in &bundle.state {
-            match &bundle_acct.info {
+    /// Item 7 option 0 (task 1.2): absorb a block's EVM rows into this block
+    /// overlay, in ONE pass under one write lock, so they ride the block's
+    /// pending set (its flush, its running-hash digest, and on the fast path
+    /// the frozen set, L and the checkpoint) instead of a separate batch:
+    /// - the bundle's plain change set, exactly as
+    ///   [`crate::incremental::apply_bundle_plain`] writes it (CF_ACCOUNTS put /
+    ///   delete, CF_STORAGE put / delete per slot, a zero slot deleted, CF_CODE
+    ///   put of the original bytes);
+    /// - then the writer-precompile journal's own pending puts and deletes
+    ///   (CoreWriter queue rows, the CF_FEE_CONFIG cursor rows), moved out of
+    ///   `journal` (consumed: its layers, if any, are released with it).
+    ///
+    /// The native phase then reads the bundle's CF_ACCOUNTS rows (lockbox) as
+    /// it read the rows the old `seed_from_bundle` put there, and
+    /// [`Self::dirty_evm_accounts`] still lists every bundle account. Errors
+    /// only on a closed (frozen) overlay or an unregistered CF (a code bug).
+    pub fn absorb_evm(
+        &self,
+        bundle: &revm::database::BundleState,
+        journal: NativeStateOverlay,
+    ) -> Result<(), StateError> {
+        use crate::cf::{CF_ACCOUNTS, CF_CODE, CF_STORAGE};
+        use crate::db::{encode_account_info, storage_key};
+        let id =
+            |cf: &str| intern_cf(cf).ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()));
+        let (accounts, storage, code) = (id(CF_ACCOUNTS)?, id(CF_STORAGE)?, id(CF_CODE)?);
+        // Move the journal's rows out (its pending set is left empty) and
+        // release the journal before taking this overlay's lock.
+        let rows = std::mem::replace(&mut *journal.pending.write().unwrap(), PendingState::new());
+        drop(journal);
+        let mut state = self.pending.write().unwrap();
+        if state.frozen {
+            return Err(PendingState::frozen_err());
+        }
+        fn put(cfp: &mut CfPending, key: Vec<u8>, value: Vec<u8>) {
+            cfp.deletes.remove(&key);
+            cfp.writes.insert(key, value);
+        }
+        fn delete(cfp: &mut CfPending, key: Vec<u8>) {
+            cfp.writes.remove(&key);
+            cfp.deletes.insert(key);
+        }
+        for (address, acct) in &bundle.state {
+            match &acct.info {
                 Some(info) => {
-                    let _ = StateBackend::put_cf_raw(
-                        self,
-                        CF_ACCOUNTS,
-                        address.as_slice(),
-                        &encode_account_info(info),
+                    put(
+                        state.cf_mut(accounts),
+                        address.to_vec(),
+                        encode_account_info(info).to_vec(),
                     );
+                    let cfp = state.cf_mut(storage);
+                    for (slot, sv) in &acct.storage {
+                        let key = storage_key(address, slot).to_vec();
+                        if sv.present_value.is_zero() {
+                            delete(cfp, key);
+                        } else {
+                            put(cfp, key, sv.present_value.to_be_bytes::<32>().to_vec());
+                        }
+                    }
                 }
                 None => {
-                    if bundle_acct.original_info.is_some() {
-                        let _ = StateBackend::delete_cf_raw(self, CF_ACCOUNTS, address.as_slice());
+                    if acct.original_info.is_some() {
+                        delete(state.cf_mut(accounts), address.to_vec());
+                    }
+                    let cfp = state.cf_mut(storage);
+                    for slot in acct.storage.keys() {
+                        delete(cfp, storage_key(address, slot).to_vec());
                     }
                 }
             }
         }
+        let cfp = state.cf_mut(code);
+        for (code_hash, bytecode) in &bundle.contracts {
+            put(
+                cfp,
+                code_hash.to_vec(),
+                bytecode.original_byte_slice().to_vec(),
+            );
+        }
+        // Item 7 option 0 (task 3.6, plan C7): the absorbed rows by kind.
+        #[cfg(feature = "test-probes")]
+        {
+            use crate::probes::bump;
+            let mut c = [0u64; 5];
+            for acct in bundle.state.values() {
+                match &acct.info {
+                    Some(_) => {
+                        c[0] += 1;
+                        for sv in acct.storage.values() {
+                            c[if sv.present_value.is_zero() { 3 } else { 2 }] += 1;
+                        }
+                    }
+                    None => {
+                        c[1] += u64::from(acct.original_info.is_some());
+                        c[3] += acct.storage.len() as u64;
+                    }
+                }
+            }
+            c[4] = bundle.contracts.len() as u64;
+            bump("absorb.account_put", c[0]);
+            bump("absorb.account_delete", c[1]);
+            bump("absorb.slot_put", c[2]);
+            bump("absorb.slot_delete", c[3]);
+            bump("absorb.code_put", c[4]);
+            let journal_rows =
+                |cf: &str| intern_cf(cf).map_or(0, |id| rows.cf(id).writes.len() as u64);
+            bump(
+                "absorb.queue_row",
+                journal_rows(crate::cf::CF_CORE_WRITER_QUEUE),
+            );
+            bump("absorb.cursor_row", journal_rows(crate::cf::CF_FEE_CONFIG));
+        }
+        // The journal's pending set: puts and deletes are disjoint per key.
+        for (dst, src) in state.cfs.iter_mut().zip(rows.cfs) {
+            if src.is_empty() {
+                continue;
+            }
+            if dst.is_empty() {
+                *dst = src;
+                continue;
+            }
+            for key in src.deletes {
+                delete(dst, key);
+            }
+            for (key, value) in src.writes {
+                put(dst, key, value);
+            }
+        }
+        Ok(())
     }
 
     pub fn db(&self) -> &StateDb {
@@ -1980,7 +2480,9 @@ fn flush_pending_with_native_trie_stats(
 
 /// Item 6 Phase 3: the checkpoint batch (see
 /// [`crate::CheckpointLayer::flush_checkpoint`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn flush_checkpoint_batch(
+    prefix: WriteBatch,
     state: &PendingState,
     side: Option<&PendingState>,
     rows: &crate::running_hash::ChainRows,
@@ -1990,7 +2492,7 @@ pub(crate) fn flush_checkpoint_batch(
     member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
 ) -> Result<NativeFlushStats, StateError> {
     flush_pending_after_batch(
-        WriteBatch::default(),
+        prefix,
         state,
         side,
         target,
@@ -2363,6 +2865,15 @@ pub struct NativeFlushStats {
     pub state_hash_entries: usize,
 }
 
+/// `test-probes`: the last returned key when `limit` cut the read (`out`
+/// holds `limit` rows), else `None` (the whole range was resolved).
+#[cfg(feature = "test-probes")]
+fn limit_cut(out: &[(Vec<u8>, Vec<u8>)], limit: usize) -> Option<&[u8]> {
+    out.last()
+        .filter(|_| out.len() >= limit)
+        .map(|(k, _)| k.as_slice())
+}
+
 /// A layer's pending-write keys starting with `prefix`, in key order.
 pub(crate) fn writes_under<'a>(
     writes: &'a BTreeMap<Vec<u8>, Vec<u8>>,
@@ -2489,6 +3000,13 @@ fn overlay_sorted<'a>(
 
 impl StateBackend for NativeStateOverlay {
     fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+        #[cfg(feature = "test-probes")]
+        if let Some(flat) = self.enqueue_bypass(cf) {
+            return StateBackend::get_cf_raw(&flat, cf, key);
+        }
+        // Item 7 option 0 (task 1.6): the overlay's DB fall-through is the
+        // bottom of its layered read, never a raw-DB bypass.
+        let _exempt = crate::tripwire::exempt();
         // C2: interned CF + borrowed key lookup — ZERO allocations on this path
         // (was one String + one Vec<u8> per get). An unregistered CF name can
         // never hold overlay entries (put/delete reject it), so it falls through
@@ -2497,12 +3015,28 @@ impl StateBackend for NativeStateOverlay {
             {
                 let state = self.pending.read().unwrap();
                 if let Some(hit) = state.lookup(id, key) {
+                    #[cfg(feature = "test-probes")]
+                    crate::probes::record_point(
+                        id.name(),
+                        key,
+                        crate::probes::Layer::Own,
+                        || hit.is_some(),
+                        || false,
+                    );
                     return Ok(hit.map(<[u8]>::to_vec));
                 }
             }
             // Item 6 Phase 1: R replaces the DB for its CFs; C6a (B0):
             // and the parent layer, which R already holds.
             if let Some(rows) = self.resident(id) {
+                #[cfg(feature = "test-probes")]
+                crate::probes::record_point(
+                    id.name(),
+                    key,
+                    crate::probes::Layer::Resident,
+                    || rows.get(key).is_some(),
+                    || false,
+                );
                 return Ok(rows.get(key));
             }
             // bl2 exec pipeline: previous block's frozen set (read-your-writes);
@@ -2510,6 +3044,14 @@ impl StateBackend for NativeStateOverlay {
             if let Some(hit) = self.lookup_lower(id, key)? {
                 return Ok(hit.map(<[u8]>::to_vec));
             }
+            #[cfg(feature = "test-probes")]
+            crate::probes::record_point(
+                id.name(),
+                key,
+                crate::probes::Layer::Db,
+                || self.db.get_cf_raw(cf, key).ok().flatten().is_some(),
+                || false,
+            );
         }
         self.db.get_cf_raw(cf, key)
     }
@@ -2561,6 +3103,13 @@ impl StateBackend for NativeStateOverlay {
         cf: &str,
         prefix: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        #[cfg(feature = "test-probes")]
+        if let Some(flat) = self.enqueue_bypass(cf) {
+            return StateBackend::iterate_cf(&flat, cf, prefix);
+        }
+        // Item 7 option 0 (task 1.6): the overlay's DB fall-through is the
+        // bottom of its layered read, never a raw-DB bypass.
+        let _exempt = crate::tripwire::exempt();
         let Some(id) = intern_cf(cf) else {
             // Unregistered CF: the overlay cannot hold entries for it; delegate
             // (the DB reports MissingColumnFamily, same as pre-C2).
@@ -2586,6 +3135,8 @@ impl StateBackend for NativeStateOverlay {
         let db_entries = StateBackend::iterate_cf(&self.db, cf, prefix)?;
         let lower = self.lower(id)?;
         let state = self.pending.read().unwrap();
+        #[cfg(feature = "test-probes")]
+        self.probe_range(id, &state, &lower, p, |k: &[u8]| k.starts_with(p), None);
         // Fix 3 (s87): no layer holds a key under the prefix -> the DB rows
         // as they are (already sorted and unique under the bytewise comparator).
         if !state.touches(id, p) && !lower.iter().flatten().any(|s| s.touches(id, p)) {
@@ -2613,6 +3164,13 @@ impl StateBackend for NativeStateOverlay {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        #[cfg(feature = "test-probes")]
+        if let Some(flat) = self.enqueue_bypass(cf) {
+            return StateBackend::iterate_cf_from(&flat, cf, start, limit);
+        }
+        // Item 7 option 0 (task 1.6): the overlay's DB fall-through is the
+        // bottom of its layered read, never a raw-DB bypass.
+        let _exempt = crate::tripwire::exempt();
         let Some(id) = intern_cf(cf) else {
             return StateBackend::iterate_cf_from(&self.db, cf, start, limit);
         };
@@ -2637,24 +3195,70 @@ impl StateBackend for NativeStateOverlay {
                 rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
             )
             .map(|item| item.map_err(StateError::from));
-        merge_from(&pending, &lower, id, start, limit, dbi)
+        let out = merge_from(&pending, &lower, id, start, limit, dbi)?;
+        #[cfg(feature = "test-probes")]
+        self.probe_range(
+            id,
+            &pending,
+            &lower,
+            start,
+            |_: &[u8]| true,
+            limit_cut(&out, limit),
+        );
+        Ok(out)
     }
 
     /// The layered point-read rule (pending, R, parent, DB) on lengths only.
     fn get_cf_len(&self, cf: &str, key: &[u8]) -> Result<Option<usize>, StateError> {
+        #[cfg(feature = "test-probes")]
+        if let Some(flat) = self.enqueue_bypass(cf) {
+            return StateBackend::get_cf_len(&flat, cf, key);
+        }
+        // Item 7 option 0 (task 1.6): the overlay's DB fall-through is the
+        // bottom of its layered read, never a raw-DB bypass.
+        let _exempt = crate::tripwire::exempt();
         if let Some(id) = intern_cf(cf) {
             {
                 let state = self.pending.read().unwrap();
                 if let Some(hit) = state.lookup(id, key) {
+                    #[cfg(feature = "test-probes")]
+                    crate::probes::record_point(
+                        id.name(),
+                        key,
+                        crate::probes::Layer::Own,
+                        || hit.is_some(),
+                        || false,
+                    );
                     return Ok(hit.map(<[u8]>::len));
                 }
             }
             if let Some(rows) = self.resident(id) {
+                #[cfg(feature = "test-probes")]
+                crate::probes::record_point(
+                    id.name(),
+                    key,
+                    crate::probes::Layer::Resident,
+                    || rows.get_len(key).is_some(),
+                    || false,
+                );
                 return Ok(rows.get_len(key));
             }
-            if let Some(hit) = self.lookup_lower(id, key)? {
+            if let Some(hit) = self.lookup_lower_as::<true>(id, key)? {
                 return Ok(hit.map(<[u8]>::len));
             }
+            #[cfg(feature = "test-probes")]
+            crate::probes::record_point(
+                id.name(),
+                key,
+                crate::probes::Layer::Db,
+                || {
+                    StateBackend::get_cf_len(&self.db, cf, key)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                },
+                || false,
+            );
         }
         StateBackend::get_cf_len(&self.db, cf, key)
     }
@@ -2668,6 +3272,13 @@ impl StateBackend for NativeStateOverlay {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        #[cfg(feature = "test-probes")]
+        if let Some(flat) = self.enqueue_bypass(cf) {
+            return StateBackend::iterate_cf_prefix_from(&flat, cf, prefix, start, limit);
+        }
+        // Item 7 option 0 (task 1.6): the overlay's DB fall-through is the
+        // bottom of its layered read, never a raw-DB bypass.
+        let _exempt = crate::tripwire::exempt();
         let Some(id) = intern_cf(cf) else {
             return StateBackend::iterate_cf_prefix_from(&self.db, cf, prefix, start, limit);
         };
@@ -2694,7 +3305,20 @@ impl StateBackend for NativeStateOverlay {
                 rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
             )
             .map(|item| item.map_err(StateError::from));
-        merge_from(&pending, &lower, id, start, limit, dbi).map(cut)
+        let out: Vec<(Vec<u8>, Vec<u8>)> =
+            cut(merge_from(&pending, &lower, id, start, limit, dbi)?);
+        // A cut row past the prefix leaves fewer than `limit`: the whole
+        // prefix range from `start` was resolved.
+        #[cfg(feature = "test-probes")]
+        self.probe_range(
+            id,
+            &pending,
+            &lower,
+            start,
+            |k: &[u8]| k.starts_with(prefix),
+            limit_cut(&out, limit),
+        );
+        Ok(out)
     }
 
     /// Same answer as the merged `iterate_cf`, without materialising it: a key
@@ -2703,6 +3327,13 @@ impl StateBackend for NativeStateOverlay {
     /// stops at the first one no layer tombstones — it skips at most the
     /// tombstones under `prefix`.
     fn prefix_exists(&self, cf: &str, prefix: &[u8]) -> Result<bool, StateError> {
+        #[cfg(feature = "test-probes")]
+        if let Some(flat) = self.enqueue_bypass(cf) {
+            return StateBackend::prefix_exists(&flat, cf, prefix);
+        }
+        // Item 7 option 0 (task 1.6): the overlay's DB fall-through is the
+        // bottom of its layered read, never a raw-DB bypass.
+        let _exempt = crate::tripwire::exempt();
         let Some(id) = intern_cf(cf) else {
             return StateBackend::prefix_exists(&self.db, cf, prefix);
         };
@@ -2723,32 +3354,43 @@ impl StateBackend for NativeStateOverlay {
                 None => true,
             }
         };
-        if writes_under(&self.pending.read().unwrap().cf(id).writes, prefix).next().is_some() {
-            return Ok(true);
-        }
-        for layer in lower.iter().flatten() {
-            if writes_under(&layer.cf(id).writes, prefix).any(|k| live(k)) {
-                return Ok(true);
+        let exists = 'exists: {
+            if writes_under(&self.pending.read().unwrap().cf(id).writes, prefix)
+                .next()
+                .is_some()
+            {
+                break 'exists true;
             }
-        }
-        // Item 6 Phase 1: R's keys under the prefix stand in for the DB walk.
-        if let Some(rows) = rows {
-            return Ok(rows.range(prefix, prefix).any(|(k, _)| live(&k)));
-        }
-        let db = self.db.inner();
-        let cf_handle = db
-            .cf_handle(cf)
-            .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
-        for item in crate::db::prefix_iter(db, &cf_handle, prefix) {
-            let (key, _) = item?;
-            if !key.starts_with(prefix) {
-                break;
+            for layer in lower.iter().flatten() {
+                if writes_under(&layer.cf(id).writes, prefix).any(|k| live(k)) {
+                    break 'exists true;
+                }
             }
-            if live(&key) {
-                return Ok(true);
+            // Item 6 Phase 1: R's keys under the prefix stand in for the DB walk.
+            if let Some(rows) = rows {
+                break 'exists rows.range(prefix, prefix).any(|(k, _)| live(&k));
             }
+            let db = self.db.inner();
+            let cf_handle = db
+                .cf_handle(cf)
+                .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
+            for item in crate::db::prefix_iter(db, &cf_handle, prefix) {
+                let (key, _) = item?;
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                if live(&key) {
+                    break 'exists true;
+                }
+            }
+            false
+        };
+        #[cfg(feature = "test-probes")]
+        if rows.is_none() {
+            let own = self.pending.read().unwrap();
+            self.probe_exists(id, &own, &lower, prefix, exists);
         }
-        Ok(false)
+        Ok(exists)
     }
 
     /// With R attached and `cf` one of its CFs: this overlay's own pending set
@@ -2897,6 +3539,275 @@ mod tests {
         }
         assert!(yes > 0 && no > 0, "non-vacuous: {yes} / {no}");
         assert!(!overlay.prefix_exists(cf, b"q").unwrap(), "no key under the prefix");
+    }
+
+    /// Item 7 option 0 step 0 (task 0.3, Codex P2 on 543980f0): a range
+    /// read (`iterate_cf`, `iterate_cf_from`, `iterate_cf_prefix_from`,
+    /// `prefix_exists`) counts the parent layer only where the parent's row
+    /// determined the answer: never a row the overlay's own set shadows,
+    /// never a row past the range limit. Over every layering of three keys
+    /// (DB: absent / row; parent: none / write / tombstone / write equal to
+    /// the DB row; own: none / write / tombstone), many starts and limits:
+    /// the parent is in flight iff the same read with the parent skipped
+    /// (`Plant::SkipParent`, below it only the DB) answers otherwise, and a
+    /// parent hit is at most one per read. Plus the two Codex cases by name.
+    #[cfg(feature = "test-probes")]
+    #[test]
+    fn o0_probe_range_counts_effective_parent_rows_only() {
+        use crate::probes::{self, Layer, Plant, Probe};
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        // per key: (in DB, parent op 0..4, own op 0..3)
+        let states: Vec<(bool, u8, u8)> = (0..24u8)
+            .map(|i| (i % 2 == 1, (i / 2) % 4, i / 8))
+            .collect();
+        let combos: Vec<[(bool, u8, u8); 3]> = (0..states.len() * states.len() * 2)
+            .map(|i| {
+                let a = states[i % states.len()];
+                let b = states[(i / states.len()) % states.len()];
+                // The third key: absent everywhere, or a plain DB row.
+                [a, b, (i / (states.len() * states.len()) == 1, 0, 0)]
+            })
+            .collect();
+        let prefix = |c: usize| [b'p', (c >> 8) as u8, c as u8].to_vec();
+        let key = |c: usize, k: u8| [prefix(c), vec![k * 2 + 1]].concat();
+        for (c, keys) in combos.iter().enumerate() {
+            for (k, &(in_db, _, _)) in keys.iter().enumerate() {
+                if in_db {
+                    db.put_cf_raw(cf, &key(c, k as u8), b"db").unwrap();
+                }
+            }
+        }
+        let apply = |ov: &NativeStateOverlay, layer: usize| {
+            for (c, keys) in combos.iter().enumerate() {
+                for (k, st) in keys.iter().enumerate() {
+                    let kk = key(c, k as u8);
+                    match if layer == 0 { st.1 } else { st.2 } {
+                        1 => ov.put_cf_raw(cf, &kk, b"w").unwrap(),
+                        2 => ov.delete_cf_raw(cf, &kk).unwrap(),
+                        3 => ov.put_cf_raw(cf, &kk, b"db").unwrap(),
+                        _ => {}
+                    }
+                }
+            }
+        };
+        let parent_ov = NativeStateOverlay::new(db.clone());
+        apply(&parent_ov, 0);
+        let parent = parent_ov.freeze(1);
+        let overlay = NativeStateOverlay::with_parent(db.clone(), Some(parent.clone()));
+        apply(&overlay, 1);
+        let skipped = {
+            let plant = Probe::new();
+            plant.plant(Plant::SkipParent);
+            let _i = probes::install(plant);
+            let ov = NativeStateOverlay::with_parent(db.clone(), Some(parent.clone()));
+            apply(&ov, 1);
+            ov
+        };
+        let p = Probe::new();
+        let _i = probes::install(p.clone());
+        // One read: the parent's count, and whether skipping it changes the answer.
+        let read = |f: &dyn Fn(&NativeStateOverlay) -> String| {
+            p.reset();
+            let got = f(&overlay);
+            let c = p.total(|_, l, _| l == Layer::Parent);
+            (c, got != f(&skipped))
+        };
+        let (mut inflight, mut quiet, mut hidden) = (0, 0, 0);
+        let mut check = |what: String, f: &dyn Fn(&NativeStateOverlay) -> String| {
+            let (c, differs) = read(f);
+            assert!(c.hits <= 1, "{what}: {c:?}");
+            assert_eq!(
+                c.inflight > 0,
+                differs,
+                "{what}: {c:?}, answer differs without the parent: {differs}"
+            );
+            match (c.hits, differs) {
+                (_, true) => inflight += 1,
+                (1, false) => quiet += 1,
+                _ => hidden += 1,
+            }
+        };
+        for (c, combo) in combos.iter().enumerate() {
+            let pre = prefix(c);
+            check(format!("iterate_cf {c} {combo:?}"), &|ov| {
+                format!("{:?}", ov.iterate_cf(cf, Some(&pre)).unwrap())
+            });
+            check(format!("prefix_exists {c} {combo:?}"), &|ov| {
+                format!("{:?}", ov.prefix_exists(cf, &pre).unwrap())
+            });
+            for s in [vec![], vec![2], vec![3], vec![4], vec![6]] {
+                let start = [pre.clone(), s].concat();
+                for limit in 1..=4 {
+                    check(
+                        format!("iterate_cf_from {c} {combo:?} {start:?} {limit}"),
+                        &|ov| format!("{:?}", ov.iterate_cf_from(cf, &start, limit).unwrap()),
+                    );
+                    check(
+                        format!("iterate_cf_prefix_from {c} {combo:?} {start:?} {limit}"),
+                        &|ov| {
+                            format!(
+                                "{:?}",
+                                ov.iterate_cf_prefix_from(cf, &pre, &start, limit).unwrap()
+                            )
+                        },
+                    );
+                }
+            }
+        }
+        assert!(
+            inflight > 0 && quiet > 0 && hidden > 0,
+            "non-vacuous: {inflight} / {quiet} / {hidden}"
+        );
+
+        // The Codex cases by name. Shadowed: the parent's row sits under
+        // the overlay's own write of the same key: no parent hit at all.
+        let q = |k: u8| vec![b'q', k];
+        let parent_ov = NativeStateOverlay::new(db.clone());
+        parent_ov.put_cf_raw(cf, &q(1), b"parent").unwrap();
+        parent_ov.put_cf_raw(cf, &q(5), b"parent").unwrap();
+        let ov = NativeStateOverlay::with_parent(db.clone(), Some(parent_ov.freeze(2)));
+        ov.put_cf_raw(cf, &q(1), b"own").unwrap();
+        db.put_cf_raw(cf, &q(3), b"db").unwrap();
+        let parent_hits = |f: &dyn Fn()| {
+            p.reset();
+            f();
+            p.total(|_, l, _| l == Layer::Parent)
+        };
+        let none = probes::Count::default();
+        assert_eq!(
+            parent_hits(&|| {
+                ov.iterate_cf_prefix_from(cf, b"q", &q(0), 2).unwrap();
+            }),
+            none,
+            "q1 shadowed by own, q5 past the limit (q1, q3 returned)"
+        );
+        assert_eq!(
+            parent_hits(&|| {
+                ov.iterate_cf_from(cf, &q(0), 2).unwrap();
+            }),
+            none,
+            "the same without the prefix bound"
+        );
+        assert_eq!(
+            parent_hits(&|| {
+                ov.prefix_exists(cf, b"q").unwrap();
+            }),
+            none,
+            "the first live key is own's q1"
+        );
+        assert_eq!(
+            parent_hits(&|| {
+                ov.iterate_cf_from(cf, &q(0), 3).unwrap();
+            }),
+            probes::Count {
+                hits: 1,
+                inflight: 1
+            },
+            "q5 returned: the parent determined it, the DB lacks it"
+        );
+    }
+
+    /// Codex round 2 P2 on 84ce3a57: a probe counts a layer in flight iff
+    /// what the CALLER observes differs without it. `get_cf_len` observes
+    /// a length only, so a parent row of the DB row's length with other
+    /// bytes is a parent hit, never in flight (it was: the probe compared
+    /// bytes). Over every layering of one key (DB: absent / "db"; parent:
+    /// none / "w" (other length) / "xy" (same length, other bytes) / "db"
+    /// (equal) / tombstone; own: none / write / tombstone), for every read
+    /// kind: the parent is in flight iff the same read with the parent
+    /// skipped (`Plant::SkipParent`, only the DB below) answers otherwise.
+    #[cfg(feature = "test-probes")]
+    #[test]
+    fn o0_probes_count_what_the_caller_observes() {
+        use crate::probes::{self, Layer, Plant, Probe};
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        let mut combos = Vec::new();
+        for in_db in [false, true] {
+            for parent in 0..5u8 {
+                for own in 0..3u8 {
+                    combos.push((in_db, parent, own));
+                }
+            }
+        }
+        let key = |c: usize| vec![b'k', c as u8];
+        for (c, &(in_db, _, _)) in combos.iter().enumerate() {
+            if in_db {
+                db.put_cf_raw(cf, &key(c), b"db").unwrap();
+            }
+        }
+        let parent_ov = NativeStateOverlay::new(db.clone());
+        for (c, &(_, op, _)) in combos.iter().enumerate() {
+            match op {
+                1 => parent_ov.put_cf_raw(cf, &key(c), b"w").unwrap(),
+                2 => parent_ov.put_cf_raw(cf, &key(c), b"xy").unwrap(),
+                3 => parent_ov.put_cf_raw(cf, &key(c), b"db").unwrap(),
+                4 => parent_ov.delete_cf_raw(cf, &key(c)).unwrap(),
+                _ => {}
+            }
+        }
+        let parent = parent_ov.freeze(1);
+        let own = |ov: &NativeStateOverlay| {
+            for (c, &(_, _, op)) in combos.iter().enumerate() {
+                match op {
+                    1 => ov.put_cf_raw(cf, &key(c), b"own").unwrap(),
+                    2 => ov.delete_cf_raw(cf, &key(c)).unwrap(),
+                    _ => {}
+                }
+            }
+        };
+        let overlay = NativeStateOverlay::with_parent(db.clone(), Some(parent.clone()));
+        own(&overlay);
+        let skipped = {
+            let plant = Probe::new();
+            plant.plant(Plant::SkipParent);
+            let _i = probes::install(plant);
+            let ov = NativeStateOverlay::with_parent(db.clone(), Some(parent.clone()));
+            own(&ov);
+            ov
+        };
+        let p = Probe::new();
+        let _i = probes::install(p.clone());
+        let mut seen = std::collections::BTreeSet::new();
+        for (c, combo) in combos.iter().enumerate() {
+            let k = key(c);
+            type Read<'r> = &'r dyn Fn(&NativeStateOverlay) -> String;
+            let reads: [(&str, Read); 4] = [
+                ("get_cf_raw", &|ov| {
+                    format!("{:?}", ov.get_cf_raw(cf, &k).unwrap())
+                }),
+                ("get_cf_len", &|ov| {
+                    format!("{:?}", ov.get_cf_len(cf, &k).unwrap())
+                }),
+                ("iterate_cf", &|ov| {
+                    format!("{:?}", ov.iterate_cf(cf, Some(&k)).unwrap())
+                }),
+                ("prefix_exists", &|ov| {
+                    format!("{:?}", ov.prefix_exists(cf, &k).unwrap())
+                }),
+            ];
+            for (what, f) in reads {
+                p.reset();
+                let got = f(&overlay);
+                let n = p.total(|_, l, _| l == Layer::Parent);
+                let differs = got != f(&skipped);
+                assert!(n.hits <= 1, "{what} {combo:?}: {n:?}");
+                assert_eq!(
+                    n.inflight > 0,
+                    differs,
+                    "{what} {combo:?}: {n:?}, answer differs without the parent: {differs}"
+                );
+                seen.insert((what, n.hits, differs));
+            }
+        }
+        // The Codex case by name: an equal-length parent row is a hit, not
+        // in flight, for a length read; a row of another length is in flight.
+        let (len_quiet, len_inflight) = (("get_cf_len", 1, false), ("get_cf_len", 1, true));
+        assert!(
+            seen.contains(&len_quiet) && seen.contains(&len_inflight),
+            "{seen:?}"
+        );
     }
 
     /// Review H3 (s517): `iterate_cf_from(start, limit)` == the first `limit`
@@ -4995,6 +5906,275 @@ mod tests {
                 .as_deref(),
             Some(&[0x60u8, 0x00][..])
         );
+    }
+
+    /// Item 7 option 0 (task 1.2): a seeded random EVM block: a bundle
+    /// (accounts put with storage puts and zeroed slots, destroyed accounts
+    /// with slots, a slot-only `None` account, new code) and a journal's
+    /// pending set (queue rows and cursor rows, puts and deletes). Built
+    /// twice from one seed (`absorb_evm` consumes the journal).
+    fn o0_random_evm_block(
+        db: &StateDb,
+        seed: u64,
+    ) -> (revm::database::BundleState, NativeStateOverlay) {
+        use crate::cf::{CF_CORE_WRITER_QUEUE, CF_FEE_CONFIG};
+        use alloy_primitives::{Bytes, U256};
+        use revm::database::states::{StorageSlot, StorageWithOriginalValues};
+        use revm::database::{AccountStatus, BundleAccount, BundleState};
+        use revm::state::{AccountInfo, Bytecode};
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let mut bundle = BundleState::default();
+        for a in 0..(1 + next(6)) {
+            let address = Address::repeat_byte((a as u8) * 16 + next(16) as u8);
+            let mut storage = StorageWithOriginalValues::default();
+            for _ in 0..next(5) {
+                let present = if next(3) == 0 {
+                    U256::ZERO
+                } else {
+                    U256::from(1 + next(1000))
+                };
+                storage.insert(
+                    U256::from(next(8)),
+                    StorageSlot::new_changed(U256::from(next(9)), present),
+                );
+            }
+            let acct = match next(4) {
+                0 => BundleAccount::new(
+                    Some(AccountInfo::default()),
+                    None,
+                    storage,
+                    AccountStatus::Destroyed,
+                ),
+                1 => BundleAccount::new(None, None, storage, AccountStatus::Destroyed),
+                _ => {
+                    let code = (next(2) == 0)
+                        .then(|| Bytecode::new_raw(Bytes::from(vec![0x60, next(255) as u8, 0x00])));
+                    let info = AccountInfo {
+                        balance: U256::from(next(1_000_000)),
+                        nonce: next(9),
+                        code_hash: code
+                            .as_ref()
+                            .map_or(revm::primitives::KECCAK_EMPTY, |c| c.hash_slow()),
+                        code: code.clone(),
+                        account_id: None,
+                    };
+                    if let Some(c) = code {
+                        bundle.contracts.insert(c.hash_slow(), c);
+                    }
+                    BundleAccount::new(None, Some(info), storage, AccountStatus::Changed)
+                }
+            };
+            bundle.state.insert(address, acct);
+        }
+        let journal = NativeStateOverlay::new(db.clone());
+        for _ in 0..next(6) {
+            let mut key = (100 + next(4)).to_be_bytes().to_vec();
+            key.extend_from_slice(&next(5).to_be_bytes());
+            if next(4) == 0 {
+                journal.delete_cf_raw(CF_CORE_WRITER_QUEUE, &key).unwrap();
+            } else {
+                journal
+                    .put_cf_raw(CF_CORE_WRITER_QUEUE, &key, &[next(255) as u8; 9])
+                    .unwrap();
+            }
+        }
+        for cursor in [
+            &b"core_writer_last_order_target"[..],
+            b"core_writer_full_order_run",
+        ] {
+            if next(2) == 0 {
+                journal
+                    .put_cf_raw(CF_FEE_CONFIG, cursor, &next(500).to_be_bytes())
+                    .unwrap();
+            }
+        }
+        (bundle, journal)
+    }
+
+    /// The rows a `WriteBatch` holds, decoded back per CF name (later wins:
+    /// RocksDB's batch semantics). CF ids are learnt from a probe batch.
+    fn o0_decode_batch(
+        db: &StateDb,
+        batch: &WriteBatch,
+    ) -> BTreeMap<(&'static str, Vec<u8>), Option<Vec<u8>>> {
+        struct Names<'a>(&'a mut BTreeMap<u32, &'static str>, &'static str);
+        impl rocksdb::WriteBatchIteratorCf for Names<'_> {
+            fn put_cf(&mut self, id: u32, _: &[u8], _: &[u8]) {
+                self.0.insert(id, self.1);
+            }
+            fn delete_cf(&mut self, _: u32, _: &[u8]) {}
+            fn merge_cf(&mut self, _: u32, _: &[u8], _: &[u8]) {}
+        }
+        let mut names = BTreeMap::new();
+        for cf in crate::cf::ALL_CF_NAMES {
+            let mut probe = WriteBatch::default();
+            probe.put_cf(db.cf_handle(cf).unwrap(), b"k", b"v");
+            probe.iterate_cf(&mut Names(&mut names, cf));
+        }
+        struct Rows<'a>(
+            &'a BTreeMap<u32, &'static str>,
+            BTreeMap<(&'static str, Vec<u8>), Option<Vec<u8>>>,
+        );
+        impl rocksdb::WriteBatchIteratorCf for Rows<'_> {
+            fn put_cf(&mut self, id: u32, k: &[u8], v: &[u8]) {
+                self.1.insert((self.0[&id], k.to_vec()), Some(v.to_vec()));
+            }
+            fn delete_cf(&mut self, id: u32, k: &[u8]) {
+                self.1.insert((self.0[&id], k.to_vec()), None);
+            }
+            fn merge_cf(&mut self, _: u32, _: &[u8], _: &[u8]) {
+                panic!("no merge in an EVM batch");
+            }
+        }
+        let mut rows = Rows(&names, BTreeMap::new());
+        batch.iterate_cf(&mut rows);
+        rows.1
+    }
+
+    /// The overlay's own pending rows per CF name (`None` = tombstone).
+    fn o0_pending_rows(
+        ov: &NativeStateOverlay,
+    ) -> BTreeMap<(&'static str, Vec<u8>), Option<Vec<u8>>> {
+        let state = ov.pending.read().unwrap();
+        let mut out = BTreeMap::new();
+        for (i, cfp) in state.cfs.iter().enumerate() {
+            let name = CfId(i as u8).name();
+            for (k, v) in &cfp.writes {
+                out.insert((name, k.clone()), Some(v.clone()));
+            }
+            for k in &cfp.deletes {
+                out.insert((name, k.clone()), None);
+            }
+        }
+        out
+    }
+
+    /// Item 7 option 0 (task 1.2, RED before `absorb_evm`): for random
+    /// bundles and journal pending sets, the block overlay's rows after
+    /// `absorb_evm` equal, key and value (tombstones included), what
+    /// `apply_bundle_plain` + `append_pending_to_batch` put in a `WriteBatch`
+    /// (today's EVM prefix minus the hashed mirror and trie), decoded back. The
+    /// journal is consumed (its pending set is left empty), and a closed
+    /// (frozen) overlay refuses the absorb.
+    #[test]
+    fn absorb_evm_writes_exactly_the_plain_batch_rows() {
+        let (db, _d) = temp_db();
+        let mut nonempty = 0;
+        for seed in 0..200u64 {
+            let (bundle, journal) = o0_random_evm_block(&db, seed);
+            let mut batch = WriteBatch::default();
+            crate::incremental::apply_bundle_plain(&db, &mut batch, &bundle).unwrap();
+            journal.append_pending_to_batch(&db, &mut batch).unwrap();
+            let want = o0_decode_batch(&db, &batch);
+            let ov = NativeStateOverlay::new(db.clone());
+            let shared = journal.clone();
+            ov.absorb_evm(&bundle, journal).unwrap();
+            assert_eq!(o0_pending_rows(&ov), want, "seed {seed}");
+            assert_eq!(shared.pending_write_count(), 0, "the journal is consumed");
+            nonempty += usize::from(!want.is_empty());
+        }
+        assert!(nonempty > 150, "the generator yields rows ({nonempty})");
+
+        // A frozen overlay refuses it (the block is closed).
+        let (bundle, journal) = o0_random_evm_block(&db, 7);
+        let ov = NativeStateOverlay::new(db.clone());
+        let _ = ov.freeze(1);
+        assert!(ov.absorb_evm(&bundle, journal).is_err());
+    }
+
+    /// Item 7 option 0 (task 1.2): one EVM block flushed today's way (plain
+    /// rows + journal rows as the batch PREFIX, the same rows as hash extras,
+    /// the bundle's CF_ACCOUNTS rows seeded into the overlay, then the native
+    /// writes) and the absorb way (rows absorbed into the overlay, then the
+    /// same native writes) gives the same `h_n` and the same bytes in every
+    /// CF. The native writes overlap the EVM rows on purpose: a credit to a
+    /// bundle account, a delete of an EVM-deleted account, a queue row drained
+    /// and a cursor rewritten.
+    #[test]
+    fn absorb_keeps_h_n_and_flush_bytes() {
+        use crate::cf::{CF_ACCOUNTS, CF_CORE_WRITER_QUEUE, CF_FEE_CONFIG};
+        use crate::running_hash::read_running_hash;
+        type Rows = Vec<(Vec<u8>, Vec<u8>)>;
+        let dump = |db: &StateDb| -> Vec<(&str, Rows)> {
+            crate::cf::ALL_CF_NAMES
+                .iter()
+                .map(|cf| (*cf, StateBackend::iterate_cf(db, cf, None).unwrap()))
+                .collect()
+        };
+        for seed in 0..40u64 {
+            let mut out = Vec::new();
+            for absorb in [false, true] {
+                let (db, _d) = rsh_db();
+                // Pre-state, so deletions are observable.
+                for a in 0..16u8 {
+                    db.put_cf_raw(CF_ACCOUNTS, &[a * 16 + 3; 20], b"pre")
+                        .unwrap();
+                }
+                let (bundle, journal) = o0_random_evm_block(&db, seed);
+                let native = |ov: &NativeStateOverlay| {
+                    let first = bundle.state.keys().next().copied().unwrap();
+                    ov.put_cf_raw(CF_ACCOUNTS, first.as_slice(), b"credited")
+                        .unwrap();
+                    ov.delete_cf_raw(CF_ACCOUNTS, &[0x33; 20]).unwrap();
+                    let mut q = 101u64.to_be_bytes().to_vec();
+                    q.extend_from_slice(&0u64.to_be_bytes());
+                    ov.delete_cf_raw(CF_CORE_WRITER_QUEUE, &q).unwrap();
+                    ov.put_cf_raw(CF_FEE_CONFIG, b"core_writer_full_order_run", b"native")
+                        .unwrap();
+                    ov.put_cf_raw(crate::cf::CF_NATIVE_BALANCES, &[seed as u8], b"bal")
+                        .unwrap();
+                };
+                let ov = NativeStateOverlay::new(db.clone());
+                let prefix = if absorb {
+                    ov.absorb_evm(&bundle, journal).unwrap();
+                    native(&ov);
+                    WriteBatch::default()
+                } else {
+                    let mut batch = WriteBatch::default();
+                    crate::incremental::apply_bundle_plain(&db, &mut batch, &bundle).unwrap();
+                    journal.append_pending_to_batch(&db, &mut batch).unwrap();
+                    let mut extras = HashExtras::new();
+                    extras.add_evm_bundle(&bundle);
+                    extras.add_overlay_pending(&journal);
+                    // Today's `seed_from_bundle`: the bundle's CF_ACCOUNTS rows.
+                    for (address, acct) in &bundle.state {
+                        match &acct.info {
+                            Some(info) => ov
+                                .put_cf_raw(
+                                    CF_ACCOUNTS,
+                                    address.as_slice(),
+                                    &crate::db::encode_account_info(info),
+                                )
+                                .unwrap(),
+                            None if acct.original_info.is_some() => {
+                                ov.delete_cf_raw(CF_ACCOUNTS, address.as_slice()).unwrap()
+                            }
+                            None => {}
+                        }
+                    }
+                    native(&ov);
+                    ov.set_hash_extras(extras);
+                    batch
+                };
+                ov.flush_after_batch_with_native_trie_stats(prefix, &db, Some(1), None, None)
+                    .unwrap();
+                out.push((read_running_hash(&db), dump(&db), ov.dirty_evm_accounts()));
+            }
+            assert_eq!(out[0].0, out[1].0, "seed {seed}: h_n");
+            assert!(out[0].0.is_some());
+            assert_eq!(out[0].1, out[1].1, "seed {seed}: CF bytes");
+            let mut a = out[0].2.clone();
+            let mut b = out[1].2.clone();
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "seed {seed}: dirty EVM accounts (the resync set)");
+        }
     }
 
     fn flush_block(db: &StateDb, h: u64) {
