@@ -845,6 +845,29 @@ fn f3_tc_high_tip_view_must_be_the_signed_view() {
     assert!(!raised.is_correct(&tree).unwrap(), "a tip view no signer signed");
 }
 
+/// F3: the tip view is bound by each signer's signature, not only by the
+/// metadata next to it: a relayer rewriting both the high tip and every
+/// signer's metadata to a later (genuine) header of the same block breaks
+/// the signatures.
+#[test]
+fn f3_tip_view_is_bound_by_the_signatures() {
+    let keys = keys();
+    let set = validator_set(&keys);
+    let (tree, _) = steady_block_tree(&set);
+    let b = block(1);
+    let tips = vec![Some(tip(&b, VIEW - 3)); 3];
+    let tc = collected_tc(&keys[..3], &set, VIEW - 1, &tips, &[None, None, None]);
+    let mut rewritten = tc.clone();
+    let raised = tip(&b, VIEW - 1);
+    rewritten.high_tip = Some(raised.clone());
+    for (summary, _) in rewritten.voter_metadata.iter_mut() {
+        if summary.is_some() {
+            *summary = Some(raised.summary());
+        }
+    }
+    assert!(!rewritten.is_correct(&tree).unwrap(), "tip views the signers did not sign");
+}
+
 /// F3: a signed tip can be no newer than the view the TC times out.
 #[test]
 fn f3_tc_with_a_tip_from_a_later_view_is_not_correct() {
@@ -1058,4 +1081,56 @@ fn no_endorsement_replayed_as_a_timeout_vote_is_rejected() {
         highest_qc: None,
     };
     assert!(!replayed.is_correct(&key.verifying_key()), "NE accepted as a timeout vote");
+}
+
+// Cost --------------------------------------------------------------------
+
+/// Phase C per-block cost (report, not a check): one header signature per
+/// proposal, one header verification per received header or proposal, and
+/// F2 (block-hash recompute + one or two verifications) per tip in a timeout
+/// vote and per TC high tip. Run in release:
+/// `cargo nextest run --release -p hotstuff_rs -E 'test(tip_signing_cost)' --run-ignored only --no-capture`.
+#[test]
+#[ignore]
+fn tip_signing_cost_report() {
+    use std::time::Instant;
+    const N: u32 = 2000;
+    let keys = keys();
+    let set = validator_set(&keys);
+    let (tree, _) = steady_block_tree(&set);
+    let b = child(VIEW - 2, 63);
+    let leader = key_of(&select_leader(ViewNumber::new(VIEW - 1), &set));
+    let view = ViewNumber::new(VIEW - 1);
+    let time = |name: &str, f: &mut dyn FnMut()| {
+        f();
+        let start = Instant::now();
+        for _ in 0..N {
+            f();
+        }
+        let per = start.elapsed() / N;
+        eprintln!("tip_signing_cost {name}: {per:?} per op");
+    };
+    let mut signature = SignatureBytes::new([0; 64]);
+    time("sign header (leader, per proposal)", &mut || {
+        signature = sign_proposal_header(&leader, CHAIN_ID, view, &b.hash);
+    });
+    let header = ProposalHeader { leader_signature: signature, ..header_of(&b, VIEW - 1) };
+    time("verify header signature (per header / proposal)", &mut || {
+        assert!(header.is_signed_by(&leader.verifying_key()));
+    });
+    time("Block::hash recompute (3-of-4 QC justify)", &mut || {
+        assert!(Block::hash(b.height, &b.justify, &b.data_hash) == b.hash);
+    });
+    let t = TipInfo::from_header(&header);
+    time("F2 TipInfo::is_correct (per vote tip, per TC high tip)", &mut || {
+        assert!(t.is_correct(CHAIN_ID, &tree).unwrap());
+    });
+    let with_tip = reproposal_tc(&b);
+    let without_tip = bare_tc(VIEW - 1);
+    time("TimeoutCertificate::is_correct, 3 signers, no tip", &mut || {
+        assert!(without_tip.is_correct(&tree).unwrap());
+    });
+    time("TimeoutCertificate::is_correct, 3 signers, high tip (F2 + F3)", &mut || {
+        assert!(with_tip.is_correct(&tree).unwrap());
+    });
 }

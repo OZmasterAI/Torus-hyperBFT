@@ -484,7 +484,7 @@ pub(crate) fn valid_proposal_certificates<K: KVStore>(
     let Some(tc) = tc else {
         return Ok(true);
     };
-    if tc.view.int().checked_add(1) != Some(view.int()) {
+    if tc.chain_id != chain_id || tc.view.int().checked_add(1) != Some(view.int()) {
         return Ok(false);
     }
     if nec.is_none()

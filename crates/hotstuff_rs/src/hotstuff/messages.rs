@@ -214,9 +214,10 @@ impl Proposal {
         is_header_signed_by(self.chain_id, self.view, &self.block.hash, &self.leader_signature, leader)
     }
 
-    /// Returns true if this proposal is a reproposal (MonadBFT Case 4).
+    /// Returns true if this proposal is a reproposal (MonadBFT Case 4): its TC's high tip wins
+    /// and no NEC excuses skipping it (an NEC proposal carries a fresh block).
     pub fn is_reproposal(&self) -> bool {
-        self.tc.as_ref().is_some_and(|tc| tc.high_tip_is_winner)
+        is_reproposal(self.tc.as_ref(), self.nec.as_ref())
     }
 }
 
@@ -478,6 +479,16 @@ impl ProposalHeader {
     pub fn is_signed_by(&self, leader: &VerifyingKey) -> bool {
         is_header_signed_by(self.chain_id, self.view, &self.block_hash, &self.leader_signature, leader)
     }
+
+    /// See [`Proposal::is_reproposal`].
+    pub fn is_reproposal(&self) -> bool {
+        is_reproposal(self.tc.as_ref(), self.nec.as_ref())
+    }
+}
+
+/// A proposal carrying `tc` and `nec` re-proposes the TC's high tip: the tip wins and no NEC.
+fn is_reproposal(tc: Option<&TimeoutCertificate>, nec: Option<&NoEndorsementCertificate>) -> bool {
+    nec.is_none() && tc.is_some_and(|tc| tc.high_tip_is_winner)
 }
 
 /// Whether `signature` is `leader`'s signature over [`proposal_header_bytes`]`(chain_id, view,

@@ -53,8 +53,6 @@ pub type TipSummary = (CryptoHash, ViewNumber);
 /// What a timeout vote signs about its highest QC: `(view, block hash)`.
 pub type QcSummary = (ViewNumber, CryptoHash);
 
-// Phase-C skeleton: the legacy (untagged) layouts; the tags land with the checks.
-#[allow(dead_code)]
 fn tagged(domain: &[u8], body: impl BorshSerialize) -> Vec<u8> {
     let mut bytes = domain.to_vec();
     body.serialize(&mut bytes).expect("borsh into a Vec cannot fail");
@@ -64,12 +62,12 @@ fn tagged(domain: &[u8], body: impl BorshSerialize) -> Vec<u8> {
 /// The bytes a leader signs for its proposal (and header) of `block_hash` in `view` (F1). The block
 /// hash commits the height, justify and data hash ([`Block::hash`](super::block::Block::hash)).
 pub fn proposal_header_bytes(chain_id: ChainID, view: ViewNumber, block_hash: &CryptoHash) -> Vec<u8> {
-    (chain_id, view, block_hash).try_to_vec().unwrap()
+    tagged(DOMAIN_PROPOSAL_HEADER, (chain_id, view, block_hash))
 }
 
 /// The bytes a validator signs to phase-vote for `block` in `view`.
 pub fn phase_vote_bytes(chain_id: ChainID, view: ViewNumber, block: &CryptoHash, phase: Phase) -> Vec<u8> {
-    (chain_id, view, block, phase).try_to_vec().unwrap()
+    tagged(DOMAIN_PHASE_VOTE, (chain_id, view, block, phase))
 }
 
 /// The bytes a validator signs to time out of `view`, binding its local tip's hash and view (F3)
@@ -80,21 +78,13 @@ pub fn timeout_vote_bytes(
     tip: Option<TipSummary>,
     highest_qc: Option<QcSummary>,
 ) -> Vec<u8> {
-    let mut bytes = (chain_id, view).try_to_vec().unwrap();
-    if let Some((hash, _)) = tip {
-        bytes.extend_from_slice(&hash.bytes());
-    }
-    if let Some((qc_view, qc_block)) = highest_qc {
-        bytes.extend_from_slice(&qc_view.int().to_be_bytes());
-        bytes.extend_from_slice(&qc_block.bytes());
-    }
-    bytes
+    tagged(DOMAIN_TIMEOUT_VOTE, (chain_id, view, tip, highest_qc))
 }
 
 /// The bytes a validator signs to attest that it did not vote for the high tip whose QC is of
 /// `high_tip_qc_view`, for the recovery in `view`.
-pub fn no_endorsement_bytes(_chain_id: ChainID, view: ViewNumber, high_tip_qc_view: ViewNumber) -> Vec<u8> {
-    (view, high_tip_qc_view).try_to_vec().unwrap()
+pub fn no_endorsement_bytes(chain_id: ChainID, view: ViewNumber, high_tip_qc_view: ViewNumber) -> Vec<u8> {
+    tagged(DOMAIN_NO_ENDORSEMENT, (chain_id, view, high_tip_qc_view))
 }
 
 /// Sign [`proposal_header_bytes`] with `key` (the leader of `view`).

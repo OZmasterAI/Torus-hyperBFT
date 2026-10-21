@@ -1285,6 +1285,17 @@ impl<N: Network> HotStuff<N> {
         })
         .publish(&self.event_publisher);
 
+        // TC-required phase C (F1): the proposer signed this view and block. Checked first, so a
+        // proposal the leader did not sign is neither voted on nor taken as its equivocation, and
+        // the voter's tip (F5) carries a valid signature.
+        if proposal.view != self.view_info.view || !proposal.is_signed_by(origin) {
+            log::warn!(
+                "dropping proposal: not signed by its proposer for view {}",
+                self.view_info.view.int()
+            );
+            return Ok(());
+        }
+
         // MonadBFT B3: Equivocation detection — check if we've seen a different
         // block from this leader in this view. If so, this is leader equivocation.
         let proposal_key = (proposal.view, *origin);
@@ -1511,18 +1522,16 @@ impl<N: Network> HotStuff<N> {
                 self.send_phase_vote(&phase_vote, &validator_set_state, block_tree);
 
                 // MonadBFT: Update local_tip (paper Alg 1, line 13: local_tip ← GetTip(p)).
-                // For fresh proposals: tip is the proposal itself.
-                // For reproposals: tip is tc.high_tip (paper Alg 6, line 15).
-                if !proposal.is_reproposal() && vote_phase == Phase::Generic {
+                // For fresh proposals: tip is the proposal itself (its signed header, F2).
+                // For reproposals: tip is the verified tc.high_tip (paper Alg 6, line 15).
+                // The header path does the same (`cast_header_vote`, F5).
+                if proposal.is_reproposal() {
+                    if let Some(tip) = proposal.tc.as_ref().and_then(|tc| tc.high_tip.as_ref()) {
+                        block_tree.set_local_tip(tip)?;
+                    }
+                } else if vote_phase == Phase::Generic {
                     let tip = crate::pacemaker::types::TipInfo::from_proposal(&proposal);
                     block_tree.set_local_tip(&tip)?;
-                } else if proposal.is_reproposal() {
-                    // Reproposal: set local_tip to tc.high_tip per paper GetTip().
-                    if let Some(ref tc) = proposal.tc {
-                        if let Some(ref tip) = tc.high_tip {
-                            block_tree.set_local_tip(tip)?;
-                        }
-                    }
                 }
 
                 Event::PhaseVote(PhaseVoteEvent {
@@ -1608,21 +1617,10 @@ impl<N: Network> HotStuff<N> {
             .phase_vote_collectors
             .update_validator_sets(&validator_set_state);
 
-        // FIX CONS-FIND-27: Update local_tip for nudge-certified blocks.
-        {
-            use crate::pacemaker::types::TipInfo;
-            if let Ok(Some(block)) = block_tree.block(&nudge.justify.block) {
-                let tip = TipInfo {
-                    block_hash: block.hash,
-                    block_height: block.height,
-                    block_justify: nudge.justify.clone(),
-                    block_data_hash: block.data_hash,
-                    view: self.view_info.view,
-                    leader_signature: crate::types::data_types::SignatureBytes::new([0; 64]),
-                };
-                block_tree.set_local_tip(&tip)?;
-            }
-        }
+        // TC-required phase C (F5): a nudge does not set the local tip. A nudge carries no block
+        // header (no leader-signed view and block, F2): FIX CONS-FIND-27 stored the nudge's QC as
+        // the tip's block justify, which does not hash to the block. The tip stays the last
+        // fresh header voted for.
 
         // 4. Vote, if I am allowed to vote and if I haven't voted in this view yet.
         if is_phase_voter(
@@ -2282,6 +2280,16 @@ impl<N: Network> HotStuff<N> {
             self.inline_self_header = None;
             return Ok(());
         }
+        // TC-required phase C (F1): the proposer signed this header's view and block. Checked
+        // first: a header the leader did not sign is neither voted on, nor taken as its
+        // equivocation, nor a tip (F5).
+        if !header.is_signed_by(origin) {
+            log::warn!(
+                "dropping proposal header: not signed by its proposer, view={}",
+                header.view.int()
+            );
+            return Ok(());
+        }
         // Headers bypass receive-side view filtering so delayed bodies and
         // ancestors can still be recovered. Only the authenticated leader's
         // header for our CURRENT view may consume that view's vote/status.
@@ -2909,6 +2917,17 @@ impl<N: Network> HotStuff<N> {
         // again in this view (possibly for another block).
         block_tree.set_vote_state_atomic(header.view, header.block_hash)?;
         self.send_phase_vote(&phase_vote, &validator_set_state, block_tree);
+        // TC-required phase C (F5): the production (header-first) path sets the local tip as the
+        // full-proposal path does: a re-proposal keeps the TC's verified high tip (its original
+        // view and leader signature), a fresh Generic vote takes this signed header. Before, only
+        // the full path did, so the tail-fork block B was never a tip and TC(v) could not carry it.
+        if header.is_reproposal() {
+            if let Some(tip) = header.tc.as_ref().and_then(|tc| tc.high_tip.as_ref()) {
+                block_tree.set_local_tip(tip)?;
+            }
+        } else if vote_phase == Phase::Generic {
+            block_tree.set_local_tip(&crate::pacemaker::types::TipInfo::from_header(header))?;
+        }
         // T1.3 observability: this vote was cast before `app.validate_block` ran on the body
         // (unless the block is already in the tree, in which case it was validated on
         // insertion). If the body later turns out app-invalid, `try_insert_body` increments

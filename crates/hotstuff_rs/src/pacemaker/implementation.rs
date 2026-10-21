@@ -284,9 +284,18 @@ impl<N: Network> Pacemaker<N> {
         // vote is dropped (neither echoed nor collected), so the TC forms from the honest votes.
         // Honest voters usually report this replica's own (already verified) highest PC, which
         // skips the n signature checks.
+        //
+        // TC-required phase C (F4): the vote's tip must be a real header (F2: its fields hash to
+        // its block, leader(tip.view) signed it) no newer than the vote. A forged tip would
+        // otherwise win the TC's high tip and force the next leader into recovery. Such a vote
+        // is dropped like a forged high QC.
         let vote_ok = timeout_vote.is_correct(origin)
             && match &timeout_vote.highest_qc {
                 Some(qc) => *qc == block_tree.highest_pc()? || qc.is_correct(block_tree)?,
+                None => true,
+            }
+            && match &timeout_vote.local_tip {
+                Some(tip) => tip.view <= timeout_vote.view && tip.is_correct(self.config.chain_id, block_tree)?,
                 None => true,
             };
         if vote_ok {
@@ -359,13 +368,6 @@ impl<N: Network> Pacemaker<N> {
                 Some(tc) if tc.is_correct(block_tree)? => Some(tc.clone()),
                 _ => None,
             };
-
-            // FIX CONS-FIND-26: Validate TipInfo fields before collecting.
-            if let Some(ref tip) = timeout_vote.local_tip {
-                if tip.view > self.view_info.view {
-                    return Ok(());
-                }
-            }
 
             // 3. Try to collect the TimeoutVote into a new `TimeoutCertificate`.
             //    TC-required phase A (C3): a vote for the view just left goes to

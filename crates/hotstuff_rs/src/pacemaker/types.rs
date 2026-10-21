@@ -10,9 +10,11 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use ed25519_dalek::Verifier;
 
 use crate::hotstuff::{
-    messages::{Proposal, ProposalHeader},
+    messages::{is_header_signed_by, Proposal, ProposalHeader},
     types::PhaseCertificate,
 };
+use crate::pacemaker::implementation::{select_leader, select_leader_with_reputation};
+use crate::types::block::Block;
 
 use crate::{
     block_tree::{
@@ -71,13 +73,37 @@ impl TipInfo {
         (self.block_hash, self.view)
     }
 
-    /// F2: whether this tip is a real header of chain `chain_id`. Phase-C skeleton: not checked yet.
+    /// F2: whether this tip is a real proposal header of chain `chain_id`:
+    ///
+    /// - its height, justify and data hash recompute its block hash ([`Block::hash`]), so the
+    ///   fields the protocol reads from a tip (`block_justify` above all) are the block's own;
+    /// - `leader_signature` is leader(`view`)'s signature over `(chain_id, view, block_hash)`
+    ///   ([`proposal_header_bytes`](crate::types::signing::proposal_header_bytes)), with
+    ///   leader(`view`) taken in the committed or the previous validator set (as for TCs). A tip
+    ///   signed under an older set fails (open question 4: drop, not archive).
+    ///
+    /// Costs one hash and one or two signature checks.
     pub fn is_correct<K: KVStore>(
         &self,
-        _chain_id: ChainID,
-        _block_tree: &BlockTreeSingleton<K>,
+        chain_id: ChainID,
+        block_tree: &BlockTreeSingleton<K>,
     ) -> Result<bool, BlockTreeError> {
-        Ok(true)
+        if Block::hash(self.block_height, &self.block_justify, &self.block_data_hash) != self.block_hash {
+            return Ok(false);
+        }
+        let validator_set_state = block_tree.validator_set_state()?;
+        let reputation = block_tree.leader_reputation().ok();
+        let leader_in = |set: &ValidatorSet| {
+            (set.len() > 0 && set.total_power().int() > 0).then(|| match reputation.as_ref() {
+                Some(rep) => select_leader_with_reputation(self.view, set, rep),
+                None => select_leader(self.view, set),
+            })
+        };
+        let committed = leader_in(validator_set_state.committed_validator_set());
+        let previous = leader_in(validator_set_state.previous_validator_set()).filter(|leader| Some(*leader) != committed);
+        Ok([committed, previous].into_iter().flatten().any(|leader| {
+            is_header_signed_by(chain_id, self.view, &self.block_hash, &self.leader_signature, &leader)
+        }))
     }
 }
 
@@ -114,15 +140,15 @@ impl TimeoutCertificate {
     /// signatures over that metadata are checked by the caller,
     /// [`is_correctly_signed`](Certificate::is_correctly_signed)):
     ///
-    /// - `high_tip` is a tip hash some signer signed, and is present iff any
-    ///   signer signed one;
+    /// - `high_tip` is a tip some signer signed (hash and view, F3), at the
+    ///   highest tip view any signer signed, and is present iff any signer
+    ///   signed one; no signed tip is newer than the view this TC times out;
     /// - `high_qc` is the highest `(view, block)` QC summary any signer
     ///   signed, and is present iff any signer signed one;
     /// - `high_tip_is_winner` is the collector's rule over the two.
     ///
-    /// A timeout vote signs only its tip's block hash, not the tip's other
-    /// fields (`TipInfo::view` above all), so this cannot check that
-    /// `high_tip` is the highest signed tip, nor its view.
+    /// That `high_tip` is a real header (F2) is checked by
+    /// [`is_correct`](Certificate::is_correct), which has the validator sets.
     fn summaries_are_signed(&self) -> bool {
         let signed = || {
             self.signatures
@@ -131,10 +157,12 @@ impl TimeoutCertificate {
                 .filter(|(_, signature)| signature.is_some())
                 .filter_map(|(idx, _)| self.voter_metadata.get(idx))
         };
-        let tip_ok = match &self.high_tip {
-            Some(tip) => signed().any(|(summary, _)| summary.is_some_and(|(hash, _)| hash == tip.block_hash)),
-            None => signed().all(|(summary, _)| summary.is_none()),
-        };
+        let max_tip = signed().filter_map(|(tip, _)| *tip).map(|(_, view)| view).max();
+        let tip_ok = max_tip.is_none_or(|view| view <= self.view)
+            && match &self.high_tip {
+                Some(tip) => max_tip == Some(tip.view) && signed().any(|(summary, _)| *summary == Some(tip.summary())),
+                None => max_tip.is_none(),
+            };
         let max_qc = signed().filter_map(|(_, qc)| *qc).map(|(view, _)| view).max();
         let qc_ok = match &self.high_qc {
             Some(qc) => {
@@ -179,6 +207,13 @@ impl Certificate for TimeoutCertificate {
         if !signed {
             return Ok(false);
         }
+        // F2: the high tip is a real header (its view, which the signers signed, is the one its
+        // leader signed).
+        if let Some(tip) = &self.high_tip {
+            if !tip.is_correct(self.chain_id, block_tree)? {
+                return Ok(false);
+            }
+        }
         // This replica's own highest PC was verified when it was accepted; skip its n
         // signature checks (the common case: the TC's signers report the same QC).
         match &self.high_qc {
@@ -190,8 +225,9 @@ impl Certificate for TimeoutCertificate {
     /// Checks if all of the signatures in the certificate are correct, and if the set of signatures forms
     /// a quorum.
     fn is_correctly_signed(&self, validator_set: &ValidatorSet) -> bool {
-        // Check whether the size of the signature set is the same as the size of the validator set.
-        if self.signatures.len() != validator_set.len() {
+        // Check whether the size of the signature set (and of the per-signer metadata) is the same
+        // as the size of the validator set.
+        if self.signatures.len() != validator_set.len() || self.voter_metadata.len() != validator_set.len() {
             return false;
         }
 
@@ -212,7 +248,7 @@ impl Certificate for TimeoutCertificate {
                 if let Ok(signature) = Signature::from_slice(&signature.bytes()) {
                     // Reconstruct the per-voter message bytes including their
                     // local_tip and highest_qc metadata (bound by their signature).
-                    let (tip, qc) = self.voter_metadata.get(idx).copied().unwrap_or((None, None));
+                    let (tip, qc) = self.voter_metadata[idx];
                     let msg = timeout_vote_bytes(self.chain_id, self.view, tip, qc);
 
                     if _signer.verify(&msg, &signature).is_ok() {
