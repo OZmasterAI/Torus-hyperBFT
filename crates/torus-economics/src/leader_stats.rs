@@ -646,9 +646,10 @@ mod tests {
         assert_eq!(excluded(&plan(&mgr, 8).unwrap()), vec![addr(3)]);
 
         let (_d, mgr) = setup(&[2_000_000, 2_000_000, 1_000_000]);
-        exec(&mgr, 1, &missed(&[1, 1, 1], 2, 4));
+        exec(&mgr, 1, &missed(&[2, 2, 2], 1, 4));
         let mut view = 4;
         quiet(&mgr, 2, 4, &mut view);
+        assert_eq!(leader_stats(mgr.state(), &addr(2)).unwrap().miss_run, 3, "K reached");
         assert_eq!(plan(&mgr, 8), None, "eligible 3M < quorum 3,333,334");
         assert_eq!(quorum_power(5_000_000), 3_333_334);
     }
