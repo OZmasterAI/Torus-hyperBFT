@@ -77,8 +77,8 @@ these locations to verify the safety arguments.
 | Guard | File | Lines | Function | What it does |
 |-------|------|-------|----------|--------------|
 | Reproposal detect | hotstuff/messages.rs | 161-163 | Proposal::is_reproposal | `tc.high_tip_is_winner` |
-| TC validation | hotstuff/implementation.rs | 558-578 | on_receive_proposal | Verifies TC correct, view matches, block matches high_tip |
-| NEC validation | hotstuff/implementation.rs | 581-594 | on_receive_proposal | `valid_nec(nec, block_tree)?` |
+| TC validation | hotstuff/types.rs | — | valid_proposal_certificates | TC correct and for view - 1; a re-proposal without NEC proposes exactly high_tip. Called by on_receive_proposal AND on_receive_proposal_header |
+| NEC validation | hotstuff/types.rs | — | valid_proposal_certificates | `valid_nec`, nec.view == proposal view, comes with a TC, over the QC view of the TC's high tip |
 | Phased reproposal | block_tree/invariants.rs | 590-601 | repropose_block | Re-propose on interrupted phased chain |
 
 ### P8: 2-chain commit correctness
@@ -97,7 +97,7 @@ these locations to verify the safety arguments.
 |-------|------|-------|----------|--------------|
 | Block correctness | types/block.rs | — | Block::is_correct | Hash verification, structure checks |
 | PC correctness | hotstuff/types.rs | 48-188 | PhaseCertificate::is_correct | Signature + quorum verification |
-| TC correctness | pacemaker/types.rs | 55-116 | TimeoutCertificate::is_correct | Signature + quorum verification |
+| TC correctness | pacemaker/types.rs | — | TimeoutCertificate::is_correct | Signature + quorum verification; high_tip / high_qc / high_tip_is_winner match the signers' signed metadata (summaries_are_signed). TipInfo.view is unsigned and unchecked |
 | View monotonicity | pacemaker/implementation.rs | 472-478 | update_view | `next_view > cur_view` enforced |
 | Proposal dedup | hotstuff/implementation.rs | 433-437 | on_receive_msg | ProposalStatus prevents double proposals |
 | Bracha amplify | pacemaker/implementation.rs | 253-281 | on_receive_timeout_vote | f+1 timeout votes → broadcast own |

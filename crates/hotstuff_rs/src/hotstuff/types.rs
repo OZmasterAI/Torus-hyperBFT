@@ -16,6 +16,7 @@ use crate::{
         accessors::internal::{BlockTreeError, BlockTreeSingleton},
         pluggables::KVStore,
     },
+    pacemaker::types::TimeoutCertificate,
     types::{
         data_types::*,
         signed_messages::{Certificate, Collector},
@@ -445,6 +446,46 @@ pub fn valid_nec<K: KVStore>(
     };
 
     Ok(is_nec_correctly_signed(nec, validator_set))
+}
+
+/// VALIDPROPOSAL's certificate part: whether the TC and NEC a proposal for
+/// `view` of block `block_hash` carries are valid. The one check both the
+/// full-proposal path and the header-first path run.
+///
+/// - An NEC must be valid ([`valid_nec`]), for `view`, and come with a TC
+///   whose high tip's QC view it is over (it proves that tip can be skipped).
+/// - A TC must be correct (which includes its high tip / high QC summaries
+///   matching what its signers signed) and for `view - 1`.
+/// - A re-proposal (the TC's high tip won) without an NEC must propose
+///   exactly the TC's high tip.
+pub(crate) fn valid_proposal_certificates<K: KVStore>(
+    view: ViewNumber,
+    block_hash: &CryptoHash,
+    tc: Option<&TimeoutCertificate>,
+    nec: Option<&NoEndorsementCertificate>,
+    block_tree: &BlockTreeSingleton<K>,
+) -> Result<bool, BlockTreeError> {
+    if let Some(nec) = nec {
+        let over_tc_tip = tc
+            .and_then(|tc| tc.high_tip.as_ref())
+            .is_some_and(|tip| tip.block_justify.view == nec.high_tip_qc_view);
+        if nec.view != view || !over_tc_tip || !valid_nec(nec, block_tree)? {
+            return Ok(false);
+        }
+    }
+    let Some(tc) = tc else {
+        return Ok(true);
+    };
+    if tc.view.int().checked_add(1) != Some(view.int()) {
+        return Ok(false);
+    }
+    if nec.is_none()
+        && tc.high_tip_is_winner
+        && tc.high_tip.as_ref().is_none_or(|tip| tip.block_hash != *block_hash)
+    {
+        return Ok(false);
+    }
+    tc.is_correct(block_tree)
 }
 
 /// Check if the NEC's signatures are correct and form a quorum.
