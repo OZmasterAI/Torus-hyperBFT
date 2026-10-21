@@ -147,6 +147,11 @@ fn world(ctx: &mut NativeExecContext) -> World {
 fn run_m1(mode: Mode, block: &[(Address, NativeAction)]) -> Run {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
+    // Pre-testnet P0: orders need a listed market (placeholder rows,
+    // tick / lot 1, as the old implicit book).
+    for m in 1..=64u64 {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+    }
     let mut ctx = NativeExecContext::new(db, 1, 1000, 0, 100, 10, addr(99), addr(100), addr(101));
     for n in 1..=3u8 {
         fund_native(&ctx, &addr(n), fp(1_000_000));
@@ -251,6 +256,11 @@ fn row41_rejected_limit_takes_no_open_order_slot() {
     for mode in MODES {
         let dir = tempfile::tempdir().unwrap();
         let db = StateDb::open(dir.path()).unwrap();
+        // Pre-testnet P0: orders need a listed market (placeholder rows,
+        // tick / lot 1, as the old implicit book).
+        for m in 1..=64u64 {
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+        }
         let mut ctx = NativeExecContext::new(db, 1, 1000, 0, 100, 10, addr(99), addr(100), addr(101));
         fund_native(&ctx, &a, fp(1_000_000_000));
         // Fill all but one slot with resting bids (no volume: base limit).
@@ -268,8 +278,9 @@ fn row41_rejected_limit_takes_no_open_order_slot() {
 
 /// Row 42: a market with a row (tick 0.5, lot 0.1) and no book gets a book
 /// with the row's tick and lot on every path; pre-book checks use them; the
-/// book persists them. A placeholder row (not a market layout) and a market
-/// without a row keep 1 / 1.
+/// book persists them. A placeholder row (not a market layout) keeps 1 / 1.
+/// Pre-testnet P0: a market without a row is not listed: its order is
+/// rejected (`unknown market_id`) and creates no book.
 #[test]
 fn row42_books_created_from_the_market_row() {
     let (a, c) = (addr(1), addr(3));
@@ -279,7 +290,7 @@ fn row42_books_created_from_the_market_row() {
         place(a, order(5, true, fp(100), fpr(S / 20))),             // 2: below the lot 0.1
         place(c, order(5, false, fpr(101 * S + S / 2), fpr(3 * S / 10))), // 3: rests
         place(a, order(6, true, fpr(100 * S + S / 2), fp(1))),      // 4: placeholder row: tick 1
-        place(a, order(7, true, fp(100), fpr(S / 2))),              // 5: no row: lot 1
+        place(a, order(7, true, fp(100), fpr(S / 2))),              // 5: no row: not listed
         place(c, order(6, false, fp(101), fp(2))),                  // 6: rests in m6 (1 / 1)
     ];
     let mut batch = Vec::new();
@@ -299,7 +310,7 @@ fn row42_books_created_from_the_market_row() {
         assert!(err_has(&r[1], "order rejected: price 100.25000000 is not a multiple of the tick 0.50000000"), "{mode:?}: {:?}", r[1]);
         assert!(err_has(&r[2], "order rejected: quantity 0.05000000 below the lot size 0.10000000"), "{mode:?}: {:?}", r[2]);
         assert!(err_has(&r[4], "is not a multiple of the tick 1.00000000"), "{mode:?}: {:?}", r[4]);
-        assert!(err_has(&r[5], "below the lot size 1.00000000"), "{mode:?}: {:?}", r[5]);
+        assert!(err_has(&r[5], "unknown market_id 7"), "{mode:?}: {:?}", r[5]);
         let b5 = &ctx.order_books()[&5];
         assert_eq!((b5.tick_size, b5.lot_size), (fpr(S / 2), fpr(S / 10)), "{mode:?}");
         assert_eq!(b5.best_bid(), Some(fpr(100 * S + S / 2)), "{mode:?}");
@@ -327,6 +338,11 @@ fn row42_existing_book_keeps_its_meta() {
     for mode in MODES {
         let dir = tempfile::tempdir().unwrap();
         let db = StateDb::open(dir.path()).unwrap();
+        // Pre-testnet P0: orders need a listed market (placeholder rows,
+        // tick / lot 1, as the old implicit book).
+        for m in 1..=64u64 {
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+        }
         db.put_cf_raw(CF_NATIVE_MARKETS, &5u64.to_be_bytes(), &market_row(S / 2, S / 10)).unwrap();
         let mut ctx = NativeExecContext::new(db, 1, 1000, 0, 100, 10, addr(99), addr(100), addr(101));
         fund_native(&ctx, &a, fp(1_000_000));

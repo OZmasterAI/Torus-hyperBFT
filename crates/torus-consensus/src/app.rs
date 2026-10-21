@@ -587,11 +587,296 @@ struct CommittedBlockMsg {
     /// the same bytes would land in the same key. `Default` (both `false`) =
     /// "not known durable" ⇒ execution writes them, exactly as before.
     durable: DurableRows,
+    /// T5.3: the header + body write runs on the [`CommitPersistWriter`]
+    /// instead of the consensus thread; the exec thread waits for this ticket
+    /// (and uses its rows instead of `durable`) before it executes the block.
+    /// `None` = `durable` is final (the write already ran in the dispatch).
+    persist: Option<PersistTicket>,
     /// Exec-aware admission: the normal actions this block added to the
     /// committed-but-unexecuted count (`Mempool::note_exec_committed`); the
     /// exec thread releases exactly this after executing it. 0 with the
     /// knob off (the exec thread then touches nothing).
     committed_unexecuted: usize,
+}
+
+/// T5.3: called with a committed height once its `CF_BLOCK_HEADERS` row is
+/// readable (the node publishes the RPC height + the WS head from it). With the
+/// [`CommitPersistWriter`] the header lands after the commit event, so the
+/// commit handler alone would publish one height behind and never catch up
+/// once commits stop. Called on the writer thread (after the row's write
+/// returned and the height's ticket filled, so exec never waits on it), in height order, at most once
+/// per height there; or on the exec thread for a height whose writer write
+/// failed (exec wrote the row). Must be quick and must not panic. Never called
+/// with the manifest in the state DB (the dispatch writes the row before the
+/// commit event there).
+pub type HeaderPersistedHook = Arc<dyn Fn(u64) + Send + Sync>;
+
+/// T5.3: the [`HeaderPersistedHook`] slot, shared by `TorusApp`, the
+/// [`CommitPersistWriter`] and the exec thread; empty = nobody is told.
+type HeaderHookSlot = Arc<std::sync::OnceLock<HeaderPersistedHook>>;
+
+/// T5.3: the commit-persist result of one height: filled by the
+/// [`CommitPersistWriter`] once the height's header + body write returned,
+/// awaited by the exec thread before it executes the height, and by the DA
+/// body GC before it records the height (RH4: its restore reloads the body
+/// row, see [`crate::da_gc_worker`]).
+#[derive(Clone, Default)]
+pub(crate) struct PersistTicket(Arc<(std::sync::Mutex<TicketSlot>, std::sync::Condvar)>);
+
+/// What a [`PersistTicket`] holds.
+#[derive(Default)]
+struct TicketSlot {
+    rows: Option<DurableRows>,
+    /// The block's native actions when its body row did not land (the DA
+    /// body GC restores from them then; taken once).
+    unwritten_actions: Option<Vec<torus_types::SignedNativeAction>>,
+}
+
+impl PersistTicket {
+    /// Fill the ticket once (a second fill is ignored) and wake the waiter,
+    /// handing the block's `actions` back when its body row did not land
+    /// (dropped otherwise).
+    fn settle(&self, rows: DurableRows, actions: Option<Vec<torus_types::SignedNativeAction>>) {
+        let (slot, cv) = &*self.0;
+        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.rows.is_none() {
+            slot.rows = Some(rows);
+            if !rows.body {
+                slot.unwritten_actions = actions.filter(|a| !a.is_empty());
+            }
+            cv.notify_all();
+        }
+    }
+
+    /// Block until the ticket is filled.
+    fn wait(&self) -> DurableRows {
+        let (slot, cv) = &*self.0;
+        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(rows) = slot.rows {
+                return rows;
+            }
+            slot = cv.wait(slot).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Wait at most `timeout` for the ticket: `Some(body row written)` once
+    /// filled, `None` while the write is pending.
+    pub(crate) fn wait_body_for(&self, timeout: std::time::Duration) -> Option<bool> {
+        let (slot, cv) = &*self.0;
+        let slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+        let (slot, _) = cv
+            .wait_timeout_while(slot, timeout, |slot| slot.rows.is_none())
+            .unwrap_or_else(|e| e.into_inner());
+        slot.rows.map(|rows| rows.body)
+    }
+
+    /// The block's actions, once, if its body row did not land.
+    pub(crate) fn take_unwritten_actions(&self) -> Option<Vec<torus_types::SignedNativeAction>> {
+        let mut slot = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        slot.unwritten_actions.take()
+    }
+}
+
+#[cfg(test)]
+impl PersistTicket {
+    /// [`Self::settle`] without actions.
+    fn set(&self, rows: DurableRows) {
+        self.settle(rows, None);
+    }
+
+    /// The filled rows, without waiting (`None` while the write is pending).
+    fn peek(&self) -> Option<DurableRows> {
+        self.0 .0.lock().unwrap_or_else(|e| e.into_inner()).rows
+    }
+}
+
+#[cfg(test)]
+impl CommittedBlockMsg {
+    /// The rows the exec thread uses: the queued write's once it returned,
+    /// else `durable`.
+    fn settled_durable(&self) -> DurableRows {
+        self.persist
+            .as_ref()
+            .map_or(self.durable, PersistTicket::wait)
+    }
+}
+
+/// T5.3: one queued commit-persist write. Dropped unwritten (the writer died,
+/// or it was stopped first) it fills its ticket with `DurableRows::default()`
+/// ("not durable"), so the exec thread never waits forever and writes the
+/// rows itself, as after a failed dispatch-time write; the block's actions
+/// go back with it (the DA body GC's restore source then).
+struct PersistJob {
+    block: TorusBlock,
+    ticket: PersistTicket,
+}
+
+impl Drop for PersistJob {
+    fn drop(&mut self) {
+        let actions = std::mem::take(&mut self.block.native_actions);
+        self.ticket.settle(DurableRows::default(), Some(actions));
+    }
+}
+
+/// T5.3: the thread (`torus-commit-persist`) that writes each dispatched
+/// height's header + body to the state DB ([`persist_committed_block_durably_timed`],
+/// same batch, same timers) instead of the consensus thread, so a commit no
+/// longer waits behind a state checkpoint batch in the state DB's write queue.
+///
+/// Contract: one FIFO queue, so the writes land in height order; the exec thread
+/// waits for a height's [`PersistTicket`] before executing it, so the rows are
+/// written before the block executes (as when the dispatch wrote them); the
+/// height's commit manifest (consensus DB, written synchronously by the commit
+/// hook) is the crash backstop until then: a crash before the write lands
+/// leaves a manifest-backed height above the header frontier, which boot parks
+/// and heals (FIX 6 / F-1); and the manifest goes only after a state-WAL sync
+/// made the write durable (the owned [`ManifestPruner`], noted after each
+/// write with a body).
+struct CommitPersistWriter {
+    tx: Option<std::sync::mpsc::Sender<PersistJob>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    /// Test seam ([`Self::held`]): queued jobs stay here, unwritten.
+    #[cfg(test)]
+    _held: Option<std::sync::mpsc::Receiver<PersistJob>>,
+}
+
+impl CommitPersistWriter {
+    fn spawn(
+        state_db: StateDb,
+        pruner: ManifestPruner,
+        metrics: Option<Arc<torus_telemetry::Metrics>>,
+        header_hook: HeaderHookSlot,
+    ) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<PersistJob>();
+        let worker = Self::spawn_on(rx, state_db, pruner, metrics, header_hook);
+        Self {
+            tx: Some(tx),
+            worker: Some(worker),
+            #[cfg(test)]
+            _held: None,
+        }
+    }
+
+    /// The writer thread over `rx` (see [`Self::spawn`]).
+    fn spawn_on(
+        rx: std::sync::mpsc::Receiver<PersistJob>,
+        state_db: StateDb,
+        pruner: ManifestPruner,
+        metrics: Option<Arc<torus_telemetry::Metrics>>,
+        header_hook: HeaderHookSlot,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::Builder::new()
+            .name("torus-commit-persist".into())
+            .spawn(move || {
+                for mut job in rx {
+                    let height = job.block.header.height;
+                    let durable = persist_committed_block_durably_timed(
+                        &state_db,
+                        &job.block,
+                        metrics.as_deref(),
+                        false,
+                    );
+                    // Settle the ticket first: exec unblocks without waiting
+                    // on the publish below. A body that did not land hands
+                    // the actions back (the DA body GC restores from them).
+                    let unwritten =
+                        (!durable.body).then(|| std::mem::take(&mut job.block.native_actions));
+                    job.ticket.settle(durable, unwritten);
+                    // The header row is readable now (the write returned Ok):
+                    // publish the height (RPC height + WS head), so the commit
+                    // handler's stale read (it may have run before this write)
+                    // is repaired even if no commit follows.
+                    if durable.header {
+                        if let Some(hook) = header_hook.get() {
+                            hook(height);
+                        }
+                    }
+                    if durable.body {
+                        pruner.note(height);
+                    }
+                }
+                // `pruner` drops here: its last pass, then its thread joins.
+            })
+            .expect("spawn the commit-persist writer")
+    }
+
+    /// Test seam: a writer that queues jobs and never writes them (a crash
+    /// before the off-thread write lands); dropping it drops them unwritten.
+    #[cfg(test)]
+    fn held() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<PersistJob>();
+        Self {
+            tx: Some(tx),
+            worker: None,
+            _held: Some(rx),
+        }
+    }
+
+    /// Test seam: the real writer, each write landing `delay` after its
+    /// submit (a write queued behind a state checkpoint batch).
+    #[cfg(test)]
+    fn delayed(state_db: StateDb, pruner: ManifestPruner, delay: std::time::Duration) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<PersistJob>();
+        let (fwd_tx, fwd_rx) = std::sync::mpsc::channel::<PersistJob>();
+        std::thread::spawn(move || {
+            for job in rx {
+                std::thread::sleep(delay);
+                if fwd_tx.send(job).is_err() {
+                    return;
+                }
+            }
+        });
+        Self {
+            tx: Some(tx),
+            worker: Some(Self::spawn_on(
+                fwd_rx,
+                state_db,
+                pruner,
+                None,
+                HeaderHookSlot::default(),
+            )),
+            _held: None,
+        }
+    }
+
+    /// Test seam: let a [`Self::held`] writer go: the real writer thread
+    /// starts on the held queue and writes what it holds, in order, then
+    /// what follows (a slow write that lands late).
+    #[cfg(test)]
+    fn release(&mut self, state_db: StateDb, pruner: ManifestPruner) {
+        let rx = self._held.take().expect("a held writer");
+        self.worker = Some(Self::spawn_on(
+            rx,
+            state_db,
+            pruner,
+            None,
+            HeaderHookSlot::default(),
+        ));
+    }
+
+    /// Queue `block`'s header + body write; the ticket fills once it returned.
+    fn submit(&self, block: TorusBlock) -> PersistTicket {
+        let ticket = PersistTicket::default();
+        let job = PersistJob {
+            block,
+            ticket: ticket.clone(),
+        };
+        if let Some(tx) = &self.tx {
+            // A dead writer hands the job back; dropping it fills the ticket.
+            let _ = tx.send(job);
+        }
+        ticket
+    }
+}
+
+impl Drop for CommitPersistWriter {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 /// Which of a committed block's node-local durable rows are known to be on
@@ -1289,6 +1574,9 @@ struct ExecutionContext {
     /// without streams. Set before consensus starts;
     /// boot replay runs before it can be set, so replayed blocks never reach it.
     fill_sink: Arc<std::sync::OnceLock<Arc<dyn torus_state::trade_rows::FillSink>>>,
+    /// T5.3: the header-persisted hook slot (see [`HeaderPersistedHook`]); the
+    /// exec thread calls it for a height whose commit-persist write failed.
+    header_hook: HeaderHookSlot,
     /// Running state hash: attestation submitter (shared with `TorusApp`).
     state_hash: Arc<crate::state_hash::StateHashMonitor>,
     /// L3 flush-pipe (b): background writer for the exec-time block-body persist
@@ -1926,19 +2214,29 @@ impl Drop for ObserveOnDrop {
 ///   boot-replay / block-sync / RPC readers see exactly the coverage they had
 ///   before. The EVM arm's `commit_block_metadata` (receipts/indices, only
 ///   known post-execution) is untouched.
+///
+/// Test shorthand with the manifest in the state DB (the pre-T5.3 layout,
+/// `TORUS_MANIFEST_IN_STATE_DB=1`): the height's manifest is pruned in the
+/// same batch.
 #[cfg(test)]
 fn persist_committed_block_durably(state_db: &StateDb, block: &TorusBlock) -> DurableRows {
-    persist_committed_block_durably_timed(state_db, block, None)
+    persist_committed_block_durably_timed(state_db, block, None, true)
 }
 
 /// [`persist_committed_block_durably`] with the consensus-thread timers
 /// (`torus_commit_persist_seconds` = whole call, `torus_commit_body_encode_seconds`
 /// = the body-record encode alone, `torus_commit_persist_write_seconds` = the
 /// WriteBatch write alone).
+///
+/// `prune_manifest_in_batch`: the commit manifest lives in this state DB (the
+/// pre-T5.3 layout), so its row is deleted in the same batch as the body.
+/// With the manifest in the consensus DB the caller hands the height to the
+/// [`ManifestPruner`], which deletes the row only after a state-WAL sync.
 fn persist_committed_block_durably_timed(
     state_db: &StateDb,
     block: &TorusBlock,
     metrics: Option<&torus_telemetry::Metrics>,
+    prune_manifest_in_batch: bool,
 ) -> DurableRows {
     let persist_timer = std::time::Instant::now();
     let height_key = block.header.height.to_be_bytes();
@@ -1987,8 +2285,8 @@ fn persist_committed_block_durably_timed(
     // `CF_COMMIT_MANIFEST` stays bounded to the committed-but-not-yet-dispatched
     // window. Only when the body is actually in the batch: a still-missing body
     // keeps its manifest for the heal pull. (A missing manifest CF is harmless:
-    // the CF merely grows.)
-    if body {
+    // the CF merely grows.) T5.3: only while the manifest lives in this DB.
+    if body && prune_manifest_in_batch {
         if let Ok(cf) = state_db.cf_handle(CF_COMMIT_MANIFEST) {
             batch.delete_cf(cf, height_key);
         }
@@ -2045,7 +2343,9 @@ fn sync_committed_wal(state_db: &StateDb, enabled: bool) -> bool {
 }
 
 /// FIX (heal-channel crash-safety). Persist the committed consensus DATUM
-/// verbatim, keyed by height, to [`CF_COMMIT_MANIFEST`]. Called as the FIRST
+/// verbatim, keyed by height, to [`CF_COMMIT_MANIFEST`] in `manifest_db` (T5.3:
+/// the node's consensus DB, see [`TorusApp::try_new_with_manifest_db`]; the
+/// state DB in the pre-T5.3 layout). Called as the FIRST
 /// durable action on every commit callback (`on_committed_block`), BEFORE the
 /// body is reconstructed or the block enters the execution pipeline.
 ///
@@ -2062,14 +2362,252 @@ fn sync_committed_wal(state_db: &StateDb, enabled: bool) -> bool {
 /// [`recovery_exec_source`]). Best-effort: a write failure is loud but never
 /// aborts the commit (it degrades to the same un-healable-but-loud hole, never a
 /// silent state loss).
-fn persist_commit_manifest(state_db: &StateDb, height: u64, datum_bytes: &[u8]) {
-    if let Err(e) = state_db.put_cf_raw(CF_COMMIT_MANIFEST, &height.to_be_bytes(), datum_bytes) {
+///
+/// Durability (T5.3): a default write (WAL on, not fsynced), as in the state
+/// DB before. With `TORUS_SYNC_WAL_ON_COMMIT` the commit-persist write's
+/// `sync_wal` (on the [`CommitPersistWriter`] thread since T5.3, so after the
+/// commit hook returned) syncs the consensus DB's WAL (the state DB's
+/// attached peer) first. In the
+/// consensus DB the row also shares a WAL with the HotStuff app-fed height,
+/// advanced after this callback returns, so the row cannot be lost while that
+/// advance survives (before T5.3 they sat in different WALs).
+fn persist_commit_manifest(manifest_db: &StateDb, height: u64, datum_bytes: &[u8]) {
+    if let Err(e) = manifest_db.put_cf_raw(CF_COMMIT_MANIFEST, &height.to_be_bytes(), datum_bytes) {
         tracing::error!(
             %e,
             height,
             "failed to persist commit manifest at commit time (a boot-parked hole here could not heal from peers)"
         );
     }
+}
+
+/// T5.3: at most one [`manifest_prune_pass`] per this interval (one state-WAL
+/// fsync per second on the pruner thread, never on the consensus thread).
+const MANIFEST_PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// T5.3: one prune pass over dispatched `heights` whose header + body
+/// `dispatch_to_exec` wrote to the state DB. Syncs the state DB's WAL FIRST, so
+/// those writes are durable even across a power loss, and only then deletes the
+/// heights' manifest rows from the consensus DB. The two DBs have separate WALs:
+/// a delete that became durable while the unsynced body write was lost would
+/// leave a committed height with neither body nor manifest, an unhealable hole.
+/// (Before T5.3 the delete rode the body's own batch.) `Err` keeps the rows.
+fn manifest_prune_pass(
+    state_db: &StateDb,
+    manifest_db: &StateDb,
+    heights: &[u64],
+) -> Result<(), String> {
+    if heights.is_empty() {
+        return Ok(());
+    }
+    state_db
+        .inner()
+        .flush_wal(true)
+        .map_err(|e| format!("sync the state WAL: {e}"))?;
+    let cf = manifest_db
+        .cf_handle(CF_COMMIT_MANIFEST)
+        .map_err(|e| format!("commit manifest CF: {e}"))?;
+    let mut batch = rocksdb::WriteBatch::default();
+    for h in heights {
+        batch.delete_cf(cf, h.to_be_bytes());
+    }
+    manifest_db
+        .write(batch)
+        .map_err(|e| format!("delete commit manifests: {e}"))
+}
+
+/// T5.3: the background thread (`torus-manifest-prune`) that prunes the
+/// consensus-DB commit manifests: `dispatch_to_exec` hands it every height
+/// whose body it wrote ([`Self::note`], a channel send), and it runs
+/// [`manifest_prune_pass`] over them at most once per
+/// [`MANIFEST_PRUNE_INTERVAL`], so a row outlives its body's state-WAL sync
+/// and the consensus thread never fsyncs. Dropping it runs a last pass over
+/// what is pending and joins the thread. Rows of executed heights that a
+/// crash leaves behind go at boot ([`prune_commit_manifests_through`]).
+struct ManifestPruner {
+    tx: Option<std::sync::mpsc::Sender<u64>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ManifestPruner {
+    fn spawn(
+        state_db: StateDb,
+        manifest_db: StateDb,
+        interval: std::time::Duration,
+        metrics: Option<Arc<torus_telemetry::Metrics>>,
+    ) -> Self {
+        use std::sync::mpsc::RecvTimeoutError;
+        let (tx, rx) = std::sync::mpsc::channel::<u64>();
+        let worker = std::thread::Builder::new()
+            .name("torus-manifest-prune".into())
+            .spawn(move || {
+                let mut pending: Vec<u64> = Vec::new();
+                let mut next = std::time::Instant::now();
+                loop {
+                    let got = if pending.is_empty() {
+                        rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
+                    } else {
+                        rx.recv_timeout(next.saturating_duration_since(std::time::Instant::now()))
+                    };
+                    let closed = match got {
+                        Ok(h) => {
+                            pending.push(h);
+                            pending.extend(rx.try_iter());
+                            if std::time::Instant::now() < next {
+                                continue;
+                            }
+                            false
+                        }
+                        Err(RecvTimeoutError::Timeout) => false,
+                        Err(RecvTimeoutError::Disconnected) => true,
+                    };
+                    if !pending.is_empty() {
+                        let timer = std::time::Instant::now();
+                        match manifest_prune_pass(&state_db, &manifest_db, &pending) {
+                            Ok(()) => pending.clear(),
+                            Err(e) => tracing::error!(
+                                %e,
+                                rows = pending.len(),
+                                "commit manifest prune pass failed (rows kept for the next pass)"
+                            ),
+                        }
+                        if let Some(m) = &metrics {
+                            m.commit_manifest_prune_seconds
+                                .observe(timer.elapsed().as_secs_f64());
+                        }
+                        next = std::time::Instant::now() + interval;
+                    }
+                    if closed {
+                        return;
+                    }
+                }
+            })
+            .expect("spawn the commit manifest pruner");
+        Self {
+            tx: Some(tx),
+            worker: Some(worker),
+        }
+    }
+
+    /// Test seam: a pruner that only records the heights on `tx` (no pass).
+    #[cfg(test)]
+    fn detached(tx: std::sync::mpsc::Sender<u64>) -> Self {
+        Self {
+            tx: Some(tx),
+            worker: None,
+        }
+    }
+
+    /// `height`'s header + body were written to the state DB.
+    fn note(&self, height: u64) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(height);
+        }
+    }
+}
+
+impl Drop for ManifestPruner {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// T5.3 boot cleanup: delete the manifest rows at or below `applied` (executed
+/// heights never need the heal channel). Only the deferred consensus-DB prune
+/// leaves such rows (a crash before its pass).
+/// Returns how many went.
+fn prune_commit_manifests_through(manifest_db: &StateDb, applied: u64) -> usize {
+    let db = manifest_db.inner();
+    let Some(cf) = db.cf_handle(CF_COMMIT_MANIFEST) else {
+        return 0;
+    };
+    let mut batch = rocksdb::WriteBatch::default();
+    let mut n = 0;
+    for item in db.iterator_cf(cf, rocksdb::IteratorMode::Start) {
+        let Ok((key, _)) = item else { continue };
+        let Ok(h) = <[u8; 8]>::try_from(key.as_ref()).map(u64::from_be_bytes) else {
+            continue;
+        };
+        if h > applied {
+            break; // keys are BE heights: ascending
+        }
+        batch.delete_cf(cf, &key);
+        n += 1;
+    }
+    if n > 0 {
+        if let Err(e) = manifest_db.write(batch) {
+            tracing::error!(%e, applied, "boot: failed to drop executed commit-manifest rows");
+            return 0;
+        }
+    }
+    n
+}
+
+/// T5.3: move every commit-manifest row from `from` to `to` (the manifest's
+/// home changed: the consensus DB since T5.3, the state DB under
+/// `TORUS_MANIFEST_IN_STATE_DB=1`). Run at boot before the manifest is read,
+/// so a leftover row (a committed-but-not-dispatched height of the previous
+/// run, possibly a hole that can only heal from it) is never ignored. A row
+/// already in `to` is kept. The copy is made durable (WAL fsync) before the
+/// source rows are deleted, so a crash in between leaves the row in both
+/// DBs and the next boot repeats the move. Returns how many rows moved;
+/// `Err` (a boot error) when they cannot be moved.
+pub fn migrate_commit_manifests(from: &StateDb, to: &StateDb) -> Result<usize, String> {
+    let src = from.inner();
+    let Some(from_cf) = src.cf_handle(CF_COMMIT_MANIFEST) else {
+        return Ok(0);
+    };
+    let mut rows = Vec::new();
+    for item in src.iterator_cf(from_cf, rocksdb::IteratorMode::Start) {
+        let (k, v) = item.map_err(|e| format!("read leftover commit manifests: {e}"))?;
+        rows.push((k, v));
+    }
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let to_cf = to
+        .cf_handle(CF_COMMIT_MANIFEST)
+        .map_err(|e| format!("commit manifest target DB: {e}"))?;
+    let mut copy = rocksdb::WriteBatch::default();
+    for (k, v) in &rows {
+        let present = to
+            .get_cf_raw(CF_COMMIT_MANIFEST, k)
+            .map_err(|e| format!("read commit manifest target: {e}"))?
+            .is_some();
+        if !present {
+            copy.put_cf(to_cf, k, v);
+        }
+    }
+    to.write(copy)
+        .map_err(|e| format!("copy leftover commit manifests: {e}"))?;
+    to.inner()
+        .flush_wal(true)
+        .map_err(|e| format!("sync copied commit manifests: {e}"))?;
+    let mut delete = rocksdb::WriteBatch::default();
+    for (k, _) in &rows {
+        delete.delete_cf(from_cf, k);
+    }
+    from.write(delete)
+        .map_err(|e| format!("drop moved commit manifests: {e}"))?;
+    Ok(rows.len())
+}
+
+/// T5.3 A/B switch: `TORUS_MANIFEST_IN_STATE_DB=1` keeps the commit manifest in
+/// the state DB (the pre-T5.3 layout, its prune back in the commit-persist
+/// batch); unset = the consensus DB. Node-local, perf-only: the manifest is not
+/// consensus state. Leftover rows move at boot either way
+/// ([`migrate_commit_manifests`]).
+pub const ENV_MANIFEST_IN_STATE_DB: &str = "TORUS_MANIFEST_IN_STATE_DB";
+
+/// Parse [`ENV_MANIFEST_IN_STATE_DB`]: `1` / `true` / `on` / `yes` = state DB.
+pub fn parse_manifest_in_state_db(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    )
 }
 
 /// FIX 6 / F-1 (S443): heights present in [`CF_COMMIT_MANIFEST`] strictly above
@@ -2079,8 +2617,8 @@ fn persist_commit_manifest(state_db: &StateDb, height: u64, datum_bytes: &[u8]) 
 /// left them recoverable ONLY from the manifest, and boot crash-recovery
 /// (`replay_committed`, keyed off the header frontier) can't see them. Boot
 /// reconciliation scans them here to park+heal.
-fn manifest_heights_above(state_db: &StateDb, floor: u64) -> Vec<u64> {
-    let db = state_db.inner();
+fn manifest_heights_above(manifest_db: &StateDb, floor: u64) -> Vec<u64> {
+    let db = manifest_db.inner();
     let Some(cf) = db.cf_handle(CF_COMMIT_MANIFEST) else {
         return vec![];
     };
@@ -2100,8 +2638,8 @@ fn manifest_heights_above(state_db: &StateDb, floor: u64) -> Vec<u64> {
 }
 
 /// Load a committed height's durable datum from [`CF_COMMIT_MANIFEST`], if present.
-fn load_commit_manifest(state_db: &StateDb, height: u64) -> Option<Vec<u8>> {
-    match state_db.get_cf_raw(CF_COMMIT_MANIFEST, &height.to_be_bytes()) {
+fn load_commit_manifest(manifest_db: &StateDb, height: u64) -> Option<Vec<u8>> {
+    match manifest_db.get_cf_raw(CF_COMMIT_MANIFEST, &height.to_be_bytes()) {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(%e, height, "crash recovery: failed to read commit manifest");
@@ -2121,8 +2659,8 @@ fn load_commit_manifest(state_db: &StateDb, height: u64) -> Option<Vec<u8>> {
 /// A FULL-block datum decodes to `ExecSource::Ready` (bodies inline — no pull
 /// needed). Only when NO manifest exists (legacy pre-fix DBs) does this fall back
 /// to `ExecSource::Durable`, which can heal solely from a local durable body.
-fn recovery_exec_source(state_db: &StateDb, height: u64) -> ExecSource {
-    if let Some(datum) = load_commit_manifest(state_db, height) {
+fn recovery_exec_source(manifest_db: &StateDb, height: u64) -> ExecSource {
+    if let Some(datum) = load_commit_manifest(manifest_db, height) {
         if let Ok(full) = bincode::deserialize::<TorusBlock>(&datum) {
             return ExecSource::Ready(full);
         }
@@ -2221,7 +2759,7 @@ fn load_replay_header(state_db: &StateDb, height: u64) -> Option<TorusBlockHeade
 
 /// Load and deserialize the durable body for `height` from `CF_BLOCK_BODIES`.
 /// Returns `None` when the body is missing (never persisted / pruned) OR corrupt.
-fn load_replay_body(state_db: &StateDb, height: u64) -> Option<TorusBlockBody> {
+pub(crate) fn load_replay_body(state_db: &StateDb, height: u64) -> Option<TorusBlockBody> {
     match state_db.get_cf_raw(CF_BLOCK_BODIES, &height.to_be_bytes()) {
         Ok(Some(data)) => match torus_state::block_body::decode_body_record(&data) {
             Ok(b) => Some(b),
@@ -5994,9 +6532,32 @@ fn execution_loop(rx: std::sync::mpsc::Receiver<CommittedBlockMsg>, ctx: Executi
             torus_block,
             pending_slashes,
             durable,
+            persist,
             committed_unexecuted,
         } = msg;
         let height = torus_block.header.height;
+        // T5.3: the writer's header write failed (or was dropped): execution
+        // writes the row, so the exec thread publishes the height after it.
+        let mut header_from_exec = false;
+        // T5.3: the header + body write runs on the commit-persist writer; the
+        // block executes only once it returned (timed: how long exec waits).
+        let durable = match persist {
+            Some(ticket) => {
+                let wait = std::time::Instant::now();
+                let rows = ticket.wait();
+                header_from_exec = !rows.header;
+                if let Some(ref m) = ctx.metrics {
+                    m.exec_commit_persist_wait_seconds
+                        .observe(wait.elapsed().as_secs_f64());
+                }
+                if exec_rewrite_durable_rows() {
+                    DurableRows::default()
+                } else {
+                    rows
+                }
+            }
+            None => durable,
+        };
         // T1.5: contain execution panics — a panic here must become a
         // controlled fail-stop (latch + loop exit), not silent thread death
         // with consensus zombie-advancing while state is frozen.
@@ -6006,6 +6567,12 @@ fn execution_loop(rx: std::sync::mpsc::Receiver<CommittedBlockMsg>, ctx: Executi
         if result.is_err() {
             ctx.exec_failed.store(true, Ordering::SeqCst);
             tracing::error!(height, "execution pipeline PANICKED executing committed block");
+        }
+        // The hook's receiver checks the row is readable before publishing.
+        if header_from_exec && !ctx.exec_failed.load(Ordering::SeqCst) {
+            if let Some(hook) = ctx.header_hook.get() {
+                hook(height);
+            }
         }
         // Paired with the inc() at the `exec_tx.send` site: dec AFTER execution
         // so the gauge counts queued + in-flight blocks (pinned near the channel
@@ -6100,6 +6667,20 @@ impl InFlightHashLedger {
 pub struct TorusApp {
     #[allow(dead_code)]
     state_db: StateDb,
+    /// T5.3: the DB holding `CF_COMMIT_MANIFEST`: the node's consensus DB
+    /// (own WAL and write queue, so the commit hook's manifest put never waits
+    /// behind a state checkpoint batch), or `state_db` itself in the pre-T5.3
+    /// layout ([`Self::try_new`], `TORUS_MANIFEST_IN_STATE_DB=1`).
+    manifest_db: StateDb,
+    /// T5.3: `manifest_db` is `state_db` (the pre-T5.3 path: the dispatch
+    /// writes header + body itself and the manifest prune rides that batch).
+    manifest_in_state_db: bool,
+    /// T5.3: writes each dispatched height's header + body off this thread
+    /// and owns the manifest pruner; `None` with the manifest in the state DB.
+    commit_persist: Option<CommitPersistWriter>,
+    /// T5.3: the ticket of `exec_prepared_height`'s queued write (reused by a
+    /// rank-2 retry of the same height).
+    exec_prepared_ticket: Option<PersistTicket>,
     #[allow(dead_code)]
     proposer: BlockProposer,
     #[allow(dead_code)]
@@ -6178,17 +6759,28 @@ pub struct TorusApp {
     /// when the mempool or fetcher is absent (consensus-only tests) — a miss
     /// then fails the view without a handoff, same as before BS-4a.
     da_recovery: Option<DaRecoveryWorker>,
-    /// RH4 durable DA body GC: the window in dispatched heights and the
-    /// block tree whose prune pointer bounds it. `None` = off, the default:
-    /// every committed body stays (an archive node, or a test). The node sets
-    /// it from `TORUS_DA_BODY_RETENTION` / the block-tree retention
-    /// ([`crate::da_gc::resolve_da_body_retention`]).
-    da_body_gc: Option<crate::da_gc::DaBodyGc>,
-    /// A DA body GC pass at least this long logs one warn line with its
+    /// RH4 durable DA body GC: the pass ([`crate::da_gc_worker::DaGcRunner`]:
+    /// the window in dispatched heights, the block tree whose prune pointer
+    /// bounds it, the stores), built by [`Self::set_da_body_gc`]. `None` =
+    /// off, the default: every committed body stays (an archive node, or a
+    /// test). The node sets it from `TORUS_DA_BODY_RETENTION` / the
+    /// block-tree retention ([`crate::da_gc::resolve_da_body_retention`]).
+    da_gc_runner: Option<Arc<crate::da_gc_worker::DaGcRunner>>,
+    /// The GC worker thread and its handoff queue, spawned at the first
+    /// dispatched height (`None` before, and with `TORUS_DA_GC_INLINE=1`).
+    da_gc_worker: Option<crate::da_gc_worker::DaGcWorker>,
+    /// `TORUS_DA_GC_INLINE=1`: the pass runs on the consensus thread, inside
+    /// the commit dispatch, as before the worker.
+    da_gc_inline: bool,
+    /// The worker died (or could not spawn) and that was logged.
+    da_gc_dead_logged: bool,
+    /// A DA body GC pass at least this long (ns) logs one warn line with its
     /// phases and counts `torus_da_gc_slow_passes` (`TORUS_DA_GC_SLOW_MS`,
     /// default [`crate::da_gc::DA_GC_SLOW_PASS_MS`]; read in
-    /// [`Self::set_da_body_gc`]).
-    da_gc_slow_pass: std::time::Duration,
+    /// [`Self::set_da_body_gc`]). Shared with the worker.
+    da_gc_slow_pass_nanos: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    da_gc_hooks: Arc<crate::da_gc_worker::DaGcTestHooks>,
     /// Item 3 (`TORUS_ASYNC_VALIDATE=1`): speculative body validation off the
     /// hotstuff-algo thread. `None` with the flag off (the default) — the
     /// validate path then runs synchronously; cost parity still needs measurement.
@@ -6232,6 +6824,9 @@ pub struct TorusApp {
     exec_prepared_durable: DurableRows,
     /// s80: the execution thread's fill sink slot (see `set_fill_sink`).
     fill_sink: Arc<std::sync::OnceLock<Arc<dyn torus_state::trade_rows::FillSink>>>,
+    /// T5.3: the header-persisted hook slot (see `set_header_persisted_hook`),
+    /// shared with the commit-persist writer and the exec thread.
+    header_hook: HeaderHookSlot,
     /// Running state hash monitor, shared with the execution thread.
     state_hash: Arc<crate::state_hash::StateHashMonitor>,
 }
@@ -6937,6 +7532,10 @@ impl TorusApp {
     /// rows to resolve the signing key's proposer address (a local storage
     /// fault) — startup stops instead of proposing as `Address::ZERO`. A key
     /// that is not a validator (`Ok(None)`) still yields `Address::ZERO`.
+    ///
+    /// The commit manifest lives in `state_db` (the pre-T5.3 layout, for
+    /// embedders without a consensus DB); the node uses
+    /// [`Self::try_new_with_manifest_db`].
     pub fn try_new(
         state_db: StateDb,
         config: &ChainConfig,
@@ -6944,6 +7543,39 @@ impl TorusApp {
         mempool: Option<Arc<Mempool>>,
         signing_key: Option<ed25519_dalek::SigningKey>,
     ) -> Result<Self, String> {
+        let manifest_db = state_db.clone();
+        Self::try_new_with_manifest_db(state_db, manifest_db, config, metrics, mempool, signing_key)
+    }
+
+    /// [`Self::try_new`] with the commit manifest (`CF_COMMIT_MANIFEST`) in
+    /// `manifest_db`: the node's consensus DB (T5.3), or `state_db` itself
+    /// (the pre-T5.3 layout). With a separate `manifest_db`, rows left in the
+    /// state DB's manifest CF by a pre-T5.3 run (or by
+    /// `TORUS_MANIFEST_IN_STATE_DB=1`) are moved into it before boot recovery
+    /// reads it ([`migrate_commit_manifests`]), so a hole they guard still
+    /// heals; `Err` when `manifest_db` has no manifest CF or the move fails.
+    pub fn try_new_with_manifest_db(
+        state_db: StateDb,
+        manifest_db: StateDb,
+        config: &ChainConfig,
+        metrics: Option<Arc<torus_telemetry::Metrics>>,
+        mempool: Option<Arc<Mempool>>,
+        signing_key: Option<ed25519_dalek::SigningKey>,
+    ) -> Result<Self, String> {
+        let manifest_in_state_db = Arc::ptr_eq(&state_db.db_arc(), &manifest_db.db_arc());
+        if !manifest_in_state_db {
+            manifest_db
+                .cf_handle(CF_COMMIT_MANIFEST)
+                .map_err(|e| format!("commit manifest DB: {e}"))?;
+            let moved = migrate_commit_manifests(&state_db, &manifest_db)?;
+            if moved > 0 {
+                tracing::warn!(
+                    moved,
+                    "T5.3: moved leftover commit-manifest rows from the state DB into the \
+                     consensus DB before boot recovery"
+                );
+            }
+        }
         let staking = StakingManager::new(state_db.clone());
         let mut proposer = BlockProposer::new(
             config.chain_id,
@@ -6986,6 +7618,8 @@ impl TorusApp {
         // s80: fill-sink slot, shared with the exec thread (see `set_fill_sink`).
         let fill_sink: Arc<std::sync::OnceLock<Arc<dyn torus_state::trade_rows::FillSink>>> =
             Default::default();
+        // T5.3: header-persisted hook slot (see `set_header_persisted_hook`).
+        let header_hook: HeaderHookSlot = Default::default();
         let state_hash = Arc::new(crate::state_hash::StateHashMonitor::new());
 
         // Execution pipeline context — owns its own copies for thread safety.
@@ -7017,6 +7651,7 @@ impl TorusApp {
             // execution thread (backpressure) instead of ballooning memory.
             trade_history: trade_history_enabled(),
             fill_sink: fill_sink.clone(),
+            header_hook: header_hook.clone(),
             state_hash: state_hash.clone(),
             trade_writer: Some(torus_state::BackgroundCfWriter::spawn(
                 state_db.clone(),
@@ -7304,8 +7939,25 @@ impl TorusApp {
             m.set_evm_header(&last_header);
         }
 
+        let commit_persist = (!manifest_in_state_db).then(|| {
+            CommitPersistWriter::spawn(
+                state_db.clone(),
+                ManifestPruner::spawn(
+                    state_db.clone(),
+                    manifest_db.clone(),
+                    MANIFEST_PRUNE_INTERVAL,
+                    metrics.clone(),
+                ),
+                metrics.clone(),
+                header_hook.clone(),
+            )
+        });
         let mut app = Self {
             state_db,
+            commit_persist,
+            exec_prepared_ticket: None,
+            manifest_db,
+            manifest_in_state_db,
             proposer,
             validator,
             evm_executor: EvmExecutor::new(config.chain_id),
@@ -7340,8 +7992,15 @@ impl TorusApp {
             da_fetcher: None,
             shard_fetcher: None,
             da_recovery: None,
-            da_body_gc: None,
-            da_gc_slow_pass: std::time::Duration::from_millis(crate::da_gc::DA_GC_SLOW_PASS_MS),
+            da_gc_runner: None,
+            da_gc_worker: None,
+            da_gc_inline: false,
+            da_gc_dead_logged: false,
+            da_gc_slow_pass_nanos: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::da_gc::DA_GC_SLOW_PASS_MS * 1_000_000,
+            )),
+            #[cfg(test)]
+            da_gc_hooks: Arc::default(),
             async_validate: None,
             exec_next_height: None,
             deferred_exec: std::collections::BTreeMap::new(),
@@ -7352,6 +8011,7 @@ impl TorusApp {
             exec_prepared_height: None,
             exec_prepared_durable: DurableRows::default(),
             fill_sink,
+            header_hook,
             state_hash,
         };
 
@@ -7382,7 +8042,7 @@ impl TorusApp {
                 // record with no manifest falls back to `Durable(h)` (local-body
                 // heal only). This is the difference between a hole that heals and
                 // one that stalls forever at `missing=0` (t12-r3-full h1165).
-                let source = recovery_exec_source(&app.state_db, h);
+                let source = recovery_exec_source(&app.manifest_db, h);
                 app.park_deferred(h, source, Vec::new());
             }
             app.exec_next_height = Some(hole);
@@ -7420,7 +8080,17 @@ impl TorusApp {
                     break 'reconcile;
                 }
             };
-            let manifest_heights = manifest_heights_above(&app.state_db, applied);
+            // T5.3: rows at or below `applied` are executed heights whose
+            // consensus-DB prune did not land before a crash; drop them.
+            let dropped = prune_commit_manifests_through(&app.manifest_db, applied);
+            if dropped > 0 {
+                tracing::info!(
+                    dropped,
+                    applied,
+                    "boot: dropped commit-manifest rows of executed heights"
+                );
+            }
+            let manifest_heights = manifest_heights_above(&app.manifest_db, applied);
             if let Some(&manifest_max) = manifest_heights.iter().max() {
                 let first = applied + 1;
                 // Park ONLY heights that actually carry a durable manifest —
@@ -7436,7 +8106,7 @@ impl TorusApp {
                     // Preserve any FIX 1b entry already parked at this height
                     // (the old `.entry(h).or_insert_with(...)` semantics).
                     if !app.deferred_exec.contains_key(&h) {
-                        let source = recovery_exec_source(&app.state_db, h);
+                        let source = recovery_exec_source(&app.manifest_db, h);
                         app.park_deferred(h, source, Vec::new());
                     }
                 }
@@ -7528,103 +8198,182 @@ impl TorusApp {
 
     /// RH4: durable DA body GC settings, `None` = off. Call before the
     /// replica starts; see [`crate::da_gc`] for the policy
-    /// ([`crate::da_gc::resolve_da_body_retention`]).
+    /// ([`crate::da_gc::resolve_da_body_retention`]) and
+    /// [`crate::da_gc_worker`] for the worker the passes run on
+    /// (`TORUS_DA_GC_INLINE=1`: on the consensus thread, as before). With the
+    /// worker, the mempool's [`torus_state::DaGcFence`] is turned on here, so
+    /// every body check from now on pins its block's hashes first.
     pub fn set_da_body_gc(&mut self, gc: Option<crate::da_gc::DaBodyGc>) {
-        if gc.is_some() {
-            let env = std::env::var("TORUS_DA_GC_SLOW_MS").ok();
-            let ms = crate::da_gc::resolve_da_gc_slow_ms(env.as_deref());
-            self.da_gc_slow_pass = std::time::Duration::from_millis(ms);
-            tracing::info!(
-                slow_ms = ms,
-                env = ?env,
-                "DA body GC: a pass at or over slow_ms logs one warn line (TORUS_DA_GC_SLOW_MS)"
-            );
+        let inline_env = std::env::var("TORUS_DA_GC_INLINE").ok();
+        let inline = crate::da_gc_worker::resolve_da_gc_inline(inline_env.as_deref());
+        self.set_da_body_gc_mode(gc, inline);
+    }
+
+    /// [`Self::set_da_body_gc`] with the mode given (`inline`: the pass on
+    /// the consensus thread) instead of read from `TORUS_DA_GC_INLINE`.
+    pub fn set_da_body_gc_mode(&mut self, gc: Option<crate::da_gc::DaBodyGc>, inline: bool) {
+        self.da_gc_worker = None;
+        self.da_gc_inline = inline;
+        let (Some(gc), Some(mempool)) = (gc, self.mempool.clone()) else {
+            self.da_gc_runner = None;
+            return;
+        };
+        let env = std::env::var("TORUS_DA_GC_SLOW_MS").ok();
+        let ms = crate::da_gc::resolve_da_gc_slow_ms(env.as_deref());
+        self.da_gc_slow_pass_nanos
+            .store(ms.saturating_mul(1_000_000), Ordering::Relaxed);
+        tracing::info!(
+            slow_ms = ms,
+            env = ?env,
+            inline,
+            "DA body GC: a pass at or over slow_ms logs one warn line (TORUS_DA_GC_SLOW_MS); \
+             passes run {} (TORUS_DA_GC_INLINE)",
+            if inline { "on the consensus thread" } else { "on the torus-da-gc worker" }
+        );
+        if !inline {
+            // The fence's window starts at the committed tip this node knows
+            // (its last header, the block tree's); every commit moves it.
+            let fence = mempool.da_gc_fence();
+            fence.note_committed(self.last_header.height);
+            match crate::da_gc::read_tree_committed_tip(&gc.block_tree_db) {
+                Ok(tip) => fence.note_committed(tip.unwrap_or(0)),
+                Err(e) => tracing::warn!(
+                    "DA body GC: block tree committed tip unreadable at start, the fence \
+                     window starts at the last header: {e}"
+                ),
+            }
+            fence.set_enabled(true);
         }
-        self.da_body_gc = gc;
+        self.da_gc_runner = Some(Arc::new(crate::da_gc_worker::DaGcRunner {
+            gc,
+            mempool,
+            state_db: self.state_db.clone(),
+            metrics: self.metrics.clone(),
+            slow_pass_nanos: self.da_gc_slow_pass_nanos.clone(),
+            fenced: !inline,
+            #[cfg(test)]
+            hooks: self.da_gc_hooks.clone(),
+        }));
     }
 
     /// The slow-pass log threshold (tests; the node takes
     /// `TORUS_DA_GC_SLOW_MS` in [`Self::set_da_body_gc`]).
     pub fn set_da_gc_slow_pass(&mut self, threshold: std::time::Duration) {
-        self.da_gc_slow_pass = threshold;
+        self.da_gc_slow_pass_nanos.store(
+            u64::try_from(threshold.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
-    /// RH4: one durable DA body GC pass for the committed `height` that
-    /// dispatch just made durable. Records `hashes` for deletion
-    /// `retention` dispatched heights later and deletes the bodies (and
-    /// shards) of the heights that aged out AND whose blocks the block tree
-    /// pruned at least [`crate::da_gc::DA_GC_MARGIN_BLOCKS`] heights ago
-    /// (its durable prune pointer, read each pass; unreadable = delete
-    /// nothing). A block whose body row did not land in `CF_BLOCK_BODIES`
-    /// (`!body_durable`) and that has native actions is not recorded at all,
-    /// never as "no actions" (Codex P1, round 2): the GC cursor stays at it,
-    /// the pass deletes nothing (`torus_da_gc_held_passes{reason="unrecorded"}`)
-    /// and the next pass back-fills it, pins included, from the block tree.
-    /// Nothing is deleted either while the tree holds committed heights
-    /// above `height` (a multi-block commit, boot reconciliation): one may
-    /// re-include a due body before its own pass pins it. A due body a block
-    /// above the committed tip references (the tree's uncommitted tail) stays
-    /// while its row goes; an unreadable tail holds the pass. Every held
-    /// pass counts `torus_da_gc_held_passes{reason}`.
+    /// Wait until the DA body GC worker finished every height handed to it
+    /// (at most `timeout`; `true` = idle, or no worker). Tests and tools:
+    /// the node never waits for the GC.
+    pub fn da_gc_wait_idle(&self, timeout: std::time::Duration) -> bool {
+        self.da_gc_worker
+            .as_ref()
+            .is_none_or(|worker| worker.wait_idle(timeout))
+    }
+
+    /// Tests: a crash of the GC worker. It runs nothing more (the queued
+    /// jobs are lost) and its thread is gone when this returns.
+    #[cfg(test)]
+    pub(crate) fn da_gc_kill_worker(&self) {
+        self.da_gc_hooks.kill();
+        if let Some(ref worker) = self.da_gc_worker {
+            let t = std::time::Instant::now();
+            while !worker.is_dead() {
+                assert!(t.elapsed() < std::time::Duration::from_secs(60), "worker did not exit");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// Test hooks of this app's DA body GC (worker gate, pass counter).
+    #[cfg(test)]
+    pub(crate) fn da_gc_hooks(&self) -> &Arc<crate::da_gc_worker::DaGcTestHooks> {
+        &self.da_gc_hooks
+    }
+
+    /// RH4: hand the committed `height` that dispatch just made durable to
+    /// the DA body GC. The consensus thread builds the job (the `hashes`
+    /// dispatch computed for the mempool prune, moved; the shard count) and
+    /// pushes it on the GC worker's queue ([`crate::da_gc_worker`]): no DB
+    /// read or write, no body lookup, no wait for a pass. A full queue keeps only the height
+    /// (its record is back-filled from the block tree). With
+    /// `TORUS_DA_GC_INLINE=1` the pass runs right here instead.
+    ///
+    /// The pass (either way) records `hashes` for deletion `retention`
+    /// dispatched heights later and deletes the bodies (and shards) of the
+    /// heights that aged out AND whose blocks the block tree pruned at least
+    /// [`crate::da_gc::DA_GC_MARGIN_BLOCKS`] heights ago (its durable prune
+    /// pointer, read each pass; unreadable = delete nothing). A block whose
+    /// body row did not land in `CF_BLOCK_BODIES` (`!body_durable`) and that
+    /// has native actions is not recorded at all, never as "no actions"
+    /// (Codex P1, round 2): the GC cursor stays at it, the pass deletes
+    /// nothing (`torus_da_gc_held_passes{reason="unrecorded"}`) and the next
+    /// pass back-fills it, pins included, from the block tree. Nothing is
+    /// deleted either while the tree holds committed heights above `height`
+    /// (a multi-block commit, boot reconciliation): one may re-include a due
+    /// body before its own pass pins it. A due body a block above the
+    /// committed tip references (the tree's uncommitted tail, read from the
+    /// tip the pass read) stays while its row goes; an unreadable tail holds
+    /// the pass. On the worker, a due body a concurrent check pinned
+    /// ([`torus_state::DaGcFence`]) stays the same way. Every held pass counts
+    /// `torus_da_gc_held_passes{reason}`.
     ///
     /// A hash this block re-includes moves to this height
     /// ([`torus_state::NativeDaStore::gc_committed`]), so its body goes when
     /// this block's window ends, not the earlier one's. And a body the block
     /// references that is already gone (a re-inclusion validated while the
     /// action's earlier row was pending, that row aging out before this
-    /// dispatch) is restored from `actions` first, so the block stays
-    /// servable for its own window (Codex P1 sibling). The body only, not its
-    /// shards: a shard miss falls back to the whole-body pull.
-    ///
-    /// Runs on the consensus thread, bounded: two point reads (the tree's
-    /// prune pointer, the GC state; plus, when a row is due, the tree's
-    /// committed tip and its uncommitted tail: normally 2-3 datum decodes,
-    /// at most [`crate::da_gc::MAX_TAIL_BLOCKS`]), two `MultiGet`s over this
-    /// block's hashes (body presence, latest references), one iterator over at most
-    /// [`crate::da_gc::DA_GC_LIMITS`] aged rows (and one over their
-    /// re-inclusion markers, normally none) and one `WriteBatch` to the
-    /// consensus DB (plus a body write on a restore), all linear in this
-    /// block's hashes and the aged rows. Timed by `torus_da_gc_seconds`.
+    /// dispatch) is restored first (from `actions` inline; on the worker from
+    /// the durable body row, or from the job's copy of `actions` when that
+    /// row did not land), so the block stays servable for its own window
+    /// (Codex P1 sibling). The body only, not its shards: a shard miss falls
+    /// back to the whole-body pull.
     ///
     /// Never deletes while the bookkeeping is behind (Codex P1, pre-merge
     /// review; [`crate::da_gc`] module docs): a height dispatched without its
-    /// GC record (a crash after the body write, before this pass; a failed
-    /// record write) is back-filled from the block tree on the next pass,
-    /// with its re-inclusion pins and body restores, before anything is
-    /// deleted. A height the tree cannot supply holds every deletion (logged,
-    /// `torus_da_gc_held_passes{reason="gap"}`) until a later pass fills it. Back-filled
-    /// heights are recorded whatever their body row's durability (their
-    /// dispatch is past).
+    /// GC record (a crash after the body write, before its pass; a failed
+    /// record write; a coalesced or still-queued handoff at a crash) is
+    /// back-filled from the block tree on the next pass, with its
+    /// re-inclusion pins and body restores, before anything is deleted. A
+    /// height the tree cannot supply holds every deletion (logged,
+    /// `torus_da_gc_held_passes{reason="gap"}`) until a later pass fills it.
+    /// T5.3: with the [`CommitPersistWriter`] the body row lands after this
+    /// call, and `persist` is its ticket (`body_durable` is then ignored).
+    /// The height is recorded, and its restore reloads the row, only once the
+    /// ticket settled: the worker waits for it before the pass, the inline
+    /// pass right here. A write that failed leaves the height unrecorded as
+    /// above, and the ticket hands back the block's actions for the restore.
+    /// A crash before the write lands leaves the height unrecorded (the
+    /// restart parks it from its manifest; its pass records it after the
+    /// healed write); one after the write but before the pass is back-filled
+    /// from the tree.
     ///
-    /// To move it off this thread, send `(height, hashes, shard_count)` over a
-    /// channel to one dedicated thread that runs the same pass, in order:
-    /// a late pass only lengthens the window; a lost one is back-filled.
+    /// Timed on this thread by `torus_da_gc_handoff_seconds`; the pass by
+    /// `torus_da_gc_seconds`.
     fn gc_da_bodies_after_dispatch(
-        &self,
+        &mut self,
         height: u64,
         actions: &[torus_types::SignedNativeAction],
-        hashes: &[torus_types::B256],
+        hashes: Vec<torus_types::B256>,
         body_durable: bool,
+        persist: Option<PersistTicket>,
     ) {
-        let (Some(gc), Some(mempool)) = (self.da_body_gc.as_ref(), self.mempool.as_ref()) else {
+        let Some(runner) = self.da_gc_runner.clone() else {
             return;
         };
-        // A height whose body row did not land is not recorded at all (never
-        // as "no actions": that would drop its re-inclusion pins, Codex P1
-        // round 2): the GC cursor stays at it, this pass deletes nothing, and
-        // the next pass back-fills it from the block tree. A native-empty
-        // block has nothing to pin: its empty record is the truth.
-        let record: Option<&[torus_types::B256]> = if body_durable || hashes.is_empty() {
-            Some(hashes)
-        } else {
-            tracing::warn!(
-                height,
-                bodies = hashes.len(),
-                "DA body GC: body row not durable at dispatch, not recording this height \
-                 (deleting nothing; the next pass back-fills it from the block tree)"
-            );
-            None
+        let started = std::time::Instant::now();
+        // T5.3: the writer's ticket settles whether the body row landed. The
+        // inline pass waits for it right here (the bisect lever then also
+        // waits for the write, as the pre-T5.3 dispatch did); the worker
+        // waits for it before the pass.
+        let body_durable = match (&persist, self.da_gc_inline) {
+            (Some(ticket), true) => ticket.wait().body,
+            _ => body_durable,
         };
+        let record = || crate::da_gc_worker::record_height(height, hashes.len(), body_durable);
         // The shards custodied per body (`custody_native_shards_core`): none with
         // custody off, else `n` of the current set's erasure params.
         let shard_count = if shard_custody_enabled() {
@@ -7639,207 +8388,63 @@ impl TorusApp {
         } else {
             0
         };
-        let started = std::time::Instant::now();
-        if !hashes.is_empty() {
-            match mempool.mirror_missing_native_to_da(actions, hashes) {
-                Ok(0) => {}
-                Ok(restored) => tracing::info!(
-                    height,
-                    restored,
-                    "DA body GC: restored bodies a dispatched block references (re-included after \
-                     an earlier row aged out)"
-                ),
-                Err(e) => tracing::warn!(
-                    height,
-                    "DA body GC: restoring a dispatched block's missing bodies failed: {e}"
-                ),
-            }
-        }
-        // Slow-pass observability: plain `Instant`s between the phases.
-        let restored_at = std::time::Instant::now();
-        let keep_from = gc.keep_from().unwrap_or_else(|e| {
-            tracing::warn!(
-                height,
-                "DA body GC: block-tree prune pointer unreadable, deleting nothing this pass: {e}"
-            );
-            0
-        });
-        let pointer_read = restored_at.elapsed();
-        // Heights this pass finds unrecorded (a crash after an earlier
-        // dispatch's body write, or a failed record) are re-read from the
-        // block tree; their missing bodies are restored like this height's.
-        let state_db = &self.state_db;
-        let restore = |at: u64,
-                       hashes: &[torus_types::B256],
-                       actions: Option<&[torus_types::SignedNativeAction]>| {
-            if hashes.is_empty() || mempool.has_all_native_da(hashes) {
-                return;
-            }
-            let loaded;
-            let actions = match actions {
-                Some(actions) => actions,
-                None => match load_replay_body(state_db, at) {
-                    Some(body) => {
-                        loaded = body.native_actions;
-                        &loaded[..]
-                    }
-                    None => {
-                        tracing::warn!(
-                            height = at,
-                            "DA body GC back-fill: a referenced body is missing and the \
-                             durable block body is unavailable to restore it"
+        if self.da_gc_inline {
+            runner.run(height, Some(actions), &hashes, record(), shard_count, true);
+        } else {
+            if self.da_gc_worker.is_none() && !self.da_gc_dead_logged {
+                match crate::da_gc_worker::DaGcWorker::spawn(
+                    runner,
+                    crate::da_gc_worker::DA_GC_QUEUE_CAP,
+                ) {
+                    Ok(worker) => self.da_gc_worker = Some(worker),
+                    Err(e) => {
+                        self.da_gc_dead_logged = true;
+                        tracing::error!(
+                            "DA body GC: cannot spawn the worker thread, no DA bodies are \
+                             deleted on this node (bodies are kept): {e}"
                         );
-                        return;
                     }
-                },
-            };
-            if actions.len() != hashes.len() {
-                tracing::warn!(
-                    height = at,
-                    "DA body GC back-fill: block body does not match the tree's hashes, \
-                     not restoring"
-                );
-                return;
+                }
             }
-            match mempool.mirror_missing_native_to_da(actions, hashes) {
-                Ok(0) => {}
-                Ok(restored) => tracing::info!(
-                    height = at,
-                    restored,
-                    "DA body GC back-fill: restored bodies a committed block references"
-                ),
-                Err(e) => tracing::warn!(
-                    height = at,
-                    "DA body GC back-fill: restoring missing bodies failed: {e}"
-                ),
+            if let Some(ref worker) = self.da_gc_worker {
+                let job = match persist {
+                    // The worker settles `record` and the restore's source
+                    // from the ticket.
+                    Some(ticket) => crate::da_gc_worker::DaGcJob {
+                        height,
+                        actions: None,
+                        record: false,
+                        hashes,
+                        shard_count,
+                        persist: Some(ticket),
+                    },
+                    None => crate::da_gc_worker::DaGcJob {
+                        height,
+                        // The restore reloads a durable body row; only a
+                        // block whose row did not land carries its actions.
+                        actions: (!body_durable && !actions.is_empty()).then(|| actions.to_vec()),
+                        record: record(),
+                        hashes,
+                        shard_count,
+                        persist: None,
+                    },
+                };
+                if worker.submit(job) == crate::da_gc_worker::Handoff::Dead
+                    && !self.da_gc_dead_logged
+                {
+                    self.da_gc_dead_logged = true;
+                    tracing::error!(
+                        height,
+                        "DA body GC: the worker is gone, no DA bodies are deleted on this node \
+                         from here on (bodies are kept)"
+                    );
+                }
             }
-        };
-        let history = crate::da_gc::BlockTreeHistory::new(&gc.block_tree_db, &restore);
-        let mut stats = torus_state::DaGcPassStats::default();
-        let out = mempool.gc_committed_native_da_timed(
-            height,
-            record,
-            shard_count,
-            gc.retention,
-            keep_from,
-            crate::da_gc::DA_GC_LIMITS,
-            &history,
-            &mut stats,
-        );
-        let elapsed = started.elapsed();
-        let slow = elapsed >= self.da_gc_slow_pass;
-        if slow {
-            self.log_slow_da_gc_pass(
-                gc,
-                height,
-                hashes.len(),
-                elapsed,
-                restored_at.duration_since(started),
-                pointer_read,
-                &stats,
-                &out,
-                history.tail_blocks(),
-            );
         }
         if let Some(ref m) = self.metrics {
-            m.da_gc_seconds.observe(elapsed.as_secs_f64());
-            m.da_gc_last_pass_max.observe(elapsed.as_secs_f64());
-            if slow {
-                m.da_gc_slow_passes.inc();
-            }
-            m.da_bodies_gc_deleted.inc_by(out.bodies_deleted);
-            // P3 (claude-review r4): every held pass, by its reason.
-            if let Some(reason) = out.hold_reason {
-                m.da_gc_held_passes
-                    .get_or_create(&vec![("reason".into(), reason.as_str().into())])
-                    .inc();
-            }
+            m.da_gc_handoff_seconds
+                .observe(started.elapsed().as_secs_f64());
         }
-        if out.tail_pinned > 0 {
-            tracing::warn!(
-                height,
-                kept = out.tail_pinned,
-                "DA body GC: kept due bodies a block above the committed tip re-includes"
-            );
-        }
-        if out.heights_backfilled > 0 {
-            tracing::info!(
-                height,
-                backfilled = out.heights_backfilled,
-                "DA body GC: back-filled unrecorded heights from the block tree"
-            );
-        }
-        if out.backlog {
-            tracing::debug!(
-                height,
-                rows = out.rows_deleted,
-                "DA body GC: backlog left for the next pass"
-            );
-        }
-    }
-
-    /// The one warn line of a DA body GC pass at or over the slow-pass
-    /// threshold (8h: rare 51-205 ms passes, nothing recorded to explain
-    /// them). Times in ms (3 decimals): `restore_ms` the body presence
-    /// `MultiGet` (and any restore write), `bookkeeping_read_ms` the tree's
-    /// prune pointer plus the GC state, `record_ms` the latest-reference
-    /// `MultiGet` and the record's puts, `backfill_ms` back-filling from the
-    /// tree, `tip_ms` / `tail_ms` the tree's committed tip and uncommitted
-    /// tail (`tail_blocks` blocks decoded, `tail_hashes` hashes),
-    /// `delete_scan_ms` the due-row walk (tail excluded) and `write_ms` the
-    /// batch write (record, deletes and GC state together). `dispatch_lag` is
-    /// the tree's committed tip minus this height (the tip read again here
-    /// when the pass did not). A failed pass logs too (`held=store_error`,
-    /// `error` its message, the failed phase's time included; `none` when
-    /// it did not fail). Off the hot path: only slow passes get here.
-    #[allow(clippy::too_many_arguments)]
-    fn log_slow_da_gc_pass(
-        &self,
-        gc: &crate::da_gc::DaBodyGc,
-        height: u64,
-        recorded: usize,
-        total: std::time::Duration,
-        restore: std::time::Duration,
-        pointer_read: std::time::Duration,
-        stats: &torus_state::DaGcPassStats,
-        out: &torus_state::DaGcOutcome,
-        tail_blocks: usize,
-    ) {
-        let ms = |d: std::time::Duration| (d.as_secs_f64() * 1e6).round() / 1e3;
-        let tip = stats.committed_tip.or_else(|| {
-            crate::da_gc::read_tree_committed_tip(&gc.block_tree_db)
-                .ok()
-                .flatten()
-        });
-        let opt = |v: Option<u64>| v.map_or_else(|| "none".to_string(), |v| v.to_string());
-        tracing::warn!(
-            height,
-            total_ms = ms(total),
-            threshold_ms = self.da_gc_slow_pass.as_millis() as u64,
-            bodies_recorded = recorded,
-            rows_deleted = out.rows_deleted,
-            bodies_scanned = stats.bodies_scanned,
-            bodies_deleted = out.bodies_deleted,
-            shard_keys_deleted = out.shard_keys_deleted,
-            tail_pinned = out.tail_pinned,
-            backlog = out.backlog,
-            restore_ms = ms(restore),
-            bookkeeping_read_ms = ms(pointer_read + stats.state_read),
-            record_ms = ms(stats.record),
-            backfill_ms = ms(stats.backfill),
-            heights_backfilled = out.heights_backfilled,
-            tip_ms = ms(stats.tip_read),
-            tail_ms = ms(stats.tail_read),
-            tail_blocks,
-            tail_hashes = stats.tail_hashes,
-            delete_scan_ms = ms(stats.delete_scan),
-            write_ms = ms(stats.write),
-            committed_tip = %opt(tip),
-            dispatch_lag = %opt(tip.map(|tip| tip.saturating_sub(height))),
-            held = %out.hold_reason.map_or("none", |r| r.as_str()),
-            error = %stats.error.as_deref().unwrap_or("none"),
-            "DA body GC: slow pass"
-        );
     }
 
     /// s80: install the stream sink for executed blocks' fills. The execution
@@ -7858,6 +8463,17 @@ impl TorusApp {
     pub fn set_fill_sink(&self, sink: Arc<dyn torus_state::trade_rows::FillSink>) {
         if self.fill_sink.set(sink).is_err() {
             tracing::warn!("fill sink already set; ignoring the second one");
+        }
+    }
+
+    /// T5.3: install the [`HeaderPersistedHook`] (the node publishes the RPC
+    /// height + the WS head from it once a height's header row is readable).
+    /// Set before consensus starts. A second call is ignored (logged). With the
+    /// manifest in the state DB it is never called (the commit handler sees the
+    /// row the dispatch already wrote).
+    pub fn set_header_persisted_hook(&self, hook: HeaderPersistedHook) {
+        if self.header_hook.set(hook).is_err() {
+            tracing::warn!("header-persisted hook already set; ignoring the second one");
         }
     }
 
@@ -7950,13 +8566,26 @@ impl TorusApp {
         self.shard_fetcher = Some(f);
     }
 
-    /// Create a stub `TorusApp` without a database (for consensus-only tests).
+    /// Create a stub `TorusApp` on scratch databases (for consensus-only
+    /// tests), laid out as on a node: the commit manifest in its own
+    /// consensus DB (T5.3).
     pub fn stub() -> Self {
-        Self::stub_on(StateDb::open(&scratch_db_dir("torus-stub")).expect("open stub state db"))
+        let state_db = StateDb::open(&scratch_db_dir("torus-stub")).expect("open stub state db");
+        let consensus_db = StateDb::open_consensus(&scratch_db_dir("torus-stub-cdb"))
+            .expect("open stub consensus db");
+        Self::stub_with(state_db, consensus_db)
     }
 
-    /// [`Self::stub`] on a given database (a restart test reopens one).
+    /// [`Self::stub`] on a given database (a restart test reopens one), the
+    /// commit manifest in it (the pre-T5.3 layout).
+    #[cfg(test)]
     fn stub_on(state_db: StateDb) -> Self {
+        let manifest_db = state_db.clone();
+        Self::stub_with(state_db, manifest_db)
+    }
+
+    /// [`Self::stub`] with the commit manifest in `manifest_db`.
+    fn stub_with(state_db: StateDb, manifest_db: StateDb) -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -7989,7 +8618,15 @@ impl TorusApp {
         let mut seed = [0u8; 32];
         seed[..8].copy_from_slice(&id.to_le_bytes());
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
-        Self::new(state_db, &config, None, None, Some(signing_key))
+        Self::try_new_with_manifest_db(
+            state_db,
+            manifest_db,
+            &config,
+            None,
+            None,
+            Some(signing_key),
+        )
+        .unwrap_or_else(|e| panic!("TorusApp startup failed: {e}"))
     }
 
     /// Crash recovery: replay committed blocks whose execution was interrupted.
@@ -8500,8 +9137,23 @@ impl TorusApp {
     /// vectors are EMPTY, so `produce_block` proposes empty-native this view — a block
     /// that cannot wedge a validator — instead of referencing a body no node durably holds. A metric
     /// counts the drop. No mempool wired (test/edge) ⇒ pass-through unchanged.
+    #[cfg(test)]
     fn mirror_or_drop_native(
         &self,
+        native_with_senders: Vec<(torus_types::Address, torus_types::SignedNativeAction)>,
+    ) -> (
+        Vec<(torus_types::Address, torus_types::SignedNativeAction)>,
+        Vec<torus_types::SignedNativeAction>,
+        Vec<torus_types::B256>,
+    ) {
+        self.mirror_or_drop_native_at(self.last_header.height.saturating_add(1), native_with_senders)
+    }
+
+    /// [`Self::mirror_or_drop_native`] for a proposal at `height` (the DA
+    /// body GC fence pins its bodies at it).
+    fn mirror_or_drop_native_at(
+        &self,
+        height: u64,
         native_with_senders: Vec<(torus_types::Address, torus_types::SignedNativeAction)>,
     ) -> (
         Vec<(torus_types::Address, torus_types::SignedNativeAction)>,
@@ -8521,6 +9173,34 @@ impl TorusApp {
         let Some(ref mempool) = self.mempool else {
             return (native_with_senders, actions, hashes);
         };
+        // RH4 GC worker: pin the bodies before the mirror's presence check,
+        // so none of them is deleted under our proposal. One the GC is
+        // deleting right now (a window-old re-inclusion) is left out of this
+        // proposal: the mirror could lose to the delete batch.
+        let busy = mempool.pin_native_da(height, &hashes);
+        let (native_with_senders, actions, hashes) = if busy.is_empty() {
+            (native_with_senders, actions, hashes)
+        } else {
+            tracing::warn!(
+                left_out = busy.len(),
+                "produce_block: bodies being deleted by the DA body GC right now are left out"
+            );
+            fn keep_where<T>(v: Vec<T>, keep: &[bool]) -> Vec<T> {
+                v.into_iter()
+                    .zip(keep)
+                    .filter_map(|(x, &k)| k.then_some(x))
+                    .collect()
+            }
+            let keep: Vec<bool> = hashes.iter().map(|h| !busy.contains(h)).collect();
+            (
+                keep_where(native_with_senders, &keep),
+                keep_where(actions, &keep),
+                keep_where(hashes, &keep),
+            )
+        };
+        if hashes.is_empty() {
+            return (native_with_senders, actions, hashes);
+        }
         match mempool.mirror_missing_native_to_da(&actions, &hashes) {
             Ok(written) => {
                 if let Some(ref m) = self.metrics {
@@ -8689,6 +9369,27 @@ impl TorusApp {
             // bar the compact path already guarantees. Fail-closed on error.
             if !block.native_actions.is_empty() {
                 if let Some(mempool) = mempool {
+                    // RH4 GC worker: pin before the mirror; a body the GC is
+                    // deleting right now could lose this write to its batch,
+                    // so retry once it landed (`torus_state::DaGcFence`).
+                    if mempool.da_gc_fence().is_enabled() {
+                        let hashes: Vec<torus_types::B256> = block
+                            .native_actions
+                            .iter()
+                            .map(torus_types::compute_action_hash)
+                            .collect();
+                        if !mempool
+                            .pin_native_da(block.header.height, &hashes)
+                            .is_empty()
+                        {
+                            tracing::warn!(
+                                height = block.header.height,
+                                "validate_block: a body is being deleted by the DA body GC \
+                                 right now -- MissingData (retried)"
+                            );
+                            return Err(ValidateBlockResponse::MissingData);
+                        }
+                    }
                     let da_timer = std::time::Instant::now();
                     let mirrored = mempool.mirror_native_to_da(&block.native_actions);
                     if let Some(m) = metrics.as_ref() {
@@ -8735,6 +9436,22 @@ impl TorusApp {
             let native_actions = if compact.native_action_hashes.is_empty() {
                 vec![]
             } else {
+                // RH4 GC worker: pin before reading the bodies, so a body
+                // found here is never deleted under the vote; one being
+                // deleted right now counts as missing (`torus_state::DaGcFence`).
+                if let Some(mempool) = mempool {
+                    let busy = mempool
+                        .pin_native_da(compact.header.height, &compact.native_action_hashes);
+                    if !busy.is_empty() {
+                        tracing::warn!(
+                            busy = busy.len(),
+                            height = compact.header.height,
+                            "validate_block: bodies are being deleted by the DA body GC right \
+                             now -- MissingData (retried)"
+                        );
+                        return Err(ValidateBlockResponse::MissingData);
+                    }
+                }
                 // Reconstruct out-of-band bodies for the HOT path: a fast local retry for
                 // a racing pre-proposal PUSH, then a SHORT bounded native-DA PULL so a
                 // genuine push miss is recovered live instead of wedging (#4 Task 1 — the
@@ -8976,6 +9693,15 @@ impl TorusApp {
         if let Some(fetcher) = self.da_fetcher.as_ref() {
             Self::absorb_fetched_bodies(mempool, fetcher.as_ref());
         }
+        // RH4 GC worker: pin the hashes BEFORE the presence check, so a body
+        // found here is never deleted under the vote; one being deleted
+        // right now counts as missing (`torus_state::DaGcFence`).
+        if !mempool
+            .pin_native_da(header.height, &compact.native_action_hashes)
+            .is_empty()
+        {
+            return BlockDataCheck::Missing;
+        }
         if mempool
             .native_da_missing(&compact.native_action_hashes)
             .is_empty()
@@ -9070,7 +9796,7 @@ impl TorusApp {
         let (native_with_senders, native_actions, native_hashes) = {
             let _mirror_span =
                 ObserveOnDrop::new(self.metrics.clone(), |m| &m.block_build_mirror_seconds);
-            self.mirror_or_drop_native(native_with_senders)
+            self.mirror_or_drop_native_at(next_height, native_with_senders)
         };
 
         let sig_attestation = {
@@ -9457,7 +10183,11 @@ impl App<RocksKVStore> for TorusApp {
         // durable (`dispatch_to_exec`). Without this, a SIGKILL in the
         // commit->persist window strands the hole with no way to pull bodies
         // (`missing=0`, t12-r3-full h1165).
-        persist_commit_manifest(&self.state_db, height, datum_bytes);
+        {
+            let _manifest_span =
+                ObserveOnDrop::new(self.metrics.clone(), |m| &m.commit_manifest_seconds);
+            persist_commit_manifest(&self.manifest_db, height, datum_bytes);
+        }
 
         // Committed: these hashes leave the in-flight window. The mempool prunes
         // them via `remove_committed_native` when the block actually executes.
@@ -9469,6 +10199,11 @@ impl App<RocksKVStore> for TorusApp {
         // consensus voting/finalization runs ahead; execution lags and heals below.
         if height > self.last_header.height {
             self.last_header = header.clone();
+            // RH4 GC worker: the DA body GC fence takes pins up to a window
+            // above the committed tip (one atomic).
+            if let Some(ref mempool) = self.mempool {
+                mempool.da_gc_fence().note_committed(height);
+            }
             self.leader_state.set_view(height.saturating_add(1));
             self.leader_state
                 .set_evm_block_interval(header.evm_block_interval);
@@ -9975,8 +10710,8 @@ impl TorusApp {
             // benign. This also converts any unknown cousin of F-1 from silent to a
             // loud, budget-bounded heal.
             let Some(entry) = self.deferred_exec.remove(&next) else {
-                if load_commit_manifest(&self.state_db, next).is_some() {
-                    let source = recovery_exec_source(&self.state_db, next);
+                if load_commit_manifest(&self.manifest_db, next).is_some() {
+                    let source = recovery_exec_source(&self.manifest_db, next);
                     self.park_deferred(next, source, Vec::new());
                     tracing::error!(
                         height = next,
@@ -10141,20 +10876,45 @@ impl TorusApp {
             // failed here is still rewritten at exec, as before.
             // `TORUS_EXEC_REWRITE_DURABLE_ROWS=1` forces the pre-skip rewrite (bisect).
             // The commit manifest that guarded the heal channel for this height is
-            // pruned INSIDE the same WriteBatch (redundant once the body is durable),
-            // keeping `CF_COMMIT_MANIFEST` bounded to the committed-but-not-yet-
-            // dispatched window; a still-parked hole never reaches here, so its
-            // manifest is retained for the pull.
-            let durable = persist_committed_block_durably_timed(
-                &self.state_db,
-                &torus_block,
-                self.metrics.as_deref(),
-            );
+            // pruned once the body is durable (redundant then), keeping
+            // `CF_COMMIT_MANIFEST` bounded to the committed-but-not-yet-dispatched
+            // window; a still-parked hole never reaches here, so its manifest is
+            // retained for the pull.
+            //
+            // T5.3 (manifest in the consensus DB): the write runs on the
+            // `CommitPersistWriter` thread instead (a state-DB write here waited
+            // behind the checkpoint batch); the exec thread waits for its ticket
+            // before executing the block, so the rows still land first, in height
+            // order. Until they land, the height's manifest (written synchronously by
+            // the commit hook) is the crash backstop, and the writer's
+            // `ManifestPruner` deletes it only after a state-WAL sync made the write
+            // durable. The pre-T5.3 layout (manifest in the state DB) keeps the
+            // synchronous write here, the manifest prune in its batch.
+            let (durable, ticket) = match &self.commit_persist {
+                Some(writer) => (
+                    DurableRows::default(),
+                    Some(writer.submit(torus_block.clone())),
+                ),
+                None => (
+                    persist_committed_block_durably_timed(
+                        &self.state_db,
+                        &torus_block,
+                        self.metrics.as_deref(),
+                        self.manifest_in_state_db,
+                    ),
+                    None,
+                ),
+            };
             self.exec_prepared_durable = if exec_rewrite_durable_rows() {
                 DurableRows::default()
             } else {
                 durable
             };
+            // RH4 x T5.3: the DA body GC records the height only once its
+            // body row landed: with the writer it waits for this ticket
+            // (`gc_da_bodies_after_dispatch`), as the exec thread does.
+            let gc_persist = ticket.clone();
+            self.exec_prepared_ticket = ticket;
 
             tracing::info!(
                 height,
@@ -10189,13 +10949,14 @@ impl TorusApp {
                     }
                 }
             }
-            // RH4: record this height's bodies for the DA body GC and delete
-            // the bodies that aged out (one bounded batch, see `da_gc`).
+            // RH4: hand this height to the DA body GC worker (records its
+            // bodies, deletes the ones that aged out; see `da_gc_worker`).
             self.gc_da_bodies_after_dispatch(
                 height,
                 &torus_block.native_actions,
-                &hashes,
+                hashes,
                 durable.body,
+                gc_persist,
             );
 
             // D4 (S392): pin the mempool's admission fee floor to the base fee
@@ -10227,6 +10988,7 @@ impl TorusApp {
                 torus_block,
                 pending_slashes,
                 durable: self.exec_prepared_durable,
+                persist: self.exec_prepared_ticket.clone(),
                 committed_unexecuted,
             };
             // inc BEFORE the (possibly blocking) send so a consensus thread stalled
@@ -10258,6 +11020,7 @@ impl TorusApp {
                             torus_block,
                             pending_slashes,
                             durable: _,
+                            persist: _,
                             committed_unexecuted: _,
                         } = msg;
                         return DispatchOutcome::Full(torus_block, pending_slashes);
@@ -11900,7 +12663,7 @@ mod exec_dispatch_tests {
         let a1 = vec![signed(151, t), cancel(152, t), cancel(153, t)];
         let b1 = block(1, a1.clone());
         let datum = bincode::serialize(&CompactBlock::from_block(&b1)).unwrap();
-        persist_commit_manifest(&app.state_db, 1, &datum);
+        persist_commit_manifest(&app.manifest_db, 1, &datum);
         app.exec_next_height = Some(1);
 
         app.drain_exec_queue();
@@ -11945,7 +12708,7 @@ mod exec_dispatch_tests {
         let a3 = vec![signed(164, t)];
         let b2 = block(2, a2.clone());
         let datum = bincode::serialize(&CompactBlock::from_block(&block(3, a3.clone()))).unwrap();
-        persist_commit_manifest(&app.state_db, 3, &datum);
+        persist_commit_manifest(&app.manifest_db, 3, &datum);
 
         app.enqueue_for_execution(1, ExecSource::Ready(b1), vec![]);
         app.enqueue_for_execution(
@@ -12315,6 +13078,17 @@ mod crash_recovery_tests {
     use super::*;
     use torus_types::{Bloom, FixedPoint, NativeAction, SignedNativeAction, B256, U256};
 
+    /// Pre-testnet P0: orders need a listed market. Every fixture DB of this
+    /// module lists markets 1..=8 with placeholder rows (tick / lot 1, no
+    /// margin config: the book an unlisted market used to get).
+    fn list_test_markets(state_db: &StateDb) {
+        for m in 1..=8u64 {
+            state_db
+                .put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed")
+                .expect("list market");
+        }
+    }
+
     fn make_test_config_and_db() -> (ChainConfig, StateDb) {
         // Native trie maintenance is a process-global flag that only ever
         // goes off -> on (resolved off from the env on first use, forced on
@@ -12329,6 +13103,7 @@ mod crash_recovery_tests {
         // `cargo test` and in nextest.
         torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         let state_db = StateDb::open(&scratch_db_dir("torus-crash-test")).expect("open test db");
+        list_test_markets(&state_db);
         let config = ChainConfig {
             chain_id: torus_evm::TORUS_CHAIN_ID,
             chain_name: "crash-test".to_string(),
@@ -13008,6 +13783,54 @@ mod crash_recovery_tests {
         assert_eq!(last.height, 3);
     }
 
+    /// s132: the crash-replay loader (also the RH4 DA GC restore's source) treats a
+    /// pruned height as "no durable body" in both prune modes, though in filter mode the
+    /// row is still on disk until a compaction drops it; at and above the cutoff it loads.
+    #[test]
+    fn load_replay_body_hides_pruned_heights_in_both_prune_modes() {
+        use std::sync::atomic::AtomicU64;
+        use torus_state::prune_filter::PruneMode;
+        use torus_state::{PrunerConfig, StatePruner};
+        for mode in [PruneMode::Range, PruneMode::Filter] {
+            let dir = tempfile::tempdir().unwrap();
+            let state_db = StateDb::open_with_prune_mode(dir.path(), mode).unwrap();
+            for h in 1..=10u64 {
+                persist_committed_block_durably(
+                    &state_db,
+                    &make_block(h, vec![sign_claim_rewards(h)]),
+                );
+            }
+            state_db
+                .put_cf_raw(
+                    CF_CONSENSUS_META,
+                    torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
+                    &10u64.to_be_bytes(),
+                )
+                .unwrap();
+            let cfg = PrunerConfig {
+                retention_blocks: 4,
+                prune_interval_blocks: 1,
+                batch_size: 100,
+                trade_retention_blocks: None,
+            };
+            StatePruner::new(state_db.clone(), cfg, Arc::new(AtomicU64::new(0)))
+                .maybe_prune(10)
+                .unwrap();
+            let raw = state_db
+                .inner()
+                .get_cf(state_db.cf_handle(CF_BLOCK_BODIES).unwrap(), 5u64.to_be_bytes())
+                .unwrap();
+            assert_eq!(raw.is_some(), mode == PruneMode::Filter, "{mode:?}: lazy on disk");
+            for h in 1..=10u64 {
+                assert_eq!(
+                    load_replay_body(&state_db, h).is_some(),
+                    h >= 6,
+                    "{mode:?}: height {h} (cutoff 6)"
+                );
+            }
+        }
+    }
+
     /// FIX 1a: `persist_committed_block_durably` writes BOTH the header (with the committed
     /// block hash in the first 32 bytes, for `detect_conflicting_commit`) and the full body,
     /// so the two crash-replay loaders (`load_replay_header` / `load_replay_body`) both resolve
@@ -13511,7 +14334,6 @@ mod crash_recovery_tests {
     /// artifact carrying the committed height's action hashes.
     #[test]
     fn commit_manifest_persists_native_action_hashes_at_commit() {
-        let (_config, state_db) = make_test_config_and_db();
         let actions: Vec<SignedNativeAction> = (0..20).map(sign_claim_rewards).collect();
         // Height 5 (small: `make_block` links parent hashes recursively — the real
         // h1165 recurses too deep for a test stack; the height is cosmetic here).
@@ -13519,10 +14341,16 @@ mod crash_recovery_tests {
 
         // Exactly what the commit callback ships: the compact consensus datum.
         let datum = encode_proposal_datum(&block, true);
-        persist_commit_manifest(&state_db, 5, &datum);
+        // T5.3: in the consensus DB, and durable across a reopen of it.
+        let dir = scratch_db_dir("torus-manifest-reopen");
+        {
+            let cdb = StateDb::open_consensus(&dir).unwrap();
+            persist_commit_manifest(&cdb, 5, &datum);
+        }
+        let cdb = StateDb::open_consensus(&dir).unwrap();
 
         // Survives the kill window: reload + decode yields the reconstruction key.
-        let loaded = load_commit_manifest(&state_db, 5).expect("manifest durable at commit");
+        let loaded = load_commit_manifest(&cdb, 5).expect("manifest durable at commit");
         let compact: CompactBlock =
             bincode::deserialize(&loaded).expect("manifest decodes to the committed CompactBlock");
         let want: Vec<_> = actions.iter().map(torus_types::compute_action_hash).collect();
@@ -13552,13 +14380,14 @@ mod crash_recovery_tests {
 
         // Kill-window state: header + manifest durable at commit; body NEVER landed.
         persist_header_only_for_test(&state_db, &block);
-        persist_commit_manifest(&state_db, 5, &encode_proposal_datum(&block, true));
+        let cdb = make_test_consensus_db();
+        persist_commit_manifest(&cdb, 5, &encode_proposal_datum(&block, true));
         // Mark applied so `TorusApp::new`'s replay is a no-op (this test drives the
         // recovery/reconstruct seams directly, not the boot park path).
         write_native_applied_height(&state_db, 5);
 
         // The heal-channel seed decodes the manifest to a Compact source.
-        let source = recovery_exec_source(&state_db, 5);
+        let source = recovery_exec_source(&cdb, 5);
         let compact = match source {
             ExecSource::Compact(c) => c,
             _ => panic!("a manifest-backed boot hole must seed ExecSource::Compact"),
@@ -13841,7 +14670,8 @@ mod crash_recovery_tests {
             drop(app);
 
             let ctx = make_exec_ctx(&config, &db);
-            ctx.execute_committed_block_with(&msg.torus_block, msg.pending_slashes, msg.durable);
+            let durable = msg.settled_durable();
+            ctx.execute_committed_block_with(&msg.torus_block, msg.pending_slashes, durable);
             assert!(!ctx.exec_failed.load(Ordering::SeqCst));
             drop(ctx);
             db
@@ -14399,7 +15229,7 @@ mod crash_recovery_tests {
             bincode::serialize(&committed).unwrap()
         );
         assert_eq!(
-            msg.durable,
+            msg.settled_durable(),
             DurableRows { header: true, body: true }
         );
         let durable_body = load_replay_body(&state_db, 5).expect("body durable before dispatch");
@@ -15926,19 +16756,22 @@ mod crash_recovery_tests {
 
         // But height 5 was committed pre-crash: its datum lives ONLY in the durable
         // commit manifest (headers/bodies never persisted — the crash-in-hole window).
+        // T5.3: the manifest lives in the consensus DB.
         let datum = bincode::serialize(&make_block(5, vec![])).unwrap();
-        state_db
-            .put_cf_raw(
-                torus_state::cf::CF_COMMIT_MANIFEST,
-                &5u64.to_be_bytes(),
-                &datum,
-            )
-            .unwrap();
+        let cdb = make_test_consensus_db();
+        cdb.put_cf_raw(
+            torus_state::cf::CF_COMMIT_MANIFEST,
+            &5u64.to_be_bytes(),
+            &datum,
+        )
+        .unwrap();
 
         // Sanity: replay itself sees no gap (frontier == applied == 4).
         assert_eq!(find_last_committed_height(&state_db), Some(4));
 
-        let app = TorusApp::new(state_db.clone(), &config, None, None, None);
+        let app =
+            TorusApp::try_new_with_manifest_db(state_db.clone(), cdb, &config, None, None, None)
+                .unwrap();
 
         assert_eq!(
             app.exec_next_height,
@@ -15980,10 +16813,19 @@ mod crash_recovery_tests {
         };
         let actions = vec![sign_claim_rewards(5), cancel(6), cancel(7)];
         let b5 = make_block(5, actions.clone());
-        persist_commit_manifest(&state_db, 5, &encode_proposal_datum(&b5, true));
+        let cdb = make_test_consensus_db();
+        persist_commit_manifest(&cdb, 5, &encode_proposal_datum(&b5, true));
 
         let mempool = exec_aware_mempool(&state_db);
-        let app = TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
+        let app = TorusApp::try_new_with_manifest_db(
+            state_db.clone(),
+            cdb,
+            &config,
+            None,
+            Some(mempool.clone()),
+            None,
+        )
+        .unwrap();
         assert!(matches!(
             app.deferred_exec.get(&5).map(|e| &e.source),
             Some(ExecSource::Compact(_))
@@ -16077,6 +16919,7 @@ mod crash_recovery_tests {
             trade_writer: None,
             trade_history: true,
             fill_sink: Default::default(),
+            header_hook: Default::default(),
             state_hash: Default::default(),
             // None -> exec-time body write is synchronous (exact-today). Tests that
             // exercise the async stage build their own writer explicitly.
@@ -18962,6 +19805,21 @@ mod crash_recovery_tests {
         )
     }
 
+    /// [`committed_compact_block`] with the FULL datum (bodies inline): it
+    /// dispatches without a DA store.
+    fn committed_full_block(block: &TorusBlock) -> hotstuff_rs::types::block::Block {
+        use hotstuff_rs::hotstuff::types::PhaseCertificate;
+        use hotstuff_rs::types::data_types::BlockHeight;
+        let datum = encode_proposal_datum(block, false);
+        let hash = TorusApp::hash_datum(&datum);
+        hotstuff_rs::types::block::Block::new(
+            BlockHeight::new(block.header.height),
+            PhaseCertificate::genesis_pc(),
+            CryptoHash::new(hash),
+            Data::new(vec![Datum::new(datum)]),
+        )
+    }
+
     /// T1.2 (a) RED-first: a STALE same-height `pending_proposals` entry (fewer
     /// actions than the committed block) must NEVER be executed in place of the
     /// committed datum. The body handed to execution must carry the COMMITTED
@@ -19043,7 +19901,7 @@ mod crash_recovery_tests {
         app.on_committed_block(&committed, committed.hash);
 
         assert!(
-            load_commit_manifest(&app.state_db, 5).is_none(),
+            load_commit_manifest(&app.manifest_db, 5).is_none(),
             "a benign re-delivery below the exec frontier must NOT re-write its commit \
              manifest (pruned at dispatch; re-writing leaks it forever)"
         );
@@ -19158,7 +20016,16 @@ mod crash_recovery_tests {
             state_db.clone(),
             torus_mempool::MempoolConfig::default(),
         ));
-        let mut app = TorusApp::new(state_db.clone(), config, None, Some(mempool.clone()), None);
+        // T5.3: laid out as on a node (manifest in its own consensus DB).
+        let mut app = TorusApp::try_new_with_manifest_db(
+            state_db.clone(),
+            make_test_consensus_db(),
+            config,
+            None,
+            Some(mempool.clone()),
+            None,
+        )
+        .unwrap();
         let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(64);
         app.replace_exec_tx(tx);
         (app, rx, mempool)
@@ -19193,6 +20060,886 @@ mod crash_recovery_tests {
         );
     }
 
+    /// T5.3 part 0: the commit-manifest put is timed on its own, once per
+    /// commit (section 106: the consensus thread's in-window commit-hook stall
+    /// is inferred to be this put, waiting behind the checkpoint batch).
+    #[test]
+    fn commit_manifest_put_is_timed_once_per_commit() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, rx, mempool) = app_with_recording_exec(&config, &state_db);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        app.metrics = Some(metrics.clone());
+
+        let a5 = vec![sign_claim_rewards(5)];
+        let _ = mempool.mirror_native_to_da(&a5);
+        let b5 = make_block(5, a5);
+        app.exec_next_height = Some(5);
+        let c5 = committed_compact_block(&b5);
+        app.on_committed_block(&c5, c5.hash);
+        rx.try_recv().expect("height 5 must reach execution");
+
+        let text = metrics.encode();
+        assert!(
+            text.contains("torus_commit_manifest_seconds_count 1"),
+            "one manifest-put observation per commit:\n{text}"
+        );
+        assert!(
+            text.contains("torus_on_committed_block_seconds_count 1"),
+            "the whole hook is timed once:\n{text}"
+        );
+    }
+
+    /// T5.3: a scratch consensus DB (the node's manifest home).
+    fn make_test_consensus_db() -> StateDb {
+        StateDb::open_consensus(&scratch_db_dir("torus-crash-cdb")).expect("open test consensus db")
+    }
+
+    /// T5.3 RED-first: the commit hook writes the manifest (the committed
+    /// datum, verbatim) to the CONSENSUS DB only; dispatch prunes it there
+    /// after the durable body write; the state DB's manifest CF is never
+    /// touched. RED on main: no consensus-DB manifest home exists.
+    #[test]
+    fn commit_manifest_lands_in_consensus_db_and_is_pruned_there_at_dispatch() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, rx, mempool) = app_with_recording_exec(&config, &state_db);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        app.metrics = Some(metrics.clone());
+        assert!(
+            !app.manifest_in_state_db,
+            "node layout: manifest in the consensus DB"
+        );
+        let cdb = app.manifest_db.clone();
+        let key = 5u64.to_be_bytes();
+
+        let a5 = vec![sign_claim_rewards(5)];
+        let b5 = make_block(5, a5.clone());
+        app.exec_next_height = Some(5);
+        let c5 = committed_compact_block(&b5);
+        // Body not in the DA store yet: height 5 parks and keeps its manifest.
+        app.on_committed_block(&c5, c5.hash);
+        assert!(rx.try_recv().is_err(), "a missing body parks height 5");
+        assert_eq!(
+            cdb.get_cf_raw(CF_COMMIT_MANIFEST, &key).unwrap().as_deref(),
+            Some(c5.data.vec()[0].bytes().as_slice()),
+            "the committed datum, verbatim, in the consensus DB"
+        );
+        assert!(
+            state_db
+                .get_cf_raw(CF_COMMIT_MANIFEST, &key)
+                .unwrap()
+                .is_none(),
+            "nothing in the state DB"
+        );
+
+        mempool.mirror_native_to_da(&a5).unwrap();
+        app.drain_exec_queue();
+        let msg = rx.try_recv().expect("healed height 5 reaches execution");
+        assert_eq!(
+            msg.settled_durable(),
+            DurableRows {
+                header: true,
+                body: true
+            }
+        );
+        assert!(
+            wait_manifest_pruned(&cdb, 5),
+            "pruned from the consensus DB by the background pass after dispatch"
+        );
+        assert!(state_db
+            .get_cf_raw(CF_COMMIT_MANIFEST, &key)
+            .unwrap()
+            .is_none());
+    }
+
+    /// T5.3: run the commit hook for a height that parks (so the manifest put
+    /// is the hook's only DB write) while another thread's large state-DB
+    /// write (a stand-in for the checkpoint batch on the flush worker) is in
+    /// flight. Returns `(hook s, s of that write left when the hook started)`,
+    /// or `None` when the write was too short to measure against.
+    ///
+    /// With `dispatch_via` (the app's mempool), the height's body is in the
+    /// DA store and it is the next to execute, so the hook also runs
+    /// `dispatch_to_exec` (its commit-persist write goes to the state DB).
+    fn commit_hook_during_state_write(
+        app: &mut TorusApp,
+        state_db: &StateDb,
+        entries: u64,
+        height: u64,
+        dispatch_via: Option<&Mempool>,
+    ) -> Option<(f64, f64)> {
+        let actions = vec![sign_claim_rewards(height)];
+        // DA bodies first: in tests the DA store is on the state DB, so the
+        // mirror must not itself queue behind the held write.
+        if let Some(mempool) = dispatch_via {
+            mempool.mirror_native_to_da(&actions).unwrap();
+        }
+        let db = state_db.clone();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut batch = rocksdb::WriteBatch::default();
+            {
+                let cf = db.cf_handle(torus_state::cf::CF_NATIVE_ORDERS).unwrap();
+                for i in 0..entries {
+                    batch.put_cf(cf, i.to_be_bytes(), [7u8; 100]);
+                }
+            }
+            go_tx.send(()).unwrap();
+            db.write(batch).unwrap();
+            std::time::Instant::now()
+        });
+        go_rx.recv().unwrap();
+        // Let the write enter RocksDB's write queue first.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let block = make_block(height, actions);
+        let committed = committed_compact_block(&block);
+        app.exec_next_height = match dispatch_via {
+            Some(_) => Some(height),  // dispatched in the hook
+            None => Some(height - 1), // parks: no dispatch
+        };
+        let t0 = std::time::Instant::now();
+        app.on_committed_block(&committed, committed.hash);
+        let hook = t0.elapsed().as_secs_f64();
+        let write_end = writer.join().unwrap();
+        let left = write_end.saturating_duration_since(t0).as_secs_f64();
+        assert_eq!(
+            app.deferred_exec.contains_key(&height),
+            dispatch_via.is_none(),
+            "height {height} parked iff not dispatched"
+        );
+        eprintln!(
+            "T5.3 commit hook {:.1} ms (dispatch: {}); held state-DB write had {:.1} ms left \
+             ({entries} entries, manifest in state DB: {})",
+            hook * 1e3,
+            dispatch_via.is_some(),
+            left * 1e3,
+            app.manifest_in_state_db
+        );
+        (left >= 0.15).then_some((hook, left))
+    }
+
+    fn measure_commit_hook_during_state_write(
+        app: &mut TorusApp,
+        state_db: &StateDb,
+        dispatch_via: Option<&Mempool>,
+    ) -> (f64, f64) {
+        for (entries, height) in [(400_000u64, 7u64), (1_600_000, 17)] {
+            if let Some(r) =
+                commit_hook_during_state_write(app, state_db, entries, height, dispatch_via)
+            {
+                return r;
+            }
+        }
+        panic!("the held state-DB write was too short to measure against, even at 1.6M entries");
+    }
+
+    /// T5.3 RED-first (section 106): with the manifest in the consensus DB the
+    /// commit hook does not wait for a state-DB write in flight on another
+    /// thread. RED on main (manifest in the state DB): the put queues in the
+    /// state DB's write queue until that write ends; the control test below
+    /// pins that for the pre-T5.3 layout in this binary.
+    #[test]
+    fn commit_hook_does_not_wait_behind_a_state_db_write() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, _rx, _mempool) = app_with_recording_exec(&config, &state_db);
+        assert!(!app.manifest_in_state_db);
+        let (hook, left) = measure_commit_hook_during_state_write(&mut app, &state_db, None);
+        assert!(
+            hook < left * 0.25,
+            "the commit hook took {:.1} ms while the held state-DB write had {:.1} ms left: it \
+             waited behind it",
+            hook * 1e3,
+            left * 1e3
+        );
+    }
+
+    /// T5.3 control: in the pre-T5.3 layout (manifest in the state DB, also
+    /// `TORUS_MANIFEST_IN_STATE_DB=1`) the commit hook DOES wait behind the
+    /// held state-DB write: the mechanism section 106 inferred.
+    #[test]
+    fn commit_hook_with_state_db_manifest_waits_behind_a_state_db_write() {
+        let (config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let mut app = TorusApp::new(state_db.clone(), &config, None, Some(mempool), None);
+        assert!(app.manifest_in_state_db);
+        let (hook, left) = measure_commit_hook_during_state_write(&mut app, &state_db, None);
+        assert!(
+            hook > left * 0.5,
+            "the commit hook took {:.1} ms but the held state-DB write had {:.1} ms left: the \
+             state-DB manifest put did not wait behind it",
+            hook * 1e3,
+            left * 1e3
+        );
+    }
+
+    /// T5.3 (Codex WARN 2) RED-first: a commit that dispatches in its hook
+    /// does not wait behind a held state-DB write either: the header + body
+    /// write runs on the commit-persist writer thread. RED on the first part-1
+    /// cut (1,502 ms behind a 1,502 ms held write): `dispatch_to_exec` wrote
+    /// them to the state DB on the consensus thread.
+    #[test]
+    fn commit_dispatch_does_not_wait_behind_a_state_db_write() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, _rx, mempool) = app_with_recording_exec(&config, &state_db);
+        let (hook, left) =
+            measure_commit_hook_during_state_write(&mut app, &state_db, Some(&mempool));
+        assert!(
+            hook < left * 0.25,
+            "commit + dispatch took {:.1} ms while the held state-DB write had {:.1} ms left: \
+             the dispatch's commit-persist write waited behind it",
+            hook * 1e3,
+            left * 1e3
+        );
+    }
+
+    /// Wait (up to 10 s) until the background pruner deleted `height`'s
+    /// manifest from `manifest_db`.
+    fn wait_manifest_pruned(manifest_db: &StateDb, height: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if load_commit_manifest(manifest_db, height).is_none() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// T5.3 (Codex WARN 1) RED-first: the manifest of a dispatched height is
+    /// NOT deleted before the state DB's WAL is synced (the two DBs have
+    /// separate WALs; a delete that becomes durable while the unsynced body
+    /// write is lost on power loss would leave an unhealable hole). Until the
+    /// sync, losing the header + body (simulated by deleting the rows) still
+    /// leaves the manifest, and boot parks the height from it and heals it.
+    /// A prune pass syncs the state WAL first, then deletes. RED on the first
+    /// part-1 cut: the manifest was deleted right after the unsynced body write.
+    #[test]
+    fn manifest_outlives_unsynced_body_write_and_heals_after_its_loss() {
+        let (config, state_db) = make_test_config_and_db();
+        let cdb = make_test_consensus_db();
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 4);
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let boot = || {
+            TorusApp::try_new_with_manifest_db(
+                state_db.clone(),
+                cdb.clone(),
+                &config,
+                None,
+                Some(mempool.clone()),
+                None,
+            )
+            .unwrap()
+        };
+        let mut app = boot();
+        // Hold the pruner: it records the heights but runs no pass.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        app.commit_persist = Some(CommitPersistWriter::spawn(
+            state_db.clone(),
+            ManifestPruner::detached(held_tx),
+            None,
+            app.header_hook.clone(),
+        ));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+        app.replace_exec_tx(tx);
+        let a5 = vec![sign_claim_rewards(5)];
+        mempool.mirror_native_to_da(&a5).unwrap();
+        let b5 = make_block(5, a5);
+        app.exec_next_height = Some(5);
+        let c5 = committed_compact_block(&b5);
+        app.on_committed_block(&c5, c5.hash);
+        let msg = rx.try_recv().expect("dispatched");
+        assert!(msg.settled_durable().body, "the off-thread write landed");
+        assert_eq!(
+            held_rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(5),
+            "handed to the pruner after the write"
+        );
+        assert!(
+            load_commit_manifest(&cdb, 5).is_some(),
+            "kept until the state WAL is synced"
+        );
+
+        // Power loss before any state-WAL sync: the unsynced header + body go.
+        let key = 5u64.to_be_bytes();
+        state_db.delete_cf_raw(CF_BLOCK_HEADERS, &key).unwrap();
+        state_db.delete_cf_raw(CF_BLOCK_BODIES, &key).unwrap();
+        drop(app);
+
+        let mut app = boot();
+        assert_eq!(app.exec_next_height, Some(5), "parked from the manifest");
+        assert!(matches!(
+            app.deferred_exec.get(&5).map(|e| &e.source),
+            Some(ExecSource::Compact(_))
+        ));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+        app.replace_exec_tx(tx);
+        app.drain_exec_queue();
+        let msg = rx.try_recv().expect("heals from the manifest + DA bodies");
+        assert_eq!(msg.torus_block.header.height, 5);
+        // Wait for the healed height's off-thread write (its ticket) first.
+        assert!(msg.settled_durable().body, "the healed write landed");
+        assert!(load_replay_body(&state_db, 5).is_some(), "body rewritten");
+
+        // A prune pass: the state WAL sync first, then the delete.
+        let syncs = state_db.wal_sync_count();
+        manifest_prune_pass(&state_db, &cdb, &[5]).unwrap();
+        if let (Some(before), Some(after)) = (syncs, state_db.wal_sync_count()) {
+            assert!(after > before, "the pass synced the state WAL");
+        }
+        assert!(load_commit_manifest(&cdb, 5).is_none());
+    }
+
+    /// T5.3: a recording [`HeaderPersistedHook`]: each call's height and
+    /// whether its `CF_BLOCK_HEADERS` row was readable at the call.
+    #[allow(clippy::type_complexity)]
+    fn recording_header_hook(
+        state_db: &StateDb,
+    ) -> (HeaderPersistedHook, Arc<std::sync::Mutex<Vec<(u64, bool)>>>) {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (db, sink) = (state_db.clone(), calls.clone());
+        let hook: HeaderPersistedHook = Arc::new(move |h: u64| {
+            let readable = db
+                .get_cf_raw(CF_BLOCK_HEADERS, &h.to_be_bytes())
+                .unwrap()
+                .is_some();
+            sink.lock().unwrap().push((h, readable));
+        });
+        (hook, calls)
+    }
+
+    /// T5.3 (Codex P2) RED-first: with the header + body write off the
+    /// consensus thread, the commit handler can run before the height's header
+    /// exists, so the node needs a signal once it does: the header-persisted
+    /// hook fires for each dispatched height, in order, exactly once, after its
+    /// row is readable. RED on 173f9a12: nothing tells the node, and the last
+    /// committed height stays unpublished once commits stop. The hook runs
+    /// after the ticket settles (see the test below), so the test waits for
+    /// the hook's call itself (a channel; no sleeps).
+    #[test]
+    fn header_persisted_hook_fires_once_per_height_after_its_off_thread_write() {
+        let (config, state_db) = make_test_config_and_db();
+        let cdb = make_test_consensus_db();
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 4);
+        let mut app =
+            TorusApp::try_new_with_manifest_db(state_db.clone(), cdb, &config, None, None, None)
+                .unwrap();
+        assert!(app.commit_persist.is_some(), "the off-thread writer");
+        let (record, calls) = recording_header_hook(&state_db);
+        let (fired_tx, fired_rx) = std::sync::mpsc::channel::<u64>();
+        let fired_tx = std::sync::Mutex::new(fired_tx);
+        let hook: HeaderPersistedHook = Arc::new(move |h: u64| {
+            record(h);
+            let _ = fired_tx.lock().unwrap().send(h);
+        });
+        app.set_header_persisted_hook(hook);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(8);
+        app.replace_exec_tx(tx);
+        app.exec_next_height = Some(5);
+        for h in 5..=7u64 {
+            let c = committed_full_block(&make_block(h, vec![]));
+            app.on_committed_block(&c, c.hash);
+            let msg = rx.try_recv().expect("dispatched");
+            assert_eq!(msg.torus_block.header.height, h);
+            assert!(msg.persist.is_some(), "queued on the writer");
+            assert!(msg.settled_durable().header, "the write landed");
+            assert_eq!(fired_rx.recv().unwrap(), h, "the hook fired for h");
+            assert_eq!(
+                calls.lock().unwrap().last().copied(),
+                Some((h, true)),
+                "published once its row was readable"
+            );
+        }
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(5, true), (6, true), (7, true)],
+            "in order, each height once"
+        );
+    }
+
+    /// T5.3 (review P3) RED-first: the writer settles a height's ticket (exec
+    /// unblocks) BEFORE it runs the header-persisted hook, so the publish work
+    /// (lock, row read, header parse, broadcast) is not added to exec's wait.
+    /// Deterministic: the hook reports its entry and then blocks until the test
+    /// releases it; while it is blocked, the ticket is already filled. RED on
+    /// 0036f1f3: the hook ran first, so the ticket was still empty.
+    #[test]
+    fn writer_settles_the_ticket_before_the_header_persisted_hook() {
+        let (config, state_db) = make_test_config_and_db();
+        let cdb = make_test_consensus_db();
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 4);
+        let mut app =
+            TorusApp::try_new_with_manifest_db(state_db.clone(), cdb, &config, None, None, None)
+                .unwrap();
+        assert!(app.commit_persist.is_some(), "the off-thread writer");
+        let (record, calls) = recording_header_hook(&state_db);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<u64>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new((entered_tx, release_rx));
+        let hook: HeaderPersistedHook = Arc::new(move |h: u64| {
+            record(h);
+            let gate = gate.lock().unwrap();
+            let _ = gate.0.send(h);
+            // Held until the test releases it (or drops `release_tx`).
+            let _ = gate.1.recv();
+        });
+        app.set_header_persisted_hook(hook);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(8);
+        app.replace_exec_tx(tx);
+        app.exec_next_height = Some(5);
+        // Declared after `app`: dropped first on a failed assert, which frees
+        // a held hook so the writer's join in `app`'s drop cannot hang.
+        let release_tx = release_tx;
+        for h in 5..=6u64 {
+            let c = committed_full_block(&make_block(h, vec![]));
+            app.on_committed_block(&c, c.hash);
+            let msg = rx.try_recv().expect("dispatched");
+            assert_eq!(msg.torus_block.header.height, h);
+            let ticket = msg.persist.as_ref().expect("queued on the writer");
+            assert_eq!(entered_rx.recv().unwrap(), h, "the hook is running");
+            let settled = ticket.peek();
+            assert!(
+                settled.is_some_and(|rows| rows.header),
+                "the ticket settled before the hook ran (exec is not held by it)"
+            );
+            release_tx.send(()).unwrap();
+        }
+        drop(release_tx);
+        assert_eq!(*calls.lock().unwrap(), vec![(5, true), (6, true)]);
+    }
+
+    /// T5.3: `TORUS_MANIFEST_IN_STATE_DB=1` (pre-T5.3 layout) is unchanged: the
+    /// dispatch writes the header itself, before the commit event, so the
+    /// commit handler sees it; the hook is never called.
+    #[test]
+    fn header_persisted_hook_is_not_used_with_the_manifest_in_the_state_db() {
+        let (config, state_db) = make_test_config_and_db();
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 4);
+        let mut app = TorusApp::try_new(state_db.clone(), &config, None, None, None).unwrap();
+        assert!(app.commit_persist.is_none(), "no off-thread writer");
+        let (hook, calls) = recording_header_hook(&state_db);
+        app.set_header_persisted_hook(hook);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(8);
+        app.replace_exec_tx(tx);
+        app.exec_next_height = Some(5);
+        let c = committed_full_block(&make_block(5, vec![]));
+        app.on_committed_block(&c, c.hash);
+        let msg = rx.try_recv().expect("dispatched");
+        assert!(msg.persist.is_none(), "written in the dispatch");
+        assert!(msg.durable.header);
+        assert!(state_db
+            .get_cf_raw(CF_BLOCK_HEADERS, &5u64.to_be_bytes())
+            .unwrap()
+            .is_some());
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// T5.3: a height whose off-thread write failed (ticket settled "nothing
+    /// durable") gets its header row from execution; the exec thread then fires
+    /// the hook for it, after executing it. A height the writer did write is
+    /// not re-signalled by exec, nor is one written in the dispatch.
+    #[test]
+    fn header_persisted_hook_fires_from_exec_when_the_off_thread_write_failed() {
+        let (config, state_db) = make_test_config_and_db();
+        let ctx = make_exec_ctx(&config, &state_db);
+        let (hook, calls) = recording_header_hook(&state_db);
+        assert!(ctx.header_hook.set(hook).is_ok());
+        ctx.exec_shutdown.store(true, Ordering::SeqCst);
+        let latch = ctx.exec_failed.clone();
+        let settled = |rows: DurableRows| {
+            let ticket = PersistTicket::default();
+            ticket.set(rows);
+            ticket
+        };
+        let both = DurableRows {
+            header: true,
+            body: true,
+        };
+        let b1 = make_block(1, vec![]);
+        let b2 = make_block(2, vec![]);
+        let b3 = make_block(3, vec![]);
+        // Heights 2 and 3 were written before exec (writer / dispatch).
+        persist_block_for_test(&state_db, &b2);
+        persist_block_for_test(&state_db, &b3);
+        let msg = |block: TorusBlock, durable, persist| CommittedBlockMsg {
+            torus_block: block,
+            pending_slashes: vec![],
+            durable,
+            persist,
+            committed_unexecuted: 0,
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(8);
+        tx.send(msg(
+            b1,
+            DurableRows::default(),
+            Some(settled(DurableRows::default())),
+        ))
+        .unwrap();
+        tx.send(msg(b2, DurableRows::default(), Some(settled(both))))
+            .unwrap();
+        tx.send(msg(b3, both, None)).unwrap();
+        drop(tx);
+        std::thread::spawn(move || execution_loop(rx, ctx))
+            .join()
+            .unwrap();
+        assert!(!latch.load(Ordering::SeqCst), "executes cleanly");
+        assert_eq!(read_native_applied_height(&state_db), Some(3));
+        assert_eq!(*calls.lock().unwrap(), vec![(1, true)]);
+    }
+
+    /// T5.3 crash window (a): killed after the commit (manifest durable in the
+    /// consensus DB) but before the off-thread header + body write landed. The
+    /// state DB has nothing for the height; boot parks it from the manifest
+    /// (FIX 6 / F-1) and heals it from the DA bodies, in order.
+    #[test]
+    fn crash_before_the_off_thread_persist_lands_heals_from_the_manifest() {
+        let (config, state_db) = make_test_config_and_db();
+        let cdb = make_test_consensus_db();
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 4);
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let boot = || {
+            TorusApp::try_new_with_manifest_db(
+                state_db.clone(),
+                cdb.clone(),
+                &config,
+                None,
+                Some(mempool.clone()),
+                None,
+            )
+            .unwrap()
+        };
+        let mut app = boot();
+        app.commit_persist = Some(CommitPersistWriter::held());
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+        app.replace_exec_tx(tx);
+        let a5 = vec![sign_claim_rewards(5)];
+        mempool.mirror_native_to_da(&a5).unwrap();
+        let b5 = make_block(5, a5);
+        app.exec_next_height = Some(5);
+        let c5 = committed_compact_block(&b5);
+        app.on_committed_block(&c5, c5.hash);
+        let msg = rx.try_recv().expect("dispatched; its write is queued");
+        let key = 5u64.to_be_bytes();
+        assert!(state_db
+            .get_cf_raw(CF_BLOCK_HEADERS, &key)
+            .unwrap()
+            .is_none());
+        assert!(state_db
+            .get_cf_raw(CF_BLOCK_BODIES, &key)
+            .unwrap()
+            .is_none());
+        assert!(
+            load_commit_manifest(&cdb, 5).is_some(),
+            "the crash backstop"
+        );
+        drop(app); // the "kill": the queued write is dropped unwritten
+        assert_eq!(
+            msg.settled_durable(),
+            DurableRows::default(),
+            "a dropped write reports nothing durable (exec would write the rows)"
+        );
+        drop(msg);
+
+        let mut app = boot();
+        assert_eq!(app.exec_next_height, Some(5), "parked from the manifest");
+        assert!(matches!(
+            app.deferred_exec.get(&5).map(|e| &e.source),
+            Some(ExecSource::Compact(_))
+        ));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+        app.replace_exec_tx(tx);
+        app.drain_exec_queue();
+        let msg = rx.try_recv().expect("heals from the manifest + DA bodies");
+        assert_eq!(msg.torus_block.header.height, 5);
+        assert_eq!(
+            msg.settled_durable(),
+            DurableRows {
+                header: true,
+                body: true
+            }
+        );
+        assert!(load_replay_body(&state_db, 5).is_some());
+        assert!(
+            wait_manifest_pruned(&cdb, 5),
+            "pruned after the healed write"
+        );
+    }
+
+    /// T5.3 crash window (b): killed after the off-thread header + body write
+    /// landed but before the manifest prune (and before execution). Boot replays
+    /// the height once from its durable rows, drops the now-executed manifest,
+    /// parks nothing, and a re-delivered commit of it is skipped (no manifest
+    /// re-write, nothing dispatched).
+    #[test]
+    fn crash_after_the_off_thread_persist_before_the_prune_replays_once() {
+        let (config, state_db) = make_test_config_and_db();
+        let cdb = make_test_consensus_db();
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 4);
+        let boot = || {
+            TorusApp::try_new_with_manifest_db(
+                state_db.clone(),
+                cdb.clone(),
+                &config,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let mut app = boot();
+        let (held_tx, _held_rx) = std::sync::mpsc::channel();
+        app.commit_persist = Some(CommitPersistWriter::spawn(
+            state_db.clone(),
+            ManifestPruner::detached(held_tx),
+            None,
+            app.header_hook.clone(),
+        ));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+        app.replace_exec_tx(tx);
+        let b5 = make_block(5, vec![sign_claim_rewards(5)]);
+        app.exec_next_height = Some(5);
+        let c5 = committed_full_block(&b5);
+        app.on_committed_block(&c5, c5.hash);
+        let msg = rx.try_recv().expect("dispatched");
+        assert!(msg.settled_durable().body, "the write landed");
+        drop(msg);
+        drop(app); // the "kill": executed nothing, pruned nothing
+        assert!(load_commit_manifest(&cdb, 5).is_some());
+        assert_eq!(read_native_applied_height(&state_db), Some(4));
+
+        let mut app = boot();
+        assert_eq!(
+            read_native_applied_height(&state_db),
+            Some(5),
+            "boot replayed height 5 from its durable rows"
+        );
+        assert!(app.deferred_exec.is_empty(), "nothing parked");
+        assert!(
+            load_commit_manifest(&cdb, 5).is_none(),
+            "the executed height's manifest is dropped at boot"
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+        app.replace_exec_tx(tx);
+        let c5 = committed_full_block(&b5);
+        app.on_committed_block(&c5, c5.hash);
+        assert!(
+            rx.try_recv().is_err(),
+            "a re-delivery is not dispatched again"
+        );
+        assert!(
+            load_commit_manifest(&cdb, 5).is_none(),
+            "nor its manifest re-written"
+        );
+    }
+
+    /// T5.3 (FIX 1b path): a boot gap hole (header durable, body lost in the
+    /// commit->persist window) parks from its manifest in the CONSENSUS DB as
+    /// a Compact source carrying the real action hashes (the peer-pull key),
+    /// and heals in order once its bodies reach the DA store; the dispatch
+    /// then prunes the manifest there.
+    #[test]
+    fn boot_parks_a_hole_from_its_consensus_db_manifest_and_heals_it() {
+        let (config, state_db) = make_test_config_and_db();
+        let cdb = make_test_consensus_db();
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 4);
+        let a5 = vec![sign_claim_rewards(5)];
+        let b5 = make_block(5, a5.clone());
+        persist_header_only_for_test(&state_db, &b5);
+        persist_commit_manifest(&cdb, 5, &encode_proposal_datum(&b5, true));
+
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let mut app = TorusApp::try_new_with_manifest_db(
+            state_db.clone(),
+            cdb.clone(),
+            &config,
+            None,
+            Some(mempool.clone()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(app.exec_next_height, Some(5), "parked at the hole");
+        match app.deferred_exec.get(&5).map(|e| &e.source) {
+            Some(ExecSource::Compact(c)) => assert_eq!(
+                c.native_action_hashes,
+                vec![torus_types::compute_action_hash(&a5[0])],
+                "the consensus-DB manifest names the bodies to pull"
+            ),
+            _ => panic!("the hole must park from its consensus-DB manifest as a Compact source"),
+        }
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+        app.replace_exec_tx(tx);
+        mempool.mirror_native_to_da(&a5).unwrap();
+        app.drain_exec_queue();
+        let msg = rx
+            .try_recv()
+            .expect("the hole heals from peer-delivered bodies");
+        assert_eq!(msg.torus_block.header.height, 5);
+        assert_eq!(app.exec_next_height, Some(6));
+        assert!(
+            wait_manifest_pruned(&cdb, 5),
+            "pruned from the consensus DB after dispatch"
+        );
+    }
+
+    /// T5.3 leftover rows: a manifest row left in the STATE DB (a pre-T5.3
+    /// run, or `TORUS_MANIFEST_IN_STATE_DB=1`) moves into the consensus DB at
+    /// boot and its height still parks for heal: never silently ignored.
+    #[test]
+    fn boot_moves_leftover_state_db_manifests_into_the_consensus_db() {
+        let (config, state_db) = make_test_config_and_db();
+        let cdb = make_test_consensus_db();
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 4);
+        let datum = bincode::serialize(&make_block(5, vec![])).unwrap();
+        persist_commit_manifest(&state_db, 5, &datum);
+
+        let app = TorusApp::try_new_with_manifest_db(
+            state_db.clone(),
+            cdb.clone(),
+            &config,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            app.exec_next_height,
+            Some(5),
+            "the leftover row still parks its height"
+        );
+        assert!(app.deferred_exec.contains_key(&5));
+        assert_eq!(load_commit_manifest(&cdb, 5), Some(datum));
+        assert!(
+            load_commit_manifest(&state_db, 5).is_none(),
+            "moved, not copied"
+        );
+    }
+
+    /// T5.3: the A/B switch's direction (consensus DB -> state DB) moves rows
+    /// too; a row already in the target is kept; a second move is a no-op.
+    #[test]
+    fn migrate_commit_manifests_moves_rows_and_keeps_existing_targets() {
+        let (_config, state_db) = make_test_config_and_db();
+        let cdb = make_test_consensus_db();
+        persist_commit_manifest(&cdb, 7, b"seven");
+        persist_commit_manifest(&cdb, 8, b"eight-from-cdb");
+        persist_commit_manifest(&state_db, 8, b"eight-in-target");
+        assert_eq!(migrate_commit_manifests(&cdb, &state_db), Ok(2));
+        assert_eq!(
+            load_commit_manifest(&state_db, 7).as_deref(),
+            Some(&b"seven"[..])
+        );
+        assert_eq!(
+            load_commit_manifest(&state_db, 8).as_deref(),
+            Some(&b"eight-in-target"[..])
+        );
+        assert!(manifest_heights_above(&cdb, 0).is_empty());
+        assert_eq!(
+            migrate_commit_manifests(&cdb, &state_db),
+            Ok(0),
+            "nothing left"
+        );
+    }
+
+    /// T5.3: the consensus-DB prune is its own write after the body write, so
+    /// a crash in between leaves rows of executed heights: boot drops them and
+    /// keeps (and parks) the rows above the applied height.
+    #[test]
+    fn boot_drops_consensus_db_manifests_of_executed_heights() {
+        let (config, state_db) = make_test_config_and_db();
+        let cdb = make_test_consensus_db();
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 4);
+        for h in 3..=5u64 {
+            persist_commit_manifest(
+                &cdb,
+                h,
+                &bincode::serialize(&make_block(h, vec![])).unwrap(),
+            );
+        }
+        let app = TorusApp::try_new_with_manifest_db(
+            state_db.clone(),
+            cdb.clone(),
+            &config,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(manifest_heights_above(&cdb, 0), vec![5]);
+        assert!(app.deferred_exec.contains_key(&5));
+    }
+
+    /// T5.3: a separate manifest DB without the manifest CF is a boot error,
+    /// not a silent per-commit write failure.
+    #[test]
+    fn manifest_db_without_the_manifest_cf_is_a_boot_error() {
+        let (config, state_db) = make_test_config_and_db();
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let old = rocksdb::DB::open_cf(&opts, scratch_db_dir("torus-old-cdb"), [CF_CONSENSUS_META])
+            .unwrap();
+        let err = TorusApp::try_new_with_manifest_db(
+            state_db,
+            StateDb::from_existing_db(old),
+            &config,
+            None,
+            None,
+            None,
+        )
+        .err()
+        .expect("boot must refuse");
+        assert!(err.contains("commit manifest DB"), "{err}");
+    }
+
+    #[test]
+    fn manifest_in_state_db_switch_parses_truthy_spellings() {
+        assert!(!parse_manifest_in_state_db(None));
+        for v in ["", "0", "false", "off", "no", "2"] {
+            assert!(!parse_manifest_in_state_db(Some(v)), "{v:?}");
+        }
+        for v in ["1", " 1 ", "true", "TRUE", "on", "yes"] {
+            assert!(parse_manifest_in_state_db(Some(v)), "{v:?}");
+        }
+    }
+
     #[test]
     fn dispatch_reports_durable_rows_after_persisting_them() {
         let (config, state_db) = make_test_config_and_db();
@@ -19209,7 +20956,7 @@ mod crash_recovery_tests {
         let msg = rx.try_recv().expect("height 5 must reach execution");
         assert_eq!(msg.torus_block.header.height, 5);
         assert_eq!(
-            msg.durable,
+            msg.settled_durable(),
             DurableRows {
                 header: true,
                 body: true
@@ -19218,14 +20965,17 @@ mod crash_recovery_tests {
         );
         let key = 5u64.to_be_bytes();
         assert!(
-            state_db.get_cf_raw(CF_BLOCK_HEADERS, &key).unwrap().is_some(),
-            "header row must already be durable when the message is sent"
+            state_db
+                .get_cf_raw(CF_BLOCK_HEADERS, &key)
+                .unwrap()
+                .is_some(),
+            "header row durable once the exec thread may execute the block"
         );
-        let body = load_replay_body(&state_db, 5).expect("body row must already be durable");
+        let body = load_replay_body(&state_db, 5).expect("body row durable before execution");
         assert_eq!(body.native_actions.len(), 1);
         assert!(
-            state_db.get_cf_raw(CF_COMMIT_MANIFEST, &key).unwrap().is_none(),
-            "commit manifest pruned at dispatch (same batch as the durable body)"
+            wait_manifest_pruned(&app.manifest_db, 5),
+            "commit manifest pruned after dispatch (consensus DB, after a state-WAL sync)"
         );
     }
 
@@ -20346,6 +22096,7 @@ mod crash_recovery_tests {
                 torus_block: b.clone(),
                 pending_slashes: vec![],
                 durable,
+                persist: None,
                 committed_unexecuted: 0,
             };
             if tx.send(msg).is_err() {
@@ -20632,6 +22383,7 @@ mod crash_recovery_tests {
                 torus_block: b.clone(),
                 pending_slashes: vec![],
                 durable,
+                persist: None,
                 committed_unexecuted,
             })
             .unwrap();
@@ -28388,6 +30140,7 @@ mod crash_recovery_tests {
         torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         let dir = scratch_db_dir("torus-r02-replay");
         let db = StateDb::open(&dir).expect("open test db");
+        list_test_markets(&db);
         torus_state::running_hash::configure_activation(&db, Some(1))
             .expect("configure running hash activation");
         (dir, db)
@@ -29108,6 +30861,92 @@ mod crash_recovery_tests {
         );
     }
 
+    /// T5.3 x item 7 option 0 (merge of main into T5.3): a fast-path EVM
+    /// block's header + body go through the commit-persist writer like any
+    /// other block. The exec thread's rows come from the writer's ticket (both
+    /// durable), so the EVM block still takes the pipelined path (not
+    /// `evm.serial_flag_on.nondurable`); its rows are in the state DB before
+    /// it executes; the writer hands each height to the manifest pruner; and
+    /// the state DB ends identical to the dispatch-time write.
+    #[test]
+    fn t53_evm_fast_path_block_rows_come_from_the_commit_persist_writer() {
+        let key = k256::ecdsa::SigningKey::from_slice(&[0x58; 32]).unwrap();
+        let (blocks, _b) = r02_evm_blocks(
+            &key,
+            alloy_primitives::TxKind::Create,
+            vec![0x60, 0x01, 0x60, 0x00, 0x55],
+        );
+        // Reference: the dispatch-time write (manifest in the state DB).
+        let (_c, db_ref) = make_test_config_and_db();
+        r02_fund(&db_ref, &key);
+        let mut ctx = pipeline_ctx(&db_ref, true, None);
+        ctx.evm_fast_path = true;
+        for b in &blocks {
+            dispatch_and_execute(&ctx, &db_ref, b);
+        }
+        assert!(ctx.pipeline_barrier());
+        drop(ctx);
+
+        let (_c, db) = make_test_config_and_db();
+        r02_fund(&db, &key);
+        let mut ctx = pipeline_ctx(&db, true, None);
+        ctx.evm_fast_path = true;
+        let (pruned_tx, pruned_rx) = std::sync::mpsc::channel();
+        let writer = CommitPersistWriter::spawn(
+            db.clone(),
+            ManifestPruner::detached(pruned_tx),
+            None,
+            HeaderHookSlot::default(),
+        );
+        for b in &blocks {
+            let h = b.header.height;
+            let rows = writer.submit(b.clone()).wait();
+            assert_eq!(
+                rows,
+                DurableRows {
+                    header: true,
+                    body: true
+                },
+                "the writer landed {h}"
+            );
+            assert!(
+                db.get_cf_raw(CF_BLOCK_HEADERS, &h.to_be_bytes())
+                    .unwrap()
+                    .is_some(),
+                "header of {h} before it executes"
+            );
+            assert!(
+                load_replay_body(&db, h).is_some(),
+                "body of {h} before it executes"
+            );
+            assert_eq!(
+                pruned_rx.recv_timeout(std::time::Duration::from_secs(10)),
+                Ok(h),
+                "{h} handed to the manifest pruner"
+            );
+            ctx.execute_committed_block_with(b, vec![], rows);
+        }
+        drop(writer);
+        assert!(ctx.pipeline_barrier());
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        {
+            let paths = ctx.test_paths.lock().unwrap();
+            assert_eq!(paths.get("block.pipelined.evm"), Some(&1), "{paths:?}");
+            assert_eq!(
+                paths.get("evm.serial_flag_on.nondurable"),
+                None,
+                "{paths:?}"
+            );
+        }
+        drop(ctx);
+        assert_eq!(r02_receipt_status(&db, 2), Some(true));
+        assert_dumps_equal(
+            &dump_all_cfs(&db_ref),
+            &dump_all_cfs(&db),
+            "writer path vs dispatch-time write",
+        );
+    }
+
     /// Item 7 option 0 (task 2.3): the serial EVM section's read of the EVM
     /// trie stale marker failing is a local fault: the block fail-stops
     /// (exec_failed, marker unchanged, nothing flushed) and the restart's
@@ -29362,6 +31201,7 @@ mod crash_recovery_tests {
                 .copied()
                 .filter(|cf| *cf != missing);
             let db = StateDb::from_existing_db(rocksdb::DB::open_cf(&opts, &dir, cfs).unwrap());
+            list_test_markets(&db);
             torus_state::running_hash::configure_activation(&db, Some(1))
                 .expect("configure running hash activation");
             evm_db_fault_setup(&db, &key);
@@ -29521,6 +31361,7 @@ mod crash_recovery_tests {
                 .copied()
                 .filter(|cf| *cf != CF_TX_HASH_TO_LOCATION);
             let db = StateDb::from_existing_db(rocksdb::DB::open_cf(&opts, &dir, cfs).unwrap());
+            list_test_markets(&db);
             torus_state::running_hash::configure_activation(&db, Some(1))
                 .expect("configure running hash activation");
             receipts_fault_setup(&db, &key);
@@ -31163,6 +33004,14 @@ mod crash_recovery_tests {
                 &U256::from(100 + slot),
             )
             .unwrap();
+        }
+        // Pre-testnet P0 merge: `make_test_config_and_db` lists markets
+        // 1..=8 with placeholder rows; the stream trades markets 1..=3 only
+        // (`C5_MARKETS`, listed by `c5_fixture`), so the extra rows are
+        // dropped and the DB is the one the golden was captured on.
+        for m in 4..=8u64 {
+            db.delete_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes())
+                .unwrap();
         }
         torus_state::incremental::ensure_trie_built(&db).unwrap();
         (config, db)
@@ -41079,7 +42928,7 @@ mod crash_recovery_tests {
         f()
     }
 
-    /// 8k L2.2 (`TORUS_SETTLE_NO_MERGE`, node-local, off by default): pass B
+    /// 8k L2.2 (`TORUS_SETTLE_NO_MERGE`, node-local, on by default): pass B
     /// keeps each market's position cache unmerged and the end-of-call flush
     /// writes them with the batch cache in the same key order. Over the 130
     /// P2 blocks with reduce-only places and cloids (fills, closes and flips
@@ -41096,8 +42945,8 @@ mod crash_recovery_tests {
             parse_settle_no_merge, settle_no_merge_fallbacks_on_this_thread,
             settle_no_merge_flushes_on_this_thread, with_settle_no_merge, BookMode,
         };
-        assert!(!parse_settle_no_merge(None), "off by default");
-        assert!(parse_settle_no_merge(Some("1")));
+        assert!(parse_settle_no_merge(None), "on by default");
+        assert!(!parse_settle_no_merge(Some("0")));
         let (blocks, _, cloid_places) = p2_blocks_with(true, true);
         assert!(!cloid_places.is_empty(), "the stream places cloids");
         let run = |on: bool| {
@@ -42554,6 +44403,11 @@ mod crash_recovery_tests {
         (ctx, mempool, db, blocks)
     }
 
+    /// How long the retention tests wait for the threads behind E (dropper,
+    /// merge, slice) to settle before counting. Polled: idle it takes ms; on a
+    /// loaded host those threads can be off-CPU for seconds.
+    const SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
     /// The retention gauges once a block is done: (live objects, live bytes,
     /// read views, oldest live age in blocks).
     fn retention_gauges(ctx: &ExecutionContext) -> (i64, i64, i64, i64) {
@@ -42664,8 +44518,11 @@ mod crash_recovery_tests {
             drop(view);
             // The dropper and the merge / slice threads run behind E: give
             // them a moment before counting (they never hold more than a
-            // block or two).
-            let deadline = Instant::now() + Duration::from_secs(5);
+            // block or two). The loop ends as soon as both hold (ms when
+            // idle); the deadline only bounds a real leak. 5 s was too short
+            // on a loaded host (seen: "h519: stats 1 live / 2 views vs 2 seen
+            // alive" under a full-workspace run, passes alone).
+            let deadline = Instant::now() + SETTLE_DEADLINE;
             let bounded = |s: &[u64], l: &[u64]| {
                 s.iter()
                     .chain(l.iter())
@@ -42757,7 +44614,7 @@ mod crash_recovery_tests {
         let (ctx, mempool, db, blocks) = retention_fixture(62, EVERY);
         let stats = ctx.ckpt.lock().unwrap().retention.clone();
         let settle = |want_views: i64| {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + SETTLE_DEADLINE;
             while stats.read_views() != want_views && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(2));
             }
@@ -43698,6 +45555,15 @@ mod crash_recovery_tests {
     fn da_gc_commit(app: &mut TorusApp, height: u64, actions: Vec<SignedNativeAction>) {
         let committed = committed_compact_block(&make_block(height, actions));
         app.on_committed_block(&committed, committed.hash);
+        da_gc_settle(app);
+    }
+
+    /// Wait for the DA body GC worker to finish every handed-off height.
+    fn da_gc_settle(app: &TorusApp) {
+        assert!(
+            app.da_gc_wait_idle(std::time::Duration::from_secs(60)),
+            "the DA body GC worker did not catch up"
+        );
     }
 
     fn da_has(mempool: &torus_mempool::Mempool, action: &SignedNativeAction) -> bool {
@@ -43760,9 +45626,9 @@ mod crash_recovery_tests {
                 da_gc_commit(&mut app, tip, vec![committed[tip as usize - 1].clone()]);
             }
             // Tip 5: row 1 is due, so the pass reads the tail: make it slow.
-            crate::da_gc::TEST_TAIL_DELAY.with(|d| d.set(Duration::from_millis(80)));
+            app.da_gc_hooks().tail_delay_ms.store(80, Ordering::SeqCst);
             da_gc_commit(&mut app, 5, vec![committed[4].clone()]);
-            crate::da_gc::TEST_TAIL_DELAY.with(|d| d.set(Duration::ZERO));
+            app.da_gc_hooks().tail_delay_ms.store(0, Ordering::SeqCst);
         });
         let lines: Vec<&str> = out
             .lines()
@@ -43874,10 +45740,11 @@ mod crash_recovery_tests {
     /// Two measurements over the same block stream (`RH4_BENCH_BLOCKS`
     /// blocks of `RH4_BENCH_ACTIONS` order batches of `RH4_BENCH_ORDERS`
     /// orders, bodies put into the DA store first as ingress does):
-    ///  1. `on_committed_block` with the GC off vs on (window 1128, the tree
-    ///     prune pointer moved as hotstuff's pruner moves it), interleaved,
-    ///     separate DBs laid out as the node's: the app's state DB, the DA
-    ///     store and the block tree in a consensus DB;
+    ///  1. `on_committed_block` (the consensus thread's cost) with the GC
+    ///     off vs inline (`TORUS_DA_GC_INLINE=1`) vs on its worker (window
+    ///     1128, the tree prune pointer moved as hotstuff's pruner moves
+    ///     it), interleaved, separate DBs laid out as the node's: the app's
+    ///     state DB, the DA store and the block tree in a consensus DB;
     ///  2. the GC pass's own steps on a bare store: the body presence
     ///     `MultiGet`, the prune-pointer read, and the pass (GC state read,
     ///     record, write; tip / tail / delete scan once rows are due).
@@ -43940,67 +45807,92 @@ mod crash_recovery_tests {
             )
         }
 
-        // 1. The commit dispatch, GC off vs on.
+        // 1. The commit dispatch, GC off vs inline (on the consensus thread,
+        // `TORUS_DA_GC_INLINE=1`) vs on the worker (the default): the time
+        // `on_committed_block` takes on the consensus thread.
         let consensus_db = || StateDb::open_consensus(&scratch_db_dir("rh4-bench")).unwrap();
         let (config, state_off) = make_test_config_and_db();
-        let (_, state_on) = make_test_config_and_db();
-        let (db_off, db_on) = (consensus_db(), consensus_db());
-        let app_for = |state: &StateDb, db: &StateDb, gc: bool| {
+        let (_, state_inline) = make_test_config_and_db();
+        let (_, state_worker) = make_test_config_and_db();
+        let (db_off, db_inline, db_worker) = (consensus_db(), consensus_db(), consensus_db());
+        // `gc`: None = off, Some(inline).
+        let app_for = |state: &StateDb, db: &StateDb, gc: Option<bool>| {
             let mempool = Arc::new(torus_mempool::Mempool::new(
                 db.clone(),
                 torus_mempool::MempoolConfig::default(),
             ));
+            let metrics = Arc::new(torus_telemetry::Metrics::new());
             let mut app = TorusApp::new(
                 state.clone(),
                 &config,
-                Some(Arc::new(torus_telemetry::Metrics::new())),
+                Some(metrics.clone()),
                 Some(mempool.clone()),
                 None,
             );
             let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(1024);
             app.replace_exec_tx(tx);
             std::thread::spawn(move || for _ in rx {});
-            if gc {
-                app.set_da_body_gc(Some(crate::da_gc::DaBodyGc {
-                    retention: window,
-                    block_tree_db: db.clone(),
-                }));
+            if let Some(inline) = gc {
+                app.set_da_body_gc_mode(
+                    Some(crate::da_gc::DaBodyGc {
+                        retention: window,
+                        block_tree_db: db.clone(),
+                    }),
+                    inline,
+                );
             }
-            (app, mempool)
+            (app, mempool, metrics)
         };
-        let (mut off, mp_off) = app_for(&state_off, &db_off, false);
-        let (mut on, mp_on) = app_for(&state_on, &db_on, true);
-        let mut t_off: [Vec<Duration>; 3] = Default::default();
-        let mut t_on: [Vec<Duration>; 3] = Default::default();
+        let mut arms = [
+            ("off", app_for(&state_off, &db_off, None), db_off.clone()),
+            ("inline", app_for(&state_inline, &db_inline, Some(true)), db_inline.clone()),
+            ("worker", app_for(&state_worker, &db_worker, Some(false)), db_worker.clone()),
+        ];
+        let mut times: [[Vec<Duration>; 3]; 3] = Default::default();
         for h in 1..=blocks {
             let actions = actions_at(h);
-            mp_off.mirror_native_to_da(&actions).unwrap();
-            mp_on.mirror_native_to_da(&actions).unwrap();
-            set_pointer(&db_on, h);
+            for (_, (_, mempool, _), db) in &arms {
+                mempool.mirror_native_to_da(&actions).unwrap();
+                set_pointer(db, h);
+            }
             let committed = committed_compact_block(&make_block(h, actions));
-            let run = |app: &mut TorusApp| {
+            // Rotate the order so no arm always runs first.
+            for k in 0..3 {
+                let arm = (k + h as usize) % 3;
+                let app = &mut arms[arm].1 .0;
                 let t = Instant::now();
                 app.on_committed_block(&committed, committed.hash);
-                t.elapsed()
-            };
-            // Alternate the order so neither arm always runs second.
-            let (a, b) = if h % 2 == 0 {
-                let a = run(&mut off);
-                (a, run(&mut on))
-            } else {
-                let b = run(&mut on);
-                (run(&mut off), b)
-            };
-            t_off[segment(h)].push(a);
-            t_on[segment(h)].push(b);
+                times[arm][segment(h)].push(t.elapsed());
+            }
         }
         println!(
             "RH4 early cost: {blocks} blocks x {per_block} actions x {orders} orders, \
              window {window}"
         );
         for i in 0..3 {
-            println!("on_committed_block {}: off {}", names[i], summary(&mut t_off[i]));
-            println!("on_committed_block {}: on  {}", names[i], summary(&mut t_on[i]));
+            for (arm, (name, _, _)) in arms.iter().enumerate() {
+                println!(
+                    "on_committed_block {}: {name:<6} {}",
+                    names[i],
+                    summary(&mut times[arm][i])
+                );
+            }
+        }
+        // The worker kept up: its passes and the consensus-side handoff.
+        let (_, (worker_app, _, _), _) = &arms[2];
+        assert!(worker_app.da_gc_wait_idle(Duration::from_secs(600)));
+        for (name, (_, _, m), _) in &arms[1..] {
+            let mean = |hist: &str| {
+                let (sum, count) = hist_sum_count(m, hist);
+                (sum / count.max(1) as f64 * 1e6, count)
+            };
+            let (handoff, n) = mean("torus_da_gc_handoff_seconds");
+            let (pass, passes) = mean("torus_da_gc_seconds");
+            println!(
+                "GC {name}: consensus-thread handoff mean {handoff:.1}us (n={n}); \
+                 pass mean {pass:.1}us (n={passes}, {})",
+                if *name == "worker" { "on the worker" } else { "on the consensus thread" }
+            );
         }
 
         // 2. The pass's own steps on a bare store in a consensus DB (the DA
@@ -44108,6 +46000,7 @@ mod crash_recovery_tests {
             .mirror_native_to_da(std::slice::from_ref(&actions[2]))
             .unwrap();
         app.drain_exec_queue();
+        da_gc_settle(&app);
         assert_eq!(app.exec_next_height, Some(11));
         for (i, action) in actions.iter().enumerate() {
             let at = i as u64 + 1;
@@ -44156,6 +46049,7 @@ mod crash_recovery_tests {
         let commit = |app: &mut TorusApp, block: &TorusBlock| {
             let committed = committed_compact_block(block);
             app.on_committed_block(&committed, committed.hash);
+            da_gc_settle(app);
         };
         {
             let (mut app, mempool, _metrics, _rx) = da_gc_app(&state_db, &config, Some(4));
@@ -44325,6 +46219,7 @@ mod crash_recovery_tests {
             Data::new(vec![Datum::new(datum)]),
         );
         app.on_committed_block(&committed, committed.hash);
+        da_gc_settle(&app);
         assert_eq!(app.exec_next_height, Some(7), "height 6 dispatched");
         for tip in 7..=10u64 {
             assert!(
@@ -44438,7 +46333,7 @@ mod crash_recovery_tests {
     }
 
     /// Every `reason` label of `torus_da_gc_held_passes`.
-    const DA_GC_HOLD_LABELS: [&str; 9] = [
+    const DA_GC_HOLD_LABELS: [&str; 10] = [
         "gap",
         "backfilling",
         "unrecorded",
@@ -44448,6 +46343,7 @@ mod crash_recovery_tests {
         "tip_unreadable",
         "tail_unreadable",
         "store_error",
+        "fence_full",
     ];
 
     /// `torus_da_gc_held_passes{reason}`.
@@ -44571,6 +46467,7 @@ mod crash_recovery_tests {
         for block in [&blocks[1], &next] {
             let committed = committed_compact_block(block);
             app.on_committed_block(&committed, committed.hash);
+            da_gc_settle(&app);
         }
         assert!(!app.is_exec_failed(), "{what}");
         assert_eq!(app.exec_next_height, Some(1229), "{what}: 1228 dispatched");
@@ -44598,7 +46495,7 @@ mod crash_recovery_tests {
     fn da_gc_unfillable_gap_holds_deletion_and_resumes_once_filled() {
         const W: u64 = 155;
         let (config, state_db) = make_test_config_and_db();
-        let (app, mempool, metrics, _rx) = da_gc_app(&state_db, &config, Some(W));
+        let (mut app, mempool, metrics, _rx) = da_gc_app(&state_db, &config, Some(W));
         // keep_from 113: row 100 may go once its window ends (100 + 155 = 255).
         set_tree_frontier(&state_db, 240);
         let x = sign_claim_rewards(1);
@@ -44606,13 +46503,15 @@ mod crash_recovery_tests {
         mempool
             .mirror_native_to_da(std::slice::from_ref(&x))
             .unwrap();
-        app.gc_da_bodies_after_dispatch(100, std::slice::from_ref(&x), &[hx], true);
+        app.gc_da_bodies_after_dispatch(100, std::slice::from_ref(&x), vec![hx], true, None);
         for h in 101..=250 {
-            app.gc_da_bodies_after_dispatch(h, &[], &[], true);
+            app.gc_da_bodies_after_dispatch(h, &[], vec![], true, None);
         }
+        da_gc_settle(&app);
         assert!(da_has(&mempool, &x), "inside the window at 250");
         // 251..=260: dispatched before a crash, never recorded, not in the tree.
-        app.gc_da_bodies_after_dispatch(261, &[], &[], true);
+        app.gc_da_bodies_after_dispatch(261, &[], vec![], true, None);
+        da_gc_settle(&app);
         assert!(
             da_has(&mempool, &x),
             "row 100 is due, but the bookkeeping is behind"
@@ -44622,7 +46521,8 @@ mod crash_recovery_tests {
         let mut gap: Vec<TorusBlock> = (251..=261).map(|h| high_block(h, vec![])).collect();
         link_blocks(&mut gap);
         tree_commit_chain(&state_db, &gap);
-        app.gc_da_bodies_after_dispatch(262, &[], &[], true);
+        app.gc_da_bodies_after_dispatch(262, &[], vec![], true, None);
+        da_gc_settle(&app);
         assert!(!da_has(&mempool, &x), "back-filled 251..=261, row 100 went");
         assert_eq!(held_total(&metrics), 1);
         assert_eq!(metrics.da_bodies_gc_deleted.get(), 1);
@@ -44762,6 +46662,7 @@ mod crash_recovery_tests {
         for block in &blocks[1..] {
             let committed = committed_compact_block(block);
             app.on_committed_block(&committed, committed.hash);
+            da_gc_settle(&app);
         }
         assert!(!app.is_exec_failed());
         assert_eq!(app.exec_next_height, Some(1229), "1228 dispatched");
@@ -44811,6 +46712,7 @@ mod crash_recovery_tests {
         }));
         let committed = committed_compact_block(&blocks[1]);
         app.on_committed_block(&committed, committed.hash);
+        da_gc_settle(&app);
         assert_eq!(app.exec_next_height, Some(1229), "1228 dispatched");
         assert!(
             store.contains(&hx.0).unwrap(),
@@ -44818,6 +46720,7 @@ mod crash_recovery_tests {
         );
         let committed = committed_compact_block(&blocks[2]);
         app.on_committed_block(&committed, committed.hash);
+        da_gc_settle(&app);
         assert!(!app.is_exec_failed());
         assert_eq!(
             app.exec_next_height,
@@ -44840,19 +46743,38 @@ mod crash_recovery_tests {
     /// Its record must not be "no actions": the cursor stays at 1228 and
     /// nothing goes; the next pass back-fills 1228 from the tree, pin
     /// included.
+    ///
+    /// RH4 x T5.3: the same when the T5.3 `CommitPersistWriter` makes the
+    /// failed write (`writer`): the GC learns of the failure from the
+    /// writer's ticket, not at dispatch. And x, lost from the DA store
+    /// before 1228 dispatched, is restored from the block's actions either
+    /// way (the body row it would otherwise reload never landed).
     #[test]
     fn da_gc_failed_body_write_leaves_the_cursor_behind() {
+        for writer in [false, true] {
+            da_gc_failed_body_write(writer);
+        }
+    }
+
+    fn da_gc_failed_body_write(writer: bool) {
         use hotstuff_rs::hotstuff::types::PhaseCertificate;
         use hotstuff_rs::types::data_types::BlockHeight;
         const W: u64 = 1128;
+        let what = format!("writer {writer}");
         let (config, scratch) = make_test_config_and_db();
         let x = sign_claim_rewards(1);
         let hx = torus_types::compute_action_hash(&x);
-        let (consensus, store, _) =
-            da_gc_store_with_row(&scratch, "torus-da-gc-ro", &x, 99, 1227, W);
+        let (consensus, store, _) = da_gc_store_with_row(
+            &scratch,
+            &format!("torus-da-gc-ro-{writer}"),
+            &x,
+            99,
+            1227,
+            W,
+        );
         let mut blocks = vec![high_block(1227, vec![]), high_block(1228, vec![x.clone()])];
         link_blocks(&mut blocks);
-        let state_dir = scratch_db_dir("torus-da-gc-ro-state");
+        let state_dir = scratch_db_dir(&format!("torus-da-gc-ro-state-{writer}"));
         {
             let state = StateDb::open(&state_dir).unwrap();
             persist_committed_block_durably(&state, &blocks[0]);
@@ -44863,7 +46785,7 @@ mod crash_recovery_tests {
         let state_db = StateDb::open_read_only(&state_dir).unwrap();
         assert!(
             !persist_committed_block_durably(&state_db, &blocks[1]).body,
-            "the state DB rejects the body write"
+            "{what}: the state DB rejects the body write"
         );
         let mempool = Arc::new(torus_mempool::Mempool::with_da_store(
             state_db.clone(),
@@ -44878,10 +46800,20 @@ mod crash_recovery_tests {
             Some(mempool.clone()),
             None,
         );
+        if writer {
+            let (pruned_tx, _pruned_rx) = std::sync::mpsc::channel();
+            app.commit_persist = Some(CommitPersistWriter::spawn(
+                state_db.clone(),
+                ManifestPruner::detached(pruned_tx),
+                None,
+                app.header_hook.clone(),
+            ));
+        }
         app.set_da_body_gc(Some(crate::da_gc::DaBodyGc {
             retention: W,
             block_tree_db: consensus.clone(),
         }));
+        store.remove(&[hx]).unwrap();
         // A full datum (a proposal this node validated): the body is in hand.
         let datum = encode_proposal_datum(&blocks[1], false);
         let committed = hotstuff_rs::types::block::Block::new(
@@ -44891,22 +46823,25 @@ mod crash_recovery_tests {
             Data::new(vec![Datum::new(datum)]),
         );
         app.on_committed_block(&committed, committed.hash);
-        assert_eq!(app.exec_next_height, Some(1229), "1228 dispatched");
-        assert!(tree_serves(&consensus, 1228));
+        da_gc_settle(&app);
+        assert_eq!(app.exec_next_height, Some(1229), "{what}: 1228 dispatched");
+        assert!(tree_serves(&consensus, 1228), "{what}");
         assert!(
             store.contains(&hx.0).unwrap(),
-            "1228's record is unknown (its body write failed): nothing goes"
+            "{what}: restored from the block's actions; 1228's record is unknown (its body \
+             write failed): nothing goes"
         );
         assert_eq!(
             (held_passes(&metrics, "unrecorded"), held_total(&metrics)),
             (1, 1),
-            "the held pass is counted, by its reason"
+            "{what}: the held pass is counted, by its reason"
         );
         // The next pass back-fills 1228 from the tree: x moves to row 1228.
-        app.gc_da_bodies_after_dispatch(1229, &[], &[], true);
-        assert!(store.contains(&hx.0).unwrap(), "pinned by 1228");
-        assert_eq!(metrics.da_bodies_gc_deleted.get(), 0);
-        assert_eq!(held_total(&metrics), 1);
+        app.gc_da_bodies_after_dispatch(1229, &[], vec![], true, None);
+        da_gc_settle(&app);
+        assert!(store.contains(&hx.0).unwrap(), "{what}: pinned by 1228");
+        assert_eq!(metrics.da_bodies_gc_deleted.get(), 0, "{what}");
+        assert_eq!(held_total(&metrics), 1, "{what}");
     }
 
     /// The tree's uncommitted tail, as the GC reads it: every block above
@@ -44955,6 +46890,45 @@ mod crash_recovery_tests {
         assert!(history.uncommitted_hashes().is_err());
     }
 
+    /// RH4 GC worker: a pass reads the committed tip, then (at its first due
+    /// row) the tail. Off the consensus thread a block can commit between the
+    /// two reads; the tail is read from the tip the pass read, so that block
+    /// (no longer above the current tip) and its descendants still pin.
+    #[test]
+    fn da_gc_tail_is_read_from_the_tip_the_pass_read() {
+        use std::collections::HashSet;
+        use torus_state::DaGcHistory;
+        let (_config, db) = make_test_config_and_db();
+        let noop = |_: u64, _: &[torus_types::B256], _: Option<&[SignedNativeAction]>| {};
+        let history = crate::da_gc::BlockTreeHistory::new(&db, &noop);
+        let [a, b, c] = [1u64, 2, 3].map(sign_claim_rewards);
+        let hash = torus_types::compute_action_hash;
+        let mut chain = vec![
+            high_block(1, vec![a.clone()]),
+            high_block(2, vec![b.clone()]),
+            high_block(3, vec![c.clone()]),
+        ];
+        link_blocks(&mut chain);
+        let h1 = tree_insert(&db, 0, None, tree_data(&chain[0], true));
+        tree_commit(&db, &h1);
+        let h2 = tree_insert(&db, 1, Some(h1), tree_data(&chain[1], true));
+        tree_insert(&db, 2, Some(h2), tree_data(&chain[2], true));
+        assert_eq!(history.committed_through().unwrap(), Some(1), "the pass reads tip 1");
+        // 2 commits before the pass reads the tail.
+        tree_commit(&db, &h2);
+        let set = |v: Vec<torus_types::B256>| v.into_iter().collect::<HashSet<_>>();
+        assert_eq!(
+            set(history.uncommitted_hashes().unwrap()),
+            set(vec![hash(&b), hash(&c)]),
+            "2 committed since the tip read: still read"
+        );
+        assert_eq!(
+            set(crate::da_gc::uncommitted_native_hashes_in_tree(&db).unwrap()),
+            set(vec![hash(&c)]),
+            "from the current tip: 3 only"
+        );
+    }
+
     /// Codex r3 / claude-review r4 P2 (torus issue 282de5bb; port of
     /// `/tmp/rh4-claude-r4`): the tree holds UNCOMMITTED Torus 1229 (compact)
     /// above committed 1228; 1229 re-includes x, whose row (100) is due at
@@ -44997,6 +46971,7 @@ mod crash_recovery_tests {
         app.set_da_body_gc(Some(gc()));
         let committed = committed_compact_block(&blocks[1]);
         app.on_committed_block(&committed, committed.hash);
+        da_gc_settle(&app);
         assert_eq!(app.exec_next_height, Some(1229), "1228 dispatched");
         assert!(tree_serves_block(&consensus, &h1229), "the tree still holds 1229");
         assert!(
@@ -45023,6 +46998,7 @@ mod crash_recovery_tests {
         tree_commit(&consensus, &h1229);
         let committed = committed_compact_block(&blocks[2]);
         app.on_committed_block(&committed, committed.hash);
+        da_gc_settle(&app);
         assert!(!app.is_exec_failed());
         assert!(
             load_replay_body(&state_db, 1229).is_some(),
@@ -45068,6 +47044,7 @@ mod crash_recovery_tests {
         }));
         let committed = committed_compact_block(&blocks[1]);
         app.on_committed_block(&committed, committed.hash);
+        da_gc_settle(&app);
         assert_eq!(app.exec_next_height, Some(1229), "1228 dispatched");
         assert!(store.contains(&hx.0).unwrap(), "an unreadable tail holds");
         assert_eq!(
@@ -45075,5 +47052,916 @@ mod crash_recovery_tests {
             (1, 1)
         );
         assert_eq!(metrics.da_bodies_gc_deleted.get(), 0);
+    }
+
+    // ---- RH4 GC worker: the pass off the consensus thread ----
+
+    /// A GC app over `state_db` (its own block tree too) in `inline` mode or
+    /// on the worker, with the tree's prune pointer left as the test sets it.
+    fn da_gc_app_mode(
+        state_db: &StateDb,
+        config: &ChainConfig,
+        retention: u64,
+        inline: bool,
+    ) -> DaGcFixture {
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut app = TorusApp::new(
+            state_db.clone(),
+            config,
+            Some(metrics.clone()),
+            Some(mempool.clone()),
+            None,
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4096);
+        app.replace_exec_tx(tx);
+        app.set_da_body_gc_mode(
+            Some(crate::da_gc::DaBodyGc {
+                retention,
+                block_tree_db: state_db.clone(),
+            }),
+            inline,
+        );
+        (app, mempool, metrics, rx)
+    }
+
+    /// `(sum, count)` of the histogram `name` in `metrics`' exposition.
+    fn hist_sum_count(metrics: &torus_telemetry::Metrics, name: &str) -> (f64, u64) {
+        let text = metrics.encode();
+        let value = |suffix: &str| -> f64 {
+            let key = format!("{name}_{suffix} ");
+            text.lines()
+                .find_map(|l| l.strip_prefix(&key))
+                .unwrap_or_else(|| panic!("{key} missing"))
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        (value("sum"), value("count") as u64)
+    }
+
+    /// The durable GC state `(frontier, cursor, hold)`, `None` = none written.
+    fn da_gc_state(db: &StateDb) -> Option<(u64, u64, u64)> {
+        let raw = db
+            .get_cf_raw(torus_state::cf::CF_NATIVE_PENDING, b"\xffda-gc-state")
+            .unwrap()?;
+        let w = |i: usize| u64::from_be_bytes(raw[8 * i..8 * i + 8].try_into().unwrap());
+        assert_eq!(raw.len(), 24, "a cursor state");
+        Some((w(0), w(1), w(2)))
+    }
+
+    /// Test 1 (RH4 GC worker): with the GC on, the consensus thread's part of
+    /// a commit does no GC DB write and no body lookup. The worker is held:
+    /// six commits return (one of them references a body the DA store lost,
+    /// which the restore would put back), yet no pass ran, no GC state was
+    /// written, the lost body is still missing and no due body went. Every
+    /// commit was timed as a handoff. Released, the worker runs the six
+    /// passes, none on the consensus (test) thread: the body is restored, the
+    /// cursor covers 1..=6 and the due rows went. Inline mode, the reference,
+    /// runs its passes on the calling thread.
+    #[test]
+    fn da_gc_consensus_side_does_no_db_write_and_no_body_lookup() {
+        let (config, state_db) = make_test_config_and_db();
+        set_tree_frontier(&state_db, u64::MAX);
+        let (mut app, mempool, metrics, _rx) = da_gc_app_mode(&state_db, &config, 4, false);
+        let me = std::thread::current().id();
+        let actions: Vec<_> = (1..=6u64).map(sign_claim_rewards).collect();
+        // Height 3's body is lost (its block arrives as a full datum).
+        for (i, a) in actions.iter().enumerate() {
+            if i != 2 {
+                mempool.mirror_native_to_da(std::slice::from_ref(a)).unwrap();
+            }
+        }
+        let mut blocks: Vec<TorusBlock> = (1..=6u64)
+            .map(|h| high_block(h, vec![actions[h as usize - 1].clone()]))
+            .collect();
+        link_blocks(&mut blocks);
+        app.da_gc_hooks().pause();
+        for block in &blocks {
+            let committed = if block.header.height == 3 {
+                committed_full_block(block)
+            } else {
+                committed_compact_block(block)
+            };
+            app.on_committed_block(&committed, committed.hash);
+        }
+        assert_eq!(app.exec_next_height, Some(7), "all six dispatched");
+        let hooks = app.da_gc_hooks().clone();
+        assert_eq!(hooks.passes.load(Ordering::SeqCst), 0, "no pass ran");
+        assert_eq!(da_gc_state(&state_db), None, "no GC write");
+        assert!(!da_has(&mempool, &actions[2]), "no restore on the consensus thread");
+        assert!(da_has(&mempool, &actions[0]), "due at 5, but nothing ran");
+        assert_eq!(hist_sum_count(&metrics, "torus_da_gc_handoff_seconds").1, 6);
+        hooks.resume();
+        da_gc_settle(&app);
+        assert_eq!(hooks.passes.load(Ordering::SeqCst), 6);
+        assert!(
+            !hooks.pass_threads.lock().unwrap().contains(&me),
+            "a pass ran on the consensus thread"
+        );
+        assert!(da_has(&mempool, &actions[2]), "restored by the worker");
+        assert_eq!(da_gc_state(&state_db).map(|s| s.1), Some(7), "cursor past 6");
+        for (i, a) in actions.iter().enumerate() {
+            let h = i as u64 + 1;
+            assert_eq!(da_has(&mempool, a), h + 4 > 6, "body of {h}");
+        }
+
+        // Inline (TORUS_DA_GC_INLINE=1): the same pass, on this thread.
+        let (config, state_db) = make_test_config_and_db();
+        set_tree_frontier(&state_db, u64::MAX);
+        let (mut app, mempool, _metrics, _rx) = da_gc_app_mode(&state_db, &config, 4, true);
+        mempool.mirror_native_to_da(&actions[..1]).unwrap();
+        let committed = committed_compact_block(&blocks[0]);
+        app.on_committed_block(&committed, committed.hash);
+        assert_eq!(da_gc_state(&state_db).map(|s| s.1), Some(2), "recorded inline");
+        assert!(app.da_gc_hooks().pass_threads.lock().unwrap().contains(&me));
+    }
+
+    /// Test 4 (RH4 GC worker): a stalled worker never blocks consensus. With
+    /// the worker held, `DA_GC_QUEUE_CAP + 40` commits all return; the queue
+    /// fills, the rest are coalesced (counted), and the depth and lag gauges
+    /// show it. Released, the worker back-fills the coalesced heights from
+    /// the block tree: the cursor covers every dispatched height, no pass
+    /// held for a gap.
+    #[test]
+    fn da_gc_stalled_worker_never_blocks_consensus() {
+        use crate::da_gc_worker::DA_GC_QUEUE_CAP;
+        let n = DA_GC_QUEUE_CAP as u64 + 40;
+        let (config, state_db) = make_test_config_and_db();
+        let mut blocks: Vec<TorusBlock> = (1..=n)
+            .map(|h| high_block(h, vec![sign_claim_rewards(h)]))
+            .collect();
+        link_blocks(&mut blocks);
+        tree_commit_chain(&state_db, &blocks);
+        let (mut app, mempool, metrics, _rx) = da_gc_app_mode(&state_db, &config, 1128, false);
+        for block in &blocks {
+            mempool.mirror_native_to_da(&block.native_actions).unwrap();
+        }
+        app.da_gc_hooks().pause();
+        let t = std::time::Instant::now();
+        for block in &blocks {
+            let committed = committed_compact_block(block);
+            app.on_committed_block(&committed, committed.hash);
+        }
+        let took = t.elapsed();
+        assert_eq!(app.exec_next_height, Some(n + 1), "every height dispatched");
+        let coalesced = metrics.da_gc_coalesced_heights.get();
+        // The worker drained the first few jobs into its batch before it
+        // stopped at the gate; the queue then filled.
+        assert!(
+            coalesced > 0 && coalesced <= n - DA_GC_QUEUE_CAP as u64,
+            "coalesced {coalesced} of {n}"
+        );
+        assert_eq!(metrics.da_gc_queue_depth.get(), DA_GC_QUEUE_CAP as i64, "full");
+        assert_eq!(metrics.da_gc_lag_heights.get(), n as i64);
+        assert_eq!(app.da_gc_hooks().passes.load(Ordering::SeqCst), 0);
+        assert!(took < std::time::Duration::from_secs(60), "{took:?}");
+        app.da_gc_hooks().resume();
+        da_gc_settle(&app);
+        assert_eq!(
+            da_gc_state(&state_db).map(|s| s.1),
+            Some(n + 1),
+            "every height recorded, the coalesced ones from the tree"
+        );
+        assert_eq!(held_passes(&metrics, "gap"), 0);
+        assert_eq!(metrics.da_gc_lag_heights.get(), 0);
+        assert_eq!(metrics.da_gc_queue_depth.get(), 0);
+    }
+
+    /// One scripted block stream through the DA body GC (`inline` or the
+    /// worker), with a real block tree: one uncommitted tail block ahead of
+    /// every dispatch, the tree's prune pointer moved as its pruner would
+    /// (tree retention [`EQ_TREE`]: row `h` is due at the pass of `h + 138`),
+    /// re-inclusions (in the window: 60 re-includes 40; by the tail block as
+    /// the row comes due: 151 re-includes 12; after the body went: 160
+    /// re-includes 15, fetched again), an abandoned fork (a sibling of 172
+    /// re-including 33 as its row comes due at 171), an app restart (120)
+    /// and two crashes (worker: 181..=183 handed off, never processed;
+    /// 191..=193 handed off, the worker stops after one job; inline: plain
+    /// restarts). Every block enters the tree as validation puts it there:
+    /// its hashes pinned, its bodies present. `lag`: the worker is also held
+    /// over 150..=154. Returns, per dispatched height, the stream bodies
+    /// still present; checks at every step that no body a block the tree
+    /// still serves (window and margin) or a tail block references is gone.
+    const EQ_TREE: u64 = 10;
+    const EQ_TIP: u64 = 200;
+
+    fn da_gc_stream(inline: bool, lag: bool) -> Vec<std::collections::BTreeSet<u64>> {
+        use std::collections::BTreeSet;
+        const W: u64 = 12;
+        let (config, state_db) = make_test_config_and_db();
+        // Body `i` is action `sign_claim_rewards(i)` (signed once: signing
+        // dominates a debug run otherwise).
+        let signed: Vec<SignedNativeAction> = (0..=EQ_TIP).map(sign_claim_rewards).collect();
+        let hashes: Vec<torus_types::B256> =
+            signed.iter().map(torus_types::compute_action_hash).collect();
+        let body = |i: u64| signed[i as usize].clone();
+        let block_bodies = |h: u64| -> Vec<u64> {
+            match h {
+                60 => vec![60, 40],
+                151 => vec![151, 12],
+                160 => vec![160, 15],
+                _ => vec![h],
+            }
+        };
+        let mut blocks: Vec<TorusBlock> = (1..=EQ_TIP)
+            .map(|h| high_block(h, block_bodies(h).into_iter().map(body).collect()))
+            .collect();
+        link_blocks(&mut blocks);
+        let mut fork = high_block(172, vec![body(33)]);
+        fork.header.timestamp += 7;
+        let new_app = |db: &StateDb| da_gc_app_mode(db, &config, W, inline);
+        let (mut app, mut mempool, _metrics, rx) = new_app(&state_db);
+        let mut exec_rx = vec![rx];
+        let mut tree: Vec<CryptoHash> = Vec::new();
+        let mut snapshots = Vec::new();
+        // A validator pins a block's hashes, then finds (or fetches) its
+        // bodies, before the block enters the tree.
+        let insert = |db: &StateDb,
+                      mempool: &torus_mempool::Mempool,
+                      parent: Option<CryptoHash>,
+                      block: &TorusBlock|
+         -> CryptoHash {
+            let hashes: Vec<_> = block
+                .native_actions
+                .iter()
+                .map(torus_types::compute_action_hash)
+                .collect();
+            mempool.pin_native_da(block.header.height, &hashes);
+            mempool.mirror_native_to_da(&block.native_actions).unwrap();
+            tree_insert(db, block.header.height - 1, parent, tree_data(block, true))
+        };
+        tree.push(insert(&state_db, &mempool, None, &blocks[0]));
+        for h in 1..=EQ_TIP {
+            // The tail: h + 1 enters the tree before h dispatches.
+            if h < EQ_TIP {
+                let parent = tree.last().copied();
+                tree.push(insert(&state_db, &mempool, parent, &blocks[h as usize]));
+            }
+            if h == 171 {
+                insert(&state_db, &mempool, Some(tree[170]), &fork);
+            }
+            tree_commit(&state_db, &tree[h as usize - 1]);
+            if let Some(p) = (h - 1).checked_sub(EQ_TREE).filter(|&p| p > 0) {
+                set_tree_frontier(&state_db, p);
+            }
+            let held = !inline
+                && ((181..=183).contains(&h)
+                    || (191..=193).contains(&h)
+                    || (lag && (150..=154).contains(&h)));
+            if held && matches!(h, 150 | 181 | 191) {
+                app.da_gc_hooks().pause();
+            }
+            let committed = committed_compact_block(&blocks[h as usize - 1]);
+            app.on_committed_block(&committed, committed.hash);
+            assert!(!app.is_exec_failed(), "height {h}");
+            if !inline && lag && h == 155 {
+                app.da_gc_hooks().resume();
+            }
+            if !inline && h == 193 {
+                // The worker runs one job (191), then stops.
+                let hooks = app.da_gc_hooks().clone();
+                let before = hooks.passes.load(Ordering::SeqCst);
+                hooks.pause_after(1);
+                let t = std::time::Instant::now();
+                while hooks.passes.load(Ordering::SeqCst) == before {
+                    assert!(t.elapsed() < std::time::Duration::from_secs(60));
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            if !inline && matches!(h, 183 | 193) {
+                app.da_gc_kill_worker();
+            }
+            if !held {
+                da_gc_settle(&app);
+            }
+            if matches!(h, 120 | 183 | 193) {
+                write_native_applied_height(&state_db, h);
+                drop(app);
+                let fresh = new_app(&state_db);
+                app = fresh.0;
+                mempool = fresh.1;
+                exec_rx.push(fresh.3);
+            }
+            let missing = mempool.native_da_missing(&hashes[1..]);
+            let present: BTreeSet<u64> = (1..=EQ_TIP)
+                .filter(|&i| !missing.contains(&hashes[i as usize]))
+                .collect();
+            // Row b is due at the pass of b + 138 (the tree bound; the
+            // window, 12, is shorter): until then, and for the tail block,
+            // every body its block references stays.
+            for b in 1..=(h + 1).min(EQ_TIP) {
+                if b + 138 > h {
+                    for i in block_bodies(b) {
+                        assert!(
+                            present.contains(&i),
+                            "tip {h} (inline {inline}, lag {lag}): body {i} of block {b} is gone"
+                        );
+                    }
+                }
+            }
+            snapshots.push(present);
+        }
+        snapshots
+    }
+
+    /// Test 2 (RH4 GC worker): over the scripted stream the worker deletes
+    /// exactly what the inline pass deletes at every durable point (each
+    /// height settled), a subset while it is stopped by a crash, and the same
+    /// again once the restarted node back-filled the lost records; no body a
+    /// served block references is ever deleted (checked inside the stream).
+    /// Held over five heights it deletes a subset of the inline set at every
+    /// height and the same set once caught up.
+    #[test]
+    fn da_gc_worker_deletes_what_the_inline_pass_deletes() {
+        let inline = da_gc_stream(true, false);
+        let worker = da_gc_stream(false, false);
+        let lagged = da_gc_stream(false, true);
+        for (i, ((a, b), c)) in inline.iter().zip(&worker).zip(&lagged).enumerate() {
+            let h = i as u64 + 1;
+            if (181..=183).contains(&h) || (191..=193).contains(&h) {
+                assert!(a.is_subset(b), "tip {h}: the stopped worker deleted more");
+            } else {
+                assert_eq!(a, b, "tip {h}: worker vs inline");
+            }
+            assert!(a.is_subset(c), "tip {h}: the lagging worker deleted more");
+            if !(150..=154).contains(&h) && !(181..=183).contains(&h) && !(191..=193).contains(&h) {
+                assert_eq!(a, c, "tip {h}: the lagging worker caught up");
+            }
+        }
+        // Deletions happened; the re-inclusions and both pins held.
+        let last = inline.last().unwrap();
+        assert!(!last.contains(&1) && !last.contains(&40) && !last.contains(&62));
+        assert!(last.contains(&33), "pinned by the abandoned fork, for good");
+        assert!(last.contains(&12) && last.contains(&15), "inside 151's / 160's window");
+        assert!(last.contains(&63), "row 63 is due only at 201");
+    }
+
+    /// Test 3 (RH4 GC worker, crash boundaries): 1226 re-includes x, whose
+    /// row (100) comes due at 1228. The node crashes with 1226 and 1227
+    /// handed to the worker but not processed (`run_first` 0), or after the
+    /// worker processed 1226 only (`run_first` 1, mid-batch). The restarted
+    /// node's next pass (1228) back-fills the lost records from the block
+    /// tree, the re-inclusion pin included, before deleting: x stays (the
+    /// tree serves 1226), and nothing holds.
+    #[test]
+    fn da_gc_crash_with_queued_handoffs_keeps_a_reincluded_body() {
+        for run_first in [0u64, 1] {
+            const W: u64 = 1128;
+            let what = format!("run_first {run_first}");
+            let (config, state_db) = make_test_config_and_db();
+            let x = sign_claim_rewards(1);
+            let hx = torus_types::compute_action_hash(&x);
+            let prefix = format!("torus-da-gc-queued-{run_first}");
+            let (consensus, store, mempool) =
+                da_gc_store_with_row(&state_db, &prefix, &x, 100, 1225, W);
+            let mut blocks = vec![
+                high_block(1225, vec![]),
+                high_block(1226, vec![x.clone()]),
+                high_block(1227, vec![]),
+                high_block(1228, vec![]),
+            ];
+            link_blocks(&mut blocks);
+            persist_committed_block_durably(&state_db, &blocks[0]);
+            write_native_applied_height(&state_db, 1225);
+            tree_commit_chain(&consensus, &blocks[1..]);
+            set_tree_frontier(&consensus, 228);
+            let gc = || crate::da_gc::DaBodyGc {
+                retention: W,
+                block_tree_db: consensus.clone(),
+            };
+            let metrics = Arc::new(torus_telemetry::Metrics::new());
+            let new_app = |mempool: Arc<torus_mempool::Mempool>| {
+                let mut app = TorusApp::new(
+                    state_db.clone(),
+                    &config,
+                    Some(metrics.clone()),
+                    Some(mempool),
+                    None,
+                );
+                app.set_da_body_gc_mode(Some(gc()), false);
+                app
+            };
+            let mut app = new_app(mempool);
+            app.da_gc_hooks().pause();
+            for block in &blocks[1..3] {
+                let committed = committed_compact_block(block);
+                app.on_committed_block(&committed, committed.hash);
+            }
+            assert_eq!(app.exec_next_height, Some(1228), "{what}");
+            let hooks = app.da_gc_hooks().clone();
+            if run_first > 0 {
+                hooks.pause_after(run_first);
+                let t = std::time::Instant::now();
+                while hooks.passes.load(Ordering::SeqCst) < run_first {
+                    assert!(t.elapsed() < std::time::Duration::from_secs(60), "{what}");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            app.da_gc_kill_worker();
+            assert_eq!(
+                da_gc_state(&consensus).map(|s| s.1),
+                Some(1226 + run_first),
+                "{what}: the records the worker landed before the crash"
+            );
+            // Before the crash: with `run_first` 1 the worker's pass of 1226
+            // may have held (1227 committed above it).
+            let held_before = held_total(&metrics);
+            drop(app);
+            // Restart (the DA store survives in the consensus DB).
+            let mempool = Arc::new(torus_mempool::Mempool::with_da_store(
+                state_db.clone(),
+                store.clone(),
+                torus_mempool::MempoolConfig::default(),
+            ));
+            let mut app = new_app(mempool);
+            assert!(!app.is_exec_failed(), "{what}");
+            let committed = committed_compact_block(&blocks[3]);
+            app.on_committed_block(&committed, committed.hash);
+            da_gc_settle(&app);
+            assert_eq!(app.exec_next_height, Some(1229), "{what}: 1228 dispatched");
+            assert!(tree_serves(&consensus, 1226), "{what}");
+            assert!(
+                store.contains(&hx.0).unwrap(),
+                "{what}: the tree serves 1226, its re-included body must stay"
+            );
+            assert_eq!(da_gc_state(&consensus).map(|s| s.1), Some(1229), "{what}");
+            assert_eq!(
+                held_total(&metrics),
+                held_before,
+                "{what}: back-filled, the restarted pass held nothing"
+            );
+        }
+    }
+
+    /// The cursor of the durable DA body GC state in `db`.
+    fn da_gc_cursor(db: &StateDb) -> Option<u64> {
+        da_gc_state(db).map(|s| s.1)
+    }
+
+    /// `app`'s off-thread commit-persist writer, as the T5.3 node runs it.
+    fn spawn_commit_persist_writer(app: &mut TorusApp) {
+        let (pruned_tx, _pruned_rx) = std::sync::mpsc::channel();
+        app.commit_persist = Some(CommitPersistWriter::spawn(
+            app.state_db.clone(),
+            ManifestPruner::detached(pruned_tx),
+            None,
+            app.header_hook.clone(),
+        ));
+    }
+
+    /// RH4 x T5.3 (the GC worker): a dispatched height reaches the GC only
+    /// once the `CommitPersistWriter` wrote its body row. Height 6
+    /// re-includes x, whose body aged out at tip 5; the restore reloads it
+    /// from 6's body row. The writer holds 6's write: the worker records
+    /// nothing for 6 (the cursor stays at 6), however long it waits. Once the
+    /// write lands the pass restores x from the row and records 6, and x
+    /// stays for 6's whole window. Run on the handoff alone the pass would
+    /// record 6 with its row still unwritten and its restore failing: x
+    /// would be gone for good.
+    #[test]
+    fn da_gc_worker_records_a_height_only_once_its_commit_persist_write_landed() {
+        let (config, state_db) = make_test_config_and_db();
+        set_tree_frontier(&state_db, u64::MAX);
+        let (mut app, mempool, _metrics, _rx) = da_gc_app_mode(&state_db, &config, 4, false);
+        spawn_commit_persist_writer(&mut app);
+        let x = sign_claim_rewards(1);
+        mempool
+            .mirror_native_to_da(std::slice::from_ref(&x))
+            .unwrap();
+        da_gc_commit(&mut app, 1, vec![x.clone()]);
+        for tip in 2..=5u64 {
+            da_gc_commit(&mut app, tip, vec![]);
+        }
+        assert!(!da_has(&mempool, &x), "row 1 aged out at tip 5");
+        assert_eq!(da_gc_cursor(&state_db), Some(6));
+        // 6's write is slow (queued behind a checkpoint batch): held.
+        app.commit_persist = Some(CommitPersistWriter::held());
+        let committed = committed_full_block(&make_block(6, vec![x.clone()]));
+        app.on_committed_block(&committed, committed.hash);
+        assert_eq!(app.exec_next_height, Some(7), "height 6 dispatched");
+        let t = std::time::Instant::now();
+        while t.elapsed() < std::time::Duration::from_millis(500) {
+            assert_eq!(
+                da_gc_cursor(&state_db),
+                Some(6),
+                "height 6 recorded before its body row was written"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(load_replay_body(&state_db, 6).is_none(), "6's write is held");
+        let (pruned_tx, _pruned_rx) = std::sync::mpsc::channel();
+        app.commit_persist
+            .as_mut()
+            .unwrap()
+            .release(state_db.clone(), ManifestPruner::detached(pruned_tx));
+        da_gc_settle(&app);
+        assert!(load_replay_body(&state_db, 6).is_some(), "6's write landed");
+        assert_eq!(da_gc_cursor(&state_db), Some(7), "6 recorded");
+        for tip in 7..=10u64 {
+            assert!(
+                da_has(&mempool, &x),
+                "tip {}: restored from 6's row, block 6 still needs it",
+                tip - 1
+            );
+            da_gc_commit(&mut app, tip, vec![]);
+        }
+        assert!(!da_has(&mempool, &x), "block 6's window ended at tip 10");
+    }
+
+    /// RH4 x T5.3 (`TORUS_DA_GC_INLINE=1`): the inline pass also runs only
+    /// once the writer wrote the height's rows (each write lands 300 ms after
+    /// its submit here): when the commit returns, the height is recorded and
+    /// its body row is on disk, never the record alone.
+    #[test]
+    fn da_gc_inline_pass_waits_for_the_commit_persist_write() {
+        let (config, state_db) = make_test_config_and_db();
+        set_tree_frontier(&state_db, u64::MAX);
+        let (mut app, mempool, _metrics, _rx) = da_gc_app_mode(&state_db, &config, 4, true);
+        let (pruned_tx, _pruned_rx) = std::sync::mpsc::channel();
+        app.commit_persist = Some(CommitPersistWriter::delayed(
+            state_db.clone(),
+            ManifestPruner::detached(pruned_tx),
+            std::time::Duration::from_millis(300),
+        ));
+        let x = sign_claim_rewards(1);
+        mempool
+            .mirror_native_to_da(std::slice::from_ref(&x))
+            .unwrap();
+        for (h, actions) in [(1u64, vec![x.clone()]), (2, vec![])] {
+            let committed = committed_compact_block(&make_block(h, actions));
+            app.on_committed_block(&committed, committed.hash);
+            assert_eq!(da_gc_cursor(&state_db), Some(h + 1), "height {h} recorded");
+            assert!(
+                load_replay_body(&state_db, h).is_some(),
+                "height {h} recorded before its body row was written"
+            );
+        }
+    }
+
+    /// RH4 x T5.3, the two crash windows around the off-thread write, in the
+    /// production layout (manifest, block tree and DA store in the consensus
+    /// DB; the `CommitPersistWriter` writes 1226's rows; x, re-included by
+    /// 1226, has its old row at 100, due at 1228):
+    ///
+    /// - `write_landed` false: the crash comes before the writer wrote 1226.
+    ///   The GC (waiting on the write) recorded nothing for 1226. The restart
+    ///   parks 1226 from its manifest, heals it from the DA store, and its
+    ///   pass (after the healed write) records the pin.
+    /// - `write_landed` true: the write landed, the crash came before the GC
+    ///   recorded 1226. The restart replays 1226 from its rows and the next
+    ///   pass back-fills 1226's record (the pin) from the tree.
+    ///
+    /// Either way x survives 1228's pass (row 100 due), the cursor reaches
+    /// 1229, and no pass holds for a gap or an unknown record.
+    #[test]
+    fn da_gc_with_the_commit_persist_writer_survives_a_crash_in_either_window() {
+        for write_landed in [false, true] {
+            const W: u64 = 1128;
+            let what = format!("write landed before the crash: {write_landed}");
+            let (config, state_db) = make_test_config_and_db();
+            let x = sign_claim_rewards(1);
+            let hx = torus_types::compute_action_hash(&x);
+            let prefix = format!("torus-da-gc-writer-crash-{write_landed}");
+            let (consensus, store, mempool) =
+                da_gc_store_with_row(&state_db, &prefix, &x, 100, 1225, W);
+            let mut blocks = vec![
+                high_block(1225, vec![]),
+                high_block(1226, vec![x.clone()]),
+                high_block(1227, vec![]),
+                high_block(1228, vec![]),
+            ];
+            link_blocks(&mut blocks);
+            persist_committed_block_durably(&state_db, &blocks[0]);
+            write_native_applied_height(&state_db, 1225);
+            tree_commit_chain(&consensus, &blocks[1..]);
+            set_tree_frontier(&consensus, 228);
+            let metrics = Arc::new(torus_telemetry::Metrics::new());
+            let boot = |mempool: Arc<torus_mempool::Mempool>| {
+                let mut app = TorusApp::try_new_with_manifest_db(
+                    state_db.clone(),
+                    consensus.clone(),
+                    &config,
+                    Some(metrics.clone()),
+                    Some(mempool),
+                    None,
+                )
+                .unwrap();
+                assert!(app.commit_persist.is_some(), "the off-thread writer");
+                app.set_da_body_gc_mode(
+                    Some(crate::da_gc::DaBodyGc {
+                        retention: W,
+                        block_tree_db: consensus.clone(),
+                    }),
+                    false,
+                );
+                app
+            };
+            let mut app = boot(mempool);
+            if write_landed {
+                app.da_gc_hooks().pause();
+            } else {
+                app.commit_persist = Some(CommitPersistWriter::held());
+            }
+            let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+            app.replace_exec_tx(tx);
+            let committed = committed_compact_block(&blocks[1]);
+            app.on_committed_block(&committed, committed.hash);
+            let msg = rx.try_recv().expect("1226 dispatched");
+            if write_landed {
+                assert!(msg.settled_durable().body, "{what}: 1226's rows landed");
+            } else {
+                let t = std::time::Instant::now();
+                while t.elapsed() < std::time::Duration::from_millis(500) {
+                    assert_eq!(
+                        da_gc_cursor(&consensus),
+                        Some(1226),
+                        "{what}: 1226 recorded before its body row was written"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            app.da_gc_kill_worker();
+            assert_eq!(da_gc_cursor(&consensus), Some(1226), "{what}: no record");
+            drop(app); // the crash: a held write is dropped unwritten
+            drop(msg);
+            assert_eq!(
+                load_replay_body(&state_db, 1226).is_some(),
+                write_landed,
+                "{what}"
+            );
+
+            let mempool = Arc::new(torus_mempool::Mempool::with_da_store(
+                state_db.clone(),
+                store.clone(),
+                torus_mempool::MempoolConfig::default(),
+            ));
+            let mut app = boot(mempool);
+            assert!(!app.is_exec_failed(), "{what}");
+            if write_landed {
+                assert_eq!(
+                    read_native_applied_height(&state_db),
+                    Some(1226),
+                    "{what}: 1226 replayed from its rows"
+                );
+            } else {
+                assert_eq!(
+                    app.exec_next_height,
+                    Some(1226),
+                    "{what}: 1226 parked from its manifest"
+                );
+                app.drain_exec_queue();
+            }
+            for block in &blocks[2..] {
+                let committed = committed_compact_block(block);
+                app.on_committed_block(&committed, committed.hash);
+            }
+            da_gc_settle(&app);
+            assert!(!app.is_exec_failed(), "{what}");
+            assert_eq!(app.exec_next_height, Some(1229), "{what}: 1228 dispatched");
+            assert!(load_replay_body(&state_db, 1226).is_some(), "{what}");
+            assert!(
+                store.contains(&hx.0).unwrap(),
+                "{what}: the tree serves 1226, its re-included body must stay"
+            );
+            assert_eq!(da_gc_cursor(&consensus), Some(1229), "{what}");
+            assert_eq!(
+                (
+                    held_passes(&metrics, "gap"),
+                    held_passes(&metrics, "unrecorded")
+                ),
+                (0, 0),
+                "{what}"
+            );
+        }
+    }
+
+    /// Test 3 (RH4 GC worker, the fence at the delete write): the worker is
+    /// stopped right before the write that deletes x (row 1, due at 5), its
+    /// bodies marked. A validation of a block re-including x, racing that
+    /// write, pins x and treats it as missing (`MissingData`): the body may
+    /// be gone the moment the batch lands, and it is. Once fetched again it
+    /// stays. And a body a check pinned BEFORE the pass (y, row 2, due at 6)
+    /// is kept: the row goes, the body stays, counted.
+    #[test]
+    fn da_gc_fence_orders_body_checks_against_the_delete_write() {
+        let (config, state_db) = make_test_config_and_db();
+        set_tree_frontier(&state_db, u64::MAX);
+        let (mut app, mempool, metrics, _rx) = da_gc_app_mode(&state_db, &config, 4, false);
+        let (x, y) = (sign_claim_rewards(1), sign_claim_rewards(2));
+        let (hx, hy) = (
+            torus_types::compute_action_hash(&x),
+            torus_types::compute_action_hash(&y),
+        );
+        mempool.mirror_native_to_da(&[x.clone(), y.clone()]).unwrap();
+        da_gc_commit(&mut app, 1, vec![x.clone()]);
+        da_gc_commit(&mut app, 2, vec![y.clone()]);
+        for h in 3..=4 {
+            da_gc_commit(&mut app, h, vec![]);
+        }
+        // A check for a block at 9 that references y, before y is due.
+        assert!(mempool.pin_native_da(9, &[hy]).is_empty());
+        let (at_write_tx, at_write) = std::sync::mpsc::channel::<()>();
+        let (go, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = std::sync::Mutex::new(go_rx);
+        *app.da_gc_hooks().before_delete.lock().unwrap() = Some(Box::new(move || {
+            at_write_tx.send(()).unwrap();
+            go_rx.lock().unwrap().recv().unwrap();
+        }));
+        let committed = committed_compact_block(&make_block(5, vec![]));
+        app.on_committed_block(&committed, committed.hash);
+        at_write
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the worker reaches the delete write");
+        assert_eq!(mempool.da_gc_fence().deleting(), 1, "x is being deleted");
+        // A validation racing the write: x counts as missing.
+        let mut reinclude = make_block(6, vec![x.clone()]);
+        reinclude.header.timestamp += 1;
+        let datum = encode_proposal_datum(&reinclude, true);
+        let hash = CryptoHash::new(TorusApp::hash_datum(&datum));
+        assert!(matches!(
+            app.validate_datum(&datum, &hash),
+            ValidateBlockResponse::MissingData
+        ));
+        assert!(da_has(&mempool, &x), "not deleted yet");
+        go.send(()).unwrap();
+        da_gc_settle(&app);
+        *app.da_gc_hooks().before_delete.lock().unwrap() = None;
+        assert!(!da_has(&mempool, &x), "the marked delete landed");
+        assert_eq!(mempool.da_gc_fence().deleting(), 0);
+        assert_eq!(mempool.native_da_missing(&[hx]), vec![hx], "the checker sees it missing");
+        // Fetched again: pinned, it stays.
+        mempool.mirror_native_to_da(std::slice::from_ref(&x)).unwrap();
+        da_gc_commit(&mut app, 6, vec![]);
+        assert!(da_has(&mempool, &x));
+        assert!(da_has(&mempool, &y), "pinned before its pass: kept");
+        assert_eq!(metrics.da_gc_fence_kept.get(), 1, "y");
+        assert_eq!(metrics.da_bodies_gc_deleted.get(), 1, "x only");
+    }
+
+    /// RH4 GC worker (Codex adversarial, s132): `TORUS_ASYNC_VALIDATE`'s
+    /// speculative decode pins a datum's bodies before any ancestry check, at
+    /// whatever height the datum claims. A height beyond the fence's window
+    /// above the committed tip is refused: the check reads its bodies as
+    /// missing (`MissingData`, nothing cached, the sync path decides), the
+    /// fence stores nothing (2000 rising far-future datums re-pinning one
+    /// hash leave it empty), and the refusals are exported. A datum in the
+    /// window pins and validates as before.
+    #[test]
+    fn da_gc_fence_refuses_speculative_far_future_pins() {
+        use torus_state::da_gc_fence::DA_GC_FENCE_HEIGHT_WINDOW as WINDOW;
+        let (config, state_db) = make_test_config_and_db();
+        set_tree_frontier(&state_db, u64::MAX);
+        let (mut app, mempool, metrics, _rx) = da_gc_app_mode(&state_db, &config, 4, false);
+        da_gc_commit(&mut app, 1, vec![]);
+        let x = sign_claim_rewards(1);
+        let hx = torus_types::compute_action_hash(&x);
+        mempool.mirror_native_to_da(std::slice::from_ref(&x)).unwrap();
+        let fence = mempool.da_gc_fence().clone();
+        let speculate = |height: u64, compact: bool| {
+            let datum = encode_proposal_datum(&high_block(height, vec![x.clone()]), compact);
+            TorusApp::decode_proposal_and_ensure_durable_core(
+                Some(&mempool),
+                None,
+                None,
+                &Some(metrics.clone()),
+                4,
+                &datum,
+                |_, _| {},
+            )
+            .map(|_| ())
+            .map_err(|e| matches!(e, ValidateBlockResponse::MissingData))
+        };
+        for i in 0..2_000u64 {
+            let r = speculate(2 + WINDOW + i * 1_000, i % 2 == 0);
+            assert_eq!(r, Err(true), "datum {i}: refused pin reads as missing");
+        }
+        assert_eq!(fence.metadata_entries(), 0, "nothing stored");
+        assert!(!fence.is_full());
+        assert_eq!(fence.refused_pins(), 2_000);
+        assert!(da_has(&mempool, &x), "the body itself is untouched");
+        // In the window: pinned and valid.
+        assert!(speculate(1 + WINDOW, true).is_ok());
+        assert!(fence.is_pinned(&hx));
+        da_gc_commit(&mut app, 2, vec![]);
+        assert_eq!(metrics.da_gc_fence_refused_pins.get(), 2_000, "exported");
+    }
+
+    /// RH4 GC worker (Codex adversarial, s132): over its cap the fence cannot
+    /// say which bodies a check is about to read, so every pass HOLDS
+    /// (`held_passes{reason="fence_full"}`): x's row and body stay. Once the
+    /// worker passed the highest height pinned meanwhile (9), the next pass
+    /// deletes x.
+    #[test]
+    fn da_gc_full_fence_holds_the_pass() {
+        let (config, state_db) = make_test_config_and_db();
+        set_tree_frontier(&state_db, u64::MAX);
+        let (mut app, mempool, metrics, _rx) = da_gc_app_mode(&state_db, &config, 4, false);
+        let x = sign_claim_rewards(1);
+        mempool
+            .mirror_native_to_da(std::slice::from_ref(&x))
+            .unwrap();
+        da_gc_commit(&mut app, 1, vec![x.clone()]);
+        for h in 2..=4 {
+            da_gc_commit(&mut app, h, vec![]);
+        }
+        let fence = mempool.da_gc_fence().clone();
+        fence.set_max_pins(1);
+        let (a, b) = (sign_claim_rewards(7), sign_claim_rewards(8));
+        let busy = fence.pin(
+            9,
+            &[
+                torus_types::compute_action_hash(&a),
+                torus_types::compute_action_hash(&b),
+            ],
+        );
+        assert!(busy.is_empty());
+        assert!(fence.is_full());
+        for h in 5..=9 {
+            da_gc_commit(&mut app, h, vec![]);
+            assert!(da_has(&mempool, &x), "x due at 5, held at {h}");
+        }
+        assert_eq!(held_passes(&metrics, "fence_full"), 5);
+        assert!(!fence.is_full(), "the worker passed 9");
+        da_gc_commit(&mut app, 10, vec![]);
+        assert!(!da_has(&mempool, &x), "deleted once the fence drained");
+        assert_eq!(held_passes(&metrics, "fence_full"), 5);
+    }
+
+    /// RH4 GC worker (Codex adversarial, s132; probe `/tmp/rh4-wakeup-proof`):
+    /// a height coalesced on a full queue is published after the full
+    /// `try_send`. Scheduled so the worker drains the queue, finds nothing
+    /// coalesced and goes to wait BEFORE that publication, the height must
+    /// still be passed without another dispatch (the old receive slept until
+    /// the next dispatch: `processed=2 pending=3`).
+    #[test]
+    fn da_gc_coalesced_height_wakes_a_waiting_worker() {
+        use std::sync::mpsc::channel;
+        use std::sync::Mutex;
+        let secs = std::time::Duration::from_secs;
+        let (config, state_db) = make_test_config_and_db();
+        let mut blocks: Vec<TorusBlock> = (1..=3u64)
+            .map(|h| high_block(h, vec![sign_claim_rewards(h)]))
+            .collect();
+        link_blocks(&mut blocks);
+        tree_commit_chain(&state_db, &blocks);
+        let (mut app, mempool, metrics, _rx) = da_gc_app_mode(&state_db, &config, 1128, false);
+        for block in &blocks {
+            mempool.mirror_native_to_da(&block.native_actions).unwrap();
+        }
+        let hooks = app.da_gc_hooks().clone();
+        hooks.queue_cap.store(1, Ordering::SeqCst);
+        let (wait_tx, wait_rx) = channel::<u64>();
+        let wait_tx = Mutex::new(wait_tx);
+        let weak = Arc::downgrade(&hooks);
+        *hooks.before_wait.lock().unwrap() = Some(Box::new(move || {
+            let passes = weak
+                .upgrade()
+                .map_or(0, |h| h.passes.load(Ordering::SeqCst));
+            let _ = wait_tx.lock().unwrap().send(passes);
+        }));
+        let (full_tx, full_rx) = channel::<()>();
+        let (go_tx, go_rx) = channel::<()>();
+        let (full_tx, go_rx) = (Mutex::new(full_tx), Mutex::new(go_rx));
+        *hooks.on_full.lock().unwrap() = Some(Box::new(move || {
+            full_tx.lock().unwrap().send(()).unwrap();
+            go_rx.lock().unwrap().recv().unwrap();
+        }));
+        hooks.pause();
+        let commit = |app: &mut TorusApp, block: &TorusBlock| {
+            let committed = committed_compact_block(block);
+            app.on_committed_block(&committed, committed.hash);
+        };
+        commit(&mut app, &blocks[0]);
+        assert!(hooks.wait_gated(secs(60)), "the worker holds job 1");
+        commit(&mut app, &blocks[1]);
+        std::thread::scope(|s| {
+            let third = s.spawn(|| commit(&mut app, &blocks[2]));
+            full_rx
+                .recv_timeout(secs(60))
+                .expect("height 3 finds the queue full");
+            hooks.resume();
+            // The worker runs 1 and 2, then goes to wait for more.
+            while wait_rx.recv_timeout(secs(60)).expect("the worker waits") < 2 {}
+            go_tx.send(()).unwrap();
+            third.join().unwrap();
+        });
+        *hooks.on_full.lock().unwrap() = None;
+        *hooks.before_wait.lock().unwrap() = None;
+        assert_eq!(metrics.da_gc_coalesced_heights.get(), 1);
+        assert!(
+            app.da_gc_wait_idle(secs(10)),
+            "coalesced height 3 left pending: {} passes",
+            hooks.passes.load(Ordering::SeqCst)
+        );
+        assert_eq!(hooks.passes.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            da_gc_state(&state_db).map(|s| s.1),
+            Some(4),
+            "1..=3 recorded"
+        );
     }
 }

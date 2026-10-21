@@ -22,6 +22,13 @@ const KECCAK_EMPTY: B256 = B256::new([
 fn open_test_db() -> (tempfile::TempDir, StateDb) {
     let dir = tempfile::tempdir().expect("create temp dir");
     let db = StateDb::open(dir.path()).expect("open db");
+    // Pre-testnet P0: orders need a listed market (no implicit books).
+    // Placeholder rows: tick / lot 1 and no margin config, as the old
+    // implicit book had.
+    for m in 1..=64u64 {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed")
+            .expect("list market");
+    }
     (dir, db)
 }
 

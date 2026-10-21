@@ -55,6 +55,7 @@ fn hex_addr(a: &Address) -> String {
 #[test]
 fn test_full_order_lifecycle() {
     let h = TestHarness::new();
+    h.list_markets(1..=64);
     let mut ctx = h.exec_context(1);
     let trader_a = TestHarness::addr(1);
     let trader_b = TestHarness::addr(2);
@@ -103,6 +104,7 @@ fn test_full_order_lifecycle() {
 #[test]
 fn test_partial_fill() {
     let h = TestHarness::new();
+    h.list_markets(1..=64);
     let mut ctx = h.exec_context(1);
     let buyer = TestHarness::addr(1);
     let seller = TestHarness::addr(2);
@@ -154,6 +156,7 @@ fn test_partial_fill() {
 #[test]
 fn test_cancel_order() {
     let h = TestHarness::new();
+    h.list_markets(1..=64);
     let mut ctx = h.exec_context(1);
     let trader = TestHarness::addr(1);
     let market = 1u64;
@@ -195,6 +198,7 @@ fn test_cancel_order() {
 #[test]
 fn test_multiple_markets() {
     let h = TestHarness::new();
+    h.list_markets(1..=64);
     let mut ctx = h.exec_context(1);
     let trader_a = TestHarness::addr(1);
     let trader_b = TestHarness::addr(2);
@@ -239,6 +243,7 @@ fn test_multiple_markets() {
 #[test]
 fn test_batch_execution() {
     let h = TestHarness::new();
+    h.list_markets(1..=64);
     let mut ctx = h.exec_context(1);
     let trader_a = TestHarness::addr(1);
     let trader_b = TestHarness::addr(2);
@@ -282,6 +287,7 @@ fn test_batch_execution() {
 #[tokio::test]
 async fn test_rpc_position_consistency() {
     let h = TestHarness::new();
+    h.list_markets(1..=64);
     let mut ctx = h.exec_context(1);
     let trader_a = TestHarness::addr(1);
     let trader_b = TestHarness::addr(2);
@@ -332,6 +338,7 @@ async fn test_rpc_position_consistency() {
 #[tokio::test]
 async fn test_rpc_balances_consistency() {
     let h = TestHarness::new();
+    h.list_markets(1..=64);
     let trader = TestHarness::addr(3);
 
     h.fund_native(&trader, TestHarness::fp(5000));

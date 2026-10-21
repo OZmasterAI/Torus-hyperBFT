@@ -84,8 +84,13 @@ impl StateBackend for FailBal {
 
 fn fail_ctx() -> (tempfile::TempDir, FailBal, NativeExecContext<FailBal>) {
     let dir = tempfile::tempdir().unwrap();
+    let inner = StateDb::open(dir.path()).unwrap();
+    // Pre-testnet P0: orders need a listed market (placeholder rows).
+    for m in 1..=64u64 {
+        inner.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+    }
     let backend = FailBal {
-        inner: StateDb::open(dir.path()).unwrap(),
+        inner,
         armed: Arc::default(),
         hits: Arc::default(),
     };
@@ -748,6 +753,11 @@ fn stitch_records_the_scan_candidates_on_real_phase2_runs() {
     for round in 0..80u64 {
         let dir = tempfile::tempdir().unwrap();
         let db = StateDb::open(dir.path()).unwrap();
+        // Pre-testnet P0: orders need a listed market (placeholder rows,
+        // tick / lot 1, as the old implicit book).
+        for m in 1..=64u64 {
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+        }
         let mut ctx = NativeExecContext::new(
             db,
             9,
@@ -1158,8 +1168,13 @@ fn execute_batch_routes_top_ups_by_the_flag() {
     };
     let run = |fast: bool| {
         let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        // Pre-testnet P0: orders need a listed market (placeholder rows).
+        for m in 1..=64u64 {
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+        }
         let mut ctx = NativeExecContext::new(
-            StateDb::open(dir.path()).unwrap(),
+            db,
             1,
             1_000,
             0,

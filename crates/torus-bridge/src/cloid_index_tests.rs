@@ -186,6 +186,11 @@ fn one_book_probe_per_check_at_300_markets() {
         let what = format!("{path:?}");
         let dir = tempfile::tempdir().unwrap();
         let db = StateDb::open(dir.path()).unwrap();
+        // Pre-testnet P0: orders need a listed market (placeholder rows,
+        // tick / lot 1, as the old implicit book).
+        for m in 1..=512u64 {
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+        }
         let mut ctx = ctx_at(&db, 1, BookMode::Classic, None);
         fund(&ctx, 1);
         fund(&ctx, 2);
@@ -263,6 +268,11 @@ fn a_cloid_in_an_untouched_market_is_found_after_a_reload() {
             let what = format!("{mode:?} resident={resident}");
             let dir = tempfile::tempdir().unwrap();
             let db = StateDb::open(dir.path()).unwrap();
+            // Pre-testnet P0: orders need a listed market (placeholder rows,
+            // tick / lot 1, as the old implicit book).
+            for m in 1..=512u64 {
+                db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+            }
             let mut holder = ResidentBooks::default();
             let mut ctx = ctx_at(&db, 1, mode, resident.then_some(&mut holder));
             fund(&ctx, 1);
@@ -412,6 +422,11 @@ fn the_carried_index_equals_a_rebuild_after_every_block() {
             let what = format!("{mode:?} {path:?}");
             let dir = tempfile::tempdir().unwrap();
             let db = StateDb::open(dir.path()).unwrap();
+            // Pre-testnet P0: orders need a listed market (placeholder rows,
+            // tick / lot 1, as the old implicit book).
+            for m in 1..=512u64 {
+                db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+            }
             let mut holder = ResidentBooks::default();
             let ctx = ctx_at(&db, 1, mode, Some(&mut holder));
             for n in 1..=4 {
@@ -485,6 +500,11 @@ fn run_traffic(
 ) -> (Vec<Vec<(bool, FailureReason)>>, B256) {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
+    // Pre-testnet P0: orders need a listed market (placeholder rows,
+    // tick / lot 1, as the old implicit book).
+    for m in 1..=512u64 {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+    }
     let mut holder = ResidentBooks::default();
     let ctx = ctx_at(&db, 1, mode, None);
     fund(&ctx, 1);

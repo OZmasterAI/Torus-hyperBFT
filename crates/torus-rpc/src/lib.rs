@@ -828,34 +828,162 @@ where
 ///
 /// FIX 9 (EVM-FIND-14): Previous implementation scanned from block 0 upward (O(N)).
 /// Now uses a reverse iterator to find the last key in O(1).
+///
+/// Infallible: any read failure reads as 0 (fresh DB). Callers that must not
+/// mistake a read failure for an empty chain use [`try_find_latest_height`].
 pub fn find_latest_height(state: &StateDb) -> u64 {
-    let Ok(cf) = state.cf_handle(CF_BLOCK_HEADERS) else {
-        return 0;
-    };
+    try_find_latest_height(state).unwrap_or(0)
+}
+
+/// Bound on the non-height entries [`try_find_latest_height`] skips at the
+/// end of CF_BLOCK_HEADERS; today there is exactly one (the pruner's meta key).
+const MAX_TRAILING_META_KEYS: usize = 8;
+
+/// [`find_latest_height`] that reports failure instead of reading it as 0:
+/// a missing CF_BLOCK_HEADERS handle, an iterator error, or more than
+/// [`MAX_TRAILING_META_KEYS`] non-height entries at the end of the CF (the
+/// tip cannot be located) are `Err`. `Ok(0)` means the CF holds no height key
+/// (fresh DB). Used by the archive-upgrade probe, where 0 would let the
+/// retention safeguard pass (Codex P2, s131).
+pub fn try_find_latest_height(state: &StateDb) -> Result<u64, String> {
+    let cf = state
+        .cf_handle(CF_BLOCK_HEADERS)
+        .map_err(|e| format!("open {CF_BLOCK_HEADERS}: {e}"))?;
     // Non-height entries (e.g. the pruner's `__prune_meta__` key) sort AFTER
     // the 8-byte big-endian height keys, so skip past them instead of bailing
     // to 0 — on a pruned DB the meta key is the last entry and bailing froze
-    // eth_blockNumber at 0 and short-circuited on_commit_block (s334). The
-    // take(8) bounds the scan; today there is exactly one meta key.
-    for entry in state
-        .inner()
-        .iterator_cf(cf, rocksdb::IteratorMode::End)
-        .take(8)
-    {
+    // eth_blockNumber at 0 and short-circuited on_commit_block (s334).
+    let mut skipped = 0usize;
+    for entry in state.inner().iterator_cf(cf, rocksdb::IteratorMode::End) {
         match entry {
             Ok((key, _)) if key.len() == 8 => {
-                return u64::from_be_bytes(key[..8].try_into().unwrap());
+                return Ok(u64::from_be_bytes(key[..8].try_into().unwrap()));
             }
-            Ok(_) => continue,
-            Err(_) => return 0,
+            Ok(_) => {
+                skipped += 1;
+                if skipped >= MAX_TRAILING_META_KEYS {
+                    return Err(format!(
+                        "no height key among the last {MAX_TRAILING_META_KEYS} entries of \
+                         {CF_BLOCK_HEADERS}"
+                    ));
+                }
+            }
+            Err(e) => return Err(format!("iterate {CF_BLOCK_HEADERS}: {e}")),
         }
     }
-    0
+    Ok(0)
 }
 
 /// Public helper to update latest height after committing a new block.
 pub fn set_latest_height(state: &RpcState, height: u64) {
     state.latest_height.store(height, Ordering::Relaxed);
+}
+
+/// Most heights [`HeadPublisher::publish_up_to`] notifies in one call: a gap
+/// wider than this (none in normal operation, where each committed height is
+/// published on its own) notifies only its top heights.
+pub const MAX_HEAD_BACKFILL: u64 = 256;
+
+/// T5.3: publishes committed heights to the RPC height (`eth_blockNumber`,
+/// the shared `latest_height`) and the WS `newHeads` stream, from the
+/// `CF_BLOCK_HEADERS` rows. Shared by the commit handler (the state-DB frontier
+/// after each commit) and the consensus header-persisted hook (each height once
+/// its off-thread header write landed), so the last committed height becomes
+/// visible even when its header lands after the commit event and no commit
+/// follows.
+///
+/// Guarantees: a height is published only once its header row is readable,
+/// and only after every height below it (down to the backfill bound) was: a
+/// missing row stops the fill, and the heights above it wait (a later call,
+/// e.g. the exec fallback's after it wrote the row, publishes them); heights go
+/// out in increasing order, each at most once; the RPC height never regresses
+/// and is stored before the height's head is notified.
+pub struct HeadPublisher {
+    state_db: StateDb,
+    notifier: BlockNotifier,
+    latest_height: Arc<AtomicU64>,
+    /// The lock serializes the publishing callers.
+    progress: Mutex<HeadProgress>,
+}
+
+/// [`HeadPublisher`]'s position.
+struct HeadProgress {
+    /// Highest height published (or the boot height).
+    published: u64,
+    /// Highest height any caller asked for: heights above a missing row are
+    /// published once it is readable, with no further call for them.
+    wanted: u64,
+}
+
+impl HeadPublisher {
+    /// Heights up to `latest_height`'s current value count as published.
+    pub fn new(state_db: StateDb, notifier: BlockNotifier, latest_height: Arc<AtomicU64>) -> Self {
+        let boot = latest_height.load(Ordering::Relaxed);
+        Self {
+            state_db,
+            notifier,
+            latest_height,
+            progress: Mutex::new(HeadProgress {
+                published: boot,
+                wanted: boot,
+            }),
+        }
+    }
+
+    /// The highest height published so far.
+    pub fn published(&self) -> u64 {
+        self.progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .published
+    }
+
+    /// Ask for every height up to `height` (and any asked for earlier), then
+    /// publish the readable run above the published height, in order: store
+    /// each as the RPC height, then notify its head (a row that does not parse
+    /// is not notified). The run stops at the first missing row. A gap wider
+    /// than [`MAX_HEAD_BACKFILL`] starts at its top heights. Returns whether
+    /// anything was published (`false`: `height` was already published, or
+    /// the next height's row is not readable yet).
+    pub fn publish_up_to(&self, height: u64) -> bool {
+        let mut progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        progress.wanted = progress.wanted.max(height);
+        let wanted = progress.wanted;
+        if wanted <= progress.published {
+            return false;
+        }
+        let from = progress
+            .published
+            .saturating_add(1)
+            .max(wanted.saturating_sub(MAX_HEAD_BACKFILL - 1));
+        let mut advanced = false;
+        for h in from..=wanted {
+            let Some(row) = self.header_row(h) else {
+                break;
+            };
+            self.publish_one(h, &row);
+            progress.published = h;
+            advanced = true;
+        }
+        advanced
+    }
+
+    fn header_row(&self, height: u64) -> Option<Vec<u8>> {
+        self.state_db
+            .get_cf_raw(CF_BLOCK_HEADERS, &height.to_be_bytes())
+            .ok()
+            .flatten()
+    }
+
+    fn publish_one(&self, height: u64, row: &[u8]) {
+        self.latest_height.fetch_max(height, Ordering::Relaxed);
+        let head = Some(row)
+            .filter(|data| data.len() > 32)
+            .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data[32..]).ok());
+        if let Some(head) = head {
+            self.notifier.notify_new_block(head);
+        }
+    }
 }
 
 /// Scan CF_NATIVE_TRADES for all trades at a given block height across all markets.
@@ -1130,6 +1258,185 @@ mod tests {
             )
             .unwrap();
         assert_eq!(find_latest_height(&state), 5);
+        assert_eq!(try_find_latest_height(&state), Ok(5));
+    }
+
+    /// The fallible probe: `Ok(0)` only for a CF with no height key; a CF
+    /// whose tail is all non-height keys (tip not locatable) is `Err`, while
+    /// the infallible wrapper keeps reading that as 0.
+    #[test]
+    fn try_find_latest_height_reports_an_unlocatable_tip() {
+        let dir = TempDir::new().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        assert_eq!(try_find_latest_height(&state), Ok(0));
+        state.put_cf_raw(CF_BLOCK_HEADERS, &3u64.to_be_bytes(), b"hdr").unwrap();
+        for i in 0..8u8 {
+            state
+                .put_cf_raw(CF_BLOCK_HEADERS, &[b'~', b'm', b'e', b't', b'a', i], b"x")
+                .unwrap();
+        }
+        let err = try_find_latest_height(&state).unwrap_err();
+        assert!(err.contains("no height key"), "{err}");
+        assert_eq!(find_latest_height(&state), 0, "infallible semantics unchanged");
+    }
+
+    /// A `CF_BLOCK_HEADERS` row as the node writes it: 32-byte hash, then
+    /// the header JSON.
+    fn put_header_row(state: &StateDb, height: u64) {
+        let mut row = vec![0u8; 32];
+        row.extend_from_slice(
+            &serde_json::to_vec(&serde_json::json!({ "height": height })).unwrap(),
+        );
+        state
+            .put_cf_raw(CF_BLOCK_HEADERS, &height.to_be_bytes(), &row)
+            .unwrap();
+    }
+
+    fn drain_heads(rx: &mut broadcast::Receiver<serde_json::Value>) -> Vec<u64> {
+        let mut heads = Vec::new();
+        while let Ok(head) = rx.try_recv() {
+            heads.push(head["height"].as_u64().unwrap());
+        }
+        heads
+    }
+
+    /// T5.3 (Codex P2): the commit handler ran while the last height's header
+    /// write was still pending (it saw the old frontier); once the write lands,
+    /// the header-persisted hook publishes it: the RPC height and the WS head
+    /// reach it with no further commit, each height notified exactly once.
+    #[test]
+    fn head_publisher_publishes_the_last_height_once_its_row_lands() {
+        let dir = TempDir::new().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        for h in 1..=4 {
+            put_header_row(&state, h);
+        }
+        let latest = Arc::new(AtomicU64::new(find_latest_height(&state)));
+        let notifier = BlockNotifier::new();
+        let mut rx = notifier.new_heads.subscribe();
+        let publisher = HeadPublisher::new(state.clone(), notifier, latest.clone());
+
+        // Commit event for 5, its header not written yet: the handler sees 4.
+        assert!(!publisher.publish_up_to(find_latest_height(&state)));
+        // A hook call before the row is readable publishes nothing.
+        assert!(!publisher.publish_up_to(5));
+        assert_eq!(latest.load(Ordering::Relaxed), 4);
+        assert_eq!(drain_heads(&mut rx), Vec::<u64>::new());
+
+        put_header_row(&state, 5); // the off-thread write lands
+        assert!(publisher.publish_up_to(5));
+        assert_eq!(latest.load(Ordering::Relaxed), 5, "durable 5 = RPC 5");
+        assert_eq!(drain_heads(&mut rx), vec![5]);
+        // The handler (or a repeat) after the hook: no duplicate.
+        assert!(!publisher.publish_up_to(find_latest_height(&state)));
+        assert!(!publisher.publish_up_to(5));
+        assert_eq!(drain_heads(&mut rx), Vec::<u64>::new());
+    }
+
+    /// T5.3 (review P3) RED-first: the writer's write for 5 failed but 6's
+    /// landed. 6 must wait for 5 (a gap fill that skipped 5 would publish 6 and
+    /// 5 would never get a head: the exec fallback's later call for 5 would be
+    /// a no-op). Once exec writes 5, its call publishes 5 then 6, in order,
+    /// each once, with no further call for 6.
+    #[test]
+    fn head_publisher_waits_for_a_missing_row_below_the_top() {
+        let dir = TempDir::new().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        for h in 1..=4 {
+            put_header_row(&state, h);
+        }
+        let latest = Arc::new(AtomicU64::new(4));
+        let notifier = BlockNotifier::new();
+        let mut rx = notifier.new_heads.subscribe();
+        let publisher = HeadPublisher::new(state.clone(), notifier, latest.clone());
+
+        put_header_row(&state, 6); // the writer: 5 failed, 6 landed
+        assert!(!publisher.publish_up_to(6), "6 waits for 5");
+        assert!(!publisher.publish_up_to(find_latest_height(&state)));
+        assert_eq!(latest.load(Ordering::Relaxed), 4);
+        assert_eq!(publisher.published(), 4);
+        assert_eq!(drain_heads(&mut rx), Vec::<u64>::new());
+
+        put_header_row(&state, 5); // the exec fallback writes 5
+        assert!(publisher.publish_up_to(5));
+        assert_eq!(drain_heads(&mut rx), vec![5, 6], "5 then 6, no call for 6");
+        assert_eq!(latest.load(Ordering::Relaxed), 6);
+        assert_eq!(publisher.published(), 6);
+        for again in [5, 6] {
+            assert!(!publisher.publish_up_to(again));
+        }
+        assert_eq!(drain_heads(&mut rx), Vec::<u64>::new(), "each once");
+    }
+
+    /// Heights go out in order, never regress, each once; a gap is filled in
+    /// order and stops at a missing row, and an older call is a no-op.
+    #[test]
+    fn head_publisher_is_ordered_monotonic_and_exactly_once() {
+        let dir = TempDir::new().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        put_header_row(&state, 1);
+        let latest = Arc::new(AtomicU64::new(1));
+        let notifier = BlockNotifier::new();
+        let mut rx = notifier.new_heads.subscribe();
+        let publisher = HeadPublisher::new(state.clone(), notifier, latest.clone());
+        for h in [2, 3, 5, 6] {
+            put_header_row(&state, h);
+        }
+        assert!(publisher.publish_up_to(3));
+        assert_eq!(drain_heads(&mut rx), vec![2, 3]);
+        assert!(!publisher.publish_up_to(6), "4 has no row: 5 and 6 wait");
+        assert_eq!(drain_heads(&mut rx), Vec::<u64>::new());
+        assert_eq!(latest.load(Ordering::Relaxed), 3);
+        put_header_row(&state, 4);
+        assert!(publisher.publish_up_to(4));
+        assert_eq!(drain_heads(&mut rx), vec![4, 5, 6]);
+        assert_eq!(latest.load(Ordering::Relaxed), 6);
+        for stale in [0, 2, 4, 6] {
+            assert!(!publisher.publish_up_to(stale));
+        }
+        assert_eq!(latest.load(Ordering::Relaxed), 6, "never regresses");
+        assert_eq!(publisher.published(), 6);
+        assert_eq!(drain_heads(&mut rx), Vec::<u64>::new());
+
+        // Concurrent publishers (handler + hook): each height still once, in order.
+        for h in 7..=40 {
+            put_header_row(&state, h);
+        }
+        let publisher = Arc::new(publisher);
+        let threads: Vec<_> = (0..4)
+            .map(|t| {
+                let p = publisher.clone();
+                std::thread::spawn(move || {
+                    for h in (7 + t..=40).step_by(3) {
+                        p.publish_up_to(h);
+                    }
+                    p.publish_up_to(40);
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(drain_heads(&mut rx), (7..=40).collect::<Vec<_>>());
+        assert_eq!(latest.load(Ordering::Relaxed), 40);
+    }
+
+    /// A gap wider than `MAX_HEAD_BACKFILL` notifies only its top heights.
+    #[test]
+    fn head_publisher_bounds_a_wide_gap() {
+        let dir = TempDir::new().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        let top = MAX_HEAD_BACKFILL + 10;
+        for h in 1..=top {
+            put_header_row(&state, h);
+        }
+        let latest = Arc::new(AtomicU64::new(0));
+        let notifier = BlockNotifier::new();
+        let mut rx = notifier.new_heads.subscribe();
+        let publisher = HeadPublisher::new(state, notifier, latest.clone());
+        assert!(publisher.publish_up_to(top));
+        assert_eq!(drain_heads(&mut rx), (11..=top).collect::<Vec<_>>());
+        assert_eq!(latest.load(Ordering::Relaxed), top);
     }
 
     async fn start_server(
@@ -4044,6 +4351,76 @@ mod tests {
             serde_json::to_value(&body.native_actions[0]).unwrap()
         );
         handle.stop().unwrap();
+    }
+
+    /// s132: with `TORUS_PRUNE_MODE=filter` the pruned rows stay on disk
+    /// until a compaction drops them; the body RPCs must answer exactly as
+    /// with the eager range delete, heights just below the cutoff included.
+    #[tokio::test]
+    async fn pruned_history_rpcs_answer_identically_in_range_and_filter_mode() {
+        use jsonrpsee::core::client::ClientT;
+        use std::sync::atomic::AtomicU64;
+        use torus_state::prune_filter::PruneMode;
+        use torus_state::{PrunerConfig, StatePruner};
+        let mut answers = Vec::new();
+        for mode in [PruneMode::Range, PruneMode::Filter] {
+            let dir = TempDir::new().unwrap();
+            let state = StateDb::open_with_prune_mode(dir.path(), mode).unwrap();
+            let body = TorusBlockBody {
+                native_actions: vec![],
+                evm_transactions: vec![],
+                core_writer_actions: vec![],
+            };
+            for h in 1..=12u64 {
+                store_header(&state, &test_header(h, 0, 1_000_000_000));
+                store_body(&state, h, &body);
+                state
+                    .put_cf_raw(
+                        torus_state::cf::CF_BLOCK_ACTION_STATUS,
+                        &h.to_be_bytes(),
+                        &torus_state::action_status::BlockActionStatus::default().encode(),
+                    )
+                    .unwrap();
+            }
+            store_applied_height(&state, 12);
+            let cfg = PrunerConfig {
+                retention_blocks: 4,
+                prune_interval_blocks: 1,
+                batch_size: 3,
+                trade_retention_blocks: None,
+            };
+            let mut pruner = StatePruner::new(state.clone(), cfg, Arc::new(AtomicU64::new(0)));
+            assert_eq!(pruner.maybe_prune(12).unwrap(), 8, "cutoff 8");
+            let cf = state.cf_handle(CF_BLOCK_BODIES).unwrap();
+            let on_disk = state.inner().get_cf(cf, 7u64.to_be_bytes()).unwrap().is_some();
+            assert_eq!(on_disk, mode == PruneMode::Filter, "{mode:?}: height 7 on disk");
+
+            let mempool = Arc::new(Mempool::new(state.clone(), MempoolConfig::default()));
+            let executor = Arc::new(EvmExecutor::new(TORUS_CHAIN_ID));
+            let (handle, addr) = start_server(state, mempool, executor).await;
+            let client = jsonrpsee::http_client::HttpClientBuilder::default()
+                .build(format!("http://{addr}"))
+                .unwrap();
+            let mut got = Vec::new();
+            for h in 1..=12u64 {
+                let body: serde_json::Value = client
+                    .request("torus_getBlockBody", jsonrpsee::rpc_params![h])
+                    .await
+                    .unwrap();
+                assert_eq!(body.is_null(), h < 8, "{mode:?}: body {h}");
+                got.push(body);
+                let block: Result<serde_json::Value, _> = client
+                    .request(
+                        "eth_getBlockByNumber",
+                        jsonrpsee::rpc_params![format!("{h:#x}"), true],
+                    )
+                    .await;
+                got.push(block.unwrap_or_else(|e| serde_json::Value::String(e.to_string())));
+            }
+            handle.stop().unwrap();
+            answers.push(got);
+        }
+        assert_eq!(answers[0], answers[1], "range vs filter answers");
     }
 
     /// s84 decision 1: `torus_getBlockBody` reports each native action's and

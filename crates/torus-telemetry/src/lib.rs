@@ -233,6 +233,14 @@ pub struct Metrics {
 
     // Pruner metrics
     pub pruner_blocks_removed: Counter,
+    /// s132 (`TORUS_PRUNE_MODE=filter`): SST files of the height-keyed CFs
+    /// the pruner dropped whole with `DeleteFilesInRange`.
+    pub pruner_files_dropped: Counter,
+    /// s132: rows the compaction filter dropped below the prune cutoff.
+    pub pruner_filter_rows_dropped: Counter,
+    /// s132: the compaction filter's cutoff height (0 = drops nothing:
+    /// range mode, retention off, or not armed yet).
+    pub pruner_filter_cutoff: Gauge,
 
     // RPC metrics
     pub rpc_requests_total: Family<Vec<(String, String)>, Counter>,
@@ -568,6 +576,24 @@ pub struct Metrics {
     /// Consensus thread: whole `on_committed_block` hook (manifest persist,
     /// durable block persist, mempool prune, exec dispatch).
     pub on_committed_block_seconds: Histogram,
+    /// T5.3: the commit-manifest put inside `on_committed_block` (section 106:
+    /// the in-window commit-hook stall, waiting behind the checkpoint batch
+    /// while the manifest lived in the state DB).
+    pub commit_manifest_seconds: Histogram,
+    /// T5.3: one background manifest prune pass (pruner thread, at most 1/s):
+    /// state-DB WAL fsync, then the delete of the dispatched heights' manifests
+    /// in the consensus DB. Not observed with the manifest in the state DB (its
+    /// prune rides the commit-persist batch).
+    pub commit_manifest_prune_seconds: Histogram,
+    /// T5.3: how long the exec thread waits, before executing a block, for its
+    /// header + body write on the commit-persist writer thread (that write keeps
+    /// the `torus_commit_persist_*` timers, now observed on the writer).
+    pub exec_commit_persist_wait_seconds: Histogram,
+    /// T5.3: the whole `on_commit_block` event handler (event-bus thread:
+    /// height lookup, mempool prune, header read, WS notify).
+    pub on_commit_block_handler_seconds: Histogram,
+    /// T5.3: the handler's applied-marker read + `prune_committed_txs`.
+    pub commit_handler_prune_seconds: Histogram,
     /// Consensus thread: `remove_committed_native` (mempool write-lock + prune)
     /// inside the commit dispatch.
     pub mempool_remove_committed_seconds: Histogram,
@@ -575,8 +601,9 @@ pub struct Metrics {
     /// (`cf_native_pending`) after leaving the retention window. Without the
     /// GC the store only grew.
     pub da_bodies_gc_deleted: Counter,
-    /// RH4, consensus thread: one DA body GC pass inside the commit dispatch
-    /// (record the height's row, delete aged bodies and shards: one batch).
+    /// RH4: one DA body GC pass (restore, record the height's row, delete
+    /// aged bodies and shards: one batch), on the GC worker thread (inside
+    /// the commit dispatch with `TORUS_DA_GC_INLINE=1`).
     pub da_gc_seconds: Histogram,
     /// RH4, `torus_da_gc_last_pass_max_seconds`: the longest DA body GC pass
     /// since the previous scrape (each scrape reads and resets it to 0). The
@@ -595,9 +622,34 @@ pub struct Metrics {
     /// skipped pruned height not due yet), `dispatch_behind` (dispatch is
     /// behind the committed tip, e.g. backpressure in non-blocking dispatch),
     /// `tip_unreadable`, `tail_unreadable` (a block above the committed tip
-    /// cannot be read or decoded), `store_error` (the pass failed). The
-    /// bodies stay; the next pass retries.
+    /// cannot be read or decoded), `store_error` (the pass failed),
+    /// `fence_full` (the GC worker's fence is over its cap). The bodies
+    /// stay; the next pass retries.
     pub da_gc_held_passes: Family<Vec<(String, String)>, Counter>,
+    /// RH4 GC worker, consensus thread: handing one dispatched height to the
+    /// DA body GC (`torus_da_gc_handoff_seconds`): building its job and the
+    /// non-blocking enqueue; with `TORUS_DA_GC_INLINE=1`, the whole pass.
+    pub da_gc_handoff_seconds: Histogram,
+    /// RH4 GC worker: dispatched heights waiting in its handoff queue.
+    pub da_gc_queue_depth: Gauge,
+    /// RH4 GC worker: the highest dispatched height minus the highest height
+    /// the worker finished (0 = caught up).
+    pub da_gc_lag_heights: Gauge,
+    /// RH4 GC worker: heights handed off while its queue was full (the
+    /// consensus thread never waits): their records are back-filled from the
+    /// block tree.
+    pub da_gc_coalesced_heights: Counter,
+    /// RH4 GC worker: due bodies a pass kept because a concurrent proposal
+    /// check or validation pinned them (`torus_state::DaGcFence`).
+    pub da_gc_fence_kept: Counter,
+    /// RH4 GC worker: hashes pinned against it by proposal checks and
+    /// validation (released once the worker passed their height).
+    pub da_gc_fence_pins: Gauge,
+    /// RH4 GC worker: body checks whose pin the fence refused (a height more
+    /// than `torus_state::da_gc_fence::DA_GC_FENCE_HEIGHT_WINDOW` above the
+    /// committed tip, e.g. a speculative far-future datum): their bodies
+    /// were treated as missing.
+    pub da_gc_fence_refused_pins: Counter,
     /// PROFILER (s470): total resting orders across all books, sampled once per
     /// block right after the load/rebuild. Book-depth axis for the
     /// depth-vs-cost correlation (the funnel `orders_resting` counter is a
@@ -804,6 +856,13 @@ pub struct Metrics {
     /// Item 6 Phase 3: flush-worker wall time per checkpoint job (the one
     /// batch: build, root, write, EVM resync).
     pub flush_worker_checkpoint_seconds: Histogram,
+    /// T5.3: the checkpoint's state-DB `write` alone (WAL + memtable), one
+    /// observation per checkpoint.
+    pub exec_checkpoint_db_write_seconds: Histogram,
+    /// T5.3: wall clock (unix ms) at which the latest checkpoint DB write
+    /// started / ended, to cut in-window intervals without a /proc sampler.
+    pub exec_checkpoint_db_write_start_ms: Gauge,
+    pub exec_checkpoint_db_write_end_ms: Gauge,
     /// Item 7 option 0 (task 4.2): the flush worker's EVM trie step (the
     /// hashed mirror and trie nodes of a fast-path EVM block at interval 0,
     /// of a checkpoint window holding one otherwise), inside
@@ -1607,6 +1666,24 @@ impl Metrics {
             "Total blocks removed by pruner",
             pruner_blocks_removed.clone(),
         );
+        let pruner_files_dropped = Counter::default();
+        registry.register(
+            "torus_pruner_files_dropped",
+            "SST files of the pruned height-keyed CFs dropped whole by DeleteFilesInRange (filter mode)",
+            pruner_files_dropped.clone(),
+        );
+        let pruner_filter_rows_dropped = Counter::default();
+        registry.register(
+            "torus_pruner_filter_rows_dropped",
+            "Rows below the prune cutoff dropped by the compaction filter (filter mode)",
+            pruner_filter_rows_dropped.clone(),
+        );
+        let pruner_filter_cutoff = Gauge::default();
+        registry.register(
+            "torus_pruner_filter_cutoff",
+            "Prune compaction filter cutoff height (0 = filter drops nothing)",
+            pruner_filter_cutoff.clone(),
+        );
 
         let rpc_requests_total = Family::<Vec<(String, String)>, Counter>::default();
         registry.register(
@@ -2332,6 +2409,36 @@ impl Metrics {
             "Consensus thread: whole on_committed_block hook (persist + prune + dispatch)",
             on_committed_block_seconds.clone(),
         );
+        let commit_manifest_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_commit_manifest_seconds",
+            "Consensus thread: commit-manifest put inside on_committed_block (T5.3)",
+            commit_manifest_seconds.clone(),
+        );
+        let commit_manifest_prune_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_commit_manifest_prune_seconds",
+            "Pruner thread: state-WAL fsync + commit-manifest delete in the consensus DB, per pass (T5.3)",
+            commit_manifest_prune_seconds.clone(),
+        );
+        let exec_commit_persist_wait_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 16));
+        registry.register(
+            "torus_exec_commit_persist_wait_seconds",
+            "Exec thread: wait for the block's off-thread header + body write before executing it (T5.3)",
+            exec_commit_persist_wait_seconds.clone(),
+        );
+        let on_commit_block_handler_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_on_commit_block_handler_seconds",
+            "Event-bus thread: whole on_commit_block handler (T5.3)",
+            on_commit_block_handler_seconds.clone(),
+        );
+        let commit_handler_prune_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_commit_handler_prune_seconds",
+            "Event-bus thread: applied-marker read + prune_committed_txs in on_commit_block (T5.3)",
+            commit_handler_prune_seconds.clone(),
+        );
         let mempool_remove_committed_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
         registry.register(
             "torus_mempool_remove_committed_seconds",
@@ -2348,7 +2455,8 @@ impl Metrics {
         let da_gc_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 15));
         registry.register(
             "torus_da_gc_seconds",
-            "Consensus thread: one DA body GC pass inside the commit dispatch (RH4)",
+            "One DA body GC pass (on its worker thread; inside the commit dispatch with \
+             TORUS_DA_GC_INLINE=1) (RH4)",
             da_gc_seconds.clone(),
         );
         let da_gc_last_pass_max = MaxSinceScrape::default();
@@ -2368,8 +2476,56 @@ impl Metrics {
         registry.register(
             "torus_da_gc_held_passes",
             "DA body GC passes that deleted nothing, by reason (gap / backfilling / unrecorded / \
-             pre_cursor / pruned_gap / dispatch_behind / tip_unreadable / tail_unreadable / store_error) (RH4)",
+             pre_cursor / pruned_gap / dispatch_behind / tip_unreadable / tail_unreadable / store_error / \
+             fence_full) (RH4)",
             da_gc_held_passes.clone(),
+        );
+        // 1 us .. 16 ms: a handoff is a job build and a try_send.
+        let da_gc_handoff_seconds = Histogram::new(exponential_buckets(0.000001, 2.0, 15));
+        registry.register(
+            "torus_da_gc_handoff_seconds",
+            "Consensus thread: handing one dispatched height to the DA body GC worker \
+             (the whole pass with TORUS_DA_GC_INLINE=1) (RH4)",
+            da_gc_handoff_seconds.clone(),
+        );
+        let da_gc_queue_depth = Gauge::default();
+        registry.register(
+            "torus_da_gc_queue_depth",
+            "Dispatched heights waiting in the DA body GC worker's queue (RH4)",
+            da_gc_queue_depth.clone(),
+        );
+        let da_gc_lag_heights = Gauge::default();
+        registry.register(
+            "torus_da_gc_lag_heights",
+            "Highest dispatched height minus the highest height the DA body GC worker finished (RH4)",
+            da_gc_lag_heights.clone(),
+        );
+        let da_gc_coalesced_heights = Counter::default();
+        registry.register(
+            "torus_da_gc_coalesced_heights",
+            "Heights handed to the DA body GC worker while its queue was full; back-filled from \
+             the block tree (RH4)",
+            da_gc_coalesced_heights.clone(),
+        );
+        let da_gc_fence_kept = Counter::default();
+        registry.register(
+            "torus_da_gc_fence_kept",
+            "Due DA bodies the GC worker kept because a concurrent proposal check or validation \
+             pinned them (RH4)",
+            da_gc_fence_kept.clone(),
+        );
+        let da_gc_fence_pins = Gauge::default();
+        registry.register(
+            "torus_da_gc_fence_pins",
+            "Hashes pinned against the DA body GC worker by proposal checks and validation (RH4)",
+            da_gc_fence_pins.clone(),
+        );
+        let da_gc_fence_refused_pins = Counter::default();
+        registry.register(
+            "torus_da_gc_fence_refused_pins",
+            "Body checks whose DA body GC fence pin was refused (height beyond the window above \
+             the committed tip): their bodies were treated as missing (RH4)",
+            da_gc_fence_refused_pins.clone(),
         );
 
         let exec_resting_orders = Gauge::default();
@@ -2689,6 +2845,24 @@ impl Metrics {
             "torus_flush_worker_checkpoint_seconds",
             "Item 6 Phase 3: flush worker wall time per checkpoint job",
             flush_worker_checkpoint_seconds.clone(),
+        );
+        let exec_checkpoint_db_write_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 16));
+        registry.register(
+            "torus_exec_checkpoint_db_write_seconds",
+            "T5.3: the checkpoint's state-DB write alone (WAL + memtable)",
+            exec_checkpoint_db_write_seconds.clone(),
+        );
+        let exec_checkpoint_db_write_start_ms = Gauge::default();
+        registry.register(
+            "torus_exec_checkpoint_db_write_start_ms",
+            "T5.3: unix ms at which the latest checkpoint DB write started",
+            exec_checkpoint_db_write_start_ms.clone(),
+        );
+        let exec_checkpoint_db_write_end_ms = Gauge::default();
+        registry.register(
+            "torus_exec_checkpoint_db_write_end_ms",
+            "T5.3: unix ms at which the latest checkpoint DB write ended",
+            exec_checkpoint_db_write_end_ms.clone(),
         );
         let flush_worker_evm_trie_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
         registry.register(
@@ -3108,6 +3282,9 @@ impl Metrics {
             sell_top_ups_partial,
             sell_top_ups_none,
             pruner_blocks_removed,
+            pruner_files_dropped,
+            pruner_filter_rows_dropped,
+            pruner_filter_cutoff,
             rpc_requests_total,
             rpc_request_duration_seconds,
             gossip_messages_received,
@@ -3213,12 +3390,24 @@ impl Metrics {
             validate_block_da_wait_seconds,
             validate_block_attest_lookup_seconds,
             on_committed_block_seconds,
+            commit_manifest_seconds,
+            commit_manifest_prune_seconds,
+            exec_commit_persist_wait_seconds,
+            on_commit_block_handler_seconds,
+            commit_handler_prune_seconds,
             mempool_remove_committed_seconds,
             da_bodies_gc_deleted,
             da_gc_seconds,
             da_gc_last_pass_max,
             da_gc_slow_passes,
             da_gc_held_passes,
+            da_gc_handoff_seconds,
+            da_gc_queue_depth,
+            da_gc_lag_heights,
+            da_gc_coalesced_heights,
+            da_gc_fence_kept,
+            da_gc_fence_pins,
+            da_gc_fence_refused_pins,
             exec_resting_orders,
             exec_resident_rebuilds,
             exec_resident_rows,
@@ -3267,6 +3456,9 @@ impl Metrics {
             exec_checkpoint_read_views_live,
             exec_checkpoint_oldest_live_age_blocks,
             flush_worker_checkpoint_seconds,
+            exec_checkpoint_db_write_seconds,
+            exec_checkpoint_db_write_start_ms,
+            exec_checkpoint_db_write_end_ms,
             flush_worker_evm_trie_seconds,
             order_age_admit_seconds,
             order_age_commit_seconds,
@@ -3506,11 +3698,15 @@ pub enum OrderRejectReason {
     Other,
     /// s114 cloid: the order's cloid is live for its trader (any market).
     DuplicateCloid,
+    /// Pre-testnet P0: the order names a market that is not listed.
+    UnknownMarket,
+    /// Pre-testnet P1: a non-reduce-only order on a delisted market.
+    MarketDelisted,
 }
 
 impl OrderRejectReason {
     /// Number of reasons (labels).
-    pub const COUNT: usize = 17;
+    pub const COUNT: usize = 19;
 
     /// Every reason in discriminant order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -3531,6 +3727,8 @@ impl OrderRejectReason {
         Self::Fill,
         Self::Other,
         Self::DuplicateCloid,
+        Self::UnknownMarket,
+        Self::MarketDelisted,
     ];
 
     /// The label value (the `FailureReason` names of torus-state where one
@@ -3554,6 +3752,8 @@ impl OrderRejectReason {
             Self::Fill => "fill",
             Self::Other => "other",
             Self::DuplicateCloid => "duplicate_cloid",
+            Self::UnknownMarket => "unknown_market",
+            Self::MarketDelisted => "market_delisted",
         }
     }
 }
@@ -3893,6 +4093,11 @@ mod tests {
             "torus_validate_block_da_wait_seconds",
             "torus_validate_block_attest_lookup_seconds",
             "torus_on_committed_block_seconds",
+            "torus_commit_manifest_seconds",
+            "torus_commit_manifest_prune_seconds",
+            "torus_exec_commit_persist_wait_seconds",
+            "torus_on_commit_block_handler_seconds",
+            "torus_commit_handler_prune_seconds",
             "torus_mempool_remove_committed_seconds",
             "torus_da_bodies_gc_deleted_total",
             "torus_da_gc_seconds",
@@ -3907,6 +4112,32 @@ mod tests {
     /// buckets topped out at 0.82 s and nothing showed which pass): the
     /// pass histogram reaches past 1 s, the longest pass since the previous
     /// scrape is a gauge that the scrape resets, and slow passes are counted.
+    /// RH4 GC worker: the consensus-side handoff cost, the queue depth and
+    /// lag, coalesced heights and the fence are exported.
+    #[test]
+    fn da_gc_worker_metrics_register() {
+        let m = Metrics::new();
+        m.da_gc_handoff_seconds.observe(0.000_02);
+        m.da_gc_queue_depth.set(3);
+        m.da_gc_lag_heights.set(5);
+        m.da_gc_coalesced_heights.inc();
+        m.da_gc_fence_kept.inc();
+        m.da_gc_fence_pins.set(7);
+        m.da_gc_fence_refused_pins.inc();
+        let text = m.encode();
+        for line in [
+            "torus_da_gc_handoff_seconds_count 1",
+            "torus_da_gc_queue_depth 3",
+            "torus_da_gc_lag_heights 5",
+            "torus_da_gc_coalesced_heights_total 1",
+            "torus_da_gc_fence_kept_total 1",
+            "torus_da_gc_fence_pins 7",
+            "torus_da_gc_fence_refused_pins_total 1",
+        ] {
+            assert!(text.contains(line), "{line} missing:\n{text}");
+        }
+    }
+
     #[test]
     fn da_gc_slow_pass_metrics_register() {
         let m = Metrics::new();
@@ -3997,6 +4228,9 @@ mod tests {
             "torus_exec_checkpoint_read_views_live",
             "torus_exec_checkpoint_oldest_live_age_blocks",
             "torus_flush_worker_checkpoint_seconds",
+            "torus_exec_checkpoint_db_write_seconds",
+            "torus_exec_checkpoint_db_write_start_ms",
+            "torus_exec_checkpoint_db_write_end_ms",
             "torus_exec_save_books_drain_seconds",
             "torus_exec_save_books_write_seconds",
             "torus_exec_native_blocks",

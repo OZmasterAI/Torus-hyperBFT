@@ -1,8 +1,9 @@
-//! 8k L2.2 settle-no-merge (`TORUS_SETTLE_NO_MERGE=1`, node-local, off by
-//! default): the parallel settle's pass B keeps each market's plan cache as a
-//! run instead of `merge_disjoint`-ing it into the batch cache, and the
-//! end-of-call flush writes the batch cache and the runs together
-//! (`PositionCache::flush_with_runs`) in the same global key order.
+//! 8k L2.2 settle-no-merge (`TORUS_SETTLE_NO_MERGE`, node-local, on by
+//! default since s131; `0` turns it off): the parallel settle's pass B keeps
+//! each market's plan cache as a run instead of `merge_disjoint`-ing it into
+//! the batch cache, and the end-of-call flush writes the batch cache and the
+//! runs together (`PositionCache::flush_with_runs`) in the same global key
+//! order.
 //!
 //! THE contract under test: the flag changes where pass B's position entries
 //! sit until the flush, never what is written or in which order. Over a
@@ -411,6 +412,11 @@ fn run_seeded(
 ) -> (RunOut, RunStats) {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = StateDb::open(dir.path()).expect("open db");
+    // Pre-testnet P0: orders need a listed market (placeholder rows,
+    // tick / lot 1, as the old implicit book).
+    for m in 1..=64u64 {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+    }
     for n in 1..=TRADERS as u8 {
         let bal = NativeBalance {
             available: fp(1_000_000),

@@ -103,6 +103,28 @@ first deleting pass marked, and the new per-scrape max gauge).
    the 32-byte body keys). If they do not, a separate CF or a prefix bloom for references is an option. Measure
    before changing.
 
+## Proposal 3 done: the GC worker (s132, branch `perf/rh4-gc-worker`)
+
+Bench 8o (perf doc section 100) measured retention 1000 at block p50 +8.1% and 51-189 ms passes on the algo
+thread. The pass now runs on one worker thread (`crates/torus-consensus/src/da_gc_worker.rs`; design and safety
+argument in the `da_gc.rs` module docs, "Where the passes run"). The algo thread moves the block's hashes into a job
+and `try_send`s it on a bounded queue (512 heights; full = the height is coalesced and back-filled from the block
+tree). `TORUS_DA_GC_INLINE=1` restores the old in-dispatch pass for A/B runs. New metrics:
+`torus_da_gc_handoff_seconds`, `torus_da_gc_queue_depth`, `torus_da_gc_lag_heights`,
+`torus_da_gc_coalesced_heights_total`, `torus_da_gc_fence_kept_total`, `torus_da_gc_fence_pins`.
+
+`rh4_early_cost_per_block` (release, 18c, other builds running; 1,500 blocks x 130 order batches, three arms
+interleaved), `on_committed_block` p50 on the algo thread:
+
+| segment | GC off | inline | worker |
+|---|---|---|---|
+| Torus 1..1001 (record only) | 2.21 ms | 4.16 ms | 2.25 ms |
+| 1002..1128 (tree prunes) | 2.46 ms | 4.73 ms | 2.53 ms |
+| 1129.. (deleting) | 2.45 ms | 6.45 ms | 2.53 ms |
+
+Handoff mean 127 us (n = 1,500) against a 2.6 ms inline pass mean. The worker's own pass mean is 3.7 ms (it now
+competes with the algo thread for CPU and cache). Not yet measured in a node: the 8o A/B rerun with the worker.
+
 ## The slow-pass log and metrics (part 1, same branch)
 
 A pass of at least `TORUS_DA_GC_SLOW_MS` (default 50, `0` = every pass; resolved and logged at

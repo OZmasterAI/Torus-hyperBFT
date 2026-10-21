@@ -780,7 +780,7 @@ Not merge blockers; each is tracked where it is defined. Status after the s96 me
 | governance storage errors don't halt the node | row 74 | before mainnet | owner call (halt like liquidation?) |
 | RPC 1/1 for undecodable rows, book StopLimit tick guard, RPC price <= 0 | rows 44-46 | soon | yes to all three (small) |
 | native root dropped from blocks in `02aa50c` (intended?) | 9.3 | before mainnet | decide whether blocks carry a native state root |
-| oracle review M2: lower bound on block timestamps | bench doc Open, `4a12020` | before testnet | review with the oracle docs |
+| oracle review M2: lower bound on block timestamps | bench doc Open, `4a12020` | before mainnet (owner s131; was: before testnet) | not in the testnet genesis. Work kept on `wip/m2-timestamp-lower-bound`, see `docs/plans/oracle-aggregation.md` Decision 5 |
 | anti-spam D: no validator exemption for the per-IP limit | bench doc Open | before testnet | check whether validators hit it |
 | liquidation stress at full-node load | row 76 | before testnet | one ozarchy cell (larger walk or accounts near maintenance) |
 | slow first block after the load; 2.5 ms empty block with the feed live | rows 77-78 | Phase 2 | step 0 profile |
@@ -812,7 +812,7 @@ already (16, 17, 26, 28, 36, 40-43, 71, 73, 9.10, 9.12) or asked no question.
     or bring a root back for light clients / state proofs).
   - Anti-spam D validator exemption: measure first (add a metric for oracle submissions evicted
     in the pool), before testnet.
-  - Oracle M2 (block timestamp lower bound, `4a12020`): review with the oracle docs before testnet.
+  - Oracle M2 (block timestamp lower bound, `4a12020`): moved to pre-mainnet (owner s131). See `docs/plans/oracle-aggregation.md` Decision 5.
   - 9.11: superseded by the s94 design check: over-commit cannot happen while every market has one
     flat tier (resting orders prepay their IM). Build a non-consensus counter + tests that pin
     `d <= 0` under flat tiers; multi-tier configs trigger option 4 (reserve at the position tier).

@@ -8,7 +8,8 @@
 # Optional history retention (Q9 data-dir growth soak): with TORUS_RETENTION_BLOCKS
 # set and non-empty, each validator gets --retention-blocks=$TORUS_RETENTION_BLOCKS
 # (state pruner + block-tree pruner; the DA body GC window derives from it, see
-# torus_consensus::da_gc). Unset or empty = archive, exactly as before. A compose
+# torus_consensus::da_gc). Unset or empty = no flag, the node default (since
+# s131 prune by default, N = 100,000); TORUS_RETENTION_BLOCKS=0 = archive. A compose
 # command list cannot drop an item, so the flag is appended by this entrypoint.
 x-node-entrypoint: &node-entrypoint
   - /bin/sh

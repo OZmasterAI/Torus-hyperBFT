@@ -7,6 +7,7 @@ pub mod block_body;
 pub mod cf;
 pub mod checkpoint_layer;
 pub mod corewriter_tx;
+pub mod da_gc_fence;
 pub mod db;
 pub mod erasure;
 pub mod error;
@@ -19,6 +20,7 @@ pub mod overlay;
 /// Item 7 option 0 step 0: test-only overlay read probes (`test-probes`).
 #[cfg(feature = "test-probes")]
 pub mod probes;
+pub mod prune_filter;
 pub mod pruner;
 pub mod read_view;
 pub mod resident_rows;
@@ -43,6 +45,7 @@ pub use db::{
     consensus_db_path, DbTuning, RocksdbHist, RocksdbHistograms, RocksdbRuntimeStats,
     RocksdbTickers, StateDb, CONSENSUS_DB_CFS, CONSENSUS_DB_DIR,
 };
+pub use da_gc_fence::DaGcFence;
 pub use error::StateError;
 pub use evm_block_state::{EvmBlockState, LayeredEvmDb};
 pub use native_da::{
@@ -50,7 +53,10 @@ pub use native_da::{
     NativeDaStore, NoDaGcHistory,
 };
 pub use overlay::StateOverlay;
-pub use pruner::{dir_size_bytes, read_trades_pruned_height, PrunerConfig, StatePruner};
+pub use prune_filter::{PruneCutoff, PruneMode, PRUNE_MODE_ENV};
+pub use pruner::{
+    dir_size_bytes, read_pruned_up_to, read_trades_pruned_height, PrunerConfig, StatePruner,
+};
 pub use read_view::ReadView;
 pub use resident_rows::{ResidentChange, ResidentDelta, ResidentRow, ResidentRowIter, ResidentRows, ResidentSource};
 pub use retention::RetentionStats;

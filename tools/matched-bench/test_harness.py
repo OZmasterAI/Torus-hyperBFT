@@ -1324,8 +1324,9 @@ class CrashKillGuardTest(unittest.TestCase):
 # ------------------------------- start-node.sh: optional history retention (Q9)
 class StartNodeRetentionTest(unittest.TestCase):
     """devnet/wsl/start-node.sh passes `--retention-blocks=N` only when
-    TORUS_RETENTION_BLOCKS is set. Unset or empty = archive, the argv of every
-    earlier cell, byte for byte. The flag goes last, so crash-kill.sh's
+    TORUS_RETENTION_BLOCKS is set. Unset or empty = no flag, the argv of every
+    earlier cell, byte for byte (since s131 that means the node default,
+    prune by default with N = 100,000; TORUS_RETENTION_BLOCKS=0 = archive). The flag goes last, so crash-kill.sh's
     `--data-dir=` match (and with it the restart) still accepts the node."""
 
     START_NODE_SH = os.path.join(
@@ -5506,6 +5507,208 @@ class BulkCountAndPreloadHarnessTest(unittest.TestCase):
         again = self.src.index('python3 "$SELF_DIR/preload.py" summary --dir "$OUT"', summ)
         self.assertLess(again, self.src.index('python3 "$TOOLS_DIR/health.py" accept'))
 
+
+
+AUDITED_FLAGS = (
+    "TORUS_BOOK_ROWS",
+    "TORUS_BOOK_FAST_ENCODE",
+    "TORUS_SETTLE_NO_MERGE",
+    "TORUS_EVM_FAST_PATH",
+    "TORUS_BOOK_COALESCE",
+    "TORUS_CHECKPOINT_INTERVAL_MS",
+)
+
+# (TORUS_BOOK_ROWS value or None = unset, book mode the node runs). Mirrors
+# torus_bridge::native_executor::parse_book_rows_mode: trimmed "1"/"2"/"3",
+# anything else (including unset and empty) is Classic.
+BOOK_MODE_CASES = (
+    (None, "classic"),
+    ("", "classic"),
+    ("0", "classic"),
+    ("1", "mode1"),
+    ("2", "mode2"),
+    ("3", "mode3"),
+    (" 3 ", "mode3"),
+    ("\t3\n", "mode3"),
+    ("03", "classic"),
+    ("4", "classic"),
+    ("3 3", "classic"),
+    ("x", "classic"),
+)
+
+
+# TORUS_RETENTION_BLOCKS -> the effective history retention of the cell
+# (devnet/wsl/start-node.sh passes --retention-blocks=V when V is non-empty;
+# torus-node: 0 = archive, unset = the default N = 100,000 since s131).
+RETENTION_CASES = [
+    (None, "100000(default)"),
+    ("", "100000(default)"),
+    ("0", "archive"),
+    ("000", "archive"),
+    ("1000", "1000"),
+    ("0100", "100"),
+    ("12x", "invalid"),
+]
+
+
+class BookModeNotPinnedTest(unittest.TestCase):
+    """s131 (bench 8y, perf doc section 110): RECORD_ENV pinned
+    TORUS_BOOK_ROWS=3, so a cell was mode 3 unless its campaign overrode the
+    knob, and one 8y Classic smoke silently ran mode 3. The book mode is never
+    implicit now: no override = the node default (Classic), and every cell logs
+    and records its effective book mode and the default-changed flags. Runs a
+    sandbox copy whose launch fails, so the cell stops right after the node env
+    is exported and logged."""
+
+    setUp = EvmBlockIntervalKnobTest.setUp
+    tearDown = EvmBlockIntervalKnobTest.tearDown
+    write_generator = EvmBlockIntervalKnobTest.write_generator
+    run_cell = EvmBlockIntervalKnobTest.run_cell
+
+    @staticmethod
+    def flags_line(log):
+        lines = [l for l in log.splitlines() if " book_mode=" in l]
+        return lines
+
+    def test_record_env_no_longer_sets_the_book_mode(self):
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        i = src.index("RECORD_ENV=(")
+        block = src[i : src.index(")", i)]
+        self.assertNotIn("TORUS_BOOK_ROWS", block)
+
+    def test_no_override_runs_and_records_classic(self):
+        r, log = self.run_cell("TORUS_X=1", TORUS_BOOK_ROWS="3")  # ambient: must not leak
+        self.assertIn("launch-3val.sh failed", log, r.stdout + r.stderr + log)
+        lines = self.flags_line(log)
+        self.assertEqual(len(lines), 1, log)
+        self.assertIn("cell=knob-x book_mode=classic", lines[0])
+        self.assertIn("TORUS_BOOK_ROWS='unset (default)'", lines[0])
+        env_line = [l for l in log.splitlines() if "node env: " in l][0]
+        node_env = json.loads(env_line.split("node env: ", 1)[1])
+        self.assertNotIn("TORUS_BOOK_ROWS", node_env)
+        # logged after the node env is final and before the launch
+        self.assertLess(log.index("node env: "), log.index(" book_mode="))
+        self.assertLess(log.index(" book_mode="), log.index("launch-3val.sh failed"))
+
+    def test_explicit_mode_3_records_mode_3(self):
+        r, log = self.run_cell("TORUS_BOOK_ROWS=3")
+        lines = self.flags_line(log)
+        self.assertEqual(len(lines), 1, r.stdout + r.stderr + log)
+        self.assertIn("cell=knob-x book_mode=mode3", lines[0])
+        self.assertIn("TORUS_BOOK_ROWS='3'", lines[0])
+
+    def test_explicit_empty_override_is_classic(self):
+        r, log = self.run_cell("TORUS_BOOK_ROWS=")
+        lines = self.flags_line(log)
+        self.assertEqual(len(lines), 1, r.stdout + r.stderr + log)
+        self.assertIn("book_mode=classic", lines[0])
+        self.assertIn("TORUS_BOOK_ROWS='empty (default)'", lines[0])
+
+    def test_flag_line_lists_every_default_changed_flag(self):
+        r, log = self.run_cell(
+            "TORUS_EVM_FAST_PATH=0 TORUS_CHECKPOINT_INTERVAL_MS= TORUS_BOOK_COALESCE=1"
+        )
+        lines = self.flags_line(log)
+        self.assertEqual(len(lines), 1, r.stdout + r.stderr + log)
+        line = lines[0]
+        for k in AUDITED_FLAGS:
+            self.assertEqual(line.count(" %s='" % k), 1, (k, line))
+        self.assertIn("TORUS_EVM_FAST_PATH='0'", line)
+        self.assertIn("TORUS_CHECKPOINT_INTERVAL_MS='empty (default)'", line)
+        self.assertIn("TORUS_BOOK_COALESCE='1'", line)
+        self.assertIn("TORUS_BOOK_FAST_ENCODE='unset (default)'", line)
+        self.assertIn("TORUS_SETTLE_NO_MERGE='unset (default)'", line)
+        # the order is fixed, so two arms' lines diff cleanly
+        pos = [line.index(" %s='" % k) for k in AUDITED_FLAGS]
+        self.assertEqual(pos, sorted(pos), line)
+
+    def test_flag_line_records_the_effective_retention(self):
+        """claude-review P2 (s131): since prune by default a cell without
+        TORUS_RETENTION_BLOCKS runs retention (N = 100,000, DA GC worker and
+        pruner on), so the line names the effective retention per cell."""
+        for extra, want in [
+            ("TORUS_X=1", "retention=100000(default)"),
+            ("TORUS_RETENTION_BLOCKS=0", "retention=archive"),
+            ("TORUS_RETENTION_BLOCKS=1000", "retention=1000"),
+        ]:
+            with self.subTest(extra=extra):
+                r, log = self.run_cell(extra, TORUS_RETENTION_BLOCKS="7")  # ambient: must not leak
+                lines = self.flags_line(log)
+                self.assertEqual(len(lines), 1, r.stdout + r.stderr + log)
+                self.assertIn(" book_mode=", lines[0])
+                self.assertIn(" " + want + " ", lines[0])
+
+    def test_bash_retention_mirrors_start_node_and_the_node(self):
+        fn = self.node_flags_fn()
+        for v, want in RETENTION_CASES:
+            with self.subTest(v=v):
+                env = {k: x for k, x in os.environ.items() if not k.startswith("TORUS_")}
+                if v is not None:
+                    env["TORUS_RETENTION_BLOCKS"] = v
+                r = subprocess.run(["bash", "-c", fn + "\nnode_flags_line"],
+                                   capture_output=True, text=True, timeout=10, env=env)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn(" retention=%s " % want, r.stdout, (v, r.stdout))
+
+    def test_summary_records_the_effective_retention(self):
+        d = tempfile.mkdtemp(prefix="retention-sum-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        write_cell(d, 1_000, 1_000)
+        write_agreement(d, ["same"] * 3)
+        for v, want in RETENTION_CASES:
+            with self.subTest(v=v):
+                env = {} if v is None else {"TORUS_RETENTION_BLOCKS": v}
+                s, _ = run_summarize(d, extra=["--node-env", json.dumps(env)])
+                self.assertEqual(s["cell"]["retention"], want)
+        s, _ = run_summarize(d)
+        self.assertIsNone(s["cell"]["retention"])
+
+    def node_flags_fn(self):
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        i = src.index("NODE_FLAGS_AUDIT=(")
+        j = src.index("node_flags_line() {")
+        return src[i : src.index("\n}\n", j) + 3]
+
+    def test_bash_book_mode_mirrors_the_node_parse(self):
+        fn = self.node_flags_fn()
+        for v, mode in BOOK_MODE_CASES:
+            with self.subTest(v=v):
+                env = {k: x for k, x in os.environ.items() if not k.startswith("TORUS_")}
+                if v is not None:
+                    env["TORUS_BOOK_ROWS"] = v
+                r = subprocess.run(["bash", "-c", fn + "\nnode_flags_line"],
+                                   capture_output=True, text=True, timeout=10, env=env)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertTrue(r.stdout.startswith("book_mode=%s " % mode), (v, r.stdout))
+
+    def test_summary_records_book_mode_and_flags(self):
+        d = tempfile.mkdtemp(prefix="book-mode-sum-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        write_cell(d, 1_000, 1_000)
+        write_agreement(d, ["same"] * 3)
+        for v, mode in BOOK_MODE_CASES:
+            with self.subTest(v=v):
+                env = {"TORUS_EVM_FAST_PATH": "0"}
+                if v is not None:
+                    env["TORUS_BOOK_ROWS"] = v
+                s, _ = run_summarize(d, extra=["--node-env", json.dumps(env)])
+                self.assertEqual(s["cell"]["book_mode"], mode)
+                flags = s["cell"]["node_flags"]
+                self.assertEqual(list(flags), list(AUDITED_FLAGS))
+                self.assertEqual(flags["TORUS_EVM_FAST_PATH"], "0")
+                self.assertEqual(flags["TORUS_SETTLE_NO_MERGE"], "unset (default)")
+                want = ("unset (default)" if v is None
+                        else "empty (default)" if v == "" else v)
+                self.assertEqual(flags["TORUS_BOOK_ROWS"], want)
+        # an empty node env (all defaults) is Classic too
+        s, _ = run_summarize(d, extra=["--node-env", "{}"])
+        self.assertEqual(s["cell"]["book_mode"], "classic")
+        # a cell without a recorded node env says nothing rather than guessing
+        s, _ = run_summarize(d)
+        self.assertIsNone(s["cell"]["book_mode"])
+        self.assertIsNone(s["cell"]["node_flags"])
 
 if __name__ == "__main__":
     if not os.path.exists(DIGEST_SH):

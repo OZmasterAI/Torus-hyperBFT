@@ -73,6 +73,11 @@ fn key() -> Vec<u8> {
 fn apply(layer: &CheckpointLayer) -> (StateDb, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = StateDb::open(dir.path()).expect("open db");
+    // Pre-testnet P0: orders need a listed market (placeholder rows,
+    // tick / lot 1, as the old implicit book).
+    for m in 1..=64u64 {
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+    }
     let mut batch = WriteBatch::default();
     layer.append_to_batch(&db, &mut batch).unwrap();
     db.write(batch).unwrap();
@@ -107,6 +112,11 @@ impl Chain {
         defer_books_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let db = StateDb::open(dir.path()).expect("open db");
+        // Pre-testnet P0: orders need a listed market (placeholder rows,
+        // tick / lot 1, as the old implicit book).
+        for m in 1..=64u64 {
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+        }
         {
             let ctx0 = NativeExecContext::new_with_mode(
                 db.clone(),
