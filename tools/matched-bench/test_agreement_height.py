@@ -104,7 +104,7 @@ class AgreementCompareHeightTest(unittest.TestCase):
         j = self.src.index('cat "$OUT/agreement.jsonl" >> "$OUT/run.log"', i)
         return self.src[i:j]
 
-    def run_step(self, nodes, hgt):
+    def run_step(self, nodes, hgt, live=(0, 1, 2), rpcs=None):
         """Runs the agreement step (compare height + block fetch) against `nodes` (make_node kwargs) with
         metrics heights `hgt`; returns (agreement rows, run.log text)."""
         servers = [make_node(**n) for n in nodes]
@@ -130,7 +130,10 @@ class AgreementCompareHeightTest(unittest.TestCase):
                 self.fn("mval() {"),
                 self.fn("rpc() { #"),
                 self.fn("agree_cmp_height() {"),
-                "RPCS=(%s)" % " ".join(s[1] for s in servers),
+                "RPCS=(%s)" % " ".join(rpcs or [s[1] for s in servers]),
+                # run-cell's survivors (KILL_NO_RESTART) or every node, and its LIVE_RPCS line verbatim
+                "LIVE_IDX=(%s)" % " ".join(map(str, live)),
+                next(l for l in self.src.splitlines() if l.startswith("LIVE_RPCS=(); for i in")),
                 "declare -a HGT=(%s) DHGT=(%s) DIGSECS=(0 0 0) DIGSHA=(d d d)"
                 % (" ".join(map(str, hgt)), " ".join(map(str, hgt))),
                 "HCMP=$(( %d - 5 )); HHEX=$(printf '0x%%x' \"$HCMP\")" % hmin,
@@ -168,6 +171,26 @@ class AgreementCompareHeightTest(unittest.TestCase):
         )
         self.assertEqual([r["cmp_height"] for r in rows], [2060] * 3, log)
         self.assertNotIn("ERR", {r["block_hash"] for r in rows}, log)
+
+    def test_kill_no_restart_compares_the_survivors_only(self):
+        """KILL_NO_RESTART=val1: survivors val0 + val2. val1 (lowest head here) is not asked; the compare height
+        is the survivors' lowest served head, and val2's served head is read at ITS position in LIVE_RPCS"""
+        rows, log = self.run_step([dict(head=1990), dict(head=1950), dict(head=2000)], [2037, 2036, 2037],
+                                  live=(0, 2))
+        self.assertEqual([r["node"] for r in rows], ["val0", "val2"], log)
+        self.assertEqual([r["cmp_height"] for r in rows], [1990, 1990], log)
+        self.assertNotIn("ERR", {r["block_hash"] for r in rows}, log)
+        self.assertNotIn("ERROR", log)
+
+    def test_kill_no_restart_dead_rpc_is_never_called(self):
+        servers = [make_node(head=1990), make_node(head=2000)]
+        for s in servers:
+            self.addCleanup(s[0].shutdown)
+        rows, log = self.run_step([dict(head=1), dict(head=1), dict(head=1)], [2037, 2036, 2037], live=(0, 2),
+                                  rpcs=[servers[0][1], "http://127.0.0.1:9", servers[1][1]])
+        self.assertEqual([r["node"] for r in rows], ["val0", "val2"], log)
+        self.assertEqual([r["cmp_height"] for r in rows], [1990, 1990], log)
+        self.assertEqual({r["block_hash"] for r in rows}, {"0xh%x" % 1990}, log)
 
     def test_older_binary_keeps_hmin_minus_5(self):
         """an older binary writes the marker every block: its served head is the committed head, >= HMIN-5,

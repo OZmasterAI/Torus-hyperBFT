@@ -376,7 +376,22 @@ VERBATIM_FUNCS = (
     "dumeas",
     "savelog",
 )
-FUNC_SUBST = {"memguard": ("/proc/meminfo", '"$PROC/meminfo"')}
+FUNC_SUBST = {
+    "memguard": ("/proc/meminfo", '"$PROC/meminfo"'),
+    # run-cell.sh KILL_NO_RESTART (s134): the one-validator-down baseline kills a validator for good; its death is
+    # not a mid-cell node death once crash-kill.sh norestart logged the marker for exactly that pid
+    "watch_nodes": (
+        '            fi\n            if ! kill -0 "$p" 2>/dev/null; then\n',
+        '            fi\n'
+        "            # run-cell.sh KILL_NO_RESTART: this exact pid's death is expected once crash-kill.sh norestart"
+        " logged its marker\n"
+        '            if ! kill -0 "$p" 2>/dev/null && grep -qF "kill-no-restart: SIGKILL val$i pid $p "'
+        ' "$o/run.log" 2>/dev/null; then\n'
+        "                i=$((i+1)); continue\n"
+        "            fi\n"
+        '            if ! kill -0 "$p" 2>/dev/null; then\n',
+    ),
+}
 # cell(): the Job 4 drivers' watcher and sampler wiring, in their order (lines compared stripped)
 CELL_WIRING = [
     'dusamp "$R/$label" & DP=$!',
@@ -1724,6 +1739,43 @@ class WatchNodesTest(FakeHostBase):
         self.assertIn("all 3 node pids alive at every 0.5 s check", life)
         self.assertIn("stop-3val window", life)
         self.assertIsNone(hp.poll())  # not TERMed
+
+    def test_no_restart_kill_of_the_named_pid_is_no_death(self):
+        """run-cell.sh KILL_NO_RESTART: crash-kill.sh norestart logs the marker for val2's pid, then val2 dies for
+        good; the watcher keeps watching the survivors and the harness stop ends it as usual"""
+        pids = self.nodes(die=2)
+        hp, _ = self.harness()
+        runlog = os.path.join(self.cell, "run.log")
+        with open(runlog, "a") as f:
+            f.write("kill-no-restart: SIGKILL val2 pid %d (no restart; height=600 committed=602)\n" % pids[2])
+        stop = (
+            '(sleep 2.5; for p in %d %d; do echo "stopping pid $p"; done >> %s; echo stopped. >> %s) &'
+            % (pids[0], pids[1], shlex.quote(runlog), shlex.quote(runlog))
+        )
+        r = self.lib(
+            self.drv,
+            '%s\nwatch_nodes %s %d; echo "WN=$?"' % (stop, shlex.quote(self.cell), hp.pid),
+            env=self.env(),
+        )
+        self.assertIn("WN=0", r.stdout, r.stdout + r.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.cell, "node-death.txt")))
+        self.assertIsNone(hp.poll())  # not TERMed
+
+    def test_no_restart_marker_does_not_cover_another_node(self):
+        """the marker names val2's pid: val1 dying is still a mid-cell death"""
+        pids = self.nodes(die=1)
+        hp, _ = self.harness()
+        with open(os.path.join(self.cell, "run.log"), "a") as f:
+            f.write("kill-no-restart: SIGKILL val2 pid %d (no restart; height=600 committed=602)\n" % pids[2])
+        r = self.lib(
+            self.drv,
+            'watch_nodes %s %d; echo "WN=$?"' % (shlex.quote(self.cell), hp.pid),
+            env=self.env(),
+        )
+        self.assertIn("WN=3", r.stdout, r.stdout + r.stderr)
+        death = open(os.path.join(self.cell, "node-death.txt")).read()
+        self.assertIn("DEATH node val1 comm=torus-node pid=%d " % pids[1], death)
+        self.assertEqual(hp.wait(timeout=10), 130)
 
     def test_step_flags_the_dead_cell(self):
         """a clean fixture cell (rc 0, ACCEPT AGREE, md5 ok) whose node dies: its cells.tsv row is bad:death"""

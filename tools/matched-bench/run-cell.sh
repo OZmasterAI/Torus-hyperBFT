@@ -103,7 +103,9 @@
 #   BENCH_RPCS=all  bench ingress over all three validators (the bench pins
 #                sender i to url i % 3). DEFAULT since s76 (unset = all).
 #                BENCH_RPCS=0 = val0 only, the ingress every pre-s76 cell used.
-#                Recorded via cell.bench_cmd.
+#                BENCH_RPCS=0,1 (a comma list of distinct validator indices)
+#                = those validators only (KILL_NO_RESTART needs the killed one
+#                out of it). Recorded via cell.bench_cmd.
 #   OVERWRITE=1  allow reusing an existing non-empty results dir
 #   HEALTH_TIMEOUT (240 s)
 #   DRAIN_TIMEOUT  default 180 + 2*MARKETS s (300 markets => 780 s). A 300-market
@@ -145,6 +147,37 @@
 #                NEVER val0 (it serves the bench RPC and every headline number),
 #                and never anything outside this devnet — see the guard in
 #                crash-kill.sh.
+#   KILL_NO_RESTART=val1|val2  KILL_NO_RESTART_AT_S=N  ONE VALIDATOR DOWN (s134
+#                baseline): N seconds into the load, SIGKILL that validator and
+#                NEVER restart it (crash-kill.sh norestart: the same target guard;
+#                its line in $RUN_DIR/pids is blanked, kill-norestart.json records
+#                the pid, kill time and its height / committed / exec queue at the
+#                kill). Both or neither; unset (default) = off, nothing below
+#                changes. N: the crash gate's window (>= 10, <= DUR-30). Refused
+#                with CRASH_KILL_AT_S, ORACLE_FEED=1 (a fresh mark needs all 3
+#                validators), EVM_LOAD_RATE > 0 (pinned per-validator senders),
+#                and unless the survivors keep a consensus quorum (> 2/3 of the
+#                power: VALIDATOR_STAKES=2,2,1 with KILL_NO_RESTART=val2; with
+#                equal stakes the chain halts at the kill) and the bench ingress
+#                (BENCH_RPCS) leaves the killed node out (e.g. BENCH_RPCS=0,1;
+#                give the all-up arm the same ingress). After the load every step
+#                runs over the SURVIVORS only: the drain (health.py --exclude), the
+#                after-snapshots, the compare height and agreement.jsonl, the
+#                digest and its funnel snapshots, STATE_HASH_ATTEST's scan
+#                (state_attest.py --exclude; the dead validator's votes are not
+#                required); the killed node is recorded as EXCLUDED (summary.json
+#                .agreement/.liveness excluded_nodes), never as a disagreement.
+#                summary.json .kill_no_restart: killed_node, kill_at_s, kill_ts,
+#                height_at_kill, and per node before/after the kill blk/s,
+#                matched/s, timeouts_per_min (sampler.csv column
+#                torus_consensus_timeout_total_total), views_per_min and the order
+#                age p50/p90/p99; .headline.killed_node. MAX_IN_FLIGHT's block
+#                tail reads val1 instead of val2 when val2 is the one killed.
+#   VALIDATOR_STAKES=a,b,c  per-validator stake weights of the cell genesis
+#                (gen-3val-genesis.sh: stake = weight x the 1M TRS base stake;
+#                positive integers). A genesis input (genesis_cache.py keys it).
+#                Unset (default) = the equal base stakes, genesis byte-identical.
+#                A run-cell.sh knob, never EXTRA_ENV (refused there).
 #   HOTSTUFF_CPUS=a/b/c  pin each node's "hotstuff-algo" thread (the consensus
 #                thread, named by the node binary) to CPU list a / b / c (one
 #                CPU or a range per node, taskset syntax, e.g. 2/6/10 or
@@ -506,6 +539,9 @@ DIGEST_PAR=${DIGEST_PAR:-8}
 RPC_TIMEOUT=${RPC_TIMEOUT:-60}
 CRASH_KILL_AT_S=${CRASH_KILL_AT_S:-}
 KILL_NODE=${KILL_NODE:-val1}
+KILL_NO_RESTART=${KILL_NO_RESTART:-}
+KILL_NO_RESTART_AT_S=${KILL_NO_RESTART_AT_S:-}
+VALIDATOR_STAKES=${VALIDATOR_STAKES:-}
 HOTSTUFF_CPUS=${HOTSTUFF_CPUS:-}
 SCHED_THREADS="hotstuff-algo torus-execution torus-flush-worker"
 ORACLE_FEED=${ORACLE_FEED:-0}
@@ -689,10 +725,21 @@ fi
 RPCS=(http://127.0.0.1:8645 http://127.0.0.1:8646 http://127.0.0.1:8647)
 # s76: which validators take bench ingress (see BENCH_RPCS in the usage).
 bench_rpc_urls() {
+    local i seen=, out=()
     case "${BENCH_RPCS:-}" in
         0) printf '%s\n' "${RPCS[0]}" ;;
         ""|all) (IFS=,; printf '%s\n' "${RPCS[*]}") ;;
-        *) echo "FATAL: BENCH_RPCS must be unset, all or 0 (got '$BENCH_RPCS')" >&2; return 2 ;;
+        *)
+            # a comma list of distinct validator indices, e.g. 0,1 (KILL_NO_RESTART=val2)
+            if [[ "$BENCH_RPCS" =~ ^[0-2](,[0-2]){0,2}$ ]]; then
+                for i in ${BENCH_RPCS//,/ }; do
+                    case "$seen" in *",$i,"*) echo "FATAL: BENCH_RPCS=$BENCH_RPCS lists val$i twice" >&2; return 2 ;; esac
+                    seen+="$i,"; out+=("${RPCS[$i]}")
+                done
+                (IFS=,; printf '%s\n' "${out[*]}")
+            else
+                echo "FATAL: BENCH_RPCS must be unset, all, 0 or a comma list of validator indices such as 0,1 (got '$BENCH_RPCS')" >&2; return 2
+            fi ;;
     esac
 }
 BENCH_RPC_URLS=$(bench_rpc_urls) || exit 2
@@ -787,6 +834,7 @@ case "$DEFER_REPORT_SCANS" in 0|1) ;; *) echo "FATAL: DEFER_REPORT_SCANS must be
 # EXTRA_ENV is exported mid-run: there a harness variable would overwrite this script's own (DEFER_REPORT_SCANS
 # before the report scans read it; GENESIS_CACHE_DIR reaches only the nodes). Set them in run-cell.sh's env.
 for kv in $EXTRA_ENV; do case $kv in DEFER_REPORT_SCANS=*|GENESIS_CACHE_DIR=*) echo "FATAL: ${kv%%=*} in EXTRA_ENV (the node env): a run-cell.sh variable, set it in run-cell.sh's own env (the campaign driver sets it from its preflight)" >&2; exit 2 ;; esac; done
+for kv in $EXTRA_ENV; do case $kv in VALIDATOR_STAKES=*|KILL_NO_RESTART=*|KILL_NO_RESTART_AT_S=*) echo "FATAL: ${kv%%=*} in EXTRA_ENV (the node env, exported after the genesis and the launch): a run-cell.sh knob, set it in run-cell.sh's own env (a campaign arm: harness_env)" >&2; exit 2 ;; esac; done
 # shellcheck source=log-scans.sh
 . "$SELF_DIR/log-scans.sh" 2>/dev/null || { echo "FATAL: $SELF_DIR/log-scans.sh missing (copy it beside run-cell.sh)" >&2; exit 1; }
 [ -z "$GENESIS_CACHE_DIR" ] || [ -f "$SELF_DIR/genesis_cache.py" ] \
@@ -843,6 +891,8 @@ for v in EXPECT_NODE_MD5 EXPECT_BENCH_MD5; do
 done
 [[ "$ORACLE_WALK_BP" =~ ^[0-9]+$ ]] && [ "$ORACLE_WALK_BP" -lt 1250 ] \
     || { echo "FATAL: ORACLE_WALK_BP must be an integer in 0..1249 (got '$ORACLE_WALK_BP')" >&2; exit 2; }
+[ -z "$VALIDATOR_STAKES" ] || [[ "$VALIDATOR_STAKES" =~ ^[1-9][0-9]{0,5},[1-9][0-9]{0,5},[1-9][0-9]{0,5}$ ]] \
+    || { echo "FATAL: VALIDATOR_STAKES must be three positive integer stake weights a,b,c (val0,val1,val2; got '$VALIDATOR_STAKES')" >&2; exit 2; }
 [[ "$LIQ_THIN" =~ ^[0-9]{1,9}$ ]] || { echo "FATAL: LIQ_THIN must be a non-negative integer (got '$LIQ_THIN')" >&2; exit 2; }
 LIQ_THIN=$((10#$LIQ_THIN))
 if [ "$LIQ_THIN" -gt 0 ]; then
@@ -984,6 +1034,45 @@ if [ -n "$CRASH_KILL_AT_S" ]; then
         echo "FATAL: CRASH_KILL_AT_S=$CRASH_KILL_AT_S is not a valid kill list for a ${DUR}s cell (each offset >= 10 and <= $((DUR-30)); killing during the drain hangs the agreement probe; a list must strictly increase with >= ${CRASH_KILL_MIN_GAP_S}s between kills)" >&2; exit 2; }
     IFS=, read -r -a CRASH_AT <<< "$CRASH_KILL_AT_S"
 fi
+
+# ---- no-restart kill (KILL_NO_RESTART) pre-flight. Off (the default): KNR_IDX
+# stays empty, LIVE_IDX = all three, and every step below runs as before.
+# LIVE_IDX = the validators that take part after the load (the survivors).
+KNR_IDX=""
+LIVE_IDX=(0 1 2)
+if [ -n "$KILL_NO_RESTART" ] || [ -n "$KILL_NO_RESTART_AT_S" ]; then
+    [ -n "$KILL_NO_RESTART" ] && [ -n "$KILL_NO_RESTART_AT_S" ] \
+        || { echo "FATAL: KILL_NO_RESTART (val1|val2) and KILL_NO_RESTART_AT_S (seconds into the load) go together" >&2; exit 2; }
+    [ -z "$CRASH_KILL_AT_S" ] || { echo "FATAL: KILL_NO_RESTART and CRASH_KILL_AT_S exclude each other (one kills for good, the other restarts)" >&2; exit 2; }
+    [ -x "$TOOLS_DIR/crash-kill.sh" ] || { echo "FATAL: $TOOLS_DIR/crash-kill.sh missing" >&2; exit 1; }
+    # shellcheck source=/dev/null
+    CRASH_KILL_LIB=1 source "$TOOLS_DIR/crash-kill.sh"
+    case "$KILL_NO_RESTART" in
+        val1) KNR_IDX=1 ;;
+        val2) KNR_IDX=2 ;;
+        *) echo "FATAL: KILL_NO_RESTART must be val1 or val2 (never val0 — it serves the bench RPC and every headline number)" >&2; exit 2 ;;
+    esac
+    # the selected tools must know the mode: a candidate worktree's older copies would kill and restart, drain
+    # all three nodes (never quiet), or score two agreement rows as INCOMPLETE
+    { declare -F crash_norestart_quorum_ok >/dev/null && grep -q -- '--exclude' "$TOOLS_DIR/health.py" 2>/dev/null \
+        && grep -q 'kill-norestart.json' "$TOOLS_DIR/summarize.py" 2>/dev/null; } \
+        || { echo "FATAL: KILL_NO_RESTART needs crash-kill.sh norestart, health.py drain --exclude and a summarize.py that reads kill-norestart.json, and $TOOLS_DIR lacks one (TOOLS_FROM_WORKTREE=$TOOLS_FROM_WORKTREE; point TOOLS_DIR= at a newer tools/matched-bench)" >&2; exit 1; }
+    crash_kill_at_ok "$KILL_NO_RESTART_AT_S" "$DUR" \
+        || { echo "FATAL: KILL_NO_RESTART_AT_S=$KILL_NO_RESTART_AT_S is not inside the load window of a ${DUR}s cell (>= 10 and <= $((DUR-30)); DUR >= 40)" >&2; exit 2; }
+    crash_norestart_quorum_ok "$KNR_IDX" "${VALIDATOR_STAKES:-1,1,1}" \
+        || { echo "FATAL: KILL_NO_RESTART=$KILL_NO_RESTART: the two validators left would hold no consensus quorum (> 2/3 of the power) under stakes ${VALIDATOR_STAKES:-1,1,1} (VALIDATOR_STAKES): the chain would halt at the kill. Use VALIDATOR_STAKES=2,2,1 with KILL_NO_RESTART=val2" >&2; exit 2; }
+    [ "$ORACLE_FEED" != 1 ] || { echo "FATAL: KILL_NO_RESTART with ORACLE_FEED=1: a fresh oracle aggregate needs all 3 validators, the marks would go stale at the kill" >&2; exit 2; }
+    ! evm_load_on || { echo "FATAL: KILL_NO_RESTART with EVM_LOAD_RATE > 0: the EVM senders are pinned one validator each" >&2; exit 2; }
+    case ",$BENCH_RPC_URLS," in
+        *",${RPCS[$KNR_IDX]},"*) echo "FATAL: KILL_NO_RESTART=$KILL_NO_RESTART but the bench sends to it (BENCH_RPCS='${BENCH_RPCS:-all}': $BENCH_RPC_URLS): its senders would fail from the kill on. Set BENCH_RPCS to the survivors (e.g. BENCH_RPCS=0,1), and the same on the all-up arm for a like-for-like ingress" >&2; exit 2 ;;
+    esac
+    LIVE_IDX=()
+    for i in 0 1 2; do [ "$i" = "$KNR_IDX" ] || LIVE_IDX+=("$i"); done
+fi
+LIVE_RPCS=(); for i in "${LIVE_IDX[@]}"; do LIVE_RPCS+=("${RPCS[$i]}"); done
+# Drain / attest scan: the killed node is excluded (empty = every node)
+KNR_EXCLUDE_ARGS=()
+[ -z "$KNR_IDX" ] || KNR_EXCLUDE_ARGS=(--exclude "$KILL_NO_RESTART")
 
 # ---- liquidation stress (row 76) helpers
 # liq_stress_on: either knob set -> the vault digest/RPC and liquidation sampling.
@@ -1179,7 +1268,7 @@ fi
 mkdir -p "$OUT"
 : > "$OUT/run.log"
 
-SAMPLER_PID=""; CPU_PID=""; BENCH_PID=""; CRASH_PID=""; ORACLE_PID=""; ORACLE_RC=""
+SAMPLER_PID=""; CPU_PID=""; BENCH_PID=""; CRASH_PID=""; KNR_PID=""; ORACLE_PID=""; ORACLE_RC=""
 # alive <pid>: running or stopped, NOT an unreaped zombie (kill -0 succeeds on those).
 alive() { local s; s=$(ps -o stat= -p "$1" 2>/dev/null) && [ -n "$s" ] && [ "${s#Z}" = "$s" ]; }
 # Idempotent; safe on every exit path. TERM first, CONT so a feed paused for the
@@ -1243,6 +1332,7 @@ finish_fail() {
     [ -n "$CPU_PID" ] && kill "$CPU_PID" 2>/dev/null
     [ -n "$BENCH_PID" ] && kill "$BENCH_PID" 2>/dev/null
     [ -n "$CRASH_PID" ] && kill "$CRASH_PID" 2>/dev/null
+    [ -n "${KNR_PID:-}" ] && kill "$KNR_PID" 2>/dev/null
     stop_oracle_feed
     evm_load_stop
     "$WSL/stop-3val.sh" >>"$OUT/run.log" 2>&1 || true
@@ -1311,7 +1401,7 @@ genesis_key() { # key | store ARGS...: genesis_cache.py with this cell's key inp
     python3 -I "$SELF_DIR/genesis_cache.py" "$cmd" --root "$MAINREPO" --run-cell "$SELF_DIR/run-cell.sh" \
         --param MARKETS="$MARKETS" --param BULK_COUNT="$BULK_COUNT" --param TIMEOUT_BASE_MS="$GEN_TIMEOUT_BASE_MS" \
         --param EVM_BLOCK_INTERVAL="$GEN_EVM_BLOCK_INTERVAL" --param LIQ_THIN="$LIQ_THIN" --param LIQ_THIN_AVAIL="$LIQ_THIN_AVAIL" \
-        --param BOOK_MODE="$GEN_BOOK_MODE" "$@"
+        --param BOOK_MODE="$GEN_BOOK_MODE" --param VALIDATOR_STAKES="$VALIDATOR_STAKES" "$@"
 }
 genesis_key_store() {
     genesis_key store --dir "$GENESIS_CACHE_DIR" --genesis "$GENESIS" --md5 "$GEN_MD5" $GEN_FORCED \
@@ -1354,7 +1444,7 @@ else
     fi
     # The generator's run.log bytes (GEN_LOG_FROM..GEN_LOG_TO) go into the cache entry (genesis_key_store).
     GEN_LOG_FROM=$(stat -c %s -- "$OUT/run.log")
-    TIMEOUT_BASE_MS=$GEN_TIMEOUT_BASE_MS EVM_BLOCK_INTERVAL=$GEN_EVM_BLOCK_INTERVAL BOOK_MODE=$GEN_BOOK_MODE MARKETS=$MARKETS BULK_COUNT=$BULK_COUNT OUT="$GENESIS" BENCH_BIN="$BENCH" "$MAINREPO/devnet/wsl/gen-3val-genesis.sh" >>"$OUT/run.log" 2>&1 \
+    TIMEOUT_BASE_MS=$GEN_TIMEOUT_BASE_MS EVM_BLOCK_INTERVAL=$GEN_EVM_BLOCK_INTERVAL BOOK_MODE=$GEN_BOOK_MODE VALIDATOR_STAKES=$VALIDATOR_STAKES MARKETS=$MARKETS BULK_COUNT=$BULK_COUNT OUT="$GENESIS" BENCH_BIN="$BENCH" "$MAINREPO/devnet/wsl/gen-3val-genesis.sh" >>"$OUT/run.log" 2>&1 \
         || die "genesis generation failed (see run.log)"
     GEN_LOG_TO=$(stat -c %s -- "$OUT/run.log")
     GEN_TBMS=$(jq '.consensus.timeout_base_ms' "$GENESIS")
@@ -1395,6 +1485,8 @@ log "genesis markets=$GEN_MARKETS native_balances=$GEN_ACCTS bulk_count=$GEN_BUL
 [ "$GEN_BOOK_MODE_GOT" = "${GEN_BOOK_MODE:-classic}" ] \
     || die "genesis consensus.book_mode=$GEN_BOOK_MODE_GOT, wanted ${GEN_BOOK_MODE:-classic} (${GEN_BOOK_MODE_SRC:-no TORUS_BOOK_ROWS / BOOK_MODE in EXTRA_ENV}): gen-3val-genesis.sh copies .consensus from $MAINREPO/testnet/genesis-weighted-full.json; remove a hand patch there (set the mode per cell with EXTRA_ENV BOOK_MODE= or TORUS_BOOK_ROWS=)"
 log "genesis consensus.book_mode=$GEN_BOOK_MODE_GOT (${GEN_BOOK_MODE_SRC:-absent: classic})"
+[ -z "$VALIDATOR_STAKES" ] || log "genesis validator stakes: VALIDATOR_STAKES=$VALIDATOR_STAKES (val0,val1,val2 weights x the base stake; gen-3val-genesis.sh validator_stakes line above)"
+[ -z "$KNR_IDX" ] || log "no-restart kill: KILL_NO_RESTART=$KILL_NO_RESTART at bench+${KILL_NO_RESTART_AT_S}s, never restarted; stakes ${VALIDATOR_STAKES:-1,1,1}; bench ingress $BENCH_RPC_URLS; after the load only val${LIVE_IDX[0]} val${LIVE_IDX[1]} are drained, digested and compared"
 if [ "$GEN_REUSED" != 1 ]; then
     if [ -n "$GENESIS_CACHE_DIR" ]; then
         # Keyed again by the store, after the build: a first (or FORCE=1) build writes the weighted-full genesis.
@@ -1665,7 +1757,7 @@ cpusampler() {
     echo "ts,load1,load5,ncpu,pid,comm,pcpu,rss_kb" > "$OUT/cpu.csv"
     while true; do
         ts=$(date +%s); read -r l1 l5 _ < /proc/loadavg
-        ps -o pid=,comm=,pcpu=,rss= -p "$(tr '\n' ',' < "$RUN_DIR/pids" | sed 's/,$//')${BENCH_PID:+,$BENCH_PID}${EVM_PID:+,$EVM_PID}" 2>/dev/null \
+        ps -o pid=,comm=,pcpu=,rss= -p "$(grep -v '^$' "$RUN_DIR/pids" | tr '\n' ',' | sed 's/,$//')${BENCH_PID:+,$BENCH_PID}${EVM_PID:+,$EVM_PID}" 2>/dev/null \
             | awk -v ts="$ts" -v l1="$l1" -v l5="$l5" -v n="$(nproc)" '{printf "%s,%s,%s,%s,%s,%s,%s,%s\n",ts,l1,l5,n,$1,$2,$3,$4}' >> "$OUT/cpu.csv"
         sleep 10
     done
@@ -1691,7 +1783,9 @@ BENCH_CMD=("$BENCH" consensus --rpc-urls "$BENCH_RPC_URLS" --econ --senders "$SE
 [ -n "$MPS" ] && BENCH_CMD+=(--markets-per-sender "$MPS")
 [ -n "$OPEN_ORDER_BUDGET" ] && BENCH_CMD+=(--open-order-budget "$OPEN_ORDER_BUDGET")
 [ "$RETRY_BUSY" = 1 ] && BENCH_CMD+=(--retry-busy)
-[ -n "$MAX_IN_FLIGHT" ] && BENCH_CMD+=(--max-in-flight "$MAX_IN_FLIGHT" --in-flight-watch-rpc "${RPCS[2]}")
+# the in-flight block tail reads val2, never val0; val1 when val2 is the one KILL_NO_RESTART kills
+IN_FLIGHT_WATCH_IDX=2; [ "${KNR_IDX:-}" != 2 ] || IN_FLIGHT_WATCH_IDX=1
+[ -n "$MAX_IN_FLIGHT" ] && BENCH_CMD+=(--max-in-flight "$MAX_IN_FLIGHT" --in-flight-watch-rpc "${RPCS[${IN_FLIGHT_WATCH_IDX:-2}]}")
 [ -n "$IN_FLIGHT_TAIL" ] && BENCH_CMD+=(--in-flight-tail "$IN_FLIGHT_TAIL")
 [ -n "$SPAM_CANCEL_KEYS" ] && BENCH_CMD+=(--spam-cancel-keys "$SPAM_CANCEL_KEYS")
 [ -n "$SPAM_CANCEL_RATE" ] && BENCH_CMD+=(--spam-cancel-rate "$SPAM_CANCEL_RATE")
@@ -1743,6 +1837,14 @@ if [ -n "$CRASH_KILL_AT_S" ]; then
     crash_sequence >>"$OUT/run.log" 2>&1 &
     CRASH_PID=$!
 fi
+# KILL_NO_RESTART: one SIGKILL at bench+KILL_NO_RESTART_AT_S, no restart (crash-kill.sh norestart: the target
+# guard, the pre-kill snapshot, the marker line, the blanked pids line, kill-norestart.json).
+KNR_RC=""
+if [ -n "$KNR_IDX" ]; then
+    log "no-restart kill ARMED: SIGKILL $KILL_NO_RESTART at bench+${KILL_NO_RESTART_AT_S}s, never restarted"
+    { sleep "$KILL_NO_RESTART_AT_S"; "$TOOLS_DIR/crash-kill.sh" norestart "$WT" "$KNR_IDX" "$OUT" "$KILL_NO_RESTART_AT_S"; } >>"$OUT/run.log" 2>&1 &
+    KNR_PID=$!
+fi
 wait "$BENCH_PID"; BENCH_RC=$?
 if [ -n "$CRASH_PID" ]; then
     # rc is informational: bash may already have reaped the sub-shell, and a
@@ -1754,6 +1856,14 @@ fi
 if [ -n "$CRASH_KILL_AT_S" ] && [ ! -s "$OUT/crash-kill.json" ]; then
     die "crash gate did not complete (no crash-kill.json) — the node was not killed+restarted, see run.log"
 fi
+if [ -n "$KNR_PID" ]; then
+    wait "$KNR_PID"; KNR_RC=$?; KNR_PID=""
+    log "no-restart kill exited rc=$KNR_RC"
+fi
+if [ -n "$KNR_IDX" ] && [ ! -s "$OUT/kill-norestart.json" ]; then
+    die "no-restart kill did not complete (no kill-norestart.json) — $KILL_NO_RESTART was not killed as planned, see run.log"
+fi
+[ -z "$KNR_IDX" ] || log "no-restart kill: $(jq -c '{kill_node, killed_pid, kill_at_s, height_at_kill: .pre_kill.block_height, committed_at_kill: .pre_kill.blocks_committed}' "$OUT/kill-norestart.json" 2>/dev/null); survivors val${LIVE_IDX[0]} val${LIVE_IDX[1]}"
 # multi-crash: every planned kill needs its record, except a logged SKIP tail.
 CRASH_DONE=0
 if [ -n "$CRASH_KILL_AT_S" ]; then
@@ -1823,7 +1933,7 @@ if state_attest_on; then
 fi
 if python3 "$TOOLS_DIR/health.py" drain --out "$OUT" --timeout "$DRAIN_TIMEOUT" --quiet "$QUIET_S" \
     --urls "${DRAIN_URLS[@]}" "${FEED_DRAIN_ARGS[@]}" ${ATTEST_DRAIN_ARGS[@]+"${ATTEST_DRAIN_ARGS[@]}"} \
-    >>"$OUT/run.log" 2>&1; then DRAINED=1; fi
+    ${KNR_EXCLUDE_ARGS[@]+"${KNR_EXCLUDE_ARGS[@]}"} >>"$OUT/run.log" 2>&1; then DRAINED=1; fi
 T_DRAIN=$(date +%s)
 log "drained=$DRAINED after $((T_DRAIN - T_BENCH1))s (evidence: drain.json and drain-samples.jsonl)"
 if [ "$ORACLE_FEED_DRAIN" = 1 ]; then
@@ -1837,7 +1947,8 @@ if [ "$ORACLE_FEED_DRAIN" = 1 ]; then
     mkdir -p "$OUT/feed-stop-settle"
     SETTLED=0
     python3 "$TOOLS_DIR/health.py" drain --out "$OUT/feed-stop-settle" --timeout "$FEED_STOP_SETTLE_MAX_S" --quiet "$QUIET_S" \
-        --to-height auto --urls "${DRAIN_URLS[@]}" ${ATTEST_DRAIN_ARGS[@]+"${ATTEST_DRAIN_ARGS[@]}"} >>"$OUT/run.log" 2>&1
+        --to-height auto --urls "${DRAIN_URLS[@]}" ${ATTEST_DRAIN_ARGS[@]+"${ATTEST_DRAIN_ARGS[@]}"} \
+        ${KNR_EXCLUDE_ARGS[@]+"${KNR_EXCLUDE_ARGS[@]}"} >>"$OUT/run.log" 2>&1
     SETTLE_RC=$?
     [ "$SETTLE_RC" = 0 ] && SETTLED=1
     SETTLE_JSON="$OUT/feed-stop-settle/drain.json"
@@ -1861,16 +1972,17 @@ kill "$CPU_PID" 2>/dev/null; CPU_PID=""
 # three scrapes can straddle an attestation block (native counter +1..3 on some
 # nodes only): re-scrape, at most 10 times 1 s apart, until the three native
 # counters agree; still apart is logged and left to summarize.py, as before.
+# KILL_NO_RESTART: the survivors only (LIVE_IDX; the killed node gets no metrics-after file).
 after_snapshots() {
     local try i n
     for try in 1 2 3 4 5 6 7 8 9 10; do
-        for i in 0 1 2; do scrape_one "${METS[$i]}" > "$OUT/metrics-after-val$i.txt"; done
+        for i in "${LIVE_IDX[@]}"; do scrape_one "${METS[$i]}" > "$OUT/metrics-after-val$i.txt"; done
         state_attest_on || return 0
-        n=$(for i in 0 1 2; do mval torus_native_actions_processed_total < "$OUT/metrics-after-val$i.txt"; done | sort -u | wc -l)
+        n=$(for i in "${LIVE_IDX[@]}"; do mval torus_native_actions_processed_total < "$OUT/metrics-after-val$i.txt"; done | sort -u | wc -l)
         [ "$n" = 1 ] && return 0
         [ "$try" = 10 ] || sleep 1
     done
-    log "WARNING: metrics-after: torus_native_actions_processed_total still apart after 10 scrapes ($(for i in 0 1 2; do printf 'val%s=%s ' "$i" "$(mval torus_native_actions_processed_total < "$OUT/metrics-after-val$i.txt")"; done)); summarize.py decides"
+    log "WARNING: metrics-after: torus_native_actions_processed_total still apart after 10 scrapes ($(for i in "${LIVE_IDX[@]}"; do printf 'val%s=%s ' "$i" "$(mval torus_native_actions_processed_total < "$OUT/metrics-after-val$i.txt")"; done)); summarize.py decides"
 }
 after_snapshots
 mapfile -t PIDS_NOW < "$RUN_DIR/pids"; schedstat_snapshot after "${PIDS_NOW[@]}"
@@ -1901,7 +2013,7 @@ agree_cmp_height() { # BASE URL... -> AGREE_HCMP = min(BASE, served heads), AGRE
     return 0
 }
 declare -a HGT
-for i in 0 1 2; do HGT[$i]=$(mval torus_block_height < "$OUT/metrics-after-val$i.txt"); HGT[$i]=${HGT[$i]%.*}; done
+for i in "${LIVE_IDX[@]}"; do HGT[$i]=$(mval torus_block_height < "$OUT/metrics-after-val$i.txt"); HGT[$i]=${HGT[$i]%.*}; done
 HMIN=$(printf '%s\n' "${HGT[@]}" | sort -n | head -1); HMAX=$(printf '%s\n' "${HGT[@]}" | sort -n | tail -1)
 HCMP=$(( HMIN - 5 )); HHEX=$(printf '0x%x' "$HCMP")
 log "heights after drain: ${HGT[*]} (spread $((HMAX-HMIN))); comparing block $HCMP on all nodes"
@@ -1974,13 +2086,13 @@ print(",".join(values[name] for name in wanted))' "$attest"
 }
 funnel_snapshot() {
     local i metrics row snapshot=""
-    for i in 0 1 2; do
+    for i in "${LIVE_IDX[@]}"; do
         metrics=$(scrape_one "${METS[$i]}") || return 1
         row=$(printf '%s\n' "$metrics" | funnel_counters) || return 1
         [ -n "$row" ] || return 1
         snapshot+="${snapshot:+$'\n'}$row"
     done
-    # Emit only a complete three-node snapshot, never a successful partial one.
+    # Emit only a complete snapshot of every live node (three unless KILL_NO_RESTART), never a partial one.
     printf '%s\n' "$snapshot"
 }
 # STATE_HASH_ATTEST=1 digest window (the native counter is out of the funnel
@@ -1992,9 +2104,9 @@ funnel_snapshot() {
 # scraped BEFORE the first funnel snapshot to the highest committed height
 # (executed + torus_exec_queue_depth) scraped AFTER the second one. An
 # unreadable height or body is unavailable evidence: not quiescent.
-attest_window_height() { # lo|hi -> min executed / max committed height over the 3 nodes
+attest_window_height() { # lo|hi -> min executed / max committed height over the live nodes (3 unless KILL_NO_RESTART)
     local i metrics h q v best=""
-    for i in 0 1 2; do
+    for i in "${LIVE_IDX[@]}"; do
         metrics=$(scrape_one "${METS[$i]}") || return 1
         h=$(printf '%s\n' "$metrics" | awk '$1 == "torus_block_height" { print $2 }')
         q=$(printf '%s\n' "$metrics" | awk '$1 == "torus_exec_queue_depth" { print $2 }')
@@ -2011,20 +2123,20 @@ attest_window_clean() { # LO -> 0 iff blocks LO..(max committed now) executed no
     : > "$OUT/digest-attest-window.json"
     [[ "$lo" =~ ^[0-9]+$ ]] || return 1
     hi=$(attest_window_height hi) || return 1
-    python3 -I "$SELF_DIR/attest_traffic.py" window --from "$lo" --to "$hi" --rpc "${RPCS[@]}" \
+    python3 -I "$SELF_DIR/attest_traffic.py" window --from "$lo" --to "$hi" --rpc "${LIVE_RPCS[@]}" \
         > "$OUT/digest-attest-window.json"
 }
 declare -a DHGT DIGSHA DIGSECS
 ATTEST_WIN_LO=""; if [ "${STATE_HASH_ATTEST:-0}" = 1 ]; then ATTEST_WIN_LO=$(attest_window_height lo) || ATTEST_WIN_LO=""; fi
 Q_BEFORE_OK=0
 if Q_BEFORE=$(funnel_snapshot); then Q_BEFORE_OK=1; fi
-for i in 0 1 2; do
+for i in "${LIVE_IDX[@]}"; do
     h=$(scrape_one "${METS[$i]}" | mval torus_block_height); DHGT[$i]=${h%.*}
 done
-log "state digest: $MARKETS markets + $DIG_ACCTS accounts + $DIG_POS_ACCTS position accounts, 3 nodes CONCURRENTLY (par=$DIGEST_PAR/node, rpc timeout ${RPC_TIMEOUT}s), heights ${DHGT[*]}"
+log "state digest: $MARKETS markets + $DIG_ACCTS accounts + $DIG_POS_ACCTS position accounts, ${#LIVE_IDX[@]} nodes CONCURRENTLY (par=$DIGEST_PAR/node, rpc timeout ${RPC_TIMEOUT}s), heights ${DHGT[*]}"
 TDIG0=$(date +%s)
 DIG_PIDS=()
-for i in 0 1 2; do
+for i in "${LIVE_IDX[@]}"; do
     "$TOOLS_DIR/digest-node.sh" "${RPCS[$i]}" "$MARKETS" "$OUT/digest-accounts.txt" \
         "$OUT/state-digest-val$i.txt" "$DIGEST_PAR" "$RPC_TIMEOUT" ${DIG_POS[@]+"${DIG_POS[@]}"} \
         > "$OUT/digest-val$i.out" 2>>"$OUT/run.log" &
@@ -2039,14 +2151,14 @@ ATTEST_WIN_OK=1; if [ "${STATE_HASH_ATTEST:-0}" = 1 ]; then ATTEST_WIN_OK=0; att
 # Liquidation stress: each node's vault (cash, deficit, open positions) while
 # the chain is still quiet; "RPC_ERR" if a node did not answer.
 if liq_stress_on; then
-    for i in 0 1 2; do
+    for i in "${LIVE_IDX[@]}"; do
         rpc "${RPCS[$i]}" torus_getLiquidatorVault '[]' | jq -cS '.result // .error' > "$OUT/vault-val$i.json" 2>/dev/null
         [ -s "$OUT/vault-val$i.json" ] || echo '"RPC_ERR"' > "$OUT/vault-val$i.json"
     done
-    log "liquidator vault: $(for i in 0 1 2; do printf 'val%s=%s ' "$i" "$(cat "$OUT/vault-val$i.json")"; done)"
+    log "liquidator vault: $(for i in "${LIVE_IDX[@]}"; do printf 'val%s=%s ' "$i" "$(cat "$OUT/vault-val$i.json")"; done)"
 fi
 if [ "$Q_BEFORE_OK" = 1 ] && [ "$Q_AFTER_OK" = 1 ] && [ -n "$Q_BEFORE" ] && [ "$Q_BEFORE" = "$Q_AFTER" ] && [ "$ATTEST_WIN_OK" = 1 ]; then DIGEST_QUIESCENT=1; else DIGEST_QUIESCENT=0; fi
-for i in 0 1 2; do
+for i in "${LIVE_IDX[@]}"; do
     sha=""; secs=""; read -r sha secs < "$OUT/digest-val$i.out" || true
     DIGSHA[$i]=${sha:-ERR}; DIGSECS[$i]=${secs:-0}
 done
@@ -2058,17 +2170,20 @@ if [ "$ORACLE_FEED" = 1 ]; then
     log "oracle feed: oracle_feed=1 $(jq -c '{sent,accepted,rejected,last_error}' "$OUT/oracle-feed-stats.json" 2>/dev/null || echo 'stats=MISSING') stale_marks_at_bench_end=$(jq -r '.markets - .usable' <<<"$ORACLE_MEND" 2>/dev/null) fresh_after_s=$ORACLE_FRESH_S"
 fi
 
-agree_cmp_height "$HCMP" "${RPCS[@]}"
+agree_cmp_height "$HCMP" "${LIVE_RPCS[@]}"
 if [ "$AGREE_HCMP" != "$HCMP" ]; then
     log "agreement: block $HCMP is above a node's served (applied) head (served ${AGREE_SERVED[*]}); comparing block $AGREE_HCMP instead"
     HCMP=$AGREE_HCMP; HHEX=$(printf '0x%x' "$HCMP")
 fi
 case " ${AGREE_SERVED[*]} " in *" ERR "*) log "WARNING: agreement: eth_blockNumber unreadable on a node (served ${AGREE_SERVED[*]}); its block read at $HCMP decides" ;; esac
 : > "$OUT/agreement.jsonl"
-for i in 0 1 2; do
+# KILL_NO_RESTART: the survivors' rows only (summarize.py records the killed node as excluded);
+# AGREE_SERVED is positional over LIVE_RPCS (j), the rest is per validator (i).
+for j in "${!LIVE_IDX[@]}"; do
+    i=${LIVE_IDX[$j]}
     blk=$(rpc "${RPCS[$i]}" eth_getBlockByNumber "[\"$HHEX\",false]")
     bh=$(printf '%s' "$blk" | jq -r '.result.hash // "ERR"'); sr=$(printf '%s' "$blk" | jq -r '.result.stateRoot // "ERR"')
-    [ "$bh" = ERR ] && [ "${AGREE_SERVED[$i]}" != ERR ] && log "ERROR: agreement: val$i did not return block $HCMP although it serves up to ${AGREE_SERVED[$i]}: an RPC failure, not the applied-marker lag"
+    [ "$bh" = ERR ] && [ "${AGREE_SERVED[$j]}" != ERR ] && log "ERROR: agreement: val$i did not return block $HCMP although it serves up to ${AGREE_SERVED[$j]}: an RPC failure, not the applied-marker lag"
     dig=${DIGSHA[$i]}
     matched=$(mval torus_orders_matched_total < "$OUT/metrics-after-val$i.txt")
     placed=$(mval torus_orders_placed_accepted_total < "$OUT/metrics-after-val$i.txt")
@@ -2132,7 +2247,8 @@ if state_attest_on; then
         --metrics "http://127.0.0.1:${METS[0]}/metrics" --metrics "http://127.0.0.1:${METS[1]}/metrics" \
         --metrics "http://127.0.0.1:${METS[2]}/metrics" \
         --log "$RUN_DIR/val0.log" --log "$RUN_DIR/val1.log" --log "$RUN_DIR/val2.log" \
-        --keys "$ORACLE_KEYS" --wait-s 90 --activation "$STATE_HASH_ACTIVATION" --out "$OUT/state-attest.json" 2>&1) \
+        --keys "$ORACLE_KEYS" --wait-s 90 --activation "$STATE_HASH_ACTIVATION" --out "$OUT/state-attest.json" \
+        ${KNR_EXCLUDE_ARGS[@]+"${KNR_EXCLUDE_ARGS[@]}"} 2>&1) \
         || STATE_ATTEST_LINE="state attest: ok=0 scan failed: $(tail -c 400 <<<"$STATE_ATTEST_LINE")"
     log "$STATE_ATTEST_LINE"
 fi

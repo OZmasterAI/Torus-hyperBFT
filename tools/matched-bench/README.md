@@ -608,6 +608,69 @@ tools/matched-bench/crash-freeze.py /home/18c/bench-results-matched/<label>
   longest val0 commit gap. Commit times come from `val0.log.gz` (µs), falling
   back to the 1 Hz `sampler.csv` counter.
 
+## One validator down — `KILL_NO_RESTART` (s134 baseline)
+
+All-up vs one validator killed **without** restart. Both arms on the same
+genesis stakes and the same bench ingress:
+
+```
+# all-up arm
+VALIDATOR_STAKES=2,2,1 BENCH_RPCS=0,1 tools/matched-bench/run-cell.sh <wt> knr-up 10 600
+# one-down arm: val2 (stake 1 of 5) SIGKILLed 120 s into the load, never restarted
+VALIDATOR_STAKES=2,2,1 BENCH_RPCS=0,1 KILL_NO_RESTART=val2 KILL_NO_RESTART_AT_S=120 \
+  tools/matched-bench/run-cell.sh <wt> knr-down 10 600
+```
+
+- `KILL_NO_RESTART=val1|val2` + `KILL_NO_RESTART_AT_S=N` (both or neither;
+  unset = off, the cell runs exactly as before). N: the crash gate's window
+  (`>= 10`, `<= DUR-30`). `crash-kill.sh norestart` applies the same target
+  guard as the crash gate (devnet val1/val2 only), snapshots the target's
+  height / committed / exec queue, logs the marker
+  `kill-no-restart: SIGKILL val<i> pid <pid> ...`, kills, and **blanks** the
+  node's line in `$RUN_DIR/pids` (stop-3val.sh and xargs skip a blank line;
+  a dead pid left there would be `kill -9`ed after any reuse). Record:
+  `kill-norestart.json`.
+- **Stakes.** With equal stakes the two survivors hold exactly 2/3 of the
+  power and hotstuff needs more (`quorum = floor(2P/3) + 1`): the chain halts
+  at the kill. Pre-flight refuses that (`crash_norestart_quorum_ok`).
+  `VALIDATOR_STAKES=a,b,c` (`gen-3val-genesis.sh`: stake_i = weight_i x the 1M
+  TRS base stake; `genesis_cache.py` keys it) — `2,2,1` and kill val2 leaves
+  4/5. No automatic downtime jailing is wired into the node
+  (`DowntimeTracker` has no caller), so the set stays 2/2/1 for the whole cell.
+- **Refused combinations:** `CRASH_KILL_AT_S`, `ORACLE_FEED=1` (a fresh oracle
+  aggregate needs all three validators), `EVM_LOAD_RATE > 0` (senders pinned
+  per validator), and a bench ingress that includes the killed node
+  (`BENCH_RPCS` now takes a comma list such as `0,1`; give the all-up arm the
+  same ingress). `MAX_IN_FLIGHT`'s block tail reads val1 when val2 is killed.
+- **After the load only the survivors take part:** the drain
+  (`health.py drain --exclude val2`: quiet counters and commit progress on the
+  survivors), metrics-after, the compare height and `agreement.jsonl`, the
+  state digest and its funnel snapshots, the liquidator vault. summarize.py
+  reads `kill-norestart.json`, drops the dead node's failed scrapes (all-zero
+  rows, `scrape_valid=0`) from `sampler.csv`, compares agreement over the
+  survivors and judges liveness over them; the killed node is listed in
+  `agreement.excluded_nodes` / `liveness.excluded_nodes`, never as a
+  disagreement, so it cannot REJECT the cell by itself.
+- **`STATE_HASH_ATTEST=1` + kill** works only because the stakes leave a
+  quorum: the attestation quorum is stake-weighted `> 2/3` (staking.rs), so
+  with 2/2/1 and val2 down val0+val1 (4/5) still certify every checkpoint.
+  `state_attest.py scan --exclude val2` reads the survivors only and does not
+  require the dead validator's votes. (Equal stakes are refused anyway: no
+  consensus quorum.) A 4-validator devnet is not supported by the harness.
+- **summary.json `kill_no_restart`**: `killed_node`, `kill_at_s`, `kill_ts`,
+  `height_at_kill`, `committed_at_kill`, `survivors`, and per node the load
+  window split at the kill (`windows.before` = `[t_bench0, kill_ts]`,
+  `windows.after` = `[kill_ts, t_bench1]`; the dead node: before only):
+  `blk_s`, `committed_blk_s`, `matched_s`, `timeouts_per_min`,
+  `views_per_min`, `order_age_ms` (p50/p90/p99 per stage). `headline` gains
+  `killed_node`, `kill_at_s`, `height_at_kill`. Timeout views per minute over
+  time: `sampler.csv`, column `torus_consensus_timeout_total_total` (1 Hz, per
+  node); `torus_consensus_view` beside it.
+- **Campaign driver:** put the knobs in the arm's `harness_env`
+  (`campaign/run_cell.py` allows them too). `watch_nodes` accepts the death of
+  exactly the pid named in the marker line; any other node death still aborts
+  the cell.
+
 ## Liveness and benchmark acceptance
 
 `AGREE` describes state consistency independently of performance acceptance.

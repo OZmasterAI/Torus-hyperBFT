@@ -54,6 +54,33 @@ def genesis_book_mode_digit(v):
 
 GENESIS_BOOK_MODE = genesis_book_mode_digit(A.genesis_book_mode)
 
+# ---------------------------------------------------------------- no-restart kill
+# run-cell.sh KILL_NO_RESTART=val<i> (the one-validator-down baseline):
+# crash-kill.sh norestart SIGKILLed one validator KILL_NO_RESTART_AT_S into the
+# load and never restarted it, and left kill-norestart.json here. That node is
+# not a participant after its kill: its scrapes fail (sampler rows of zeros,
+# scrape_valid=0, dropped below), it has no metrics-after scrape, no digest and
+# no agreement row. Agreement, liveness and the drain are judged over the
+# survivors, and the dead node is recorded as EXCLUDED, never as a
+# disagreement. Absent file (every other cell): None, nothing below changes.
+def norestart_record(path):
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict) or not raw.get("enabled"):
+        return None
+    node = raw.get("kill_node")
+    if node not in ("val1", "val2"):
+        sys.exit("summarize.py: %s names kill_node %r (val1 or val2)" % (path, node))
+    return raw
+
+
+NORESTART = norestart_record(os.path.join(OUT, "kill-norestart.json"))
+DEAD_NODE = NORESTART["kill_node"] if NORESTART else None
+LIVE_NODES = tuple(n for n in ("val0", "val1", "val2") if n != DEAD_NODE)
+
 # ---------------------------------------------------------------- load sampler
 rows = {"val0": [], "val1": [], "val2": []}
 with open(os.path.join(OUT, "sampler.csv")) as f:
@@ -62,6 +89,10 @@ with open(os.path.join(OUT, "sampler.csv")) as f:
         try:
             r = {k: (float(v) if k not in ("node",) else v) for k, v in r.items()}
         except (TypeError, ValueError):
+            continue
+        # the killed node's failed scrapes (all zeros) would read as a counter
+        # reset to 0 in every rate below
+        if r["node"] == DEAD_NODE and r.get("scrape_valid", 1.0) == 0:
             continue
         rows[r["node"]].append(r)
 
@@ -979,8 +1010,15 @@ try:
                 agree_rows.append(json.loads(line))
 except (OSError, ValueError) as e:
     agree_rows = []
+if DEAD_NODE:
+    # run-cell.sh writes survivors' rows only; a dead node's row would be ERR
+    agree_rows = [r for r in agree_rows if r.get("node") != DEAD_NODE]
 agreement = {"nodes": agree_rows}
-if len(agree_rows) == 3:
+if DEAD_NODE:
+    agreement["excluded_nodes"] = [DEAD_NODE]
+    agreement["excluded_reason"] = ("killed without restart at bench+%ss (kill-norestart.json): "
+                                    "agreement compares the survivors only" % NORESTART.get("kill_at_s"))
+if len(agree_rows) == len(LIVE_NODES):
     hs = [r["height"] for r in agree_rows]
     agreement["height_spread"] = max(hs) - min(hs)
     agreement["block_hash_equal"] = len({r["block_hash"] for r in agree_rows}) == 1 and agree_rows[0]["block_hash"] != "ERR"
@@ -1437,7 +1475,66 @@ except OSError:
     pass
 
 v0 = funnel.get("val0", {})
-liveness = assess_liveness(rows, t0, td, DEFAULT_STALL_S)
+
+
+# ---------------------------------------------------------------- no-restart kill: before / after
+# Per survivor (and the dead node before its kill), the load window split at
+# the kill: blocks/s, matched/s, consensus timeout views per minute
+# (sampler.csv torus_consensus_timeout_total_total: the 1 Hz node counter of
+# views that ended in a timeout), views per minute (torus_consensus_view) and
+# the order-age p50/p90/p99 (torus_order_age_<stage>_seconds buckets). Per-minute
+# series: sampler.csv, column torus_consensus_timeout_total_total, per node.
+def norestart_windows(raw):
+    kill_ts = raw.get("kill_ts")
+    if not isinstance(kill_ts, (int, float)):
+        return {"error": "kill-norestart.json has no kill_ts"}
+    windows = {"before": (t0, kill_ts), "after": (kill_ts, t1)}
+    per_node = {}
+    for node in ("val0", "val1", "val2"):
+        rs = rows.get(node) or []
+        if not rs:
+            continue
+        d = {}
+        for wname, (lo, hi) in windows.items():
+            if node == DEAD_NODE and wname == "after":
+                continue
+            span = rate(rs, "block_height", lo, hi)[1]
+            buckets = bucket_deltas(BROWS, lo, hi)
+            d[wname] = {
+                "span_s": span,
+                "blk_s": round(rate(rs, "block_height", lo, hi)[0], 3),
+                "committed_blk_s": round(rate(rs, "blocks_committed_total", lo, hi)[0], 3),
+                "matched_s": round(rate(rs, "orders_matched_total", lo, hi)[0], 1),
+                "timeouts_per_min": round(rate(rs, "consensus_timeout_total_total", lo, hi)[0] * 60, 2),
+                "views_per_min": round(rate(rs, "consensus_view", lo, hi)[0] * 60, 1),
+                "order_age_ms": order_age(buckets, node),
+            }
+        per_node[node] = d
+    return {"windows": {k: list(v) for k, v in windows.items()}, "per_node": per_node}
+
+
+kill_no_restart = None
+if NORESTART:
+    pre = NORESTART.get("pre_kill") or {}
+    kill_no_restart = {
+        "killed_node": DEAD_NODE,
+        "kill_idx": NORESTART.get("kill_idx"),
+        "kill_at_s": NORESTART.get("kill_at_s"),
+        "kill_ts": NORESTART.get("kill_ts"),
+        "dead_ts": NORESTART.get("dead_ts"),
+        "killed_pid": NORESTART.get("killed_pid"),
+        "height_at_kill": pre.get("block_height"),
+        "committed_at_kill": pre.get("blocks_committed"),
+        "pre_kill": pre,
+        "survivors": list(LIVE_NODES),
+        "timeouts_column": "sampler.csv torus_consensus_timeout_total_total (per node, 1 Hz counter)",
+    }
+    kill_no_restart.update(norestart_windows(NORESTART))
+if DEAD_NODE:
+    liveness = assess_liveness(rows, t0, td, DEFAULT_STALL_S, nodes=LIVE_NODES)
+    liveness["excluded_nodes"] = [DEAD_NODE]
+else:
+    liveness = assess_liveness(rows, t0, td, DEFAULT_STALL_S)
 # Keep the runner's historical observation for audit, but a known stall cannot
 # count as a successfully drained performance cell. Agreement stays independent.
 drained = A.drained == "1" and liveness['verdict'] != 'FAIL'
@@ -1539,6 +1636,11 @@ summary = {
 }
 if crash_kills:
     summary["crash_kills"] = crash_kills
+if kill_no_restart:
+    summary["kill_no_restart"] = kill_no_restart
+    summary["headline"]["killed_node"] = DEAD_NODE
+    summary["headline"]["kill_at_s"] = kill_no_restart["kill_at_s"]
+    summary["headline"]["height_at_kill"] = kill_no_restart["height_at_kill"]
 with open(os.path.join(OUT, "summary.json"), "w") as f:
     json.dump(summary, f, indent=1)
 h = summary["headline"]
@@ -1552,6 +1654,15 @@ print(f"SUMMARY {A.label}: matched/s avg={h['matched_s_avg']} first120={h['match
       f"drained={summary['timing']['drained']} bench_rc={A.bench_rc}")
 print(f"VALIDITY {A.label}: {validity['verdict']} liveness={liveness['verdict']} "
       f"reasons={validity['fail_reasons'] + validity['unverified_reasons']}")
+if kill_no_restart:
+    _pn = kill_no_restart.get("per_node") or {}
+    print(f"KILL-NO-RESTART {DEAD_NODE}: at bench+{kill_no_restart['kill_at_s']}s height={kill_no_restart['height_at_kill']} "
+          f"survivors={kill_no_restart['survivors']} "
+          + " ".join("%s timeouts/min %s->%s blk/s %s->%s" % (
+              n, (_pn.get(n, {}).get("before") or {}).get("timeouts_per_min"),
+              (_pn.get(n, {}).get("after") or {}).get("timeouts_per_min"),
+              (_pn.get(n, {}).get("before") or {}).get("blk_s"),
+              (_pn.get(n, {}).get("after") or {}).get("blk_s")) for n in kill_no_restart["survivors"]))
 if crash:
     print(f"CRASH val{crash.get('kill_idx')}: verdict={crash['verdict']} "
           f"kill_at={crash.get('kill_at_s')}s down={crash.get('down_s')}s "

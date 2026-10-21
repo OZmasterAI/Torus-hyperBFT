@@ -53,6 +53,9 @@ RUNNER_ENV_KEYS = {
     "PRELOAD_LEVELS",
     "PRELOAD_RATE",
     "PRELOAD_TIMEOUT",
+    "KILL_NO_RESTART",
+    "KILL_NO_RESTART_AT_S",
+    "VALIDATOR_STAKES",
 }
 p = argparse.ArgumentParser(
     description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
