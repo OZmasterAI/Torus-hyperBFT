@@ -563,6 +563,24 @@ pub struct Metrics {
     /// Consensus thread: whole `on_committed_block` hook (manifest persist,
     /// durable block persist, mempool prune, exec dispatch).
     pub on_committed_block_seconds: Histogram,
+    /// T5.3: the commit-manifest put inside `on_committed_block` (section 106:
+    /// the in-window commit-hook stall, waiting behind the checkpoint batch
+    /// while the manifest lived in the state DB).
+    pub commit_manifest_seconds: Histogram,
+    /// T5.3: one background manifest prune pass (pruner thread, at most 1/s):
+    /// state-DB WAL fsync, then the delete of the dispatched heights' manifests
+    /// in the consensus DB. Not observed with the manifest in the state DB (its
+    /// prune rides the commit-persist batch).
+    pub commit_manifest_prune_seconds: Histogram,
+    /// T5.3: how long the exec thread waits, before executing a block, for its
+    /// header + body write on the commit-persist writer thread (that write keeps
+    /// the `torus_commit_persist_*` timers, now observed on the writer).
+    pub exec_commit_persist_wait_seconds: Histogram,
+    /// T5.3: the whole `on_commit_block` event handler (event-bus thread:
+    /// height lookup, mempool prune, header read, WS notify).
+    pub on_commit_block_handler_seconds: Histogram,
+    /// T5.3: the handler's applied-marker read + `prune_committed_txs`.
+    pub commit_handler_prune_seconds: Histogram,
     /// Consensus thread: `remove_committed_native` (mempool write-lock + prune)
     /// inside the commit dispatch.
     pub mempool_remove_committed_seconds: Histogram,
@@ -787,6 +805,13 @@ pub struct Metrics {
     /// Item 6 Phase 3: flush-worker wall time per checkpoint job (the one
     /// batch: build, root, write, EVM resync).
     pub flush_worker_checkpoint_seconds: Histogram,
+    /// T5.3: the checkpoint's state-DB `write` alone (WAL + memtable), one
+    /// observation per checkpoint.
+    pub exec_checkpoint_db_write_seconds: Histogram,
+    /// T5.3: wall clock (unix ms) at which the latest checkpoint DB write
+    /// started / ended, to cut in-window intervals without a /proc sampler.
+    pub exec_checkpoint_db_write_start_ms: Gauge,
+    pub exec_checkpoint_db_write_end_ms: Gauge,
     /// Item 7 option 0 (task 4.2): the flush worker's EVM trie step (the
     /// hashed mirror and trie nodes of a fast-path EVM block at interval 0,
     /// of a checkpoint window holding one otherwise), inside
@@ -2308,6 +2333,36 @@ impl Metrics {
             "Consensus thread: whole on_committed_block hook (persist + prune + dispatch)",
             on_committed_block_seconds.clone(),
         );
+        let commit_manifest_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_commit_manifest_seconds",
+            "Consensus thread: commit-manifest put inside on_committed_block (T5.3)",
+            commit_manifest_seconds.clone(),
+        );
+        let commit_manifest_prune_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_commit_manifest_prune_seconds",
+            "Pruner thread: state-WAL fsync + commit-manifest delete in the consensus DB, per pass (T5.3)",
+            commit_manifest_prune_seconds.clone(),
+        );
+        let exec_commit_persist_wait_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 16));
+        registry.register(
+            "torus_exec_commit_persist_wait_seconds",
+            "Exec thread: wait for the block's off-thread header + body write before executing it (T5.3)",
+            exec_commit_persist_wait_seconds.clone(),
+        );
+        let on_commit_block_handler_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_on_commit_block_handler_seconds",
+            "Event-bus thread: whole on_commit_block handler (T5.3)",
+            on_commit_block_handler_seconds.clone(),
+        );
+        let commit_handler_prune_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_commit_handler_prune_seconds",
+            "Event-bus thread: applied-marker read + prune_committed_txs in on_commit_block (T5.3)",
+            commit_handler_prune_seconds.clone(),
+        );
         let mempool_remove_committed_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
         registry.register(
             "torus_mempool_remove_committed_seconds",
@@ -2647,6 +2702,24 @@ impl Metrics {
             "torus_flush_worker_checkpoint_seconds",
             "Item 6 Phase 3: flush worker wall time per checkpoint job",
             flush_worker_checkpoint_seconds.clone(),
+        );
+        let exec_checkpoint_db_write_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 16));
+        registry.register(
+            "torus_exec_checkpoint_db_write_seconds",
+            "T5.3: the checkpoint's state-DB write alone (WAL + memtable)",
+            exec_checkpoint_db_write_seconds.clone(),
+        );
+        let exec_checkpoint_db_write_start_ms = Gauge::default();
+        registry.register(
+            "torus_exec_checkpoint_db_write_start_ms",
+            "T5.3: unix ms at which the latest checkpoint DB write started",
+            exec_checkpoint_db_write_start_ms.clone(),
+        );
+        let exec_checkpoint_db_write_end_ms = Gauge::default();
+        registry.register(
+            "torus_exec_checkpoint_db_write_end_ms",
+            "T5.3: unix ms at which the latest checkpoint DB write ended",
+            exec_checkpoint_db_write_end_ms.clone(),
         );
         let flush_worker_evm_trie_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
         registry.register(
@@ -3170,6 +3243,11 @@ impl Metrics {
             validate_block_da_wait_seconds,
             validate_block_attest_lookup_seconds,
             on_committed_block_seconds,
+            commit_manifest_seconds,
+            commit_manifest_prune_seconds,
+            exec_commit_persist_wait_seconds,
+            on_commit_block_handler_seconds,
+            commit_handler_prune_seconds,
             mempool_remove_committed_seconds,
             da_bodies_gc_deleted,
             da_gc_seconds,
@@ -3221,6 +3299,9 @@ impl Metrics {
             exec_checkpoint_read_views_live,
             exec_checkpoint_oldest_live_age_blocks,
             flush_worker_checkpoint_seconds,
+            exec_checkpoint_db_write_seconds,
+            exec_checkpoint_db_write_start_ms,
+            exec_checkpoint_db_write_end_ms,
             flush_worker_evm_trie_seconds,
             order_age_admit_seconds,
             order_age_commit_seconds,
@@ -3855,6 +3936,11 @@ mod tests {
             "torus_validate_block_da_wait_seconds",
             "torus_validate_block_attest_lookup_seconds",
             "torus_on_committed_block_seconds",
+            "torus_commit_manifest_seconds",
+            "torus_commit_manifest_prune_seconds",
+            "torus_exec_commit_persist_wait_seconds",
+            "torus_on_commit_block_handler_seconds",
+            "torus_commit_handler_prune_seconds",
             "torus_mempool_remove_committed_seconds",
             "torus_da_bodies_gc_deleted_total",
             "torus_da_gc_seconds",
@@ -3956,6 +4042,9 @@ mod tests {
             "torus_exec_checkpoint_read_views_live",
             "torus_exec_checkpoint_oldest_live_age_blocks",
             "torus_flush_worker_checkpoint_seconds",
+            "torus_exec_checkpoint_db_write_seconds",
+            "torus_exec_checkpoint_db_write_start_ms",
+            "torus_exec_checkpoint_db_write_end_ms",
             "torus_exec_save_books_drain_seconds",
             "torus_exec_save_books_write_seconds",
             "torus_exec_native_blocks",

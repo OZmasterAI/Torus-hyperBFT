@@ -1,12 +1,13 @@
 //! Section 71.8 option A: the node's two RocksDB instances.
 //!
 //! * The **state DB** (`<data_dir>`): execution state, block headers / bodies,
-//!   the commit manifest, and the state meta keys of `cf_consensus_meta`
-//!   (applied marker, running hash, epoch plan, ...), all written by the
-//!   execution / checkpoint path.
+//!   and the state meta keys of `cf_consensus_meta` (applied marker, running
+//!   hash, epoch plan, ...), all written by the execution / checkpoint path.
 //! * The **consensus DB** (`<data_dir>/consensus-db`): ALL HotStuff store
-//!   traffic (`RocksKVStore`: blocks, PCs, locks, vote state, frontier) and the
-//!   DA store (`NativeDaStore`: bodies, shards).
+//!   traffic (`RocksKVStore`: blocks, PCs, locks, vote state, frontier), the
+//!   DA store (`NativeDaStore`: bodies, shards) and, since T5.3, the commit
+//!   manifest (`cf_commit_manifest`, the commit hook's first durable write;
+//!   `TORUS_MANIFEST_IN_STATE_DB=1` keeps it in the state DB for an A/B).
 //!
 //! Each has its own WAL and write queue, so the consensus thread's QC / lock /
 //! vote writes and the mempool's DA mirrors no longer wait behind the state
