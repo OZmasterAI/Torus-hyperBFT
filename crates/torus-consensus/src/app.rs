@@ -25838,6 +25838,214 @@ mod crash_recovery_tests {
         }
     }
 
+    // ---- P0.0 phase 3: the running state hash follows the header bit ----
+
+    /// P0.0 phase 3 fixture: empty blocks 1..=n linked from `genesis` (the
+    /// nodes' genesis parent header), carrying the `RunningStateHash` bit from
+    /// height `from` on (`None`: never).
+    fn p3_blocks(genesis: &TorusBlockHeader, n: u64, from: Option<u64>) -> Vec<TorusBlock> {
+        let rsh = torus_types::Feature::RunningStateHash.bit();
+        let mut blocks: Vec<TorusBlock> = (1..=n)
+            .map(|h| {
+                let bits = if from.is_some_and(|f| h >= f) { rsh } else { 0 };
+                with_features(make_block(h, vec![]), bits)
+            })
+            .collect();
+        blocks[0].header.parent_hash = alloy_primitives::keccak256(genesis.canonical_header_bytes());
+        link_blocks(&mut blocks);
+        blocks
+    }
+
+    /// The chain config of a node whose genesis schedules `RunningStateHash`
+    /// at `local` (`None`: never). Never at 1: block 1's bits are in the
+    /// genesis parent header, so such a node could not link the fixture.
+    fn p3_config(local: Option<u64>) -> ChainConfig {
+        assert!(local.is_none_or(|h| h > 1));
+        let (mut config, _) = make_test_config_and_db();
+        config.activations = local.map(rsh_at).unwrap_or_default();
+        config.state_hash_activation_height = local;
+        config
+    }
+
+    /// Boot a node on `db` with `config` (`TorusApp::new`: the boot-time
+    /// running-hash setup and the crash replay of every committed block above
+    /// the applied height), then shut it down.
+    fn p3_boot(db: &StateDb, config: &ChainConfig) {
+        drop(TorusApp::new(db.clone(), config, None, None, None));
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum P3Exec {
+        Serial,
+        Pipelined,
+        /// Pipelined with a checkpoint every 3 blocks.
+        Checkpointed,
+    }
+
+    /// Execute `blocks` live (dispatch + execute) on `db` in `mode`, then
+    /// drain: every executed height is durable.
+    fn p3_execute(db: &StateDb, config: &ChainConfig, blocks: &[TorusBlock], mode: P3Exec) {
+        let mut ctx = make_exec_ctx(config, db);
+        match mode {
+            P3Exec::Serial => {}
+            P3Exec::Pipelined => ctx.attach_flush_worker(None),
+            P3Exec::Checkpointed => {
+                ctx.checkpoint = Some(ckpt_every(3));
+                ctx.attach_flush_worker(None);
+            }
+        }
+        for b in blocks {
+            dispatch_and_execute(&ctx, db, b);
+        }
+        assert!(ctx.pipeline_barrier(), "{mode:?}: W failed");
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{mode:?}: fail-stop");
+    }
+
+    /// `(N, h_N)` of a node scheduling the bit where the headers carry it
+    /// (`H`), executing `blocks` serially; asserts nothing is hashed below
+    /// `H` and the chain starts at `H`.
+    fn p3_reference(blocks: &[TorusBlock], h: u64) -> (u64, [u8; 32]) {
+        use torus_state::running_hash::{read_activation_height, read_running_hash};
+        let config = p3_config(Some(h));
+        let (_, db) = make_test_config_and_db();
+        p3_boot(&db, &config);
+        let below = (h - 1) as usize;
+        p3_execute(&db, &config, &blocks[..below], P3Exec::Serial);
+        assert_eq!(read_running_hash(&db), None, "reference: nothing hashed below H");
+        p3_execute(&db, &config, &blocks[below..=below], P3Exec::Serial);
+        assert_eq!(read_running_hash(&db).map(|(at, _)| at), Some(h), "reference: hashed at H");
+        assert_eq!(read_activation_height(&db), Some(h), "reference: chain starts at H");
+        p3_execute(&db, &config, &blocks[h as usize..], P3Exec::Serial);
+        let end = read_running_hash(&db).expect("reference: hashed");
+        assert_eq!(end.0, blocks.len() as u64);
+        end
+    }
+
+    /// The running-hash rows of `db` after a P0.0 phase 3 run, against the
+    /// uninterrupted reference.
+    fn p3_assert_chain(db: &StateDb, h: u64, reference: (u64, [u8; 32]), what: &str) {
+        use torus_state::running_hash::{
+            read_activation_height, read_configured_activation, read_running_hash,
+            read_unverified_since,
+        };
+        assert_eq!(read_native_applied_height(db), Some(reference.0), "{what}: applied");
+        assert_eq!(read_unverified_since(db), None, "{what}: hash-verified");
+        assert_eq!(
+            read_activation_height(db),
+            Some(h),
+            "{what}: the chain starts at the first header with the bit"
+        );
+        assert_eq!(read_configured_activation(db), Some(h), "{what}: configured from the headers");
+        assert_eq!(read_running_hash(db), Some(reference), "{what}: the same h_n");
+    }
+
+    /// P0.0 phase 3: the running state hash starts at the first block whose
+    /// header carries the `RunningStateHash` bit (`h_{H-1}` = zeros), on every
+    /// node whatever its own genesis schedule (none, earlier, the same,
+    /// later), executed live (serial, pipelined, pipelined with checkpoints)
+    /// or by the boot replay: the same activation record and the same h_n as
+    /// a node scheduling it at H. A chain whose headers never carry the bit is
+    /// never hashed, even on a node scheduling it.
+    /// RED before phase 3: the hash followed the node's own schedule (the
+    /// boot-time `configure_activation` from the chain config).
+    #[test]
+    fn running_hash_starts_at_the_first_header_with_the_bit_whatever_the_local_schedule() {
+        use torus_state::running_hash::{
+            read_activation_height, read_configured_activation, read_running_hash,
+        };
+        const H: u64 = 5;
+        const N: u64 = 12;
+        let genesis = torus_bridge::genesis_parent_header_for(&p3_config(None));
+        let blocks = p3_blocks(&genesis, N, Some(H));
+        let reference = p3_reference(&blocks, H);
+        for local in [None, Some(3), Some(H), Some(8)] {
+            let config = p3_config(local);
+            for mode in [
+                Some(P3Exec::Serial),
+                Some(P3Exec::Pipelined),
+                Some(P3Exec::Checkpointed),
+                None,
+            ] {
+                let what = format!("local schedule {local:?}, {}", match mode {
+                    Some(m) => format!("live {m:?}"),
+                    None => "boot replay".into(),
+                });
+                let (_, db) = make_test_config_and_db();
+                p3_boot(&db, &config);
+                match mode {
+                    Some(m) => p3_execute(&db, &config, &blocks, m),
+                    None => {
+                        for b in &blocks {
+                            persist_committed_block_durably(&db, b);
+                        }
+                        p3_boot(&db, &config);
+                    }
+                }
+                p3_assert_chain(&db, H, reference, &what);
+            }
+        }
+        // Headers without the bit: never hashed, whatever the local schedule.
+        let plain = p3_blocks(&genesis, N, None);
+        for local in [Some(3), Some(8)] {
+            let config = p3_config(local);
+            for replay in [false, true] {
+                let what = format!("no bit, local schedule {local:?}, replay={replay}");
+                let (_, db) = make_test_config_and_db();
+                p3_boot(&db, &config);
+                if replay {
+                    for b in &plain {
+                        persist_committed_block_durably(&db, b);
+                    }
+                    p3_boot(&db, &config);
+                } else {
+                    p3_execute(&db, &config, &plain, P3Exec::Pipelined);
+                }
+                assert_eq!(read_native_applied_height(&db), Some(N), "{what}");
+                assert_eq!(read_running_hash(&db), None, "{what}: nothing hashed");
+                assert_eq!(read_activation_height(&db), None, "{what}");
+                assert_eq!(read_configured_activation(&db), None, "{what}");
+            }
+        }
+    }
+
+    /// P0.0 phase 3: a node stopped before, just before, at, just after and
+    /// after the activation height H and restarted (continuing live, or
+    /// replaying the committed blocks above its applied height at boot)
+    /// holds the same chain as an uninterrupted node: start H, the same h_n.
+    /// Its own schedule is none, H or a later height.
+    /// RED before phase 3: nodes not scheduling H hashed from their own
+    /// height (or never).
+    #[test]
+    fn running_hash_restart_before_at_and_after_the_activation_matches_an_uninterrupted_node() {
+        const H: u64 = 5;
+        const N: u64 = 12;
+        let genesis = torus_bridge::genesis_parent_header_for(&p3_config(None));
+        let blocks = p3_blocks(&genesis, N, Some(H));
+        let reference = p3_reference(&blocks, H);
+        for local in [None, Some(H), Some(8)] {
+            let config = p3_config(local);
+            for stop in [3, H - 1, H, H + 1, 8] {
+                for replay in [false, true] {
+                    let what = format!("local schedule {local:?}, stop at {stop}, replay={replay}");
+                    let (_, db) = make_test_config_and_db();
+                    p3_boot(&db, &config);
+                    p3_execute(&db, &config, &blocks[..stop as usize], P3Exec::Pipelined);
+                    let rest = &blocks[stop as usize..];
+                    if replay {
+                        for b in rest {
+                            persist_committed_block_durably(&db, b);
+                        }
+                        p3_boot(&db, &config);
+                    } else {
+                        p3_boot(&db, &config);
+                        p3_execute(&db, &config, rest, P3Exec::Serial);
+                    }
+                    p3_assert_chain(&db, H, reference, &what);
+                }
+            }
+        }
+    }
+
     // ---- item 7 step 0: EVM header rules before the vote ----
 
     /// A signed EVM tx declaring `gas_limit` (a plain call, zero value).
