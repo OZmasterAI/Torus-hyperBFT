@@ -218,6 +218,59 @@ pub fn genesis_changed_error(
     )
 }
 
+/// What boot step 4 does with a genesis file, decided before anything is
+/// written ([`check_genesis_binding`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenesisPlan {
+    /// Fresh data dir: seed genesis, store the digest.
+    Fresh,
+    /// Initialized dir without a stored digest: store the file's.
+    Legacy,
+    /// The file matches the stored digest: nothing to write.
+    Matched,
+}
+
+/// Boot step 4, the read-only half: an initialized data dir with a stored
+/// digest refuses a file that digests differently. Writes nothing, so a
+/// refused start leaves the data dir as it was (Codex review of phase 4:
+/// every boot-time write waits for this check).
+pub fn check_genesis_binding(
+    dbs: &NodeDbs,
+    file_digest: &GenesisDigest,
+    genesis_path: &Path,
+    data_dir: &Path,
+) -> Result<GenesisPlan, String> {
+    if !genesis_applied(dbs)? {
+        return Ok(GenesisPlan::Fresh);
+    }
+    match read_genesis_digest(&dbs.state)? {
+        Some(stored) if stored.digest == file_digest.digest => Ok(GenesisPlan::Matched),
+        Some(stored) => Err(genesis_changed_error(&stored, file_digest, genesis_path, data_dir)),
+        None => Ok(GenesisPlan::Legacy),
+    }
+}
+
+/// Boot step 4, the writing half, after [`check_genesis_binding`] passed.
+pub fn write_genesis_binding(
+    dbs: &NodeDbs,
+    genesis: &torus_genesis::Genesis,
+    file_digest: &GenesisDigest,
+    plan: GenesisPlan,
+) -> Result<GenesisBinding, String> {
+    match plan {
+        GenesisPlan::Matched => Ok(GenesisBinding::Matched),
+        GenesisPlan::Legacy => {
+            store_genesis_digest(&dbs.state, file_digest)?;
+            Ok(GenesisBinding::Legacy)
+        }
+        GenesisPlan::Fresh => {
+            apply_genesis_if_fresh(dbs, genesis)?;
+            store_genesis_digest(&dbs.state, file_digest)?;
+            Ok(GenesisBinding::Fresh)
+        }
+    }
+}
+
 /// Boot step 4 with a genesis file (P0.0 phase 4): an initialized data dir
 /// with a stored digest refuses a file that digests differently (before
 /// anything is written); one without a stored digest stores the file's
@@ -230,24 +283,8 @@ pub fn init_genesis(
     genesis_path: &Path,
     data_dir: &Path,
 ) -> Result<GenesisBinding, String> {
-    if genesis_applied(dbs)? {
-        return match read_genesis_digest(&dbs.state)? {
-            Some(stored) if stored.digest == file_digest.digest => Ok(GenesisBinding::Matched),
-            Some(stored) => Err(genesis_changed_error(
-                &stored,
-                file_digest,
-                genesis_path,
-                data_dir,
-            )),
-            None => {
-                store_genesis_digest(&dbs.state, file_digest)?;
-                Ok(GenesisBinding::Legacy)
-            }
-        };
-    }
-    apply_genesis_if_fresh(dbs, genesis)?;
-    store_genesis_digest(&dbs.state, file_digest)?;
-    Ok(GenesisBinding::Fresh)
+    let plan = check_genesis_binding(dbs, file_digest, genesis_path, data_dir)?;
+    write_genesis_binding(dbs, genesis, file_digest, plan)
 }
 
 /// The `--genesis` file as boot step 4 reads it.
@@ -257,10 +294,14 @@ pub struct GenesisFile<'a> {
     pub path: &'a Path,
 }
 
-/// Boot steps 3b and 4: the history-retention rule
-/// ([`enforce_history_retention`]) and the genesis binding ([`init_genesis`],
-/// or [`check_no_genesis_file`] without a genesis file). `Ok(None)`: no
-/// genesis file.
+/// Boot steps 3b and 4: the genesis binding check first
+/// ([`check_genesis_binding`], or [`check_no_genesis_file`] without a genesis
+/// file), then the history-retention rule ([`enforce_history_retention`],
+/// which records the retention mode), then the genesis writes
+/// ([`write_genesis_binding`]). A start refused for its genesis writes
+/// nothing (Codex review of phase 4, P2: the retention marker written before
+/// the refusal let the next default start prune an archive dir). `Ok(None)`:
+/// no genesis file.
 pub fn bind_genesis_and_retention(
     dbs: &NodeDbs,
     file: Option<GenesisFile<'_>>,
@@ -268,10 +309,17 @@ pub fn bind_genesis_and_retention(
     explicit: bool,
     data_dir: &Path,
 ) -> Result<Option<GenesisBinding>, String> {
+    let plan = match &file {
+        Some(f) => Some(check_genesis_binding(dbs, f.digest, f.path, data_dir)?),
+        None => {
+            check_no_genesis_file(dbs, data_dir)?;
+            None
+        }
+    };
     enforce_history_retention(&dbs.state, retention, explicit, data_dir)?;
-    match file {
-        Some(f) => init_genesis(dbs, f.genesis, f.digest, f.path, data_dir).map(Some),
-        None => check_no_genesis_file(dbs, data_dir).map(|()| None),
+    match (file, plan) {
+        (Some(f), Some(plan)) => write_genesis_binding(dbs, f.genesis, f.digest, plan).map(Some),
+        _ => Ok(None),
     }
 }
 
