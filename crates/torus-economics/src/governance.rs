@@ -119,6 +119,8 @@ pub enum ProposalType {
     MarketDelist,
     /// Pre-testnet P1: change a listed market's tick, lot and max leverage.
     MarketParamsUpdate,
+    /// Delist decisions (owner s134, 1c): set a delisted market's close price.
+    DelistClosePrice,
 }
 
 impl BorshSerialize for ProposalType {
@@ -132,6 +134,7 @@ impl BorshSerialize for ProposalType {
             Self::PermanentUnlock => 5,
             Self::MarketDelist => 6,
             Self::MarketParamsUpdate => 7,
+            Self::DelistClosePrice => 8,
         };
         writer.write_all(&[disc])
     }
@@ -150,6 +153,7 @@ impl BorshDeserialize for ProposalType {
             5 => Ok(Self::PermanentUnlock),
             6 => Ok(Self::MarketDelist),
             7 => Ok(Self::MarketParamsUpdate),
+            8 => Ok(Self::DelistClosePrice),
             x => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid ProposalType discriminant: {x}"),
@@ -255,6 +259,12 @@ pub enum ExecutionPayload {
         tick_size: FixedPoint,
         initial_margin: FixedPoint,
     },
+    /// Delist decisions (owner s134, 1c): the settlement price of delisted
+    /// `market_id`. Execution writes `CF_NATIVE_LIQUIDATION`
+    /// [`torus_types::delist_close_price_key`] -> price raw (16, BE) while
+    /// the settlement price is not fixed yet; the executor's settlement step
+    /// takes it ahead of the mark and the last aggregate.
+    DelistClosePrice { market_id: u64, price: FixedPoint },
 }
 
 impl BorshSerialize for ExecutionPayload {
@@ -318,6 +328,11 @@ impl BorshSerialize for ExecutionPayload {
                 BorshSerialize::serialize(&lot_size.raw(), writer)?;
                 BorshSerialize::serialize(&tick_size.raw(), writer)?;
                 BorshSerialize::serialize(&initial_margin.raw(), writer)?;
+            }
+            Self::DelistClosePrice { market_id, price } => {
+                writer.write_all(&[7u8])?;
+                BorshSerialize::serialize(market_id, writer)?;
+                BorshSerialize::serialize(&price.raw(), writer)?;
             }
         }
         Ok(())
@@ -386,6 +401,11 @@ impl BorshDeserialize for ExecutionPayload {
                     tick_size,
                     initial_margin,
                 })
+            }
+            7 => {
+                let market_id = u64::deserialize_reader(reader)?;
+                let price = FixedPoint::from_raw(i128::deserialize_reader(reader)?);
+                Ok(Self::DelistClosePrice { market_id, price })
             }
             x => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -967,6 +987,7 @@ impl<T: StateBackend> GovernanceManager<T> {
             Some(ExecutionPayload::PermanentUnlock { .. }) => ProposalType::PermanentUnlock,
             Some(ExecutionPayload::MarketDelist { .. }) => ProposalType::MarketDelist,
             Some(ExecutionPayload::MarketParamsUpdate { .. }) => ProposalType::MarketParamsUpdate,
+            Some(ExecutionPayload::DelistClosePrice { .. }) => ProposalType::DelistClosePrice,
             None => ProposalType::TextProposal,
         };
 
@@ -1488,6 +1509,8 @@ impl<T: StateBackend> GovernanceManager<T> {
                 tracing::debug!(market_id, "market params update staged");
                 vec![(CF_NATIVE_MARKETS, market_id.to_be_bytes().to_vec(), Some(data))]
             }
+            // RED stub (delist decisions 1c): no effect yet.
+            ExecutionPayload::DelistClosePrice { .. } => Vec::new(),
         };
         Ok(writes)
     }

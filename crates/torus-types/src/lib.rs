@@ -1204,6 +1204,11 @@ impl NativeAction {
                         buf.push(4);
                         buf.extend_from_slice(candidate.as_slice());
                     }
+                    ProposalAction::SetDelistClosePrice { market_id, price } => {
+                        buf.push(5);
+                        buf.extend_from_slice(&market_id.to_be_bytes());
+                        buf.extend_from_slice(&price.raw().to_be_bytes());
+                    }
                 }
             }
             NativeAction::Vote {
@@ -1565,6 +1570,16 @@ pub enum ProposalAction {
     ValidatorRegistration {
         candidate: Address,
     },
+    /// Delist decisions (owner s134, 1c), appended: the settlement price of
+    /// the delisted market `market_id`. Valid at submission when `price` > 0
+    /// and the market has a row; executes only while the settlement price is
+    /// not fixed (height <= `close_at`, or the delist's own block), else the
+    /// proposal fails. Stored in [`delist_close_price_key`]; at the first
+    /// settlement block it wins over the mark and the last aggregate.
+    SetDelistClosePrice {
+        market_id: MarketId,
+        price: FixedPoint,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1599,6 +1614,43 @@ pub fn market_delisted_key(market_id: MarketId) -> [u8; 9] {
     key[..8].copy_from_slice(&market_id.to_be_bytes());
     key[8] = b'D';
     key
+}
+
+/// Delist decisions (owner s134, 3b): the `CF_NATIVE_MARKETS` key of a
+/// delisted market's oracle-closed marker: the 8-byte big-endian market id
+/// followed by `b'S'` (nine bytes, skipped by every market-row scan, like
+/// [`market_delisted_key`]). Value: the height it was written (8 bytes BE).
+/// Written once the market's settlement is complete (no settlement row, and
+/// the liquidator vault and both ADL escrows flat in it); from then on its
+/// oracle submissions are ignored and it is not aggregated. Never deleted.
+pub fn market_oracle_closed_key(market_id: MarketId) -> [u8; 9] {
+    let mut key = [0u8; 9];
+    key[..8].copy_from_slice(&market_id.to_be_bytes());
+    key[8] = b'S';
+    key
+}
+
+/// Delist option C: the `CF_NATIVE_LIQUIDATION` tag of a delisted market's
+/// settlement row (`0x08 ‖ market(8)`, torus-core `liquidation.rs`).
+pub const DELIST_SETTLE_TAG: u8 = 0x08;
+/// Delist decisions (owner s134, 1c): the `CF_NATIVE_LIQUIDATION` tag of a
+/// governance close price (`0x09 ‖ market(8)` -> price raw (16, BE)).
+pub const DELIST_CLOSE_PRICE_TAG: u8 = 0x09;
+
+/// The key of `market_id`'s delist settlement row (`0x08 ‖ market`).
+pub fn delist_settlement_key(market_id: MarketId) -> [u8; 9] {
+    let mut k = [0u8; 9];
+    k[0] = DELIST_SETTLE_TAG;
+    k[1..].copy_from_slice(&market_id.to_be_bytes());
+    k
+}
+
+/// The key of `market_id`'s governance close price (`0x09 ‖ market`).
+pub fn delist_close_price_key(market_id: MarketId) -> [u8; 9] {
+    let mut k = [0u8; 9];
+    k[0] = DELIST_CLOSE_PRICE_TAG;
+    k[1..].copy_from_slice(&market_id.to_be_bytes());
+    k
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

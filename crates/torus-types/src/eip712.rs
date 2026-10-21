@@ -791,6 +791,16 @@ fn hash_proposal_action(action: &ProposalAction) -> B256 {
             keccak256(&buf)
         }
         ProposalAction::ValidatorRegistration { candidate } => keccak256(encode_address(candidate)),
+        // Delist decisions (owner s134, 1c): typed (the older variants hash
+        // their fields only), so it cannot share a preimage with them.
+        ProposalAction::SetDelistClosePrice { market_id, price } => {
+            let th = keccak256("SetDelistClosePrice(uint64 marketId,int128 price)");
+            let mut buf = Vec::with_capacity(3 * 32);
+            buf.extend_from_slice(&th.0);
+            buf.extend_from_slice(&encode_u64(*market_id));
+            buf.extend_from_slice(&encode_i128(price.raw()));
+            keccak256(&buf)
+        }
     }
 }
 

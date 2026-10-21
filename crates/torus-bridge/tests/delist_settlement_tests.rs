@@ -31,8 +31,8 @@ use torus_state::cf::{
 };
 use torus_state::{NativeStateOverlay, StateBackend, StateDb};
 use torus_types::{
-    FixedPoint, MarketId, MarketParams, NativeAction, OrderType, PlaceOrderParams, Proposal,
-    ProposalAction, TimeInForce,
+    FixedPoint, MarketId, MarketParams, NativeAction, OracleSubmission, OrderType,
+    PlaceOrderParams, Proposal, ProposalAction, TimeInForce,
 };
 
 const M: MarketId = 1;
@@ -670,6 +670,7 @@ fn dump(db: &StateDb) -> Vec<(&'static str, CfRows)> {
         CF_NATIVE_ORDER_BOOKS,
         CF_NATIVE_MARKETS,
         CF_FEE_CONFIG,
+        CF_NATIVE_ORACLE,
     ]
     .into_iter()
     .map(|cf| (cf, db.iterate_cf(cf, None).unwrap()))
@@ -983,4 +984,401 @@ fn reduce_only_stop_triggers_on_a_delisted_market() {
         let b = bal(&db, &addr(14));
         assert_eq!((b.available, b.order_margin), (fp(FUND - 24), FixedPoint::ZERO), "path {path}");
     }
+}
+
+// ============================================================================
+// Part C: owner s134 decisions. 1c: a governance close price; 3b: the oracle
+// stops for a market whose settlement is complete.
+// ============================================================================
+
+fn close_price(m: MarketId, price: i64) -> ProposalAction {
+    ProposalAction::SetDelistClosePrice { market_id: m, price: fp(price) }
+}
+
+/// Votes proposals `ids` through and runs one block's tail (governance, then
+/// the settlement step) at `h`; the statuses are left to the caller.
+fn execute_at(db: &StateDb, ids: &[u64], h: u64) -> (Vec<NativeActionResult>, Vec<NativeActionResult>) {
+    let mut ctx = ctx_at(db.clone(), h);
+    for &id in ids {
+        ctx.governance.cast_vote(addr(PROPOSER), id, true, 10).unwrap();
+        ctx.governance.finalize_proposal(id, 104).unwrap();
+    }
+    let out = gov_tail(&mut ctx);
+    ctx.save_order_books();
+    assert_eq!(ctx.take_fatal_error(), None);
+    out
+}
+
+/// The stored governance close price of `m` (`0x09 ‖ m`), if any.
+fn close_row(db: &StateDb, m: MarketId) -> Option<FixedPoint> {
+    db.get_cf_raw(CF_NATIVE_LIQUIDATION, &torus_types::delist_close_price_key(m))
+        .unwrap()
+        .map(|v| FixedPoint::from_raw(i128::from_be_bytes(v[..16].try_into().unwrap())))
+}
+
+fn failed_with(gov: &[NativeActionResult], needle: &str) {
+    assert!(
+        gov.iter().any(|r| !r.success && r.error.as_deref().unwrap_or("").contains(needle)),
+        "no failure containing {needle:?}: {gov:?}"
+    );
+}
+
+/// 1c: a close price set during the grace period is the settlement price,
+/// ahead of a fresh mark (110); its row is consumed when the price is fixed.
+#[test]
+fn governance_close_price_wins_over_the_mark() {
+    let (_d, db) = setup(&[13, 14]);
+    set_grace(&db, 5);
+    open_pair(&db, M, 14, 13, 2, 100);
+    set_mark(&db, M, 100, H);
+    delist_m(&db);
+    submit(&db, "Close BTC at 130", close_price(M, 130));
+    let (gov, _) = execute_at(&db, &[2], H + 2);
+    assert_eq!(status(&db, 2), ProposalStatus::Executed, "{gov:?}");
+    assert_eq!(close_row(&db, M), Some(fp(130)));
+    set_mark(&db, M, 110, H + 5);
+    let (_, s) = block(&db, H + 5, 1, &[]);
+    assert!(s.iter().all(|r| r.success), "{s:?}");
+    assert_eq!(net_oi(&db, M), (FixedPoint::ZERO, 0));
+    assert_eq!(bal(&db, &addr(14)).available, fp(FUND + 60), "long 2 @100 closed at 130");
+    assert_eq!(bal(&db, &addr(13)).available, fp(FUND - 60));
+    assert_eq!(close_row(&db, M), None, "consumed with the settlement");
+    assert_eq!(row(&db), None);
+}
+
+/// 1c: the close price may execute in the delist's own block (higher id):
+/// with N = 0 it is the price of the same block's settlement, with N = 5 of
+/// the settlement at H + 5. A close price with a LOWER id than the delist
+/// runs first and fails (not delisted yet).
+#[test]
+fn governance_close_price_in_the_delist_block() {
+    for grace in [0, 5] {
+        let (_d, db) = setup(&[13, 14]);
+        set_grace(&db, grace);
+        open_pair(&db, M, 14, 13, 2, 100);
+        set_mark(&db, M, 100, H);
+        submit(&db, "Delist BTC", ProposalAction::DelistMarket { market_id: M });
+        submit(&db, "Close BTC at 80", close_price(M, 80));
+        pass_and_execute(&db, &[1, 2]);
+        if grace == 5 {
+            assert_eq!(close_row(&db, M), Some(fp(80)), "stored for the settlement");
+            set_mark(&db, M, 110, H + 5);
+            block(&db, H + 5, 1, &[]);
+        }
+        assert_eq!(net_oi(&db, M), (FixedPoint::ZERO, 0), "grace {grace}");
+        assert_eq!(bal(&db, &addr(14)).available, fp(FUND - 40), "grace {grace}: closed at 80");
+        assert_eq!(bal(&db, &addr(13)).available, fp(FUND + 40), "grace {grace}");
+        assert_eq!(close_row(&db, M), None, "grace {grace}");
+    }
+    let (_d, db) = setup(&[13, 14]);
+    set_grace(&db, 5);
+    open_pair(&db, M, 14, 13, 2, 100);
+    submit(&db, "Close BTC at 80", close_price(M, 80));
+    submit(&db, "Delist BTC", ProposalAction::DelistMarket { market_id: M });
+    let (gov, _) = execute_at(&db, &[1, 2], H);
+    assert_eq!(status(&db, 1), ProposalStatus::Failed, "{gov:?}");
+    assert_eq!(status(&db, 2), ProposalStatus::Executed, "{gov:?}");
+    failed_with(&gov, "is not delisted");
+    assert_eq!(close_row(&db, M), None);
+}
+
+/// 1c: a close price executing AT `close_at` runs before that block's
+/// settlement step (governance first) and is its price.
+#[test]
+fn governance_close_price_at_close_at_is_used() {
+    let (_d, db) = setup(&[13, 14]);
+    set_grace(&db, 5);
+    open_pair(&db, M, 14, 13, 2, 100);
+    set_mark(&db, M, 100, H);
+    delist_m(&db);
+    submit(&db, "Close BTC at 125", close_price(M, 125));
+    set_mark(&db, M, 110, H + 5);
+    let (gov, s) = execute_at(&db, &[2], H + 5);
+    assert_eq!(status(&db, 2), ProposalStatus::Executed, "{gov:?}");
+    assert!(s.iter().all(|r| r.success), "{s:?}");
+    assert_eq!(net_oi(&db, M), (FixedPoint::ZERO, 0));
+    assert_eq!(bal(&db, &addr(14)).available, fp(FUND + 50), "closed at 125");
+    assert_eq!(close_row(&db, M), None);
+}
+
+/// 1c: a later close price replaces an earlier one (last executed wins).
+#[test]
+fn later_governance_close_price_replaces_the_earlier_one() {
+    let (_d, db) = setup(&[13, 14]);
+    set_grace(&db, 5);
+    open_pair(&db, M, 14, 13, 2, 100);
+    set_mark(&db, M, 100, H);
+    delist_m(&db);
+    submit(&db, "Close BTC at 130", close_price(M, 130));
+    submit(&db, "Close BTC at 140", close_price(M, 140));
+    execute_at(&db, &[2], H + 1);
+    execute_at(&db, &[3], H + 2);
+    assert_eq!((status(&db, 2), status(&db, 3)), (ProposalStatus::Executed, ProposalStatus::Executed));
+    assert_eq!(close_row(&db, M), Some(fp(140)));
+    set_mark(&db, M, 110, H + 5);
+    block(&db, H + 5, 1, &[]);
+    assert_eq!(bal(&db, &addr(14)).available, fp(FUND + 80), "closed at 140");
+}
+
+/// 1c: once the settlement price is fixed (first settlement block, 110) a
+/// close price arriving later fails as too late and changes nothing: the
+/// walk continues at 110 to the end.
+#[test]
+fn governance_close_price_after_the_price_is_fixed_fails() {
+    let (_d, db) = setup(&[]);
+    set_grace(&db, 5);
+    seed_pairs(&db);
+    set_mark(&db, M, 100, H);
+    delist_m(&db);
+    submit(&db, "Close BTC at 150", close_price(M, 150));
+    set_mark(&db, M, 110, H + 5);
+    {
+        let mut ctx = ctx_at(db.clone(), H + 5);
+        NativeExecutor::run_delist_settlements_with(&mut ctx, 3, 2);
+        assert_eq!(ctx.take_fatal_error(), None);
+    }
+    assert_eq!(row(&db).and_then(|r| r.price), Some(fp(110)), "fixed, mid-walk");
+    let (gov, _) = execute_at(&db, &[2], H + 6);
+    assert_eq!(status(&db, 2), ProposalStatus::Failed, "{gov:?}");
+    failed_with(&gov, "too late");
+    assert_eq!(close_row(&db, M), None, "nothing written");
+    assert_eq!(row(&db).and_then(|r| r.price), Some(fp(110)), "price unchanged");
+    block(&db, H + 7, 1, &[]);
+    assert_eq!(net_oi(&db, M), (FixedPoint::ZERO, 0));
+    for i in 0..PAIRS {
+        let pnl = 10 * (i64::from(i) + 1);
+        assert_eq!(bal(&db, &addr(20 + 2 * i)).available, fp(FUND + pnl), "long {i} at 110");
+    }
+}
+
+/// 1c (owner rule: before or at `close_at`): a market still waiting for a
+/// price after `close_at` cannot get one from governance; the first oracle
+/// price settles it.
+#[test]
+fn governance_close_price_after_close_at_fails_even_while_waiting() {
+    let (_d, db) = setup(&[13, 14]);
+    set_grace(&db, 5);
+    open_pair(&db, M, 14, 13, 2, 100);
+    delist_m(&db);
+    submit(&db, "Close BTC at 130", close_price(M, 130));
+    let (_, s) = block(&db, H + 5, 1, &[]);
+    assert!(!s[0].success, "waiting: {s:?}");
+    let (gov, _) = execute_at(&db, &[2], H + 6);
+    assert_eq!(status(&db, 2), ProposalStatus::Failed, "{gov:?}");
+    failed_with(&gov, "too late");
+    assert_eq!(close_row(&db, M), None);
+    set_mark(&db, M, 95, H + 7);
+    block(&db, H + 7, 1, &[]);
+    assert_eq!(bal(&db, &addr(14)).available, fp(FUND - 10), "closed at the oracle 95");
+}
+
+/// 1c: submission rejects a price <= 0 and a market without a row; at
+/// execution a market that is not delisted, or already settled, fails with
+/// nothing written.
+#[test]
+fn governance_close_price_rejections() {
+    let (_d, db) = setup(&[13, 14]);
+    for (action, needle) in [
+        (close_price(M, 0), "close price must be > 0"),
+        (close_price(M, -5), "close price must be > 0"),
+        (close_price(9, 100), "market 9 is not listed"),
+    ] {
+        let mut ctx = ctx_at(db.clone(), 3);
+        let r = NativeExecutor::execute(
+            &mut ctx,
+            &addr(PROPOSER),
+            &NativeAction::SubmitProposal(Proposal { title: "t".into(), description: "d".into(), action }),
+        );
+        assert!(!r.success, "{needle}: {r:?}");
+        assert!(r.error.as_deref().unwrap_or("").contains(needle), "{needle}: {r:?}");
+    }
+    // OTHER is listed, never delisted.
+    submit(&db, "Close ETH", close_price(OTHER, 50));
+    let (gov, _) = execute_at(&db, &[1], H);
+    assert_eq!(status(&db, 1), ProposalStatus::Failed, "{gov:?}");
+    failed_with(&gov, "market 2 is not delisted");
+    assert_eq!(close_row(&db, OTHER), None);
+    // M settled at once (N = 0); a close price after that is too late.
+    set_grace(&db, 0);
+    open_pair(&db, M, 14, 13, 1, 100);
+    set_mark(&db, M, 100, H + 1);
+    submit(&db, "Delist BTC", ProposalAction::DelistMarket { market_id: M });
+    execute_at(&db, &[2], H + 1);
+    assert_eq!(row(&db), None, "settled");
+    submit(&db, "Close BTC", close_price(M, 120));
+    let (gov, _) = execute_at(&db, &[3], H + 2);
+    assert_eq!(status(&db, 3), ProposalStatus::Failed, "{gov:?}");
+    failed_with(&gov, "too late");
+    assert_eq!(close_row(&db, M), None);
+}
+
+// ---------------------------------------------------------------------------
+// 3b: oracle submissions after the settlement is complete
+// ---------------------------------------------------------------------------
+
+fn activate_validator(db: &StateDb) {
+    let sm = torus_economics::StakingManager::new(db.clone());
+    let mut v = sm.get_validator(&addr(1)).unwrap().unwrap();
+    v.status = torus_economics::ValidatorStatus::Active;
+    sm.put_validator(&addr(1), &v).unwrap();
+}
+
+/// Validator 1's submission sampled at block `h`'s time.
+fn oracle_sub(h: u64, prices: &[(MarketId, i64)]) -> (Address, NativeAction) {
+    (
+        addr(1),
+        NativeAction::SubmitOraclePrices(OracleSubmission {
+            prices: prices.iter().map(|&(m, p)| (m, fp(p))).collect(),
+            timestamp: ts(h) * 1_000,
+        }),
+    )
+}
+
+/// Validator 1's stored submission row for `m` (`"sub" ‖ m ‖ validator`).
+fn sub_row(db: &StateDb, m: MarketId) -> Option<Vec<u8>> {
+    let k = [b"sub".as_slice(), &m.to_be_bytes(), addr(1).as_slice()].concat();
+    db.get_cf_raw(CF_NATIVE_ORACLE, &k).unwrap()
+}
+
+fn agg_of(db: &StateDb, m: MarketId) -> Option<Vec<u8>> {
+    db.get_cf_raw(CF_NATIVE_ORACLE, &agg_key(m)).unwrap()
+}
+
+/// A node block on the Classic path: the oracle step, `actions` (engine on
+/// `threads` workers, 0 = single path), the liquidation step, governance and
+/// the settlement step.
+fn full_block(db: &StateDb, h: u64, threads: usize, actions: &[(Address, NativeAction)]) -> Vec<NativeActionResult> {
+    let mut ctx = ctx_at(db.clone(), h);
+    let _ = NativeExecutor::begin_block_oracle(&mut ctx);
+    let r = if threads == 0 {
+        actions.iter().map(|(s, a)| NativeExecutor::execute(&mut ctx, s, a)).collect()
+    } else {
+        NativeExecutor::execute_batch_engine_mode(&mut ctx, actions, threads).results
+    };
+    let _ = NativeExecutor::run_liquidations(&mut ctx);
+    let _ = gov_tail(&mut ctx);
+    ctx.save_order_books();
+    assert_eq!(ctx.take_fatal_error(), None, "h {h}");
+    r
+}
+
+/// 3b: during the grace period a delisted market's submissions are stored
+/// and aggregated; from the block after its settlement completed, its
+/// entries are ignored (not stored; the other markets' entries are, the
+/// action succeeds) and it is no longer aggregated. Same on the single path
+/// and the engine on 1 and 4 workers.
+#[test]
+fn oracle_stops_for_a_settled_market_only() {
+    for path in PATHS {
+        let (_d, db) = setup(&[13, 14]);
+        activate_validator(&db);
+        set_grace(&db, 5);
+        open_pair(&db, M, 14, 13, 2, 100);
+        set_mark(&db, M, 100, H);
+        set_mark(&db, OTHER, 50, H);
+        delist_m(&db);
+        // Grace: stored, then aggregated in the next block.
+        let r = full_block(&db, H + 1, path, &[oracle_sub(H + 1, &[(M, 101), (OTHER, 51)])]);
+        assert!(r[0].success, "path {path}: {r:?}");
+        assert!(sub_row(&db, M).is_some(), "path {path}: grace submission stored");
+        full_block(&db, H + 2, path, &[]);
+        assert_eq!(&agg_of(&db, M).unwrap()[..16], fp(101).raw().to_be_bytes(), "path {path}: aggregated");
+        // Settlement block: the submission still lands (row present until
+        // the tail), the settlement completes in the tail.
+        set_mark(&db, M, 110, H + 5);
+        let r = full_block(&db, H + 5, path, &[oracle_sub(H + 5, &[(M, 105), (OTHER, 55)])]);
+        assert!(r[0].success, "path {path}: {r:?}");
+        assert_eq!(net_oi(&db, M), (FixedPoint::ZERO, 0), "path {path}: settled");
+        let (sub_m, agg_m) = (sub_row(&db, M), agg_of(&db, M));
+        // Next block: M not aggregated (its H + 5 submission ignored), OTHER is.
+        let r = full_block(&db, H + 6, path, &[oracle_sub(H + 6, &[(M, 106), (OTHER, 56)])]);
+        assert!(r[0].success, "path {path}: the action succeeds: {r:?}");
+        assert_eq!(agg_of(&db, M), agg_m, "path {path}: settled market not aggregated");
+        assert_eq!(&agg_of(&db, OTHER).unwrap()[..16], fp(55).raw().to_be_bytes(), "path {path}");
+        assert_eq!(sub_row(&db, M), sub_m, "path {path}: settled entry ignored");
+        // Only the settled market: success, nothing written.
+        let r = full_block(&db, H + 7, path, &[oracle_sub(H + 7, &[(M, 107)])]);
+        assert!(r[0].success, "path {path}: {r:?}");
+        assert_eq!(sub_row(&db, M), sub_m, "path {path}");
+        full_block(&db, H + 8, path, &[]);
+        assert_eq!(agg_of(&db, M), agg_m, "path {path}");
+        assert_eq!(&agg_of(&db, OTHER).unwrap()[..16], fp(56).raw().to_be_bytes(), "path {path}");
+    }
+}
+
+/// 3b: a settlement walk that ends with an ADL obligation open is not
+/// complete: the market keeps its oracle until the drain closes the escrow
+/// against the vault (at the stored price, no mark needed); from then on its
+/// entries are ignored.
+#[test]
+fn oracle_stops_only_after_the_adl_drain_of_a_delisted_market() {
+    let (_d, db) = setup(&[14]);
+    activate_validator(&db);
+    fund(&db, 13, 50);
+    set_grace(&db, 5);
+    open_pair(&db, M, 14, 13, 10, 100);
+    set_mark(&db, M, 100, H);
+    delist_m(&db);
+    set_mark(&db, M, 120, H + 2);
+    {
+        let mut ctx = ctx_at(db.clone(), H + 2);
+        let _ = NativeExecutor::run_liquidations_with(&mut ctx, 2_048, 64, 0);
+        assert_eq!(ctx.take_fatal_error(), None);
+    }
+    assert_eq!(pos_of(&db, &liq::ADL_ESCROW_SHORT, M), fp(-10));
+    set_mark(&db, M, 120, H + 5);
+    let (_, s) = block(&db, H + 5, 1, &[]);
+    assert!(s.iter().all(|r| r.success), "{s:?}");
+    assert_eq!(row(&db), None, "walk done");
+    assert_eq!(pos_of(&db, &LIQUIDATOR_VAULT, M), fp(10), "vault mirrors the escrow");
+    // Not complete: accepted.
+    let r = run(&db, H + 6, 0, &[oracle_sub(H + 6, &[(M, 121)])]);
+    assert!(r[0].success, "{r:?}");
+    let sub = sub_row(&db, M);
+    assert!(sub.is_some(), "stored while the obligation is open");
+    // The drain closes the escrow against the vault.
+    {
+        let mut ctx = ctx_at(db.clone(), H + 7);
+        let _ = NativeExecutor::run_liquidations(&mut ctx);
+        assert_eq!(ctx.take_fatal_error(), None);
+    }
+    assert_eq!(net_oi(&db, M), (FixedPoint::ZERO, 0));
+    assert!(liq::next_obligation(&db, &[liq::ADL_OBLIGATION_TAG]).unwrap().is_none());
+    let r = run(&db, H + 8, 0, &[oracle_sub(H + 8, &[(M, 122)])]);
+    assert!(r[0].success, "{r:?}");
+    assert_eq!(sub_row(&db, M), sub, "complete now: ignored");
+}
+
+/// 3b on every node: the resident node lifecycle (R + resident books) equals
+/// the Classic path, oracle rows included, through grace, settlement and
+/// ignored submissions.
+#[test]
+fn oracle_stop_resident_lifecycle_equals_classic() {
+    let sub = |h: u64| Step::Actions(vec![oracle_sub(h, &[(M, 100 + (h - E) as i64), (OTHER, 50)])]);
+    let script = vec![
+        (E - 1, 100, Step::Actions(vec![])),
+        (E, 100, Step::Actions(vec![])), // the delist executes
+        (E + 1, 100, sub(E + 1)),
+        (E + 2, 100, sub(E + 2)),
+        (E + 5, 110, sub(E + 5)), // settles in the tail
+        (E + 6, 110, sub(E + 6)),
+        (E + 7, 110, sub(E + 7)),
+    ];
+    let seed = |db: &StateDb| {
+        activate_validator(db);
+        set_grace(db, 5);
+        seed_pairs(db);
+        submit_passed(db, 1, "Delist BTC", ProposalAction::DelistMarket { market_id: M });
+    };
+    lifecycle_equals_classic(seed, &script, |h, db| {
+        if h == E + 2 {
+            assert!(sub_row(db, M).is_some(), "grace: stored");
+        }
+        if h >= E + 6 {
+            assert_eq!(net_oi(db, M), (FixedPoint::ZERO, 0), "settled");
+            // The stored sample is still the one of E + 5 (ignored since).
+            let stored = ctx_at(db.clone(), 1).oracle.stored_sample_ms(M, &addr(1)).unwrap();
+            assert_eq!(stored, Some(ts(E + 5) * 1_000), "h {h}: M's submission row is the E + 5 one");
+        }
+    });
 }

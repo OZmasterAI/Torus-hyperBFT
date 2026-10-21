@@ -2418,6 +2418,7 @@ fn map_proposal(p: torus_economics::governance::Proposal) -> RpcProposal {
         ProposalType::PermanentUnlock => "PermanentUnlock",
         ProposalType::MarketDelist => "MarketDelist",
         ProposalType::MarketParamsUpdate => "MarketParamsUpdate",
+        ProposalType::DelistClosePrice => "DelistClosePrice",
     };
 
     let status = match p.status {

@@ -14041,6 +14041,11 @@ impl NativeExecutor {
                     candidate: *candidate,
                 })
             }
+            // Delist decisions (owner s134, 1c): checked at submission (price
+            // > 0, market row) and at execution (delisted, price not fixed).
+            ProposalAction::SetDelistClosePrice { market_id, price } => {
+                Some(ExecutionPayload::DelistClosePrice { market_id: *market_id, price: *price })
+            }
         };
 
         match ctx.governance.submit_proposal(
