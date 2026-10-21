@@ -40,20 +40,23 @@ use crate::{
         roles::{is_phase_voter, new_view_recipients_with_reputation, view_leader_with_reputation},
         types::{
             carries_required_certificate, valid_proposal_certificates, NECollector, Phase,
-            PhaseVoteCollector,
+            PhaseCertificate, PhaseVoteCollector,
         },
     },
     networking::{
         network::{Network, ValidatorSetUpdateHandle},
         sending::SenderHandle,
     },
-    pacemaker::{implementation::ViewInfo, types::TimeoutCertificate},
+    pacemaker::{
+        implementation::ViewInfo,
+        types::{fresh_proposer, tip_leader_reputation, TimeoutCertificate},
+    },
     types::{
         block::Block,
         crypto_primitives::Keypair,
         data_types::{BlockHeight, ChainID, CryptoHash, ViewNumber},
         signed_messages::{ActiveCollectorPair, Certificate, SignedMessage},
-        validator_set::ValidatorSetState,
+        validator_set::{ValidatorSetState, ValidatorSetUpdatesStatus},
     },
 };
 
@@ -816,6 +819,13 @@ impl<N: Network> HotStuff<N> {
         match highest_pc.phase {
             // Produce and broadcast a new Proposal.
             Phase::Generic | Phase::Decide => {
+                // TC phase C review (§4): during a validator-set update both sets' leaders of a
+                // view are proposers (nudges, re-proposals), but only one may propose a fresh
+                // block; validators do not vote for the other's.
+                let me = self.config.keypair.public();
+                if !Self::is_fresh_proposer(&me, self.view_info.view, &highest_pc, block_tree)? {
+                    return Ok(());
+                }
                 // S470 Piece 2 (proposer exec-backpressure): a leader
                 // whose exec backlog exceeds the watermark yields its
                 // slot instead of producing off a stale executed tip.
@@ -1493,12 +1503,17 @@ impl<N: Network> HotStuff<N> {
             // and the block passes the pre-vote data check (rebase s87, T0b: the same
             // vote-time rules as the header-first path; insertion above never applies
             // them, so a block others certify is still accepted here).
+            // TC phase C review (§4): a vote that makes this proposal the voter's tip (a fresh
+            // Generic proposal, NEC ones included) is cast only for the view's one fresh proposer.
+            let sets_tip_from_proposal = validator_set_updates.is_none() && !proposal.is_reproposal();
             if is_phase_voter(
                 &self.config.keypair.public(),
                 &validator_set_state,
                 &proposal.block.justify,
             ) && (block_tree.highest_view_voted()?.is_none()
                 || block_tree.highest_view_voted()?.unwrap() < self.view_info.view)
+                && (!sets_tip_from_proposal
+                    || Self::is_fresh_proposer(origin, proposal.view, &proposal.block.justify, block_tree)?)
                 && Self::vote_check(&proposal.block, block_tree, app)? == BlockDataCheck::Held
             {
                 let vote_phase = if validator_set_updates.is_some() {
@@ -2094,13 +2109,21 @@ impl<N: Network> HotStuff<N> {
 
     /// PROCESSNEREQUST: On receiving an NERequest, check if we voted for the
     /// high_tip block. If NOT, sign and send an NE message.
+    ///
+    /// The NE goes to the requester, which must be a proposer of the view (either set's leader
+    /// while a validator-set update is undecided, as `is_proposer`): the NEC is collected by the
+    /// leader running RECOVER, which during an update need not be the committed set's leader.
     fn on_receive_ne_request<K: KVStore>(
         &mut self,
         req: NERequest,
-        _origin: &VerifyingKey,
+        origin: &VerifyingKey,
         block_tree: &mut BlockTreeSingleton<K>,
     ) -> Result<(), HotStuffError> {
         if req.view != self.view_info.view {
+            return Ok(());
+        }
+        let reputation = block_tree.leader_reputation().ok();
+        if !is_proposer_with_reputation(origin, req.view, &block_tree.validator_set_state()?, reputation.as_ref()) {
             return Ok(());
         }
 
@@ -2139,22 +2162,9 @@ impl<N: Network> HotStuff<N> {
                 signature,
             };
 
-            // FIX CONS-FIND-11: Use reputation-weighted leader for NE routing.
-            let validator_set_state = block_tree.validator_set_state()?;
-            let reputation = block_tree.leader_reputation().ok();
-            let leader = match reputation.as_ref() {
-                Some(rep) => crate::pacemaker::implementation::select_leader_with_reputation(
-                    req.view,
-                    validator_set_state.committed_validator_set(),
-                    rep,
-                ),
-                None => crate::pacemaker::implementation::select_leader(
-                    req.view,
-                    validator_set_state.committed_validator_set(),
-                ),
-            };
+            // To the recovering proposer (checked above), not the committed set's leader.
             self.sender_handle
-                .send::<HotStuffMessage>(leader, ne.into());
+                .send::<HotStuffMessage>(*origin, ne.into());
             self.ne_sent_views.insert(req.view);
         }
 
@@ -2200,6 +2210,11 @@ impl<N: Network> HotStuff<N> {
             } else {
                 return Ok(());
             };
+            // TC phase C review (§4): an NEC proposal is a fresh block.
+            let me = self.config.keypair.public();
+            if !Self::is_fresh_proposer(&me, self.view_info.view, &high_tip_qc, block_tree)? {
+                return Ok(());
+            }
 
             // Produce a new block extending from the high_tip's QC.
             let parent_block = if high_tip_qc.is_genesis_pc() {
@@ -2524,12 +2539,16 @@ impl<N: Network> HotStuff<N> {
         {
             self.view_skip = Some((header.clone(), *origin));
         }
+        // TC phase C review (§4): as on the full path, a vote that makes this header the voter's
+        // tip (F5: a fresh Generic header) is cast only for the view's one fresh proposer.
+        let sets_tip_from_header = !header.has_validator_set_updates && !header.is_reproposal();
         if header_is_current && is_phase_voter(
             &self.config.keypair.public(),
             &validator_set_state,
             &header.justify,
         ) && (block_tree.highest_view_voted()?.is_none()
             || block_tree.highest_view_voted()?.unwrap() < self.view_info.view)
+            && (!sets_tip_from_header || Self::is_fresh_proposer(origin, header.view, &header.justify, block_tree)?)
         {
             // s84: the vote waits until this replica holds the body, so a QC
             // implies a quorum holds it. Votes now if the block is already in
@@ -2881,6 +2900,32 @@ impl<N: Network> HotStuff<N> {
             );
         }
         Ok(check)
+    }
+
+    /// TC phase C review (docs/plans/tc-required-and-tip-signing.md §4): whether `proposer` is the
+    /// one fresh proposer of `view` ([`fresh_proposer`]) for a block justified by `justify`.
+    ///
+    /// The validator-set state is the one after `justify`: a Decide PC on an updating block this
+    /// replica has not committed yet (the first block after an update; a header-path replica only
+    /// commits on body arrival) names the proposer under the set that update brings in, as every
+    /// replica that has committed it does.
+    fn is_fresh_proposer<K: KVStore>(
+        proposer: &VerifyingKey,
+        view: ViewNumber,
+        justify: &PhaseCertificate,
+        block_tree: &BlockTreeSingleton<K>,
+    ) -> Result<bool, BlockTreeError> {
+        let mut validator_set_state = block_tree.validator_set_state()?;
+        if justify.phase.is_decide() {
+            if let ValidatorSetUpdatesStatus::Pending(updates) = block_tree.validator_set_updates_status(&justify.block)? {
+                let previous = validator_set_state.committed_validator_set().clone();
+                let mut committed = previous.clone();
+                committed.apply_updates(&updates);
+                validator_set_state = ValidatorSetState::new(committed, previous, None, true);
+            }
+        }
+        let reputation = tip_leader_reputation(block_tree);
+        Ok(fresh_proposer(view, &validator_set_state, reputation.as_ref()).as_ref() == Some(proposer))
     }
 
     /// Phase-vote for `header`, the current view's checked proposal header

@@ -475,7 +475,17 @@ pub struct ReplicaSpec<K: KVStore, A: App<K> + 'static, N: Network + 'static> {
 
 impl<K: KVStore, A: App<K> + 'static, N: Network + 'static> ReplicaSpec<K, A, N> {
     /// Starts all threads and channels associated with running a replica, and returns the handles to them in a [Replica] struct.
+    ///
+    /// # Panics
+    ///
+    /// If reputation-weighted leader selection is enabled
+    /// ([`check_leader_selection_mode`](crate::pacemaker::check_leader_selection_mode)).
     pub fn start(mut self) -> Replica<K> {
+        if let Err(refused) =
+            crate::pacemaker::check_leader_selection_mode(crate::pacemaker::reputation_leader_selection_enabled())
+        {
+            panic!("{refused}");
+        }
         let block_tree = BlockTreeSingleton::new(self.kv_store.clone());
         self.network.init_validator_set(
             block_tree

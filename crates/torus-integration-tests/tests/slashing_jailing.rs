@@ -287,21 +287,18 @@ fn double_sign_detection_produces_verifiable_evidence() {
     let mut detector = DoubleSignDetector::new(chain_id, EVIDENCE_WINDOW_VIEWS);
 
     // Build two conflicting votes at same view
+    // Signed over the bytes a hotstuff_rs validator signs (ObservedPhaseVote::signed_message).
     let mk_vote = |block_hash: [u8; 32]| {
-        let mut msg = Vec::with_capacity(49);
-        msg.extend_from_slice(&chain_id.to_be_bytes());
-        msg.extend_from_slice(&50u64.to_be_bytes());
-        msg.extend_from_slice(&block_hash);
-        msg.push(0);
-        let sig = sk.sign(&msg);
-        ObservedPhaseVote {
+        let mut vote = ObservedPhaseVote {
             chain_id,
             view: 50,
             block_hash,
             phase: 0,
             signer: sk.verifying_key().to_bytes(),
-            signature: sig.to_bytes(),
-        }
+            signature: [0; 64],
+        };
+        vote.signature = sk.sign(&vote.signed_message()).to_bytes();
+        vote
     };
 
     let vote_a = mk_vote([0xAA; 32]);

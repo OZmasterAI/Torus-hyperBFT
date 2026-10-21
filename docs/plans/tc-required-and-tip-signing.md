@@ -159,8 +159,10 @@ within about two one-way delays of the first f+1.
 ### As built (phase C)
 
 Owner answers s134: option (3); domain tags on every consensus signature now; drop nudge tips. Open question 4
-follows F2 (a tip signed under a set older than the previous one is dropped); 5 stays as is (reputation off; the tip
-check uses the same leader function as the proposer check, reputation-aware if it is ever enabled).
+follows F2 (a tip signed under a set older than the previous one is dropped); 5: reputation stays off, and since the
+review (P2) it is refused: `check_leader_selection_mode` makes `ReplicaSpec::start` panic and the node refuse to start
+when `reputation_leader_selection` is on, because F2 would pick a tip's leader from today's reputation, not the tip
+view's.
 
 - **Signed bytes** (`types/signing.rs`): `DOMAIN_* || borsh(fields)`, tags `torus-hotstuff/v1/{proposal-header,
   phase-vote, timeout-vote, no-endorsement}` (prefix-free). Timeout vote: `(chain_id, view, Option<(tip_hash,
@@ -170,8 +172,10 @@ check uses the same leader function as the proposer check, reputation-aware if i
 - **F1.** `Proposal::signed`, `ProposalHeader.leader_signature`. A header or proposal not signed by its origin (the
   proposer) is dropped before equivocation detection, so a forged header cannot frame a leader; a full proposal must
   also be for the current view. `ProposalResponse` carries the block only (the recovering leader re-signs).
-- **F2.** `TipInfo::is_correct`: `Block::hash` recompute, then the signature under leader(view) of the committed or
-  previous set.
+- **F2.** `TipInfo::is_correct`: `Block::hash` recompute, then the signature of the view's one fresh proposer
+  (`fresh_proposer`, §4 "Validator-set update window"): leader(view) of the previous set while an update is undecided
+  and `view <= update_view`, else of the committed set. (First built as "committed or previous set", which let one
+  view have two valid tips; review fix s134.)
 - **F3.** `summaries_are_signed`: the high tip is a signed `(hash, view)` at the highest signed tip view, and no
   signed tip is newer than the TC's view. `is_correct` runs F2 on the high tip. `voter_metadata` must cover every
   validator position (the unsigned-base fallback is gone).
@@ -202,6 +206,36 @@ recommended.
   - Unsigned views let the TC builder rank B below high_qc: F3 closes that. Optional TCs let the builder skip the TC
     entirely: V1 closes that. V3 closes the QC-winner variant.
   - The argument carries across consecutive timeout views, because a reproposal keeps B as the tip.
+- **Validator-set update window (review fix s134).** While an update is committed but not decided, `is_proposer`
+  accepts leader(v) of the committed set (CVS) and of the previous set (PVS), for nudges and re-proposals. If F2 also
+  accepted both (as first built, even after the decision), view v could have two valid tips: B from one leader with
+  2f+1 votes and X from the other (signed by a byzantine leader, reported by a byzantine voter). The collector keeps the
+  first tip at the highest view and `summaries_are_signed` accepts any signed tip there, so TC(v) could name X; X's
+  re-proposal fails, an NEC then lets a fresh block drop B, and no rollback fires (equivocation is keyed by
+  (view, leader)). Committed blocks stay safe (the lock).
+  - *Rule: one fresh proposer per view* (`ValidatorSetState::fresh_proposer_set`, `pacemaker::types::fresh_proposer`).
+    Undecided: the PVS leader for `v <= update_view`, the CVS leader for `v > update_view`; decided: the CVS leader.
+    `update_view` (block-tree variable 24) is recorded when the updating block U is committed: the view of the Commit
+    or Decide PC on U the commit rests on (a commit through a descendant uses U's child's justify, U's Decide PC).
+    Honest fresh proposals before it were made under the PVS; between U's Commit PC and Decide PC honest leaders only
+    nudge; every block after U justifies on U's Decide PC or later.
+  - Applied in three places: F2 (one signature check now); a vote that sets the voter's tip (fresh Generic proposal,
+    NEC proposals included, both paths) only for that proposer, judged under the state after the justify (a Decide PC
+    on an update this replica has not committed yet is read as if committed); a leader proposes a fresh block (or an
+    NEC block) only if it is that proposer. Nudges, VSU re-proposals and TC re-proposals (which copy the TC's high
+    tip) keep the two-leader rule.
+  - Options rejected: "PVS only while undecided" alone still has two leaders per view in the window. Ranking tied tips
+    by signer count fails (X can have up to 2f reporters, B only f+1). Treating both leaders' proposals in one view as
+    equivocation would make the undo detectable but TC(v) could still drop B. A single leader per view keeps the
+    argument above unconditional, and with dead-leader exclusion (the CVS drops a dead leader) it is the CVS leader
+    that proposes once the update takes over.
+  - Also from the review: the NE reply goes to the requesting proposer (either leader while undecided, as
+    `is_proposer`), not the CVS leader; the timeout blame (reputation bookkeeping) names the view's fresh proposer. The
+    justify-block fetch target (`request_missing_parent`) still asks the CVS leader of the justify's view first: a
+    hint, with rotation over the committed validators and height-range sync as fallbacks.
+  - Residual: a replica that applied U's Decide PC without committing U, and then a Generic PC on U's child before
+    the body arrives, judges later proposers under the old set until it commits; this is a liveness lag of that
+    replica, and its fresh votes for the old set's leader need 2f+1 such replicas to matter.
 - **Speculative-commit undo closed.** A speculatively committed block can then only be undone by leader
   equivocation, the existing rollback trigger (HS:1270-1285). `speculative_commits` has no RPC or exec consumer yet.
 - **Commit safety unchanged.** It still comes from the HotStuff lock (`safe_block` / `safe_pc`).
@@ -248,6 +282,13 @@ Phase C built the F1-F5 and domain-tag unit cases (`tc_validation_test.rs` "Phas
 F4, `types/signing.rs`) and, in `tests/tc_required_byzantine_test.rs`, a byzantine voter whose forged tips (fields not
 hashing to the signed block) must not make any honest leader run a recovery. The VSU case forces the V3-amendment
 re-proposal by dropping the first Prepare nudge and asserts it happened.
+
+The review fix (s134) adds `hotstuff/window_tip_leader_test.rs` (F2 per update view and decision, the B-vs-X tie at
+TC(v) resolving to B, fresh votes only for the view's fresh proposer incl. a Decide-PC justify on an uncommitted update,
+`update_view` recorded at commit, NE reply to the requesting proposer, the full path's drop of a proposal for another
+view), two window cases in `prev_view_collector_test.rs` (F4 drops the vote reporting X; timeout blame), the
+reputation-mode refusal, and `torus-consensus` slashing: a real phase-vote signature verifies through
+`build_vote_message`, which now builds hotstuff_rs's tagged phase-vote bytes.
 
 **Mutation checks** (each must fail at least one test): revert V1 to `Ok(true)`; drop V3; unsign `tip.view`; skip
 the F2 hash recompute; skip the leader-signature check; drop the domain tag; drop `prev_collector` (expect the

@@ -394,18 +394,15 @@ impl<N: Network> Pacemaker<N> {
                 .publish(&self.event_publisher);
 
                 // MonadBFT B3: Record leader timeout for reputation tracking.
-                // Must use reputation-aware selection to blame the actual leader.
-                let timed_out_leader = match block_tree.leader_reputation().ok() {
-                    Some(ref rep) => select_leader_with_reputation(
-                        new_tc.view,
-                        validator_set_state.committed_validator_set(),
-                        rep,
-                    ),
-                    None => {
-                        select_leader(new_tc.view, validator_set_state.committed_validator_set())
-                    }
-                };
-                let _ = block_tree.record_leader_timeout(&timed_out_leader);
+                // Must use reputation-aware selection to blame the actual leader: the view's one
+                // fresh proposer, which during a validator-set update may be the previous set's
+                // leader (TC phase C review).
+                let reputation = block_tree.leader_reputation().ok();
+                if let Some(timed_out_leader) =
+                    crate::pacemaker::types::fresh_proposer(new_tc.view, &validator_set_state, reputation.as_ref())
+                {
+                    let _ = block_tree.record_leader_timeout(&timed_out_leader);
+                }
 
                 // 3.1. If a newly collected Timeout Certificate has a higher view than `highest_tc`, update `highest_tc`.
                 //
@@ -1232,16 +1229,30 @@ static REPUTATION_LEADER_SELECTION_ENABLED: std::sync::atomic::AtomicBool =
 /// Leader selection must agree on every replica of a chain: set this to the
 /// same value on ALL replicas, before the replica starts, and never while it
 /// is running.
+///
+/// Enabling it is refused at replica start ([`check_leader_selection_mode`]):
+/// the TC tip checks (F2) pick a tip's leader with today's reputation rather
+/// than the tip view's (TC phase C review P2).
 pub fn set_reputation_leader_selection(enabled: bool) {
     REPUTATION_LEADER_SELECTION_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether a replica may run with reputation-weighted leader selection set to `reputation_enabled`.
 ///
-/// Skeleton (TC phase C review P2): accepts every mode until the guard lands.
+/// TC phase C review P2: refused. The tip checks (F2, docs/plans/tc-required-and-tip-signing.md §3)
+/// verify a tip's leader signature against leader(tip view), and with reputation that leader is
+/// computed from today's locally accumulated reputation, not the reputation the tip's view was led
+/// under; replicas would also disagree on it (see [`set_reputation_leader_selection`]). Reputation
+/// has to be derived from committed chain data and fixed per view before this can be lifted.
+/// Called by `ReplicaSpec::start` (panics) and by the node at startup (refuses to start).
 pub fn check_leader_selection_mode(reputation_enabled: bool) -> Result<(), &'static str> {
-    let _ = reputation_enabled;
-    Ok(())
+    if reputation_enabled {
+        Err("reputation-weighted leader selection cannot run with the TC tip checks (F2): a tip's \
+             leader would be picked from today's reputation instead of the tip view's; keep \
+             reputation_leader_selection off")
+    } else {
+        Ok(())
+    }
 }
 
 /// Whether reputation-weighted leader selection is currently enabled.

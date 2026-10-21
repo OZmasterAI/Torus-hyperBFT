@@ -79,12 +79,15 @@ impl TipInfo {
     ///
     /// - its height, justify and data hash recompute its block hash ([`Block::hash`]), so the
     ///   fields the protocol reads from a tip (`block_justify` above all) are the block's own;
-    /// - `leader_signature` is leader(`view`)'s signature over `(chain_id, view, block_hash)`
-    ///   ([`proposal_header_bytes`](crate::types::signing::proposal_header_bytes)), with
-    ///   leader(`view`) taken in the committed or the previous validator set (as for TCs). A tip
-    ///   signed under an older set fails (open question 4: drop, not archive).
+    /// - `leader_signature` is the signature of the view's one fresh proposer
+    ///   ([`fresh_proposer`]) over `(chain_id, view, block_hash)`
+    ///   ([`proposal_header_bytes`](crate::types::signing::proposal_header_bytes)): leader(`view`) of
+    ///   the previous set while an update is undecided and `view` is at most the update view, else of
+    ///   the committed set. One leader per view, so a view has at most one valid tip unless that
+    ///   leader equivocated (docs/plans/tc-required-and-tip-signing.md §4). A tip signed under an
+    ///   older set fails (open question 4: drop, not archive).
     ///
-    /// Costs one hash and one or two signature checks.
+    /// Costs one hash and one signature check.
     pub fn is_correct<K: KVStore>(
         &self,
         chain_id: ChainID,
@@ -105,18 +108,27 @@ impl TipInfo {
         if Block::hash(self.block_height, &self.block_justify, &self.block_data_hash) != self.block_hash {
             return false;
         }
-        let leader_in = |set: &ValidatorSet| {
-            (!set.is_empty() && set.total_power().int() > 0).then(|| match reputation {
-                Some(rep) => select_leader_with_reputation(self.view, set, rep),
-                None => select_leader(self.view, set),
-            })
-        };
-        let committed = leader_in(validator_set_state.committed_validator_set());
-        let previous = leader_in(validator_set_state.previous_validator_set()).filter(|leader| Some(*leader) != committed);
-        [committed, previous].into_iter().flatten().any(|leader| {
+        fresh_proposer(self.view, validator_set_state, reputation).is_some_and(|leader| {
             is_header_signed_by(chain_id, self.view, &self.block_hash, &self.leader_signature, &leader)
         })
     }
+}
+
+/// The one validator that may make a fresh proposal (sign a header that can become a tip) in
+/// `view`: leader(`view`) in [`ValidatorSetState::fresh_proposer_set`]. `None` if that set is empty.
+///
+/// Used by F2, by voters before a vote that sets their tip, and by a leader before it proposes a
+/// fresh block, so all three agree on one leader per view during a validator-set update.
+pub(crate) fn fresh_proposer(
+    view: ViewNumber,
+    validator_set_state: &ValidatorSetState,
+    reputation: Option<&LeaderReputation>,
+) -> Option<VerifyingKey> {
+    let set = validator_set_state.fresh_proposer_set(view);
+    (!set.is_empty() && set.total_power().int() > 0).then(|| match reputation {
+        Some(rep) => select_leader_with_reputation(view, set, rep),
+        None => select_leader(view, set),
+    })
 }
 
 /// The leader reputation a tip's leader is selected with: read only while reputation-weighted

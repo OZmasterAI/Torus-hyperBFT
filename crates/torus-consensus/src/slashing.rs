@@ -20,7 +20,8 @@ pub struct ObservedPhaseVote {
     pub chain_id: u64,
     pub view: u64,
     pub block_hash: [u8; 32],
-    /// 0 = Prepare, 1 = PreCommit, 2 = Commit
+    /// The hotstuff_rs [`Phase`](hotstuff_rs::hotstuff::types::Phase) as its borsh byte:
+    /// 0 = Generic, 1 = Prepare, 2 = Precommit, 3 = Commit, 4 = Decide.
     pub phase: u8,
     /// Ed25519 public key of the signer (32 bytes)
     pub signer: [u8; 32],
@@ -29,7 +30,7 @@ pub struct ObservedPhaseVote {
 }
 
 impl ObservedPhaseVote {
-    /// Build the canonical signed message: chain_id(8) || view(8) || block_hash(32) || phase(1).
+    /// The bytes the validator signed: hotstuff_rs's phase-vote bytes (see [`build_vote_message`]).
     pub fn signed_message(&self) -> Vec<u8> {
         build_vote_message(self.chain_id, self.view, &self.block_hash, self.phase)
     }
@@ -103,14 +104,24 @@ impl DoubleSignEvidence {
     }
 }
 
-/// Build the canonical vote message: chain_id(8) || view(8) || block_hash(32) || phase(1).
+/// The bytes a hotstuff_rs validator signs for this phase vote:
+/// [`phase_vote_bytes`](hotstuff_rs::types::signing::phase_vote_bytes), the phase-vote domain tag
+/// then borsh `(chain_id, view, block_hash, phase)` (little-endian). A `phase` byte that is no
+/// hotstuff_rs phase gives an empty message, which no signature verifies.
+///
+/// Before the TC phase C review this was an untagged big-endian layout that matched no real vote.
 fn build_vote_message(chain_id: u64, view: u64, block_hash: &[u8; 32], phase: u8) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(49);
-    msg.extend_from_slice(&chain_id.to_be_bytes());
-    msg.extend_from_slice(&view.to_be_bytes());
-    msg.extend_from_slice(block_hash);
-    msg.push(phase);
-    msg
+    use hotstuff_rs::hotstuff::types::Phase;
+    use hotstuff_rs::types::data_types::{ChainID, CryptoHash, ViewNumber};
+    let phase = match phase {
+        0 => Phase::Generic,
+        1 => Phase::Prepare,
+        2 => Phase::Precommit,
+        3 => Phase::Commit,
+        4 => Phase::Decide,
+        _ => return Vec::new(),
+    };
+    hotstuff_rs::types::signing::phase_vote_bytes(ChainID::new(chain_id), ViewNumber::new(view), &CryptoHash::new(*block_hash), phase)
 }
 
 /// Vote identity key: (chain_id, view, phase, signer).
