@@ -11168,8 +11168,13 @@ impl App<RocksKVStore> for TorusApp {
         {
             let _manifest_span =
                 ObserveOnDrop::new(self.metrics.clone(), |m| &m.commit_manifest_seconds);
-            let value = crate::leader_skip::manifest_value(datum_bytes, evidence.as_ref());
-            persist_commit_manifest(&self.manifest_db, height, &value);
+            // A refused value (a plain manifest from height 2^48 on, which could read back as
+            // an evidence envelope) is handled as a failed write: no manifest, recovery falls
+            // back to the durable body.
+            match crate::leader_skip::manifest_value(height, datum_bytes, evidence.as_ref()) {
+                Ok(value) => persist_commit_manifest(&self.manifest_db, height, &value),
+                Err(e) => tracing::error!(%e, height, "commit manifest not written"),
+            }
         }
         if let Some(evidence) = evidence {
             self.leader_evidence.insert(height, evidence);

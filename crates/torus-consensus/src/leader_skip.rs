@@ -83,9 +83,10 @@ pub fn leader_qc_key(height: u64) -> Vec<u8> {
 /// evidence, and a parked height (boot, FIX 6 / F-1) gets its evidence from the manifest it is
 /// parked from. A plain manifest is the datum verbatim (bincode of a `TorusBlock` or
 /// `CompactBlock`, both starting with the header's height, u64 LE); read as that height, the
-/// tag's last two bytes (`0xff 0xff`) put it above 2^64 - 2^48, which no committed height
-/// reaches, so the two never collide. Feature off (K = 0) writes plain manifests, byte for
-/// byte as before; old manifests decode as plain.
+/// tag's last two bytes (`0xff 0xff`) put it at or above 2^64 - 2^48 (`0xffff01564543514c`
+/// is the tag itself), so [`manifest_value`] refuses a plain manifest from
+/// [`MAX_PLAIN_MANIFEST_HEIGHT`] on and the two never collide. Feature off (K = 0) writes
+/// plain manifests, byte for byte as before; old manifests decode as plain.
 pub const MANIFEST_EVIDENCE_V1: [u8; 8] = [b'L', b'Q', b'C', b'E', b'V', 1, 0xff, 0xff];
 
 /// The prefix every envelope version shares (the version is byte 5).
@@ -93,13 +94,34 @@ fn is_envelope(value: &[u8]) -> bool {
     value.len() >= 8 && value[..5] == MANIFEST_EVIDENCE_V1[..5] && value[6..8] == [0xff, 0xff]
 }
 
-/// The manifest value for `datum`: the datum verbatim without `evidence`, else the envelope.
+/// The first height a plain manifest is refused at: 2^48 (Codex P3 on 0f3f6524). Every height
+/// whose LE bytes could spell an envelope prefix (`0xffff....` in the top two bytes) is at or
+/// above 2^64 - 2^48, far above this bound; 2^48 heights are ~8,900 years at 1,000 blocks/s,
+/// so no real chain reaches it, and a round power of two keeps the check one comparison.
+pub const MAX_PLAIN_MANIFEST_HEIGHT: u64 = 1 << 48;
+
+/// The manifest value of committed `height` for `datum`: the datum verbatim without
+/// `evidence`, else the envelope. `Err` for a plain manifest at a height from
+/// [`MAX_PLAIN_MANIFEST_HEIGHT`] on or a datum shaped like an envelope, which
+/// [`split_manifest`] would read back as one (the caller writes no manifest, as on a failed
+/// write; the envelope is unambiguous at any height).
 pub fn manifest_value<'a>(
+    height: u64,
     datum: &'a [u8],
     evidence: Option<&LeaderEvidence>,
-) -> std::borrow::Cow<'a, [u8]> {
+) -> Result<std::borrow::Cow<'a, [u8]>, String> {
     let Some(evidence) = evidence else {
-        return std::borrow::Cow::Borrowed(datum);
+        if height >= MAX_PLAIN_MANIFEST_HEIGHT {
+            return Err(format!(
+                "plain commit manifest refused at height {height:#x} (>= 2^48 could read back as an evidence envelope)"
+            ));
+        }
+        if is_envelope(datum) {
+            return Err(format!(
+                "plain commit manifest refused at height {height}: the datum starts with the evidence envelope tag"
+            ));
+        }
+        return Ok(std::borrow::Cow::Borrowed(datum));
     };
     let ev = borsh::to_vec(evidence).expect("borsh into a Vec cannot fail");
     let mut out = Vec::with_capacity(12 + ev.len() + datum.len());
@@ -107,7 +129,7 @@ pub fn manifest_value<'a>(
     out.extend_from_slice(&(ev.len() as u32).to_le_bytes());
     out.extend_from_slice(&ev);
     out.extend_from_slice(datum);
-    std::borrow::Cow::Owned(out)
+    Ok(std::borrow::Cow::Owned(out))
 }
 
 /// A manifest value split into its leader evidence (`None`: a plain manifest) and its datum.
@@ -549,10 +571,10 @@ mod tests {
     fn manifest_envelope_round_trips_and_plain_manifests_pass_through() {
         let e = ev(9, QC_GENERIC, vec![true, false, true]);
         let datum = b"some committed datum".to_vec();
-        let off = manifest_value(&datum, None);
+        let off = manifest_value(5, &datum, None).unwrap();
         assert!(matches!(off, std::borrow::Cow::Borrowed(_)));
         assert_eq!(&*off, datum.as_slice());
-        let on = manifest_value(&datum, Some(&e));
+        let on = manifest_value(5, &datum, Some(&e)).unwrap();
         assert_eq!(on[..8], MANIFEST_EVIDENCE_V1);
         assert_eq!(
             split_manifest(&on).unwrap(),
@@ -561,7 +583,9 @@ mod tests {
         assert_eq!(split_manifest(&datum).unwrap(), (None, datum.as_slice()));
         assert_eq!(split_manifest(&[]).unwrap(), (None, &[][..]));
 
-        // A plain datum: bincode (fixint, LE) of a block, its header's height first.
+        // A plain datum: bincode (fixint, LE) of a block, its header's height first. Heights
+        // from 2^48 on are refused on the write side
+        // (`plain_manifest_refuses_heights_that_collide_with_the_envelope_tag`).
         for height in [0u64, 1, 5, 1 << 40, u64::MAX - (1 << 48)] {
             let mut plain = bincode::serialize(&height).unwrap();
             plain.extend_from_slice(b"rest of the block");
@@ -577,6 +601,53 @@ mod tests {
         assert!(split_manifest(&v2).is_err(), "unknown version");
         assert!(split_manifest(&on[..10]).is_err(), "truncated length");
         assert!(split_manifest(&on[..14]).is_err(), "truncated evidence");
+    }
+
+    /// Codex P3 on 0f3f6524: a plain manifest's first 8 bytes are its height (u64 LE), so the
+    /// heights whose bytes spell the tag would be read back as an envelope: 0xffff01564543514c
+    /// splits as a version 1 envelope, 0xffff02564543514c is refused as version 2. The plain
+    /// path refuses every height from 2^48 on (all colliding heights are >= 2^64 - 2^48), and
+    /// any datum shaped like an envelope; heights below 2^48 pass, and with evidence the
+    /// envelope is unambiguous at any height.
+    #[test]
+    fn plain_manifest_refuses_heights_that_collide_with_the_envelope_tag() {
+        let plain_at = |height: u64| {
+            let mut datum = bincode::serialize(&height).unwrap();
+            datum.extend_from_slice(b"rest of the block");
+            datum
+        };
+        let v1 = u64::from_le_bytes(MANIFEST_EVIDENCE_V1);
+        assert_eq!(v1, 0xffff_0156_4543_514c, "fixture: the tag read as a height");
+        let v2 = 0xffff_0256_4543_514c_u64;
+        // The collision the guard prevents: written plain, these heights do not read back plain.
+        assert!(
+            !matches!(split_manifest(&plain_at(v1)), Ok((None, _))),
+            "fixture: the v1 tag height is not read back as a plain manifest"
+        );
+        assert!(split_manifest(&plain_at(v2)).is_err(), "fixture: the v2 height reads as version 2");
+
+        for height in [v1, v2, MAX_PLAIN_MANIFEST_HEIGHT, MAX_PLAIN_MANIFEST_HEIGHT + 1, u64::MAX] {
+            assert!(
+                manifest_value(height, &plain_at(height), None).is_err(),
+                "plain manifest at height {height:#x} refused"
+            );
+        }
+        let below = MAX_PLAIN_MANIFEST_HEIGHT - 1;
+        let datum = plain_at(below);
+        let value = manifest_value(below, &datum, None).unwrap();
+        assert_eq!(&*value, datum.as_slice(), "below 2^48: the datum verbatim");
+        assert_eq!(split_manifest(&value).unwrap(), (None, datum.as_slice()));
+
+        // A datum shaped like an envelope is refused whatever height it claims.
+        assert!(manifest_value(7, &plain_at(v1), None).is_err());
+
+        // With evidence: the envelope, at the colliding heights too.
+        let e = ev(9, QC_GENERIC, vec![true, false, true]);
+        for height in [v1, v2, u64::MAX] {
+            let datum = plain_at(height);
+            let on = manifest_value(height, &datum, Some(&e)).unwrap();
+            assert_eq!(split_manifest(&on).unwrap(), (Some(e.clone()), datum.as_slice()));
+        }
     }
 
     /// Execution's row set: the evidence row is required (missing = error, never a guess), and
