@@ -363,6 +363,8 @@ impl<K: KVStore> BlockTreeSingleton<K> {
             // TC phase C review: record where the committed update took over fresh proposals.
             if let Some(view) = self.update_view_of(&committed_blocks, justify)? {
                 wb.set_validator_set_update_view(view)?;
+                // s138 option 1: only here, when this commit includes an updating block.
+                self.record_update_commit_pc(&mut wb, &committed_blocks, justify)?;
             }
         }
 
@@ -589,6 +591,35 @@ impl<K: KVStore> BlockTreeSingleton<K> {
             None => self.block_justify(&justify.block)?.view,
         };
         Ok(Some(view))
+    }
+
+    /// s138 option 1 (docs/plans/vset-membership-sync-remainder.md): if `justify` is a Commit PC on
+    /// the updating block U that `update(justify)` just committed (U is the top of
+    /// `committed_blocks`), store it with U's updates at U's height
+    /// ([`update_records`](crate::block_tree::update_records)), in `wb`, the commit's write batch.
+    ///
+    /// Called only when `committed_blocks` holds an updating block. An update committed by its
+    /// Decide PC or as an ancestor of a later commit gets no record: no Commit PC is at hand, and
+    /// the Decide check every client runs on U's child is deterministic.
+    fn record_update_commit_pc(
+        &self,
+        wb: &mut BlockTreeWriteBatch<K::WriteBatch>,
+        committed_blocks: &[(CryptoHash, Option<ValidatorSetUpdates>)],
+        justify: &PhaseCertificate,
+    ) -> Result<(), BlockTreeError> {
+        if !justify.phase.is_commit() {
+            return Ok(());
+        }
+        let Some((updating_block, Some(updates))) = committed_blocks.last() else {
+            return Ok(());
+        };
+        if *updating_block != justify.block {
+            return Ok(());
+        }
+        let height = self
+            .block_height(updating_block)?
+            .ok_or(BlockTreeError::BlockExpectedButNotFound { block: *updating_block })?;
+        wb.set_validator_set_update_record(height, updates, justify)
     }
 
     /// Set the highest `TimeoutCertificate` to be `tc`.
