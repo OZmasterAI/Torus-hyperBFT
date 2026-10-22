@@ -238,6 +238,7 @@ impl Round {
                     pre_pos: None,
                     top_up_candidate: self.candidate[j],
                     res_price: params.price,
+                    cert_skipped: false,
                 });
         }
         out
@@ -865,6 +866,7 @@ fn stitch_records_the_scan_candidates_on_real_phase2_runs() {
                     2,
                     orders.len(),
                     false,
+                    None,
                 )
                 .expect("no worker panic");
                 for (i, (s, p)) in orders.iter().enumerate() {
@@ -1054,6 +1056,7 @@ fn batched_margin_cut_counters_equal_record_margin_cuts() {
                 pre_pos: None,
                 top_up_candidate: rng.one_in(2),
                 res_price: cents(9_000 + rng.below(2_000) as i64),
+                cert_skipped: false,
             })
             .collect();
         let results: Vec<MatchResult> = (0..n)

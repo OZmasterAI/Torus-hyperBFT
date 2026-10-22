@@ -156,6 +156,7 @@ fn settle_ioc(parallel: bool, fault: bool) -> (bool, Rows, Option<String>, usize
             pre_pos: None,
             top_up_candidate: false,
             res_price: params.price,
+            cert_skipped: false,
         }],
     );
     let mut results = vec![NativeActionResult::ok("pending", 0)];
@@ -282,6 +283,7 @@ fn top_up(fault: bool) -> ([u64; 3], Rows, Option<String>, usize) {
             pre_pos: None,
             top_up_candidate: true,
             res_price: params.price,
+            cert_skipped: false,
         }],
     );
     let mut bal_cache = BalanceCache::new();

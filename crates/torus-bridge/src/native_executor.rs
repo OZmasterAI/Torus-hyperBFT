@@ -578,6 +578,11 @@ struct PreparedOrder<'a> {
     /// (Phase 2's reservation price, raised to a granted top-up's price); the
     /// sell-cut counters bucket a cut by its hit price minus this.
     res_price: FixedPoint,
+    /// s80 (tests, `TORUS_S80_P2_CERT`): this order took the certified
+    /// skip path, so it carries no `pre_pos` (the M1 shadow in
+    /// `match_setup` accepts exactly these orders without one).
+    #[cfg(test)]
+    cert_skipped: bool,
 }
 
 /// C3: everything a settle worker precomputes for ONE prepared order —
@@ -1670,13 +1675,18 @@ struct PrepPass {
     /// [`SenderState::excess_unchecked`] sums; tests' oracle).
     #[cfg(test)]
     excess_im: FixedPoint,
+    /// s80 (tests): [`PreparedOrder::cert_skipped`].
+    #[cfg(test)]
+    cert_skipped: bool,
 }
 
 /// s80 phase2-sender-certificate (`TORUS_S80_P2_CERT`, prototype, default
 /// off = the exact Phase-2 path). `probe`: the exact path plus the
 /// certificate's statistics; `1`: certified senders skip the F1 placement
-/// math; `shadow`: both, and a mismatch panics; `ub`: an UNSOUND
-/// upper-bound arm (every plain GTC / PostOnly limit skips; bench only).
+/// math (serial loop and sharded prepare); `shadow`: the exact path, and a
+/// certified sender's order that the exact path rejects on margin / price
+/// or passes with excess > 1 raw is counted and logged at ERROR (never a
+/// panic). Review fix 7: the unsound `ub` bench arm is gone.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum P2CertMode {
@@ -1684,7 +1694,6 @@ pub enum P2CertMode {
     Probe,
     On,
     Shadow,
-    Ub,
 }
 
 /// s80: pure parse of `TORUS_S80_P2_CERT`.
@@ -1694,7 +1703,6 @@ pub fn parse_p2_cert(v: Option<&str>) -> P2CertMode {
         Some("1" | "on" | "true") => P2CertMode::On,
         Some("probe") => P2CertMode::Probe,
         Some("shadow") => P2CertMode::Shadow,
-        Some("ub") => P2CertMode::Ub,
         _ => P2CertMode::Off,
     }
 }
@@ -1734,15 +1742,11 @@ fn p2_cert_mode() -> P2CertMode {
 /// s80 probe counters: [senders seen, senders certified, orders seen,
 /// orders covered (certified senders' orders), orders skipped (the skip
 /// path ran), bail: not eligible, senders with split runs (gathered, not a
-/// bail), bail: bound failed, bail: overflow, shadow checks].
-static P2_CERT_STATS: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+/// bail), bail: bound failed, bail: overflow, shadow checks, shadow
+/// mismatches, senders certified in the sharded prepare].
+static P2_CERT_STATS: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
 /// s80 probe: the smallest relative slack (slack / F0, ppm) seen.
 static P2_CERT_MIN_SLACK_PPM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
-
-/// s80 (tests): a certified skip ran in this process (the M1 shadow then
-/// accepts a checked taker without `pre_pos`).
-#[cfg(test)]
-static P2_CERT_SKIPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn p2_stat(k: usize, n: u64) {
     P2_CERT_STATS[k].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -1750,8 +1754,8 @@ fn p2_stat(k: usize, n: u64) {
 
 /// s80: the probe counters ([`P2_CERT_STATS`]) and the min slack ppm, then reset.
 #[doc(hidden)]
-pub fn p2_cert_stats_take() -> ([u64; 10], u64) {
-    let mut out = [0u64; 10];
+pub fn p2_cert_stats_take() -> ([u64; 12], u64) {
+    let mut out = [0u64; 12];
     for (o, a) in out.iter_mut().zip(P2_CERT_STATS.iter()) {
         *o = a.swap(0, std::sync::atomic::Ordering::Relaxed);
     }
@@ -9496,6 +9500,10 @@ impl NativeExecutor {
                 groups[gi].1.push((i, params));
             }
             if groups.len() >= 2 {
+                // s80 (review fix 3): the sharded prepare certifies too
+                // (each worker, per sender group = the sender's
+                // PlaceOrders of the call in flat order).
+                let cert = cert_on.then_some((cert_mode, &ctx.order_books));
                 match Self::phase2_parallel_prepare(
                     &reader,
                     &open_at_start,
@@ -9505,6 +9513,7 @@ impl NativeExecutor {
                     engine_threads,
                     n,
                     split_margin_label,
+                    cert,
                 ) {
                     Some((outcomes, out)) => {
                         // Sender shards are disjoint, so the merged output
@@ -9568,11 +9577,7 @@ impl NativeExecutor {
                     (s, FlatAction::Place(p)) => (s, *p),
                     (_, FlatAction::Other(_)) => unreachable!(),
                 };
-                let certified = match cert_mode {
-                    P2CertMode::Off | P2CertMode::Probe | P2CertMode::Shadow => false,
-                    P2CertMode::Ub => Self::p2_cert_eligible(params),
-                    P2CertMode::On => certs[pos],
-                };
+                let certified = cert_mode == P2CertMode::On && certs[pos];
                 let outcome = Self::prepare_one(
                     &reader,
                     &open_at_start,
@@ -9585,27 +9590,8 @@ impl NativeExecutor {
                     split_margin_label,
                     certified,
                 );
-                // s80 shadow: the exact path ran; a certified sender's
-                // order must pass its account check (no margin reject, no
-                // placement_need overflow) with an excess of <= 1 raw.
                 if cert_mode == P2CertMode::Shadow && certs[pos] {
-                    p2_stat(9, 1);
-                    match &outcome {
-                        PrepOutcome::Pass(_pass) => {
-                            #[cfg(test)]
-                            assert!(
-                                _pass.excess_im <= FixedPoint::from_raw(1),
-                                "TORUS_S80_P2_CERT shadow: certified {sender} order {i}: excess {}",
-                                _pass.excess_im
-                            );
-                        }
-                        PrepOutcome::Reject { funnel, reason, msg } => {
-                            assert!(
-                                !matches!(funnel, RejectReason::Margin(_)) && *reason != FailureReason::Price,
-                                "TORUS_S80_P2_CERT shadow: certified {sender} order {i} rejected: {msg}"
-                            );
-                        }
-                    }
+                    Self::p2_shadow_check(sender, i, &outcome);
                 }
                 let stitched = Self::stitch_outcome(
                     &mut ctx.next_global_order_id,
@@ -10246,8 +10232,6 @@ impl NativeExecutor {
                     // only feeds the (certified non-binding) pool.
                     pos_net = pn;
                     p2_stat(4, 1);
-                    #[cfg(test)]
-                    P2_CERT_SKIPPED.store(true, std::sync::atomic::Ordering::Relaxed);
                 } else {
                 // `position_px` with the market's mark read once per call.
                 let e = match st.proj.get_or_try_insert(params.market_id, || {
@@ -10381,6 +10365,8 @@ impl NativeExecutor {
             res_price,
             #[cfg(test)]
             excess_im: if checked { FixedPoint::ZERO } else { excess },
+            #[cfg(test)]
+            cert_skipped: certified && needs_account,
         })
     }
 
@@ -10460,6 +10446,59 @@ impl NativeExecutor {
             }
         }
         out
+    }
+
+    /// s80 (review fix 3): [`Self::p2_certify`] for one sender group of the
+    /// sharded prepare (all the sender's PlaceOrders of the call, flat
+    /// order — the same input `p2_certify` gathers for it).
+    #[allow(clippy::too_many_arguments)]
+    fn p2_cert_group<T: StateBackend>(
+        reader: &AccountReader<'_, T>,
+        books: &HashMap<MarketId, OrderBook>,
+        open_at_start: &HashMap<Address, u32>,
+        basis: &HashMap<usize, (FixedPoint, FixedPoint)>,
+        markets: &HashMap<MarketId, Phase2Market<'_>>,
+        sender: &Address,
+        orders: &[(usize, &PlaceOrderParams)],
+    ) -> bool {
+        let run: Vec<(usize, Address, &PlaceOrderParams)> = orders.iter().map(|&(i, p)| (i, *sender, p)).collect();
+        p2_stat(0, 1);
+        p2_stat(2, run.len() as u64);
+        match Self::p2_cert_one(reader, books, open_at_start, basis, markets, sender, &run) {
+            Ok(_) => {
+                p2_stat(1, 1);
+                p2_stat(11, 1);
+                p2_stat(3, run.len() as u64);
+                true
+            }
+            Err(kind) => {
+                p2_stat(kind, 1);
+                false
+            }
+        }
+    }
+
+    /// s80 shadow (`TORUS_S80_P2_CERT=shadow`): the exact path ran for a
+    /// certified sender's order; it must pass its account check (no margin
+    /// or price reject) with an excess of <= 1 raw (the excess is only
+    /// visible in test builds). A violation is counted ([`P2_CERT_STATS`]
+    /// 10) and logged at ERROR — never a panic (review fix 7).
+    fn p2_shadow_check(sender: &Address, i: usize, outcome: &PrepOutcome) {
+        p2_stat(9, 1);
+        let bad = match outcome {
+            #[cfg(test)]
+            PrepOutcome::Pass(pass) => (pass.excess_im > FixedPoint::from_raw(1))
+                .then(|| format!("excess {}", pass.excess_im)),
+            #[cfg(not(test))]
+            PrepOutcome::Pass(_) => None,
+            PrepOutcome::Reject { funnel, reason, msg } => (matches!(funnel, RejectReason::Margin(_))
+                || *reason == FailureReason::Price)
+                .then(|| format!("rejected: {msg}")),
+        };
+        if let Some(what) = bad {
+            p2_stat(10, 1);
+            tracing::error!("TORUS_S80_P2_CERT shadow MISMATCH: certified {sender} order {i}: {what}");
+        }
     }
 
     /// s80: the flat-tier cap of a market's IM — `Some(cap)`: `IM(n) =
@@ -10543,7 +10582,15 @@ impl NativeExecutor {
         let mut cap_min = GUARD;
         let mut anchor: Option<MarketId> = None;
         for &(i, _, p) in orders {
-            if !Self::p2_cert_eligible(p) || basis.contains_key(&i) {
+            // Review fix 1: an order the exact path rejects for its price
+            // or a non-positive quantity would enter the sums with a
+            // negative (or zero) notional — it voids the certificate. From
+            // here on every price and quantity summed is > 0.
+            if !Self::p2_cert_eligible(p)
+                || basis.contains_key(&i)
+                || Self::validate_order_price(p).is_err()
+                || p.quantity <= FixedPoint::ZERO
+            {
                 return Err(NOT_ELIGIBLE);
             }
             let m = markets.get(&p.market_id).ok_or(NOT_ELIGIBLE)?;
@@ -10589,9 +10636,15 @@ impl NativeExecutor {
             let r = m.band.ok_or(NOT_ELIGIBLE)?.reference;
             let tiers = m.tiers();
             let p_fill = c.p_fill;
+            // Review fix 2: checked (FixedPoint `-` panics on overflow).
+            let adverse_of = |is_buy: bool, px: FixedPoint| {
+                (if is_buy { px.raw().checked_sub(r.raw()) } else { r.raw().checked_sub(px.raw()) })
+                    .map(FixedPoint::from_raw)
+                    .ok_or(OVERFLOW)
+            };
             for &(_, _, p) in orders.iter().filter(|o| o.2.market_id == pm) {
                 let base = Self::reserve_price(p);
-                let adverse = if p.is_buy { base - r } else { r - base };
+                let adverse = adverse_of(p.is_buy, base)?;
                 if adverse > FixedPoint::ZERO {
                     need = add(need, mul(adverse, p.quantity)?)?;
                 }
@@ -10603,7 +10656,7 @@ impl NativeExecutor {
             let book = books.get(&pm);
             let resting = book.map_or(0, OrderBook::order_count);
             for o in book.map(|b| b.orders_for_trader(sender)).unwrap_or_default() {
-                let adverse = if o.side == Side::Buy { o.price - r } else { r - o.price };
+                let adverse = adverse_of(o.side == Side::Buy, o.price)?;
                 if adverse > FixedPoint::ZERO {
                     need = add(need, mul(adverse, o.remaining_qty)?)?;
                 }
@@ -10640,7 +10693,9 @@ impl NativeExecutor {
         }
         let p_fill = m.bid_floor.unwrap_or(FixedPoint::ZERO).max(Self::p2_band_hi(band)?);
         Some(P2CertMarket {
-            tup: m.bid_floor.and_then(Self::sell_top_up_price).unwrap_or(FixedPoint::ZERO),
+            // Review fix 4: no top-up price (overflow) -> the floor itself
+            // is the highest reservation price (no top-up is granted).
+            tup: m.bid_floor.map_or(FixedPoint::ZERO, |b| Self::sell_top_up_price(b).unwrap_or(b)),
             p_fill,
             top: p_fill.max(mark),
             lev,
@@ -10694,6 +10749,8 @@ impl NativeExecutor {
                     pre_pos: pass.pre_pos,
                     top_up_candidate: pass.top_up_candidate,
                     res_price: pass.res_price,
+                    #[cfg(test)]
+                    cert_skipped: pass.cert_skipped,
                 });
                 stitched
             }
@@ -10733,6 +10790,8 @@ impl NativeExecutor {
         threads: usize,
         n: usize,
         split_margin_label: bool,
+        // s80 (`TORUS_S80_P2_CERT`): the mode (not Off) and the books.
+        cert: Option<(P2CertMode, &HashMap<MarketId, OrderBook>)>,
     ) -> Option<(Vec<Option<PrepOutcome>>, FoldOut)> {
         let workers = threads.min(groups.len()).max(1);
         let shard = groups.len().div_ceil(workers);
@@ -10757,23 +10816,30 @@ impl NativeExecutor {
                             let mut fold = SenderFold::with_capacity(shard_groups.len());
                             let mut out: Vec<(usize, PrepOutcome)> = Vec::with_capacity(orders);
                             for (sender, orders) in shard_groups {
+                                // s80: the sender's certificate over its
+                                // group (= `p2_certify`'s gathered runs).
+                                let certs = cert.is_some_and(|(_, books)| {
+                                    Self::p2_cert_group(reader, books, open_at_start, basis, markets, sender, orders)
+                                });
+                                let mode = cert.map(|c| c.0);
                                 for &(i, params) in orders {
                                     // L3-ENG: literally the serial loop's step.
-                                    out.push((
+                                    let outcome = Self::prepare_one(
+                                        reader,
+                                        open_at_start,
+                                        basis,
+                                        markets,
+                                        &mut fold,
                                         i,
-                                        Self::prepare_one(
-                                            reader,
-                                            open_at_start,
-                                            basis,
-                                            markets,
-                                            &mut fold,
-                                            i,
-                                            sender,
-                                            params,
-                                            split_margin_label,
-                                            false,
-                                        ),
-                                    ));
+                                        sender,
+                                        params,
+                                        split_margin_label,
+                                        certs && mode == Some(P2CertMode::On),
+                                    );
+                                    if certs && mode == Some(P2CertMode::Shadow) {
+                                        Self::p2_shadow_check(sender, i, &outcome);
+                                    }
+                                    out.push((i, outcome));
                                 }
                             }
                             #[cfg(test)]
@@ -13528,10 +13594,11 @@ impl NativeExecutor {
                 #[cfg(test)]
                 if let Some(s) = reader.sums.filter(|s| s.shadow) {
                     let want = reader.position_px(&p.sender, market_id).map_or(FixedPoint::ZERO, |(_, px)| px);
-                    // s80: a certified sender's order carries no `pre_pos`
-                    // (TORUS_S80_P2_CERT skip path): the read above is the
-                    // M1 fallback, not a mismatch.
-                    if want != px || (p.pre_pos.is_none() && !P2_CERT_SKIPPED.load(std::sync::atomic::Ordering::Relaxed)) {
+                    // s80: an order that took the certified skip path
+                    // (TORUS_S80_P2_CERT) carries no `pre_pos`: the read
+                    // above is the M1 fallback, not a mismatch. Per order
+                    // (review fix 6), so every other order keeps the check.
+                    if want != px || (p.pre_pos.is_none() && !p.cert_skipped) {
                         s.shadow_mismatches.lock().unwrap().push(format!(
                             "M1 px {} {market_id}: reused {px:?}, position_px {want:?}, pre_pos {:?}",
                             p.sender, p.pre_pos
@@ -17515,6 +17582,7 @@ mod option_b_fold_pool_tests {
                 2,
                 orders.len(),
                 false,
+                None,
             )
             .expect("no worker panic");
             let mut sharded: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::default();

@@ -144,6 +144,7 @@ fn settle_closing_taker(
             pre_pos: None,
             top_up_candidate: false,
             res_price: params.price,
+            cert_skipped: false,
         }],
     );
     let mut results = vec![NativeActionResult::ok("pending", 0)];
@@ -367,6 +368,7 @@ fn settle_two_markets(workers: Option<usize>, precedence: bool) -> (Option<Strin
                 pre_pos: None,
                 top_up_candidate: false,
                 res_price: params.price,
+                cert_skipped: false,
             }],
         );
     }
