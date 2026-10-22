@@ -24,7 +24,8 @@ Checkpoints off (the node's own resolution, resolve_interval_ms) and no node
 reporting a checkpoint -> skipped, one line, no wait. The env says off but a
 node did checkpoint -> the node is the truth: wait, with a WARNING note. A node
 without either metric (older binary) with checkpoints on -> sleep interval +
-margin instead. No W >= C0 + 1 on every node within the timeout (default
+margin for it (the nodes that do report them are still held to
+W >= C0 + 1). No W >= C0 + 1 on every node within the timeout (default
 2 x interval + 30 s) -> outcome "timeout", exit 3: the digest may predate the
 final state (run-cell.sh logs it, summarize.py marks the cell).
 
@@ -184,6 +185,12 @@ def poll_durable(rec, nodes, t0, deadline, poll_s):
                 rec["nodes"][name]["write_count"] = v[WRITES]
 
 
+def per_node_line(rec, nodes):
+    return ", ".join("%s ckpt %s->%s %s" % (n, rec["nodes"][n]["c0"], rec["nodes"][n]["write_count"],
+                                          "durable" if rec["nodes"][n]["durable"] else "NOT durable")
+                     for n, _ in nodes)
+
+
 def new_record(nodes, interval_ms, timeout_s, poll_s):
     return {"outcome": None, "interval_ms": interval_ms, "timeout_s": timeout_s,
             "poll_s": poll_s, "metrics": {"submits": SUBMITS, "writes": WRITES},
@@ -242,12 +249,24 @@ def main(argv=None):
         return finish("skipped", "skipped, %s%s" % (
             off, "; checkpoint metrics absent on %s" % " ".join(missing) if missing else ""))
     if missing:
+        # Mixed fleet: the nodes that report both metrics are still held to
+        # W >= C0 + 1 (an older binary elsewhere excuses no stalled node);
+        # only the others are covered by sleeping interval + margin.
         names = "/".join(sorted({k for n in missing for k in rec["nodes"][n]["missing"]}))
         rec["note"] = "checkpoint metrics absent on %s (older binary): slept interval + %.1f s" % (
             " ".join(missing), a.fallback_margin_s)
+        capable = [(n, u) for n, u in nodes if n not in missing]
+        if not any((base[n][SUBMITS] or 0) > 0 for n, _ in capable):
+            capable = []
+        pending = poll_durable(rec, capable, t0, deadline, a.poll_s) if capable else []
+        per = per_node_line(rec, capable)
+        if pending:
+            return finish("timeout", "TIMEOUT: %s, waited {waited}s of %.0fs (%s) (%s)"
+                          % (per, timeout_s, iv, rec["note"]), TIMEOUT_RC)
         time.sleep(max(0.0, eff_ms / 1000.0 + a.fallback_margin_s - (time.monotonic() - t0)))
-        return finish("fallback_sleep", "%s absent on %s (older binary), slept {waited}s = "
-                      "interval + %.1fs margin (%s)" % (names, " ".join(missing), a.fallback_margin_s, iv))
+        return finish("fallback_sleep", "%s%s absent on %s (older binary), slept {waited}s >= "
+                      "interval + %.1fs margin (%s)" % (per + ", " if per else "", names,
+                                                         " ".join(missing), a.fallback_margin_s, iv))
     if not ran:
         rec["note"] = "%s=0 on every live node: no checkpoint ran (per-block flush)" % SUBMITS
         return finish("skipped", "skipped, no checkpoint ran on any live node (%s=0; %s)" % (SUBMITS, iv))
@@ -256,9 +275,7 @@ def main(argv=None):
                        "(timeout from the 15 s default)" % (off, " ".join(ran)))
 
     pending = poll_durable(rec, nodes, t0, deadline, a.poll_s)
-    per = ", ".join("%s ckpt %s->%s %s" % (n, rec["nodes"][n]["c0"], rec["nodes"][n]["write_count"],
-                                         "durable" if rec["nodes"][n]["durable"] else "NOT durable")
-                    for n, _ in nodes)
+    per = per_node_line(rec, nodes)
     warn = " (%s)" % rec["note"] if rec["note"] else ""
     if pending:
         return finish("timeout", "TIMEOUT: %s, waited {waited}s of %.0fs (%s)%s"

@@ -283,7 +283,8 @@ python3 tools/matched-bench/test_harness.py
    the quiet point is on disk). One `digest checkpoint wait:` line per cell;
    `digest-ckpt-wait.json` holds C0, the final write count and the wait per
    node. Checkpoints off (and no node checkpointing) -> `skipped`, no wait;
-   metrics absent (older binary) -> sleep interval + 5 s (`fallback_sleep`);
+   metrics absent (older binary) -> sleep interval + 5 s (`fallback_sleep`;
+   the nodes that report them are still held to C0 + 1);
    no checkpoint within 2 x interval + 30 s -> `timeout` (WARNING in run.log;
    summarize.py treats the digest as unpinned, so unequal digests read
    `DIGEST_UNVERIFIED` instead of `DISAGREE`, and adds an unverified reason, so

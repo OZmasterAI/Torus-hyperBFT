@@ -242,6 +242,39 @@ class WaitTests(unittest.TestCase):
                 self.assertIn("absent", out)
                 self.assertIn("slept", out)
 
+    def test_mixed_fleet_still_checks_the_nodes_that_report_the_metrics(self):
+        """Codex stop review: an older binary on one node must not excuse a
+        stalled checkpoint on another: val1 (metrics, write stuck below C0+1)
+        is a timeout even though val0 can only be slept on."""
+        old = FakeNode([(0, None, None)])
+        stalled = FakeNode([(0, 9, 8)])
+        with old, stalled:
+            rc, out, err, rec, _ = run_wait(
+                [("val0", old), ("val1", stalled)],
+                json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "300"}),
+                extra=["--fallback-margin-s", "0.2", "--timeout-s", "1.0"],
+            )
+        self.assertEqual(rc, 3, out + err)
+        self.assertEqual(rec["outcome"], "timeout")
+        self.assertFalse(rec["nodes"]["val1"]["durable"])
+        self.assertIn("val1 ckpt 9->8 NOT durable", out)
+
+    def test_mixed_fleet_waits_for_both_the_sleep_and_the_durable_checkpoint(self):
+        old = FakeNode([(0, None, None)])
+        slow = FakeNode([(0, 9, 9), (1.0, 10, 10)])
+        with old, slow:
+            rc, out, err, rec, wall = run_wait(
+                [("val0", old), ("val1", slow)],
+                json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "300"}),
+                extra=["--fallback-margin-s", "0.2"],
+            )
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(rec["outcome"], "fallback_sleep")
+        self.assertTrue(rec["nodes"]["val1"]["durable"])
+        self.assertGreaterEqual(wall, 1.0)
+        self.assertIn("val1 ckpt 9->10 durable", out)
+        self.assertIn("absent on val0", out)
+
     def test_metric_absent_with_checkpoints_off_skips_without_sleeping(self):
         old = FakeNode([(0, None, None)])
         with old:
