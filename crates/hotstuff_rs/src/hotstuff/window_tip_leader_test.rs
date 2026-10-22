@@ -656,3 +656,185 @@ fn case3_leader_decided_by_the_tc_high_qc_votes_for_its_own_proposal() {
         assert!(voted, "decided={decided}: a peer votes for the case-3 proposal on the header path");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Dead-leader skip on the TC set (s136): an exclusion-only update in the window.
+//
+// The update keeps the members (validators 1..4) and only excludes validator 4 from leading. It
+// flows through `ValidatorSetUpdates` and `apply_updates` like a membership update, so the
+// committed set carries the exclusion and `fresh_proposer_set` names the previous set's leader up
+// to the update view (validator 4 where it leads) and the committed set's leader after it (never
+// validator 4). F2, TC validation and `is_fresh_proposer` (including its rebuild of the committed
+// set from a Decide PC the replica has not committed yet) agree on that leader, decided or not.
+// ---------------------------------------------------------------------------
+
+/// The excluded validator: 4 (never the local replica, which is one of 1..3).
+fn excluded() -> VerifyingKey {
+    old_keys()[3].verifying_key()
+}
+
+/// The exclusion-only update: members unchanged, validator 4 excluded from leading.
+fn exclusion_update() -> ValidatorSetUpdates {
+    let mut updates = ValidatorSetUpdates::new();
+    updates.exclude_leader(excluded());
+    updates
+}
+
+/// The previous (old) set with the exclusion applied through `apply_updates`.
+fn excluded_set() -> ValidatorSet {
+    let mut set = old_set();
+    set.apply_updates(&exclusion_update());
+    set
+}
+
+fn excluded_set_leader(view: u64) -> VerifyingKey {
+    select_leader(ViewNumber::new(view), &excluded_set())
+}
+
+/// The first view from `from` that validator 4 leads in the previous set (so the two sets' leaders
+/// differ: the committed set never picks it).
+fn excluded_leads_from(from: u64) -> u64 {
+    (from..from + 64).find(|v| old_leader(*v) == excluded()).expect("validator 4 leads some view")
+}
+
+/// The exclusion-only update committed by its Commit PC at `update_view` (real block-tree flow:
+/// insert with the update, commit), then, if `decided`, decided by a Decide PC at `update_view + 1`.
+fn exclusion_tree(update_view: u64, decided: bool) -> BlockTreeSingleton<MemKV> {
+    let old = old_set();
+    let mut tree = tree_of(&ValidatorSetState::new(old.clone(), old, None, true));
+    let updating = block(110);
+    tree.insert(&updating, None, Some(&exclusion_update())).unwrap();
+    tree.update(&pc(update_view, &updating, Phase::Commit), &None).unwrap();
+    if decided {
+        let decide = signed_pc(update_view + 1, &updating, Phase::Decide, &excluded_set());
+        tree.advance_highest_pc_from_remote(&decide, &None).unwrap();
+    }
+    tree
+}
+
+/// A replica at `view` over `tree`'s state: one of validators 1..3 leading `view` in neither set.
+fn exclusion_replica(view: u64, tree: BlockTreeSingleton<MemKV>) -> Replica {
+    let state = tree.validator_set_state().unwrap();
+    let local = signing_keys(&[1, 2, 3])
+        .into_iter()
+        .find(|key| key.verifying_key() != old_leader(view) && key.verifying_key() != excluded_set_leader(view))
+        .expect("a validator that leads neither set's view");
+    let net = RecordingNetwork::default();
+    let (tx, events) = std::sync::mpsc::channel();
+    let hotstuff = HotStuff::new(
+        HotStuffConfiguration { chain_id: CHAIN_ID, keypair: Keypair::new(local) },
+        ViewInfo::new(ViewNumber::new(view), Instant::now() + Duration::from_secs(3600)),
+        SenderHandle::new(net.clone()),
+        ValidatorSetUpdateHandle::new(net.clone()),
+        state,
+        Some(tx),
+    );
+    Replica { hotstuff, tree, events, net }
+}
+
+#[test]
+fn exclusion_only_update_flows_through_apply_updates_into_the_committed_set() {
+    let set = excluded_set();
+    assert!(set.is_leader_excluded(&excluded()), "apply_updates applies the exclusion delta");
+    assert!(set.leader_exclusion_active(), "fixture: 3 of 4 eligible is a quorum");
+    for decided in [false, true] {
+        let state = exclusion_tree(5, decided).validator_set_state().unwrap();
+        assert_eq!(state.update_decided(), decided, "fixture: decided={decided}");
+        assert_eq!(state.update_view(), Some(ViewNumber::new(5)), "decided={decided}: the update view is recorded");
+        assert!(state.committed_validator_set() == &set, "decided={decided}: the stored committed set carries the exclusion");
+        assert!(state.previous_validator_set() == &old_set(), "decided={decided}: the previous set has none");
+    }
+}
+
+/// F2 and TC validation: one fresh proposer per view across the exclusion-only update, the same on
+/// a decided and an undecided replica.
+#[test]
+fn exclusion_window_f2_and_tc_validation_agree_on_one_leader_decided_or_not() {
+    let early = excluded_leads_from(1);
+    let update_view = early;
+    let late = excluded_leads_from(update_view + 1);
+    let x = excluded();
+    let b = block(111);
+    for decided in [false, true] {
+        let tree = exclusion_tree(update_view, decided);
+        // F2 up to the update view: the previous set's leader (validator 4), not the committed set's.
+        assert!(tip_by(&b, early, &x).is_correct(CHAIN_ID, &tree).unwrap(), "decided={decided}: excluded validator's pre-update tip");
+        assert!(
+            !tip_by(&b, early, &excluded_set_leader(early)).is_correct(CHAIN_ID, &tree).unwrap(),
+            "decided={decided}: committed-set leader up to the update view"
+        );
+        // F2 after it: the committed set's leader; validator 4 no longer leads.
+        assert!(
+            tip_by(&b, late, &excluded_set_leader(late)).is_correct(CHAIN_ID, &tree).unwrap(),
+            "decided={decided}: committed-set leader after the update view"
+        );
+        assert!(!tip_by(&b, late, &x).is_correct(CHAIN_ID, &tree).unwrap(), "decided={decided}: excluded validator after the update view");
+
+        // TC validation at `late`: a TC naming the excluded validator's tip at `late` is not
+        // correct; one naming the committed-set leader's tip, or the pre-update tip, is.
+        let tc_with = |tip: TipInfo| collected_tc_in(excluded_set(), late, &[Some(tip.clone()), Some(tip.clone()), Some(tip)], None);
+        assert!(!tc_with(tip_by(&b, late, &x)).is_correct(&tree).unwrap(), "decided={decided}: TC naming the excluded leader's tip");
+        assert!(
+            tc_with(tip_by(&b, late, &excluded_set_leader(late))).is_correct(&tree).unwrap(),
+            "decided={decided}: TC naming the committed-set leader's tip"
+        );
+        assert!(tc_with(tip_by(&b, early, &x)).is_correct(&tree).unwrap(), "decided={decided}: TC naming the pre-update tip");
+    }
+}
+
+/// `is_fresh_proposer`: a fresh proposal is voted only from the view's one fresh proposer, on a
+/// decided and an undecided replica, on both paths.
+#[test]
+fn exclusion_window_fresh_proposals_are_voted_only_from_one_leader_decided_or_not() {
+    let update_view = 1;
+    let late = excluded_leads_from(update_view + 1);
+    let b = block(112);
+    for decided in [false, true] {
+        let state = exclusion_tree(update_view, decided).validator_set_state().unwrap();
+        // The vote paths need a tree whose lock admits a genesis-justified block: the same state,
+        // initialized directly (as `window_tree`).
+        let votes = |origin: &VerifyingKey| {
+            let mut header = exclusion_replica(late, tree_of(&state));
+            let mut full = exclusion_replica(late, tree_of(&state));
+            (header.header_path(late, &b, origin, None), full.full_path(late, &b, origin, None))
+        };
+        assert_eq!(votes(&excluded_set_leader(late)), (true, true), "decided={decided}: committed-set leader");
+        assert_eq!(votes(&excluded()), (false, false), "decided={decided}: the excluded validator");
+    }
+}
+
+/// `is_fresh_proposer` rebuilds the committed set from a Decide PC this replica has not committed
+/// yet with `apply_updates`, so it carries the exclusion: the first fresh block on the exclusion
+/// update's Decide PC is voted from the committed set's leader, not from the excluded validator
+/// (which leads that view in the replica's stale set).
+#[test]
+fn fresh_proposal_on_an_exclusion_decide_pc_is_judged_under_the_exclusion() {
+    let view = excluded_leads_from(3);
+    let old = old_set();
+    let steady = ValidatorSetState::new(old.clone(), old.clone(), None, true);
+    let updating = block(113);
+    let decide = signed_pc(view - 1, &updating, Phase::Decide, &old);
+    let fresh = Block::new(BlockHeight::new(1), decide, CryptoHash::new([114; 32]), Data::new(vec![]));
+    let stale_replica = || {
+        let mut tree = tree_of(&steady);
+        tree.insert(&updating, None, Some(&exclusion_update())).unwrap();
+        exclusion_replica(view, tree)
+    };
+    assert!(!stale_replica().header_path(view, &fresh, &excluded(), None), "header path, the excluded validator");
+    assert!(!stale_replica().full_path(view, &fresh, &excluded(), None), "full path, the excluded validator");
+
+    // Control: at a view both sets give the same leader, the rebuilt set still names it (a replica
+    // that has not committed the update drops a proposal from a leader of neither of its own sets
+    // at the `is_proposer` receive gate, before this check; membership updates alike).
+    let same = (view + 1..view + 64).find(|v| old_leader(*v) == excluded_set_leader(*v)).unwrap();
+    let decide = signed_pc(same - 1, &updating, Phase::Decide, &old);
+    let fresh = Block::new(BlockHeight::new(1), decide, CryptoHash::new([115; 32]), Data::new(vec![]));
+    let stale_replica = || {
+        let mut tree = tree_of(&steady);
+        tree.insert(&updating, None, Some(&exclusion_update())).unwrap();
+        exclusion_replica(same, tree)
+    };
+    let leader = old_leader(same);
+    assert!(stale_replica().header_path(same, &fresh, &leader, None), "header path, the leader of both sets");
+    assert!(stale_replica().full_path(same, &fresh, &leader, None), "full path, the leader of both sets");
+}
