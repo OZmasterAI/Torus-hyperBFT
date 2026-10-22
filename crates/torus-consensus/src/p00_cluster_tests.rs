@@ -126,6 +126,9 @@ fn chain_config(schedule: ActivationSchedule) -> ChainConfig {
         exec_trust_cache: false,
         activations: schedule,
         book_mode: Default::default(),
+        // Dead-leader skip off, as the other consensus fixtures (no justify evidence).
+        leader_miss_threshold: 0,
+        leader_exclusion_cap: torus_types::DEFAULT_LEADER_EXCLUSION_CAP,
     }
 }
 
@@ -215,6 +218,7 @@ impl Cluster {
         let options = AppOptions {
             known_features: binary.known,
             exec_hold: binary.hold.clone(),
+            keep_manifests: false,
         };
         let metrics = Arc::new(torus_telemetry::Metrics::new());
         let app = TorusApp::try_new_with_options(

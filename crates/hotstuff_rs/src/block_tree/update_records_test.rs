@@ -20,7 +20,7 @@ use crate::hotstuff::types::{Phase, PhaseCertificate};
 use crate::types::block::Block;
 use crate::types::crypto_primitives::SigningKey;
 use crate::types::data_types::{BlockHeight, ChainID, CryptoHash, Data, Power, SignatureSet, ViewNumber};
-use crate::types::update_sets::{AppStateUpdates, ValidatorSetUpdates, ValidatorSetUpdatesBytes};
+use crate::types::update_sets::{AppStateUpdates, ValidatorSetUpdates};
 use crate::types::validator_set::{ValidatorSet, ValidatorSetState};
 
 const CHAIN_ID: ChainID = ChainID::new(0);
@@ -166,12 +166,17 @@ fn new_tree() -> (BlockTreeSingleton<RecKV>, RecKV) {
 /// B0 (height 0) <- B1 (height 1) <- U (height 2, updates), Generic PCs at views 1 and 2, U
 /// justified by a Generic PC on B1 at view 3. Nothing committed. Returns `[B0, B1, U]`.
 fn chain_to_update(tree: &mut BlockTreeSingleton<RecKV>) -> [Block; 3] {
+    chain_to_update_with(tree, &updates())
+}
+
+/// [`chain_to_update`] with U carrying `updates`.
+fn chain_to_update_with(tree: &mut BlockTreeSingleton<RecKV>, updates: &ValidatorSetUpdates) -> [Block; 3] {
     let b0 = block(0, PhaseCertificate::genesis_pc(), 10);
     let b1 = block(1, pc(1, &b0.hash, Phase::Generic), 11);
     let u = block(2, pc(2, &b1.hash, Phase::Generic), 12);
     tree.insert(&b0, None, None).unwrap();
     tree.insert(&b1, None, None).unwrap();
-    tree.insert(&u, None, Some(&updates())).unwrap();
+    tree.insert(&u, None, Some(updates)).unwrap();
     [b0, b1, u]
 }
 
@@ -206,7 +211,7 @@ fn extend_and_commit(
 }
 
 fn updates_bytes(updates: &ValidatorSetUpdates) -> Vec<u8> {
-    ValidatorSetUpdatesBytes::from(updates).try_to_vec().unwrap()
+    updates.power_updates_bytes().try_to_vec().unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +244,39 @@ fn a_commit_pc_on_an_update_is_recorded_in_the_commit_batch() {
         .collect();
     assert_eq!(commit_batches.len(), 1, "one batch commits U");
     assert!(commit_batches[0].contains(&key), "the record is in U's commit batch");
+}
+
+/// Batch C (dead-leader skip on top of option 1): the record keeps U's whole update. An update
+/// with a leader exclusion delta (here exclusion-only, the dead-leader case, plus a readmit) stores
+/// the delta next to the (empty) power part, and decodes back to the same update.
+#[test]
+fn a_record_keeps_the_leader_exclusion_delta() {
+    let (mut tree, _) = new_tree();
+    let mut updates = ValidatorSetUpdates::new();
+    updates.exclude_leader(keys()[3].verifying_key());
+    updates.readmit_leader(keys()[2].verifying_key());
+    let [_, _, u] = chain_to_update_with(&mut tree, &updates);
+
+    let result = tree.update(&commit_pc(&u), &None).unwrap();
+    assert!(result.validator_set_updates.is_some(), "fixture: U committed");
+    let record = tree
+        .validator_set_update_record(u.height)
+        .unwrap()
+        .expect("an exclusion-only update committed on its Commit PC is recorded");
+    assert!(record.commit_pc == commit_pc(&u));
+    assert_eq!(record.updates.try_to_vec().unwrap(), updates_bytes(&updates), "empty power part");
+    assert_eq!(record.leader_exclusions, updates.leader_exclusion_updates_bytes(), "the delta");
+    let decoded = record.validator_set_updates().unwrap();
+    assert_eq!(decoded.leader_excludes().copied().collect::<Vec<_>>(), vec![keys()[3].verifying_key()]);
+    assert_eq!(decoded.leader_readmits().copied().collect::<Vec<_>>(), vec![keys()[2].verifying_key()]);
+    assert_eq!(decoded.inserts().count() + decoded.deletes().count(), 0);
+
+    // An update without a delta records an empty one.
+    let (mut tree, _) = new_tree();
+    let [_, _, u] = chain_to_update(&mut tree);
+    tree.update(&commit_pc(&u), &None).unwrap();
+    let record = tree.validator_set_update_record(u.height).unwrap().unwrap();
+    assert!(!record.validator_set_updates().unwrap().has_leader_exclusion_updates());
 }
 
 /// Owner s138: no extra work on ordinary blocks. Committing blocks that update nothing reads and

@@ -18,7 +18,11 @@ use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::{
     hotstuff::types::PhaseCertificate,
-    types::{data_types::BlockHeight, update_sets::ValidatorSetUpdatesBytes},
+    types::{
+        crypto_primitives::SignatureError,
+        data_types::BlockHeight,
+        update_sets::{LeaderExclusionUpdatesBytes, ValidatorSetUpdates, ValidatorSetUpdatesBytes},
+    },
 };
 
 use super::variables::{concat, VALIDATOR_SET_UPDATE_RECORDS};
@@ -26,10 +30,30 @@ use super::variables::{concat, VALIDATOR_SET_UPDATE_RECORDS};
 /// What a replica stores for a validator-set update U it committed on U's Commit PC.
 #[derive(Clone, BorshSerialize, BorshDeserialize)]
 pub struct ValidatorSetUpdateRecord {
-    /// U's validator-set updates (`S_new = S_old ⊕ updates`).
+    /// The power part of U's validator-set updates (`S_new = S_old ⊕ updates`).
     pub updates: ValidatorSetUpdatesBytes,
+    /// The leader exclusion delta of U's updates (dead-leader skip; empty for an update without
+    /// one). Kept with the power part so the record holds U's whole update: an exclusion-only
+    /// update is still a validator-set update with a Commit PC.
+    pub leader_exclusions: LeaderExclusionUpdatesBytes,
     /// U's Commit PC (`commit_pc.block` is U's hash), signed by a quorum of `S_old`.
     pub commit_pc: PhaseCertificate,
+}
+
+impl ValidatorSetUpdateRecord {
+    /// The record of `updates`, committed on `commit_pc`.
+    pub(crate) fn new(updates: &ValidatorSetUpdates, commit_pc: &PhaseCertificate) -> Self {
+        Self {
+            updates: updates.power_updates_bytes(),
+            leader_exclusions: updates.leader_exclusion_updates_bytes(),
+            commit_pc: commit_pc.clone(),
+        }
+    }
+
+    /// U's validator-set updates, power part and exclusion delta.
+    pub fn validator_set_updates(&self) -> Result<ValidatorSetUpdates, SignatureError> {
+        ValidatorSetUpdates::try_from_bytes(self.updates.clone(), Some(self.leader_exclusions.clone()))
+    }
 }
 
 /// The key of the record of the update committed at `height`: `VALIDATOR_SET_UPDATE_RECORDS ++

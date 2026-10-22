@@ -12,7 +12,7 @@ use ed25519_dalek::SigningKey;
 use hotstuff_rs::events::{
     CollectPCEvent, CommitBlockEvent, InsertBlockEvent, PhaseVoteEvent, ProposeEvent,
     ReceivePhaseVoteEvent, ReceiveProposalEvent, ReceiveProposalHeaderEvent, StartViewEvent,
-    UpdateHighestPCEvent, ViewTimeoutEvent,
+    UpdateHighestPCEvent, UpdateValidatorSetEvent, ViewTimeoutEvent,
 };
 use hotstuff_rs::replica::{Configuration, ReplicaSpec};
 use hotstuff_rs::types::data_types::{BufferSize, ChainID, EpochLength};
@@ -476,6 +476,8 @@ fn default_chain_config() -> ChainConfig {
         )
         .expect("the default genesis set never conflicts with the built-in table"),
         book_mode: Default::default(),
+        leader_miss_threshold: torus_types::DEFAULT_LEADER_MISS_THRESHOLD,
+        leader_exclusion_cap: torus_types::DEFAULT_LEADER_EXCLUSION_CAP,
     }
 }
 
@@ -1276,6 +1278,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let own_hotstuff_vk = verifying_key;
     let timeout_counter = metrics.consensus_timeout_total.clone();
     let leader_state_for_view = leader_state.clone();
+    // Dead-leader skip: the leader hints use the committed hotstuff validator set's
+    // leader-excluded set. Seed it from the block tree before the replica starts (a restart
+    // with exclusions in force), then follow each committed exclusion delta.
+    match hotstuff_rs::block_tree::accessors::public::BlockTreeCamera::new(dbs.kv_store())
+        .snapshot()
+        .committed_validator_set()
+    {
+        Ok(committed) => leader_state.seed_leader_exclusions(&committed),
+        Err(e) => warn!(
+            ?e,
+            "leader hints: committed validator set unreadable, no exclusions seeded"
+        ),
+    }
+    let leader_state_for_vs_update = leader_state.clone();
     // Item 7 step 1: proposals (own and received headers) feed the next EVM
     // height's leader prediction for the RPC EVM forward.
     let leader_state_for_propose = leader_state.clone();
@@ -1303,6 +1319,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             {
                 info!("body_fetch_diag view_close: {closed}");
             }
+        })
+        .on_update_validator_set(move |ev: &UpdateValidatorSetEvent| {
+            leader_state_for_vs_update.apply_leader_exclusion_updates(&ev.validator_set_updates);
         })
         .on_propose(move |ev: &ProposeEvent| {
             // Item 7 step 1: hotstuff heights; LeaderState converts them to Torus heights.
