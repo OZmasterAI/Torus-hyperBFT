@@ -613,8 +613,8 @@ fn model(winner: Winner, report: Report, max_view: u8, suffixes: &'static [Suffi
 
 /// Prefixes of at most this many events (proposals, signed headers, votes, QC deliveries); the
 /// Codex trace is nine events deep. 11 by default (each fix check runs in about a minute in a debug
-/// build). Raise it with `TORUS_TC_TIP_MODEL_DEPTH`; both fix checks were run at depth 12 in a
-/// release build for s138 (2.4M states, about 30 s each) and hold.
+/// build). Raise it with `TORUS_TC_TIP_MODEL_DEPTH`; for s138 the fix checks were run in a release
+/// build at 13 (the active-Byzantine one at 12) and hold.
 fn depth() -> usize {
     std::env::var("TORUS_TC_TIP_MODEL_DEPTH").ok().and_then(|d| d.parse().ok()).unwrap_or(11)
 }
