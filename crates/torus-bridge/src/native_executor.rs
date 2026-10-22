@@ -15944,7 +15944,7 @@ impl NativeExecutor {
     /// A local fault latches `fatal_error`.
     pub fn begin_block_funding<T: StateBackend>(ctx: &mut NativeExecContext<T>, listed: &[MarketId]) {
         ctx.positions.set_funding(None);
-        if !ctx.feature_active(torus_types::Feature::FundingEngine) || listed.len() < usize::MAX {
+        if !ctx.feature_active(torus_types::Feature::FundingEngine) {
             return;
         }
         match Self::funding_step(ctx, listed) {

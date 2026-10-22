@@ -115,34 +115,80 @@ pub struct FundingRow {
 impl FundingRow {
     /// A fresh row at `now`: index 0, interval aligned down to `params`'.
     pub fn new(now: u64, params: &FundingParams) -> Self {
-        let _ = (now, params);
-        Self { cum_index: 0, interval_start: 0, premium_sum: 0, samples: 0, last_sample_ts: 0, last_oracle: FixedPoint::ZERO, last_rate: 0, last_settle_ts: 0 }
-    
-}
+        Self {
+            cum_index: 0,
+            interval_start: align(now, params.interval_secs),
+            premium_sum: 0,
+            samples: 0,
+            last_sample_ts: 0,
+            last_oracle: FixedPoint::ZERO,
+            last_rate: 0,
+            last_settle_ts: 0,
+        }
+    }
 
     /// Version 1: `1 ‖ cum_index ‖ interval_start ‖ premium_sum ‖ samples ‖
     /// last_sample_ts ‖ last_oracle ‖ last_rate ‖ last_settle_ts`, all BE.
     pub fn encode(&self) -> Vec<u8> {
-        let _ = ROW_VERSION;
-        Vec::new()
-    
-}
+        let mut out = Vec::with_capacity(FUNDING_ROW_LEN);
+        out.push(ROW_VERSION);
+        out.extend_from_slice(&self.cum_index.to_be_bytes());
+        out.extend_from_slice(&self.interval_start.to_be_bytes());
+        out.extend_from_slice(&self.premium_sum.to_be_bytes());
+        out.extend_from_slice(&self.samples.to_be_bytes());
+        out.extend_from_slice(&self.last_sample_ts.to_be_bytes());
+        out.extend_from_slice(&self.last_oracle.raw().to_be_bytes());
+        out.extend_from_slice(&self.last_rate.to_be_bytes());
+        out.extend_from_slice(&self.last_settle_ts.to_be_bytes());
+        out
+    }
 
     /// The row of [`Self::encode`]; any other length or version is a
     /// `CoreError::Borsh` (corrupt state: the block fail-stops, R02).
     pub fn decode(data: &[u8]) -> Result<Self, CoreError> {
-        let _ = data;
-        Err(CoreError::Borsh("funding row decode: not built".into()))
-    
-}
+        if data.len() != FUNDING_ROW_LEN || data[0] != ROW_VERSION {
+            return Err(CoreError::Borsh(format!(
+                "funding row: {} bytes, version {:?} (expected {FUNDING_ROW_LEN}, {ROW_VERSION})",
+                data.len(),
+                data.first()
+            )));
+        }
+        let mut at = 1usize;
+        let mut take = |n: usize| {
+            let s = &data[at..at + n];
+            at += n;
+            s
+        };
+        let i128_of = |b: &[u8]| i128::from_be_bytes(b.try_into().expect("16 bytes"));
+        let u64_of = |b: &[u8]| u64::from_be_bytes(b.try_into().expect("8 bytes"));
+        let cum_index = i128_of(take(16));
+        let interval_start = u64_of(take(8));
+        let premium_sum = i128_of(take(16));
+        let samples = u32::from_be_bytes(take(4).try_into().expect("4 bytes"));
+        let last_sample_ts = u64_of(take(8));
+        let last_oracle = FixedPoint::from_raw(i128_of(take(16)));
+        let last_rate = i128_of(take(16));
+        let last_settle_ts = u64_of(take(8));
+        Ok(Self {
+            cum_index,
+            interval_start,
+            premium_sum,
+            samples,
+            last_sample_ts,
+            last_oracle,
+            last_rate,
+            last_settle_ts,
+        })
+    }
 
     /// The rate the current interval would pay now (0 without samples):
     /// [`rate_e18`] of the average premium (truncated toward zero).
     pub fn predicted_rate(&self, params: &FundingParams) -> i128 {
-        let _ = params;
-        0
-    
-}
+        if self.samples == 0 {
+            return 0;
+        }
+        rate_e18(self.premium_sum / i128::from(self.samples), params)
+    }
 
     /// When the current interval settles (the first block at or after it).
     pub fn next_funding_time(&self, params: &FundingParams) -> u64 {
@@ -172,18 +218,28 @@ pub fn read_index<T: StateBackend>(state: &T, market_id: MarketId) -> Result<Opt
 /// [`INDEX_SCALE`]): `F8 = avg + clamp(interest − avg, ±clamp)`, times
 /// `interval / 8 h` (truncated toward zero), capped at `±max_rate_bps`.
 pub fn rate_e18(avg_premium: i128, params: &FundingParams) -> i128 {
-    let _ = (avg_premium, params);
-    0
-
+    const PPM: i128 = INDEX_SCALE / 1_000_000;
+    const BPS: i128 = INDEX_SCALE / 10_000;
+    let interest = i128::from(params.interest_ppm_8h) * PPM;
+    let clamp = i128::from(params.clamp_ppm_8h) * PPM;
+    // |avg| <= 1 (premiums are clamped to ±1): no overflow anywhere below.
+    let f8 = avg_premium + (interest - avg_premium).clamp(-clamp, clamp);
+    let rate = mul_div(f8, i128::from(params.interval_secs), i128::from(BASIS_SECS), false);
+    let cap = i128::from(params.max_rate_bps) * BPS;
+    rate.clamp(-cap, cap)
 }
 
 /// One premium sample, scaled [`INDEX_SCALE`]:
 /// `(max(bid − oracle, 0) − max(oracle − ask, 0)) / oracle`, clamped to ±1.
 /// A side without an impact price contributes 0. `oracle > 0`.
 pub fn premium_e18(impact_bid: Option<FixedPoint>, impact_ask: Option<FixedPoint>, oracle: FixedPoint) -> i128 {
-    let _ = (impact_bid, impact_ask, oracle);
-    0
-
+    let o = oracle.raw();
+    if o <= 0 {
+        return 0;
+    }
+    let up = impact_bid.map_or(0, |b| b.raw().saturating_sub(o).max(0));
+    let down = impact_ask.map_or(0, |a| o.saturating_sub(a.raw()).max(0));
+    mul_div(up - down, INDEX_SCALE, o, false).clamp(-INDEX_SCALE, INDEX_SCALE)
 }
 
 /// Average fill price of `notional` (quote) taken from `orders` (price,
@@ -194,9 +250,29 @@ pub fn impact_price(
     notional: FixedPoint,
     max_orders: usize,
 ) -> Option<FixedPoint> {
-    let _ = (orders.into_iter(), notional, max_orders);
-    None
-
+    if notional <= FixedPoint::ZERO {
+        return None;
+    }
+    let mut left = notional;
+    let mut qty = FixedPoint::ZERO;
+    for (price, q) in orders.into_iter().take(max_orders) {
+        if price <= FixedPoint::ZERO || q <= FixedPoint::ZERO {
+            continue;
+        }
+        let value = price.checked_mul(q).ok()?;
+        if value >= left {
+            // The last order fills the rest: `left / price` of it.
+            qty = qty.checked_add(left.checked_div(price).ok()?).ok()?;
+            left = FixedPoint::ZERO;
+            break;
+        }
+        qty = qty.checked_add(q).ok()?;
+        left = left.checked_sub(value).ok()?;
+    }
+    if left > FixedPoint::ZERO || qty <= FixedPoint::ZERO {
+        return None;
+    }
+    notional.checked_div(qty).ok()
 }
 
 /// `(impact bid, impact ask)` of `book` for `notional`.
@@ -217,18 +293,16 @@ pub fn book_impact_prices(book: &OrderBook, notional: FixedPoint) -> (Option<Fix
 /// The index step of one settlement: `rate × price` (truncated toward zero),
 /// scaled [`INDEX_SCALE`].
 pub fn index_delta(rate: i128, price: FixedPoint) -> i128 {
-    let _ = (rate, price, mul_div(0, 0, 1, false));
-    0
-
+    mul_div(rate, price.raw(), FixedPoint::SCALE, false)
 }
 
 /// What a position of `size` owes from `entry` to `index` (positive = it
 /// pays): `±size × (index − entry)`, rounded UP (a payer pays at least, a
 /// receiver gets at most the exact amount: funding never creates value).
 pub fn owed(is_long: bool, size: FixedPoint, entry: i128, index: i128) -> FixedPoint {
-    let _ = (is_long, size, entry, index);
-    FixedPoint::ZERO
-
+    let delta = index.saturating_sub(entry);
+    let signed = if is_long { size.raw() } else { -size.raw() };
+    FixedPoint::from_raw(mul_div(signed, delta, INDEX_SCALE, true))
 }
 
 /// What [`step`] did to one market's row.
@@ -254,10 +328,39 @@ pub fn step(
     mark: Option<FixedPoint>,
     impact: impl FnOnce() -> (Option<FixedPoint>, Option<FixedPoint>),
 ) -> Step {
-    let _ = (now, mark, impact, align(0, 1));
-    let row = row.unwrap_or_else(|| FundingRow::new(now, params));
-    Step { row, changed: false, sampled: false, settled: None }
-
+    let mut changed = row.is_none();
+    let mut r = row.unwrap_or_else(|| FundingRow::new(now, params));
+    let mut settled = None;
+    if now >= r.interval_start.saturating_add(params.interval_secs) {
+        let rate = r.predicted_rate(params);
+        if r.samples > 0 {
+            let price = mark.unwrap_or(r.last_oracle);
+            if price > FixedPoint::ZERO {
+                r.cum_index = r.cum_index.saturating_add(index_delta(rate, price));
+            }
+        }
+        r.last_rate = rate;
+        r.last_settle_ts = now;
+        r.interval_start = align(now, params.interval_secs);
+        r.premium_sum = 0;
+        r.samples = 0;
+        settled = Some(rate);
+        changed = true;
+    }
+    let slot = |ts: u64| ts / params.sample_secs.max(1);
+    let mut sampled = false;
+    if r.last_sample_ts == 0 || slot(now) > slot(r.last_sample_ts) {
+        r.last_sample_ts = now;
+        changed = true;
+        if let Some(oracle) = mark.filter(|m| *m > FixedPoint::ZERO) {
+            let (bid, ask) = impact();
+            r.premium_sum = r.premium_sum.saturating_add(premium_e18(bid, ask, oracle));
+            r.samples = r.samples.saturating_add(1);
+            r.last_oracle = oracle;
+            sampled = true;
+        }
+    }
+    Step { row: r, changed, sampled, settled }
 }
 
 /// `ts` aligned down to a multiple of `interval` (> 0; 0 reads as 1).

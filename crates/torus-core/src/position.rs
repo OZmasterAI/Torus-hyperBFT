@@ -108,10 +108,12 @@ impl Position {
     /// market's `index` (positive = it pays; `None` = no funding: 0), rounded
     /// against the holder ([`crate::funding::owed`]).
     pub fn funding_owed(&self, index: Option<i128>) -> FixedPoint {
-        let _ = index;
-        FixedPoint::ZERO
-    
-}
+        let Some(index) = index else {
+            return FixedPoint::ZERO;
+        };
+        let entry = self.funding.map_or(0, |f| f.entry_index);
+        crate::funding::owed(self.is_long, self.size, entry, index)
+    }
 
     /// Funding engine: funding since the position opened (settled + owed at
     /// `index`; positive = paid).
@@ -151,7 +153,7 @@ pub const POSITION_V3_LEN: usize = POSITION_V2_LEN + 32;
 
 impl BorshSerialize for Position {
     fn serialize<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        let version = POSITION_SCHEMA_VERSION;
+        let version = if self.funding.is_some() { POSITION_SCHEMA_V3 } else { POSITION_SCHEMA_VERSION };
         w.write_all(&[version])?;
         borsh_write_address(&self.trader, w)?;
         w.write_all(&self.market_id.to_be_bytes())?;
@@ -162,6 +164,10 @@ impl BorshSerialize for Position {
         borsh_write_fp(&self.realized_pnl, w)?;
         borsh_write_fp(&self.isolated_margin, w)?;
         w.write_all(&[self.margin_type as u8])?;
+        if let Some(f) = &self.funding {
+            w.write_all(&f.entry_index.to_be_bytes())?;
+            borsh_write_fp(&f.paid, w)?;
+        }
         Ok(())
     }
 }
@@ -737,9 +743,12 @@ impl FillEffect {
     /// funding settled. `None` = no balance write (no close part and no
     /// funding), exactly the cases where the pre-funding paths wrote none.
     pub fn cash(&self) -> Option<FixedPoint> {
-        self.closed_pnl
-    
-}
+        match self.closed_pnl {
+            Some(pnl) => Some(pnl - self.funding),
+            None if self.funding != FixedPoint::ZERO => Some(FixedPoint::ZERO - self.funding),
+            None => None,
+        }
+    }
 }
 
 /// Signed size of an optional position (long > 0, short < 0, none = 0).
@@ -778,7 +787,7 @@ fn fill_transition(
     // fill. A position opened (or the open part of a flip) starts at the
     // index with nothing paid. No index (feature off, or no funding row
     // yet): exactly the pre-funding transition.
-    let Some(index) = funding_index.filter(|_| false) else {
+    let Some(index) = funding_index else {
         let (new_pos, pnl) =
             fill_transition_core(existing, trader, market_id, is_buy, fill_qty, fill_price, margin_type);
         return (new_pos, pnl, FixedPoint::ZERO);

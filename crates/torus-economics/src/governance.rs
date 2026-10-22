@@ -747,7 +747,7 @@ impl<T: StateBackend> GovernanceManager<T> {
     /// accepted ([`Self::set_funding_keys`]): a decimal u64 in the key's
     /// range (`torus_types::FUNDING_PARAMS`).
     fn validate_param(&self, key: &str, value: &str) -> Result<()> {
-        if let Some((_, range)) = torus_types::funding_param(key).filter(|_| self.funding_keys && false) {
+        if let Some((_, range)) = torus_types::funding_param(key).filter(|_| self.funding_keys) {
             let v: u64 = value.parse().map_err(|_| EconomicsError::InvalidParameterValue {
                 key: key.to_string(),
                 reason: "must be a valid u64".to_string(),

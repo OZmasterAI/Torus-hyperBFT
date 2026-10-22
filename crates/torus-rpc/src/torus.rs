@@ -1283,7 +1283,7 @@ impl TorusApiServer for RpcState {
                 let unrealized = self
                     .usable_oracle_price(mid)
                     .map_or(FixedPoint::ZERO, |op| p.unrealized_pnl(op.price) - p.funding_owed(index));
-                let funding_since_open: Option<String> = None;
+                let funding_since_open = p.funding.map(|_| dec_fp(p.funding_since_open(index)));
 
                 let liquidation_price = match p.margin_type {
                     // R23: the account-wide threshold the liquidation step
@@ -2293,7 +2293,7 @@ impl TorusApiServer for RpcState {
         let internal = |e: torus_core::error::CoreError| ErrorObjectOwned::from(RpcError::Internal(e.to_string()));
         let params = FundingParams::read(&self.state).map_err(internal)?;
         let row = read_row(&self.state, mid).map_err(internal)?;
-        let active = row.is_some() && false;
+        let active = row.is_some();
         let r = row.unwrap_or_else(|| FundingRow::new(0, &params));
         Ok(RpcFundingRate {
             market_id,

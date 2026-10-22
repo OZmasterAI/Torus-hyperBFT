@@ -289,9 +289,15 @@ pub fn position_terms_funded(
     index: Option<i128>,
     tiers: Option<&[MarginTier]>,
 ) -> Result<PositionTerms, CoreError> {
-    let _ = index;
-    position_terms(pos, mark, tiers)
-
+    let mut t = position_terms(pos, mark, tiers)?;
+    if mark.is_some() && index.is_some() {
+        let owed = pos.funding_owed(index);
+        t.upnl = t
+            .upnl
+            .checked_sub(owed)
+            .map_err(|_| CoreError::Overflow("account margin overflows i128".into()))?;
+    }
+    Ok(t)
 }
 
 impl AccountView {
