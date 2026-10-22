@@ -347,9 +347,10 @@ So a narrower barrier is either the same write or a new durability model. Option
       the step 2 finding of memory ad5a8203c6de102f again). Built fix: a cursor row
       `core_writer_t_first_open_same_block_target` (every target in `h .. C` has a full same-block range), moved by
       every kept walk (each starts at its queuing block), plus step 2's cursor and run rows, which speak for the same
-      seqs 0..199 of the targets past the activation. Point reads per non-order enqueue under sustained overload: 3 in
-      steady state, at most 5 after the walk past the step 2 backlog (test
-      `t_sustained_same_block_overload_keeps_reads_per_enqueue_constant`). The backlog itself still grows with intake
+      seqs 0..199 of the targets past the activation. Point reads per non-order enqueue under sustained overload with a
+      backlog of 142 full targets: 145 before the fix, 3 after (the two cursors and one probe; test
+      `t_sustained_same_block_overload_keeps_reads_per_enqueue_constant`, across the activation, reverted txs and crash
+      replay). Step 2 full targets no step 2 row covers (below H - 1 + K) cost one read each, once. The backlog itself still grows with intake
       above the drain rate (same-block latency grows with it); bounding it is an open owner question.
     - A target drains in key order: the same-block range first (HL: EVM -> Core transfers before CoreWriter actions),
       then orders. Per-block drain stays <= 400 rows.

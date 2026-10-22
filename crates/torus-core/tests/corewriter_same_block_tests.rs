@@ -643,8 +643,8 @@ impl<T: StateBackend> StateBackend for PointReads<T> {
 /// (10M gas every two blocks: ~450 enqueues per two blocks) grows the
 /// same-block backlog every block, and a walk from the queuing block that
 /// reads every full target costs O(backlog) unmetered point reads per call.
-/// Here 800 enqueues every second block (400 a block against a drain of
-/// 200), 10% of them orders, step 2's rules before the activation `H` (its
+/// Here 2,000 enqueues every second block (1,000 a block against a drain
+/// of 200), 10% of them orders, step 2's rules before the activation `H` (its
 /// backlog of full targets runs past `H`) and T's from `H`; txs of 1 to 3
 /// calls in a block journal, a fifth of them reverted; each block drains
 /// after its EVM part; every 7th block crashes once (its journal dropped)
@@ -654,8 +654,8 @@ impl<T: StateBackend> StateBackend for PointReads<T> {
 #[test]
 fn t_sustained_same_block_overload_keeps_reads_per_enqueue_constant() {
     const FROM: u64 = 1_000;
-    const H: u64 = 1_060;
-    const TO: u64 = 1_300;
+    const H: u64 = 1_016;
+    const TO: u64 = 1_060;
     struct Run {
         _dir: tempfile::TempDir,
         db: StateDb,
@@ -670,7 +670,7 @@ fn t_sustained_same_block_overload_keeps_reads_per_enqueue_constant() {
         let mut reads = Vec::new();
         for block in FROM..TO {
             let t_on = block >= H;
-            let attempts = if crash && block % 7 == 0 { 2 } else { 1 };
+            let attempts = if crash && block.is_multiple_of(7) { 2 } else { 1 };
             let (rng0, id0) = (rng, id);
             for attempt in 0..attempts {
                 (rng, id) = (rng0, id0);
@@ -682,7 +682,7 @@ fn t_sustained_same_block_overload_keeps_reads_per_enqueue_constant() {
                 };
                 let ov = NativeStateOverlay::new(db.clone());
                 let mut max_reads = 0usize;
-                let mut left: u64 = if block % 2 == 0 { 800 } else { 0 };
+                let mut left: u64 = if block.is_multiple_of(2) { 2_000 } else { 0 };
                 while left > 0 {
                     let calls = (1 + next(3)).min(left);
                     left -= calls;
@@ -701,11 +701,11 @@ fn t_sustained_same_block_overload_keeps_reads_per_enqueue_constant() {
                             }
                         };
                         let counted = PointReads::new(ov.clone());
-                        let seq =
-                            CoreWriterQueue::enqueue_with(&counted, &qa(kind, block), t_on).unwrap();
+                        let seq = CoreWriterQueue::enqueue_with(&counted, &qa(kind, block), t_on)
+                            .unwrap();
                         if t_on && !order {
                             max_reads = max_reads.max(counted.count());
-                            if id % 97 == 0 {
+                            if id.is_multiple_of(97) {
                                 // The first target from `block` with room.
                                 let full = |t: u64| {
                                     ov.get_cf_raw(CF_CORE_WRITER_QUEUE, &queue_key(t, CAP - 1))
@@ -797,9 +797,16 @@ fn t_sustained_same_block_overload_keeps_reads_per_enqueue_constant() {
         "the backlog grows: {} full targets after {TO}",
         straight.backlog_targets
     );
-    // Constant: the T cursor, step 2's cursor and run rows, one probe (and
-    // the run row again past a full probe); the walk right after `H` may
-    // still cross step 2's uncovered full targets (below H - 1 + K) once.
-    assert!(late <= 5, "max point reads per enqueue after H + 20: {late}");
-    assert!(first <= 5 + 12, "max point reads per enqueue from H: {first}");
+    // Constant: the T cursor, step 2's cursor, one probe; the walks right
+    // after `H` may still cross step 2's full targets that no step 2 row
+    // covers (below H - 1 + K, K = 10 here), one read each.
+    // Before the fix (f7714a3c, 400 a block): 145 reads at 142 targets.
+    assert!(
+        late <= 3,
+        "max point reads per enqueue after H + 20: {late}"
+    );
+    assert!(
+        first <= 3 + 12,
+        "max point reads per enqueue from H: {first}"
+    );
 }
