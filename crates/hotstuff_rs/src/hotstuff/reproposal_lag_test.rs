@@ -67,12 +67,20 @@ const CHAIN_ID: ChainID = ChainID::new(0);
 /// The view under test; the TC is TC(VIEW - 1).
 const VIEW: u64 = 5;
 
-/// Every block is "stale": the fresh data check refuses it, the re-proposal check holds it.
+/// Every block is "stale": the fresh data check refuses it, the re-proposal check holds it
+/// (`fresh` / `reproposal` override that, e.g. `Missing` for out-of-band data not local yet).
 /// Counts both, and produces an empty block (an NEC proposal).
-#[derive(Default)]
 struct StaleApp {
+    fresh: BlockDataCheck,
+    reproposal: BlockDataCheck,
     fresh_checks: usize,
     reproposal_checks: usize,
+}
+
+impl Default for StaleApp {
+    fn default() -> Self {
+        StaleApp { fresh: BlockDataCheck::Invalid, reproposal: BlockDataCheck::Held, fresh_checks: 0, reproposal_checks: 0 }
+    }
 }
 
 impl App<MemKV> for StaleApp {
@@ -92,11 +100,11 @@ impl App<MemKV> for StaleApp {
     }
     fn check_block_data(&mut self, _: &Block, _: &AppBlockTreeView<'_, MemKV>) -> BlockDataCheck {
         self.fresh_checks += 1;
-        BlockDataCheck::Invalid
+        self.fresh
     }
     fn check_reproposal_data(&mut self, _: &Block, _: &AppBlockTreeView<'_, MemKV>) -> BlockDataCheck {
         self.reproposal_checks += 1;
-        BlockDataCheck::Held
+        self.reproposal
     }
 }
 
@@ -319,19 +327,33 @@ fn tc_reproposal_vouched_by_more_than_f_signed_tips_is_voted() {
     assert_eq!(votes(|_| {}, &b(), Some(tc_with_tip_reporters(3))), (true, true));
 }
 
-/// A TC re-proposal of this replica's own local tip: it voted for the block itself.
+/// Codex P1-a (s138 torus-adversarial): a TC re-proposal of this replica's own local tip is
+/// judged by the TC alone, like every other replica's. Exempting it locally split the honest
+/// replicas: the voters of a stale minority tip re-voted it in every view they or a byzantine
+/// leader re-proposed it (and so withheld their No-Endorsements), the others refused it, and
+/// neither a QC nor an NEC could form.
 #[test]
-fn tc_reproposal_of_the_own_tip_is_voted() {
+fn tc_reproposal_of_the_own_tip_is_judged_by_the_tc() {
     let own_tip = |r: &mut Replica| r.tree.set_local_tip(&tip(&b(), VIEW - 1)).unwrap();
-    assert_eq!(votes(own_tip, &b(), Some(tc_with_tip_reporters(1))), (true, true));
+    assert_eq!(votes(own_tip, &b(), Some(tc_with_tip_reporters(1))), (false, false));
+    assert_eq!(votes(own_tip, &b(), Some(tc_with_tip_reporters(2))), (true, true), "control: vouched");
 }
 
-/// A re-proposal of the block this replica last voted for (its vote state, e.g. a Prepare vote,
-/// which sets no tip).
+/// As above for the block this replica last voted for: a TC re-proposal is judged by the TC.
 #[test]
-fn reproposal_of_the_last_voted_block_is_voted() {
+fn tc_reproposal_of_the_last_voted_block_is_judged_by_the_tc() {
     let voted = |r: &mut Replica| r.tree.set_vote_state_atomic(ViewNumber::new(VIEW - 1), b().hash).unwrap();
-    assert_eq!(votes(voted, &b(), Some(tc_with_tip_reporters(1))), (true, true));
+    assert_eq!(votes(voted, &b(), Some(tc_with_tip_reporters(1))), (false, false));
+}
+
+/// The block this replica last voted for stays exempt outside a TC re-proposal: a validator-set
+/// update's Prepare vote sets no tip (no TC can vouch for it, and no NE is withheld for it), and
+/// `repropose_block` proposes it again unchanged.
+#[test]
+fn vsu_reproposal_of_the_last_voted_block_is_voted() {
+    let mut r = vsu_replica();
+    r.tree.set_vote_state_atomic(ViewNumber::new(VIEW - 1), b().hash).unwrap();
+    assert!(r.header_path(&b(), Some(tc(VIEW - 1, [None, None, None], None)), true));
 }
 
 /// Control (the M2 hole through the TC): a TC re-proposal only ONE signer vouches for (f = 1:
@@ -480,9 +502,11 @@ fn leader_seeks_an_nec_instead_of_reproposing_a_stale_unvouched_tip() {
     assert!(p[0].block.justify == b().justify, "the fresh block extends the tip's justify");
 }
 
-/// Controls: a vouched tip, or the leader's own tip, is re-proposed as before.
+/// Control: a vouched tip is re-proposed as before. Codex P1-a: the leader's OWN stale tip that
+/// the TC does not vouch for is not (honest replicas judge it by the TC, and refuse it); the
+/// leader seeks an NEC instead.
 #[test]
-fn leader_reproposes_a_vouched_or_own_stale_tip() {
+fn leader_reproposes_a_vouched_stale_tip_but_not_its_own_unvouched_one() {
     let mut l = leader(tc_with_tip_reporters(2), true);
     l.enter();
     let p = l.proposals();
@@ -492,10 +516,10 @@ fn leader_reproposes_a_vouched_or_own_stale_tip() {
 
     let mut l = leader(tc_with_tip_reporters(1), true);
     l.tree.set_local_tip(&tip(&b(), VIEW - 1)).unwrap();
+    l.tree.set_vote_state_atomic(ViewNumber::new(VIEW - 1), b().hash).unwrap();
     l.enter();
-    let p = l.proposals();
-    assert_eq!(p.len(), 1);
-    assert!(p[0].block.hash == b().hash);
+    assert!(l.proposals().is_empty(), "its own stale, unvouched tip is not re-proposed");
+    assert_eq!(l.net.ne_requests(), 1);
 }
 
 /// Case 5: the leader lacks the tip and recovers it through a ProposalResponse; a stale,
@@ -514,4 +538,205 @@ fn recovered_stale_unvouched_tip_is_not_reproposed() {
     let p = l.proposals();
     assert_eq!(p.len(), 1);
     assert!(p[0].nec.is_some() && p[0].block.hash != b().hash);
+}
+
+// ---------------------------------------------------------------------------
+// Codex torus-adversarial review of the M2 branch (s138), P1-a and P1-b.
+// ---------------------------------------------------------------------------
+
+/// TC(VIEW - 1) signed by `signers`, only `reporter` reporting `b` as its tip.
+fn tc_signed_by(signers: [VerifyingKey; 3], reporter: VerifyingKey) -> TimeoutCertificate {
+    let mut collector = TimeoutVoteCollector::new(CHAIN_ID, ViewNumber::new(VIEW - 1), set());
+    let mut formed = None;
+    for signer in signers {
+        let PacemakerMessage::TimeoutVote(vote) = PacemakerMessage::timeout_vote(
+            &Keypair::new(key_of(&signer)),
+            CHAIN_ID,
+            ViewNumber::new(VIEW - 1),
+            None,
+            (signer == reporter).then(|| tip(&b(), VIEW - 1)),
+            None,
+        ) else {
+            unreachable!()
+        };
+        formed = collector.collect(&signer, vote).or(formed);
+    }
+    formed.expect("three of four form a quorum")
+}
+
+/// Codex P1-b: a stale tip only the byzantine leader of VIEW - 1 reports (tip power 1 = f),
+/// whose out-of-band data this leader lacks: the fresh check refuses it, the re-proposal check
+/// says `Missing`. Before the fix the leader re-proposed it (only `Held` counted as stale), and
+/// self-voted its own loopback header from `pending_bodies` with no data check at all: an honest
+/// signed tip that, with the byzantine one, vouched (> f) for the stale block in the next TC, so
+/// every honest replica would then certify it. The leader seeks an NEC instead, and casts no vote.
+#[test]
+fn missing_data_does_not_bootstrap_a_stale_tip() {
+    let byz = leader_of(VIEW - 1);
+    let me = leader_of(VIEW);
+    let the_tc = tc_signed_by([byz, me, leader_of(VIEW + 1)], byz);
+    let mut l = leader(the_tc.clone(), true);
+    assert!(!HotStuff::<RecordingNetwork>::freshness_exempt(&b().hash, Some(&the_tc), true, &l.tree).unwrap());
+    l.app.reproposal = BlockDataCheck::Missing;
+    l.enter();
+    let proposals = l.proposals();
+    // The leader's loopback copy of whatever it proposed.
+    for p in &proposals {
+        l.receive(HotStuffMessage::ProposalHeader(ProposalHeader::from_proposal(p, false)), &me);
+    }
+    assert!(l.tree.last_voted_proposal().unwrap().is_none(), "no vote for the stale tip");
+    assert!(l.tree.local_tip().unwrap().is_none(), "no honest tip for the stale block");
+    assert!(proposals.is_empty(), "the stale tip is not re-proposed");
+    assert_eq!(l.net.ne_requests(), 1, "the leader asks for No-Endorsements");
+    l.receive_nes();
+    let p = l.proposals();
+    assert_eq!(p.len(), 1, "an NEC lets the leader propose a fresh block");
+    assert!(p[0].nec.is_some() && p[0].block.hash != b().hash);
+}
+
+/// Codex P1-b, the self-vote: a leader votes for its own TC re-proposal only once the applicable
+/// data check holds (here the re-proposal check of a vouched tip), as every other voter does;
+/// the `pending_bodies` shortcut is for its freshly produced blocks only.
+#[test]
+fn leader_self_vote_on_a_reproposal_waits_for_the_data_check() {
+    let me = leader_of(VIEW);
+    let mut l = leader(tc_with_tip_reporters(2), true);
+    l.app.reproposal = BlockDataCheck::Missing;
+    l.enter();
+    let p = l.proposals();
+    assert_eq!(p.len(), 1);
+    assert!(p[0].block.hash == b().hash && p[0].nec.is_none(), "a vouched tip is re-proposed");
+    l.receive(HotStuffMessage::ProposalHeader(ProposalHeader::from_proposal(&p[0], false)), &me);
+    assert!(l.tree.last_voted_proposal().unwrap().is_none(), "no vote while the data is missing");
+    l.app.reproposal = BlockDataCheck::Held;
+    std::thread::sleep(Duration::from_millis(30));
+    l.hotstuff.tick_body_vote(&mut l.tree, &mut l.app).unwrap();
+    assert_eq!(l.tree.last_voted_proposal().unwrap(), Some((ViewNumber::new(VIEW), b().hash)), "voted once it holds");
+}
+
+/// Codex P1-a (the probe `review_rotating_leaders_keep_minority_tip_stuck`): `b` was proposed by
+/// the byzantine leader(4) and voted by two honest replicas, leader(5) and leader(6), then a
+/// partition made it stale; leader(7), honest, never voted for it. The byzantine replica forms
+/// every TC from its own vote (no tip), ONE endorser's tip and the non-voter's, so no TC vouches
+/// for `b` (tip power 1 = f). Before the fix the endorsers exempted `b` locally (own tip, last
+/// vote): as leaders, and under the byzantine leader, they re-proposed and re-voted it in every
+/// view (no QC: the non-voter refused it) and so withheld their No-Endorsements, while the
+/// non-voter's NEC got 1 of 3: no progress, ever. Now every honest replica judges `b` by the TC:
+/// nobody re-votes it, and once the endorsers' last vote is older than the TC's view they sign
+/// NEs, so an NEC replaces `b` in the second view.
+#[test]
+fn rotating_leaders_recover_a_minority_stale_tip() {
+    struct Node {
+        vk: VerifyingKey,
+        hs: HotStuff<RecordingNetwork>,
+        net: RecordingNetwork,
+        tree: BlockTreeSingleton<MemKV>,
+        events: Receiver<Event>,
+        app: StaleApp,
+    }
+    let byz = leader_of(4);
+    let endorsers = [leader_of(5), leader_of(6)];
+    let nonvoter = leader_of(7);
+    assert!(endorsers.iter().all(|v| *v != byz && *v != nonvoter));
+    let mut nodes: Vec<Node> = keys()
+        .iter()
+        .filter(|k| k.verifying_key() != byz)
+        .map(|k| {
+            let (mut tree, vss) = steady_block_tree(&set());
+            tree.insert(&a(), None, None).unwrap();
+            tree.insert(&b(), None, None).unwrap();
+            let mut wb = BlockTreeWriteBatch::new();
+            wb.set_highest_pc(&b().justify).unwrap();
+            tree.write(wb);
+            if endorsers.contains(&k.verifying_key()) {
+                tree.set_vote_state_atomic(ViewNumber::new(4), b().hash).unwrap();
+                tree.set_local_tip(&tip(&b(), 4)).unwrap();
+            }
+            let (hs, net, events) = hotstuff_for(k.clone(), vss);
+            Node { vk: k.verifying_key(), hs, net, tree, events, app: StaleApp::default() }
+        })
+        .collect();
+    let mut stale_votes = 0;
+    let mut recovered_in = None;
+    for view in 5..13 {
+        // TC(view - 1): byzantine (no tip), the first endorser (tip b), the non-voter (no tip).
+        let mut c = TimeoutVoteCollector::new(CHAIN_ID, ViewNumber::new(view - 1), set());
+        let mut formed = None;
+        for signer in [byz, endorsers[0], nonvoter] {
+            let reported = (signer == endorsers[0]).then(|| tip(&b(), 4));
+            let PacemakerMessage::TimeoutVote(vote) = PacemakerMessage::timeout_vote(
+                &Keypair::new(key_of(&signer)),
+                CHAIN_ID,
+                ViewNumber::new(view - 1),
+                None,
+                reported,
+                Some(b().justify.clone()),
+            ) else {
+                unreachable!()
+            };
+            formed = c.collect(&signer, vote).or(formed);
+        }
+        let the_tc = formed.unwrap();
+        assert!(the_tc.high_tip_is_winner && !the_tc.tip_vouched(&nodes[0].tree).unwrap());
+        let leader = leader_of(view);
+        for n in &mut nodes {
+            n.net.sent.lock().unwrap().clear();
+            n.tree.set_highest_tc(&the_tc).unwrap();
+            let info = ViewInfo::new(ViewNumber::new(view), Instant::now() + Duration::from_secs(3600));
+            n.hs.enter_view(info, &mut n.tree, &mut n.app).unwrap();
+        }
+        let mut proposals: Vec<Proposal> = nodes
+            .iter()
+            .flat_map(|n| n.events.try_iter())
+            .filter_map(|e| if let Event::Propose(p) = e { Some(p.proposal) } else { None })
+            .collect();
+        if leader == byz {
+            // The byzantine leader re-proposes b under the TC (and withholds its own vote).
+            proposals.push(Proposal::signed(&key_of(&leader), CHAIN_ID, ViewNumber::new(view), b(), Some(the_tc.clone()), None));
+        }
+        for proposal in proposals {
+            let h = ProposalHeader::from_proposal(&proposal, false);
+            for n in &mut nodes {
+                n.hs.on_receive_msg(HotStuffMessage::ProposalHeader(h.clone()), &leader, &mut n.tree, &mut n.app).unwrap();
+            }
+        }
+        let requests: Vec<_> = nodes
+            .iter()
+            .flat_map(|n| n.net.hotstuff_msgs())
+            .filter_map(|m| if let HotStuffMessage::NERequest(r) = m { Some(r) } else { None })
+            .collect();
+        for request in requests {
+            for n in &mut nodes {
+                n.hs.on_receive_msg(HotStuffMessage::NERequest(request.clone()), &leader, &mut n.tree, &mut n.app).unwrap();
+            }
+        }
+        let responses: Vec<_> = nodes
+            .iter()
+            .flat_map(|n| {
+                n.net.hotstuff_msgs().into_iter().filter_map(|m| if let HotStuffMessage::NE(ne) = m { Some((n.vk, ne)) } else { None })
+            })
+            .collect();
+        if let Some(n) = nodes.iter_mut().find(|n| n.vk == leader) {
+            for (signer, response) in responses {
+                n.hs.on_receive_msg(HotStuffMessage::NE(response), &signer, &mut n.tree, &mut n.app).unwrap();
+            }
+        }
+        for n in &nodes {
+            for event in n.events.try_iter() {
+                match event {
+                    Event::PhaseVote(v) if v.vote.block == b().hash => stale_votes += 1,
+                    Event::Propose(p) if p.proposal.nec.is_some() => {
+                        assert_ne!(p.proposal.block.hash, b().hash);
+                        recovered_in.get_or_insert(view);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if recovered_in.is_some() {
+            break;
+        }
+    }
+    assert_eq!(stale_votes, 0, "no honest replica re-votes the stale, unvouched tip");
+    assert_eq!(recovered_in, Some(6), "the NEC forms once the endorsers' vote is older than the TC");
 }
