@@ -1955,6 +1955,7 @@ fn reject_label(reason: FailureReason) -> OrderRejectReason {
         FailureReason::DuplicateCloid => OrderRejectReason::DuplicateCloid,
         FailureReason::UnknownMarket => OrderRejectReason::UnknownMarket,
         FailureReason::MarketDelisted => OrderRejectReason::MarketDelisted,
+        FailureReason::MarketNeverMarked => OrderRejectReason::MarketNeverMarked,
         FailureReason::Other | FailureReason::BatchCap => OrderRejectReason::Other,
     }
 }

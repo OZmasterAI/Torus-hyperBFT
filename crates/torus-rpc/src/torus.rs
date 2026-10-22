@@ -3439,6 +3439,101 @@ mod delist_ingress_tests {
     }
 }
 
+/// Owner s138: ingress refuses an order on a market that has never had an
+/// oracle mark (no aggregate row) with the executor's text
+/// (`FailureReason::MarketNeverMarked`), so mempool and consensus agree; a
+/// marked market (fresh or stale) passes this check.
+#[cfg(test)]
+mod first_mark_ingress_tests {
+    use super::*;
+    use torus_types::{MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
+
+    const NOW: u64 = 1_000_000;
+    const S: i128 = FixedPoint::SCALE;
+
+    fn db() -> (tempfile::TempDir, torus_state::StateDb) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = torus_state::StateDb::open(dir.path()).unwrap();
+        (dir, state)
+    }
+
+    fn list(state: &torus_state::StateDb, mid: MarketId) {
+        use borsh::BorshSerialize;
+        let mut row = Vec::new();
+        "BTC".to_string().serialize(&mut row).unwrap();
+        "USD".to_string().serialize(&mut row).unwrap();
+        S.serialize(&mut row).unwrap(); // lot 1
+        S.serialize(&mut row).unwrap(); // tick 1
+        (5 * S).serialize(&mut row).unwrap();
+        state.put_cf_raw(CF_NATIVE_MARKETS, &mid.to_be_bytes(), &row).unwrap();
+    }
+
+    /// The aggregate row of `mid`: price(16) ‖ block(8) ‖ reporters(4) ‖ ts(8).
+    fn mark(state: &torus_state::StateDb, mid: MarketId, price: i128, ts_secs: u64) {
+        let key = [b"agg".as_slice(), &mid.to_be_bytes()].concat();
+        let row = [(price * S).to_be_bytes().as_slice(), &1u64.to_be_bytes(), &3u32.to_be_bytes(), &ts_secs.to_be_bytes()]
+            .concat();
+        state.put_cf_raw(torus_state::cf::CF_NATIVE_ORACLE, &key, &row).unwrap();
+    }
+
+    fn order(mid: MarketId) -> PlaceOrderParams {
+        PlaceOrderParams {
+            market_id: mid,
+            is_buy: true,
+            price: FixedPoint::from_raw(100 * S),
+            quantity: FixedPoint::from_raw(S),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        }
+    }
+
+    #[test]
+    fn order_on_a_never_marked_market_is_refused_with_executor_text() {
+        let (_d, state) = db();
+        for m in 1..=3 {
+            list(&state, m);
+        }
+        mark(&state, 1, 100, NOW / 1_000);
+        mark(&state, 3, 100, 1); // stale at NOW
+        let want = "market 2 has no oracle mark yet: orders open after its first mark";
+        assert_eq!(torus_types::market_never_marked_reason(2), want, "the executor's text");
+
+        let e = validate_known_markets(&NativeAction::PlaceOrder(order(2)), &state).unwrap_err();
+        assert_eq!(e, want);
+        let ro = PlaceOrderParams { reduce_only: true, ..order(2) };
+        assert_eq!(validate_known_markets(&NativeAction::PlaceOrder(ro), &state).unwrap_err(), want);
+        validate_known_markets(&NativeAction::PlaceOrder(order(1)), &state).unwrap();
+        validate_known_markets(&NativeAction::PlaceOrder(order(3)), &state).unwrap();
+
+        // A batch is one signed action: one such order refuses all of it.
+        let batch = vec![order(1), order(3), order(2)];
+        let e = validate_known_markets(&NativeAction::PlaceOrderBatch(batch), &state).unwrap_err();
+        assert_eq!(e, want);
+        validate_known_markets(&NativeAction::PlaceOrderBatch(vec![order(1), order(3)]), &state).unwrap();
+        // Cancels are not refused.
+        validate_known_markets(&NativeAction::CancelAllOrders { market_id: Some(2) }, &state).unwrap();
+    }
+
+    /// Wired into the submit path (`verify_one_action`), before the signature.
+    #[test]
+    fn submit_path_refuses_it_before_signature_verify() {
+        let (_d, state) = db();
+        list(&state, 4);
+        let key = k256::ecdsa::SigningKey::from_slice(&[9; 32]).unwrap();
+        let sign = |p| {
+            let signed = torus_types::eip712::sign_native_action(NativeAction::PlaceOrder(p), NOW, &key);
+            format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap()))
+        };
+        let r = verify_one_action(&sign(order(4)), torus_types::eip712::TORUS_CHAIN_ID, &state, NOW);
+        assert_eq!(r.err().as_deref(), Some("market 4 has no oracle mark yet: orders open after its first mark"));
+        mark(&state, 4, 100, NOW / 1_000);
+        let r = verify_one_action(&sign(order(4)), torus_types::eip712::TORUS_CHAIN_ID, &state, NOW);
+        assert!(r.is_ok(), "{:?}", r.err());
+    }
+}
+
 #[cfg(test)]
 mod order_book_decode_tests {
     //! S444 / S395 RED-first: `torus_getOrderBook` must decode the PRODUCTION
