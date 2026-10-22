@@ -16390,6 +16390,56 @@ mod crash_recovery_tests {
             .all(|(k, _)| !k.starts_with(b"leader_stats:")));
     }
 
+    /// K = 0 (s136, on the TC set): over four epochs (boundaries 4..=16) execution writes no
+    /// dead-leader row at all (no `leader_stats:`, no `leader_qc:`, no `epoch_vset:lx_*`), so the
+    /// state, its hash and the boundary updates (their exclusion delta comes only from an
+    /// `lx_plan` row) are those of the base. Control: K = 3 on the same chain writes the rows and
+    /// plans the exclusion.
+    #[test]
+    fn dead_leader_off_writes_no_row_across_epochs() {
+        let dl_rows = |db: &StateDb| -> Vec<Vec<u8>> {
+            StateBackend::iterate_cf(db, CF_CONSENSUS_META, None)
+                .unwrap()
+                .into_iter()
+                .map(|(k, _)| k)
+                .filter(|k| {
+                    k.starts_with(b"leader_stats:")
+                        || k.starts_with(crate::leader_skip::LEADER_QC_PREFIX)
+                        || k.starts_with(b"epoch_vset:lx_")
+                })
+                .collect()
+        };
+        let (mut config, db) = dls_fixture();
+        config.leader_miss_threshold = 0;
+        let ctx = make_exec_ctx(&config, &db);
+        for h in 1..=16 {
+            ctx.execute_committed_block(&make_block(h, vec![]), vec![]);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "K = 0: height {h}");
+        }
+        drop(ctx);
+        assert_eq!(read_native_applied_height(&db), Some(16));
+        assert_eq!(dl_rows(&db), Vec::<Vec<u8>>::new(), "K = 0: no dead-leader row");
+        for h in [8, 12, 16, 20] {
+            assert_eq!(
+                torus_economics::leader_stats::leader_exclusion_plan(&db, h).unwrap(),
+                None,
+                "K = 0: no exclusion plan for {h}"
+            );
+        }
+
+        let (config, on) = dls_fixture();
+        let ctx = make_exec_ctx(&config, &on);
+        dls_execute(&ctx, &on, 1, 16);
+        drop(ctx);
+        assert!(!dl_rows(&on).is_empty(), "control: K = 3 writes rows");
+        assert!(
+            torus_economics::leader_stats::leader_exclusion_plan(&on, 16)
+                .unwrap()
+                .is_some(),
+            "control: K = 3 plans the exclusion"
+        );
+    }
+
     /// The commit path carries the justify QC's evidence in the height's manifest and writes
     /// the evidence row in the block's header + body batch at dispatch (on); with the feature
     /// off, the manifest is the datum verbatim (byte-identical to before) and there is no row.
