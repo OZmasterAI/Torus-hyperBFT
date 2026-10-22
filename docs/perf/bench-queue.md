@@ -1198,7 +1198,7 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
   - **Decided (owner s128, on section 82: C -21.6% matched/s, 140 ms per validate):** custody OFF by default until
     T3.1; the RH4 shard-count fix waits for T3.1. Code default flipped on main `d6c4d0d2` (s128): only `TORUS_SHARD_CUSTODY=1` enables.
 
-- **Q12. Option S: does a larger EVM cadence N recover Q5's loss?** (item 7 step 3, `docs/plans/item7-step3-design.md`
+- **[SUPERSEDED, closed s136: option 0 (Q11 / 8l, section 107) removed the EVM barrier this targeted; r1 ran s68 (section 85), owner s128: no r2/r3, N stays 11. Keep for a revisit if the EVM fast path is ever turned off or EVM load changes the picture.] Q12. Option S: does a larger EVM cadence N recover Q5's loss?** (item 7 step 3, `docs/plans/item7-step3-design.md`
   sections 3 S and 6.2; no node code). Q5 (section 80): -12.4% matched/s at N = 11, from the barrier before every EVM
   block. Raising N (genesis `evm.block_interval`, governance 2..=100) is the zero-code alternative to option 0.
   - Binary: M (the Q5 binary `e3d11cb9`, or the campaign's M), unchanged.

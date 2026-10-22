@@ -142,6 +142,11 @@ has them). The wall-clock gap of (a) and (b) is one block each (~0.3 s at ~3.2 b
 Common base for HL, T, C0, C1, D: option 0. S is the no-code alternative; N is the narrower-barrier idea.
 
 ### S. Fewer EVM blocks (raise N; governance 2..=100, genesis >= 1): measured by Q12
+
+> **Status s136: closed as superseded (owner).** Option 0 (EVM fast path, merged s131, on by default) removed the
+> barrier S worked around: section 107 (8l), under 10 EVM tx/s E-on runs at N-on's pace (matched/s 1.079x E-off,
+> native blocks/s 3.53x, p50 0.090x, timeouts 22 -> 3). Q12 r1 ran s68 (section 85); owner s128: no r2/r3, N stays 11.
+> Revisit S only if the fast path is turned off or a heavier EVM load brings the barrier back.
 - **Mechanism:** none new. Each EVM block forces a checkpoint of the window since the last one, so its barrier wait
   grows with the window: at N = 11 a ~3.8 s window is ~100 MB, written in 0.26-0.51 s; a full 15 s window is
   ~200 MB, flushed in 0.84-0.89 s (Q6 section 1.1). The serial run adds ~0.19 s per EVM block whatever N is. So fewer
