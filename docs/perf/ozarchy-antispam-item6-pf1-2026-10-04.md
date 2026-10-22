@@ -19684,6 +19684,254 @@ Drift:
   * section 123's `j9-logscan.sh` -> `9j2-logscan.txt`;
   * `9j2-streamed.txt`.
 
+## 125. Step 9k, one-validator-down baseline: one binary pre-TC main `896240d4` (node `4719fce1`), stakes 2 / 2 / 1, U = all up vs K = `KILL_NO_RESTART=val2` (the stake-1 node, SIGKILL at bench+120 s, never restarted), hash + attestation + L6.1 + L2.1 + fail-stop on, Classic, 15 s checkpoints, standard shape (deep pending), w1 (U) + U K K U K U U K + reruns r1-K / r3-K / r4-K, 600 s cells, n = 4 (U) and 7 (K) (campaign ozarchy-9k2, archy, 2026-10-22)
+
+**With one of three validators down (stake 1 of 5, never restarted), standard-shape matched/s drops 47.5% over the
+whole cell and 58.0% after the kill. Blocks/s drops 91% after the kill.** K / U matched/s: whole cell 145,507 vs
+277,283 (-131,777 ± 1,784, 78 sd); post-kill 115,870 vs 275,743 (-58.0%). The post-kill block rate is 1.40 vs 15.86.
+The whole-cell figure is the summary headline (`matched_s_avg` over the 600 s load, 120 s of it before the kill).
+Cause: every view that the dead val2 leads runs to its timeout (val1 42.3 timeout views per minute = one in three views).
+**Finding:** in 5 of 7 K cells, 5-11 s after the kill, a survivor could not fetch the body of a block that the OTHER
+survivor had just proposed. It gave up after the 4 s budget and fell back to block sync. The chain then froze for
+17-50 s (2-11 s in the cells without it). These are the "dissemination failures" that keep 5 K cells REJECT under
+the kill-cell health fix. The cause is open: 18c investigates (`fix/body-fetch-dead-peer`).
+
+Question (bench queue 9k, owner GO s138): the "before" numbers for 9o (TC phase D) and 9p (dead-leader phase 4).
+Per window (pre-kill / post-kill): blocks/s, matched/s, timeout views per minute, p50 / p99 commit latency, and the
+end-of-load cancel-all tail.
+
+### 125.1 Setup
+
+* Binary: pre-TC main `896240d4`, node md5 `4719fce155ca0586037ce3da4f6ece0e`, bench md5
+  `db1fd9d30c66edfe7af618fb24f23903`. Node md5 ok in all 12 std cells (`summary.json` binaries, `std/cells.tsv`
+  md5_ok yes). Frozen tools: worktree `/home/oz/projects/wt/9k2-std-896240d4/tools/matched-bench`.
+* Config, both arms: `VALIDATOR_STAKES=2,2,1`, `STATE_HASH_ACTIVATION=1` + attestation, L6.1 (follows the hash),
+  L2.1 and fail-stop on (`TORUS_STATE_HASH_FAILSTOP=1`), Classic, `TORUS_CHECKPOINT_INTERVAL_MS=15000`, feed off,
+  bench ingress `BENCH_RPCS=0,1` (val0, val1).
+* K arm: `KILL_NO_RESTART=val2`, `KILL_NO_RESTART_AT_S=120`. `kill-norestart.json` records kill_ts and height (r2-K:
+  height 2443). Only val0 and val1 are drained, digested and compared after the load.
+* Load: 300 markets, rate 76,000, 5,000 senders, batch 400, `MAX_IN_FLIGHT` 4, commit tail, cancel fraction 0.05,
+  600 s. Standard shape = 100,000 accounts.
+* **The arms differ in one bench flag:** `--in-flight-watch-rpc` is val1 (`:8646`) in K and val2 (`:8647`) in U
+  (run.log bench line), because the K watch node must survive the kill. See 125.6.
+* Order: w1 (U, 300 s, warm-up gate), r1-U, r1-K, r2-K, r2-U, r3-K, r3-U, r4-U, r4-K, then reruns r1-K-rerun,
+  r3-K-rerun, r4-K-rerun of the three flagged K cells. `std/campaign.done` `exit=0 2026-10-22T16:25:38`.
+* Windows: per survivor, as `summarize.py` `norestart_windows`. The last 1 Hz sample at or before kill_ts ends
+  "pre-kill" and starts "post-kill". U cells have no kill: the analyst split them at a virtual kill at
+  t_bench0 + 120 s with the same rule. The analyst's script reproduces r2-K's `summary.json` per-window values exactly.
+* Statistics: arm mean ± 95% t CI (U n = 4, 3 df; K n = 7, 6 df); step ± Welch 95% CI; (sd) = step / pooled sd.
+  Owner decision: all 7 K cells count (complete data). The flags are verdicts, not missing data.
+
+### 125.2 Validity
+
+* All 12 std cells: AGREE (survivors only in K, val2 in `excluded_nodes`). State attestation ok=1 in every cell: 63
+  checkpoints compared in U, 32-33 in K (survivors), 0 vote mismatches, 0 no-quorum heights. 0 `panicked`,
+  `STATE HASH MISMATCH`, `diverged`, `hash-unverified`, ` ERROR ` or `FATAL` lines in the 36 node logs.
+* `campaign.log` CELL-FLAGs (rc = 2): r1-K, r3-K, r4-K and their reruns r1-K-rerun, r3-K-rerun, r4-K-rerun. All
+  four U cells and r2-K are rc 0, ACCEPT.
+* Reasons as scored: r1-K "drain not established" + "liveness failed" + "dissemination failures". The other five
+  flagged cells: "dissemination failures" only.
+* **health.py kill-cell fix** (`fix/health-kill-exempt` @ `c8fff67d`, after `016855d3` / RED `b50118ab`). In a
+  `KILL_NO_RESTART` cell, a dissemination failure line is exempt only if it is post-kill and names the killed node
+  as its peer. The rules:
+  * Sync fallbacks are never exempt, whoever proposed the block.
+  * Pre-kill lines, survivor-to-survivor lines, unattributed lines and the killed node's own lines stay strict.
+  * `collect_logs.py` records each failure line in `log-summary.json`.
+
+  Re-score (`rescore.sh` into `~/bench-results-matched/ozarchy-9k2-rescored/<cell>/rescore.json`, written 17:18:50,
+  after `c8fff67d` 17:17:54 in that worktree):
+
+  | cell | as scored | re-scored | failure lines after the kill |
+  |---|---|---|---|
+  | r1-K | REJECT | REJECT (drain, liveness, dissemination) | 2 sync fallbacks (val0 <- val1, val1 <- val0) |
+  | r2-K | ACCEPT | ACCEPT | none |
+  | r3-K | REJECT | REJECT | 2 sync fallbacks |
+  | r4-K | REJECT | REJECT | 2 sync fallbacks |
+  | r1-K-rerun | REJECT | REJECT | 1 sync fallback (val0 <- val1) |
+  | r3-K-rerun | REJECT | REJECT | 2 sync fallbacks |
+  | r4-K-rerun | REJECT | **ACCEPT** | 8 `native-da OUTBOUND FAILURE` val0 -> val2 at kill+10.0 s (exempt) |
+
+* r1-K's "drain not established" is not a separate failure. `summarize.py` line 1687 sets drained = drained_reported
+  AND liveness != FAIL. `drain.json` shows the drain completed ("quiet and advancing", 18.1 s). See 125.5.
+* Smoke cells `ozarchy-9k2-{smokeu,smokek,smokedeepk}-smoke-s0` are not scored.
+
+### 125.3 Per cell (run order; val0; survivors agree within 0.3%)
+
+| cell | arm | matched/s whole | pre-kill | post-kill | blk/s pre | blk/s post | timeouts / min val1 post | commit p50 / p99 ms post (mean of survivors) | verdict (re-scored) |
+|---|---|---|---|---|---|---|---|---|---|
+| w1 (300 s, unscored) | U | 282,033 | 285,598 | 279,682 | 15.32 | 15.65 | 0.66 | 2,127 / 9,631 | ACCEPT |
+| r1 | U | 277,127 | 280,238 | 276,355 | 15.04 | 16.20 | 0.12 | 2,107 / 9,610 | ACCEPT |
+| r1 | K | 142,265 | 266,205 | 111,409 | 17.43 | 1.346 | 40.83 | 3,186 / 73,314 | REJECT |
+| r2 | K | 146,092 | 260,544 | 117,598 | 17.06 | 1.415 | 42.70 | 3,158 / 40,786 | ACCEPT |
+| r2 | U | 277,578 | 286,014 | 275,482 | 15.41 | 15.79 | 0.62 | 2,188 / 9,620 | ACCEPT |
+| r3 | K | 145,293 | 263,483 | 115,868 | 17.50 | 1.400 | 42.45 | 3,189 / 44,776 | REJECT |
+| r3 | U | 277,302 | 285,051 | 275,377 | 15.18 | 15.43 | 0.37 | 2,340 / 9,702 | ACCEPT |
+| r4 | U | 277,126 | 282,639 | 275,756 | 15.25 | 16.01 | 0.62 | 2,169 / 9,626 | ACCEPT |
+| r4 | K | 145,422 | 263,590 | 116,064 | 17.52 | 1.402 | 42.48 | 3,183 / 45,685 | REJECT |
+| r1-rerun | K | 144,169 | 265,973 | 113,592 | 17.09 | 1.376 | 41.95 | 3,159 / 59,938 | REJECT |
+| r3-rerun | K | 146,281 | 266,572 | 116,333 | 17.53 | 1.405 | 42.57 | 3,169 / 46,534 | REJECT |
+| r4-rerun | K | 149,024 | 264,944 | 120,223 | 17.92 | 1.445 | 43.23 | 3,121 / 40,340 | ACCEPT |
+
+"commit p50 / p99" is the order age at commit (`torus_order_age_commit_seconds`, now - nonce) from `buckets.csv`.
+Drift:
+* U whole-cell in run order: 277.1k / 277.6k / 277.3k / 277.1k. No drift.
+* K whole-cell in run order: 142.3k / 146.1k / 145.3k / 145.4k / 144.2k / 146.3k / 149.0k. There is no monotonic trend.
+  The spread follows the post-kill freeze length (125.5): r4-K-rerun, the only cell without a freeze, is the highest.
+* K pre-kill: 260.5-266.6k, no trend.
+
+### 125.4 Arm means and steps (U n = 4, K n = 7; ± = 95% CI)
+
+| metric | window | U | K | K - U [CI] | % | (sd) |
+|---|---|---|---|---|---|---|
+| matched/s | whole 600 s | 277,283 ± 339 | 145,507 ± 1,913 | **-131,777 ± 1,784** | -47.5% | -78 |
+| matched/s | pre-kill | 283,485 ± 4,119 | 264,473 ± 1,965 | -19,013 ± 3,445 | -6.7% | -8.3 (confounded, 125.6) |
+| matched/s | post-kill | 275,743 ± 698 | 115,870 ± 2,596 | **-159,873 ± 2,451** | -58.0% | -69 |
+| blocks/s | whole | 15.73 ± 0.41 | 4.597 ± 0.062 | -11.14 ± 0.30 | -70.8% | -70 |
+| blocks/s | pre-kill | 15.22 ± 0.24 | 17.44 ± 0.27 | +2.22 ± 0.30 | +14.6% | +8.7 (confounded) |
+| blocks/s | post-kill | 15.86 ± 0.53 | 1.398 ± 0.029 | **-14.46 ± 0.38** | -91.2% | -75 |
+| timeout views / min, val0 | pre / post | 0.25 / 0.43 | 0.29 / 0.37 | not resolved | | +0.1 / -0.3 |
+| timeout views / min, val1 | pre / post | 0.38 / 0.43 | 0.64 / **42.32 ± 0.70** | post +41.9 ± 0.7 | | +66 |
+| views / min (val0) | pre / post | 940 / 948 | 1,047 / 126.4 | post -821 | -86.7% | -66 |
+| commit p50 ms (mean of survivors) | pre-kill | 2,260 ± 76 | 1,470 ± 214 | -789 ± 205 | -35% | -4.1 (confounded) |
+| commit p50 ms | post-kill | 2,201 ± 158 | 3,166 ± 22 | **+965 ± 114** | +44% | +16 |
+| commit p99 ms | pre-kill | 9,581 ± 59 | 8,697 ± 383 | -885 ± 357 | -9% | -2.6 (confounded) |
+| commit p99 ms | post-kill | 9,640 ± 67 | 50,196 ± 11,189 | **+40,556 ± 10,343** | +421% | +4.1 |
+
+* Post-kill timeouts count on val1 only: 42.3 per minute = 126.4 views / 3, i.e. one timeout per val2-led view. val0's
+  counter stays at ~0.4 per minute in both arms; the counter does not show why it does not count them.
+* Post-kill p50 differs by survivor in every K cell: val0 ~4.1 s, val1 ~2.2 s (r2-K 4,104 / 2,213 ms). p99 is
+  40.3-73.3 s; r1-K is the highest because of its 50 s freeze.
+* A last-attempt-only K set (r2-K + the three reruns, n = 4) gives 146,391 ± 3,178 whole and 116,936 ± 4,385
+  post-kill. The conclusion is the same.
+
+End-of-load cancel-all tail (`sampler.csv` `torus_exec_cancel_all_total`, per survivor, t_bench1 -> t_drain):
+
+| arm | cancel-alls executed during load | executed after the load ended | tail duration (last increase after t_bench1) | native mempool at t_bench1 |
+|---|---|---|---|---|
+| U (n = 4) | 346,897 | 0 in r1 / r3 / r4; 2,285-2,385 in r2-U | 0 s; 2-3 s in r2-U | 0; 3,501 in r2-U |
+| K (n = 7) | 155,439 | **4,468 ± 321** (3,488-4,946 per node) | 6-10 s | 3,488-5,888 |
+
+* The K tail is the mempool backlog of the 1.4 blocks/s chain. It clears in under 10 s once the senders stop.
+* K executes 55% fewer cancel-alls during the load because ingest is gated by in-flight commits. r2-K check: the
+  bench sent 161,348 cancel-alls = 156,508 during the load + 4,838 in the tail (val0).
+
+### 125.5 Verdict
+
+* **One validator down (stake 1/5, no restart) costs 47.5% of std matched/s over the whole cell and 58.0% after the
+  kill. Post-kill blocks/s is -91% and commit p50 +44% (high confidence).** All steps are 16-78 sd with no drift.
+  They match the s77 9k smoke (memory): 1.5 blocks/s post-kill, view gaps 1.21-1.32 s, ~4,475 cancel-alls drained
+  after the load.
+* **Mechanism, sized (estimate).** 126.4 views per minute = 0.475 s per view. Assume the two live-leader views of each
+  round take U's view time (61 ms, r1-U `view_duration_ms`). Then each val2-led view costs ~1.30 s, so ~55 of every
+  60 s go to waiting out the dead leader's views. That alone accounts for 1.40 vs 15.86 blocks/s. The default view
+  timeout is 1,200 ms (`torus-node` main.rs:464, :1191); the genesis value was not checked. matched/s falls less
+  than blocks/s (-58% vs -91%) because the blocks are fuller: 82.9k matched per block post-kill vs 17.4k in U.
+* **Finding: post-kill survivor-to-survivor body-fetch fallbacks (facts high confidence; cause open).**
+
+  | cell | requester <- proposer (view), block | give-up, s after kill | requester header arrival (s) | proposer header re-sends (n, s) | matched/s 10 s before / after / post-kill steady | blk/s same |
+  |---|---|---|---|---|---|---|
+  | r1-K | val1 <- val0 (2506) `MD62xsP` | 6.81 | 2.80 | 9, 2.78-4.79 | 39,804 / 0 / 119,282 | 7.22 / 0 / 1.44 |
+  | r1-K | val0 <- val1 (2508) `FYBvyUU` | 11.36 | 7.36 | 18, 7.59-11.84 | 9,985 / 0 / 118,867 | 0.22 / 0 / 1.43 |
+  | r3-K | val0 <- val1 (2511) `4WVzS21` | 6.27 | 2.27 | 9, 2.51-4.52 | 43,469 / 0 / 120,776 | 14.11 / 0 / 1.46 |
+  | r3-K | val1 <- val0 (2512) `KB4Y2Xz` | 10.82 | 6.80 | 18, 4.91-9.17 | 0 / 10,173 / 120,703 | 0 / 0.22 / 1.46 |
+  | r4-K | val0 <- val1 (2514) `YIaiYQf` | 5.34 | 1.34 | 9, 1.57-3.57 | 60,117 / 0 / 120,446 | 9.44 / 0 / 1.46 |
+  | r4-K | val1 <- val0 (2515) `hj5No+w` | 8.26 | 4.25 | 18, 4.20-8.45 | 27,851 / 0 / 120,036 | 2.89 / 0 / 1.46 |
+  | r1-K-rerun | val0 <- val1 (2481) `ULnuNuW` | 6.46 | 2.45 | 9, 2.70-4.71 | 55,056 / 0 / 121,399 | 12.11 / 0 / 1.47 |
+  | r3-K-rerun | val0 <- val1 (2526) `IM9F8XA` | 6.14 | 2.13 | 9, 1.68-3.69 | 54,162 / 0 / 120,706 | 8.78 / 0 / 1.46 |
+  | r3-K-rerun | val1 <- val0 (2527) `ibqwJSG` | 7.96 | 3.92 | 18, 4.14-8.48 | 17,237 / 0 / 120,365 | 2.67 / 0 / 1.46 |
+
+  * Each event is a `body fetch exhausted 9 retries (proposer + rotation) ... falling back to sync` line on one
+    survivor. The block is one the other survivor proposed in the first views after the kill; the proposer is
+    identified by its `header re-send: view=V block=<prefix>` lines. Mutual in 4 of 5 cells: the second event
+    follows 1.8-4.6 s after the first.
+  * Budget: every give-up comes 4.00-4.04 s after the requester's first message of that view
+    (`BODY_FETCH_DEADLINE` 4 s from the first request). The proposer stayed in its own view throughout, re-sending
+    the header every 250 ms, yet the body never arrived.
+  * **Fetch order, derived from code, not logged.** The per-attempt `body fetch retry` lines are debug-level, the
+    cells log at INFO, and `TORUS_BODY_FETCH_TRACE` is unset. Source: `crates/hotstuff_rs/src/hotstuff/implementation.rs`
+    at `896240d4`:
+    * 2429-2438: the first request goes to the header's origin, i.e. the proposer.
+    * 3156-3235 `tick_pending_body_retries_at`: others = committed set minus self minus proposer = [val2], the dead
+      node. val2 is never removed from the committed set.
+    * 3578-3596: retry every 100 ms, 2 attempts at the proposer, 9 fast attempts in total, then a slow phase every
+      500 ms until 4 s.
+    * 3714-3747: `rotated_body_fetch_target` / `slow_body_fetch_target`.
+
+    Resulting schedule: proposer at t+0 / 0.1 / 0.2, val2 x7 at t+0.3..0.9, then proposer / val2 alternating at
+    t+1.4 .. 3.9. The proposer is asked first and 6 times; val2 is asked 10 times.
+  * After the give-up:
+    * The val1-side syncs return 2 blocks and end `made no progress`.
+    * The val0-side syncs end in `worker fetch error (timeout/disconnect)` 3.0 s later (r3-K, r4-K, r1-K-rerun). The
+      sync peer is random among available servers (`block_sync/client.rs` 1196-1211) and is not logged. A pick of
+      the dead val2 would fit the 3 s timeout (inference).
+    * r3-K-rerun val0 logs `cannot sync (no available sync servers)` and retries after 2 s.
+  * Effect: in the 10 s after the give-up, matched/s and blocks/s are 0 in 8 of 9 events. The post-kill steady state
+    ([kill+30 s, end]) is 118.9-121.4k matched/s and 1.43-1.47 blocks/s.
+    * Longest post-kill height freeze (val0 / val1): r1-K 49 / 50 s, r3-K 18 / 18, r4-K 19 / 17, r1-K-rerun
+      26 / 25, r3-K-rerun 19 / 18.
+    * In the cells without fallbacks: r2-K 8 / 11 s, r4-K-rerun 2 / 2 s.
+    * Blocks committed in kill..+30 s: 2-19 with fallbacks, 22-23 (r2-K) and 38 (r4-K-rerun) without.
+  * Size: post-kill matched/s is 114.7k in the 5 fallback cells vs 118.9k in the 2 others (-3.6%; n = 5 vs 2, inside
+    the K spread, sd 2.8k). The freeze costs 17-50 s near the kill; it is not what drives the -58%.
+  * Also seen (not judged):
+    * In the 5 fallback cells both survivors' logs go silent together for 1.0-2.3 s at kill+0..2.4 s, and the first
+      failing header arrives right after that silence. The same silence is 0.56-0.58 s in r4-K-rerun and 0.75-1.13 s
+      in r2-K.
+    * `dropping proposal header ... is_safe=false, justify_block_known=true` on val1 after the kill: r1-K (view 2500
+      x4 at +0.0..0.76 s, view 2509 at +17.8 s) and r1-K-rerun (view 2482 at +19.95 s).
+  * Relevance to 9o / 9p: this is block-body fetching, not view change. Neither the TC set nor dead-leader skip
+    targets it, so their "after" arms carry it unless 18c's fix lands first (18c's live status).
+* **r1-K liveness / drain failure.**
+  * Both survivors stay at height 2499 from kill+1.6 s (val1) / +2.6 s (val0) to kill+51.6 s. `summary.json`
+    liveness stalls are 49 s (val0) and 50 s (val1), threshold 30 s.
+  * Sequence:
+    * +0.0..0.76 s: val1 drops val0's view-2500 header 4 times (is_safe=false).
+    * Mutual give-ups at +6.8 s (val1, for val0's `MD62xsP`) and +11.4 s (val0, for val1's `FYBvyUU`).
+    * val1's sync ends "no progress" at +6.85 s. val0's sync returns 3 blocks at +16.2 s, inserts 1 and ends "no
+      progress" at +17.8 s.
+    * +17.8 s: val1 drops val0's view-2509 header (is_safe=false).
+    * From +17.8 s to +52.5 s (12:31:10 -> 12:31:45 UTC) neither survivor logs a single consensus message; only the
+      5 s redials to val2 appear.
+    * At 12:31:44.95 val1 logs `produce_block` (view-2511 messages follow), and the chain catches up at 5-7
+      blocks/s.
+  * Candidate for the 35 s silence: the pacemaker's multiplicative view-timeout backoff (factor 2,
+    `pacemaker/implementation.rs` ~617-631). Not verified: `wedge_diag` logging is off.
+  * The cell is AGREE with state attestation ok. Its throughput stays in the K mean (owner decision).
+
+### 125.6 Limits and next
+
+* **The pre-kill window is not a clean control.** The K bench watches in-flight commits on val1 and the U bench on
+  val2 (125.1). K pre-kill runs -6.7% matched/s, +14.6% blocks/s and -35% p50 against U, all well outside the noise.
+  The watch node is the only config difference found, so it is the likely cause; this is not proven. The confound
+  also sits inside the whole-cell figure. It is small next to the post-kill step (19k vs 160k matched/s). For 9o /
+  9p, run U with the K watch node (val1) so that the windows compare cleanly.
+* The 7-cell K set counts replicates r1, r3 and r4 twice (original + rerun). The last-attempt set (n = 4) agrees
+  (125.4).
+* 5 of 7 K cells stay REJECT; their throughput is reported anyway, by owner decision. Fallback cause: 18c
+  (`fix/body-fetch-dead-peer`). For a re-check, `TORUS_BODY_FETCH_TRACE=1` would log the fetch targets that are
+  derived from code here.
+* The cancel-all tail is a 1 Hz counter. The tail duration resolves to ±1 s.
+
+### 125.7 Deep shape: pending (campaign ozarchy-9k2-deep2 running)
+
+Not analysed. The 1M-genesis + `PRELOAD=1000000` cells, U K K U K U U K, will be added here when the campaign
+finishes and its cells are re-checked.
+
+### 125.8 Data
+
+* Cells: `~/bench-results-matched/ozarchy-9k2-std-{w1,r1-U,r1-K,r2-K,r2-U,r3-K,r3-U,r4-U,r4-K,r1-K-rerun,r3-K-rerun,r4-K-rerun}`
+  (`summary.json`, `sampler.csv`, `buckets.csv`, `kill-norestart.json`, `log-summary.json`, `drain.json`,
+  `state-attest.json`, `run.log`, `val<i>.log.gz`) and their `.campaign.log` / `.cell.rc`. Not used: smokes
+  `ozarchy-9k2-{smokeu,smokek,smokedeepk}-smoke-s0`.
+* Campaign: `ozarchy-9k2-run/` (`handoff.json`, `campaign.log`, `campaign.done`, `std/{cells.tsv,campaign.log,campaign.done,rerun-queue.tsv}`).
+* Re-score: `ozarchy-9k2-rescored/<cell>/{rescore.json,log-summary.json}` (tools `/home/oz/projects/wt/health-kill-exempt`).
+* Analysis: `ozarchy-9k2-tools/analyst/`:
+  * `std_windows.py` -> `std_windows.{json,txt}` (per-window rates, order-age percentiles, cancel-all tail);
+  * `std_stats.py` -> `std_stats.txt`;
+  * `std_events.py` + `std_event_table.py` -> `std_events.json`, `std_event_rows.json`, `std_event_table.txt`;
+  * `std_evidence_md.py` -> `std-fallback-evidence.md` (raw log lines with file:line for every event, for 18c);
+  * `std-analysis.md` (notes).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
