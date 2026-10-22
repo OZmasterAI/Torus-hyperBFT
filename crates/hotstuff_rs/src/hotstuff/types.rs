@@ -825,3 +825,163 @@ impl LeaderReputation {
         self.entries.retain(|(_, e)| e.total > 0);
     }
 }
+
+/// s138 D2 (docs/plans/disjoint-vset-livelock.md §3.3, §6 T7): which set a Decide PC on an updating
+/// block U is checked against while U's updates are still Pending at this replica (a laggard, a
+/// late joiner, a node syncing from genesis).
+#[cfg(test)]
+mod pending_update_decide_pc_tests {
+    use super::*;
+    use crate::block_tree::accessors::internal::BlockTreeWriteBatch;
+    use crate::hotstuff::header_fast_path_regression_test::MemKV;
+    use crate::test_keys::key_of;
+    use crate::types::{
+        block::Block,
+        crypto_primitives::{Keypair, SigningKey, VerifyingKey},
+        update_sets::{AppStateUpdates, ValidatorSetUpdates},
+    };
+
+    const CHAIN: ChainID = ChainID::new(0);
+
+    fn vk(seed: u8) -> VerifyingKey {
+        SigningKey::from_bytes(&[seed; 32]).verifying_key()
+    }
+
+    fn set(members: &[(u8, u64)]) -> ValidatorSet {
+        let mut set = ValidatorSet::new();
+        for &(seed, power) in members {
+            set.put(&vk(seed), Power::new(power));
+        }
+        set
+    }
+
+    fn generic_pc(view: u64, block: CryptoHash) -> PhaseCertificate {
+        PhaseCertificate {
+            chain_id: CHAIN,
+            view: ViewNumber::new(view),
+            block,
+            phase: Phase::Generic,
+            signatures: SignatureSet::new(0),
+        }
+    }
+
+    /// A Decide PC on `block` in `view`, laid out for `set`, signed by `signers`.
+    fn decide_pc(
+        block: CryptoHash,
+        view: u64,
+        set: &ValidatorSet,
+        signers: &[u8],
+    ) -> PhaseCertificate {
+        let view = ViewNumber::new(view);
+        let message = phase_vote_bytes(CHAIN, view, &block, Phase::Decide);
+        let mut signatures = SignatureSet::new(set.len());
+        for (pos, member) in set.validators().enumerate() {
+            if signers.iter().any(|&seed| vk(seed) == *member) {
+                signatures.set(pos, Some(Keypair::new(key_of(member)).sign(&message)));
+            }
+        }
+        PhaseCertificate {
+            chain_id: CHAIN,
+            view,
+            block,
+            phase: Phase::Decide,
+            signatures,
+        }
+    }
+
+    /// Committed set `S_old` = {1..4} (power 1 each), last changed by an update committed at
+    /// height 1 (from `{1, 2, 3}`), decided. Blocks h0 and h1 committed. U at h2 (child of h1)
+    /// carries `updates`, still Pending: h2 is above the update height.
+    fn tree_with_pending_update(
+        updates: &ValidatorSetUpdates,
+    ) -> (BlockTreeSingleton<MemKV>, CryptoHash) {
+        let mut bt = BlockTreeSingleton::new(MemKV::default());
+        let state = ValidatorSetState::new(
+            set(&[(1, 1), (2, 1), (3, 1), (4, 1)]),
+            set(&[(1, 1), (2, 1), (3, 1)]),
+            Some(BlockHeight::new(1)),
+            true,
+        );
+        bt.initialize(&AppStateUpdates::new(), &state).unwrap();
+        let b0 = Block::new(
+            BlockHeight::new(0),
+            PhaseCertificate::genesis_pc(),
+            CryptoHash::new([10; 32]),
+            Data::new(vec![]),
+        );
+        bt.insert(&b0, None, None).unwrap();
+        let b1 = Block::new(
+            BlockHeight::new(1),
+            generic_pc(1, b0.hash),
+            CryptoHash::new([11; 32]),
+            Data::new(vec![]),
+        );
+        bt.insert(&b1, None, None).unwrap();
+        let mut wb = BlockTreeWriteBatch::new();
+        bt.commit(&mut wb, &b1.hash).unwrap();
+        bt.write(wb);
+        let u = Block::new(
+            BlockHeight::new(2),
+            generic_pc(2, b1.hash),
+            CryptoHash::new([12; 32]),
+            Data::new(vec![]),
+        );
+        bt.insert(&u, None, Some(updates)).unwrap();
+        assert!(bt
+            .validator_set_updates_status(&u.hash)
+            .unwrap()
+            .is_pending());
+        (bt, u.hash)
+    }
+
+    /// T7 `decide_pc_on_pending_update_checked_against_post_update_set`: U adds n5. The new set's
+    /// Decide PC (n1, n2, n3, n5: 4 of 5; old power 3 of 4) must pass; an old-set-laid-out Decide PC
+    /// (n1, n2, n3: 3 of 4) must fail, since `S_old` does not vote Decide on U.
+    #[test]
+    fn decide_pc_on_pending_update_checked_against_post_update_set() {
+        let mut updates = ValidatorSetUpdates::new();
+        updates.insert(vk(5), Power::new(1));
+        let (bt, u) = tree_with_pending_update(&updates);
+        let s_old = bt.committed_validator_set().unwrap();
+        let mut s_new = s_old.clone();
+        s_new.apply_updates(&updates);
+
+        assert!(
+            decide_pc(u, 5, &s_new, &[1, 2, 3, 5])
+                .is_correct(&bt)
+                .unwrap(),
+            "a Decide PC of the post-update set on a Pending U must pass"
+        );
+        assert!(
+            !decide_pc(u, 5, &s_old, &[1, 2, 3]).is_correct(&bt).unwrap(),
+            "a Decide PC laid out for the pre-update set must fail"
+        );
+    }
+
+    /// T7b (safety guard on A2): the chain U -> child carries no old-set signature on U. U* adds a
+    /// fresh key n9 with power 100, a quorum of `S_old ⊕ U*` alone (100 of 104). A Decide PC signed
+    /// by n9 alone is correctly signed for that set but proves nothing about U*: no old-set member
+    /// signed it, so nothing shows the old set committed U* (a Byzantine sync server can build U*
+    /// on any committed tip). It must fail.
+    #[test]
+    fn decide_pc_on_pending_update_needs_an_old_set_signer() {
+        let mut updates = ValidatorSetUpdates::new();
+        updates.insert(vk(9), Power::new(100));
+        let (bt, u) = tree_with_pending_update(&updates);
+        let mut s_new = bt.committed_validator_set().unwrap();
+        s_new.apply_updates(&updates);
+
+        assert!(
+            decide_pc(u, 5, &s_new, &[9]).is_correctly_signed(&s_new),
+            "fixture: n9 alone is a quorum of the post-update set"
+        );
+        assert!(
+            !decide_pc(u, 5, &s_new, &[9]).is_correct(&bt).unwrap(),
+            "a Decide PC no pre-update member signed must fail"
+        );
+        assert!(
+            !decide_pc(u, 5, &s_new, &[1, 9]).is_correct(&bt).unwrap(),
+            "old power 1 of 4 does not exceed the old set's fault bound (4 - 3 = 1): fail"
+        );
+    }
+}
