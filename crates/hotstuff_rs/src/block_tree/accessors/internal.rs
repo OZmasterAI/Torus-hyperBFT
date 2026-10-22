@@ -56,6 +56,7 @@ use crate::{
 use super::super::{
     invariants,
     pluggables::{KVGetError, KVStore, Key, WriteBatch},
+    update_records::{validator_set_update_record_key, ValidatorSetUpdateRecord},
     variables::{self, concat},
 };
 
@@ -1074,6 +1075,13 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         Ok(self.0.highest_tc()?)
     }
 
+    pub fn validator_set_update_record(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<ValidatorSetUpdateRecord>, BlockTreeError> {
+        Ok(self.0.validator_set_update_record(height)?)
+    }
+
     pub fn validator_set_state(&self) -> Result<ValidatorSetState, BlockTreeError> {
         Ok(self.0.validator_set_state()?)
     }
@@ -1582,6 +1590,29 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
                     key: Key::ValidatorSetUpdateHeight,
                     source: err,
                 })?,
+        );
+        Ok(())
+    }
+
+    /* ↓↓↓ Validator Set Update Records ↓↓↓ */
+    /// s138 option 1: store `commit_pc`, the Commit PC on the updating block U at `height`, with
+    /// U's `updates` (see [`update_records`](crate::block_tree::update_records)).
+    pub fn set_validator_set_update_record(
+        &mut self,
+        height: BlockHeight,
+        updates: &ValidatorSetUpdates,
+        commit_pc: &PhaseCertificate,
+    ) -> Result<(), BlockTreeError> {
+        let record = ValidatorSetUpdateRecord {
+            updates: updates.into(),
+            commit_pc: commit_pc.clone(),
+        };
+        let _: () = self.0.set(
+            &validator_set_update_record_key(height),
+            &record.try_to_vec().map_err(|err| KVSetError::SerializeValueError {
+                key: Key::ValidatorSetUpdateRecord { height },
+                source: err,
+            })?,
         );
         Ok(())
     }

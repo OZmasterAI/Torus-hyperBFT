@@ -18,7 +18,10 @@ use crate::{
     },
 };
 
-use super::variables::{self, concat};
+use super::{
+    update_records::{validator_set_update_record_key, ValidatorSetUpdateRecord},
+    variables::{self, concat},
+};
 
 pub trait KVStore: KVGet + Clone + Send + 'static {
     type WriteBatch: WriteBatch;
@@ -412,6 +415,25 @@ pub trait KVGet {
         }
     }
 
+    /* ↓↓↓ Validator Set Update Records ↓↓↓ */
+
+    /// The [`ValidatorSetUpdateRecord`] of the validator-set update committed at `height`, if this
+    /// replica committed it on its Commit PC (s138 option 1).
+    fn validator_set_update_record(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<ValidatorSetUpdateRecord>, KVGetError> {
+        match self.get(&validator_set_update_record_key(height)) {
+            Some(bytes) => ValidatorSetUpdateRecord::deserialize(&mut &*bytes)
+                .map(Some)
+                .map_err(|err| KVGetError::DeserializeValueError {
+                    key: Key::ValidatorSetUpdateRecord { height },
+                    source: err,
+                }),
+            None => Ok(None),
+        }
+    }
+
     /* ↓↓↓ Consensus DB Format ↓↓↓ */
 
     /// The [`CONSENSUS_DB_FORMAT`](variables::CONSENSUS_DB_FORMAT) of this store; `None` for a store
@@ -514,6 +536,7 @@ pub enum Key {
     HighestViewPhaseVoted,
     ValidatorSetUpdateView,
     ConsensusDbFormat,
+    ValidatorSetUpdateRecord { height: BlockHeight },
 }
 
 impl Display for Key {
@@ -546,6 +569,9 @@ impl Display for Key {
             Key::HighestViewPhaseVoted => write!(f, "Highest View Phase-Voted"),
             Key::ValidatorSetUpdateView => write!(f, "Validator Set Update View"),
             Key::ConsensusDbFormat => write!(f, "Consensus DB Format"),
+            Key::ValidatorSetUpdateRecord { height } => {
+                write!(f, "Validator Set Update Record at height {}", height.int())
+            }
         }
     }
 }

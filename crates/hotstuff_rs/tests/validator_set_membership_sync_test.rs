@@ -17,7 +17,14 @@
 //! | T4 | add 1 to 4; the joiner cut off through the window | RED (D2) |
 //! | T5 | add 1 to 4; a fresh node started from genesis after the decide | RED (D2) |
 //! | T6a | power 1 -> 2 for one of 4; a member deaf from U's Precommit-PC nudge on | GREEN |
-//! | T6b | power 1 -> 10 for one of 4; same; the Decide PC holds no old-set quorum | RED (ignored: needs U's Commit PC) |
+//! | T6b | power 1 -> 10 for one of 4; same; the Decide PC holds no old-set quorum | RED (needs U's Commit PC: option 1) |
+//! | T11 | disjoint replacement {n0..n3} -> {n4, n5}; an old member deaf from U's Precommit-PC nudge on | RED (option 1) |
+//! | T12 | same replacement; a fresh node started from genesis after the decide, old nodes running | RED (option 1) |
+//! | T13 | add n4 with power 7 to 4 x 1; n1/n2 Decide votes dropped, so the Decide PC is {n0, n4} (old power 1 = the old fault bound) | RED (option 1) |
+//!
+//! s138 option 1 (docs/plans/vset-membership-sync-remainder.md): a replica that commits U on U's
+//! Commit PC stores the PC, and its block-sync server ends a batch at U with that PC as the
+//! terminal PC, so T6b, T11-T13 cross U on the old set's own certificate.
 //!
 //! A laggard that is an old-set member stays in the window until it has voted Commit (its votes
 //! still leave once it is deaf). A dead old-set member in the window can livelock the window on
@@ -132,6 +139,23 @@ impl Cluster {
                 target,
                 Power::new(power),
             ));
+    }
+
+    /// One update, submitted to `via` as one batch: the validators `remove` leave, `add` (index,
+    /// power) join.
+    fn replace_validators(&mut self, via: usize, remove: &[usize], add: &[(usize, u64)]) {
+        let mut txns: Vec<NumberAppTransaction> = add
+            .iter()
+            .map(|&(i, power)| {
+                NumberAppTransaction::SetValidator(self.vk(i).to_bytes(), Power::new(power))
+            })
+            .collect();
+        txns.extend(
+            remove
+                .iter()
+                .map(|&i| NumberAppTransaction::DeleteValidator(self.vk(i).to_bytes())),
+        );
+        self.node_mut(via).submit_transactions(txns);
     }
 
     fn delete_validator(&mut self, via: usize, target: usize) {
@@ -456,11 +480,10 @@ fn laggard_crosses_a_small_power_change() {
 /// 4), and no more than the old set's fault bound (1). n0 cannot tell from the chain that the old
 /// set committed U.
 ///
-/// Stays RED with the s138 fix: n3 alone may be the old set's one tolerated fault, and the chain
+/// Stays RED with the s138 D2 fix: n3 alone may be the old set's one tolerated fault, and the chain
 /// carries no old-set signature on U, so n0 cannot tell U from a U* n3 built for itself. Crossing
-/// needs U's Commit PC served to n0 (persisted by servers: a DB and protocol change).
+/// needs U's Commit PC served to n0 (option 1: stored by the servers that committed U on it).
 #[test]
-#[ignore = "needs U's Commit PC (format change): Decide PC signed only by a member holding the old fault bound"]
 fn laggard_crosses_a_large_power_change() {
     let mut cluster = Cluster::new(4, &[(0, 1), (1, 1), (2, 1), (3, 1)]);
     for i in 0..4 {
@@ -491,6 +514,110 @@ fn laggard_crosses_a_large_power_change() {
     cluster.filter.heal();
     log_with_context(None, "T6b: n0 reconnected.");
     cluster.wait_caught_up(0, 4, 3, Some(10), target);
+}
+
+/// T11 `laggard_crosses_a_disjoint_replacement`: one update replaces {n0..n3} by {n4, n5}; n3 goes
+/// deaf at U's Precommit-PC nudge (holds U, votes Commit, never learns the Commit PC). U's Decide PC
+/// is signed by n4 and n5 only, which hold no old power, so the Decide rule cannot carry n3 across.
+/// Reconnected, n3 must commit U on the Commit PC a sync server stored, and catch up.
+#[test]
+fn laggard_crosses_a_disjoint_replacement() {
+    let mut cluster = Cluster::new(6, &[(0, 1), (1, 1), (2, 1), (3, 1)]);
+    for i in 0..6 {
+        cluster.start(i);
+    }
+    cluster.wait_height(&[0, 1, 2, 3, 4, 5], 2);
+
+    let deaf = Arc::new(AtomicBool::new(false));
+    cluster.filter.rewrite(deaf_after_precommit_nudge(
+        cluster.vk(3),
+        deaf.clone(),
+        |_, _| false,
+    ));
+    log_with_context(
+        None,
+        "T11: replacing {n0..n3} by {n4, n5}; n3 goes deaf at U's Precommit-PC nudge.",
+    );
+    cluster.replace_validators(0, &[0, 1, 2, 3], &[(4, 1), (5, 1)]);
+    let target = cluster.wait_applied(&[0, 1, 2, 4, 5], 2, 4, Some(1));
+    assert!(
+        deaf.load(Ordering::Relaxed),
+        "n3 must have received U's Precommit-PC nudge"
+    );
+    assert!(
+        cluster.has_set(3, 4, 4, None),
+        "n3 must not have committed U while deaf"
+    );
+
+    cluster.filter.heal();
+    log_with_context(None, "T11: n3 reconnected.");
+    cluster.wait_caught_up(3, 2, 4, Some(1), target);
+}
+
+/// T12 `fresh_node_syncs_across_a_disjoint_replacement`: after {n0..n3} -> {n4, n5} is decided, n6
+/// (never a validator) starts from genesis. The old nodes keep running (they are its only
+/// admissible sync servers until it commits U). It must cross U on U's stored Commit PC and sync to
+/// the tip.
+#[test]
+fn fresh_node_syncs_across_a_disjoint_replacement() {
+    let mut cluster = Cluster::new(7, &[(0, 1), (1, 1), (2, 1), (3, 1)]);
+    for i in 0..6 {
+        cluster.start(i);
+    }
+    // n6 is not running yet: keep its inbox empty.
+    cluster.filter.rewrite(cut_off(vec![cluster.vk(6)]));
+    cluster.wait_height(&[0, 1, 2, 3, 4, 5], 2);
+
+    log_with_context(None, "T12: replacing {n0..n3} by {n4, n5}.");
+    cluster.replace_validators(0, &[0, 1, 2, 3], &[(4, 1), (5, 1)]);
+    let target = cluster.wait_applied(&[0, 1, 2, 3, 4, 5], 2, 4, Some(1));
+
+    cluster.filter.heal();
+    cluster.start(6);
+    log_with_context(None, "T12: n6 started from genesis.");
+    cluster.wait_caught_up(6, 2, 4, Some(1), target);
+}
+
+/// T13 `laggard_crosses_an_unlucky_decide_quorum` (case B'): n4 joins 4 x 1 with power 7 (new
+/// quorum 8 of 11). Most Decide quorums hold more than the old fault bound (1) of old power, e.g.
+/// {n4, n0, n1}; {n4, n0} does not, and the collector forms the PC from the first quorum to arrive.
+/// That quorum is forced here by dropping n1's and n2's Decide votes. n3 goes deaf at U's
+/// Precommit-PC nudge; reconnected, it must cross U on the stored Commit PC.
+#[test]
+fn laggard_crosses_an_unlucky_decide_quorum() {
+    let mut cluster = Cluster::new(5, &[(0, 1), (1, 1), (2, 1), (3, 1)]);
+    for i in 0..5 {
+        cluster.start(i);
+    }
+    cluster.wait_height(&[0, 1, 2, 3, 4], 2);
+
+    let quiet: HashSet<VerifyingKey> = [cluster.vk(1), cluster.vk(2)].into_iter().collect();
+    let deaf = Arc::new(AtomicBool::new(false));
+    cluster.filter.rewrite(deaf_after_precommit_nudge(
+        cluster.vk(3),
+        deaf.clone(),
+        move |sender, message| {
+            quiet.contains(sender) && matches!(phase_vote(message), Some((_, Phase::Decide)))
+        },
+    ));
+    log_with_context(
+        None,
+        "T13: adding n4 (power 7); n3 deaf at U's Precommit-PC nudge; n1/n2 Decide votes dropped.",
+    );
+    cluster.set_validator(0, 4, 7);
+    let target = cluster.wait_applied(&[0, 1, 2, 4], 5, 4, Some(7));
+    assert!(
+        deaf.load(Ordering::Relaxed),
+        "n3 must have received U's Precommit-PC nudge"
+    );
+    assert!(
+        cluster.has_set(3, 4, 4, None),
+        "n3 must not have committed U while deaf"
+    );
+
+    cluster.filter.heal();
+    log_with_context(None, "T13: n3 reconnected.");
+    cluster.wait_caught_up(3, 5, 4, Some(7), target);
 }
 
 /// T10 `removal_and_equal_add_complete_with_joiners_silent`: removing n3 from four completes; then

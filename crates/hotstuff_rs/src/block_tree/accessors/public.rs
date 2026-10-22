@@ -11,7 +11,10 @@ use crate::{
     },
 };
 
-use super::super::pluggables::{KVGet, KVStore};
+use super::super::{
+    pluggables::{KVGet, KVStore},
+    update_records::ValidatorSetUpdateRecord,
+};
 
 use super::internal::BlockTreeError;
 
@@ -38,6 +41,20 @@ impl<S: KVGet> BlockTreeSnapshot<S> {
     }
 
     /* ↓↓↓ Used for syncing ↓↓↓ */
+
+    /// The blocks and the terminal PC of a block-sync response for a request from `height` with
+    /// `limit`: [`blocks_from_height_to_newest`](Self::blocks_from_height_to_newest) and the
+    /// highest PC.
+    ///
+    /// s138 option 1 (docs/plans/vset-membership-sync-remainder.md): TODO (RED skeleton).
+    pub(crate) fn sync_response(
+        &self,
+        height: BlockHeight,
+        limit: u32,
+    ) -> Result<(Vec<Block>, PhaseCertificate), BlockTreeError> {
+        let blocks = self.blocks_from_height_to_newest(height, limit)?;
+        Ok((blocks, self.0.highest_pc()?))
+    }
 
     /// Get a chain of blocks starting from the specified tail block and going towards the newest block,
     /// up until the limit.
@@ -266,6 +283,15 @@ impl<S: KVGet> BlockTreeSnapshot<S> {
 
     pub fn validator_set_update_block_height(&self) -> Result<Option<BlockHeight>, BlockTreeError> {
         Ok(self.0.validator_set_update_block_height()?)
+    }
+
+    /// s138 option 1: the record of the validator-set update committed at `height`, if this replica
+    /// committed it on its Commit PC.
+    pub fn validator_set_update_record(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<ValidatorSetUpdateRecord>, BlockTreeError> {
+        Ok(self.0.validator_set_update_record(height)?)
     }
 
     pub fn validator_set_update_complete(&self) -> Result<bool, BlockTreeError> {
