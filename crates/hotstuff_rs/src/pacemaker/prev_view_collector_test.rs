@@ -447,9 +447,9 @@ fn own_timeout_vote_reports_a_valid_tip() {
 // TC phase C review (docs/plans/tc-required-and-tip-signing.md §4): the
 // validator-set update window. The previous set is the seed validators 1..4,
 // the committed set replaces 4 by 5; the local replica is 4 (previous set
-// only). While the update is undecided, a view's one fresh proposer is the
-// previous set's leader up to the update view and the committed set's after
-// it (`ValidatorSetState::fresh_proposer_set`).
+// only). A view's one fresh proposer is the previous set's leader up to the
+// update view and the committed set's after it, decided or not (s136;
+// `ValidatorSetState::fresh_proposer_set`).
 //
 // RED-first: on the review skeleton (92105bb2) both tests fail: F4 collects
 // the vote carrying X, and the timeout blames the committed set's leader.

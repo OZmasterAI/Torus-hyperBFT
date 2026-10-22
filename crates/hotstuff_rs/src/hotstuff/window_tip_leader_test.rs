@@ -8,10 +8,11 @@
 //! first tip at the highest view and `summaries_are_signed` accepts any signed tip there, so TC(v)
 //! could name X and drop B.
 //!
-//! The fix names one fresh proposer per view (`ValidatorSetState::fresh_proposer_set`): while the
-//! update is undecided, the PVS leader for views up to the update view (recorded when the updating
-//! block is committed) and the CVS leader after it; once decided, the CVS leader. F2, the vote on a
-//! fresh proposal, and the leader's own fresh proposals all use it.
+//! The fix names one fresh proposer per view (`ValidatorSetState::fresh_proposer_set`): the PVS
+//! leader for views up to the update view (recorded when the updating block is committed) and the
+//! CVS leader after it, whether or not the update is decided (s136; the s134 rule switched to the
+//! CVS leader once decided). F2, the vote on a fresh proposal, and the leader's own fresh proposals
+//! all use it.
 //!
 //! Also here: the three other committed-set-only leader checks (NE reply, timeout blame; the justify
 //! fetch target is left as a hint), and the full path's drop of a proposal for another view.
