@@ -599,7 +599,9 @@ mod tests {
     #[test]
     fn step_settles_once_per_interval_into_the_index() {
         let p = params();
-        let mut row = step(None, 1_000, &p, Some(fp(100)), sample_impact).row;
+        // Activation on an interval boundary: every interval is whole (the
+        // first-interval pro-rating has its own test).
+        let mut row = step(None, 0, &p, Some(fp(100)), sample_impact).row;
         row = step(Some(row), 2_000, &p, Some(fp(100)), sample_impact).row;
         assert_eq!(row.samples, 2);
         // avg +1%: F8 = 1% − 0.05%, hourly = 0.95% / 8.
@@ -628,6 +630,42 @@ mod tests {
         // An interval without samples settles at rate 0.
         let empty = step(Some(FundingRow::new(0, &p)), 3_600, &p, None, sample_impact);
         assert_eq!((empty.settled, empty.row.cum_index), (Some(0), 0));
+    }
+
+    /// Owner s138 (option B): the interval containing the activation pays
+    /// `rate × (interval end − activation) / interval`, so a market activated
+    /// late in an interval does not pay a whole interval for a fraction of
+    /// it. Later intervals are whole. RED before: the first interval paid the
+    /// whole rate.
+    #[test]
+    fn step_pro_rates_the_first_interval_after_activation() {
+        let p = params();
+        let full = rate_e18(E18 / 100, &p);
+        let first = full * 2_600 / 3_600; // truncated toward zero
+        assert_ne!(first, full);
+        // Activation at 1000: the interval 0..3600 accrues 2600 s.
+        let mut row = step(None, 1_000, &p, Some(fp(100)), sample_impact).row;
+        row = step(Some(row), 2_000, &p, Some(fp(100)), sample_impact).row;
+        assert_eq!(row.predicted_rate(&p), first, "the prediction is pro-rated too");
+        let s = step(Some(row), 3_600, &p, Some(fp(100)), sample_impact);
+        assert_eq!((s.settled, s.row.last_rate), (Some(first), first));
+        assert_eq!(s.row.cum_index, index_delta(first, fp(100)));
+        // The next interval is whole.
+        let r2 = step(Some(s.row), 3_700, &p, Some(fp(100)), sample_impact).row;
+        assert_eq!(r2.predicted_rate(&p), full);
+        assert_eq!(step(Some(r2), 7_200, &p, Some(fp(100)), sample_impact).settled, Some(full));
+        // A late first settlement (a halt) still pays the activation's share
+        // of one interval.
+        let late = step(Some(row), 20_000, &p, None, sample_impact);
+        assert_eq!(late.settled, Some(first));
+        // Activation on a boundary: whole.
+        let b = step(None, 3_600, &p, Some(fp(100)), sample_impact).row;
+        assert_eq!(step(Some(b), 7_200, &p, Some(fp(100)), sample_impact).settled, Some(full));
+        // A negative rate is pro-rated toward zero as well.
+        let neg = |ts| step(None, ts, &p, Some(fp(100)), || (Some(fp(97)), Some(fp(98)))).row;
+        let full_neg = rate_e18(-2 * E18 / 100, &p);
+        assert!(full_neg < 0);
+        assert_eq!(step(Some(neg(2_700)), 3_600, &p, None, sample_impact).settled, Some(full_neg * 900 / 3_600));
     }
 
     #[test]

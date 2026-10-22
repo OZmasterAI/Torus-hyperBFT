@@ -150,8 +150,8 @@ const MODES: [(Mode, bool); 8] = [
 /// 2, so the batch paths settle two markets). The block-start step created
 /// the rows and took one sample on the empty book: premium 0. Block 2 at ts
 /// 3600 settles the first interval at the interest rate (0.01% / 8 h →
-/// 12.5 ppm) × mark 100 = index 1.25e15, so A owes 10 × 0.00125 = 0.0125
-/// and B is owed as much. Block 2: A sells 4 @ 100 to C (closing at its
+/// 12.5 ppm), pro-rated to the 2600 s since activation (owner s138), × mark
+/// 100, so A owes 10 × that and B is owed as much. Block 2: A sells 4 @ 100 to C (closing at its
 /// entry: trade PnL 0). A pays exactly 0.0125 in cash, its entry index moves
 /// to the index; B (untouched) keeps it pending; C opens at the index.
 /// RED before the funding engine: no rows, nothing paid.
@@ -193,8 +193,13 @@ fn a_fill_settles_the_positions_funding_in_cash_in_every_settle_path() {
         set_mark(&ctx.state, 2, fp(100), 3_600);
         let _ = NativeExecutor::begin_block_oracle(&mut ctx);
         let idx = row_of(&ctx.state, 1).unwrap().cum_index;
-        assert_eq!(idx, E18 / 800, "{label}: 12.5 ppm × 100 = 0.00125 per unit");
-        assert_eq!(position(&ctx.state, &b, 1).unwrap().funding_owed(Some(idx)), -FixedPoint::from_raw(1_250_000));
+        // Owner s138: the first interval after activation (ts 1000) is
+        // pro-rated, 2600 of its 3600 s.
+        let first = funding::rate_e18(0, &FundingParams::default()) * 2_600 / 3_600;
+        assert_eq!(idx, funding::index_delta(first, fp(100)), "{label}: 12.5 ppm × 2600/3600 × 100 per unit");
+        assert_ne!(idx, E18 / 800, "{label}: not the whole interval");
+        let b_owed = funding::owed(false, fp(10), 0, idx);
+        assert_eq!(position(&ctx.state, &b, 1).unwrap().funding_owed(Some(idx)), b_owed);
         let r = exec(
             &mut ctx,
             &[
@@ -210,7 +215,7 @@ fn a_fill_settles_the_positions_funding_in_cash_in_every_settle_path() {
         assert!(ctx.fatal_error.is_none(), "{label}: {:?}", ctx.fatal_error);
         ctx.save_order_books();
         drop(ctx);
-        let paid = FixedPoint::from_raw(1_250_000); // 0.0125
+        let paid = funding::owed(true, fp(10), 0, idx); // ≈ 0.0090278, rounded up
         assert_eq!(cash(&db, &a), a_cash - paid, "{label}: A paid its funding in cash");
         let pa = position(&db, &a, 1).unwrap();
         assert_eq!(pa.size, fp(6), "{label}");
@@ -218,7 +223,7 @@ fn a_fill_settles_the_positions_funding_in_cash_in_every_settle_path() {
         assert_eq!(pa.entry_price, fp(100), "{label}: entry price untouched by funding");
         let pb = position(&db, &b, 1).unwrap();
         assert_eq!(pb.funding.map(|f| f.entry_index), Some(0), "{label}: B untouched");
-        assert_eq!(pb.funding_since_open(Some(idx)), -paid, "{label}: B's receipt is pending");
+        assert_eq!(pb.funding_since_open(Some(idx)), b_owed, "{label}: B's receipt is pending");
         let pc = position(&db, &c, 1).unwrap();
         assert_eq!(pc.funding.map(|f| (f.entry_index, f.paid)), Some((idx, FixedPoint::ZERO)), "{label}");
     }
