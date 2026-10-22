@@ -788,7 +788,8 @@ fn delist_grace_param_change_is_range_checked_and_executes_into_fee_config() {
 #[test]
 fn trading_fee_param_changes_are_range_checked_and_execute_into_fee_config() {
     use torus_types::trading_fees::{MAKER_FEE_PARAM, TAKER_FEE_PARAM};
-    let (_dir, gov, staking) = setup();
+    let (_dir, mut gov, staking) = setup();
+    gov.set_fee_keys(true);
     let validator = setup_validator(&staking, 1);
     setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
     let refused: [(&str, &[&str]); 2] = [
@@ -817,6 +818,49 @@ fn trading_fee_param_changes_are_range_checked_and_execute_into_fee_config() {
         let data = gov.state().get_cf_raw(CF_FEE_CONFIG, key.as_bytes()).unwrap().unwrap();
         assert_eq!(data, value.as_bytes(), "{key}");
     }
+}
+
+/// Codex s138 #1: the fee keys follow the executed block's `trading_fees`
+/// bit (the executor sets it, as for the funding keys). Off (the default):
+/// refused at submission exactly as before the feature, and a proposal that
+/// reaches execution while off writes nothing.
+#[test]
+fn trading_fee_keys_are_refused_while_the_feature_is_off() {
+    use torus_types::trading_fees::{MAKER_FEE_PARAM, TAKER_FEE_PARAM};
+    let (_dir, mut gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    for key in [TAKER_FEE_PARAM, MAKER_FEE_PARAM] {
+        let payload = ExecutionPayload::ParameterChange {
+            param_key: key.into(),
+            new_value: "100".into(),
+        };
+        let r = gov.submit_proposal(addr(2), "P".into(), "D".into(), Some(payload), 0);
+        assert!(
+            matches!(&r, Err(EconomicsError::ParameterNotModifiable(k)) if k == key),
+            "{key}: {r:?}"
+        );
+    }
+    // Submitted while on, executed while off: refused, no row.
+    gov.set_fee_keys(true);
+    let payload = ExecutionPayload::ParameterChange {
+        param_key: TAKER_FEE_PARAM.into(),
+        new_value: "100".into(),
+    };
+    let id = gov
+        .submit_proposal(addr(2), "P".into(), "D".into(), Some(payload), 0)
+        .unwrap();
+    gov.cast_vote(addr(2), id, true, 1).unwrap();
+    let end = gov.get_proposal(id).unwrap().unwrap().end_block;
+    assert_eq!(gov.finalize_proposal(id, end + 1).unwrap(), ProposalOutcome::Passed(id));
+    gov.set_fee_keys(false);
+    let after = gov.get_proposal(id).unwrap().unwrap().executable_after;
+    let r = gov.execute_proposal(id, after);
+    assert!(
+        matches!(&r, Err(EconomicsError::ParameterNotModifiable(k)) if k == TAKER_FEE_PARAM),
+        "{r:?}"
+    );
+    assert_eq!(gov.state().get_cf_raw(CF_FEE_CONFIG, TAKER_FEE_PARAM.as_bytes()).unwrap(), None);
 }
 
 #[test]

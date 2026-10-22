@@ -404,3 +404,240 @@ fn fees_are_conserved_to_the_raw_unit() {
     assert_eq!(paid, treasury, "debits == treasury credit");
     assert_eq!(rows, treasury, "cfee rows sum to the treasury credit");
 }
+
+// ---- Codex s138 #2: an unpaid fee on a flat account ----
+
+const VAULT: Address = torus_core::liquidation::LIQUIDATOR_VAULT;
+
+fn collateral(ctx: &NativeExecContext, a: &Address) -> i128 {
+    let b = ctx.positions.get_native_balance(a).unwrap();
+    b.available.raw() + b.order_margin.raw()
+}
+
+/// Every native balance the scenario touches (traders, treasury, vault).
+fn total_collateral(ctx: &NativeExecContext) -> i128 {
+    let mut all: Vec<Address> = (1..=32u8).map(addr).collect();
+    all.extend([addr(TREASURY), VAULT]);
+    all.iter().map(|a| collateral(ctx, a)).sum()
+}
+
+/// How the closing block runs.
+#[derive(Clone, Copy, Debug)]
+enum CloseRun {
+    Batch(Path),
+    Single,
+}
+
+fn exec_on(ctx: &mut NativeExecContext, batch: &[(Address, NativeAction)], run: CloseRun) {
+    match run {
+        CloseRun::Batch(Path::Serial) => {
+            NativeExecutor::execute_batch_engine_mode(ctx, batch, 0);
+        }
+        CloseRun::Batch(Path::ParallelSettle) => {
+            with_settle_streamed(false, || {
+                NativeExecutor::execute_batch_settle_workers(ctx, batch, true, Some(3))
+            });
+        }
+        CloseRun::Batch(Path::Engine) => {
+            with_settle_streamed(false, || NativeExecutor::execute_batch_engine_mode(ctx, batch, 4));
+        }
+        CloseRun::Batch(Path::EngineStreamed) => {
+            with_settle_streamed(true, || NativeExecutor::execute_batch_engine_mode(ctx, batch, 4));
+        }
+        CloseRun::Single => {
+            for (who, a) in batch {
+                NativeExecutor::execute(ctx, who, a);
+            }
+        }
+    }
+    assert!(ctx.fatal_error.is_none(), "{run:?}: {:?}", ctx.fatal_error);
+}
+
+/// Trader 2 opens long 10 @ 100 against 1, is left with 0.10 cash, then
+/// closes all 10 @ `close_px` as the taker against 3 (maker), with the
+/// default rates. A filler pair (4 / 5) trades on market 2 in the same
+/// block so the parallel paths have two markets. Returns the context after
+/// the closing block and the total collateral before it.
+fn flat_close(close_px: i64, run: CloseRun) -> (tempfile::TempDir, StateDb, NativeExecContext, i128) {
+    let (dir, db) = open_test_db();
+    let mut ctx = make_ctx(db.clone(), true);
+    run_serial(&mut ctx, &[place(1, 1, false, 100, 10), place(2, 1, true, 100, 10)]);
+    let mut bal = ctx.positions.get_native_balance(&addr(2)).unwrap();
+    bal.available = FixedPoint::from_raw(10 * S / 100);
+    bal.order_margin = FixedPoint::ZERO;
+    ctx.positions.put_native_balance(&addr(2), &bal).unwrap();
+    let before = total_collateral(&ctx);
+    exec_on(
+        &mut ctx,
+        &[
+            place(3, 1, true, close_px, 10),
+            place(4, 2, false, 50, 4),
+            place(2, 1, false, close_px, 10),
+            place(5, 2, true, 50, 4),
+        ],
+        run,
+    );
+    assert!(
+        ctx.positions.positions_for_trader(&addr(2)).unwrap().is_empty(),
+        "{run:?}: trader 2 is flat"
+    );
+    (dir, db, ctx, before)
+}
+
+fn all_runs() -> [CloseRun; 5] {
+    [
+        CloseRun::Batch(Path::Serial),
+        CloseRun::Batch(Path::ParallelSettle),
+        CloseRun::Batch(Path::Engine),
+        CloseRun::Batch(Path::EngineStreamed),
+        CloseRun::Single,
+    ]
+}
+
+/// The close realizes no PnL; the 0.45 taker fee exceeds the 0.10 cash.
+/// The flat trader pays what it holds (0.10) and ends at exactly zero; the
+/// unpaid 0.35 is never credited (treasury and `cfee` take only what was
+/// paid), and no collateral appears or disappears. RED before: available
+/// -0.35 on an account no liquidation scan visits, treasury +0.45.
+#[test]
+fn a_flat_trader_pays_at_most_its_cash_and_the_treasury_only_what_was_paid() {
+    let mut first: Option<(Dump, B256)> = None;
+    for run in all_runs() {
+        let (_d, db, ctx, before) = flat_close(100, run);
+        assert_eq!(collateral(&ctx, &addr(2)), 0, "{run:?}: flat at zero, not negative");
+        // Block 1: 0.45 + 0.15; block 2: 2 paid 0.10, maker 3 0.15, market 2
+        // (notional 200): 4 maker 0.03, 5 taker 0.09.
+        let want = (45 + 15 + 10 + 15 + 3 + 9) * S / 100;
+        assert_eq!(available(&ctx, TREASURY), want, "{run:?}: treasury");
+        assert_eq!(cum_fee(&db, 2), Some(55 * S / 100), "{run:?}: cfee = paid");
+        assert_eq!(collateral(&ctx, &VAULT), 0, "{run:?}: nothing for the vault");
+        assert_eq!(total_collateral(&ctx), before, "{run:?}: conserved");
+        let state = (dump(&db), compute_native_state_root(&db).unwrap());
+        if let CloseRun::Batch(_) = run {
+            match &first {
+                None => first = Some(state),
+                Some(f) => {
+                    assert_eq!(state.1, f.1, "{run:?}: state root");
+                    assert!(state.0 == f.0, "{run:?}: state dump differs");
+                }
+            }
+        }
+    }
+}
+
+/// The close realizes a 100 loss on 0.10 cash: the whole fee (0.405) is
+/// unpaid (not credited), and the remaining deficit (-99.90) moves to the
+/// liquidator vault as every flat deficit does (D9 `settle_flat_deficit`).
+#[test]
+fn a_flat_loss_deficit_moves_to_the_vault_and_its_fee_is_not_credited() {
+    let mut first: Option<(Dump, B256)> = None;
+    for run in all_runs() {
+        let (_d, db, ctx, before) = flat_close(90, run);
+        assert_eq!(collateral(&ctx, &addr(2)), 0, "{run:?}");
+        assert_eq!(collateral(&ctx, &VAULT), -9_990 * S / 100, "{run:?}: vault carries the loss");
+        // Block 1: 0.60; block 2: maker 3 pays 0.135 (900 @ 150 ppm), market 2 0.12.
+        let want = 60 * S / 100 + 135 * S / 1000 + 12 * S / 100;
+        assert_eq!(available(&ctx, TREASURY), want, "{run:?}: treasury");
+        assert_eq!(cum_fee(&db, 2), Some(45 * S / 100), "{run:?}: nothing paid on the close");
+        // The realized 100 left the cash pool (trader 1's short holds it as
+        // unrealized gain); fees and the deficit move moved cash only.
+        assert_eq!(total_collateral(&ctx), before - 100 * S, "{run:?}: conserved");
+        let state = (dump(&db), compute_native_state_root(&db).unwrap());
+        if let CloseRun::Batch(_) = run {
+            match &first {
+                None => first = Some(state),
+                Some(f) => {
+                    assert_eq!(state.1, f.1, "{run:?}: state root");
+                    assert!(state.0 == f.0, "{run:?}: state dump differs");
+                }
+            }
+        }
+    }
+}
+
+// ---- Codex s138 #1: the fee keys follow the feature bit ----
+
+fn wei(tokens: u64) -> alloy_primitives::U256 {
+    alloy_primitives::U256::from(tokens)
+        * alloy_primitives::U256::from(10u64).pow(alloy_primitives::U256::from(18u64))
+}
+
+/// Governance with a 10-block timelock and a proposer (2) with stake.
+fn governance_db() -> (tempfile::TempDir, StateDb) {
+    use revm::state::AccountInfo;
+    use torus_economics::governance::GovernanceParams;
+    let (d, db) = open_test_db();
+    let ctx = make_ctx(db.clone(), false);
+    ctx.governance
+        .set_governance_params(&GovernanceParams {
+            voting_period_blocks: 100,
+            quorum_bps: 3300,
+            min_proposal_stake: wei(100),
+            permanent_weight_multiplier_num: 3,
+            permanent_weight_multiplier_den: 2,
+            treasury_address: addr(TREASURY),
+            timelock_blocks: 10,
+            permanent_unlock_threshold_bps: 8000,
+        })
+        .unwrap();
+    let val = addr(1);
+    let min = torus_economics::MIN_SELF_DELEGATION;
+    db.put_account(&val, &AccountInfo { balance: min, ..Default::default() }).unwrap();
+    ctx.staking.register_validator(val, [1; 32], 500, min).unwrap();
+    db.put_account(&addr(2), &AccountInfo { balance: wei(500), ..Default::default() })
+        .unwrap();
+    ctx.staking.delegate(addr(2), val, wei(500)).unwrap();
+    (d, db)
+}
+
+fn submit_fee_key(db: &StateDb, fees_on: bool, height: u64, key: &str, value: &str) -> torus_bridge::native_executor::NativeActionResult {
+    let mut ctx = make_ctx(db.clone(), fees_on);
+    ctx.block_height = height;
+    let action = NativeAction::SubmitProposal(torus_types::Proposal {
+        title: "fees".into(),
+        description: "fees".into(),
+        action: torus_types::ProposalAction::ParameterChange { key: key.into(), value: value.into() },
+    });
+    NativeExecutor::execute(&mut ctx, &addr(2), &action)
+}
+
+/// Bit off: a fee key proposal is refused exactly as before the feature
+/// (`not modifiable`), so no proposal state exists that the base rejects.
+/// Bit on: range-checked, and a passed proposal executed in a fee block
+/// writes the row. A proposal executed in a block without the bit writes
+/// nothing. RED before: accepted with the bit off.
+#[test]
+fn fee_keys_need_the_feature() {
+    let (_d, db) = governance_db();
+    for key in [TAKER_FEE_PARAM, MAKER_FEE_PARAM] {
+        let off = submit_fee_key(&db, false, 3, key, "100");
+        assert!(!off.success);
+        assert!(off.error.as_deref().unwrap_or("").contains("not modifiable"), "{:?}", off.error);
+    }
+    let bad = submit_fee_key(&db, true, 3, TAKER_FEE_PARAM, "10001");
+    assert!(!bad.success && bad.error.as_deref().unwrap_or("").contains("between"), "{:?}", bad.error);
+    let on = submit_fee_key(&db, true, 3, TAKER_FEE_PARAM, "300");
+    assert!(on.success, "{:?}", on.error);
+    let run_governance = |fees_on: bool| {
+        let mut ctx = make_ctx(db.clone(), fees_on);
+        ctx.block_height = 120;
+        ctx.governance.cast_vote(addr(2), 1, true, 10).ok();
+        ctx.governance.finalize_proposal(1, 104).ok();
+        let _ = NativeExecutor::process_governance(&mut ctx);
+        assert!(ctx.fatal_error.is_none());
+    };
+    // Executed in a block without the bit: refused, no row.
+    run_governance(false);
+    assert_eq!(db.get_cf_raw(CF_FEE_CONFIG, TAKER_FEE_PARAM.as_bytes()).unwrap(), None);
+    let on2 = submit_fee_key(&db, true, 130, TAKER_FEE_PARAM, "300");
+    assert!(on2.success, "{:?}", on2.error);
+    let mut ctx = make_ctx(db.clone(), true);
+    ctx.block_height = 250;
+    ctx.governance.cast_vote(addr(2), 2, true, 131).unwrap();
+    ctx.governance.finalize_proposal(2, 231).unwrap();
+    let _ = NativeExecutor::process_governance(&mut ctx);
+    assert!(ctx.fatal_error.is_none());
+    drop(ctx);
+    let stored = db.get_cf_raw(CF_FEE_CONFIG, TAKER_FEE_PARAM.as_bytes()).unwrap();
+    assert_eq!(stored.as_deref(), Some(b"300".as_slice()));
+}
