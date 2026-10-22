@@ -1101,6 +1101,12 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    views per minute, p50 / p99 commit latency, plus the end-of-load cancel-all tail (archy s136 open question).
    ~2-2.5 h (estimate). Doc target: the next results-doc section.
    **Config (s136, batch 10 on main `2d2f3ed9`):** run as the testnet will: hash + attestation + L6.1 + L2.1 + fail-stop on. `gen-weighted-genesis.sh` (needed for 2/2/1 stakes) still defaults the hash OFF, so set `STATE_HASH_ACTIVATION` explicitly ON (hash from block 1; L6.1 follows it for Classic); L2.1 and fail-stop are on by default. Check the startup lines read `on=true`.
+   **Status (s138): standard shape DONE, deep running (`ozarchy-9k2-deep2`). Results: section 125 of
+   `ozarchy-antispam-item6-pf1-2026-10-04.md`.** K / U matched/s: whole cell 145.5k vs 277.3k (-47.5%), post-kill
+   115.9k vs 275.7k (-58.0%). Post-kill blocks/s 1.40 vs 15.86. val1 times out once per val2-led view (42.3 / min).
+   Cancel-all tail: K 4.5k in 6-10 s. Finding: in 5 of 7 K cells a survivor fell back to sync for the other survivor's
+   block body (17-50 s freeze; cause open, 18c). Caveat: the in-flight watcher is val1 in K vs val2 in U, which
+   confounds the pre-kill window.
 9o. **[GO s138: 'before' cells now; 'after' arm on main after batch 12] TC-required phase D: one-down bench, main vs main + TC set.** After the TC set lands (batch 9
    + `fix/tc-liveness`) and after 9k. Same cells as 9k on both binaries, 3 runs each (design
    `docs/plans/tc-required-and-tip-signing.md` section 7): all-up and one-down (stake 2/2/1, stake-1 node killed, no
