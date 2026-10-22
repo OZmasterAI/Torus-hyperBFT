@@ -76,8 +76,12 @@ pub struct Position {
     pub funding: Option<PositionFunding>,
 }
 
-/// Funding engine: a position's lazy-settlement state.
+/// Funding engine: a position's lazy-settlement state. Packed (alignment
+/// 1): `Option<PositionFunding>` is 33 bytes and fits `Position` in 144
+/// bytes (unpacked, the i128 alignment made it 160; every resident position
+/// record pays it, `users_size_of_pins`). Fields are read by value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C, packed)]
 pub struct PositionFunding {
     /// The market's cumulative index this position last settled at
     /// (`crate::funding::INDEX_SCALE`).
@@ -166,7 +170,8 @@ impl BorshSerialize for Position {
         w.write_all(&[self.margin_type as u8])?;
         if let Some(f) = &self.funding {
             w.write_all(&f.entry_index.to_be_bytes())?;
-            borsh_write_fp(&f.paid, w)?;
+            let paid = f.paid;
+            borsh_write_fp(&paid, w)?;
         }
         Ok(())
     }

@@ -555,7 +555,9 @@ fn users_encode_byte_identical_to_rows() {
 fn users_size_of_pins() {
     let (user, position) = (std::mem::size_of::<UserState>(), std::mem::size_of::<Position>());
     println!("USERS size_of UserState {user} Position {position}");
-    assert_eq!(position, 112, "Position");
+    // Funding engine (s138): + the packed `Option<PositionFunding>` (33
+    // bytes): 112 -> 144.
+    assert_eq!(position, 144, "Position");
     assert_eq!(user, 112, "UserState");
 }
 

@@ -69,7 +69,7 @@ fn v3_row_round_trips_and_v2_stays_byte_identical() {
     assert_eq!(v3.encoded_len(), POSITION_V3_LEN);
     assert_eq!(&bytes3[1..POSITION_V2_LEN], &bytes[1..], "v3 = v2 body + funding tail");
     assert_eq!(&bytes3[POSITION_V2_LEN..POSITION_V2_LEN + 16], &f.entry_index.to_be_bytes());
-    assert_eq!(&bytes3[POSITION_V2_LEN + 16..], &f.paid.raw().to_be_bytes());
+    assert_eq!(&bytes3[POSITION_V2_LEN + 16..], &{ f.paid }.raw().to_be_bytes());
     let back = Position::try_from_slice(&bytes3).unwrap();
     assert_eq!(back.funding, Some(f));
     assert_eq!(Position::try_from_slice(&bytes).unwrap().funding, None);

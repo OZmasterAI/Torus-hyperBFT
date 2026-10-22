@@ -6273,7 +6273,7 @@ mod tests {
         assert!(r.active);
         assert_eq!((r.cum_index.as_str(), r.last_rate.as_str()), ("4", "-0.0000125"));
         assert_eq!((r.interval_secs, r.next_funding_time, r.last_funding_time, r.samples), (3_600, 10_800, 7_200, 2));
-        assert_eq!(r.predicted_rate, "0", "no premium summed");
+        assert_eq!(r.predicted_rate, "0.0000125", "zero premium: the interest alone (0.01% / 8)");
         let none: RpcFundingRate = client.request("torus_getFundingRate", jsonrpsee::rpc_params!["0x2"]).await.unwrap();
         assert!(!none.active);
         assert_eq!((none.cum_index.as_str(), none.next_funding_time), ("0", 0));

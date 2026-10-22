@@ -471,7 +471,7 @@ fn assert_funding_happened(out: &RunOut) {
         .iter()
         .filter(|(cf, _, _)| *cf == CF_NATIVE_POSITIONS)
         .filter_map(|(_, _, v)| borsh::from_slice::<Position>(v).ok())
-        .filter(|p| p.funding.is_some_and(|f| f.paid != FixedPoint::ZERO))
+        .filter(|p| p.funding.is_some_and(|f| { f.paid } != FixedPoint::ZERO))
         .count();
     assert!(paid > 0, "some position settled funding on touch");
 }
