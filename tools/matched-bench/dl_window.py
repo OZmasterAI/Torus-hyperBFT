@@ -29,7 +29,9 @@ is false, kill_to_exclusion runs to T1 and post_exclusion is empty (None rates, 
 Per window and survivor: blk_s (torus_block_height), committed_blk_s, matched_s, timeouts_per_min, views_per_min;
 consecutive windows share their boundary sample, as summarize.py's kill_no_restart windows. headline = val0 (never
 the killed node: KILL_NO_RESTART refuses val0). Writes CELL/dl-window.json, sets summary.json .dead_leader (when
-summary.json exists) and prints one line for run.log. Exit 0 with problems (recorded in .problems); 2 = usage or
+summary.json exists) and prints one line for run.log. A survivor whose every sampler.csv row is a failed scrape
+(scrape_valid=0) stays a survivor: its log is still scanned, its rates are None with unavailable=true, and it is
+listed in sampler_unavailable and .problems. Exit 0 with problems (recorded in .problems); 2 = usage or
 no kill record.
 """
 
@@ -131,6 +133,9 @@ def load_rows(path, dead):
             node = r.get("node")
             if ts is None or not node:
                 continue
+            # register the node first: a survivor whose every scrape failed still has its log
+            # scanned (report() finds survivors here) and its rates reported as unavailable
+            rows.setdefault(node, [])
             if num(r.get("scrape_valid")) == 0:
                 # a failed scrape (zero counters) is no sample, on the killed node and on a
                 # survivor alike: kept, a survivor's 10 -> 0 -> 10 reads as a late timeout
@@ -201,6 +206,12 @@ def report(cell, t0, t1, dl_k=None, dl_jcap=None):
     rows = load_rows(os.path.join(cell, "sampler.csv"), dead)
     nodes = sorted(n for n in rows if n != dead)
     problems = []
+    unavailable = [n for n in nodes if not rows[n]]
+    for n in unavailable:
+        problems.append(
+            "%s: no valid sampler.csv scrape (every row scrape_valid=0): its rates, committed "
+            "height and timeouts are unavailable" % n
+        )
     deltas = []
     logs_read = {}
     for n in nodes:
@@ -313,6 +324,10 @@ def report(cell, t0, t1, dl_k=None, dl_jcap=None):
                 samples=0,
                 reason="no exclusion committed inside the load window",
             )
+        if n in unavailable:
+            for v in w.values():
+                v["unavailable"] = True
+                v["reason"] = "no valid sampler.csv scrape on this node (all scrape_valid=0)"
         per_node[n] = w
     timeouts = {
         "last_increment_ts_by_node": {
@@ -328,6 +343,7 @@ def report(cell, t0, t1, dl_k=None, dl_jcap=None):
         "kill_ts": kill_ts,
         "kill_at_s": kill.get("kill_at_s"),
         "survivors": nodes,
+        "sampler_unavailable": unavailable,
         "dl_k": dl_k,
         "dl_jcap": dl_jcap,
         "exclusion": excl,
@@ -435,6 +451,7 @@ def main(argv=None):
                 "headline",
                 "timeouts",
                 "problems",
+                "sampler_unavailable",
             )
         }
         tmp = sp + ".dl.tmp"

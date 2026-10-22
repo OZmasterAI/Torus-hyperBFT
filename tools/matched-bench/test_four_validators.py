@@ -1296,5 +1296,42 @@ class DlWindowFailedScrapeTest(DlWindowTest):
         self.assertEqual(w["matched_s"], 1000.0)
 
 
+    def test_survivor_with_only_failed_scrapes_keeps_its_log_and_identity(self):
+        # val1: every scrape failed; the exclusion delta is logged only by val1
+        p = os.path.join(self.d, "sampler.csv")
+        with open(p) as f:
+            rows = list(csv.reader(f))
+        hdr = rows[0]
+        for r in rows[1:]:
+            if r[1] == "val1":
+                r[2:] = ["0"] * (len(hdr) - 2)
+        with open(p, "w", newline="") as f:
+            csv.writer(f).writerows(rows)
+        self.logs({"val1": [delta_line(self.kill_ts + 15.2, 800)]})
+        d, line = self.run_dl()
+        self.assertEqual(d["survivors"], ["val0", "val1", "val2"])
+        self.assertTrue(d["logs_read"]["val1"])
+        e = d["exclusion"]
+        self.assertTrue(e["found"], e)
+        self.assertEqual((e["boundary_height"], e["delta_node"]), (800, "val1"))
+        self.assertEqual(e["committed_ts"], BENCH_START + 80)  # from val0 / val2
+        self.assertIsNone(e["committed_ts_by_node"]["val1"])
+        # val1's rates are unavailable (None), never zero
+        for wname in ("pre_kill", "kill_to_exclusion", "post_exclusion"):
+            w = d["per_node"]["val1"][wname]
+            for k in ("blk_s", "matched_s", "timeouts_per_min"):
+                self.assertIsNone(w[k], (wname, k))
+            self.assertTrue(w.get("unavailable"), (wname, w))
+        self.assertIsNone(d["timeouts"]["last_increment_ts_by_node"]["val1"])
+        self.assertEqual(d["sampler_unavailable"], ["val1"])
+        self.assertTrue(
+            any("val1" in pr and "scrape_valid" in pr for pr in d["problems"]),
+            d["problems"],
+        )
+        self.assertIn("problems:", line)
+        # val0 (headline) unaffected
+        self.assertEqual(d["headline"]["post_exclusion"]["matched_s"], 1000.0)
+
+
 if __name__ == "__main__":
     unittest.main()
