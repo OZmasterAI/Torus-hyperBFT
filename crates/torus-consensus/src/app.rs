@@ -10812,6 +10812,15 @@ impl App<RocksKVStore> for TorusApp {
         self.check_proposal_data(block, |hash| tree_parent_header(block_tree, hash))
     }
 
+    /// Every block carries exactly one datum, so a datum-less response is
+    /// [`refused_proposal`] (fail-stop, an unknown feature on the parent, an
+    /// epoch plan execution has not applied yet): the leader proposes nothing
+    /// and the view times out. Proposed, two leaders refusing on the same
+    /// parent built the same block and certified it (9k2 deep r4-U, s138).
+    fn refuses_proposal(&self, response: &ProduceBlockResponse) -> bool {
+        response.data.vec().is_empty()
+    }
+
     /// Send committed block to the execution pipeline thread.
     fn on_committed_block(&mut self, block: &Block, _committed_hash: CryptoHash) {
         let _commit_span =
@@ -15675,9 +15684,16 @@ mod crash_recovery_tests {
         assert!(app.epoch_validator_set_updates(4).is_ok(), "boundary 4 needs applied >= 0");
         assert!(app.epoch_validator_set_updates(8).is_err(), "applied 3 < 4");
         let parent7 = make_block(7, vec![]).header;
-        assert!(app.build_proposal(parent7).data.vec().is_empty(), "leader refuses block 8");
+        let refused = app.build_proposal(parent7.clone());
+        assert!(refused.data.vec().is_empty(), "leader refuses block 8");
+        // s138 (9k2 deep r4-U halt): hotstuff must learn it is a refusal, or
+        // it proposes and self-votes the placeholder.
+        assert!(app.refuses_proposal(&refused), "the placeholder is a refusal");
         dispatch_and_execute(&ctx, &db, &blocks[3]);
         assert!(app.epoch_validator_set_updates(8).is_ok(), "applied 4: plan for 8 readable");
+        let built = app.build_proposal(parent7);
+        assert_eq!(built.data.vec().len(), 1, "applied 4: leader builds block 8");
+        assert!(!app.refuses_proposal(&built), "a built block is not a refusal");
         drop(ctx);
     }
 

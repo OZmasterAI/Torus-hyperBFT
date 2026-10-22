@@ -1,7 +1,10 @@
 //! [`NumberApp`], a simple implementation of [`App`] currently used in all of the integration tests.
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::Duration,
 };
@@ -58,6 +61,17 @@ pub(crate) struct NumberApp {
     tx_queue: Arc<Mutex<Vec<QueuedTransaction>>>,
     produce_delay: Duration,
     validate_delay: Duration,
+    refusal: Option<Refusal>,
+}
+
+/// s138 (9k2 deep r4-U halt): while `active` is set, a leader asked for the
+/// block at `height` refuses it with a datum-less placeholder (as TorusApp
+/// refuses an epoch-boundary block its execution is not ready for) and
+/// declares it a refusal ([`App::refuses_proposal`]).
+#[derive(Clone)]
+pub(crate) struct Refusal {
+    pub(crate) height: u64,
+    pub(crate) active: Arc<AtomicBool>,
 }
 
 /// User-sent instructions that number app execute in [`produce_block`](App::produce_block) and
@@ -136,7 +150,15 @@ impl NumberApp {
             tx_queue,
             produce_delay,
             validate_delay,
+            refusal: None,
         }
+    }
+
+    /// s138: refuse the block at `refusal.height` while `refusal.active` is set.
+    #[allow(dead_code)]
+    pub(crate) fn with_refusal(mut self, refusal: Option<Refusal>) -> NumberApp {
+        self.refusal = refusal;
+        self
     }
 
     /// Return an `AppStateUpdates` that when applied on an empty app state will produce a good "initial"
@@ -178,6 +200,16 @@ impl App<MemDB> for NumberApp {
                 .int()
                 + 1
         });
+        if let Some(refusal) = &self.refusal {
+            if refusal.height == height && refusal.active.load(Ordering::SeqCst) {
+                return ProduceBlockResponse {
+                    data_hash: datum_hash(&[]),
+                    data: Data::new(vec![]),
+                    app_state_updates: None,
+                    validator_set_updates: None,
+                };
+            }
+        }
         let (app_state_updates, validator_set_updates) =
             self.execute(height, initial_number, &tx_queue, |id| {
                 request
@@ -214,6 +246,10 @@ impl App<MemDB> for NumberApp {
         request: ValidateBlockRequest<MemDB>,
     ) -> ValidateBlockResponse {
         let data = &request.proposed_block().data;
+        // Exactly one datum (a refusal placeholder has none).
+        if data.vec().len() != 1 {
+            return ValidateBlockResponse::Invalid;
+        }
         let data_hash = datum_hash(data.vec()[0].bytes());
 
         if request.proposed_block().data_hash != data_hash {
@@ -270,6 +306,11 @@ impl App<MemDB> for NumberApp {
         } else {
             BlockDataCheck::Invalid
         }
+    }
+
+    /// s138: the datum-less placeholder of a refused block.
+    fn refuses_proposal(&self, response: &ProduceBlockResponse) -> bool {
+        response.data.vec().is_empty()
     }
 
     /// Once a block irrevocably commits, drop the transactions it contains from

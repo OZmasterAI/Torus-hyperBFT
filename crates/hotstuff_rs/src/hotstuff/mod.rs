@@ -210,3 +210,6 @@ mod window_tip_leader_test;
 
 #[cfg(test)]
 mod lock_reflexive_test;
+
+#[cfg(test)]
+mod refused_proposal_test;

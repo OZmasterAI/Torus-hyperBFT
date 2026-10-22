@@ -220,6 +220,25 @@ pub trait App<K: KVStore>: Send {
         BlockDataCheck::Held
     }
 
+    /// `response`, just returned by [`produce_block`](Self::produce_block), is
+    /// a refusal: the app must not build a block now (its execution has to
+    /// catch up first, say) and returned a placeholder that must never be
+    /// proposed. The leader then proposes nothing in this view: it does not
+    /// insert, broadcast or vote for the placeholder, and the view times out.
+    ///
+    /// A leader self-inserts and votes for its own proposal without running
+    /// [`check_block_data`](Self::check_block_data) on it, and a replica that
+    /// proposed a block votes for an identical block from a later leader the
+    /// same way. A refusal placeholder is the same block for every leader on
+    /// the same parent, so two refusing leaders whose power reaches a quorum
+    /// would certify it, and no honest replica can insert it or a child of it
+    /// (9k2 deep r4-U halt, s138).
+    ///
+    /// The default never refuses.
+    fn refuses_proposal(&self, _response: &ProduceBlockResponse) -> bool {
+        false
+    }
+
     /// Called after a block is irrevocably committed by consensus (finalized via
     /// the commit rule -- 2-chain in MonadBFT pipelined mode).
     ///
