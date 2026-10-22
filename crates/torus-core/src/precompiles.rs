@@ -654,19 +654,21 @@ fn read_position(
         }
     };
 
+    // Funding engine: the position's pending funding comes off the UPnL,
+    // with or without a usable price (it needs only the index; a stale mark
+    // must not hide a debt, Codex P1 s138). A market has a funding row only
+    // once the feature ran; without one, nothing.
+    let owed = || -> Result<FixedPoint, CoreError> {
+        let index = crate::funding::read_index(state_db, market_id)
+            .map_err(|e| CoreError::PrecompileLocalFault(format!("getPosition funding read: {e}")))?;
+        Ok(pos.funding_owed(index))
+    };
     // Compute unrealized PnL using oracle price
     let unrealized_pnl = match get_oracle_price_fp(state_db, market_id, now) {
-        // Funding engine: less the position's pending funding (a market has
-        // a funding row only once the feature ran; without one, nothing).
-        Ok(mark) => {
-            let index = crate::funding::read_index(state_db, market_id).map_err(|e| {
-                CoreError::PrecompileLocalFault(format!("getPosition funding read: {e}"))
-            })?;
-            pos.unrealized_pnl(mark) - pos.funding_owed(index)
-        }
+        Ok(mark) => pos.unrealized_pnl(mark) - owed()?,
         // No usable price (absent, stale, non-positive, short row: the same
-        // bytes on every validator): UPnL 0.
-        Err(e) if !e.is_local_fault() => FixedPoint::ZERO,
+        // bytes on every validator): trade UPnL 0, less pending funding.
+        Err(e) if !e.is_local_fault() => FixedPoint::ZERO - owed()?,
         // R02 branch 5 (owner option A): the aggregate read failed on THIS
         // node. Not UPnL 0 (an answer only this node gives) and not a revert
         // (equally consensus-visible): `PrecompileLocalFault`, which the EVM

@@ -1277,12 +1277,11 @@ impl TorusApiServer for RpcState {
                 let index = torus_core::funding::read_index(&self.state, mid)
                     .map_err(|e| RpcError::Internal(e.to_string()))
                     .map_err(ErrorObjectOwned::from)?;
-                // Unrealized PnL at the usable oracle price, less pending
-                // funding; 0 without a price (valued at entry, as the margin
-                // math does).
-                let unrealized = self
-                    .usable_oracle_price(mid)
-                    .map_or(FixedPoint::ZERO, |op| p.unrealized_pnl(op.price) - p.funding_owed(index));
+                // Unrealized PnL at the usable oracle price (0 without one:
+                // valued at entry, as the margin math does), less pending
+                // funding, which needs no price (Codex P1 s138).
+                let unrealized = self.usable_oracle_price(mid).map_or(FixedPoint::ZERO, |op| p.unrealized_pnl(op.price))
+                    - p.funding_owed(index);
                 let funding_since_open = p.funding.map(|_| dec_fp(p.funding_since_open(index)));
 
                 let liquidation_price = match p.margin_type {

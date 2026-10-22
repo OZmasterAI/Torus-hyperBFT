@@ -280,9 +280,11 @@ pub fn position_terms(
 
 /// Funding engine: [`position_terms`] with the position's pending funding at
 /// its market's cumulative `index` taken off the UPnL (`upnl − owed`; see
-/// [`Position::funding_owed`]). Without a mark the UPnL stays 0 (s517
-/// decision 2) and so does the funding term. `index = None`: exactly
-/// [`position_terms`].
+/// [`Position::funding_owed`]). Without a mark the trade UPnL stays 0 (s517
+/// decision 2), but the funding term does not: it needs only the index, and
+/// a stale mark must not erase a known debt (Codex P1 s138: with the term
+/// gated on the mark, losing it raised equity by the debt and let it be
+/// withdrawn). `index = None`: exactly [`position_terms`].
 pub fn position_terms_funded(
     pos: &Position,
     mark: Option<FixedPoint>,
@@ -290,7 +292,7 @@ pub fn position_terms_funded(
     tiers: Option<&[MarginTier]>,
 ) -> Result<PositionTerms, CoreError> {
     let mut t = position_terms(pos, mark, tiers)?;
-    if mark.is_some() && index.is_some() {
+    if index.is_some() {
         let owed = pos.funding_owed(index);
         t.upnl = t
             .upnl

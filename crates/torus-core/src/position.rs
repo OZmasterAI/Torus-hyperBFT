@@ -110,8 +110,23 @@ impl Position {
 
     /// Funding engine: what this position owes from its entry index to the
     /// market's `index` (positive = it pays; `None` = no funding: 0), rounded
-    /// against the holder ([`crate::funding::owed`]).
+    /// against the holder ([`crate::funding::owed`]). The ADL escrows are
+    /// exempt (adl-budget §8, owner decision 5): their positions owe 0 in
+    /// every valuation and every settlement, so an escrow ends at 0; their
+    /// share ([`Self::funding_accrued`]) is charged to the liquidator vault
+    /// at the touch ([`PositionManager::apply_fill`]).
     pub fn funding_owed(&self, index: Option<i128>) -> FixedPoint {
+        if crate::liquidation::is_adl_escrow(&self.trader) {
+            return FixedPoint::ZERO;
+        }
+        self.funding_accrued(index)
+    }
+
+    /// Funding engine: the funding this position's size accrued from its
+    /// entry index to `index`, whoever holds it (positive = the holder's
+    /// side pays; `None`: 0). [`Self::funding_owed`] without the escrow
+    /// exemption: for an escrow, the share the vault carries.
+    pub fn funding_accrued(&self, index: Option<i128>) -> FixedPoint {
         let Some(index) = index else {
             return FixedPoint::ZERO;
         };
@@ -609,6 +624,14 @@ impl<T: StateBackend> PositionManager<T> {
         let index = self.funding_index(market_id)?;
         let existing = self.get_position(trader, market_id)?;
         let start_size = signed_size(&existing);
+        // Funding engine: an ADL escrow owes nothing (`fill_transition`
+        // settles 0 for it); the share its position accrued since its entry
+        // index is charged to the liquidator vault instead, so the
+        // counterparties' funding stays zero-sum and the escrow ends at 0.
+        let escrow_share = match &existing {
+            Some(p) if crate::liquidation::is_adl_escrow(trader) => p.funding_accrued(index),
+            _ => FixedPoint::ZERO,
+        };
         let (new_pos, pnl, funding) = fill_transition(
             existing, trader, market_id, is_buy, fill_qty, fill_price, margin_type, index,
         );
@@ -621,6 +644,9 @@ impl<T: StateBackend> PositionManager<T> {
         let effect = FillEffect { start_size, closed_pnl: pnl, funding };
         if let Some(cash) = effect.cash() {
             self.credit_realized_pnl(trader, cash)?;
+        }
+        if escrow_share != FixedPoint::ZERO {
+            self.credit_realized_pnl(&crate::liquidation::LIQUIDATOR_VAULT, FixedPoint::ZERO - escrow_share)?;
         }
         Ok(effect)
     }
@@ -688,6 +714,15 @@ impl<T: StateBackend> PositionManager<T> {
         margin_type: MarginType,
     ) -> Result<FillEffect, CoreError> {
         let index = self.funding_index(market_id)?;
+        // Funding engine: an ADL escrow's fill charges its funding share to
+        // the vault (`apply_fill`); this path writes no balance, so it
+        // refuses one (unreachable: escrows fill only through
+        // `liquidation::transfer` / `cross_close`, which use `apply_fill`).
+        if index.is_some() && crate::liquidation::is_adl_escrow(trader) {
+            return Err(CoreError::InvalidInput(format!(
+                "funding: ADL escrow {trader} fills go through apply_fill (vault share)"
+            )));
+        }
         cache.update_in_place(self, typed, trader, market_id, |existing| {
             let start_size = signed_size(&existing);
             let (new_pos, pnl, funding) = fill_transition(

@@ -989,9 +989,15 @@ impl NativeExecutor {
         // price (`adl_price`'s fallback: still never a positive D9
         // remainder); only the test-only shadow assert below would differ.
         // It needs ~1e30-token notional: unreachable.
+        // Funding engine: an unmarked position stays with the account (H2)
+        // with all its value, its pending funding too, so `rest` leaves it
+        // out (trade UPnL and funding: 0, as before funding). Counting its
+        // debt here would price the marked closes to leave that much cash,
+        // which D9 then hands to the vault: a positive D9 remainder.
         let upnl = |p: &Position| {
-            let i = index.get(&p.market_id).copied().flatten();
-            torus_core::margin::position_terms_funded(p, marks.get(&p.market_id).copied(), i, None).ok().map(|t| t.upnl)
+            let mark = marks.get(&p.market_id).copied();
+            let i = mark.and(index.get(&p.market_id).copied().flatten());
+            torus_core::margin::position_terms_funded(p, mark, i, None).ok().map(|t| t.upnl)
         };
         let mut total = ps.iter().try_fold(FixedPoint::ZERO, |a, p| a.checked_add(upnl(p)?).ok());
         let mut rows = 0u64;
@@ -1060,7 +1066,8 @@ impl NativeExecutor {
             .into_iter()
             .filter(|q| q.market_id != m)
             .collect();
-        let funding = |x| ctx.positions.funding_index(x);
+        // Unmarked: no funding term (as `adl_to_escrow`'s `rest`, H2).
+        let funding = |x| if marks.contains_key(&x) { ctx.positions.funding_index(x) } else { Ok(None) };
         let v = match AccountView::build_funded(&bal, &others, |x| marks.get(&x).copied(), funding, |_| None) {
             Ok(v) => v,
             Err(CoreError::Overflow(_)) => return Ok(None),
