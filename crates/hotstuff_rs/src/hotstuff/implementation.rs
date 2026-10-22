@@ -219,6 +219,15 @@ pub(crate) struct HotStuff<N: Network> {
     /// [`PUSHED_BODY_BUFFER_CAP`] entries of at most
     /// [`BODY_PUSH_HARD_CAP_BYTES`] body payload each (~1 MiB worst case).
     pushed_bodies: VecDeque<(CryptoHash, Block)>,
+    /// 9k one-down: when each peer was last heard from (any progress message
+    /// or body response; see [`note_peer_heard`](Self::note_peer_heard)).
+    /// Body/justify fetch rotation skips validators silent for longer than
+    /// [`PEER_SILENCE_WINDOW`], so a dead validator stops absorbing the asks
+    /// of the fetch budget. Bounded by [`PEER_LAST_HEARD_CAP`].
+    peer_last_heard: std::collections::HashMap<VerifyingKey, Instant>,
+    /// Stand-in "last heard" for peers not heard since this replica started:
+    /// every validator gets one silence window of grace after a (re)start.
+    started_at: Instant,
 }
 
 impl<N: Network> HotStuff<N> {
@@ -276,7 +285,27 @@ impl<N: Network> HotStuff<N> {
             defer_parent_feed: defer_parent_feed_from_env(),
             commit_feed_pending: false,
             pushed_bodies: VecDeque::new(),
+            peer_last_heard: std::collections::HashMap::new(),
+            started_at: Instant::now(),
         }
+    }
+
+    /// 9k one-down: record that `peer` was heard from at `now`. Called by the
+    /// algorithm loop for every received progress message and body response.
+    pub(crate) fn note_peer_heard(&mut self, peer: &VerifyingKey, now: Instant) {
+        if let Some(last) = self.peer_last_heard.get_mut(peer) {
+            *last = now;
+            return;
+        }
+        if self.peer_last_heard.len() >= PEER_LAST_HEARD_CAP {
+            // Only validators matter; drop entries that are silent anyway.
+            self.peer_last_heard
+                .retain(|_, last| now.saturating_duration_since(*last) <= PEER_SILENCE_WINDOW);
+            if self.peer_last_heard.len() >= PEER_LAST_HEARD_CAP {
+                return;
+            }
+        }
+        self.peer_last_heard.insert(*peer, now);
     }
 
     /// Test-only override of the deferred-commit-feed flag (bypasses the
@@ -867,12 +896,22 @@ impl<N: Network> HotStuff<N> {
                     block_tree.app_view(parent_block.as_ref())?,
                 );
 
+                let response = app.produce_block(produce_block_request);
+                // s138 (9k2 deep r4-U halt): a refusal is never proposed, inserted
+                // or self-voted; the view times out (`App::refuses_proposal`).
+                if app.refuses_proposal(&response) {
+                    log::warn!(
+                        "leader of view {}: the app refused to build a block -- no proposal this view",
+                        self.view_info.view.int()
+                    );
+                    return Ok(());
+                }
                 let ProduceBlockResponse {
                     data,
                     data_hash,
                     app_state_updates,
                     validator_set_updates,
-                } = app.produce_block(produce_block_request);
+                } = response;
 
                 let block = Block::new(child_height, highest_pc, data_hash, data);
 
@@ -2265,12 +2304,24 @@ impl<N: Network> HotStuff<N> {
                 parent_block,
                 block_tree.app_view(parent_block.as_ref())?,
             );
+            let response = app.produce_block(produce_block_request);
+            // s138 (9k2 deep r4-U halt): a refusal is never proposed. Here it
+            // built the same placeholder as the refusing leader of the tip
+            // (same height, justify, data hash), which voted for it through
+            // `pending_bodies`: the two certified it.
+            if app.refuses_proposal(&response) {
+                log::warn!(
+                    "leader of view {}: the app refused the NEC proposal -- no proposal this view",
+                    self.view_info.view.int()
+                );
+                return Ok(());
+            }
             let ProduceBlockResponse {
                 data,
                 data_hash,
                 app_state_updates: _,
                 validator_set_updates: _,
-            } = app.produce_block(produce_block_request);
+            } = response;
 
             let block = Block::new(child_height, high_tip_qc, data_hash, data);
 
@@ -3366,6 +3417,7 @@ impl<N: Network> HotStuff<N> {
         app: &mut impl App<K>,
     ) -> Result<(), HotStuffError> {
         while let Some((origin, resp)) = self.sender_handle.recv_block_data() {
+            self.note_peer_heard(&origin, Instant::now());
             self.on_receive_block_data_response(resp, &origin, block_tree, app)?;
         }
         Ok(())
@@ -3380,6 +3432,13 @@ impl<N: Network> HotStuff<N> {
         *retries = MAX_BODY_RETRIES_TOTAL;
         // s63: exhaustion also requires the wall-clock budget to be spent.
         *first_request = now - BODY_FETCH_DEADLINE - BODY_RETRY_INTERVAL;
+    }
+
+    /// Test seam: pretend this replica started at `at` (the "not heard since
+    /// start" grace of [`peer_recently_heard`]).
+    #[cfg(test)]
+    pub(crate) fn set_started_at_for_test(&mut self, at: Instant) {
+        self.started_at = at;
     }
 
     #[cfg(test)]
@@ -3410,6 +3469,9 @@ impl<N: Network> HotStuff<N> {
         let me = self.config.keypair.public();
         let mut expired = Vec::new();
         let mut arrived = Vec::new();
+        let last_heard = &self.peer_last_heard;
+        let started_at = self.started_at;
+        let is_live = |vk: &VerifyingKey| peer_recently_heard(last_heard, started_at, vk, now);
         for (hash, (last_req, count, origin, first_req)) in self.body_fetch_tracker.iter_mut() {
             // s63: after the fast attempts, a slow phase runs until the
             // wall-clock budget since the FIRST request is spent.
@@ -3442,19 +3504,17 @@ impl<N: Network> HotStuff<N> {
                 continue;
             }
             if let Some(header) = self.pending_headers.get(hash) {
-                let others: Vec<VerifyingKey> = block_tree
+                // 9k one-down: order by recent traffic (live first, quiet
+                // validators asked once each in the slow phase), never exclude.
+                let peers = block_tree
                     .committed_validator_set()
-                    .map(|vs| {
-                        vs.validators()
-                            .filter(|vk| **vk != me && *vk != origin)
-                            .cloned()
-                            .collect()
-                    })
+                    .map(|vs| FetchPeers::split(vs.validators().copied(), &me, origin, &is_live))
                     .unwrap_or_default();
                 let target = if slow {
-                    Some(slow_body_fetch_target(*count - MAX_BODY_RETRIES_TOTAL, origin, &others))
+                    let slow_attempt = *count - MAX_BODY_RETRIES_TOTAL;
+                    Some(peers.slow_target(slow_attempt, origin, is_live(origin)))
                 } else {
-                    rotated_body_fetch_target(*count, MAX_BODY_RETRIES, origin, &others)
+                    peers.fast_target(*count, origin, 0)
                 };
                 let Some(target) = target else {
                     log::warn!(
@@ -3681,6 +3741,9 @@ impl<N: Network> HotStuff<N> {
         let me = self.config.keypair.public();
         let mut arrived = Vec::new();
         let mut expired = Vec::new();
+        let last_heard = &self.peer_last_heard;
+        let started_at = self.started_at;
+        let is_live = |vk: &VerifyingKey| peer_recently_heard(last_heard, started_at, vk, now);
         for (hash, (last_req, count, origin, view)) in self.justify_fetch_tracker.iter_mut() {
             // Stop retrying once the block arrived (via this fetch, a later
             // proposal body, or height-range sync).
@@ -3691,26 +3754,24 @@ impl<N: Network> HotStuff<N> {
             if now.duration_since(*last_req) < BODY_RETRY_INTERVAL {
                 continue;
             }
-            if *count >= MAX_BODY_RETRIES_TOTAL {
+            // 9k one-down: live validators first; the last fast asks are
+            // reserved for quiet ones (no slow phase here), the budget
+            // extended so no live validator loses its ask (Codex P2).
+            let peers = block_tree
+                .committed_validator_set()
+                .map(|vs| FetchPeers::split(vs.validators().copied(), &me, origin, &is_live))
+                .unwrap_or_default();
+            let budget = peers.fast_budget(QUIET_JUSTIFY_FETCH_SLOTS);
+            if *count >= budget {
                 log::warn!(
                     "justify fetch exhausted {} retries for {:?} — falling back to sync",
-                    MAX_BODY_RETRIES_TOTAL,
+                    budget,
                     hash
                 );
                 expired.push(*hash);
                 continue;
             }
-            let others: Vec<VerifyingKey> = block_tree
-                .committed_validator_set()
-                .map(|vs| {
-                    vs.validators()
-                        .filter(|vk| **vk != me && *vk != origin)
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
-            let Some(target) = rotated_body_fetch_target(*count, MAX_BODY_RETRIES, origin, &others)
-            else {
+            let Some(target) = peers.fast_target(*count, origin, QUIET_JUSTIFY_FETCH_SLOTS) else {
                 expired.push(*hash);
                 continue;
             };
@@ -3844,6 +3905,23 @@ pub(crate) const BODY_RETRY_SLOW_INTERVAL: Duration = Duration::from_millis(500)
 /// transport delays 0.5-3.4 s); giving up at ~1 s sent every one of them to
 /// block sync. Give-up now requires BOTH the fast attempt count AND this budget.
 pub(crate) const BODY_FETCH_DEADLINE: Duration = Duration::from_secs(4);
+/// 9k one-down: a validator not heard from (any progress message or body
+/// response) for longer than this is "quiet": body / justify fetches ask it
+/// only AFTER the recently heard validators (see [`FetchPeers`]) — never not at
+/// all, because quiet does not mean dead (votes go to leaders only, sync
+/// adverts run every 10 s; Codex P1 on bad3e64a). Connection state cannot
+/// replace this: a killed peer's connection stays "open" until the ~10 s idle
+/// timeout, longer than the 4 s fetch budget.
+pub(crate) const PEER_SILENCE_WINDOW: Duration = Duration::from_secs(2);
+/// 9k one-down: the by-hash justify fetch has no slow phase, so its last fast
+/// asks (up to this many) are reserved for quiet validators, one each, after
+/// every live ask ([`FetchPeers::fast_budget`] grows to fit them). Equal to the
+/// rotation length, so every validator the old all-others rotation asked is
+/// still asked (Codex P2 on 5f216e6a); at most 2 + 7 + 7 = 16 asks (1.6 s).
+pub(crate) const QUIET_JUSTIFY_FETCH_SLOTS: u8 = MAX_BODY_RETRIES_TOTAL - MAX_BODY_RETRIES;
+/// 9k one-down: bound on [`HotStuff::note_peer_heard`] entries (senders are
+/// validators; the cap only guards against unexpected senders).
+pub(crate) const PEER_LAST_HEARD_CAP: usize = 4096;
 /// s63: re-validation cadence for parked `MissingData` bodies.
 pub(crate) const MISSING_DATA_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 /// s84: re-check cadence of a held body whose out-of-band data was missing
@@ -3956,6 +4034,101 @@ fn body_payload_len(block: &Block) -> u64 {
         .sum()
 }
 
+/// 9k one-down: whether `peer` was heard from within [`PEER_SILENCE_WINDOW`] of
+/// `now`. A peer not heard since `started_at` counts as heard then (one window
+/// of grace after a start).
+fn peer_recently_heard(
+    last_heard: &std::collections::HashMap<VerifyingKey, Instant>,
+    started_at: Instant,
+    peer: &VerifyingKey,
+    now: Instant,
+) -> bool {
+    let last = last_heard.get(peer).copied().unwrap_or(started_at);
+    now.saturating_duration_since(last) <= PEER_SILENCE_WINDOW
+}
+
+/// 9k one-down: the validators a body / justify fetch may ask besides the
+/// origin (committed validators other than `me` and `origin`, in committed
+/// order), split by whether they were heard from recently. Quiet validators
+/// are ORDERED last, never excluded (Codex P1 on bad3e64a: a quiet validator
+/// may be a live holder when the proposer cannot serve):
+///
+/// - fast phase: the proposer first ([`MAX_BODY_RETRIES`]), then the live
+///   validators round-robin — or the proposer again if none is live (before
+///   9k, 10 of the 16 asks of the 4 s budget went to a dead peer in a
+///   3-validator net and the live proposer got 6); an optional tail of the
+///   fast asks is reserved for the quiet validators, one each, the budget
+///   extended so it never displaces a live ask ([`FetchPeers::fast_budget`]);
+/// - slow phase (body fetch only): the odd (non-proposer) asks go to each quiet
+///   validator once first, then rotate the live validators as before.
+///
+/// With every validator heard from (all up), `quiet` is empty and every target
+/// is exactly the old one.
+#[derive(Debug, Default, PartialEq)]
+struct FetchPeers {
+    live: Vec<VerifyingKey>,
+    quiet: Vec<VerifyingKey>,
+}
+
+impl FetchPeers {
+    fn split(
+        committed: impl Iterator<Item = VerifyingKey>,
+        me: &VerifyingKey,
+        origin: &VerifyingKey,
+        is_live: impl Fn(&VerifyingKey) -> bool,
+    ) -> Self {
+        let (live, quiet) = committed.filter(|vk| vk != me && vk != origin).partition(|vk| is_live(vk));
+        Self { live, quiet }
+    }
+
+    /// Fast-phase attempt budget with `quiet_tail` quiet slots: [`MAX_BODY_RETRIES_TOTAL`], extended
+    /// so the reserved quiet asks never displace a live ask (Codex P2 on 5f216e6a): the live
+    /// validators keep `min(live, rotation)` asks, as many as the old all-others rotation had.
+    /// Equal to [`MAX_BODY_RETRIES_TOTAL`] when nobody is quiet or `quiet_tail` is 0.
+    fn fast_budget(&self, quiet_tail: u8) -> u8 {
+        let rotation = MAX_BODY_RETRIES_TOTAL - MAX_BODY_RETRIES;
+        let live_asks = self.live.len().min(rotation as usize) as u8;
+        MAX_BODY_RETRIES + rotation.max(live_asks + self.reserved_quiet(quiet_tail))
+    }
+
+    fn reserved_quiet(&self, quiet_tail: u8) -> u8 {
+        self.quiet.len().min(quiet_tail as usize) as u8
+    }
+
+    /// Fast-phase target for attempt `attempt` (0-based, `< self.fast_budget(quiet_tail)`); the
+    /// last `min(quiet, quiet_tail)` attempts go to the quiet validators. `None` when there is no
+    /// validator besides the origin (the old "no remaining targets" give-up).
+    fn fast_target(&self, attempt: u8, origin: &VerifyingKey, quiet_tail: u8) -> Option<VerifyingKey> {
+        if attempt < MAX_BODY_RETRIES {
+            return Some(*origin);
+        }
+        if self.live.is_empty() && self.quiet.is_empty() {
+            return None;
+        }
+        let tail_start = self.fast_budget(quiet_tail) - self.reserved_quiet(quiet_tail);
+        if attempt >= tail_start {
+            return Some(self.quiet[(attempt - tail_start) as usize % self.quiet.len()]);
+        }
+        if self.live.is_empty() {
+            return Some(*origin);
+        }
+        rotated_body_fetch_target(attempt, MAX_BODY_RETRIES, origin, &self.live)
+    }
+
+    /// Slow-phase target for slow attempt `slow_attempt` (0-based). A silent proposer (it died
+    /// after its header) gets no slow asks while a live validator can be asked.
+    fn slow_target(&self, slow_attempt: u8, origin: &VerifyingKey, origin_live: bool) -> VerifyingKey {
+        let pair = (slow_attempt / 2) as usize;
+        if slow_attempt % 2 == 1 && pair < self.quiet.len() {
+            return self.quiet[pair];
+        }
+        if !origin_live && !self.live.is_empty() {
+            return self.live[slow_attempt as usize % self.live.len()];
+        }
+        slow_body_fetch_target(slow_attempt, origin, &self.live)
+    }
+}
+
 /// Pick the target for body-fetch attempt number `attempt` (0-based): the first
 /// `max_origin_retries` attempts go to `origin` (the proposer — overwhelmingly
 /// the holder), then rotate across the OTHER validators. A non-serving proposer
@@ -4026,6 +4199,120 @@ mod body_fetch_rotation_tests {
             Some(others[0]),
             "wraps around the other validators"
         );
+    }
+
+    fn key_set(seeds: &[u8]) -> Vec<VerifyingKey> {
+        seeds.iter().map(|s| vk(*s)).collect()
+    }
+
+    fn peers(live: &[u8], quiet: &[u8]) -> FetchPeers {
+        FetchPeers { live: key_set(live), quiet: key_set(quiet) }
+    }
+
+    /// 9k one-down: the split keeps every other validator (committed order),
+    /// quiet ones in their own list; with every validator live it is the old
+    /// rotation; no others stays no others.
+    #[test]
+    fn fetch_peers_split_orders_quiet_validators_without_dropping_them() {
+        let (me, origin) = (vk(1), vk(2));
+        let all = key_set(&[1, 2, 3, 4, 5]);
+        assert_eq!(FetchPeers::split(all.iter().copied(), &me, &origin, |_| true), peers(&[3, 4, 5], &[]));
+        assert_eq!(
+            FetchPeers::split(all.iter().copied(), &me, &origin, |k| *k != vk(4)),
+            peers(&[3, 5], &[4])
+        );
+        assert_eq!(FetchPeers::split(all.iter().copied(), &me, &origin, |_| false), peers(&[], &[3, 4, 5]));
+        assert_eq!(FetchPeers::split(key_set(&[1, 2]).into_iter(), &me, &origin, |_| true), peers(&[], &[]));
+    }
+
+    /// With nobody quiet, the fast / slow targets are exactly the old functions'.
+    #[test]
+    fn fetch_peers_targets_equal_the_old_schedule_when_all_are_live() {
+        let origin = vk(2);
+        let p = peers(&[3, 4, 5], &[]);
+        for attempt in 0..MAX_BODY_RETRIES_TOTAL {
+            let old = rotated_body_fetch_target(attempt, MAX_BODY_RETRIES, &origin, &p.live);
+            assert_eq!(p.fast_target(attempt, &origin, 0), old);
+            assert_eq!(p.fast_target(attempt, &origin, QUIET_JUSTIFY_FETCH_SLOTS), old);
+        }
+        for slow in 0..12 {
+            assert_eq!(p.slow_target(slow, &origin, true), slow_body_fetch_target(slow, &origin, &p.live));
+        }
+        assert_eq!(peers(&[], &[]).fast_target(MAX_BODY_RETRIES, &origin, 2), None);
+    }
+
+    /// Quiet validators: no fast asks without a reserved tail (the proposer
+    /// takes them when nobody else is live); the reserved tail asks each quiet
+    /// validator once; the slow phase's odd asks go to each quiet one once,
+    /// then back to the live rotation (or the proposer).
+    #[test]
+    fn fetch_peers_ask_quiet_validators_late_and_once() {
+        let origin = vk(2);
+        let all_quiet = peers(&[], &[3, 4]);
+        let fast: Vec<_> = (0..MAX_BODY_RETRIES_TOTAL).map(|a| all_quiet.fast_target(a, &origin, 0)).collect();
+        assert!(fast.iter().all(|t| *t == Some(origin)), "{fast:?}");
+        let fast: Vec<_> = (0..MAX_BODY_RETRIES_TOTAL).map(|a| all_quiet.fast_target(a, &origin, 2)).collect();
+        let n = MAX_BODY_RETRIES_TOTAL as usize;
+        assert!(fast[..n - 2].iter().all(|t| *t == Some(origin)));
+        assert_eq!(&fast[n - 2..], &[Some(vk(3)), Some(vk(4))]);
+        let slow: Vec<_> = (0..6).map(|s| all_quiet.slow_target(s, &origin, true)).collect();
+        assert_eq!(slow, vec![origin, vk(3), origin, vk(4), origin, origin]);
+
+        let mixed = peers(&[5], &[3]);
+        let slow: Vec<_> = (0..6).map(|s| mixed.slow_target(s, &origin, true)).collect();
+        assert_eq!(slow, vec![origin, vk(3), origin, vk(5), origin, vk(5)]);
+        // Silent proposer: live validators take its asks, the quiet one still gets its one.
+        let slow: Vec<_> = (0..4).map(|s| mixed.slow_target(s, &origin, false)).collect();
+        assert_eq!(slow, vec![vk(5), vk(3), vk(5), vk(5)]);
+    }
+
+    /// Codex P2 on 5f216e6a, every split: the justify schedule (with its reserved quiet slots)
+    /// asks every validator the old committed-order rotation asked, asks no quiet validator
+    /// before a live one, and is exactly the old schedule when nobody is quiet.
+    #[test]
+    fn justify_schedule_covers_the_old_schedule_for_every_quiet_split() {
+        let origin = vk(200);
+        let rot = (MAX_BODY_RETRIES_TOTAL - MAX_BODY_RETRIES) as usize;
+        for n in 0..=10u8 {
+            let others: Vec<VerifyingKey> = (0..n).map(|i| vk(i + 1)).collect();
+            for mask in 0u32..(1 << n) {
+                let p = FetchPeers::split(others.iter().copied(), &vk(250), &origin, |k| {
+                    let i = others.iter().position(|o| o == k).unwrap();
+                    mask & (1 << i) == 0
+                });
+                let budget = p.fast_budget(QUIET_JUSTIFY_FETCH_SLOTS);
+                assert!(budget >= MAX_BODY_RETRIES_TOTAL);
+                let new: Vec<_> = (0..budget).map(|a| p.fast_target(a, &origin, QUIET_JUSTIFY_FETCH_SLOTS)).collect();
+                if mask == 0 {
+                    assert_eq!(budget, MAX_BODY_RETRIES_TOTAL, "all up: budget unchanged");
+                    let old: Vec<_> = (0..budget).map(|a| rotated_body_fetch_target(a, MAX_BODY_RETRIES, &origin, &others)).collect();
+                    assert_eq!(new, old, "all up: schedule unchanged");
+                }
+                if n > 0 {
+                    for old_target in others.iter().take(rot) {
+                        assert!(new.contains(&Some(*old_target)), "n={n} mask={mask:b}: old target dropped");
+                    }
+                }
+                let last_live = new.iter().rposition(|t| t.is_some_and(|t| p.live.contains(&t)));
+                let first_quiet = new.iter().position(|t| t.is_some_and(|t| p.quiet.contains(&t)));
+                if let (Some(l), Some(q)) = (last_live, first_quiet) {
+                    assert!(l < q, "n={n} mask={mask:b}: quiet asked before a live one");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn peer_heard_within_the_window_is_live() {
+        let t0 = Instant::now();
+        let mut heard = std::collections::HashMap::new();
+        let (a, b) = (vk(1), vk(2));
+        heard.insert(a, t0);
+        let start = t0.checked_sub(Duration::from_secs(60)).unwrap();
+        assert!(peer_recently_heard(&heard, start, &a, t0 + PEER_SILENCE_WINDOW));
+        assert!(!peer_recently_heard(&heard, start, &a, t0 + PEER_SILENCE_WINDOW + Duration::from_millis(1)));
+        assert!(!peer_recently_heard(&heard, start, &b, t0), "never heard, grace over");
+        assert!(peer_recently_heard(&heard, t0, &b, t0 + Duration::from_secs(1)), "start grace");
     }
 
     #[test]
@@ -5038,7 +5325,13 @@ mod s63_body_fetch_tests {
     /// armed exactly as in production), with the tracker pinned to
     /// `(t0, count, origin, first)` for deterministic timing.
     fn fetch_fixture(t0: Instant, count: u8, first: Instant) -> FetchFixture {
-        let keys = signing_keys(&[1, 2, 3, 4]);
+        fetch_fixture_n(t0, count, first, 4)
+    }
+
+    /// [`fetch_fixture`] with `n` equal-power validators.
+    fn fetch_fixture_n(t0: Instant, count: u8, first: Instant, n: u8) -> FetchFixture {
+        let seeds: Vec<u8> = (1..=n).collect();
+        let keys = signing_keys(&seeds);
         let set = validator_set(&keys);
         let (mut tree, vss) = steady_block_tree(&set);
         let view = ViewNumber::new(1);
@@ -5069,7 +5362,19 @@ mod s63_body_fetch_tests {
     }
 
     impl FetchFixture {
+        /// Tick with every validator live (heard from at `now`), as when all are up.
         fn tick(&mut self, now: Instant) -> Vec<VerifyingKey> {
+            self.tick_with_silent(now, &[])
+        }
+        /// 9k one-down: tick with the `silent` validators never heard from
+        /// (and the start grace long over); the rest are heard from at `now`.
+        fn tick_with_silent(&mut self, now: Instant, silent: &[VerifyingKey]) -> Vec<VerifyingKey> {
+            self.hotstuff.set_started_at_for_test(now.checked_sub(Duration::from_secs(60)).unwrap());
+            for vk in self.others.iter().chain(std::iter::once(&self.origin)) {
+                if !silent.contains(vk) {
+                    self.hotstuff.note_peer_heard(vk, now);
+                }
+            }
             self.hotstuff.tick_pending_body_retries_at(&self.tree, now);
             self.net.take()
         }
@@ -5140,6 +5445,245 @@ mod s63_body_fetch_tests {
         assert!(f.tracked());
         assert!(!f.hotstuff.take_sync_needed());
         assert_eq!(f.hotstuff.body_fetch_tracker[&f.hash].1, 4);
+    }
+
+    /// 9k one-down: a validator that has gone silent (killed) gets none of the
+    /// fast phase's asks (they go to the live validators) and exactly one slow
+    /// ask, in case it is quiet but alive; with all validators heard from the
+    /// targets are exactly the old ones (test 1 above).
+    #[test]
+    fn rotation_asks_a_silent_validator_once_and_late() {
+        let t0 = Instant::now();
+        let mut f = fetch_fixture(t0, 0, t0);
+        let (live, dead) = (f.others[0], f.others[1]);
+        for k in 1..=MAX_BODY_RETRIES_TOTAL as u64 {
+            let expected = if k <= MAX_BODY_RETRIES as u64 { f.origin } else { live };
+            assert_eq!(f.tick_with_silent(t0 + MS(100 * k), &[dead]), vec![expected], "fast attempt {k}");
+        }
+        let slow = [(1400u64, f.origin), (1900, dead), (2400, f.origin), (2900, live), (3400, f.origin), (3900, live)];
+        for (at, expected) in slow {
+            assert_eq!(f.tick_with_silent(t0 + MS(at), &[dead]), vec![expected], "slow attempt at {at}ms");
+        }
+    }
+
+    /// 9k one-down (3 validators at 2:2:1, the power-1 one killed): when every
+    /// validator besides the proposer is silent, the fast phase goes to the
+    /// proposer (the only live holder) instead of 10 of 16 asks to the dead
+    /// peer; each silent validator gets one slow ask; the fetch still falls
+    /// back to sync only at the deadline.
+    #[test]
+    fn fast_asks_go_to_the_proposer_when_all_other_validators_are_silent() {
+        let t0 = Instant::now();
+        let mut f = fetch_fixture(t0, 0, t0);
+        let silent = f.others.clone();
+        for k in 1..=MAX_BODY_RETRIES_TOTAL as u64 {
+            assert_eq!(f.tick_with_silent(t0 + MS(100 * k), &silent), vec![f.origin], "fast attempt {k}");
+        }
+        let slow = [(1400u64, f.origin), (1900, silent[0]), (2400, f.origin), (2900, silent[1]), (3400, f.origin), (3900, f.origin)];
+        for (at, expected) in slow {
+            assert_eq!(f.tick_with_silent(t0 + MS(at), &silent), vec![expected], "slow attempt at {at}ms");
+        }
+        assert!(f.tracked());
+        assert!(!f.hotstuff.take_sync_needed());
+        assert!(f.tick_with_silent(t0 + MS(4000), &silent).is_empty());
+        assert!(f.hotstuff.take_sync_needed(), "falls back to sync at the deadline, not earlier");
+    }
+
+    /// 9k one-down: a proposer that went silent after its header (it died
+    /// mid-dissemination) gets no slow-phase asks while a live validator can
+    /// be asked.
+    #[test]
+    fn slow_phase_skips_a_silent_proposer() {
+        let t0 = Instant::now();
+        let mut f = fetch_fixture(t0, MAX_BODY_RETRIES_TOTAL, t0);
+        let origin = f.origin;
+        let mut seen = Vec::new();
+        for at in [500u64, 1000, 1500, 2000] {
+            seen.extend(f.tick_with_silent(t0 + MS(at), &[origin]));
+        }
+        assert_eq!(seen.len(), 4);
+        assert!(!seen.contains(&origin), "slow asks went to the silent proposer: {seen:?}");
+        assert!(seen.contains(&f.others[0]) && seen.contains(&f.others[1]));
+    }
+
+    /// 9k one-down: the start grace — a validator not heard from since this
+    /// replica started is still asked during the first silence window.
+    #[test]
+    fn not_yet_heard_validators_are_asked_during_the_start_grace() {
+        let t0 = Instant::now();
+        let mut f = fetch_fixture(t0, MAX_BODY_RETRIES, t0);
+        f.hotstuff.set_started_at_for_test(t0);
+        f.hotstuff.tick_pending_body_retries_at(&f.tree, t0 + MS(100));
+        assert_eq!(f.net.take(), vec![f.others[0]]);
+        f.hotstuff.tick_pending_body_retries_at(&f.tree, t0 + PEER_SILENCE_WINDOW + MS(100));
+        assert_eq!(f.net.take(), vec![f.origin], "after the grace, silent validators are skipped");
+    }
+
+    /// 9k one-down: the by-hash justify fetch rotation asks a silent validator
+    /// only in its last (reserved) attempt.
+    #[test]
+    fn justify_fetch_rotation_asks_a_silent_validator_last() {
+        let t0 = Instant::now();
+        let mut f = fetch_fixture(t0, 0, t0);
+        let (live, dead) = (f.others[0], f.others[1]);
+        let hash = CryptoHash::new([99; 32]);
+        f.hotstuff.set_started_at_for_test(t0.checked_sub(Duration::from_secs(60)).unwrap());
+        let mut seen = Vec::new();
+        for attempt in MAX_BODY_RETRIES..MAX_BODY_RETRIES_TOTAL {
+            let now = Instant::now();
+            f.hotstuff.note_peer_heard(&f.origin, now);
+            f.hotstuff.note_peer_heard(&live, now);
+            let stale = now.checked_sub(BODY_RETRY_INTERVAL * 2).unwrap();
+            f.hotstuff.justify_fetch_tracker.insert(hash, (stale, attempt, f.origin, ViewNumber::new(1)));
+            f.hotstuff.tick_justify_fetch_retries(&f.tree);
+            seen.extend(f.net.take());
+        }
+        assert_eq!(seen.len(), (MAX_BODY_RETRIES_TOTAL - MAX_BODY_RETRIES) as usize);
+        let (last, early) = seen.split_last().unwrap();
+        assert_eq!(*last, dead, "the last justify ask is reserved for the silent validator");
+        assert!(early.iter().all(|t| *t == live), "early justify asks must go to the live validator");
+    }
+
+    /// Short label of a fixture validator for assertion messages: `P` (proposer), `o0`, `o1`.
+    fn who(f: &FetchFixture, vk: &VerifyingKey) -> String {
+        if *vk == f.origin {
+            return "P".into();
+        }
+        f.others.iter().position(|o| o == vk).map_or("?".into(), |i| format!("o{i}"))
+    }
+
+    fn label<T: Copy>(f: &FetchFixture, asks: &[(T, VerifyingKey)]) -> Vec<(T, String)> {
+        asks.iter().map(|(at, t)| (*at, who(f, t))).collect()
+    }
+
+    /// Codex P1 probe (fix/body-fetch-dead-peer): drive one body fetch through its whole 4 s
+    /// budget with the `silent` validators never heard from and only `holder` able to serve (the
+    /// proposer cannot). Returns `(ms, target)` of every ask, and whether the body arrived and
+    /// whether the fetch fell back to sync.
+    fn run_body_fetch_with_quiet_holder(
+        silent: &[VerifyingKey],
+        holder: VerifyingKey,
+        f: &mut FetchFixture,
+        t0: Instant,
+    ) -> (Vec<(u64, VerifyingKey)>, bool, bool) {
+        let block = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+            CryptoHash::new([71; 32]), Data::new(vec![]));
+        assert_eq!(block.hash, f.hash);
+        let schedule = (1..=MAX_BODY_RETRIES_TOTAL as u64).map(|k| 100 * k)
+            .chain([1400, 1900, 2400, 2900, 3400, 3900, 4000]);
+        let mut asks = Vec::new();
+        let mut arrived = false;
+        for at in schedule {
+            let targets = f.tick_with_silent(t0 + MS(at), silent);
+            asks.extend(targets.iter().map(|t| (at, *t)));
+            if targets.contains(&holder) {
+                // The holder serves: deliver its response through the normal path.
+                let mut app = ScriptedApp { calls: 0, missing_left: 0, invalid: false };
+                f.hotstuff.on_receive_msg(
+                    BlockDataResponse { view: ViewNumber::new(1), block: block.clone() }.into(),
+                    &holder, &mut f.tree, &mut app).unwrap();
+                arrived = f.tree.contains(&f.hash);
+                break;
+            }
+        }
+        let sync = f.hotstuff.take_sync_needed();
+        (asks, arrived, sync)
+    }
+
+    /// Codex P1 (fix/body-fetch-dead-peer): a validator that has been quiet > 2 s is not
+    /// necessarily dead (votes go to leaders, sync adverts run every 10 s). When the proposer
+    /// cannot serve and the only other holder is quiet but alive, the holder must still be asked
+    /// inside the budget and the body arrive without a sync fallback. A quiet validator is asked
+    /// only after the fast phase, so a truly dead one does not eat the early attempts.
+    #[test]
+    fn quiet_alive_holder_is_asked_within_the_body_fetch_budget() {
+        // (a) every other validator is quiet (the 3-validator shape); the holder is one of them.
+        let t0 = Instant::now();
+        let mut f = fetch_fixture(t0, 0, t0);
+        let silent = f.others.clone();
+        let holder = f.others[1];
+        let (asks, arrived, sync) = run_body_fetch_with_quiet_holder(&silent, holder, &mut f, t0);
+        assert!(asks.iter().any(|(_, t)| *t == holder), "quiet holder never asked: {:?}", label(&f, &asks));
+        assert!(arrived, "body did not arrive: {:?}", label(&f, &asks));
+        assert!(!sync, "fell back to sync although a live holder existed: {:?}", label(&f, &asks));
+        assert!(asks.iter().filter(|(_, t)| silent.contains(t)).all(|(at, _)| *at > 900),
+            "quiet validators were asked in the fast phase: {:?}", label(&f, &asks));
+
+        // (b) one other validator is heard from but does not hold the body; the holder is quiet.
+        let t0 = Instant::now();
+        let mut f = fetch_fixture(t0, 0, t0);
+        let holder = f.others[1];
+        let (asks, arrived, sync) = run_body_fetch_with_quiet_holder(&[holder], holder, &mut f, t0);
+        assert!(arrived && !sync, "quiet holder not reached in the budget: {:?}", label(&f, &asks));
+        assert!(asks.iter().filter(|(_, t)| *t == holder).all(|(at, _)| *at > 900),
+            "the quiet validator was asked in the fast phase: {:?}", label(&f, &asks));
+    }
+
+    /// Codex P1, justify side: the by-hash justify fetch (fast phase only) reserves its last
+    /// asks for quiet validators instead of excluding them, and asks the proposer before them.
+    #[test]
+    fn justify_fetch_reserves_late_asks_for_quiet_validators() {
+        let t0 = Instant::now();
+        let mut f = fetch_fixture(t0, 0, t0);
+        let hash = CryptoHash::new([98; 32]);
+        f.hotstuff.set_started_at_for_test(t0.checked_sub(Duration::from_secs(60)).unwrap());
+        let quiet = f.others.clone();
+        let mut seen = Vec::new();
+        for attempt in 0..MAX_BODY_RETRIES_TOTAL {
+            let now = Instant::now();
+            f.hotstuff.note_peer_heard(&f.origin, now);
+            let stale = now.checked_sub(BODY_RETRY_INTERVAL * 2).unwrap();
+            f.hotstuff.justify_fetch_tracker.insert(hash, (stale, attempt, f.origin, ViewNumber::new(1)));
+            f.hotstuff.tick_justify_fetch_retries(&f.tree);
+            seen.extend(f.net.take().into_iter().map(|t| (attempt, t)));
+        }
+        assert_eq!(seen.len(), MAX_BODY_RETRIES_TOTAL as usize);
+        for q in &quiet {
+            assert!(seen.iter().any(|(_, t)| t == q), "quiet validator never asked: {:?}", label(&f, &seen));
+        }
+        let first_quiet = seen.iter().position(|(_, t)| quiet.contains(t)).expect("asked above");
+        assert!(first_quiet >= (MAX_BODY_RETRIES_TOTAL as usize) - quiet.len(),
+            "quiet validators asked before the late reserved slots: {:?}", label(&f, &seen));
+        assert!(seen[..first_quiet].iter().all(|(_, t)| *t == f.origin));
+    }
+
+    /// Codex P2 on 5f216e6a: reserving quiet-validator slots must not cost a live validator its
+    /// ask. 10 validators: requester, proposer, six live, two quiet; only `live[5]` holds the
+    /// justify block. The old schedule asked it (attempt 7); it must still be asked before the
+    /// justify fetch gives up to sync (there is no slow phase), and the quiet ones still last.
+    #[test]
+    fn justify_fetch_reserving_quiet_slots_still_asks_every_live_validator() {
+        let t0 = Instant::now();
+        let mut f = fetch_fixture_n(t0, 0, t0, 10);
+        assert_eq!(f.others.len(), 8);
+        let quiet = f.others[6..].to_vec();
+        let holder = f.others[5];
+        let hash = CryptoHash::new([97; 32]);
+        f.hotstuff.set_started_at_for_test(t0.checked_sub(Duration::from_secs(60)).unwrap());
+        let mut seen = Vec::new();
+        let mut gave_up = false;
+        for attempt in 0..32u8 {
+            let now = Instant::now();
+            for vk in f.others.iter().chain(std::iter::once(&f.origin)).filter(|vk| !quiet.contains(vk)) {
+                f.hotstuff.note_peer_heard(vk, now);
+            }
+            let stale = now.checked_sub(BODY_RETRY_INTERVAL * 2).unwrap();
+            f.hotstuff.justify_fetch_tracker.insert(hash, (stale, attempt, f.origin, ViewNumber::new(1)));
+            f.hotstuff.tick_justify_fetch_retries(&f.tree);
+            let asked = f.net.take();
+            if asked.is_empty() {
+                gave_up = !f.hotstuff.justify_fetch_tracker.contains_key(&hash);
+                break;
+            }
+            seen.extend(asked);
+            if seen.contains(&holder) {
+                break;
+            }
+        }
+        assert!(seen.contains(&holder), "live[5] never asked before the sync fallback (gave_up={gave_up}, {} asks)", seen.len());
+        assert!(!gave_up && !f.hotstuff.take_sync_needed());
+        let first_live5 = seen.iter().position(|t| *t == holder).unwrap();
+        assert!(seen[..first_live5].iter().all(|t| !quiet.contains(t)), "a quiet validator was asked before a live one");
     }
 
     /// Slow-phase retries stop quietly once the block reached the tree by

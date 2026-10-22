@@ -3724,13 +3724,40 @@ impl Default for Metrics {
     }
 }
 
+/// 9k one-down: libp2p-gossipsub 0.49 logs every message it cannot queue to a
+/// slow peer as `warn!("Send Queue full. Could not send {:?}", rpc)`, i.e. the
+/// WHOLE message payload Debug-formatted as a decimal byte list (~400 KB per
+/// line), on the swarm task. With a validator killed, its zombie QUIC
+/// connection keeps it in the mesh until the 10 s idle timeout and every
+/// publish / forward to it hits this line: 1,279 lines = 307 MB on one
+/// survivor in ~10 s (9k2 r4-K val0), during which the survivors' direct
+/// messages (headers, body requests / responses) stopped for ~7 s and body
+/// fetches fell back to sync. The drop stays visible: the swarm's `SlowPeer`
+/// arm counts it and logs a compact throttled WARN.
+pub const GOSSIPSUB_PAYLOAD_WARN_DIRECTIVE: &str = "libp2p_gossipsub::behaviour=error";
+
+/// The subscriber filter: `rust_log` (default `info`) plus
+/// [`GOSSIPSUB_PAYLOAD_WARN_DIRECTIVE`], unless `rust_log` itself names a
+/// `libp2p_gossipsub` level (an explicit operator choice wins).
+pub fn build_env_filter(rust_log: Option<&str>) -> EnvFilter {
+    let spec = rust_log.filter(|s| !s.trim().is_empty()).unwrap_or("info");
+    let filter = EnvFilter::try_new(spec).unwrap_or_else(|_| EnvFilter::new("info"));
+    if spec.contains("libp2p_gossipsub") {
+        return filter;
+    }
+    match GOSSIPSUB_PAYLOAD_WARN_DIRECTIVE.parse() {
+        Ok(directive) => filter.add_directive(directive),
+        Err(_) => filter,
+    }
+}
+
 /// Initialize the global tracing subscriber.
 ///
 /// - Reads `RUST_LOG` env var for filtering (default: `info`).
 /// - `json = true` emits structured JSON logs (for production).
 /// - `json = false` emits human-readable logs (for development).
 pub fn init_tracing(json: bool) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = build_env_filter(std::env::var("RUST_LOG").ok().as_deref());
 
     if json {
         tracing_subscriber::registry()
@@ -3939,6 +3966,54 @@ pub fn sell_cut_metric_names() -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod env_filter_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tracing_subscriber::layer::{Context, Layer};
+
+    struct Count(Arc<AtomicUsize>);
+    impl<S: tracing::Subscriber> Layer<S> for Count {
+        fn on_event(&self, _: &tracing::Event<'_>, _: Context<'_, S>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Events that pass `build_env_filter(rust_log)`: (gossipsub warn, gossipsub error, other warn).
+    fn passed(rust_log: Option<&str>) -> (usize, usize, usize) {
+        let run = |emit: &dyn Fn()| {
+            let n = Arc::new(AtomicUsize::new(0));
+            let sub = tracing_subscriber::registry()
+                .with(build_env_filter(rust_log))
+                .with(Count(n.clone()));
+            tracing::subscriber::with_default(sub, emit);
+            n.load(Ordering::SeqCst)
+        };
+        (
+            run(&|| tracing::warn!(target: "libp2p_gossipsub::behaviour", "Send Queue full. Could not send {:?}", [0u8; 4])),
+            run(&|| tracing::error!(target: "libp2p_gossipsub::behaviour", "gossipsub error")),
+            run(&|| tracing::warn!(target: "torus_network::swarm", "other warn")),
+        )
+    }
+
+    /// 9k one-down: the per-message payload WARN never reaches the log by
+    /// default (no formatting cost on the swarm task); errors and every
+    /// other target's warnings still do.
+    #[test]
+    fn gossipsub_payload_warn_is_filtered_by_default() {
+        assert_eq!(passed(None), (0, 1, 1));
+        assert_eq!(passed(Some("info")), (0, 1, 1));
+        assert_eq!(passed(Some("warn,torus_network=debug")), (0, 1, 1));
+    }
+
+    /// An operator who names a gossipsub level explicitly gets exactly that.
+    #[test]
+    fn explicit_gossipsub_directive_wins() {
+        assert_eq!(passed(Some("info,libp2p_gossipsub=warn")), (1, 1, 1));
+    }
 }
 
 #[cfg(test)]

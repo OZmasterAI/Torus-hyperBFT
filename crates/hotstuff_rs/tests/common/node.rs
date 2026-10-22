@@ -26,7 +26,7 @@ use hotstuff_rs::{
 use crate::common::{
     mem_db::MemDB,
     network::NetworkStub,
-    number_app::{skip_record_key, NumberApp, NumberAppTransaction, QueuedTransaction},
+    number_app::{skip_record_key, NumberApp, NumberAppTransaction, QueuedTransaction, Refusal},
     verifying_key_bytes::VerifyingKeyBytes,
 };
 
@@ -119,6 +119,7 @@ impl Node {
             WedgeOptions::default(),
             DEFAULT_EPOCH_LENGTH,
             None,
+            None,
         )
     }
 
@@ -146,6 +147,7 @@ impl Node {
             true,
             wedge_options,
             DEFAULT_EPOCH_LENGTH,
+            None,
             None,
         )
     }
@@ -178,6 +180,7 @@ impl Node {
             WedgeOptions::default(),
             DEFAULT_EPOCH_LENGTH,
             None,
+            None,
         )
     }
 
@@ -205,6 +208,35 @@ impl Node {
             WedgeOptions::default(),
             epoch_length,
             kv_store,
+            None,
+        )
+    }
+
+    /// s138 (9k2 deep r4-U halt): like
+    /// [`new_with_wedge_options`](Self::new_with_wedge_options), with a
+    /// [`Refusal`]: as leader, the node refuses the block at `refusal.height`
+    /// while `refusal.active` is set.
+    #[allow(dead_code)]
+    pub(crate) fn new_with_refusal(
+        keypair: SigningKey,
+        network_stub: NetworkStub,
+        init_as_updates: AppStateUpdates,
+        init_vs_updates: ValidatorSetUpdates,
+        max_view_time: Duration,
+        wedge_options: WedgeOptions,
+        refusal: Refusal,
+    ) -> Node {
+        Self::build(
+            keypair,
+            network_stub,
+            init_as_updates,
+            init_vs_updates,
+            max_view_time,
+            true,
+            wedge_options,
+            DEFAULT_EPOCH_LENGTH,
+            None,
+            Some(refusal),
         )
     }
 
@@ -223,6 +255,7 @@ impl Node {
         wedge_options: WedgeOptions,
         epoch_length: u32,
         kv_store: Option<MemDB>,
+        refusal: Option<Refusal>,
     ) -> Node {
         let kv_store = kv_store.unwrap_or_else(|| {
             let kv_store = MemDB::new();
@@ -269,7 +302,8 @@ impl Node {
                 tx_queue.clone(),
                 wedge_options.produce_delay,
                 wedge_options.validate_delay,
-            ))
+            )
+            .with_refusal(refusal))
             .network(network_stub)
             .kv_store(kv_store.clone())
             .configuration(configuration)
@@ -455,16 +489,19 @@ fn receive_proposal_handler(
     verifying_key: VerifyingKeyBytes,
 ) -> impl Fn(&ReceiveProposalEvent) + Send + 'static {
     move |receive_proposal_event| {
-        let txn = Vec::<QueuedTransaction>::deserialize(
-            &mut &*receive_proposal_event.proposal.block.data.vec()[0]
-                .bytes()
-                .as_slice(),
-        )
-        .unwrap();
+        // s138: a refusal placeholder carries no datum.
+        let txn = receive_proposal_event
+            .proposal
+            .block
+            .data
+            .vec()
+            .first()
+            .and_then(|datum| Vec::<QueuedTransaction>::deserialize(&mut datum.bytes().as_slice()).ok());
 
-        let txn_printable = if txn.is_empty() {
-            String::from("no transactions")
-        } else {
+        let txn_printable = match txn {
+            None => String::from("no datum (refusal)"),
+            Some(txn) if txn.is_empty() => String::from("no transactions"),
+            Some(txn) => {
             let all: Vec<String> = txn
                 .iter()
                 .map(|(_id, tx)| match tx {
@@ -475,6 +512,7 @@ fn receive_proposal_handler(
                 })
                 .collect();
             all.join(", ")
+            }
         };
 
         log_with_context(
