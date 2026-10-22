@@ -291,18 +291,18 @@ fn two_blocks(features: u128, mode: Mode, streamed: bool) -> FillOut {
     ctx.save_order_books();
     drop(ctx);
     assert_eq!(
-        position(&db, A, 1).map(|p| p.size),
-        Some(fp(4)),
+        position(&db, A, 1).map(|p| (p.is_long, p.size)),
+        Some((true, fp(4))),
         "{tag}: A long 4"
     );
     assert_eq!(
-        position(&db, B, 1).map(|p| p.size),
-        Some(fp(-8)),
+        position(&db, B, 1).map(|p| (p.is_long, p.size)),
+        Some((false, fp(8))),
         "{tag}: B short 8"
     );
     assert_eq!(
-        position(&db, C, 1).map(|p| p.size),
-        Some(fp(4)),
+        position(&db, C, 1).map(|p| (p.is_long, p.size)),
+        Some((true, fp(4))),
         "{tag}: C long 4"
     );
     let mut out = FillOut {

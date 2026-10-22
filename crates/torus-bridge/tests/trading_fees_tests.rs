@@ -503,6 +503,10 @@ fn flat_close_with(
     bal.available = FixedPoint::from_raw(cash);
     bal.order_margin = FixedPoint::ZERO;
     ctx.positions.put_native_balance(&addr(2), &bal).unwrap();
+    // Owner s138 (merge with main's never-marked rule): the close happens
+    // at the mark, as a flat-loss close does (open_test_db's mark of 100
+    // would make a close at 90 / 93 an off-mark bad-debt close).
+    set_mark(&db, 1, fp(close_px), 1000);
     let before = total_collateral(&ctx);
     exec_on(
         &mut ctx,
