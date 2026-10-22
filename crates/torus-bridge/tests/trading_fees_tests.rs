@@ -459,11 +459,25 @@ fn exec_on(ctx: &mut NativeExecContext, batch: &[(Address, NativeAction)], run: 
 /// block so the parallel paths have two markets. Returns the context after
 /// the closing block and the total collateral before it.
 fn flat_close(close_px: i64, run: CloseRun) -> (tempfile::TempDir, StateDb, NativeExecContext, i128) {
+    flat_close_with(None, 10 * S / 100, close_px, run)
+}
+
+/// [`flat_close`] with governance `rates` and trader 2's `cash` (raw) before
+/// the close.
+fn flat_close_with(
+    rates: Option<(&str, &str)>,
+    cash: i128,
+    close_px: i64,
+    run: CloseRun,
+) -> (tempfile::TempDir, StateDb, NativeExecContext, i128) {
     let (dir, db) = open_test_db();
+    if let Some((t, m)) = rates {
+        set_rates(&db, t, m);
+    }
     let mut ctx = make_ctx(db.clone(), true);
     run_serial(&mut ctx, &[place(1, 1, false, 100, 10), place(2, 1, true, 100, 10)]);
     let mut bal = ctx.positions.get_native_balance(&addr(2)).unwrap();
-    bal.available = FixedPoint::from_raw(10 * S / 100);
+    bal.available = FixedPoint::from_raw(cash);
     bal.order_margin = FixedPoint::ZERO;
     ctx.positions.put_native_balance(&addr(2), &bal).unwrap();
     let before = total_collateral(&ctx);
@@ -525,34 +539,223 @@ fn a_flat_trader_pays_at_most_its_cash_and_the_treasury_only_what_was_paid() {
     }
 }
 
-/// The close realizes a 100 loss on 0.10 cash: the whole fee (0.405) is
-/// unpaid (not credited), and the remaining deficit (-99.90) moves to the
-/// liquidator vault as every flat deficit does (D9 `settle_flat_deficit`).
+/// The batch paths agree byte for byte on `db` (the first run is kept).
+fn same_state_across_batch_paths(first: &mut Option<(Dump, B256)>, run: CloseRun, db: &StateDb) {
+    let state = (dump(db), compute_native_state_root(db).unwrap());
+    if let CloseRun::Batch(_) = run {
+        match first {
+            None => *first = Some(state),
+            Some(f) => {
+                assert_eq!(state.1, f.1, "{run:?}: state root");
+                assert!(state.0 == f.0, "{run:?}: state dump differs");
+            }
+        }
+    }
+}
+
+/// Owner s138 ("fees only", [claude-review] P2): the close realizes a 100
+/// loss on 0.10 cash. Only the fee (0.405) is waived (not credited, not in
+/// `cfee`); the loss-only debt (-99.90) stays on the flat account as on
+/// main (repaid by its next deposit), nothing moves to the vault. RED
+/// before: the debt moved to the vault (D9) and the account showed 0.
 #[test]
-fn a_flat_loss_deficit_moves_to_the_vault_and_its_fee_is_not_credited() {
+fn a_flat_loss_debt_stays_on_the_account_and_only_the_fee_is_waived() {
     let mut first: Option<(Dump, B256)> = None;
     for run in all_runs() {
         let (_d, db, ctx, before) = flat_close(90, run);
-        assert_eq!(collateral(&ctx, &addr(2)), 0, "{run:?}");
-        assert_eq!(collateral(&ctx, &VAULT), -9_990 * S / 100, "{run:?}: vault carries the loss");
+        assert_eq!(collateral(&ctx, &addr(2)), -9_990 * S / 100, "{run:?}: the loss debt stays");
+        assert_eq!(collateral(&ctx, &VAULT), 0, "{run:?}: nothing for the vault");
         // Block 1: 0.60; block 2: maker 3 pays 0.135 (900 @ 150 ppm), market 2 0.12.
         let want = 60 * S / 100 + 135 * S / 1000 + 12 * S / 100;
         assert_eq!(available(&ctx, TREASURY), want, "{run:?}: treasury");
         assert_eq!(cum_fee(&db, 2), Some(45 * S / 100), "{run:?}: nothing paid on the close");
         // The realized 100 left the cash pool (trader 1's short holds it as
-        // unrealized gain); fees and the deficit move moved cash only.
+        // unrealized gain); the waived fee was never debited.
         assert_eq!(total_collateral(&ctx), before - 100 * S, "{run:?}: conserved");
-        let state = (dump(&db), compute_native_state_root(&db).unwrap());
-        if let CloseRun::Batch(_) = run {
-            match &first {
-                None => first = Some(state),
-                Some(f) => {
-                    assert_eq!(state.1, f.1, "{run:?}: state root");
-                    assert!(state.0 == f.0, "{run:?}: state dump differs");
+        same_state_across_batch_paths(&mut first, run, &db);
+    }
+}
+
+/// Owner example: cash 50, the close realizes a 70 loss, fee 0 (zero rates,
+/// bit on): the balance stays at -20 (main's behaviour), the vault and the
+/// treasury are untouched. RED before: -20 moved to the vault.
+#[test]
+fn a_flat_loss_without_fee_keeps_mains_debt() {
+    let mut first: Option<(Dump, B256)> = None;
+    for run in all_runs() {
+        let (_d, db, ctx, before) = flat_close_with(Some(("0", "0")), 50 * S, 93, run);
+        assert_eq!(collateral(&ctx, &addr(2)), -20 * S, "{run:?}: debt stays");
+        assert_eq!(collateral(&ctx, &VAULT), 0, "{run:?}: vault untouched");
+        assert_eq!(treasury_row(&db), None, "{run:?}: no fee, no treasury row");
+        assert_eq!(total_collateral(&ctx), before - 70 * S, "{run:?}: conserved");
+        same_state_across_batch_paths(&mut first, run, &db);
+    }
+}
+
+/// Owner example: cash 50, loss 50 (close @ 95, notional 950), fee 0.4275:
+/// the cash pays the loss first, the whole fee is waived (treasury not
+/// credited), the account ends at 0. Mixed case (cash 50.10): the loss
+/// first, then the 0.10 left pays part of the fee, the shortfall (0.3275)
+/// is waived, the account ends at 0.
+#[test]
+fn a_flat_loss_is_paid_first_and_the_fee_is_waived_up_to_the_shortfall() {
+    for (cash, paid) in [(50 * S, 0), (50 * S + 10 * S / 100, 10 * S / 100)] {
+        let mut first: Option<(Dump, B256)> = None;
+        for run in all_runs() {
+            let (_d, db, ctx, before) = flat_close_with(None, cash, 95, run);
+            assert_eq!(collateral(&ctx, &addr(2)), 0, "{run:?} cash {cash}: ends at 0");
+            assert_eq!(collateral(&ctx, &VAULT), 0, "{run:?}: vault untouched");
+            // Block 1: 0.60; block 2: 2 paid `paid`, maker 3 0.1425
+            // (950 @ 150 ppm), market 2 0.12.
+            let want = 60 * S / 100 + paid + 1_425 * S / 10_000 + 12 * S / 100;
+            assert_eq!(available(&ctx, TREASURY), want, "{run:?} cash {cash}: treasury");
+            assert_eq!(cum_fee(&db, 2), Some(45 * S / 100 + paid), "{run:?}: cfee = paid");
+            assert_eq!(total_collateral(&ctx), before - 50 * S, "{run:?}: conserved");
+            same_state_across_batch_paths(&mut first, run, &db);
+        }
+    }
+}
+
+/// [claude-review] P3-1: with a maker rebate (taker 450, maker -300 ppm) a
+/// flat taker's waived fee must never make the treasury pay out. The
+/// rebate part of a taker fee (0.30 of 0.45) is never waived (the maker
+/// was paid it); only the treasury's share (0.15) is. Trader 2 (0.10 cash,
+/// no PnL) is left owing 0.20; every fill nets the treasury >= 0. RED
+/// before: 0.35 waived, the treasury netted -0.20 on the close and ended
+/// at -0.02.
+#[test]
+fn a_waived_taker_fee_never_makes_the_treasury_pay_a_rebate() {
+    let mut first: Option<(Dump, B256)> = None;
+    for run in all_runs() {
+        let (_d, db, ctx, before) = flat_close_with(Some(("450", "-300")), 10 * S / 100, 100, run);
+        assert_eq!(collateral(&ctx, &addr(2)), -20 * S / 100, "{run:?}: owes the rebate part");
+        assert_eq!(cum_fee(&db, 2), Some(45 * S / 100 + 30 * S / 100), "{run:?}: cfee = paid");
+        assert_eq!(cum_fee(&db, 3), Some(-30 * S / 100), "{run:?}: maker keeps its rebate");
+        // Block 1: 0.45 - 0.30; block 2: close nets 0 (0.30 paid - 0.30
+        // rebate), market 2 (200): 0.09 - 0.06.
+        let want = 15 * S / 100 + 3 * S / 100;
+        assert_eq!(available(&ctx, TREASURY), want, "{run:?}: treasury never pays out");
+        assert_eq!(collateral(&ctx, &VAULT), 0, "{run:?}");
+        assert_eq!(total_collateral(&ctx), before, "{run:?}: conserved");
+        same_state_across_batch_paths(&mut first, run, &db);
+    }
+}
+
+/// A full rebate (maker -450 = -taker): nothing of the taker fee is the
+/// treasury's, so nothing is waived; the treasury is never touched.
+#[test]
+fn a_full_rebate_waives_nothing() {
+    for run in all_runs() {
+        let (_d, db, ctx, before) = flat_close_with(Some(("450", "-450")), 10 * S / 100, 100, run);
+        assert_eq!(collateral(&ctx, &addr(2)), -35 * S / 100, "{run:?}");
+        assert_eq!(treasury_row(&db), None, "{run:?}: net 0 on every fill");
+        assert_eq!(total_collateral(&ctx), before, "{run:?}: conserved");
+    }
+}
+
+// ---- [claude-review] P3-2: a fill failing after earlier fills applied ----
+
+/// A backend whose writes of one armed `(cf, key)` row fail (a local
+/// fault); everything else delegates.
+#[derive(Clone)]
+struct FailOneWrite {
+    inner: StateDb,
+    armed: std::sync::Arc<std::sync::Mutex<Option<(&'static str, Vec<u8>)>>>,
+}
+
+impl FailOneWrite {
+    fn hit(&self, cf: &str, key: &[u8]) -> bool {
+        self.armed
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(c, k)| *c == cf && k.as_slice() == key)
+    }
+    fn fail() -> torus_state::StateError {
+        torus_state::StateError::Io(std::io::Error::other("injected write failure"))
+    }
+}
+
+impl StateBackend for FailOneWrite {
+    fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, torus_state::StateError> {
+        self.inner.get_cf_raw(cf, key)
+    }
+    fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), torus_state::StateError> {
+        if self.hit(cf, key) {
+            return Err(Self::fail());
+        }
+        self.inner.put_cf_raw(cf, key, value)
+    }
+    fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), torus_state::StateError> {
+        self.inner.delete_cf_raw(cf, key)
+    }
+    fn iterate_cf(
+        &self,
+        cf: &str,
+        prefix: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, torus_state::StateError> {
+        self.inner.iterate_cf(cf, prefix)
+    }
+    fn atomic_write(&self, ops: &[torus_state::AtomicWriteOp<'_>]) -> Result<(), torus_state::StateError> {
+        for op in ops {
+            if let torus_state::AtomicWriteOp::Put { cf, key, .. } = op {
+                if self.hit(cf, key) {
+                    return Err(Self::fail());
                 }
             }
         }
+        self.inner.atomic_write(ops)
     }
+}
+
+/// Single path: makers 1 (10 @ 100) and 3 (10 @ 101) rest; taker 2 buys 20
+/// @ 101. Maker 3's side of fill 1 fails (its `cum_volume` write) after
+/// fill 0 and the taker's side of fill 1 applied. Every applied side pays
+/// its fee, as the per-side charging did: taker 2 both fills, maker 1 fill
+/// 0, maker 3 nothing; the treasury gets the sum. RED before: the early
+/// return skipped `charge_order_fees`, so no applied fill paid.
+#[test]
+fn single_path_charges_every_applied_fill_side_when_a_later_fill_fails() {
+    let (_dir, db) = open_test_db();
+    let backend = FailOneWrite { inner: db.clone(), armed: Default::default() };
+    let mut ctx = NativeExecContext::new(
+        backend.clone(),
+        1,
+        1000,
+        0,
+        100,
+        10,
+        addr(99),
+        addr(TREASURY),
+        addr(101),
+    );
+    ctx.features = Feature::TradingFees.bit();
+    for n in 1..=3u8 {
+        let bal = NativeBalance { available: fp(1_000_000), order_margin: FixedPoint::ZERO };
+        ctx.positions.put_native_balance(&addr(n), &bal).unwrap();
+    }
+    for (who, a) in [place(1, 1, false, 100, 10), place(3, 1, false, 101, 10)] {
+        let r = NativeExecutor::execute(&mut ctx, &who, &a);
+        assert!(r.success, "{:?}", r.error);
+    }
+    *backend.armed.lock().unwrap() =
+        Some((CF_NATIVE_BALANCES, torus_core::position::cum_volume_key(&addr(3)).to_vec()));
+    let (who, a) = place(2, 1, true, 101, 20);
+    let r = NativeExecutor::execute(&mut ctx, &who, &a);
+    assert!(
+        r.error.as_deref().is_some_and(|e| e.starts_with("maker fill failed")),
+        "{:?}",
+        r.error
+    );
+    assert!(ctx.take_fatal_error().is_some(), "a local fault fail-stops");
+    // Fill 0: 1000 (taker 0.45, maker 0.15); fill 1: 1010 (taker 0.4545).
+    let (t0, m0, t1) = (45 * S / 100, 15 * S / 100, 4_545 * S / 10_000);
+    assert_eq!(cum_fee(&db, 2), Some(t0 + t1), "taker: both applied sides");
+    assert_eq!(cum_fee(&db, 1), Some(m0), "maker of fill 0");
+    assert_eq!(cum_fee(&db, 3), None, "maker 3's side did not apply");
+    let bal = |n: u8| ctx.positions.get_native_balance(&addr(n)).unwrap().available.raw();
+    assert_eq!(bal(TREASURY), t0 + m0 + t1, "treasury: the applied sides' sum");
+    assert_eq!(bal(1), fp(1_000_000).raw() - m0);
 }
 
 // ---- Codex s138 #1: the fee keys follow the feature bit ----
