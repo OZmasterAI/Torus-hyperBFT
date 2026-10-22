@@ -51,6 +51,7 @@ fn test_order_book_reader_position() {
         realized_pnl: FixedPoint::ZERO,
         isolated_margin: TestHarness::fp(5000),
         margin_type: torus_core::position::MarginType::Isolated,
+        funding: None,
     };
     h.positions.put_position(&pos).unwrap();
 

@@ -1,4 +1,6 @@
-//! s80: builders for the `newTrades` and `userFills` WebSocket streams.
+//! s80: builders for the `newTrades` and `userFills` WebSocket streams;
+//! s139: `orderUpdates` (below) and the `l2Book` request (its feed is
+//! [`crate::book_stream`]).
 //!
 //! The execution thread publishes each executed block's fills once as an
 //! `Arc<BlockFills>`; the notifier wraps it in a [`StreamBlock`]. A
@@ -14,12 +16,14 @@ use std::sync::{Arc, Mutex};
 use alloy_primitives::Address;
 use serde_json::value::RawValue;
 use tokio::sync::OnceCell;
+use torus_state::order_events::{BlockOrderEvents, OrderEvent};
 use torus_state::trade_rows::{BlockFills, TradeFill};
 use torus_types::FixedPoint;
 
+use crate::book_stream::{L2_DEFAULT_LEVELS, L2_MAX_LEVELS};
 use crate::types::{
-    dec_fp, hex_address, hex_u128, hex_u64, parse_address, parse_u64, RpcStreamTrade, RpcTrade,
-    RpcUserFill,
+    dec_fp, hex_address, hex_u128, hex_u64, parse_address, parse_u64, RpcOrderUpdate,
+    RpcStreamTrade, RpcTrade, RpcUserFill,
 };
 
 /// A validated `torus_subscribe` request.
@@ -29,6 +33,11 @@ pub enum StreamKind {
     NewTrades(Option<u64>),
     /// `userFills {user}`: the fills where `user` is maker or taker.
     UserFills(Address),
+    /// s139: `l2Book {marketId, nLevels?}`: the market's best `levels`
+    /// levels per side, a full snapshot per change.
+    L2Book { market: u64, levels: usize },
+    /// s139: `orderUpdates {user}`: the transitions of `user`'s orders.
+    OrderUpdates(Address),
 }
 
 /// Parse and validate a `torus_subscribe(kind, params)` call. Runs before the
@@ -61,9 +70,92 @@ pub fn parse_stream_kind(
             let user = parse_address(user).map_err(|e| format!("userFills: user: {e}"))?;
             Ok(StreamKind::UserFills(user))
         }
+        "orderUpdates" => {
+            let user = field("user")?.ok_or("orderUpdates: params.user is required")?;
+            let user = parse_address(user).map_err(|e| format!("orderUpdates: user: {e}"))?;
+            Ok(StreamKind::OrderUpdates(user))
+        }
+        "l2Book" => {
+            let market = field("marketId")?.ok_or("l2Book: params.marketId is required")?;
+            let market = parse_u64(market).map_err(|e| format!("l2Book: marketId: {e}"))?;
+            let levels = match params.and_then(|m| m.get("nLevels")) {
+                None | Some(serde_json::Value::Null) => L2_DEFAULT_LEVELS as u64,
+                Some(serde_json::Value::Number(n)) => n.as_u64().ok_or_else(|| {
+                    format!("l2Book: nLevels must be 1..={L2_MAX_LEVELS}, got {n}")
+                })?,
+                Some(serde_json::Value::String(s)) => {
+                    parse_u64(s).map_err(|e| format!("l2Book: nLevels: {e}"))?
+                }
+                Some(other) => {
+                    return Err(format!("l2Book: nLevels must be a number, got {other}"))
+                }
+            };
+            if levels == 0 || levels > L2_MAX_LEVELS as u64 {
+                return Err(format!("l2Book: nLevels must be 1..={L2_MAX_LEVELS}, got {levels}"));
+            }
+            Ok(StreamKind::L2Book {
+                market,
+                levels: levels as usize,
+            })
+        }
         other => Err(format!(
-            "unknown subscription kind {other:?}; expected \"newTrades\" or \"userFills\""
+            "unknown subscription kind {other:?}; expected \"newTrades\", \"userFills\", \
+             \"l2Book\" or \"orderUpdates\""
         )),
+    }
+}
+
+/// s139: the `orderUpdates` rows of one block for `user`, in the block's
+/// event order. Encodings as `torus_getOpenOrders` (ids, heights hex;
+/// prices and sizes decimal strings).
+pub fn order_updates_for_user(block: &BlockOrderEvents, user: Address) -> Vec<RpcOrderUpdate> {
+    block
+        .events
+        .iter()
+        .filter(|e| e.trader == user)
+        .map(|e| order_update(block, e))
+        .collect()
+}
+
+fn order_update(block: &BlockOrderEvents, e: &OrderEvent) -> RpcOrderUpdate {
+    use torus_state::order_events::{OrderEventReason as R, OrderEventStatus as S};
+    let status = match e.status {
+        S::Open => "open",
+        S::PartiallyFilled => "partiallyFilled",
+        S::Filled => "filled",
+        S::Canceled => "canceled",
+        S::TriggerPending => "triggerPending",
+        S::Triggered => "triggered",
+        S::Modified => "modified",
+        S::Rejected => "rejected",
+    };
+    let reason = match e.reason {
+        R::None => None,
+        R::User => Some("user"),
+        R::SelfTrade => Some("self_trade"),
+        R::ReduceOnly => Some("reduce_only"),
+        R::Margin => Some("margin"),
+        R::Liquidation => Some("liquidation"),
+        R::Delisted => Some("delisted"),
+        R::MarketParams => Some("market_params"),
+        R::Unfilled => Some("unfilled"),
+        R::Reject(f) => Some(f.as_str()),
+    };
+    RpcOrderUpdate {
+        order_id: e.order_id.map(hex_u128),
+        client_order_id: e.cloid.map(torus_types::cloid_serde::to_hex),
+        market_id: hex_u64(e.market),
+        side: side_str(e.side == torus_types::Side::Buy),
+        price: dec_fp(e.price),
+        trigger_price: e.trigger_price.map(dec_fp),
+        original_qty: dec_fp(e.orig_qty),
+        remaining_qty: dec_fp(e.remaining),
+        filled_qty: dec_fp(e.filled),
+        reduce_only: e.reduce_only,
+        status: status.to_string(),
+        reason: reason.map(str::to_string),
+        block_number: hex_u64(block.height),
+        timestamp: hex_u64(block.timestamp),
     }
 }
 
@@ -241,6 +333,7 @@ pub fn fills_for_user(block: &BlockFills, user: Address) -> Vec<RpcUserFill> {
                 e.maker_order_id,
                 e.maker_start_raw,
                 e.maker_pnl_raw,
+                e.maker_fee_raw,
             ));
         }
         if f.taker == user {
@@ -252,6 +345,7 @@ pub fn fills_for_user(block: &BlockFills, user: Address) -> Vec<RpcUserFill> {
                 e.taker_order_id,
                 e.taker_start_raw,
                 e.taker_pnl_raw,
+                e.taker_fee_raw,
             ));
         }
     }
@@ -259,7 +353,7 @@ pub fn fills_for_user(block: &BlockFills, user: Address) -> Vec<RpcUserFill> {
 }
 
 /// One `userFills` row for the party with `role`, `bought`, `order_id`,
-/// `start_raw` and `pnl_raw`.
+/// `start_raw`, `pnl_raw` and `fee_raw` (its trading fee).
 fn user_fill(
     block: &BlockFills,
     f: &TradeFill,
@@ -268,6 +362,7 @@ fn user_fill(
     order_id: u128,
     start_raw: i128,
     pnl_raw: i128,
+    fee_raw: i128,
 ) -> RpcUserFill {
     RpcUserFill {
         trade_id: hex_u128(f.trade_index as u128),
@@ -279,6 +374,7 @@ fn user_fill(
         order_id: hex_u128(order_id),
         start_position: dec_fp(FixedPoint::from_raw(start_raw)),
         closed_pnl: dec_fp(FixedPoint::from_raw(pnl_raw)),
+        fee: block.trading_fees.then(|| dec_fp(FixedPoint::from_raw(fee_raw))),
         dir: fill_dir(start_raw, bought, f.qty_raw).to_string(),
         block_number: hex_u64(block.height),
         timestamp: hex_u64(block.timestamp),
@@ -313,6 +409,7 @@ mod tests {
         BlockFills {
             height: 7,
             timestamp: 1_700_000_007,
+            trading_fees: true,
             fills: vec![
                 fill(0, 1, A, B, 100 * S, 25 * S / 10, 0),
                 fill(1, 2, C, A, 50 * S, S, 1),
@@ -326,6 +423,8 @@ mod tests {
                     taker_start_raw: 0,
                     maker_pnl_raw: -825 * S / 10,
                     taker_pnl_raw: 0,
+                    maker_fee_raw: 375 * S / 10_000,
+                    taker_fee_raw: 1_125 * S / 10_000,
                 },
                 FillExtras {
                     maker_order_id: 33,
@@ -334,6 +433,8 @@ mod tests {
                     taker_start_raw: S / 2,
                     maker_pnl_raw: 0,
                     taker_pnl_raw: 125 * S / 100,
+                    maker_fee_raw: 0,
+                    taker_fee_raw: 0,
                 },
                 FillExtras {
                     maker_order_id: 55,
@@ -342,6 +443,8 @@ mod tests {
                     taker_start_raw: 15 * S / 10,
                     maker_pnl_raw: 0,
                     taker_pnl_raw: 0,
+                    maker_fee_raw: 0,
+                    taker_fee_raw: 0,
                 },
             ],
         }
@@ -434,7 +537,7 @@ mod tests {
                 "price": "100.00000000", "quantity": "2.50000000",
                 "role": "taker", "orderId": "0x16",
                 "startPosition": "0.00000000", "closedPnl": "0.00000000",
-                "dir": "Open Long", "blockNumber": "0x7", "timestamp": "0x6553f107",
+                "fee": "0.11250000", "dir": "Open Long", "blockNumber": "0x7", "timestamp": "0x6553f107",
             })
         );
     }
@@ -451,7 +554,7 @@ mod tests {
                 "price": "100.00000000", "quantity": "2.50000000",
                 "role": "maker", "orderId": "0xb",
                 "startPosition": "3.00000000", "closedPnl": "-82.50000000",
-                "dir": "Close Long", "blockNumber": "0x7", "timestamp": "0x6553f107",
+                "fee": "0.03750000", "dir": "Close Long", "blockNumber": "0x7", "timestamp": "0x6553f107",
             })
         );
         // #1: A is the taker and sells 1 from long 0.5: a flip.
@@ -489,6 +592,32 @@ mod tests {
             ("0x42", "1.50000000")
         );
         assert_eq!(t.dir, "Open Long");
+    }
+
+    /// Codex s138 #3: before `trading_fees` is active the row is exactly the
+    /// pre-feature row (no `fee` key), and a pre-feature row still
+    /// deserializes (`fee` absent = `None`).
+    #[test]
+    fn streams_fills_for_user_omits_fee_before_activation_and_reads_legacy_rows() {
+        let mut pre = block();
+        pre.trading_fees = false;
+        let legacy = json!({
+            "tradeId": "0x0", "marketId": "0x1", "side": "buy",
+            "price": "100.00000000", "quantity": "2.50000000",
+            "role": "taker", "orderId": "0x16",
+            "startPosition": "0.00000000", "closedPnl": "0.00000000",
+            "dir": "Open Long", "blockNumber": "0x7", "timestamp": "0x6553f107",
+        });
+        let rows = fills_for_user(&pre, B);
+        assert_eq!(to_json(&rows)[0], legacy);
+        for r in &rows {
+            assert_eq!(r.fee, None);
+        }
+        let back: RpcUserFill = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.fee, None);
+        let on = to_json(&fills_for_user(&block(), B));
+        let round: RpcUserFill = serde_json::from_value(on[0].clone()).unwrap();
+        assert_eq!(round.fee.as_deref(), Some("0.11250000"));
     }
 
     #[test]
@@ -639,10 +768,18 @@ mod subscribe_ws_tests {
         addr: SocketAddr,
         notifier: BlockNotifier,
         subs: Arc<AtomicUsize>,
+        state: StateDb,
+        feed: Arc<crate::book_stream::BookFeed>,
     }
 
     async fn start(notifier: BlockNotifier) -> Node {
         start_with(notifier, None).await
+    }
+
+    /// s139: a node whose `l2Book` feed holds `cap` ticks and polls every
+    /// `poll`.
+    async fn start_l2(cap: usize, poll: Duration) -> Node {
+        start_full(BlockNotifier::new(), None, Some((cap, poll))).await
     }
 
     /// A node configured like `torus-node` with `TORUS_ALL_MARKET_TRADES=env`
@@ -653,12 +790,20 @@ mod subscribe_ws_tests {
     }
 
     async fn start_with(notifier: BlockNotifier, all_market_trades: Option<bool>) -> Node {
+        start_full(notifier, all_market_trades, None).await
+    }
+
+    async fn start_full(
+        notifier: BlockNotifier,
+        all_market_trades: Option<bool>,
+        book_feed: Option<(usize, Duration)>,
+    ) -> Node {
         let dir = TempDir::new().unwrap();
         let state = StateDb::open(dir.path()).unwrap();
         let mempool = Arc::new(Mempool::new(state.clone(), MempoolConfig::default()));
         let executor = Arc::new(EvmExecutor::new(TORUS_CHAIN_ID));
         let mut server = RpcServer::new(
-            state,
+            state.clone(),
             mempool,
             executor,
             TORUS_CHAIN_ID,
@@ -668,7 +813,11 @@ mod subscribe_ws_tests {
         if let Some(allowed) = all_market_trades {
             server.set_all_market_trades(allowed);
         }
+        if let Some((cap, poll)) = book_feed {
+            server.set_book_feed(cap, poll);
+        }
         let subs = server.state().active_subscriptions.clone();
+        let feed = server.state().book_feed.clone();
         let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
         Node {
             _dir: dir,
@@ -676,6 +825,8 @@ mod subscribe_ws_tests {
             addr,
             notifier,
             subs,
+            state,
+            feed,
         }
     }
 
@@ -776,6 +927,7 @@ mod subscribe_ws_tests {
         BlockFills {
             height: 8,
             timestamp: 1_700_000_008,
+            trading_fees: true,
             fills: vec![f],
             extras: vec![b7.extras[1]],
         }
@@ -1077,5 +1229,353 @@ mod subscribe_ws_tests {
         assert!(Arc::ptr_eq(&p1, &p2));
         assert_eq!(p1.get(), want_m1);
         assert_eq!(sb.payload_builds(), 2);
+    }
+
+    // --- s139: orderUpdates ----------------------------------------------
+
+    fn order_block(height: u64) -> torus_state::order_events::BlockOrderEvents {
+        use torus_state::order_events::{OrderEvent, OrderEventReason as R, OrderEventStatus as St};
+        let fpi = |v: i64| FixedPoint::from_raw(v as i128 * FixedPoint::SCALE);
+        let ev = |trader: u8, id: Option<u128>, status, reason, filled: i64, remaining: i64| OrderEvent {
+            market: 1,
+            order_id: id,
+            trader: Address::repeat_byte(trader),
+            cloid: id.map(|i| i + 0x100),
+            side: torus_types::Side::Sell,
+            price: fpi(100),
+            trigger_price: None,
+            orig_qty: fpi(5),
+            remaining: fpi(remaining),
+            filled: fpi(filled),
+            reduce_only: false,
+            status,
+            reason,
+        };
+        torus_state::order_events::BlockOrderEvents {
+            height,
+            timestamp: 1_700_000_000 + height,
+            events: vec![
+                ev(0xaa, Some(7), St::Open, R::None, 0, 5),
+                ev(0xbb, Some(8), St::Filled, R::None, 2, 0),
+                ev(0xaa, Some(7), St::PartiallyFilled, R::None, 2, 3),
+                ev(0xaa, None, St::Rejected, R::Reject(torus_state::action_status::FailureReason::Tick), 0, 0),
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn order_updates_stream_filters_by_user() {
+        let node = start(BlockNotifier::new()).await;
+        let mut ws = connect(node.addr).await;
+        let user = format!("0x{}", "aa".repeat(20));
+        let sub = ws.subscribe(json!(["orderUpdates", { "user": user }])).await;
+        wait_subs(&node.subs, 1).await;
+        // Execution records events only while a subscriber exists.
+        use torus_state::trade_rows::FillSink;
+        assert!(node.notifier.wants_order_events());
+
+        node.notifier.notify_order_events(Arc::new(order_block(7)));
+        // A block with no event of the user: no message.
+        let mut other = order_block(8);
+        other.events.retain(|e| e.trader != Address::repeat_byte(0xaa));
+        node.notifier.notify_order_events(Arc::new(other));
+        node.notifier.notify_order_events(Arc::new(order_block(9)));
+
+        let n = ws.recv().await;
+        assert_eq!(n["method"], "torus_subscription", "{n}");
+        assert_eq!(n["params"]["subscription"], sub);
+        let want = order_updates_for_user(&order_block(7), Address::repeat_byte(0xaa));
+        assert_eq!(want.len(), 3);
+        assert_eq!(n["params"]["result"], to_json(&want));
+        assert_eq!(
+            n["params"]["result"][0],
+            json!({
+                "orderId": "0x7", "clientOrderId": "0x00000000000000000000000000000107",
+                "marketId": "0x1", "side": "sell", "price": "100.00000000",
+                "originalQty": "5.00000000", "remainingQty": "5.00000000",
+                "filledQty": "0.00000000", "reduceOnly": false, "status": "open",
+                "blockNumber": "0x7", "timestamp": "0x6553f107"
+            })
+        );
+        assert_eq!(n["params"]["result"][1]["status"], "partiallyFilled");
+        assert_eq!(n["params"]["result"][1]["filledQty"], "2.00000000");
+        assert_eq!(n["params"]["result"][2]["status"], "rejected");
+        assert_eq!(n["params"]["result"][2]["reason"], "tick");
+        assert_eq!(n["params"]["result"][2]["orderId"], Value::Null);
+        // Height 8 sent nothing: the next message is height 9.
+        let n = ws.recv().await;
+        assert_eq!(n["params"]["result"][0]["blockNumber"], "0x9", "{n}");
+        assert!(ws.recv_within(QUIET).await.is_none(), "extra frame");
+    }
+
+    #[tokio::test]
+    async fn order_updates_requires_valid_user() {
+        let node = start(BlockNotifier::new()).await;
+        let mut ws = connect(node.addr).await;
+        for params in [
+            json!(["orderUpdates"]),
+            json!(["orderUpdates", {}]),
+            json!(["orderUpdates", {"user": "0x12"}]),
+        ] {
+            let rp = ws.request("torus_subscribe", params.clone()).await;
+            assert_eq!(rp["error"]["code"], -32602, "{params}: {rp}");
+        }
+        assert_eq!(node.subs.load(Ordering::Relaxed), 0);
+        use torus_state::trade_rows::FillSink;
+        assert!(!node.notifier.wants_order_events(), "no subscriber, no recording");
+    }
+
+    #[tokio::test]
+    async fn order_updates_lagging_subscriber_is_closed() {
+        let node = start(BlockNotifier::with_trade_capacity(2)).await;
+        let mut ws = connect(node.addr).await;
+        let user = format!("0x{}", "aa".repeat(20));
+        let sub = ws.subscribe(json!(["orderUpdates", { "user": user }])).await;
+        wait_subs(&node.subs, 1).await;
+        for h in 1..=5u64 {
+            node.notifier.notify_order_events(Arc::new(order_block(h)));
+        }
+        let n = ws.recv().await;
+        assert_eq!(n["params"]["subscription"], sub, "{n}");
+        assert_eq!(
+            n["params"]["error"],
+            "subscriber lagged: 3 blocks dropped; resubscribe and resync with torus_getOpenOrders",
+            "{n}"
+        );
+        wait_subs(&node.subs, 0).await;
+    }
+
+    // --- s139: l2Book ----------------------------------------------------
+
+    /// Write `book` (Classic blob) and the applied height in one batch, as a
+    /// block's flush does.
+    fn commit_book(state: &StateDb, book: &torus_core::order_book::OrderBook, height: u64) {
+        let mut b = rocksdb::WriteBatch::default();
+        b.put_cf(
+            state.cf_handle(torus_state::cf::CF_NATIVE_ORDER_BOOKS).unwrap(),
+            book.market_id.to_be_bytes(),
+            borsh::to_vec(book).unwrap(),
+        );
+        b.put_cf(
+            state.cf_handle(torus_state::cf::CF_CONSENSUS_META).unwrap(),
+            torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
+            height.to_be_bytes(),
+        );
+        state.write(b).unwrap();
+    }
+
+    fn set_applied(state: &StateDb, height: u64) {
+        state
+            .put_cf_raw(
+                torus_state::cf::CF_CONSENSUS_META,
+                torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
+                &height.to_be_bytes(),
+            )
+            .unwrap();
+    }
+
+    fn place(book: &mut torus_core::order_book::OrderBook, trader: u8, is_buy: bool, price: i64, qty: i64) {
+        let fpi = |v: i64| FixedPoint::from_raw(v as i128 * FixedPoint::SCALE);
+        book.place_order(
+            torus_types::PlaceOrderParams {
+                market_id: book.market_id,
+                is_buy,
+                price: fpi(price),
+                quantity: fpi(qty),
+                order_type: torus_types::OrderType::Limit,
+                time_in_force: torus_types::TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: None,
+            },
+            Address::repeat_byte(trader),
+            1,
+        );
+    }
+
+    /// `torus_getOrderBook(market, depth)` in `l2Book`'s `levels` shape.
+    async fn rpc_levels<S: TransportSenderT, R: TransportReceiverT>(
+        ws: &mut Ws<S, R>,
+        market: &str,
+        depth: u32,
+    ) -> Value {
+        let rp = ws.request("torus_getOrderBook", json!([market, depth])).await;
+        let side = |v: &Value| -> Value {
+            Value::Array(
+                v.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|l| json!({"px": l["price"], "sz": l["quantity"], "n": l["orderCount"]}))
+                    .collect(),
+            )
+        };
+        json!([side(&rp["result"]["bids"]), side(&rp["result"]["asks"])])
+    }
+
+    /// The subscription's first message is `torus_getOrderBook`'s answer at
+    /// the applied height (seq 0); then one message per height whose best
+    /// `nLevels` changed, each equal to the method's answer at that height,
+    /// seq contiguous, heights increasing; an unchanged height sends nothing.
+    #[tokio::test]
+    async fn l2book_snapshot_then_updates_equal_rpc_book() {
+        let node = start_l2(64, Duration::from_millis(5)).await;
+        let mut book = torus_core::order_book::OrderBook::new(1, FixedPoint::ONE, FixedPoint::ONE);
+        for p in 0..5 {
+            place(&mut book, 0xa1, true, 90 - p, 1 + p);
+            place(&mut book, 0xa2, false, 110 + p, 2);
+        }
+        commit_book(&node.state, &book, 1);
+
+        let mut ws = connect(node.addr).await;
+        let mut rpc = connect(node.addr).await;
+        let sub = ws.subscribe(json!(["l2Book", {"marketId": "0x1", "nLevels": 3}])).await;
+        let n = ws.recv().await;
+        assert_eq!(n["params"]["subscription"], sub, "{n}");
+        let r = &n["params"]["result"];
+        assert_eq!(r["marketId"], "0x1", "{n}");
+        assert_eq!(r["blockNumber"], "0x1", "{n}");
+        assert_eq!(r["seq"], "0x0", "{n}");
+        assert_eq!(r["levels"], rpc_levels(&mut rpc, "0x1", 3).await, "{n}");
+        assert_eq!(r["levels"][0][0], json!({"px": "90.00000000", "sz": "1.00000000", "n": 1}));
+
+        let mut seq = 0;
+        for h in 2..=7u64 {
+            let changes = h % 3 != 0;
+            if changes {
+                // A new best bid each time (inside the top 3).
+                place(&mut book, 0xa3, true, 90 + h as i64, 1);
+                commit_book(&node.state, &book, h);
+            } else {
+                // A change below the top 3 only, then a bare height bump:
+                // the top 3 are unchanged, nothing is sent.
+                place(&mut book, 0xa3, true, 10, 1);
+                commit_book(&node.state, &book, h);
+                set_applied(&node.state, h);
+                continue;
+            }
+            let n = ws.recv().await;
+            seq += 1;
+            let r = &n["params"]["result"];
+            assert_eq!(r["blockNumber"], hex_u64(h), "{n}");
+            assert_eq!(r["seq"], hex_u64(seq), "gap-free seq: {n}");
+            assert_eq!(r["levels"], rpc_levels(&mut rpc, "0x1", 3).await, "height {h}: {n}");
+        }
+        assert_eq!(seq, 4);
+        assert!(ws.recv_within(QUIET).await.is_none(), "extra frame");
+    }
+
+    #[tokio::test]
+    async fn l2book_rejects_bad_params() {
+        let node = start_l2(64, Duration::from_millis(5)).await;
+        let mut ws = connect(node.addr).await;
+        for params in [
+            json!(["l2Book"]),
+            json!(["l2Book", {}]),
+            json!(["l2Book", {"marketId": "zz"}]),
+            json!(["l2Book", {"marketId": "0x1", "nLevels": 0}]),
+            json!(["l2Book", {"marketId": "0x1", "nLevels": 101}]),
+            json!(["l2Book", {"marketId": "0x1", "nLevels": true}]),
+        ] {
+            let rp = ws.request("torus_subscribe", params.clone()).await;
+            assert_eq!(rp["error"]["code"], -32602, "{params}: {rp}");
+        }
+        assert_eq!(node.subs.load(Ordering::Relaxed), 0);
+        assert!(node.feed.markets().is_empty());
+        assert!(!node.feed.running(), "no subscription, no publisher");
+    }
+
+    /// Unsubscribing (or closing) unregisters the market and the publisher
+    /// task stops once nothing is subscribed.
+    #[tokio::test]
+    async fn l2book_subscribe_unsubscribe_stops_the_publisher() {
+        let node = start_l2(64, Duration::from_millis(5)).await;
+        let mut ws = connect(node.addr).await;
+        let a = ws.subscribe(json!(["l2Book", {"marketId": "0x1"}])).await;
+        let first = ws.recv().await;
+        // An empty book at height 0.
+        assert_eq!(first["params"]["result"]["levels"], json!([[], []]), "{first}");
+        assert_eq!(first["params"]["result"]["blockNumber"], "0x0", "{first}");
+        let b = ws.subscribe(json!(["l2Book", {"marketId": "0x2", "nLevels": "0x5"}])).await;
+        ws.recv().await;
+        wait_subs(&node.subs, 2).await;
+        assert_eq!(node.feed.markets(), vec![1, 2]);
+        assert!(node.feed.running());
+        let rp = ws.request("torus_unsubscribe", json!([a])).await;
+        assert_eq!(rp["result"], true, "{rp}");
+        wait_subs(&node.subs, 1).await;
+        assert_eq!(node.feed.markets(), vec![2]);
+        let rp = ws.request("torus_unsubscribe", json!([b])).await;
+        assert_eq!(rp["result"], true, "{rp}");
+        wait_subs(&node.subs, 0).await;
+        assert!(node.feed.markets().is_empty());
+        for _ in 0..500 {
+            if !node.feed.running() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the publisher did not stop");
+    }
+
+    /// Codex P2 (s139): a tick for another market does not advance the
+    /// subscription's height, so a forced refresh of the subscribed market at
+    /// that same height (a subscription joining during a publisher read) is
+    /// still delivered.
+    #[tokio::test]
+    async fn l2book_other_market_tick_does_not_swallow_refresh() {
+        // The publisher never polls in this test; the ticks are injected.
+        let node = start_l2(16, Duration::from_secs(3600)).await;
+        let mut ws = connect(node.addr).await;
+        let sub = ws.subscribe(json!(["l2Book", {"marketId": "0x1"}])).await;
+        let first = ws.recv().await;
+        assert_eq!(first["params"]["result"]["blockNumber"], "0x0", "{first}");
+        wait_subs(&node.subs, 1).await;
+        let tick = |market: u64, price: &str| {
+            let level = crate::types::RpcPriceLevel {
+                price: price.to_string(),
+                quantity: "0x1".to_string(),
+                order_count: 1,
+            };
+            let snap = crate::book_stream::BookSnap::new(vec![level], Vec::new());
+            let mut books = std::collections::BTreeMap::new();
+            books.insert(market, Ok(Arc::new(snap)));
+            Arc::new(crate::book_stream::BookTick { height: 1, books })
+        };
+        let _ = node.feed.tx.send(tick(2, "0x2"));
+        let _ = node.feed.tx.send(tick(1, "0x64"));
+        let n = ws.recv().await;
+        assert_eq!(n["params"]["subscription"], sub, "{n}");
+        assert_eq!(n["params"]["result"]["blockNumber"], "0x1", "{n}");
+        assert_eq!(n["params"]["result"]["seq"], "0x1", "{n}");
+        assert_eq!(n["params"]["result"]["levels"][0][0]["px"], "0x64", "{n}");
+    }
+
+    /// A subscriber more than the feed's capacity behind is closed with a
+    /// lag error.
+    #[tokio::test]
+    async fn l2book_lagging_subscriber_is_closed() {
+        // The publisher never polls in this test; the ticks are injected.
+        let node = start_l2(2, Duration::from_secs(3600)).await;
+        let mut ws = connect(node.addr).await;
+        let sub = ws.subscribe(json!(["l2Book", {"marketId": "0x1"}])).await;
+        ws.recv().await;
+        wait_subs(&node.subs, 1).await;
+        for h in 1..=5u64 {
+            let snap = crate::book_stream::BookSnap::new(Vec::new(), Vec::new());
+            let mut books = std::collections::BTreeMap::new();
+            books.insert(1u64, Ok(Arc::new(snap)));
+            let _ = node
+                .feed
+                .tx
+                .send(Arc::new(crate::book_stream::BookTick { height: h, books }));
+        }
+        let n = ws.recv().await;
+        assert_eq!(n["params"]["subscription"], sub, "{n}");
+        assert_eq!(
+            n["params"]["error"],
+            "subscriber lagged: 3 book updates dropped; resubscribe (the first message is a \
+             full snapshot)",
+            "{n}"
+        );
+        wait_subs(&node.subs, 0).await;
     }
 }

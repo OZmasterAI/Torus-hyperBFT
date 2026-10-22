@@ -308,11 +308,26 @@ impl OrderBook {
     /// Falls back to the sequential loop — before any mutation — when fewer
     /// than two senders own orders or any index is stale/shared, so unusual
     /// states keep their exact sequential behavior.
+    ///
+    /// s139: every cancelled order and stop is logged with the cancel cause
+    /// while the event log is on.
     pub fn cancel_all_many(&mut self, senders: &[Address]) -> Vec<Vec<Order>> {
-        match self.plan_cancel_all_many(senders) {
+        let stops = self.stops_if_logging(|t| senders.contains(t));
+        let cancelled = match self.plan_cancel_all_many(senders) {
             Some(plan) => self.apply_cancel_all_many(senders, plan),
-            None => senders.iter().map(|s| self.cancel_all(*s, None)).collect(),
+            None => senders
+                .iter()
+                .map(|s| self.cancel_all_unlogged(*s, None))
+                .collect(),
+        };
+        if self.order_events.is_some() {
+            self.log_stops_gone(stops);
+            let cause = self.cancel_cause;
+            for o in cancelled.iter().flatten() {
+                self.log_removed(o, cause);
+            }
         }
+        cancelled
     }
 
     /// Read-only. Planning memory scales with the run's targets, never with

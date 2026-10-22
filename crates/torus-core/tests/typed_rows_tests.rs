@@ -160,6 +160,7 @@ fn pos(t: u8, m: MarketId, size: i64) -> Position {
         realized_pnl: FixedPoint::ZERO,
         isolated_margin: FixedPoint::ZERO,
         margin_type: MarginType::Cross,
+        funding: None,
     }
 }
 

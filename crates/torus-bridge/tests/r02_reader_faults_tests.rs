@@ -115,6 +115,7 @@ fn put_position(ctx: &Ctx, trader: Address, size: i64) {
             realized_pnl: FixedPoint::ZERO,
             isolated_margin: FixedPoint::ZERO,
             margin_type: MarginType::Cross,
+            funding: None,
         })
         .unwrap();
 }

@@ -5446,8 +5446,12 @@ impl ExecutionContext {
         // R02 branch 8 (B): a queue read error is a node fault: fail-stop
         // (C4), never "assume due" — as the oracle / liquidation due-checks.
         // Item 7 option 0 (task 1.3): through the block overlay (DB + in-flight
-        // layers), after the EVM part; this block's own queue rows target later
-        // heights, so they never answer for `height`.
+        // layers), after the EVM part and its absorb. Without item 7 T this
+        // block's own queue rows target later heights, so they never answer for
+        // `height`; under `Feature::SameBlockCoreWriter` its non-order rows
+        // target `height` and are seen here (the absorb precedes the check on
+        // every path: serial, barrier, replay, fast path), so an EVM block whose
+        // only native work is its own rows still runs the drain.
         let core_writer_due = {
             #[cfg(test)]
             let _probe_scope = torus_state::probes::scope(torus_state::probes::Reader::DueCheck);
@@ -5973,6 +5977,14 @@ impl ExecutionContext {
             // With no subscriber, exec records only what history needs (s78).
             // Checked once per block, before execution.
             ctx.record_fills = self.fill_sink.get().is_some_and(|s| s.wants_fills());
+            // s139: while an `orderUpdates` subscriber exists, the books log
+            // this block's order events and the executor records pre-book
+            // rejections (output-only). Checked once per block.
+            ctx.set_order_events(
+                self.fill_sink
+                    .get()
+                    .is_some_and(|s| s.wants_order_events()),
+            );
 
             let engine_timer = std::time::Instant::now();
             // Item 2: aggregate every listed market BEFORE any action, at the block
@@ -6190,6 +6202,16 @@ impl ExecutionContext {
             // index (timed: `exec_action_status_seconds`).
             #[cfg(test)]
             let oracle_results = (pre_results.clone(), post_results.clone());
+            // s139: the block's order events (every book's log, the triggered
+            // stops' pre-book rejections, then the action results' pre-book
+            // rejections), taken before `native_failures` moves the results'
+            // messages. Sent after the flush / hand-off, with the fills.
+            let order_events = ctx.order_events_on().then(|| {
+                let mut events = ctx.take_order_events();
+                crate::action_results::order_rejections(&pre_evm, &pre_results, &mut events);
+                crate::action_results::order_rejections(&post_evm, &post_results, &mut events);
+                events
+            });
             let action_status_timer = std::time::Instant::now();
             let core_writer = crate::action_results::core_writer_results(core_writer_drained);
             // s112: a block that drained CoreWriter rows has a record even
@@ -6349,6 +6371,7 @@ impl ExecutionContext {
             // O3: this block's fills (their rows go to the background writer
             // AFTER the flush / hand-off below, never before).
             let (fills_block, fills_ts) = (ctx.block_height, ctx.timestamp);
+            let fills_fees = ctx.feature_active(torus_types::Feature::TradingFees);
             // s80: `extras` is empty unless a stream wanted this block's fills.
             let (fills, extras) = ctx.take_pending_fills_and_extras();
             // Item 6 C2: this block's mark table / configs ride the block's
@@ -6653,6 +6676,16 @@ impl ExecutionContext {
             // A hard crash can lose the last few queued batches,
             // which is a cosmetic RPC trade-history gap, never consensus state.
             //
+            // s139: the order events go out the same way (only blocks with any).
+            if let (Some(events), Some(sink)) = (order_events, self.fill_sink.get()) {
+                if !events.is_empty() {
+                    sink.send_order_events(Arc::new(torus_state::order_events::BlockOrderEvents {
+                        height: fills_block,
+                        timestamp: fills_ts,
+                        events,
+                    }));
+                }
+            }
             // s80: the fills are wrapped once; the stream sink (if installed)
             // and the trade writer share the same Arc. Emitted here, after the
             // flush / hand-off, so a block whose hand-off failed (shutdown)
@@ -6661,6 +6694,7 @@ impl ExecutionContext {
                 let block = Arc::new(torus_state::trade_rows::BlockFills {
                     height: fills_block,
                     timestamp: fills_ts,
+                    trading_fees: fills_fees,
                     fills,
                     extras,
                 });
@@ -22546,6 +22580,161 @@ mod crash_recovery_tests {
         }
     }
 
+    /// s139: a sink with an `orderUpdates` subscriber (order events wanted,
+    /// fills not).
+    struct OrderEventSink {
+        seen: Arc<std::sync::Mutex<Vec<Arc<torus_state::order_events::BlockOrderEvents>>>>,
+    }
+
+    impl torus_state::trade_rows::FillSink for OrderEventSink {
+        fn wants_fills(&self) -> bool {
+            false
+        }
+        fn send_fills(&self, _block: Arc<torus_state::trade_rows::BlockFills>) {}
+        fn wants_order_events(&self) -> bool {
+            true
+        }
+        fn send_order_events(&self, block: Arc<torus_state::order_events::BlockOrderEvents>) {
+            self.seen.lock().unwrap().push(block);
+        }
+    }
+
+    /// s139: with an order-event subscriber, every executed block with order
+    /// events reaches the sink once, in height order, serial and pipelined
+    /// alike, with the events of its placements and fills; and every CF and
+    /// the native root equal a run without a sink (the events never touch
+    /// state).
+    #[test]
+    fn order_event_sink_receives_each_block_and_state_is_unchanged() {
+        use torus_state::order_events::OrderEventStatus as S;
+        for on in [false, true] {
+            let (plain, root_plain, _) = run_fill_fixture(on, true, None);
+            torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
+            let (_cfg, state_db) = make_test_config_and_db();
+            fund_pipeline_fixture(&state_db);
+            let mut ctx = pipeline_ctx(&state_db, on, None);
+            ctx.trade_history = true;
+            let seen: Arc<std::sync::Mutex<Vec<_>>> = Default::default();
+            let sink: Arc<dyn torus_state::trade_rows::FillSink> =
+                Arc::new(OrderEventSink { seen: seen.clone() });
+            assert!(ctx.fill_sink.set(sink).is_ok());
+            for b in &pipeline_fixture_blocks() {
+                dispatch_and_execute(&ctx, &state_db, b);
+            }
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fixture must not fail-stop");
+            drop(ctx);
+            let root = torus_state::native_trie::persisted_native_root(&state_db).unwrap();
+            assert_dumps_equal(&plain, &dump_all_cfs(&state_db), &format!("order sink vs none (on={on})"));
+            assert_eq!(root_plain, root, "native root (on={on})");
+
+            let seen = seen.lock().unwrap().clone();
+            let got: Vec<(u64, Vec<S>)> = seen
+                .iter()
+                .map(|b| {
+                    let mut st: Vec<S> = b.events.iter().map(|e| e.status).collect();
+                    st.sort_by_key(|s| format!("{s:?}"));
+                    (b.height, st)
+                })
+                .collect();
+            assert_eq!(
+                got,
+                vec![
+                    // A rests, B crosses it: the maker and the taker fill.
+                    (3, vec![S::Filled, S::Filled, S::Open]),
+                    (5, vec![S::Open]),
+                    (6, vec![S::Filled, S::Filled]),
+                    (10, vec![S::Open]),
+                    (11, vec![S::Filled, S::Filled]),
+                    (13, vec![S::Open]),
+                ],
+                "pipeline on={on}"
+            );
+            for b in &seen {
+                assert!(b.timestamp > 0, "on={on}");
+                assert!(b.events.iter().all(|e| e.order_id.is_some() && e.market == 1), "on={on}");
+            }
+        }
+    }
+
+    /// s138 product batch: a sink with both a `userFills` and an
+    /// `orderUpdates` subscriber.
+    struct FillAndOrderSink {
+        fills: SeenFills,
+        orders: Arc<std::sync::Mutex<Vec<Arc<torus_state::order_events::BlockOrderEvents>>>>,
+    }
+
+    impl torus_state::trade_rows::FillSink for FillAndOrderSink {
+        fn wants_fills(&self) -> bool {
+            true
+        }
+        fn send_fills(&self, block: Arc<torus_state::trade_rows::BlockFills>) {
+            self.fills.lock().unwrap().push(block);
+        }
+        fn wants_order_events(&self) -> bool {
+            true
+        }
+        fn send_order_events(&self, block: Arc<torus_state::order_events::BlockOrderEvents>) {
+            self.orders.lock().unwrap().push(block);
+        }
+    }
+
+    /// s138 product batch (trading fees + node-local WS streams): the blocks
+    /// handed to the stream sink say whether they ran `trading_fees` (the
+    /// executed header's bit), so `userFills` rows carry a `fee` only from the
+    /// activation (each fill's extras then hold its non-zero fees, else 0);
+    /// `orderUpdates` events carry no fee and are the same with the bit on or
+    /// off. Serial and pipelined alike.
+    #[test]
+    fn stream_sink_fills_carry_fees_only_with_trading_fees() {
+        let fees_bit = torus_types::Feature::TradingFees.bit();
+        for on in [false, true] {
+            let mut order_runs = Vec::new();
+            for fees_on in [false, true] {
+                torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
+                let (_cfg, state_db) = make_test_config_and_db();
+                fund_pipeline_fixture(&state_db);
+                let mut ctx = pipeline_ctx(&state_db, on, None);
+                ctx.trade_history = true;
+                let fills: SeenFills = Default::default();
+                let orders: Arc<std::sync::Mutex<Vec<_>>> = Default::default();
+                let sink: Arc<dyn torus_state::trade_rows::FillSink> =
+                    Arc::new(FillAndOrderSink { fills: fills.clone(), orders: orders.clone() });
+                assert!(ctx.fill_sink.set(sink).is_ok());
+                let mut blocks = pipeline_fixture_blocks();
+                if fees_on {
+                    for b in &mut blocks {
+                        b.header.features |= fees_bit;
+                    }
+                    link_blocks(&mut blocks);
+                }
+                for b in &blocks {
+                    dispatch_and_execute(&ctx, &state_db, b);
+                }
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fixture must not fail-stop");
+                drop(ctx);
+                let fills = fills.lock().unwrap().clone();
+                let tag = format!("pipeline on={on} fees_on={fees_on}");
+                assert_eq!(fills.iter().map(|b| b.height).collect::<Vec<_>>(), vec![3, 6, 11], "{tag}");
+                for b in &fills {
+                    assert_eq!(b.trading_fees, fees_on, "{tag}: block {}", b.height);
+                    assert_eq!(b.extras.len(), b.fills.len(), "{tag}");
+                    for e in &b.extras {
+                        if fees_on {
+                            assert!(e.taker_fee_raw > 0 && e.maker_fee_raw > 0, "{tag}: {e:?}");
+                        } else {
+                            assert_eq!((e.taker_fee_raw, e.maker_fee_raw), (0, 0), "{tag}");
+                        }
+                    }
+                }
+                let orders: Vec<(u64, Vec<torus_state::order_events::OrderEvent>)> =
+                    orders.lock().unwrap().iter().map(|b| (b.height, b.events.clone())).collect();
+                assert!(!orders.is_empty(), "{tag}");
+                order_runs.push(orders);
+            }
+            assert_eq!(order_runs[0], order_runs[1], "pipeline on={on}: orderUpdates do not depend on fees");
+        }
+    }
+
     /// OFF yields byte-identical state in EVERY CF and the same persisted native
     /// root — across empties, an epoch boundary (serial), a duplicated action
     /// (nonce guard through the layer), a session created in k and used by verify
@@ -31298,6 +31487,556 @@ mod crash_recovery_tests {
                 &format!("CoreWriter due: pipeline off vs {what}"),
             );
         }
+    }
+
+    // ---- Item 7 T (`Feature::SameBlockCoreWriter`; design section 3 "T",
+    // test 12, questions 8 a / 9 a; owner s138: after the testnet genesis,
+    // through P0.0 at a height) ----
+
+    const T_BIT: u128 = torus_types::Feature::SameBlockCoreWriter.bit();
+    /// One lockbox deposit of the T fixtures, in whole tokens.
+    const T_DEPOSIT_TOKENS: i128 = 100;
+
+    fn t_depositor_key() -> k256::ecdsa::SigningKey {
+        k256::ecdsa::SigningKey::from_slice(&[74u8; 32]).unwrap()
+    }
+
+    fn t_depositor() -> Address {
+        k256_address(&t_depositor_key())
+    }
+
+    /// `pipeline_fixture_blocks` (13 blocks, fills at 3 / 6 / 11, epoch
+    /// length 4 under `t_ctx`) with one EVM lockbox deposit of
+    /// [`T_DEPOSIT_TOKENS`] at each height of `deposits` (the depositor's
+    /// nonces in that order) and the T bit in every header from `t_from`
+    /// (`None`: never), on top of the running-hash bit.
+    fn t_blocks(deposits: &[u64], t_from: Option<u64>) -> Vec<TorusBlock> {
+        let key = t_depositor_key();
+        let lockbox =
+            torus_core::precompiles::precompile_address(torus_core::precompiles::ADDR_LOCKBOX);
+        let wei = U256::from(T_DEPOSIT_TOKENS as u128 * 10u128.pow(18));
+        let mut calldata =
+            alloy_primitives::keccak256("depositToNative(uint128)".as_bytes())[..4].to_vec();
+        calldata.extend_from_slice(&wei.to_be_bytes::<32>());
+        let mut blocks = pipeline_fixture_blocks();
+        for (nonce, h) in deposits.iter().enumerate() {
+            let b = &mut blocks[*h as usize - 1];
+            b.evm_transactions.push(signed_eip1559_with_value(
+                &key,
+                nonce as u64,
+                alloy_primitives::TxKind::Call(lockbox),
+                calldata.clone(),
+                wei,
+            ));
+            b.header.evm_tx_count = b.evm_transactions.len() as u32;
+        }
+        for b in &mut blocks {
+            if t_from.is_some_and(|h| b.header.height >= h) {
+                b.header.features |= T_BIT;
+            }
+        }
+        link_blocks(&mut blocks);
+        blocks
+    }
+
+    /// [`t_blocks`] with a second market's crossing pair next to market 1's
+    /// fills at 3, 6 and 11 (k_a sells, k_b buys one lot at 100 in market
+    /// 2), so on the engine (`test_engine_threads`) those blocks run the
+    /// parallel settle and L2.1 streams its pass B.
+    fn t_blocks_two_markets(deposits: &[u64], t_from: Option<u64>) -> Vec<TorusBlock> {
+        let k_a = k256::ecdsa::SigningKey::from_slice(&[41u8; 32]).unwrap();
+        let k_b = k256::ecdsa::SigningKey::from_slice(&[42u8; 32]).unwrap();
+        let order = |is_buy: bool| {
+            NativeAction::PlaceOrder(torus_types::PlaceOrderParams {
+                market_id: 2,
+                is_buy,
+                price: FixedPoint::from_raw(100 * FixedPoint::SCALE),
+                quantity: FixedPoint::from_raw(FixedPoint::SCALE),
+                order_type: torus_types::OrderType::Limit,
+                time_in_force: torus_types::TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: None,
+            })
+        };
+        let mut blocks = t_blocks(deposits, t_from);
+        for (i, h) in [3u64, 6, 11].into_iter().enumerate() {
+            let b = &mut blocks[h as usize - 1];
+            let n = NONCE_BASE + 9_100 + 2 * i as u64;
+            b.native_actions
+                .push(torus_types::eip712::sign_native_action(order(false), n, &k_a));
+            b.native_actions
+                .push(torus_types::eip712::sign_native_action(order(true), n + 1, &k_b));
+            b.header.native_action_count = b.native_actions.len() as _;
+        }
+        link_blocks(&mut blocks);
+        blocks
+    }
+
+    /// The T fixtures' schedule: the running hash from 1, T from `t_from`.
+    fn t_schedule(t_from: Option<u64>) -> torus_types::ActivationSchedule {
+        let mut genesis: std::collections::BTreeMap<_, _> =
+            [(torus_types::Feature::RunningStateHash, 1)].into_iter().collect();
+        if let Some(h) = t_from {
+            genesis.insert(torus_types::Feature::SameBlockCoreWriter, h);
+        }
+        torus_types::ActivationSchedule::merge(&genesis, &[]).unwrap()
+    }
+
+    /// A fixture DB funded for `pipeline_fixture_blocks` and the depositor
+    /// (10 000 tokens of EVM balance).
+    fn t_db() -> StateDb {
+        let (_config, db) = make_test_config_and_db();
+        fund_pipeline_fixture(&db);
+        db.put_account(
+            &t_depositor(),
+            &revm::state::AccountInfo {
+                balance: U256::from(10u128.pow(22)),
+                nonce: 0,
+                code_hash: KECCAK_EMPTY_CODE,
+                code: None,
+                account_id: None,
+            },
+        )
+        .unwrap();
+        db
+    }
+
+    /// An execution context over `db` (epoch length 4, the T schedule):
+    /// with W iff `worker`, checkpoint policy `ckpt`, EVM fast path `fast`.
+    fn t_ctx(
+        db: &StateDb,
+        t_from: Option<u64>,
+        worker: bool,
+        ckpt: Option<crate::exec_pipeline::CheckpointPolicy>,
+        fast: bool,
+    ) -> ExecutionContext {
+        let (mut config, _) = make_test_config_and_db();
+        config.epoch_length = 4;
+        config.activations = t_schedule(t_from);
+        let mut ctx = make_exec_ctx(&config, db);
+        ctx.checkpoint = ckpt;
+        ctx.evm_fast_path = fast;
+        if worker {
+            ctx.attach_flush_worker(None);
+        }
+        ctx
+    }
+
+    /// Every execution path an EVM height can take: serial (no W), W with a
+    /// per-block flush, a checkpoint every 3 blocks and never by time, each
+    /// with the EVM fast path off (the EVM block is a barrier: serial after
+    /// a drain) and on (pipelined, its rows in its frozen set / L).
+    #[allow(clippy::type_complexity)]
+    fn t_configs() -> Vec<(
+        &'static str,
+        bool,
+        Option<crate::exec_pipeline::CheckpointPolicy>,
+        bool,
+    )> {
+        vec![
+            ("serial", false, None, false),
+            ("per block, EVM barrier", true, None, false),
+            ("per block, EVM fast path", true, None, true),
+            ("every 3, EVM barrier", true, Some(ckpt_every(3)), false),
+            ("every 3, EVM fast path", true, Some(ckpt_every(3)), true),
+            ("never, EVM barrier", true, Some(ckpt_never()), false),
+            ("never, EVM fast path", true, Some(ckpt_never()), true),
+        ]
+    }
+
+    /// The depositor's native balance (available + order margin) in `db`.
+    fn t_native(db: &StateDb) -> FixedPoint {
+        let bal = torus_core::position::PositionManager::new(db.clone())
+            .get_native_balance(&t_depositor())
+            .unwrap();
+        bal.available + bal.order_margin
+    }
+
+    fn t_tokens(deposits: usize) -> FixedPoint {
+        FixedPoint::from_raw(deposits as i128 * T_DEPOSIT_TOKENS * FixedPoint::SCALE)
+    }
+
+    fn t_queue_key(target: u64, seq: u64) -> Vec<u8> {
+        let mut k = target.to_be_bytes().to_vec();
+        k.extend_from_slice(&seq.to_be_bytes());
+        k
+    }
+
+    /// The queue rows in the raw DB, as `(target, seq)`.
+    fn t_db_queue(db: &StateDb) -> Vec<(u64, u64)> {
+        StateBackend::iterate_cf(db, torus_state::cf::CF_CORE_WRITER_QUEUE, None)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| {
+                (
+                    u64::from_be_bytes(k[..8].try_into().unwrap()),
+                    u64::from_be_bytes(k[8..16].try_into().unwrap()),
+                )
+            })
+            .collect()
+    }
+
+    /// The CoreWriter rows the v4 action status record of `h` holds, as
+    /// `(seq, queued block, executed)`.
+    fn t_drained(db: &StateDb, h: u64) -> Vec<(u64, u64, bool)> {
+        action_status(db, h)
+            .map(|s| {
+                s.core_writer
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.seq,
+                            r.queued_block,
+                            r.outcome == torus_state::action_status::Outcome::Executed,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Item 7 T, test 12 (first, fifth and sixth points): with the bit on,
+    /// an EVM lockbox deposit queued in block h is drained (and credited)
+    /// in h itself, after h's native batches, on every path: serial, W with
+    /// the EVM block as a barrier (flag off), and the EVM fast path, under
+    /// a per-block flush, a checkpoint every 3 and never by time. The EVM
+    /// blocks carry no native action, so their native phase runs for the
+    /// EVM part (gas) and the due-check after the absorb. The row is put
+    /// (absorb) and deleted (drain) in one overlay: it never reaches the
+    /// raw DB, and on the fast path block h's frozen set D(h) carries the
+    /// drain's tombstone for it. The status record of h holds the row as
+    /// (seq 0, queued h, executed); its CoreWriter tx link is keyed (h, 0).
+    /// Same final state on every path. RED before T: every deposit drained
+    /// at h + 1.
+    #[test]
+    fn t_same_block_deposit_drains_in_its_own_block_on_every_path() {
+        // T from 2: a feature at 1 would also be in the genesis parent
+        // header's bits (P0.0), which `make_block(1)` links to without it.
+        let deposits = [2u64, 5, 7, 9];
+        let blocks = t_blocks(&deposits, Some(2));
+        let mut dumps = Vec::new();
+        for (what, worker, ckpt, fast) in t_configs() {
+            let db = t_db();
+            let ctx = t_ctx(&db, Some(2), worker, ckpt, fast);
+            for b in &blocks {
+                let h = b.header.height;
+                dispatch_and_execute(&ctx, &db, b);
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: {h}");
+                if !deposits.contains(&h) {
+                    continue;
+                }
+                let done = deposits.iter().filter(|d| **d <= h).count();
+                if !worker {
+                    // Serial: the block's one flush is durable.
+                    assert_eq!(read_native_applied_height(&db), Some(h), "{what}");
+                    assert_eq!(t_native(&db), t_tokens(done), "{what}: credited at {h}");
+                }
+                if fast {
+                    let parent = ctx.last_job.lock().unwrap().clone().expect("pipelined");
+                    assert_eq!(parent.height(), h, "{what}: {h} pipelined");
+                    assert_eq!(
+                        parent.lookup_row(torus_state::cf::CF_CORE_WRITER_QUEUE, &t_queue_key(h, 0)),
+                        Some(None),
+                        "{what}: D({h}) carries the drain tombstone"
+                    );
+                }
+                assert!(t_db_queue(&db).is_empty(), "{what}: no queue row in the DB at {h}");
+            }
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&db), Some(13), "{what}");
+            assert_eq!(t_native(&db), t_tokens(deposits.len()), "{what}");
+            assert!(t_db_queue(&db).is_empty(), "{what}: queue CF empty");
+            for h in deposits {
+                assert_eq!(t_drained(&db, h), vec![(0, h, true)], "{what}: status of {h}");
+                assert_eq!(t_drained(&db, h + 1), vec![], "{what}: nothing at {}", h + 1);
+                assert!(
+                    db.get_cf_raw(
+                        torus_state::cf::CF_CORE_WRITER_TX,
+                        &torus_state::corewriter_tx::key(h, 0)
+                    )
+                    .unwrap()
+                    .is_some(),
+                    "{what}: tx link ({h}, 0)"
+                );
+            }
+            dumps.push((what, dump_all_cfs(&db)));
+        }
+        for (what, d) in &dumps[1..] {
+            assert_dumps_equal(&dumps[0].1, d, &format!("T: serial vs {what}"));
+        }
+    }
+
+    /// Item 7 T, P0.0 activation boundary at H = 6 (bit off below, on from
+    /// 6): the deposit queued at H - 1 (bit off) targets H as before
+    /// (h + 1) and is drained at H with the bit on; the deposit queued at H
+    /// takes the new target (H itself), behind it in the same-block range
+    /// (seq 1). The deposit at 9 drains at 9. Checked per block on the
+    /// serial path (each flush durable), and the final state is the same on
+    /// every path. Control (bit never on): the deposit queued at 6 drains
+    /// at 7, as today.
+    #[test]
+    fn t_activation_boundary_drains_h_minus_1_rows_at_h_and_retargets_from_h() {
+        const H: u64 = 6;
+        let deposits = [5u64, 6, 9];
+        let blocks = t_blocks(&deposits, Some(H));
+        assert_eq!(blocks[4].header.features & T_BIT, 0, "H - 1 without the bit");
+        assert_ne!(blocks[5].header.features & T_BIT, 0, "H with the bit");
+        let mut dumps = Vec::new();
+        for (what, worker, ckpt, fast) in t_configs() {
+            let db = t_db();
+            let ctx = t_ctx(&db, Some(H), worker, ckpt, fast);
+            for b in &blocks {
+                let h = b.header.height;
+                dispatch_and_execute(&ctx, &db, b);
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: {h}");
+                if worker {
+                    continue;
+                }
+                let (queue, credited) = match h {
+                    5 => (vec![(H, 0)], 0),
+                    6..=8 => (vec![], 2),
+                    9.. => (vec![], 3),
+                    _ => (vec![], 0),
+                };
+                assert_eq!(t_db_queue(&db), queue, "{what}: queue after {h}");
+                assert_eq!(t_native(&db), t_tokens(credited), "{what}: after {h}");
+            }
+            drop(ctx);
+            assert_eq!(t_db_queue(&db), vec![], "{what}");
+            assert_eq!(t_native(&db), t_tokens(3), "{what}");
+            assert_eq!(t_drained(&db, H), vec![(0, H - 1, true), (1, H, true)], "{what}");
+            assert_eq!(t_drained(&db, 9), vec![(0, 9, true)], "{what}");
+            dumps.push((what, dump_all_cfs(&db)));
+        }
+        for (what, d) in &dumps[1..] {
+            assert_dumps_equal(&dumps[0].1, d, &format!("T boundary: serial vs {what}"));
+        }
+        // Control: no activation, the H deposit drains at H + 1.
+        let blocks = t_blocks(&deposits, None);
+        let db = t_db();
+        let ctx = t_ctx(&db, None, false, None, false);
+        for b in &blocks[..H as usize] {
+            dispatch_and_execute(&ctx, &db, b);
+        }
+        assert_eq!(t_db_queue(&db), vec![(H + 1, 0)], "control: h + 1");
+        assert_eq!(t_native(&db), t_tokens(1), "control");
+    }
+
+    /// How [`t_crash_replay_run`] crashes the node in block `crash_at`.
+    #[derive(Clone, Copy, Debug)]
+    enum TCrash {
+        /// The process dies after block `crash_at` (whatever W wrote is
+        /// durable; the since-checkpoint window is lost).
+        Kill,
+        /// W's next write (block `crash_at`'s digest / flush / checkpoint)
+        /// fails: the fail-stop latches with the block's rows in flight.
+        FailWrite,
+    }
+
+    /// Run `blocks` pipelined (`ckpt`, EVM fast path `fast`) to `crash_at`,
+    /// crash there (`style`), check that no queue row of a target at or
+    /// below the durable marker is left in the DB (stranded), restart (boot
+    /// replay of the committed blocks above the marker, serial), run the
+    /// rest pipelined, and return the final dump.
+    fn t_crash_replay_run(
+        blocks: &[TorusBlock],
+        t_from: Option<u64>,
+        ckpt: crate::exec_pipeline::CheckpointPolicy,
+        fast: bool,
+        crash_at: u64,
+        style: TCrash,
+    ) -> (StateDb, Vec<CfDump>) {
+        let what = format!("{ckpt:?} fast={fast} crash at {crash_at} {style:?}");
+        let db = t_db();
+        let gate = crate::exec_pipeline::WorkerGate::new();
+        let (mut config, _) = make_test_config_and_db();
+        config.epoch_length = 4;
+        config.activations = t_schedule(t_from);
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.checkpoint = Some(ckpt);
+        ctx.evm_fast_path = fast;
+        ctx.test_engine_threads = Some(4);
+        ctx.attach_flush_worker(Some(gate.clone()));
+        for b in &blocks[..crash_at as usize - 1] {
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}");
+        }
+        if let TCrash::FailWrite = style {
+            gate.fail_next();
+        }
+        dispatch_and_execute(&ctx, &db, &blocks[crash_at as usize - 1]);
+        let _ = ctx.flush_worker.as_ref().unwrap().wait_idle();
+        // A crash: no shutdown checkpoint (latched before the drop).
+        ctx.exec_failed.store(true, Ordering::SeqCst);
+        drop(ctx);
+        let durable = read_native_applied_height(&db).unwrap_or(0);
+        assert!(durable <= crash_at, "{what}");
+        for (target, seq) in t_db_queue(&db) {
+            assert!(
+                target > durable,
+                "{what}: row ({target}, {seq}) at or below the durable marker {durable} (stranded)"
+            );
+        }
+        let mut replay = make_exec_ctx(&config, &db);
+        replay.test_engine_threads = Some(4);
+        let (_last, parked) = TorusApp::replay_committed(&db, &replay);
+        assert_eq!(parked, None, "{what}");
+        assert!(!replay.exec_failed.load(Ordering::SeqCst), "{what}: replay");
+        assert_eq!(read_native_applied_height(&db), Some(crash_at), "{what}: replayed");
+        let mut ctx = replay;
+        ctx.checkpoint = Some(ckpt);
+        ctx.evm_fast_path = fast;
+        ctx.attach_flush_worker(None);
+        for b in &blocks[crash_at as usize..] {
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}");
+        }
+        drop(ctx);
+        let dump = dump_all_cfs(&db);
+        (db, dump)
+    }
+
+    /// Item 7 T, s138 audit: a same-block queue row is written (absorb) and
+    /// deleted (drain) in one block, and the delete rides that block's
+    /// pending set into the since-checkpoint window and the checkpoint
+    /// flush, with L2.1's streamed settle on (`TORUS_SETTLE_STREAMED`,
+    /// default on) in the same native phases (the fixture fills at 3, 6,
+    /// 11). Deposits below H (2, 5: bit off, drained at 3 and 6) and from H
+    /// (6, 7, 9, 10: same block). Crashes at the boundary and after it, by
+    /// a kill and by a failed W write, with a checkpoint every 2 blocks and
+    /// never by time, EVM fast path off and on: no queue row is left in the
+    /// DB at or below the durable marker (none stranded), the boot replay
+    /// crosses H by the header bits, and the final state (every CF: the
+    /// queue CF empty, the depositor credited exactly once per deposit,
+    /// the status records, the tx links) equals the uncrashed serial run.
+    #[test]
+    fn t_same_block_rows_across_checkpoints_and_crash_replay_with_streamed_settle() {
+        use torus_bridge::native_executor::{
+            settle_streamed_calls_on_this_thread, with_settle_streamed,
+        };
+        const H: u64 = 6;
+        let deposits = [2u64, 5, 6, 7, 9, 10];
+        let blocks = t_blocks_two_markets(&deposits, Some(H));
+        let reference = {
+            let db = t_db();
+            let ctx = t_ctx(&db, Some(H), false, None, false);
+            for b in &blocks {
+                dispatch_and_execute(&ctx, &db, b);
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            }
+            drop(ctx);
+            assert_eq!(t_native(&db), t_tokens(deposits.len()));
+            assert!(t_db_queue(&db).is_empty());
+            dump_all_cfs(&db)
+        };
+        let before = settle_streamed_calls_on_this_thread();
+        let mut runs = 0;
+        with_settle_streamed(true, || {
+            for ckpt in [ckpt_every(2), ckpt_never()] {
+                for fast in [false, true] {
+                    for crash_at in [H, H + 1, 10] {
+                        for style in [TCrash::Kill, TCrash::FailWrite] {
+                            let what = format!("{ckpt:?} fast={fast} crash at {crash_at} {style:?}");
+                            let (db, dump) =
+                                t_crash_replay_run(&blocks, Some(H), ckpt, fast, crash_at, style);
+                            assert_eq!(t_native(&db), t_tokens(deposits.len()), "{what}: once");
+                            assert!(t_db_queue(&db).is_empty(), "{what}: queue CF empty");
+                            assert_dumps_equal(&reference, &dump, &what);
+                            runs += 1;
+                        }
+                    }
+                }
+            }
+        });
+        assert_eq!(runs, 24);
+        assert!(
+            settle_streamed_calls_on_this_thread() > before,
+            "L2.1 streamed the fills' settle"
+        );
+    }
+
+    /// Item 7 T, P0.0 mixed versions: a binary that does not know
+    /// `Feature::SameBlockCoreWriter` (id 2) refuses a header carrying it
+    /// (no vote, no insertion: `UPGRADE REQUIRED`) and fail-stops before
+    /// executing it (nothing of H flushed; the H - 1 deposit's row waits in
+    /// the DB, not stranded); a binary that knows it votes for the header
+    /// at its scheduled height and refuses it without the bit. Upgraded,
+    /// the stopped node replays H by the header bits and ends equal to a
+    /// node that ran T from the start.
+    #[test]
+    fn t_old_binary_refuses_and_stops_at_the_bit_and_upgraded_replays_it() {
+        // Vote and insertion.
+        let parent = with_features(tip_2000(), 0); // height 4, no bits
+        let at5 = t_schedule(Some(5));
+        let rsh = torus_types::Feature::RunningStateHash.bit();
+        let mut new = gated_app(2_010, at5.clone());
+        let b5 = with_features(child_of(&parent, 2_000), rsh | T_BIT);
+        assert_eq!(pre_vote(&mut new, &parent, &b5), BlockDataCheck::Held);
+        assert_eq!(insertion_link(&new, &parent, &b5), BlockDataCheck::Held);
+        let without = with_features(child_of(&parent, 2_000), rsh);
+        assert_eq!(pre_vote(&mut new, &parent, &without), BlockDataCheck::Invalid);
+        let mut old = gated_app(2_010, t_schedule(None));
+        old.known_features = torus_types::KNOWN_FEATURES & !T_BIT;
+        assert_eq!(pre_vote(&mut old, &parent, &b5), BlockDataCheck::Invalid, "old: no vote");
+        assert_eq!(
+            check_parent_link_or_upgrade(
+                &b5.header,
+                &justify_for(&hs_block(&parent, PhaseCertificate::genesis_pc())),
+                &old.genesis_header,
+                &old.activations,
+                old.known_features,
+                {
+                    let h = parent.header.clone();
+                    move |_| ParentHeader::Header(Box::new(h))
+                },
+                |_| Ok(None),
+            ),
+            Err(UpgradeRequired { feature: 2 }),
+            "old: UPGRADE REQUIRED feature 2 at insertion"
+        );
+
+        // Execution.
+        const H: u64 = 6;
+        let blocks = t_blocks(&[5, 6], Some(H));
+        let reference = {
+            let db = t_db();
+            let ctx = t_ctx(&db, Some(H), false, None, false);
+            for b in &blocks {
+                dispatch_and_execute(&ctx, &db, b);
+            }
+            drop(ctx);
+            dump_all_cfs(&db)
+        };
+        let db = t_db();
+        // Serial, so every block below H is durable when it stops (a
+        // pipelined node keeps its since-checkpoint window in memory: the
+        // replay then starts lower, as in `t_crash_replay_run`).
+        let mut old_ctx = t_ctx(&db, None, false, None, false);
+        old_ctx.known_features = torus_types::KNOWN_FEATURES & !T_BIT;
+        for b in &blocks[..H as usize - 1] {
+            dispatch_and_execute(&old_ctx, &db, b);
+            assert!(!old_ctx.exec_failed.load(Ordering::SeqCst));
+        }
+        dispatch_and_execute(&old_ctx, &db, &blocks[H as usize - 1]);
+        assert!(old_ctx.exec_failed.load(Ordering::SeqCst), "old binary fail-stops at H");
+        drop(old_ctx);
+        assert_eq!(read_native_applied_height(&db), Some(H - 1), "nothing of H applied");
+        assert_eq!(t_db_queue(&db), vec![(H, 0)], "the H - 1 row waits for H");
+        let upgraded = t_ctx(&db, Some(H), false, None, false);
+        let (_last, parked) = TorusApp::replay_committed(&db, &upgraded);
+        assert_eq!(parked, None);
+        assert_eq!(read_native_applied_height(&db), Some(H));
+        let mut upgraded = upgraded;
+        upgraded.checkpoint = Some(ckpt_every(2));
+        upgraded.evm_fast_path = true;
+        upgraded.attach_flush_worker(None);
+        for b in &blocks[H as usize..] {
+            dispatch_and_execute(&upgraded, &db, b);
+            assert!(!upgraded.exec_failed.load(Ordering::SeqCst));
+        }
+        drop(upgraded);
+        assert_eq!(t_native(&db), t_tokens(2));
+        assert_dumps_equal(&reference, &dump_all_cfs(&db), "old binary stopped, upgraded");
     }
 
     /// Item 7 step 2 (owner decision 4): block 2 carries a lockbox deposit and a

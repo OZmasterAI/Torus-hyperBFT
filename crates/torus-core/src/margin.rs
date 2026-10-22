@@ -278,6 +278,30 @@ pub fn position_terms(
     })
 }
 
+/// Funding engine: [`position_terms`] with the position's pending funding at
+/// its market's cumulative `index` taken off the UPnL (`upnl − owed`; see
+/// [`Position::funding_owed`]). Without a mark the trade UPnL stays 0 (s517
+/// decision 2), but the funding term does not: it needs only the index, and
+/// a stale mark must not erase a known debt (Codex P1 s138: with the term
+/// gated on the mark, losing it raised equity by the debt and let it be
+/// withdrawn). `index = None`: exactly [`position_terms`].
+pub fn position_terms_funded(
+    pos: &Position,
+    mark: Option<FixedPoint>,
+    index: Option<i128>,
+    tiers: Option<&[MarginTier]>,
+) -> Result<PositionTerms, CoreError> {
+    let mut t = position_terms(pos, mark, tiers)?;
+    if index.is_some() {
+        let owed = pos.funding_owed(index);
+        t.upnl = t
+            .upnl
+            .checked_sub(owed)
+            .map_err(|_| CoreError::Overflow("account margin overflows i128".into()))?;
+    }
+    Ok(t)
+}
+
 impl AccountView {
     /// Cross positions only (every production position is Cross).
     pub fn build<'t>(
@@ -297,6 +321,32 @@ impl AccountView {
         positions: &[Position],
         mark: impl Fn(MarketId) -> Option<FixedPoint>,
         tiers: impl Fn(MarketId) -> Option<&'t [MarginTier]>,
+        seen: impl FnMut(&Position, &PositionTerms),
+    ) -> Result<Self, CoreError> {
+        Self::build_with_funded(bal, positions, mark, |_| Ok(None), tiers, seen)
+    }
+
+    /// Funding engine: [`Self::build`] with each position's pending funding
+    /// at its market's index (`funding(m)`; `Ok(None)` = no funding) in the
+    /// UPnL ([`position_terms_funded`]).
+    pub fn build_funded<'t>(
+        bal: &NativeBalance,
+        positions: &[Position],
+        mark: impl Fn(MarketId) -> Option<FixedPoint>,
+        funding: impl Fn(MarketId) -> Result<Option<i128>, CoreError>,
+        tiers: impl Fn(MarketId) -> Option<&'t [MarginTier]>,
+    ) -> Result<Self, CoreError> {
+        Self::build_with_funded(bal, positions, mark, funding, tiers, |_, _| {})
+    }
+
+    /// [`Self::build_with`] with pending funding ([`Self::build_funded`]).
+    /// THE loop: `build` / `build_with` are this with no funding.
+    pub fn build_with_funded<'t>(
+        bal: &NativeBalance,
+        positions: &[Position],
+        mark: impl Fn(MarketId) -> Option<FixedPoint>,
+        funding: impl Fn(MarketId) -> Result<Option<i128>, CoreError>,
+        tiers: impl Fn(MarketId) -> Option<&'t [MarginTier]>,
         mut seen: impl FnMut(&Position, &PositionTerms),
     ) -> Result<Self, CoreError> {
         let of = |_| CoreError::Overflow("account margin overflows i128".into());
@@ -309,7 +359,7 @@ impl AccountView {
             maintenance: FixedPoint::ZERO,
         };
         for pos in positions.iter().filter(|p| p.margin_type == MarginType::Cross) {
-            let t = position_terms(pos, mark(pos.market_id), tiers(pos.market_id))?;
+            let t = position_terms_funded(pos, mark(pos.market_id), funding(pos.market_id)?, tiers(pos.market_id))?;
             seen(pos, &t);
             v.upnl = v.upnl.checked_add(t.upnl).map_err(of)?;
             v.notional = v.notional.checked_add(t.notional).map_err(of)?;
@@ -817,6 +867,7 @@ mod tests {
             realized_pnl: FixedPoint::ZERO,
             isolated_margin: FixedPoint::ZERO,
             margin_type: MarginType::Cross,
+            funding: None,
         })
         .unwrap();
 
@@ -853,6 +904,7 @@ mod tests {
             realized_pnl: FixedPoint::ZERO,
             isolated_margin: fp(600), // above 500 maintenance
             margin_type: MarginType::Isolated,
+            funding: None,
         };
         let config = MarketMarginConfig::new(1, 50);
 

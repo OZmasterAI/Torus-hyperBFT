@@ -102,7 +102,9 @@ struct LiqStats {
 /// * `av`: the ranking AV per trader — a function of its balance, its
 ///   positions and the block's fixed marks / configs — used only as a
 ///   lookup (never iterated); dropped for both parties of every close and
-///   for the vault on a pairing, i.e. for every account the drain writes.
+///   for the vault on a pairing and (funding engine) on every escrow close,
+///   which charges the escrow's funding share to the vault's balance, i.e.
+///   for every account the drain writes.
 /// * `dirty` (adl-budget C2): the block's dirty traders per market
 ///   ([`users::dirty_by_market_and_traders`]), taken at the drain's first
 ///   ranking with R attached. A ranking of `m` reads R's holders of `m`
@@ -213,7 +215,9 @@ impl NativeExecutor {
                                 continue;
                             }
                             let p = <Position as borsh::BorshDeserialize>::try_from_slice(v).map_err(borsh)?;
-                            torus_core::margin::position_terms(&p, Some(FixedPoint::ZERO), None)?.upnl
+                            // Funding engine: pending funding is value too.
+                            let index = ctx.positions.funding_index(p.market_id)?;
+                            torus_core::margin::position_terms_funded(&p, Some(FixedPoint::ZERO), index, None)?.upnl
                         };
                         sum = sum.checked_add(x).map_err(of)?;
                     }
@@ -252,7 +256,8 @@ impl NativeExecutor {
             let b = ctx.positions.get_native_balance(&e)?;
             deficit = deficit.checked_add(b.available).and_then(|d| d.checked_add(b.order_margin)).map_err(of)?;
             for p in ctx.positions.positions_for_trader(&e)? {
-                let t = torus_core::margin::position_terms(&p, marks.get(&p.market_id).copied(), None)?;
+                let index = ctx.positions.funding_index(p.market_id)?;
+                let t = torus_core::margin::position_terms_funded(&p, marks.get(&p.market_id).copied(), index, None)?;
                 notional = notional.checked_add(t.notional).map_err(of)?;
                 deficit = deficit.checked_add(t.upnl).map_err(of)?;
             }
@@ -474,7 +479,13 @@ impl NativeExecutor {
             }
             // D4: every resting order and pending stop goes first (sorted
             // markets), reservations released. AV is unchanged.
+            // s139: logged as liquidation cancels.
+            let prev_cause = std::mem::replace(
+                &mut ctx.cancel_cause,
+                torus_state::order_events::OrderEventReason::Liquidation,
+            );
             let release = Self::cancel_orders_and_stops(ctx, &trader, None);
+            ctx.cancel_cause = prev_cause;
             Self::release_order_margin(ctx, &trader, release);
             match h {
                 Health::Adl => {
@@ -838,7 +849,13 @@ impl NativeExecutor {
         }
         let bal = ctx.positions.get_native_balance(trader)?;
         let reader = AccountReader::of(ctx);
-        Ok(AccountView::build(&bal, &ps, |m| marks.get(&m).copied(), |m| reader.tiers(m)).ok())
+        // Funding engine: pending funding in the UPnL (as the sums cache).
+        let funding = |m| ctx.positions.funding_index(m);
+        match AccountView::build_funded(&bal, &ps, |m| marks.get(&m).copied(), funding, |m| reader.tiers(m)) {
+            Ok(v) => Ok(Some(v)),
+            Err(CoreError::Overflow(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Review M2: the pending row of `trader` after its action — set iff it is
@@ -954,6 +971,7 @@ impl NativeExecutor {
     /// `rest` (cash + the UPnL of u's OTHER positions: marked at the mark,
     /// unmarked at entry = 0) is kept running: rows read once, one balance
     /// point read per transfer — O(P) (was `adl_rest` per market: O(P^2)).
+    /// Funding engine: all of u's pending funding is settled in cash first.
     /// Then D9: a non-vault account without marked positions hands its
     /// remaining collateral to the vault. Never positive under the clamp (an
     /// error line if it is; the move still conserves value): flat, exactly 0.
@@ -965,6 +983,25 @@ impl NativeExecutor {
         u: &Address,
     ) -> Result<u64, CoreError> {
         let ps = ctx.positions.positions_for_trader(u)?;
+        // Funding engine: each position's market index.
+        let index: HashMap<MarketId, Option<i128>> = ps
+            .iter()
+            .map(|p| Ok((p.market_id, ctx.positions.funding_index(p.market_id)?)))
+            .collect::<Result<_, CoreError>>()?;
+        // Codex P1 (s138, round 2): settle ALL of u's pending funding, on
+        // marked and unmarked positions, in cash first. The bankruptcy prices
+        // below are then computed on cash that already holds every funding
+        // credit and debt, and D9 sweeps exactly what is left (never
+        // positive), so no funding survives ADL: an unmarked position stays
+        // with u (H2) with nothing pending. (Leaving unmarked funding out of
+        // `rest` kept a credit that u could withdraw later, the counterparties
+        // having absorbed the loss it should have covered; counting it in
+        // `rest` without settling would let D9 sweep the offsetting cash.)
+        // Funding off (index None): no write, the pre-funding step.
+        let ps = ps
+            .iter()
+            .map(|p| ctx.positions.settle_funding(p, index.get(&p.market_id).copied().flatten()))
+            .collect::<Result<Vec<_>, CoreError>>()?;
         // `build`'s terms per position (adl_rest's `build`); None = overflow
         // -> no bankruptcy price (adl_rest's None).
         // Review L2 (accepted, no behavior change): one position's UPnL
@@ -974,8 +1011,12 @@ impl NativeExecutor {
         // price (`adl_price`'s fallback: still never a positive D9
         // remainder); only the test-only shadow assert below would differ.
         // It needs ~1e30-token notional: unreachable.
+        // Funding engine: every position's funding was settled above, so its
+        // funding term here is 0 (an unmarked position: trade UPnL 0 too).
         let upnl = |p: &Position| {
-            torus_core::margin::position_terms(p, marks.get(&p.market_id).copied(), None).ok().map(|t| t.upnl)
+            let mark = marks.get(&p.market_id).copied();
+            let i = index.get(&p.market_id).copied().flatten();
+            torus_core::margin::position_terms_funded(p, mark, i, None).ok().map(|t| t.upnl)
         };
         let mut total = ps.iter().try_fold(FixedPoint::ZERO, |a, p| a.checked_add(upnl(p)?).ok());
         let mut rows = 0u64;
@@ -991,8 +1032,13 @@ impl NativeExecutor {
             #[cfg(test)]
             assert_eq!(rest, Self::adl_rest(ctx, marks, u, m)?, "running rest == adl_rest ({u}, {m})");
             let base = prev.get(&m).copied().unwrap_or(mark);
-            let bankruptcy =
-                rest.and_then(|r| liq::bankruptcy_price(r, p.is_long, p.size, p.cost_basis));
+            // Funding engine: what the transfer pays in cash before the
+            // position moves (0: settled above; kept so the price stays the
+            // one that leaves the account at zero whatever is pending).
+            let owed = p.funding_owed(index.get(&m).copied().flatten());
+            let bankruptcy = rest
+                .and_then(|r| r.checked_sub(owed).ok())
+                .and_then(|r| liq::bankruptcy_price(r, p.is_long, p.size, p.cost_basis));
             let px = liq::adl_price(base, bankruptcy, mark, p.is_long);
             liq::transfer(&ctx.positions, u, &liq::adl_escrow(p.is_long), m, p.size, px)?;
             total = (|| total?.checked_sub(own?).ok())();
@@ -1039,7 +1085,9 @@ impl NativeExecutor {
             .into_iter()
             .filter(|q| q.market_id != m)
             .collect();
-        let v = match AccountView::build(&bal, &others, |x| marks.get(&x).copied(), |_| None) {
+        // Funding: every position's (settled by `adl_to_escrow` first: 0).
+        let funding = |x| ctx.positions.funding_index(x);
+        let v = match AccountView::build_funded(&bal, &others, |x| marks.get(&x).copied(), funding, |_| None) {
             Ok(v) => v,
             Err(CoreError::Overflow(_)) => return Ok(None),
             Err(e) => return Err(e),
@@ -1134,6 +1182,14 @@ impl NativeExecutor {
             }
             if !closes.is_empty() {
                 cache.touched(ctx, &escrow, o.market)?;
+                // Funding engine (Codex P1 s138, round 2): the escrow's
+                // close charged its funding share to the vault's balance
+                // (`PositionManager::apply_fill`), which changes the vault's
+                // ranking AV in every other market. Without funding the
+                // vault was not written and this only costs a revaluation.
+                if ctx.positions.funding_table().is_some() {
+                    cache.av.remove(&LIQUIDATOR_VAULT);
+                }
             }
             if o.size > FixedPoint::ZERO {
                 let before = o.size;

@@ -7079,6 +7079,7 @@ mod tests {
                 realized_pnl: torus_types::FixedPoint::ZERO,
                 isolated_margin: torus_types::FixedPoint::ZERO,
                 margin_type: torus_core::position::MarginType::Cross,
+                funding: None,
             })
             .unwrap();
         pool.add_native_action_presigned(address_from_key(&k4), cancel_all(&k4, t0))

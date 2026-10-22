@@ -345,7 +345,8 @@ impl EvmExecutor {
             block_cfg.number,
             block_cfg.timestamp,
             call_mode,
-        );
+        )
+        .with_features(block_cfg.features);
         let local_fault = precompiles.local_fault();
         let mut evm = ctx
             .build_mainnet_with_inspector(NativeJournalInspector {
@@ -445,7 +446,8 @@ impl EvmExecutor {
         // here, so a block that errors part-way (or a crash before the bundle
         // commit) leaves no queued action behind.
         let precompiles =
-            TorusPrecompiles::new(spec, journal.clone(), block_cfg.number, block_cfg.timestamp);
+            TorusPrecompiles::new(spec, journal.clone(), block_cfg.number, block_cfg.timestamp)
+                .with_features(block_cfg.features);
         // R02 branch 5: the provider's local-fault cell (see `local_fault_or`).
         let local_fault = precompiles.local_fault();
         let mut evm = ctx
@@ -613,7 +615,8 @@ impl EvmExecutor {
         // F1 (s515): block-scoped, returned in `native_writes` (see `execute_block`).
         let journal = NativeStateOverlay::new(overlay.base().clone());
         let precompiles =
-            TorusPrecompiles::new(spec, journal.clone(), block_cfg.number, block_cfg.timestamp);
+            TorusPrecompiles::new(spec, journal.clone(), block_cfg.number, block_cfg.timestamp)
+                .with_features(block_cfg.features);
         // R02 branch 5: the provider's local-fault cell (see `local_fault_or`).
         let local_fault = precompiles.local_fault();
         let mut evm = ctx

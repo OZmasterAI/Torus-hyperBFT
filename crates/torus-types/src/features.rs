@@ -28,6 +28,31 @@ pub enum Feature {
     /// bool `consensus.book_window_commit` is its alias (from the running
     /// hash's height).
     BookWindowCommit = 1,
+    /// Item 7 T (docs/plans/item7-step3-design.md section 3 "T"): same-block
+    /// EVM -> native for the non-order CoreWriter kinds. From its height a
+    /// lockbox deposit / withdraw or a staking action an EVM tx queues in
+    /// block h targets h itself (its own seq range 0..199 of the target,
+    /// drained after h's native batches, before the order range 200..399);
+    /// order kinds keep `max(h + K, last order target)` in the order range.
+    /// Owner s138: after the testnet genesis, through P0.0 at a height. Never
+    /// in the built-in table nor in a checked-in genesis until the owner
+    /// schedules it.
+    SameBlockCoreWriter = 2,
+    /// The perp funding engine (docs/plans/funding-engine.md): from its
+    /// height the block-start step samples each listed market's premium,
+    /// settles hourly funding into a per-market cumulative index
+    /// (`CF_NATIVE_ORACLE` `fnd` rows), and every fill settles the
+    /// position's funding since its entry index in cash. Unscheduled: no
+    /// built-in row, not in [`DEFAULT_GENESIS_ACTIVATIONS`]. Id 2 is
+    /// item 7 T, id 4 trading fees.
+    FundingEngine = 3,
+    /// Maker / taker trading fees (docs/plans/trading-fees.md): from its
+    /// height every book fill charges each side its fee (governance keys
+    /// `trading_taker_fee_ppm` / `trading_maker_fee_ppm`, built-in defaults)
+    /// from the side's quote balance and credits the sum to the treasury's
+    /// native balance. Not in any built-in table and not in
+    /// [`DEFAULT_GENESIS_ACTIVATIONS`]: off until a release schedules it.
+    TradingFees = 4,
     /// TEST-ONLY (cargo feature `test-features`, enabled from
     /// torus-consensus's dev-dependencies; no node build reaches it): the P0.0
     /// integration tests' feature with a state-visible rule (the block pipeline
@@ -41,12 +66,21 @@ impl Feature {
     /// Every feature compiled in, in id order (test-only ones included in a
     /// `test-features` build; [`KNOWN_FEATURES`] is what the node can run).
     #[cfg(not(feature = "test-features"))]
-    pub const ALL: &'static [Feature] = &[Feature::RunningStateHash, Feature::BookWindowCommit];
+    pub const ALL: &'static [Feature] = &[
+        Feature::RunningStateHash,
+        Feature::BookWindowCommit,
+        Feature::SameBlockCoreWriter,
+        Feature::FundingEngine,
+        Feature::TradingFees,
+    ];
     /// Every feature compiled in, in id order (see above).
     #[cfg(feature = "test-features")]
     pub const ALL: &'static [Feature] = &[
         Feature::RunningStateHash,
         Feature::BookWindowCommit,
+        Feature::SameBlockCoreWriter,
+        Feature::FundingEngine,
+        Feature::TradingFees,
         Feature::TestStateRule,
     ];
 
@@ -65,7 +99,11 @@ impl Feature {
     /// ([`ActivationSchedule::for_chain`]).
     pub const fn is_test_only(self) -> bool {
         match self {
-            Feature::RunningStateHash | Feature::BookWindowCommit => false,
+            Feature::RunningStateHash
+            | Feature::BookWindowCommit
+            | Feature::SameBlockCoreWriter
+            | Feature::FundingEngine
+            | Feature::TradingFees => false,
             #[cfg(feature = "test-features")]
             Feature::TestStateRule => true,
         }
@@ -76,6 +114,9 @@ impl Feature {
         match self {
             Feature::RunningStateHash => "running_state_hash",
             Feature::BookWindowCommit => "book_window_commit",
+            Feature::SameBlockCoreWriter => "same_block_core_writer",
+            Feature::FundingEngine => "funding_engine",
+            Feature::TradingFees => "trading_fees",
             #[cfg(feature = "test-features")]
             Feature::TestStateRule => "test_state_rule",
         }
@@ -265,10 +306,16 @@ mod tests {
         // of phase 5, P2): see `known_features_never_hold_a_test_feature`.
         assert_eq!(Feature::BookWindowCommit.id(), 1);
         assert_eq!(Feature::BookWindowCommit.name(), "book_window_commit");
-        assert_eq!(KNOWN_FEATURES, 0b11);
+        assert_eq!(Feature::SameBlockCoreWriter.id(), 2);
+        assert_eq!(Feature::SameBlockCoreWriter.name(), "same_block_core_writer");
+        assert_eq!(Feature::FundingEngine.id(), 3);
+        assert_eq!(Feature::FundingEngine.name(), "funding_engine");
+        assert_eq!(Feature::TradingFees.id(), 4);
+        assert_eq!(Feature::TradingFees.name(), "trading_fees");
+        assert_eq!(KNOWN_FEATURES, 0b1_1111);
         assert_eq!(first_unknown_feature_in(0b11, 0b01), Some(1));
         assert_eq!(first_unknown_feature_in(0b01, 0b01), None);
-        assert_eq!(unknown_features(0b101), 0b100);
+        assert_eq!(unknown_features(0b10_0101), 0b10_0000);
         assert_eq!(first_unknown_feature(0b1), None);
         assert_eq!(first_unknown_feature(1 | (1 << 9) | (1 << 77)), Some(9));
         for f in Feature::ALL {
@@ -390,6 +437,106 @@ mod tests {
                 Feature::BookWindowCommit.bit()
             );
         }
+    }
+
+    /// Item 7 T (owner s138): the same-block CoreWriter feature ships after
+    /// the testnet genesis, activated through P0.0 at a height the owner
+    /// picks. Until then it is known (a binary can run a chain that turns it
+    /// on) but unscheduled: not in the built-in table of any network, not in
+    /// the default genesis activations, and named by no checked-in genesis
+    /// file or genesis generator.
+    #[test]
+    fn same_block_core_writer_is_known_but_never_scheduled() {
+        let t = Feature::SameBlockCoreWriter;
+        assert_ne!(KNOWN_FEATURES & t.bit(), 0, "known");
+        assert!(!t.is_test_only());
+        for chain_id in [crate::eip712::TORUS_CHAIN_ID, 7779, 1] {
+            assert!(
+                builtin_activations(chain_id).iter().all(|(f, _)| *f != t),
+                "{chain_id}: built-in table"
+            );
+            let s = ActivationSchedule::for_chain(chain_id, &BTreeMap::new()).unwrap();
+            assert_eq!(s.height_of(t), None, "{chain_id}: node default schedule");
+        }
+        assert!(DEFAULT_GENESIS_ACTIVATIONS.iter().all(|(f, _)| *f != t));
+        // No checked-in genesis (or generator) names it.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut stack: Vec<std::path::PathBuf> =
+            ["devnet", "testnet", "bench", "tools", "monitoring"]
+                .iter()
+                .map(|d| root.join(d))
+                .filter(|p| p.is_dir())
+                .collect();
+        let mut scanned = 0usize;
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if !matches!(ext, "json" | "sh" | "py" | "toml") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                scanned += 1;
+                // s138 product batch: funding (id 3) and trading fees (id 4)
+                // are unscheduled too; no checked-in genesis names ids 2..4.
+                for f in [t, Feature::FundingEngine, Feature::TradingFees] {
+                    assert!(
+                        !text.contains(f.name()),
+                        "{} names {}: ids 2..4 are unscheduled (owner s138)",
+                        path.display(),
+                        f.name()
+                    );
+                }
+            }
+        }
+        assert!(scanned > 0, "found the checked-in genesis files");
+    }
+
+    /// Funding engine (s138): a known feature that no network and no new
+    /// genesis schedules (the owner activates it through P0.0).
+    #[test]
+    fn funding_engine_is_known_and_unscheduled() {
+        assert_ne!(KNOWN_FEATURES & Feature::FundingEngine.bit(), 0);
+        assert!(!Feature::FundingEngine.is_test_only());
+        assert!(DEFAULT_GENESIS_ACTIVATIONS.iter().all(|(f, _)| *f != Feature::FundingEngine));
+        for chain_id in [crate::eip712::TORUS_CHAIN_ID, 7779, 1] {
+            assert!(builtin_activations(chain_id).iter().all(|(f, _)| *f != Feature::FundingEngine));
+        }
+        let genesis: BTreeMap<_, _> = [(Feature::FundingEngine, 40)].into_iter().collect();
+        let s = ActivationSchedule::for_chain(crate::eip712::TORUS_CHAIN_ID, &genesis).unwrap();
+        assert_eq!(s.active_at(39), 0);
+        assert_eq!(s.active_at(40), Feature::FundingEngine.bit());
+    }
+
+    /// Trading fees (s138): a known feature that no built-in table and no
+    /// default genesis schedules (off until a release names a height), and a
+    /// genesis `consensus.activations.trading_fees` switches it on at H.
+    #[test]
+    fn trading_fees_is_known_unscheduled_and_genesis_schedulable() {
+        assert_ne!(KNOWN_FEATURES & Feature::TradingFees.bit(), 0);
+        assert!(!Feature::TradingFees.is_test_only());
+        for chain_id in [crate::eip712::TORUS_CHAIN_ID, 7779, 1] {
+            assert!(builtin_activations(chain_id)
+                .iter()
+                .all(|(f, _)| *f != Feature::TradingFees));
+        }
+        assert!(DEFAULT_GENESIS_ACTIVATIONS
+            .iter()
+            .all(|(f, _)| *f != Feature::TradingFees));
+        let id = crate::eip712::TORUS_CHAIN_ID;
+        let g: BTreeMap<_, _> = [(Feature::TradingFees, 100)].into_iter().collect();
+        let s = ActivationSchedule::for_chain(id, &g).unwrap();
+        assert_eq!(s.active_at(99) & Feature::TradingFees.bit(), 0);
+        assert_eq!(s.active_at(100), Feature::TradingFees.bit());
+        let json: serde_json::Value = serde_json::json!({"heights": {"trading_fees": 7}});
+        let back: ActivationSchedule = serde_json::from_value(json).unwrap();
+        assert_eq!(back.height_of(Feature::TradingFees), Some(7));
     }
 
     #[test]

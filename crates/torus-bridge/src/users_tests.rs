@@ -51,6 +51,7 @@ fn position(t: Address, m: MarketId, raw: u64, long: bool) -> Position {
         realized_pnl: FixedPoint::from_raw(-(i128::from(raw))),
         isolated_margin: FixedPoint::ZERO,
         margin_type: if raw.is_multiple_of(5) { MarginType::Isolated } else { MarginType::Cross },
+        funding: None,
     }
 }
 
@@ -554,7 +555,9 @@ fn users_encode_byte_identical_to_rows() {
 fn users_size_of_pins() {
     let (user, position) = (std::mem::size_of::<UserState>(), std::mem::size_of::<Position>());
     println!("USERS size_of UserState {user} Position {position}");
-    assert_eq!(position, 112, "Position");
+    // Funding engine (s138): + the packed `Option<PositionFunding>` (33
+    // bytes): 112 -> 144.
+    assert_eq!(position, 144, "Position");
     assert_eq!(user, 112, "UserState");
 }
 
@@ -1988,6 +1991,7 @@ fn p5_direct_writes(
                             realized_pnl: FixedPoint::ZERO,
                             isolated_margin: FixedPoint::ZERO,
                             margin_type: MarginType::Cross,
+                            funding: None,
                         });
                     pm.put_position(&pos).unwrap();
                     ws.puts += 1;

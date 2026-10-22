@@ -10,6 +10,7 @@ pub mod book_mode;
 pub mod eip1559;
 pub mod eip712;
 pub mod features;
+pub mod trading_fees;
 
 pub use features::{ActivationSchedule, Feature, DEFAULT_GENESIS_ACTIVATIONS, KNOWN_FEATURES};
 
@@ -797,6 +798,13 @@ pub const DEFAULT_CORE_WRITER_ORDER_DELAY: u64 = 10;
 /// Item 7 step 2 (owner decision 4): most CoreWriter rows one block drains; a row whose target is
 /// full queues for the next block with room (`CoreWriterQueue::enqueue`).
 pub const CORE_WRITER_DRAIN_CAP: u64 = 200;
+/// Item 7 T (`Feature::SameBlockCoreWriter`): with the feature on, each target block holds two seq
+/// ranges in the same key layout (target 8 BE ‖ seq 8 BE), each capped at
+/// [`CORE_WRITER_DRAIN_CAP`]: seqs `0 .. CORE_WRITER_ORDER_SEQ_BASE` for the same-block (non-order)
+/// kinds, `CORE_WRITER_ORDER_SEQ_BASE .. CORE_WRITER_ORDER_SEQ_BASE + CORE_WRITER_DRAIN_CAP` for
+/// the order kinds. A target drains in key order, the same-block range first, so at most
+/// `2 * CORE_WRITER_DRAIN_CAP` rows per block. Feature off: one range from 0, as before.
+pub const CORE_WRITER_ORDER_SEQ_BASE: u64 = CORE_WRITER_DRAIN_CAP;
 
 /// s94 option 2 (HL "Order price too far from oracle"): the governance key
 /// (`CF_FEE_CONFIG`, a decimal string, `ParameterChange`) of the chain-wide
@@ -857,6 +865,33 @@ pub const DELIST_GRACE_BLOCKS_RANGE: std::ops::RangeInclusive<u64> = 0..=302_400
 /// default.
 pub fn delist_grace_blocks(stored: Option<&[u8]>) -> u64 {
     gov_u64_in(stored, &DELIST_GRACE_BLOCKS_RANGE).unwrap_or(DELIST_GRACE_DEFAULT_BLOCKS)
+}
+
+/// Funding engine (docs/plans/funding-engine.md, P0.0 `funding_engine`):
+/// the governance keys (`CF_FEE_CONFIG`, decimal, `ParameterChange`, accepted
+/// only while the feature is active), each with its default (absent or
+/// invalid) and its valid range, in table order: interval, sample period,
+/// impact notional (quote units), interest and premium clamp (ppm per 8 h),
+/// rate cap (bps per interval).
+pub const FUNDING_INTERVAL_PARAM: &str = "funding_interval_secs";
+pub const FUNDING_SAMPLE_PARAM: &str = "funding_sample_secs";
+pub const FUNDING_IMPACT_NOTIONAL_PARAM: &str = "funding_impact_notional";
+pub const FUNDING_INTEREST_PARAM: &str = "funding_interest_ppm_8h";
+pub const FUNDING_CLAMP_PARAM: &str = "funding_premium_clamp_ppm_8h";
+pub const FUNDING_MAX_RATE_PARAM: &str = "funding_max_rate_bps";
+/// `(key, default, range)` of every funding key.
+pub const FUNDING_PARAMS: [(&str, u64, std::ops::RangeInclusive<u64>); 6] = [
+    (FUNDING_INTERVAL_PARAM, 3_600, 60..=86_400),
+    (FUNDING_SAMPLE_PARAM, 5, 1..=3_600),
+    (FUNDING_IMPACT_NOTIONAL_PARAM, 10_000, 1..=1_000_000_000_000),
+    (FUNDING_INTEREST_PARAM, 100, 0..=10_000),
+    (FUNDING_CLAMP_PARAM, 500, 0..=100_000),
+    (FUNDING_MAX_RATE_PARAM, 400, 1..=10_000),
+];
+
+/// The `(default, range)` of a funding key (`None`: not a funding key).
+pub fn funding_param(key: &str) -> Option<(u64, std::ops::RangeInclusive<u64>)> {
+    FUNDING_PARAMS.iter().find(|(k, _, _)| *k == key).map(|(_, d, r)| (*d, r.clone()))
 }
 
 /// Item 7 step 2: a valid M is 0 (off) or inside [`EVM_BIG_BLOCK_INTERVAL_RANGE`].

@@ -213,7 +213,11 @@ impl NativeExecutor {
             };
             // No order survives a settlement block (reduce-only orders placed
             // since the last one included).
-            Self::cancel_market_orders_and_stops(ctx, m);
+            Self::cancel_market_orders_and_stops(
+                ctx,
+                m,
+                torus_state::order_events::OrderEventReason::Delisted,
+            );
             if let Some(reason) = ctx.reader_fault.get() {
                 return Err(CoreError::InvalidInput(format!("order cancel: {reason}")));
             }

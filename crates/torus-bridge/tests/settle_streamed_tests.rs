@@ -530,6 +530,7 @@ fn seed_aliases(db: &StateDb) {
             realized_pnl: FixedPoint::ZERO,
             isolated_margin: FixedPoint::ZERO,
             margin_type: MarginType::Cross,
+            funding: None,
         };
         db.put_cf_raw(
             CF_NATIVE_POSITIONS,

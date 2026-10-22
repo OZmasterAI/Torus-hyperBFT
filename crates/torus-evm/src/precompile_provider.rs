@@ -13,7 +13,7 @@ use revm::primitives::{Address, Bytes, U256};
 
 use torus_core::error::CoreError;
 use torus_core::precompiles::{
-    execute_precompile_metered, is_precompile, is_reader_precompile, precompile_gas, reader_budget,
+    execute_precompile_metered_at, is_precompile, is_reader_precompile, precompile_gas, reader_budget,
     reader_gas, ReadMeter, ADDR_LOCKBOX, ALL_PRECOMPILE_ADDRESSES,
 };
 use torus_state::NativeStateOverlay;
@@ -39,6 +39,10 @@ pub struct TorusPrecompiles {
     /// eth_call / eth_estimateGas simulation: deny state-mutating (writer) precompiles so
     /// a simulation can't durably mutate the shared `StateDb` outside consensus.
     read_only: bool,
+    /// P0.0: the executed block's header bits (`BlockEnvCfg::features`). Item 7
+    /// T (`Feature::SameBlockCoreWriter`): the writers queue non-order kinds
+    /// for this block itself. 0 (no bits) until [`Self::with_features`].
+    features: u128,
     /// R02 branch 5 (owner option A): the first LOCAL storage fault a precompile
     /// hit (any `CoreError::is_local_fault` error, F1). Set before [`Self::run`] aborts
     /// the execution with a fatal error; the executor reads it
@@ -74,8 +78,15 @@ impl TorusPrecompiles {
             current_block,
             current_timestamp,
             read_only,
+            features: 0,
             local_fault: Arc::default(),
         }
+    }
+
+    /// The executed block's P0.0 header bits (see the field).
+    pub fn with_features(mut self, features: u128) -> Self {
+        self.features = features;
+        self
     }
 
     /// R02 branch 5: a handle on this provider's local-fault cell (see the
@@ -153,7 +164,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles {
             };
 
             if self.read_only {
-                execute_precompile_metered(
+                execute_precompile_metered_at(
                     &address,
                     input_bytes,
                     &inputs.caller,
@@ -161,6 +172,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles {
                     &self.journal,
                     self.current_block,
                     self.current_timestamp,
+                    self.features,
                     true,
                     &mut meter,
                 )
@@ -174,7 +186,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles {
                     "writer precompile requires a plain non-static CALL".into(),
                 ))
             } else {
-                execute_precompile_metered(
+                execute_precompile_metered_at(
                     &address,
                     input_bytes,
                     &inputs.caller,
@@ -182,6 +194,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles {
                     &self.journal,
                     self.current_block,
                     self.current_timestamp,
+                    self.features,
                     false,
                     &mut meter,
                 )

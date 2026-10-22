@@ -64,6 +64,10 @@ pub struct FillExtras {
     /// Realized PnL of the fill's close part (0 = no close part).
     pub maker_pnl_raw: i128,
     pub taker_pnl_raw: i128,
+    /// Trading fee each side paid on the fill (negative = rebate; 0 while
+    /// the `trading_fees` feature is off).
+    pub maker_fee_raw: i128,
+    pub taker_fee_raw: i128,
 }
 
 /// One executed block's fills, shared by the trade writer and the stream sink
@@ -72,6 +76,9 @@ pub struct FillExtras {
 pub struct BlockFills {
     pub height: u64,
     pub timestamp: u64,
+    /// The block ran the `trading_fees` feature: `userFills` rows carry the
+    /// fee (before activation they are the pre-feature rows).
+    pub trading_fees: bool,
     pub fills: Vec<TradeFill>,
     /// Either empty (no stream subscriber when the block executed) or exactly
     /// `fills.len()` long, `extras[i]` belonging to `fills[i]`.
@@ -87,6 +94,15 @@ pub trait FillSink: Send + Sync {
     fn wants_fills(&self) -> bool;
     /// One executed block's fills (only blocks with fills), in height order.
     fn send_fills(&self, block: std::sync::Arc<BlockFills>);
+    /// s139: whether anyone currently wants order events (`orderUpdates`),
+    /// checked once per block before execution. False = the books log no
+    /// events and the executor records no rejections.
+    fn wants_order_events(&self) -> bool {
+        false
+    }
+    /// s139: one executed block's order events (only blocks with events,
+    /// recorded while `wants_order_events` was true), in height order.
+    fn send_order_events(&self, _block: std::sync::Arc<crate::order_events::BlockOrderEvents>) {}
 }
 
 /// One entry of a `CF_NATIVE_TRADES` row.

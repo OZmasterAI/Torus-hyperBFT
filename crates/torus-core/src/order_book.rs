@@ -22,6 +22,7 @@ use torus_types::{
 
 use crate::error::CoreError;
 use torus_state::action_status::FailureReason;
+use torus_state::order_events::{OrderEvent, OrderEventReason, OrderEventStatus};
 use crate::position::{borsh_read_address, borsh_read_fp, borsh_write_address, borsh_write_fp};
 
 mod cancel_batch;
@@ -30,6 +31,8 @@ mod classic_encode;
 #[cfg(test)]
 mod classic_encode_tests;
 mod cloid_key;
+// s139: the order event log (`orderUpdates` stream).
+mod order_events;
 mod trader_orders;
 
 pub use cloid_key::CloidKey;
@@ -44,6 +47,8 @@ mod account_margins_p1_tests;
 mod mark_charge_tests;
 #[cfg(test)]
 mod cloid_tests;
+#[cfg(test)]
+mod order_events_tests;
 
 // perf/cloid-engine-cost fix 4.
 #[cfg(test)]
@@ -1310,6 +1315,16 @@ pub struct OrderBook {
     /// serialized; `None` after a load (the next save writes the row again;
     /// the CF is unhashed, so a repeated put changes nothing).
     saved_bbo: Option<[u8; 32]>,
+
+    // ---- s139: order event log for the `orderUpdates` stream (in-RAM only) ----
+    /// `Some` while the executor wants order events
+    /// ([`Self::set_order_events`]): every public mutation logs what it did
+    /// to each order it touched. Never serialized, hashed, or read by
+    /// matching or saving; `None` (the default) costs one branch per call.
+    order_events: Option<Vec<OrderEvent>>,
+    /// The reason logged for cancels by the public cancel paths
+    /// ([`Self::set_cancel_cause`]; default `User`). Only read for the log.
+    cancel_cause: OrderEventReason,
 }
 
 /// s120 (Codex r2): [`OrderBook::log_mark`]: which in-memory book, and how
@@ -1415,6 +1430,8 @@ impl OrderBook {
             instance: BookInstance::fresh(),
             log_drains: 0,
             saved_bbo: None,
+            order_events: None,
+            cancel_cause: OrderEventReason::User,
         }
     }
 
@@ -1521,7 +1538,44 @@ impl OrderBook {
 
     /// [`Self::place_order_with_accounts`]; `cloid_checked`: the caller
     /// has applied the cloid rule ([`Self::place_order_with_accounts_cloid_checked`]).
+    /// s139: logs the placement's own outcome while the event log is on.
     fn place_order_checked(
+        &mut self,
+        params: PlaceOrderParams,
+        trader: Address,
+        timestamp: u64,
+        margin: Option<&TakerMarginLimit>,
+        makers: Option<&dyn MakerAccountSource>,
+        cloid_checked: bool,
+    ) -> PlaceResult {
+        let logged = self.order_events.is_some().then(|| {
+            // Codex P2 (s139): an accepted policed reduce-only Limit /
+            // Market order is clamped to the position before it matches
+            // (`place_order_checked_inner`); its event reports the clamped
+            // size, the stored order's `original_qty`. Read before the
+            // placement: its fills move the position.
+            let clamp = (params.reduce_only
+                && matches!(params.order_type, OrderType::Limit | OrderType::Market))
+            .then(|| self.reduce_only_positions.get(&trader))
+            .flatten()
+            .map(|pos| reduce_only_allowance(pos, params.is_buy))
+            .filter(|allowed| *allowed > FixedPoint::ZERO);
+            (order_events::PlacedParams::new(&params, trader), clamp)
+        });
+        let result =
+            self.place_order_checked_inner(params, trader, timestamp, margin, makers, cloid_checked);
+        if let Some((mut p, clamp)) = logged {
+            if let (Some(allowed), None) = (clamp, result.reject) {
+                p.qty = p.qty.min(allowed);
+            }
+            self.log_placement(&p, &result);
+        }
+        result
+    }
+
+    /// [`Self::place_order_checked`] without its own log entry (its makers,
+    /// cancels and fired stops are logged where they happen).
+    fn place_order_checked_inner(
         &mut self,
         params: PlaceOrderParams,
         trader: Address,
@@ -1996,10 +2050,23 @@ impl OrderBook {
             }
             // cancel_order drops the index entry; the in-place modify keeps
             // time priority (qty decrease only).
+            // s139: logged as reduce-only cancels / shrinks, not user ones.
             let applied = if keep == FixedPoint::ZERO {
-                self.cancel_order(id).is_ok()
+                match self.cancel_order_unlogged(id) {
+                    Ok(o) => {
+                        self.log_removed(&o, OrderEventReason::ReduceOnly);
+                        true
+                    }
+                    Err(_) => false,
+                }
             } else {
-                self.modify_order(id, None, Some(keep)).is_ok()
+                match self.modify_order_unlogged(id, None, Some(keep)) {
+                    Ok(o) => {
+                        self.log_modified(&o, OrderEventReason::ReduceOnly);
+                        true
+                    }
+                    Err(_) => false,
+                }
             };
             if applied {
                 cuts.push(ReduceOnlyCut {
@@ -2083,8 +2150,17 @@ impl OrderBook {
         }
     }
 
-    /// Cancel an order by ID. Returns the cancelled order.
+    /// Cancel an order by ID. Returns the cancelled order. s139: logged with
+    /// the cancel cause ([`Self::set_cancel_cause`]).
     pub fn cancel_order(&mut self, order_id: OrderId) -> Result<Order, CoreError> {
+        let order = self.cancel_order_unlogged(order_id)?;
+        let cause = self.cancel_cause;
+        self.log_removed(&order, cause);
+        Ok(order)
+    }
+
+    /// [`Self::cancel_order`] without the event log entry.
+    fn cancel_order_unlogged(&mut self, order_id: OrderId) -> Result<Order, CoreError> {
         let loc = self
             .order_index
             .remove(&order_id)
@@ -2161,8 +2237,10 @@ impl OrderBook {
                 .into_iter()
                 .partition(|s| s.trader == *trader);
         self.pending_stops = kept;
+        let cause = self.cancel_cause;
         for s in &taken {
             Self::forget_cloid(&mut self.cloids, s.trader, s.client_order_id, s.id);
+            self.log_stop_removed(s, cause);
         }
         taken
             .into_iter()
@@ -2171,8 +2249,22 @@ impl OrderBook {
     }
 
     /// Cancel all orders for a trader, pending stops included. Returns the
-    /// cancelled resting orders.
-    pub fn cancel_all(&mut self, trader: Address, _market_id: Option<MarketId>) -> Vec<Order> {
+    /// cancelled resting orders. s139: each is logged with the cancel cause.
+    pub fn cancel_all(&mut self, trader: Address, market_id: Option<MarketId>) -> Vec<Order> {
+        let stops = self.stops_if_logging(|t| *t == trader);
+        let cancelled = self.cancel_all_unlogged(trader, market_id);
+        if self.order_events.is_some() {
+            self.log_stops_gone(stops);
+            let cause = self.cancel_cause;
+            for o in &cancelled {
+                self.log_removed(o, cause);
+            }
+        }
+        cancelled
+    }
+
+    /// [`Self::cancel_all`] without the event log entries.
+    fn cancel_all_unlogged(&mut self, trader: Address, _market_id: Option<MarketId>) -> Vec<Order> {
         // Stops hold open-order slots, so they go even when the trader has
         // no resting order.
         self.retain_stops(|s| s.trader != trader);
@@ -2238,7 +2330,20 @@ impl OrderBook {
 
     /// Modify an order (cancel-and-replace).
     /// Qty decrease only: keeps time priority. Price change or qty increase: loses priority.
+    /// s139: logged as a user modify.
     pub fn modify_order(
+        &mut self,
+        order_id: OrderId,
+        new_price: Option<FixedPoint>,
+        new_qty: Option<FixedPoint>,
+    ) -> Result<Order, CoreError> {
+        let order = self.modify_order_unlogged(order_id, new_price, new_qty)?;
+        self.log_modified(&order, OrderEventReason::User);
+        Ok(order)
+    }
+
+    /// [`Self::modify_order`] without the event log entry.
+    fn modify_order_unlogged(
         &mut self,
         order_id: OrderId,
         new_price: Option<FixedPoint>,
@@ -2294,7 +2399,7 @@ impl OrderBook {
         }
 
         // Cancel old, re-insert with updated fields (loses time priority)
-        let old = self.cancel_order(order_id)?;
+        let old = self.cancel_order_unlogged(order_id)?;
 
         let mut replacement = old;
         if let Some(p) = new_price {
@@ -2590,6 +2695,8 @@ impl OrderBook {
         let pos = self.pending_stops.iter().position(|s| s.id == id)?;
         let stop = self.pending_stops.remove(pos);
         Self::forget_cloid(&mut self.cloids, stop.trader, stop.client_order_id, stop.id);
+        let cause = self.cancel_cause;
+        self.log_stop_removed(&stop, cause);
         Some(stop)
     }
 
@@ -2757,6 +2864,7 @@ impl OrderBook {
                         makers,
                         market_id,
                         &mut margin_cancels,
+                        self.order_events.as_mut(),
                     );
                     if level.get().is_empty() {
                         level.remove_entry();
@@ -2802,6 +2910,7 @@ impl OrderBook {
                         makers,
                         market_id,
                         &mut margin_cancels,
+                        self.order_events.as_mut(),
                     );
                     if level.get().is_empty() {
                         level.remove_entry();
@@ -2841,6 +2950,8 @@ impl OrderBook {
         makers: Option<&dyn MakerAccountSource>,
         market_id: MarketId,
         margin_cancels: &mut Vec<ReduceOnlyCut>,
+        // s139: the book's event log (`None` = off).
+        mut events: Option<&mut Vec<OrderEvent>>,
     ) {
         let tag = crate::book_rows::side_tag(maker_side);
         let raw_price = price.raw();
@@ -2877,6 +2988,15 @@ impl OrderBook {
                 let seq = order_seq.remove(&cancelled.id);
                 Self::mark_chunk_dirty(chunked_on, dirty_chunks, tag, raw_price, seq);
                 row_journal.insert(cancelled.id);
+                if let Some(ev) = events.as_deref_mut() {
+                    ev.push(order_events::order_event(
+                        market_id,
+                        &cancelled,
+                        OrderEventStatus::Canceled,
+                        OrderEventReason::SelfTrade,
+                        FixedPoint::ZERO,
+                    ));
+                }
                 // A5: hand the whole cancelled order back so the executor can
                 // release its remaining order-margin reservation.
                 self_trade_cancels.push(cancelled);
@@ -2901,6 +3021,15 @@ impl OrderBook {
                         let seq = order_seq.remove(&cut.id);
                         Self::mark_chunk_dirty(chunked_on, dirty_chunks, tag, raw_price, seq);
                         row_journal.insert(cut.id);
+                        if let Some(ev) = events.as_deref_mut() {
+                            ev.push(order_events::order_event(
+                                market_id,
+                                &cut,
+                                OrderEventStatus::Canceled,
+                                OrderEventReason::ReduceOnly,
+                                FixedPoint::ZERO,
+                            ));
+                        }
                         reduce_only_cuts.push(ReduceOnlyCut {
                             order_id: cut.id,
                             trader: cut.trader,
@@ -2985,6 +3114,15 @@ impl OrderBook {
                     let seq = order_seq.remove(&cut.id);
                     Self::mark_chunk_dirty(chunked_on, dirty_chunks, tag, raw_price, seq);
                     row_journal.insert(cut.id);
+                    if let Some(ev) = events.as_deref_mut() {
+                        ev.push(order_events::order_event(
+                            market_id,
+                            &cut,
+                            OrderEventStatus::Canceled,
+                            OrderEventReason::Margin,
+                            FixedPoint::ZERO,
+                        ));
+                    }
                     margin_cancels.push(ReduceOnlyCut {
                         order_id: cut.id,
                         trader: cut.trader,
@@ -3036,6 +3174,20 @@ impl OrderBook {
 
             let maker = queue.front_mut().unwrap();
             maker.remaining_qty -= fill_qty;
+            if let Some(ev) = events.as_deref_mut() {
+                let status = if maker.remaining_qty == FixedPoint::ZERO {
+                    OrderEventStatus::Filled
+                } else {
+                    OrderEventStatus::PartiallyFilled
+                };
+                ev.push(order_events::order_event(
+                    market_id,
+                    maker,
+                    status,
+                    OrderEventReason::None,
+                    fill_qty,
+                ));
+            }
 
             // Maker row changed either way: partial fill rewrites it,
             // full fill deletes it. Mode 3: either way its frame's chunk is
@@ -3353,6 +3505,12 @@ impl OrderBook {
             }
             !fire
         });
+        if self.order_events.is_some() {
+            for s in &fired {
+                let e = order_events::stop_event(s, OrderEventStatus::Triggered, OrderEventReason::None);
+                self.log_event(e);
+            }
+        }
         fired
             .into_iter()
             .map(|stop| {
@@ -3396,12 +3554,12 @@ impl OrderBook {
 impl OrderBook {
     /// Bid price levels ascending (the whole-book serializer's walk order),
     /// each with its FIFO queue (front = highest time priority).
-    pub fn bid_queues(&self) -> impl Iterator<Item = (&FixedPoint, &VecDeque<Order>)> {
+    pub fn bid_queues(&self) -> impl DoubleEndedIterator<Item = (&FixedPoint, &VecDeque<Order>)> {
         self.bids.iter()
     }
 
     /// Ask price levels ascending, each with its FIFO queue.
-    pub fn ask_queues(&self) -> impl Iterator<Item = (&FixedPoint, &VecDeque<Order>)> {
+    pub fn ask_queues(&self) -> impl DoubleEndedIterator<Item = (&FixedPoint, &VecDeque<Order>)> {
         self.asks.iter()
     }
 
@@ -4707,6 +4865,8 @@ impl BorshDeserialize for OrderBook {
             instance: BookInstance::fresh(),
             log_drains: 0,
             saved_bbo: None,
+            order_events: None,
+            cancel_cause: OrderEventReason::User,
         };
 
         for _ in 0..order_count {

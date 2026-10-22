@@ -334,6 +334,7 @@ fn single_readers_cost_the_base_plus_their_words() {
         realized_pnl: FixedPoint::ZERO,
         isolated_margin: FixedPoint::ZERO,
         margin_type: MarginType::Cross,
+        funding: None,
     };
     db.put_cf_raw(
         CF_NATIVE_POSITIONS,

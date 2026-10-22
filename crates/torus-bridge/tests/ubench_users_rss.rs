@@ -227,6 +227,7 @@ fn synth(n: u64, k: usize) -> (BTreeMap<Vec<u8>, Vec<u8>>, BTreeMap<Vec<u8>, Vec
                 realized_pnl: FixedPoint::from_raw(i128::from((h >> 8) % 10_000) - 5_000),
                 isolated_margin: if isolated { fp(size * price / 10) } else { FixedPoint::ZERO },
                 margin_type: if isolated { MarginType::Isolated } else { MarginType::Cross },
+                funding: None,
             };
             pos.insert(position_key(&t, m).to_vec(), borsh::to_vec(&p).expect("encode position"));
         }

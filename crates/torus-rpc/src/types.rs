@@ -254,6 +254,21 @@ pub fn dec_fp(v: FixedPoint) -> String {
     v.to_string()
 }
 
+/// Funding engine: a value scaled 1e18 (`torus_core::funding::INDEX_SCALE`)
+/// as a decimal string, trailing zeros trimmed (`-0.0000125`, `6`).
+pub fn dec_e18(v: i128) -> String {
+    let neg = v < 0;
+    let a = v.unsigned_abs();
+    let (int, frac) = (a / 1_000_000_000_000_000_000, a % 1_000_000_000_000_000_000);
+    let mut out = format!("{}{int}", if neg { "-" } else { "" });
+    if frac != 0 {
+        let f = format!("{frac:018}");
+        out.push('.');
+        out.push_str(f.trim_end_matches('0'));
+    }
+    out
+}
+
 // ============================================================================
 // Torus Native RPC Response Types
 // ============================================================================
@@ -266,7 +281,7 @@ pub struct RpcOrderBook {
     pub asks: Vec<RpcPriceLevel>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcPriceLevel {
     pub price: String,
@@ -289,6 +304,11 @@ pub struct RpcPosition {
     /// mark of this market crosses maintenance (docs/api/position.md).
     /// Isolated: the simplified `entry ∓ isolated margin / size` estimate.
     pub liquidation_price: Option<String>,
+    /// Funding engine: funding since the position opened, settled + pending
+    /// (positive = paid). Omitted for a position without funding state
+    /// (the feature off, or not touched since its market got a funding row).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub funding_since_open: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -321,6 +341,19 @@ pub struct RpcLiquidatorVault {
     pub deficit: String,
     /// Positions with a non-zero size the vault holds.
     pub open_positions: u64,
+}
+
+/// `torus_getUserFees`: the trading fee rates in force and the trader's
+/// lifetime net fees.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcUserFees {
+    /// Taker fee, ppm of notional (450 = 0.045 %).
+    pub taker_fee_ppm: i64,
+    /// Maker fee, ppm of notional (negative = rebate).
+    pub maker_fee_ppm: i64,
+    /// Lifetime net fees paid (rebates subtracted), signed decimal string.
+    pub cum_fees: String,
 }
 
 /// `torus_getUserLimits`: the per-user open-order limit and its inputs.
@@ -429,6 +462,29 @@ pub struct RpcOpenInterest {
     pub short_oi: String,
 }
 
+/// Funding engine (`torus_getFundingRate`): one market's funding state.
+/// Rates are per funding interval, decimal fractions (0.0001 = 0.01%).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcFundingRate {
+    pub market_id: String,
+    /// The market has a funding row (the feature ran for it).
+    pub active: bool,
+    /// The rate the current interval would pay now (its samples so far).
+    pub predicted_rate: String,
+    /// The rate of the last settlement.
+    pub last_rate: String,
+    /// Cumulative funding per unit of base (quote).
+    pub cum_index: String,
+    pub interval_secs: u64,
+    /// Block time the current interval settles at (first block at or after).
+    pub next_funding_time: u64,
+    /// Block time of the last settlement (0 = none yet).
+    pub last_funding_time: u64,
+    /// Premium samples in the current interval.
+    pub samples: u32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcMarkPrice {
@@ -475,9 +531,48 @@ pub struct RpcUserFill {
     pub order_id: String,
     pub start_position: String,
     pub closed_pnl: String,
+    /// Trading fee the user paid on this fill (negative = rebate). Absent
+    /// for blocks before `trading_fees` is active (the row is then exactly
+    /// the pre-feature row) and in pre-feature rows (Codex s138 #3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee: Option<String>,
     pub dir: String,
     pub block_number: String,
     pub timestamp: String,
+}
+
+/// One `orderUpdates` stream row (s139): one transition of one of the
+/// user's orders. The order fields are `torus_getOpenOrders`' names.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcOrderUpdate {
+    /// `null` for a placement refused before the book assigned an id.
+    pub order_id: Option<String>,
+    pub client_order_id: Option<String>,
+    pub market_id: String,
+    pub side: String,
+    pub price: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_price: Option<String>,
+    pub original_qty: String,
+    pub remaining_qty: String,
+    pub filled_qty: String,
+    pub reduce_only: bool,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub block_number: String,
+    pub timestamp: String,
+}
+
+/// One `l2Book` level (s139, Hyperliquid's `WsLevel`): `px` = price, `sz` =
+/// size, `n` = order count, as `torus_getOrderBook`'s `price`, `quantity`,
+/// `orderCount`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RpcL2Level {
+    pub px: String,
+    pub sz: String,
+    pub n: u32,
 }
 
 // ============================================================================

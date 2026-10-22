@@ -17,6 +17,25 @@ block with room, in queue order. So block `N`'s queue holds rows queued by
 block `N - 1` (any kind), by block `N - K` (order kinds), and rows that an
 earlier full target sent on.
 
+**Item 7 T (P0.0 feature `same_block_core_writer`, id 2; not scheduled on any
+network yet).** From the height a network activates it, the targets and seqs
+change (blocks below that height keep the rules above):
+- Every non-order kind (`lockbox_deposit`, `lockbox_withdraw`, `delegate`,
+  `undelegate`, `claim_rewards`, `lock_permanent`, `claim_unbonded`) queued by
+  block `B`'s EVM targets `B` itself and drains at the end of `B`'s native
+  phase, after all of `B`'s native actions (`queuedBlock` = `N`).
+- Each target block has two seq ranges, each capped at 200: seqs `0..=199`
+  for those kinds ("same-block" range) and `200..=399` for the order kinds.
+  A full range sends its row on to the next block with room in that same
+  range, so a backlog of delayed orders never pushes a deposit out of its
+  block. Block `N` drains at most 400 rows, in seq order: the same-block
+  range first, then the orders.
+- Order kinds keep `max(B + K, previous order target)`; their first seq in a
+  target is 200, not 0.
+- At the activation height `H` itself, rows queued by `H - 1` under the old
+  rules (seqs from 0, any kind) drain first, and `H`'s same-block rows follow
+  them in the same range.
+
 Every drained queue row has a result in block `N`'s action status record
 (`cf_block_action_status`, record v5; v4 before s114). `torus_getBlockBody(N)` returns these
 results in `coreWriterResults`, in queue order. This includes blocks that
@@ -54,10 +73,10 @@ have no native action and no EVM tx.
 
 | Field | Meaning |
 |---|---|
-| `seq` | The row's position in block `N`'s queue. The row key is `N ‖ seq`, so `(N, seq)` identifies one queued action (at most 200 per block). Seqs follow queue order: rows are appended to their target block's queue as the queuing blocks execute, and within one queuing block in the order of its successful precompile calls (tx order, then call order). The rows of block `N` come from `N - 1` (any kind), `N - K` (order kinds) and earlier blocks whose target was full. |
+| `seq` | The row's position in block `N`'s queue. The row key is `N ‖ seq`, so `(N, seq)` identifies one queued action (at most 200 per block; under item 7 T at most 400, seqs `0..=199` same-block kinds and `200..=399` order kinds, see above). Seqs follow queue order: rows are appended to their target block's queue as the queuing blocks execute, and within one queuing block in the order of its successful precompile calls (tx order, then call order). The rows of block `N` come from `N - 1` (any kind), `N - K` (order kinds) and earlier blocks whose target was full. |
 | `kind` | `place_order`, `cancel_order`, `cancel_by_cloid`, `cancel_all`, `delegate`, `undelegate`, `claim_rewards`, `lock_permanent`, `claim_unbonded`, `lockbox_deposit`, `lockbox_withdraw`; `undecodable` for a row that did not decode; `unknown` for a code this node does not know. |
 | `trader` | The precompile caller (`msg.sender`, so a contract's address when a contract called it). `null` for `undecodable`. |
-| `queuedBlock` | The block whose EVM queued it (hex): `N - 1` for staking and lockbox rows, `N - K` for order rows (K = `core_writer_order_delay`, default 10), earlier when a full block or an earlier order's target pushed the row on. `null` for `undecodable`. |
+| `queuedBlock` | The block whose EVM queued it (hex): `N - 1` for staking and lockbox rows (`N` itself under item 7 T), `N - K` for order rows (K = `core_writer_order_delay`, default 10), earlier when a full block or an earlier order's target pushed the row on. `null` for `undecodable`. |
 | `status` | `executed`, `failed` or `rejected`. `rejected` is a CoreWriter order refused with a Hyperliquid `*Rejected` status (see `rejectStatus`), as for a native placement. |
 | `reason` | Stable lowercase reason (`margin`, `tick`, `ioc_cancel`, `other`, ...), as in `nativeActionFailures`. Absent for `executed`. |
 | `rejectStatus` | The HL `*Rejected` name. Present only for `rejected`. |
@@ -67,7 +86,9 @@ have no native action and no EVM tx.
 | `txHash`, `callIndex` | The EVM tx that queued the row, see below. |
 
 Failed rows include: the delay guard (`action queued in block X
-cannot execute in block N`, a row from the current or a later block; never
+cannot execute in block N`, a row from the current or a later block; under
+item 7 T a same-block-range row of a non-order kind from block `N` itself is
+allowed, an order kind or an order-range row from `N` is not; never
 expected), an order type the queue cannot run (stop
 types), a lockbox withdraw without enough native balance, a cancel of an
 order that does not exist (`cancel_order`, `cancel_by_cloid`), a placement

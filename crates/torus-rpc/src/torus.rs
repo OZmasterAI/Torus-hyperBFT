@@ -121,6 +121,12 @@ pub trait TorusApi {
     #[method(name = "getUserLimits")]
     async fn get_user_limits(&self, trader: String) -> RpcResult<RpcUserLimits>;
 
+    /// Trading fees: the maker / taker rates in force and the trader's
+    /// lifetime net fees (whether fees are charged yet: the `trading_fees`
+    /// entry of `torus_getFeatureSchedule`).
+    #[method(name = "getUserFees")]
+    async fn get_user_fees(&self, trader: String) -> RpcResult<RpcUserFees>;
+
     /// The liquidator vault's committed cash, deficit and open positions.
     #[method(name = "getLiquidatorVault")]
     async fn get_liquidator_vault(&self) -> RpcResult<RpcLiquidatorVault>;
@@ -251,6 +257,11 @@ pub trait TorusApi {
     #[method(name = "getMarkPrice")]
     async fn get_mark_price(&self, market_id: String) -> RpcResult<RpcMarkPrice>;
 
+    /// Funding engine (docs/plans/funding-engine.md): the market's funding
+    /// state (`active: false` and zeros before its funding row exists).
+    #[method(name = "getFundingRate")]
+    async fn get_funding_rate(&self, market_id: String) -> RpcResult<RpcFundingRate>;
+
     #[method(name = "getUserTrades")]
     async fn get_user_trades(
         &self,
@@ -271,6 +282,8 @@ pub trait TorusApi {
     async fn using_big_blocks(&self, address: String) -> RpcResult<bool>;
 
     // --- Phase 7B: Trade streaming subscription ---
+    /// `torus_subscribe(kind, params)`: `newTrades`, `userFills` (s80),
+    /// `l2Book`, `orderUpdates` (s139). See `docs/api/streams.md`.
     #[subscription(name = "subscribe" => "subscription", unsubscribe = "unsubscribe", item = serde_json::Value)]
     async fn subscribe(
         &self,
@@ -1131,6 +1144,42 @@ fn decode_order_book_levels(
     Ok((to_levels(&snapshot.bids), to_levels(&snapshot.asks)))
 }
 
+/// `torus_getOrderBook`'s levels of market `mid` (at most `depth` per side,
+/// best first) in on-disk `layout`, read as of `snap` (`None` = latest).
+/// s139: shared with the `l2Book` stream, so the stream's snapshots are the
+/// method's answers.
+///
+/// The book CF holds one of three layouts (classic blob / order rows /
+/// level rows). Reading the classic key only — which is what the method
+/// used to do — silently returns an EMPTY book on a mode-1/2 node. Serve
+/// what is on disk, and error rather than fake an empty book when the
+/// layout cannot be decoded.
+pub(crate) fn read_book_levels(
+    state: &torus_state::StateDb,
+    snap: scan::Snap<'_, '_>,
+    layout: BookLayout,
+    mid: u64,
+    depth: usize,
+    budget: &mut scan::ScanBudget,
+) -> Result<(Vec<RpcPriceLevel>, Vec<RpcPriceLevel>), ErrorObjectOwned> {
+    if layout.is_rows() {
+        let levels = scan::row_book_depth(state, snap, mid, layout, depth, budget)
+            .map_err(ErrorObjectOwned::from)?;
+        return Ok((row_levels(levels.bids), row_levels(levels.asks)));
+    }
+    match scan::classic_blob(state, snap, mid, budget).map_err(ErrorObjectOwned::from)? {
+        Some(data) => {
+            let (mut bids, mut asks) = decode_order_book_levels(&data)
+                .map_err(RpcError::Internal)
+                .map_err(ErrorObjectOwned::from)?;
+            bids.truncate(depth);
+            asks.truncate(depth);
+            Ok((bids, asks))
+        }
+        None => Ok((vec![], vec![])),
+    }
+}
+
 /// Row-layout depth (`TORUS_BOOK_ROWS=1/2`) in RPC shape. Mode 2 is served
 /// from the ROOT-CF level rows; mode 1 aggregates the per-order rows.
 fn row_levels(levels: Vec<book_reader::DepthLevel>) -> Vec<RpcPriceLevel> {
@@ -1147,7 +1196,7 @@ fn row_levels(levels: Vec<book_reader::DepthLevel>) -> Vec<RpcPriceLevel> {
 /// The layout actually on disk. Never derived from this process's env — an RPC
 /// node must serve whatever the DB holds. R24: charged to the request's scan
 /// budget (a DB without the layout marker is sniffed over the whole book CF).
-fn book_layout(
+pub(crate) fn book_layout(
     state: &torus_state::StateDb,
     budget: &mut scan::ScanBudget,
 ) -> Result<BookLayout, ErrorObjectOwned> {
@@ -1161,6 +1210,34 @@ fn book_read_err(e: torus_core::error::CoreError) -> ErrorObjectOwned {
 /// Response cap for `torus_getOpenOrders`: the most open orders a user can
 /// hold, so a user at the cap still sees every resting order.
 const OPEN_ORDERS_LIMIT: usize = OPEN_ORDER_MAX_LIMIT as usize;
+
+/// Trading fees: the `torus_getUserFees` reply for `trader` (two
+/// `CF_FEE_CONFIG` point reads and the trader's `cfee` row).
+pub(crate) fn user_fees<S: StateBackend + Clone>(
+    state: &S,
+    trader: &alloy_primitives::Address,
+) -> RpcResult<RpcUserFees> {
+    let rates = stored_fee_rates(state).map_err(book_read_err)?;
+    let cum = PositionManager::new(state.clone())
+        .get_cum_fee(trader)
+        .map_err(book_read_err)?;
+    Ok(RpcUserFees {
+        taker_fee_ppm: rates.taker_ppm,
+        maker_fee_ppm: rates.maker_ppm,
+        cum_fees: dec_fp(cum),
+    })
+}
+
+/// The fee rates in force, as the executor reads them
+/// (`TradingFeeRates::from_stored` over the two governance rows).
+fn stored_fee_rates<S: StateBackend>(
+    state: &S,
+) -> Result<torus_types::trading_fees::TradingFeeRates, torus_core::error::CoreError> {
+    use torus_types::trading_fees::{TradingFeeRates, MAKER_FEE_PARAM, TAKER_FEE_PARAM};
+    let taker = state.get_cf_raw(torus_state::cf::CF_FEE_CONFIG, TAKER_FEE_PARAM.as_bytes())?;
+    let maker = state.get_cf_raw(torus_state::cf::CF_FEE_CONFIG, MAKER_FEE_PARAM.as_bytes())?;
+    Ok(TradingFeeRates::from_stored(taker.as_deref(), maker.as_deref()))
+}
 
 /// P0.0 phase 6: the `torus_getFeatureSchedule` reply for `schedule` (this
 /// node's), the features `known` (the node passes `KNOWN_FEATURES`), at the
@@ -1227,32 +1304,9 @@ impl TorusApiServer for RpcState {
             .map_or(ORDER_BOOK_MAX_LEVELS, |d| d as usize)
             .clamp(1, ORDER_BOOK_MAX_LEVELS);
         let mut budget = self.scan_budget();
-
-        // The book CF holds one of three layouts (classic blob / order rows /
-        // level rows). Reading the classic key only — which is what this
-        // handler used to do — silently returns an EMPTY book on a mode-1/2
-        // node. Serve what is on disk, and error rather than fake an empty
-        // book when the layout cannot be decoded.
         let layout = book_layout(&self.state, &mut budget)?;
-        let (bids, asks) = if layout.is_rows() {
-            let levels = scan::row_book_depth(&self.state, mid, layout, depth, &mut budget)
-                .map_err(ErrorObjectOwned::from)?;
-            (row_levels(levels.bids), row_levels(levels.asks))
-        } else {
-            match scan::classic_blob(&self.state, mid, &mut budget)
-                .map_err(ErrorObjectOwned::from)?
-            {
-                Some(data) => {
-                    let (mut bids, mut asks) = decode_order_book_levels(&data)
-                        .map_err(RpcError::Internal)
-                        .map_err(ErrorObjectOwned::from)?;
-                    bids.truncate(depth);
-                    asks.truncate(depth);
-                    (bids, asks)
-                }
-                None => (vec![], vec![]),
-            }
-        };
+        let (bids, asks) =
+            read_book_levels(&self.state, None, layout, mid, depth, &mut budget)?;
 
         Ok(RpcOrderBook {
             market_id,
@@ -1284,11 +1338,16 @@ impl TorusApiServer for RpcState {
                     torus_core::position::MarginType::Isolated => "isolated",
                 };
 
-                // Unrealized PnL at the usable oracle price; 0 without one
-                // (valued at entry, as the margin math does).
-                let unrealized = self
-                    .usable_oracle_price(mid)
-                    .map_or(FixedPoint::ZERO, |op| p.unrealized_pnl(op.price));
+                // Funding engine: the market's index (pending funding).
+                let index = torus_core::funding::read_index(&self.state, mid)
+                    .map_err(|e| RpcError::Internal(e.to_string()))
+                    .map_err(ErrorObjectOwned::from)?;
+                // Unrealized PnL at the usable oracle price (0 without one:
+                // valued at entry, as the margin math does), less pending
+                // funding, which needs no price (Codex P1 s138).
+                let unrealized = self.usable_oracle_price(mid).map_or(FixedPoint::ZERO, |op| p.unrealized_pnl(op.price))
+                    - p.funding_owed(index);
+                let funding_since_open = p.funding.map(|_| dec_fp(p.funding_since_open(index)));
 
                 let liquidation_price = match p.margin_type {
                     // R23: the account-wide threshold the liquidation step
@@ -1336,6 +1395,7 @@ impl TorusApiServer for RpcState {
                     margin: dec_fp(p.isolated_margin),
                     margin_mode: margin_mode.to_string(),
                     liquidation_price: liquidation_price.map(dec_fp),
+                    funding_since_open,
                 }))
             }
         }
@@ -1434,6 +1494,11 @@ impl TorusApiServer for RpcState {
             open_order_limit: open_order_limit(cum_volume),
             cum_volume: dec_fp(cum_volume),
         })
+    }
+
+    async fn get_user_fees(&self, trader: String) -> RpcResult<RpcUserFees> {
+        let addr = parse_address(&trader).map_err(ErrorObjectOwned::from)?;
+        user_fees(&self.state, &addr)
     }
 
     // === 2.9.2: Market info ===
@@ -2291,6 +2356,27 @@ impl TorusApiServer for RpcState {
         })
     }
 
+    async fn get_funding_rate(&self, market_id: String) -> RpcResult<RpcFundingRate> {
+        use torus_core::funding::{read_row, FundingParams, FundingRow};
+        let mid = parse_u64(&market_id).map_err(ErrorObjectOwned::from)?;
+        let internal = |e: torus_core::error::CoreError| ErrorObjectOwned::from(RpcError::Internal(e.to_string()));
+        let params = FundingParams::read(&self.state).map_err(internal)?;
+        let row = read_row(&self.state, mid).map_err(internal)?;
+        let active = row.is_some();
+        let r = row.unwrap_or_else(|| FundingRow::new(0, &params));
+        Ok(RpcFundingRate {
+            market_id,
+            active,
+            predicted_rate: dec_e18(r.predicted_rate(&params)),
+            last_rate: dec_e18(r.last_rate),
+            cum_index: dec_e18(r.cum_index),
+            interval_secs: params.interval_secs,
+            next_funding_time: if active { r.next_funding_time(&params) } else { 0 },
+            last_funding_time: r.last_settle_ts,
+            samples: r.samples,
+        })
+    }
+
     async fn get_mark_price(&self, market_id: String) -> RpcResult<RpcMarkPrice> {
         let mid = parse_u64(&market_id).map_err(ErrorObjectOwned::from)?;
 
@@ -2314,7 +2400,7 @@ impl TorusApiServer for RpcState {
                 .map_err(book_read_err)?
                 .unwrap_or(FixedPoint::ZERO)
         } else {
-            match scan::classic_blob(&self.state, mid, &mut budget) {
+            match scan::classic_blob(&self.state, None, mid, &mut budget) {
                 Ok(Some(data)) => OrderBook::try_from_slice(&data)
                     .ok()
                     .and_then(|book| book.last_trade_price())
@@ -2495,6 +2581,15 @@ impl TorusApiServer for RpcState {
                 .await;
             return Ok(());
         };
+        match kind {
+            crate::streams::StreamKind::L2Book { market, levels } => {
+                return self.run_l2_book(pending, _slot, market, levels).await;
+            }
+            crate::streams::StreamKind::OrderUpdates(user) => {
+                return self.run_order_updates(pending, _slot, user).await;
+            }
+            _ => {}
+        }
         // Subscribe before accepting so no block after the reply is missed.
         let mut rx = self.notifier.new_trades.subscribe();
         let sink = pending.accept().await?;
@@ -2536,10 +2631,144 @@ impl TorusApiServer for RpcState {
                 crate::streams::StreamKind::UserFills(user) => {
                     stream_message(&sink, &crate::streams::fills_for_user(&block.fills, user))?
                 }
+                // Dispatched above.
+                crate::streams::StreamKind::L2Book { .. }
+                | crate::streams::StreamKind::OrderUpdates(_) => None,
             };
             if let Some(msg) = msg {
                 if sink.send(msg).await.is_err() {
                     return Ok(());
+                }
+            }
+        }
+    }
+}
+
+impl RpcState {
+    /// s139: an `orderUpdates` subscription: each executed block's events of
+    /// `user`'s orders, one message per block that has any. Closed with a lag
+    /// error when it falls [`crate::BlockNotifier`]'s capacity behind.
+    async fn run_order_updates(
+        &self,
+        pending: PendingSubscriptionSink,
+        _slot: SubscriptionSlot,
+        user: alloy_primitives::Address,
+    ) -> SubscriptionResult {
+        use tokio::sync::broadcast::error::RecvError;
+        // Subscribe before accepting so no block after the reply is missed
+        // (and so execution records events from the next block on).
+        let mut rx = self.notifier.order_updates.subscribe();
+        let sink = pending.accept().await?;
+        loop {
+            let block = tokio::select! {
+                _ = sink.closed() => return Ok(()),
+                r = rx.recv() => r,
+            };
+            let block = match block {
+                Ok(b) => b,
+                Err(RecvError::Lagged(n)) => {
+                    return Err(format!(
+                        "subscriber lagged: {n} blocks dropped; resubscribe and resync \
+                         with torus_getOpenOrders"
+                    )
+                    .into());
+                }
+                Err(RecvError::Closed) => return Ok(()),
+            };
+            let rows = crate::streams::order_updates_for_user(&block, user);
+            if let Some(msg) = stream_message(&sink, &rows)? {
+                if sink.send(msg).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// s139: an `l2Book` subscription: the market's levels at the applied
+    /// height on subscribe (seq 0), then one message per later height whose
+    /// best `levels` levels changed ([`crate::book_stream`]). A read error
+    /// rejects the subscription (before) or closes it (after).
+    async fn run_l2_book(
+        &self,
+        pending: PendingSubscriptionSink,
+        _slot: SubscriptionSlot,
+        market: u64,
+        levels: usize,
+    ) -> SubscriptionResult {
+        use tokio::sync::broadcast::error::RecvError;
+        // Registered before the first read: no later change is missed.
+        let (mut rx, _reg) = self.book_feed.subscribe(self, market);
+        let rpc = self.clone();
+        let first = tokio::task::spawn_blocking(move || {
+            crate::book_stream::first_snapshot(&rpc, market)
+        })
+        .await
+        .map_err(|e| ErrorObjectOwned::from(RpcError::Internal(e.to_string())));
+        let (mut height, snap) = match first.and_then(|r| r) {
+            Ok(v) => v,
+            Err(e) => {
+                pending.reject(e).await;
+                return Ok(());
+            }
+        };
+        let sink = pending.accept().await?;
+        let market_hex = hex_u64(market);
+        let mut seq: u64 = 0;
+        let mut last = snap.levels_json(levels)?;
+        let message = |seq: u64, height: u64, raw: &serde_json::value::RawValue| {
+            jsonrpsee::SubscriptionMessage::new(
+                sink.method_name(),
+                sink.subscription_id(),
+                &crate::book_stream::L2BookMessage {
+                    market_id: market_hex.clone(),
+                    block_number: hex_u64(height),
+                    seq: hex_u64(seq),
+                    levels: raw,
+                },
+            )
+        };
+        if sink.send(message(seq, height, &last)?).await.is_err() {
+            return Ok(());
+        }
+        loop {
+            let tick = tokio::select! {
+                _ = sink.closed() => return Ok(()),
+                r = rx.recv() => r,
+            };
+            let tick = match tick {
+                Ok(t) => t,
+                Err(RecvError::Lagged(n)) => {
+                    return Err(format!(
+                        "subscriber lagged: {n} book updates dropped; resubscribe (the first \
+                         message is a full snapshot)"
+                    )
+                    .into());
+                }
+                Err(RecvError::Closed) => return Ok(()),
+            };
+            // Codex P2 (s139): only a tick carrying this market moves the
+            // height; another market's tick at height h must not swallow a
+            // forced refresh of this one at the same h (a subscription that
+            // joined during a publisher read).
+            let Some(update) = tick.books.get(&market) else {
+                continue;
+            };
+            if tick.height <= height {
+                continue;
+            }
+            height = tick.height;
+            match update {
+                Err(e) => return Err(e.clone().into()),
+                Ok(snap) => {
+                    let raw = snap.levels_json(levels)?;
+                    if raw.get() == last.get() {
+                        continue;
+                    }
+                    seq += 1;
+                    if sink.send(message(seq, height, &raw)?).await.is_err() {
+                        return Ok(());
+                    }
+                    last = raw;
                 }
             }
         }

@@ -3,7 +3,12 @@
 Status: revision 2 (s127). **Option 0 (P1 + P2) BUILT** on `feat/item7-option0` (plan `item7-option0-impl.md`,
 steps 0-4, G0-G4, 2026-10-19), behind `TORUS_EVM_FAST_PATH`; Q11 passed (perf doc section 107) and the owner merged it
 with the flag **on by default** (s131; `TORUS_EVM_FAST_PATH=0` turns it off per node). RPC freshness as
-question 4 a (`docs/api/eth-head.md`). T (P3), HL order and C0 are not built. Revision 1 (`3b79a617`) went through two
+question 4 a (`docs/api/eth-head.md`). **T (P3) BUILT** on `feat/item7-t-same-block` behind the
+P0.0 feature `same_block_core_writer` (id 2), scheduled nowhere (owner s138: after the testnet genesis, activated
+at a height); with the bit off every rule is the step 2 one. T's own order-range cursor rows are
+`core_writer_t_first_open_order_target` / `core_writer_t_full_order_run` (the step 2 rows speak for the shared range
+of the blocks below the activation); the same-block range has its cursor `core_writer_t_first_open_same_block_target`
+(Codex torus-adversarial s138, see the same-block walk below). HL order and C0 are not built. Revision 1 (`3b79a617`) went through two
 adversarial reviews: Codex (`reviews/codex-item7-step3-adv.md`, needs-attention: P1 + P2) and Claude
 (`reviews/item7-step3-claude-review.md`, build with changes: 3 high, 5 medium, 2 weak spots, missing tests). Every
 finding is verified in code and handled; section 10 maps each one to the change. Owner direction s127 is in: the RPC
@@ -334,12 +339,19 @@ So a narrower barrier is either the same write or a new durability model. Option
     - The order class keeps step 2's walk, cursor and run rows. The only change is the full test ("full iff seq 399
       taken"). Its invariant `candidate >= next_block` (`precompiles.rs:1438-1440 @ c567b1b3`) still holds, because the class now
       holds orders only.
-    - The same-block walk starts at h, probes seq 199 and spills to h + 1, h + 2, ... in its own range only. It needs
-      no cursor row. Only EVM block h itself and the spill of a recent EVM block fill these ranges, and gas bounds both:
-      at `GAS_PRECOMPILE_WRITE` = 20,000 (`precompiles.rs:57 @ c567b1b3`), one block holds at most ~150 enqueues per 3M
-      gas, which never fills the 200-row range, and a 15M big block holds ~750. So a walk probes at most ~4 targets per
-      enqueue. That keeps clear of the unmetered O(backlog) probes Codex flagged in step 2's walk (memory
-      ad5a8203c6de102f, fixed there by the cursor rows).
+    - The same-block walk starts at h, probes seq 199 and spills to h + 1, h + 2, ... in its own range only.
+      Revision note (Codex torus-adversarial on the build, s138): gas does NOT bound this walk. Revision 2 assumed 3M /
+      15M gas blocks (~150 / ~750 enqueues at `GAS_PRECOMPILE_WRITE` = 20,000, so ~4 probes); the supported settings
+      (10M gas every two blocks) queue more than the 200 a block drains, the backlog of full targets grows every block,
+      and a walk reading each one costs O(backlog) unmetered reads (Codex proof: 127 reads per enqueue at height 1000,
+      the step 2 finding of memory ad5a8203c6de102f again). Built fix: a cursor row
+      `core_writer_t_first_open_same_block_target` (every target in `h .. C` has a full same-block range), moved by
+      every kept walk (each starts at its queuing block), plus step 2's cursor and run rows, which speak for the same
+      seqs 0..199 of the targets past the activation. Point reads per non-order enqueue under sustained overload with a
+      backlog of 142 full targets: 145 before the fix, 3 after (the two cursors and one probe; test
+      `t_sustained_same_block_overload_keeps_reads_per_enqueue_constant`, across the activation, reverted txs and crash
+      replay). Step 2 full targets no step 2 row covers (below H - 1 + K) cost one read each, once. The backlog itself still grows with intake
+      above the drain rate (same-block latency grows with it); bounding it is an open owner question.
     - A target drains in key order: the same-block range first (HL: EVM -> Core transfers before CoreWriter actions),
       then orders. Per-block drain stays <= 400 rows.
   - **Drain point and assertion.** h's drain (after its native batches, as today) runs h's same-block rows. The anti-MEV
