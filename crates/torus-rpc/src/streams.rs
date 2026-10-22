@@ -1,4 +1,6 @@
-//! s80: builders for the `newTrades` and `userFills` WebSocket streams.
+//! s80: builders for the `newTrades` and `userFills` WebSocket streams;
+//! s139: `orderUpdates` (below) and the `l2Book` request (its feed is
+//! [`crate::book_stream`]).
 //!
 //! The execution thread publishes each executed block's fills once as an
 //! `Arc<BlockFills>`; the notifier wraps it in a [`StreamBlock`]. A
@@ -14,12 +16,14 @@ use std::sync::{Arc, Mutex};
 use alloy_primitives::Address;
 use serde_json::value::RawValue;
 use tokio::sync::OnceCell;
+use torus_state::order_events::{BlockOrderEvents, OrderEvent};
 use torus_state::trade_rows::{BlockFills, TradeFill};
 use torus_types::FixedPoint;
 
+use crate::book_stream::{L2_DEFAULT_LEVELS, L2_MAX_LEVELS};
 use crate::types::{
-    dec_fp, hex_address, hex_u128, hex_u64, parse_address, parse_u64, RpcStreamTrade, RpcTrade,
-    RpcUserFill,
+    dec_fp, hex_address, hex_u128, hex_u64, parse_address, parse_u64, RpcOrderUpdate,
+    RpcStreamTrade, RpcTrade, RpcUserFill,
 };
 
 /// A validated `torus_subscribe` request.
@@ -29,6 +33,11 @@ pub enum StreamKind {
     NewTrades(Option<u64>),
     /// `userFills {user}`: the fills where `user` is maker or taker.
     UserFills(Address),
+    /// s139: `l2Book {marketId, nLevels?}`: the market's best `levels`
+    /// levels per side, a full snapshot per change.
+    L2Book { market: u64, levels: usize },
+    /// s139: `orderUpdates {user}`: the transitions of `user`'s orders.
+    OrderUpdates(Address),
 }
 
 /// Parse and validate a `torus_subscribe(kind, params)` call. Runs before the
@@ -61,9 +70,91 @@ pub fn parse_stream_kind(
             let user = parse_address(user).map_err(|e| format!("userFills: user: {e}"))?;
             Ok(StreamKind::UserFills(user))
         }
+        "orderUpdates" => {
+            let user = field("user")?.ok_or("orderUpdates: params.user is required")?;
+            let user = parse_address(user).map_err(|e| format!("orderUpdates: user: {e}"))?;
+            Ok(StreamKind::OrderUpdates(user))
+        }
+        "l2Book" => {
+            let market = field("marketId")?.ok_or("l2Book: params.marketId is required")?;
+            let market = parse_u64(market).map_err(|e| format!("l2Book: marketId: {e}"))?;
+            let levels = match params.and_then(|m| m.get("nLevels")) {
+                None | Some(serde_json::Value::Null) => L2_DEFAULT_LEVELS as u64,
+                Some(serde_json::Value::Number(n)) => n.as_u64().ok_or_else(|| {
+                    format!("l2Book: nLevels must be 1..={L2_MAX_LEVELS}, got {n}")
+                })?,
+                Some(serde_json::Value::String(s)) => {
+                    parse_u64(s).map_err(|e| format!("l2Book: nLevels: {e}"))?
+                }
+                Some(other) => {
+                    return Err(format!("l2Book: nLevels must be a number, got {other}"))
+                }
+            };
+            if levels == 0 || levels > L2_MAX_LEVELS as u64 {
+                return Err(format!("l2Book: nLevels must be 1..={L2_MAX_LEVELS}, got {levels}"));
+            }
+            Ok(StreamKind::L2Book {
+                market,
+                levels: levels as usize,
+            })
+        }
         other => Err(format!(
-            "unknown subscription kind {other:?}; expected \"newTrades\" or \"userFills\""
+            "unknown subscription kind {other:?}; expected \"newTrades\", \"userFills\", \
+             \"l2Book\" or \"orderUpdates\""
         )),
+    }
+}
+
+/// s139: the `orderUpdates` rows of one block for `user`, in the block's
+/// event order. Encodings as `torus_getOpenOrders` (ids, heights hex;
+/// prices and sizes decimal strings).
+pub fn order_updates_for_user(block: &BlockOrderEvents, user: Address) -> Vec<RpcOrderUpdate> {
+    block
+        .events
+        .iter()
+        .filter(|e| e.trader == user)
+        .map(|e| order_update(block, e))
+        .collect()
+}
+
+fn order_update(block: &BlockOrderEvents, e: &OrderEvent) -> RpcOrderUpdate {
+    use torus_state::order_events::{OrderEventReason as R, OrderEventStatus as S};
+    let status = match e.status {
+        S::Open => "open",
+        S::PartiallyFilled => "partiallyFilled",
+        S::Filled => "filled",
+        S::Canceled => "canceled",
+        S::TriggerPending => "triggerPending",
+        S::Triggered => "triggered",
+        S::Modified => "modified",
+        S::Rejected => "rejected",
+    };
+    let reason = match e.reason {
+        R::None => None,
+        R::User => Some("user"),
+        R::SelfTrade => Some("self_trade"),
+        R::ReduceOnly => Some("reduce_only"),
+        R::Margin => Some("margin"),
+        R::Liquidation => Some("liquidation"),
+        R::Delisted => Some("delisted"),
+        R::Unfilled => Some("unfilled"),
+        R::Reject(f) => Some(f.as_str()),
+    };
+    RpcOrderUpdate {
+        order_id: e.order_id.map(hex_u128),
+        client_order_id: e.cloid.map(torus_types::cloid_serde::to_hex),
+        market_id: hex_u64(e.market),
+        side: side_str(e.side == torus_types::Side::Buy),
+        price: dec_fp(e.price),
+        trigger_price: e.trigger_price.map(dec_fp),
+        original_qty: dec_fp(e.orig_qty),
+        remaining_qty: dec_fp(e.remaining),
+        filled_qty: dec_fp(e.filled),
+        reduce_only: e.reduce_only,
+        status: status.to_string(),
+        reason: reason.map(str::to_string),
+        block_number: hex_u64(block.height),
+        timestamp: hex_u64(block.timestamp),
     }
 }
 

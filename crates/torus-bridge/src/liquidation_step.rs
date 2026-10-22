@@ -474,7 +474,13 @@ impl NativeExecutor {
             }
             // D4: every resting order and pending stop goes first (sorted
             // markets), reservations released. AV is unchanged.
+            // s139: logged as liquidation cancels.
+            let prev = std::mem::replace(
+                &mut ctx.cancel_cause,
+                torus_state::order_events::OrderEventReason::Liquidation,
+            );
             let release = Self::cancel_orders_and_stops(ctx, &trader, None);
+            ctx.cancel_cause = prev;
             Self::release_order_margin(ctx, &trader, release);
             match h {
                 Health::Adl => {

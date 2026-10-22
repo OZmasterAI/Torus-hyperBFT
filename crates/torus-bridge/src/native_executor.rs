@@ -105,6 +105,49 @@ impl NativeActionResult {
     }
 }
 
+impl NativeActionResult {
+    /// s139: a refusal by the order book itself (its reason's canonical
+    /// message, borrowed: [`Self::placed_reject`]), as opposed to one by a
+    /// check before the book. The book logs its own refusals (with the order
+    /// id) in its event log; the `orderUpdates` stream takes the others from
+    /// the results.
+    pub fn is_book_reject(&self) -> bool {
+        !self.success && matches!(self.error, Some(Cow::Borrowed(_)))
+    }
+}
+
+/// s139: the `Rejected` order event of a placement `trader` sent with
+/// `params`, refused before any book saw it for `reason` (`id`: a triggered
+/// stop's own id; `None` = no id was assigned).
+pub fn pre_book_reject_event(
+    trader: &Address,
+    params: &PlaceOrderParams,
+    id: Option<OrderId>,
+    reason: FailureReason,
+) -> torus_state::order_events::OrderEvent {
+    use torus_state::order_events::{OrderEvent, OrderEventReason, OrderEventStatus};
+    let (price, trigger_price) = match params.order_type {
+        OrderType::Limit | OrderType::Market => (params.price, None),
+        OrderType::StopMarket { trigger } => (params.price, Some(trigger)),
+        OrderType::StopLimit { trigger, limit } => (limit, Some(trigger)),
+    };
+    OrderEvent {
+        market: params.market_id,
+        order_id: id,
+        trader: *trader,
+        cloid: params.client_order_id,
+        side: if params.is_buy { Side::Buy } else { Side::Sell },
+        price,
+        trigger_price,
+        orig_qty: params.quantity,
+        remaining: FixedPoint::ZERO,
+        filled: FixedPoint::ZERO,
+        reduce_only: params.reduce_only,
+        status: OrderEventStatus::Rejected,
+        reason: OrderEventReason::Reject(reason),
+    }
+}
+
 /// A refused action: its typed reason and its message.
 type Rejection = (FailureReason, String);
 
@@ -6317,6 +6360,18 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// (no effect bookkeeping, no extras). Output-only either way: state,
     /// results and the native root do not depend on it. Default false.
     pub record_fills: bool,
+    /// s139: an `orderUpdates` stream wants this block's order events: every
+    /// book logs them ([`Self::set_order_events`]) and the pre-book
+    /// rejections are recorded (`pending_order_rejects`). Output-only, like
+    /// `record_fills`. Default false.
+    record_order_events: bool,
+    /// s139: placements refused before any book saw them (triggered stops;
+    /// the action results' rejections are mapped by the committer), in
+    /// execution order, while `record_order_events` is set.
+    pending_order_rejects: Vec<torus_state::order_events::OrderEvent>,
+    /// s139: the reason the cancel-all step logs for the orders it removes
+    /// (`User`; the liquidation and delist steps set theirs around it).
+    cancel_cause: torus_state::order_events::OrderEventReason,
     /// This block's fills in `trade_index` order (s77 packed trade rows).
     pending_fills: Vec<TradeFill>,
     /// s80: the `FillExtras` of `pending_fills` — exactly as long and
@@ -6963,6 +7018,9 @@ impl<T: StateBackend> NativeExecContext<T> {
             defer_trades: false,
             trade_history: true,
             record_fills: false,
+            record_order_events: false,
+            pending_order_rejects: Vec::new(),
+            cancel_cause: torus_state::order_events::OrderEventReason::User,
             pending_fills: Vec::new(),
             pending_extras: Vec::new(),
             fills_block: 0,
@@ -7318,6 +7376,66 @@ impl<T: StateBackend> NativeExecContext<T> {
             std::mem::take(&mut self.pending_fills),
             std::mem::take(&mut self.pending_extras),
         )
+    }
+
+    /// s139: turn order event recording on or off for this block: every
+    /// book's event log (books entering later get it at their entry), and
+    /// the pre-book rejections. Set before execution, once per block, like
+    /// `record_fills`. Off drops any log a resident book still carries.
+    /// O(books); output-only (no state, result or root depends on it).
+    pub fn set_order_events(&mut self, on: bool) {
+        self.record_order_events = on;
+        for book in self.order_books.values_mut() {
+            book.set_order_events(on);
+        }
+        if !on {
+            self.pending_order_rejects = Vec::new();
+        }
+    }
+
+    /// s139: whether this block records order events.
+    #[inline]
+    pub fn order_events_on(&self) -> bool {
+        self.record_order_events
+    }
+
+    /// s139: drain the block's order events: each book's log, markets
+    /// ascending (execution order within a market), then the pre-book
+    /// rejections. Empty while recording is off.
+    pub fn take_order_events(&mut self) -> Vec<torus_state::order_events::OrderEvent> {
+        if !self.record_order_events {
+            return Vec::new();
+        }
+        let mut markets: Vec<MarketId> = self
+            .order_books
+            .iter()
+            .filter(|(_, b)| b.order_events_on())
+            .map(|(&m, _)| m)
+            .collect();
+        markets.sort_unstable();
+        let mut out = Vec::new();
+        for m in markets {
+            if let Some(book) = self.order_books.get_mut(&m) {
+                out.append(&mut book.take_order_events());
+            }
+        }
+        out.append(&mut self.pending_order_rejects);
+        out
+    }
+
+    /// s139: record a placement refused before the book (only while
+    /// recording; `id` = a triggered stop's own id).
+    fn record_pre_book_reject(
+        &mut self,
+        trader: &Address,
+        params: &PlaceOrderParams,
+        id: Option<OrderId>,
+        reason: FailureReason,
+    ) {
+        if self.record_order_events {
+            self.pending_order_rejects
+                .push(pre_book_reject_event(trader, params, id, reason));
+        }
     }
 
     /// PROFILER (s470): total resting orders across every loaded book. Sampled
@@ -9607,6 +9725,10 @@ impl NativeExecutor {
                             });
                         OrderBook::new(market_id, tick, lot)
                     });
+            // s139: a book made here logs like the loaded ones.
+            if ctx.record_order_events {
+                book.set_order_events(true);
+            }
 
             if setup_in_jobs {
                 // TORUS_PARALLEL_MATCH_SETUP: the market's job builds its
@@ -13290,6 +13412,10 @@ impl NativeExecutor {
             .unwrap_or(FixedPoint::ZERO);
             Self::release_order_margin(ctx, &stop.trader, reserved);
             let r = Self::place_order_inner(ctx, &stop.trader, &stop.params, Some(stop.id), &mut queue, false);
+            // s139: a refusal before the book (the book logs its own).
+            if !r.success && !r.is_book_reject() {
+                ctx.record_pre_book_reject(&stop.trader, &stop.params, Some(stop.id), r.reason);
+            }
             if !r.success {
                 tracing::debug!(
                     stop_id = stop.id,
@@ -13529,10 +13655,13 @@ impl NativeExecutor {
 
         // Get or create order book for this market (listed: checked above).
         ctx.dirty_books.insert(market_id);
-        let book = ctx
-            .order_books
-            .entry(market_id)
-            .or_insert_with(|| OrderBook::new(market_id, shape.0, shape.1));
+        let log_events = ctx.record_order_events;
+        let book = ctx.order_books.entry(market_id).or_insert_with(|| {
+            let mut b = OrderBook::new(market_id, shape.0, shape.1);
+            // s139: a book made here logs like the loaded ones.
+            b.set_order_events(log_events);
+            b
+        });
 
         // s515 (BUG 2): police reduce-only orders against CURRENT positions.
         // Review 5: a checked taker's position too — its closing fills are
@@ -13965,8 +14094,11 @@ impl NativeExecutor {
         for mid in market_ids {
             let Some(book) = ctx.order_books.get_mut(&mid) else { continue };
             ctx.phase_accum.cancel_all_books_visited += 1;
+            // s139: the step's reason for the event log (liquidation / delist).
+            let prev_cause = book.set_cancel_cause(ctx.cancel_cause);
             let stops = book.take_pending_stops(trader);
             let cancelled = book.cancel_all(*trader, market);
+            book.set_cancel_cause(prev_cause);
             if stops.is_empty() && cancelled.is_empty() {
                 continue;
             }
@@ -16203,10 +16335,16 @@ impl NativeExecutor {
         let mut traders: Vec<Address> = book.traders_present().copied().collect();
         traders.sort_unstable();
         traders.dedup();
+        // s139: logged as delist cancels.
+        let prev = std::mem::replace(
+            &mut ctx.cancel_cause,
+            torus_state::order_events::OrderEventReason::Delisted,
+        );
         for trader in traders {
             let total = Self::cancel_orders_and_stops(ctx, &trader, Some(market_id));
             Self::release_order_margin(ctx, &trader, total);
         }
+        ctx.cancel_cause = prev;
     }
 
     /// Codex P1 (item 6 C2 / C3 invariant: the mark version changes whenever

@@ -121,6 +121,41 @@ fn list_failures(
     Some(out)
 }
 
+/// s139: append to `out` the `orderUpdates` events of the placements in
+/// `list` refused before any book saw them (the book logs its own refusals,
+/// with the order id; `NativeActionResult::is_book_reject`). `result` is
+/// `execute_batch(list)`'s; one entry per order of a PlaceOrderBatch within
+/// the cap, as [`list_failures`] reads it. A count mismatch (never expected)
+/// adds nothing. Node-local stream output only.
+pub fn order_rejections(
+    list: &[(Address, NativeAction)],
+    result: &NativeBatchResult,
+    out: &mut Vec<torus_state::order_events::OrderEvent>,
+) {
+    let total: usize = list.iter().map(|(_, a)| flat_len(a)).sum();
+    if result.results.len() != total {
+        return;
+    }
+    let mut flat = 0;
+    for (sender, action) in list {
+        let len = flat_len(action);
+        let entries = &result.results[flat..flat + len];
+        flat += len;
+        let orders: &[torus_types::PlaceOrderParams] = match action {
+            NativeAction::PlaceOrder(p) => std::slice::from_ref(p),
+            NativeAction::PlaceOrderBatch(orders) => orders,
+            _ => continue,
+        };
+        for (params, r) in orders.iter().zip(entries) {
+            if !r.success && !r.is_book_reject() {
+                out.push(torus_bridge::native_executor::pre_book_reject_event(
+                    sender, params, None, r.reason,
+                ));
+            }
+        }
+    }
+}
+
 /// The block's native execution failures and order rejections, ascending
 /// body index.
 ///

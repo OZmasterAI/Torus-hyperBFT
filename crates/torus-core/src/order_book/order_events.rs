@@ -35,4 +35,214 @@ impl OrderBook {
     pub fn set_cancel_cause(&mut self, cause: OrderEventReason) -> OrderEventReason {
         std::mem::replace(&mut self.cancel_cause, cause)
     }
+
+    /// Log `e` if the log is on.
+    #[inline]
+    pub(super) fn log_event(&mut self, e: OrderEvent) {
+        if let Some(log) = self.order_events.as_mut() {
+            log.push(e);
+        }
+    }
+
+    /// Log a removed resting order, `remaining` unfilled.
+    pub(super) fn log_removed(&mut self, o: &Order, reason: OrderEventReason) {
+        if self.order_events.is_some() {
+            let e = order_event(self.market_id, o, OrderEventStatus::Canceled, reason, FixedPoint::ZERO);
+            self.log_event(e);
+        }
+    }
+
+    /// Log a modified resting order (its new size and price).
+    pub(super) fn log_modified(&mut self, o: &Order, reason: OrderEventReason) {
+        if self.order_events.is_some() {
+            let e = order_event(self.market_id, o, OrderEventStatus::Modified, reason, FixedPoint::ZERO);
+            self.log_event(e);
+        }
+    }
+
+    /// Log a removed pending stop.
+    pub(super) fn log_stop_removed(&mut self, s: &StopOrder, reason: OrderEventReason) {
+        if self.order_events.is_some() {
+            self.log_event(stop_event(s, OrderEventStatus::Canceled, reason));
+        }
+    }
+
+    /// The pending stops of the traders `owned` selects, cloned, while the
+    /// log is on (empty otherwise): a cancel-all removes them, and the log
+    /// needs them afterwards.
+    pub(super) fn stops_if_logging(&self, owned: impl Fn(&Address) -> bool) -> Vec<StopOrder> {
+        if self.order_events.is_none() {
+            return Vec::new();
+        }
+        self.pending_stops
+            .iter()
+            .filter(|s| owned(&s.trader))
+            .cloned()
+            .collect()
+    }
+
+    /// Log the stops of `before` that are no longer pending (a cancel-all
+    /// removed them) with the current cancel cause.
+    pub(super) fn log_stops_gone(&mut self, before: Vec<StopOrder>) {
+        let cause = self.cancel_cause;
+        for s in before {
+            if !self.pending_stops.iter().any(|p| p.id == s.id) {
+                self.log_stop_removed(&s, cause);
+            }
+        }
+    }
+
+    /// Log one placement's own outcome (the taker side; its makers and the
+    /// stops it fired were logged while it ran). `p` is the placement as
+    /// requested. The fired stops' `Triggered` events, logged by
+    /// `trigger_stops` at the end of the placement, stay after it: the
+    /// taker's events go in before the last `triggered` entries.
+    pub(super) fn log_placement(&mut self, p: &PlacedParams, result: &PlaceResult) {
+        let Some(log) = self.order_events.as_mut() else {
+            return;
+        };
+        use OrderEventStatus as S;
+        let filled = result
+            .fills
+            .iter()
+            .fold(FixedPoint::ZERO, |acc, f| acc + f.quantity);
+        let base = OrderEvent {
+            market: self.market_id,
+            order_id: Some(result.order_id),
+            trader: p.trader,
+            cloid: p.cloid,
+            side: p.side,
+            price: p.price,
+            trigger_price: p.trigger,
+            orig_qty: p.qty,
+            remaining: FixedPoint::ZERO,
+            filled: FixedPoint::ZERO,
+            reduce_only: p.reduce_only,
+            status: S::Open,
+            reason: OrderEventReason::None,
+        };
+        let ev = |status, reason, filled, remaining| OrderEvent {
+            status,
+            reason,
+            filled,
+            remaining,
+            ..base.clone()
+        };
+        let unfilled = p.qty - filled.min(p.qty);
+        let mut out = Vec::with_capacity(2);
+        match (result.reject, &result.status) {
+            (Some(reason), _) => out.push(ev(
+                S::Rejected,
+                OrderEventReason::Reject(reason),
+                FixedPoint::ZERO,
+                FixedPoint::ZERO,
+            )),
+            (None, OrderStatus::PendingTrigger) => {
+                out.push(ev(S::TriggerPending, OrderEventReason::None, FixedPoint::ZERO, p.qty))
+            }
+            (None, OrderStatus::Filled) => {
+                out.push(ev(S::Filled, OrderEventReason::None, filled, FixedPoint::ZERO))
+            }
+            (None, OrderStatus::PartiallyFilled) => out.push(ev(
+                S::PartiallyFilled,
+                OrderEventReason::None,
+                filled,
+                result.rested_qty,
+            )),
+            (None, OrderStatus::Resting) => {
+                out.push(ev(S::Open, OrderEventReason::None, FixedPoint::ZERO, result.rested_qty))
+            }
+            (None, OrderStatus::Cancelled) => {
+                if filled > FixedPoint::ZERO {
+                    out.push(ev(S::PartiallyFilled, OrderEventReason::None, filled, unfilled));
+                }
+                out.push(ev(S::Canceled, OrderEventReason::Unfilled, FixedPoint::ZERO, unfilled));
+            }
+            (None, OrderStatus::Rejected) => out.push(ev(
+                S::Rejected,
+                OrderEventReason::Reject(FailureReason::Other),
+                FixedPoint::ZERO,
+                FixedPoint::ZERO,
+            )),
+        }
+        let at = log.len() - result.triggered_stops.len().min(log.len());
+        log.splice(at..at, out);
+    }
+}
+
+/// What [`OrderBook::log_placement`] needs of a placement, captured before
+/// the book consumes its params (only while the log is on).
+pub(super) struct PlacedParams {
+    pub trader: Address,
+    pub cloid: Option<Cloid>,
+    pub side: Side,
+    /// The limit (a StopLimit's limit), or a market / stop-market cap.
+    pub price: FixedPoint,
+    pub trigger: Option<FixedPoint>,
+    pub qty: FixedPoint,
+    pub reduce_only: bool,
+}
+
+impl PlacedParams {
+    pub(super) fn new(params: &PlaceOrderParams, trader: Address) -> Self {
+        let (price, trigger) = match params.order_type {
+            OrderType::Limit | OrderType::Market => (params.price, None),
+            OrderType::StopMarket { trigger } => (params.price, Some(trigger)),
+            OrderType::StopLimit { trigger, limit } => (limit, Some(trigger)),
+        };
+        Self {
+            trader,
+            cloid: params.client_order_id,
+            side: if params.is_buy { Side::Buy } else { Side::Sell },
+            price,
+            trigger,
+            qty: params.quantity,
+            reduce_only: params.reduce_only,
+        }
+    }
+}
+
+/// The event of resting order `o` in market `market` (its fields as they are
+/// now: `remaining` is `o.remaining_qty`).
+pub(super) fn order_event(
+    market: MarketId,
+    o: &Order,
+    status: OrderEventStatus,
+    reason: OrderEventReason,
+    filled: FixedPoint,
+) -> OrderEvent {
+    OrderEvent {
+        market,
+        order_id: Some(o.id),
+        trader: o.trader,
+        cloid: o.client_order_id,
+        side: o.side,
+        price: o.price,
+        trigger_price: None,
+        orig_qty: o.original_qty,
+        remaining: o.remaining_qty,
+        filled,
+        reduce_only: o.reduce_only,
+        status,
+        reason,
+    }
+}
+
+/// The event of stop `s` (`remaining` is its whole quantity).
+pub(super) fn stop_event(s: &StopOrder, status: OrderEventStatus, reason: OrderEventReason) -> OrderEvent {
+    OrderEvent {
+        market: s.market_id,
+        order_id: Some(s.id),
+        trader: s.trader,
+        cloid: s.client_order_id,
+        side: s.side,
+        price: s.reservation_price(),
+        trigger_price: Some(s.trigger_price),
+        orig_qty: s.quantity,
+        remaining: s.quantity,
+        filled: FixedPoint::ZERO,
+        reduce_only: s.reduce_only,
+        status,
+        reason,
+    }
 }

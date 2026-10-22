@@ -266,7 +266,7 @@ pub struct RpcOrderBook {
     pub asks: Vec<RpcPriceLevel>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcPriceLevel {
     pub price: String,
@@ -478,6 +478,40 @@ pub struct RpcUserFill {
     pub dir: String,
     pub block_number: String,
     pub timestamp: String,
+}
+
+/// One `orderUpdates` stream row (s139): one transition of one of the
+/// user's orders. The order fields are `torus_getOpenOrders`' names.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcOrderUpdate {
+    /// `null` for a placement refused before the book assigned an id.
+    pub order_id: Option<String>,
+    pub client_order_id: Option<String>,
+    pub market_id: String,
+    pub side: String,
+    pub price: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_price: Option<String>,
+    pub original_qty: String,
+    pub remaining_qty: String,
+    pub filled_qty: String,
+    pub reduce_only: bool,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub block_number: String,
+    pub timestamp: String,
+}
+
+/// One `l2Book` level (s139, Hyperliquid's `WsLevel`): `px` = price, `sz` =
+/// size, `n` = order count, as `torus_getOrderBook`'s `price`, `quantity`,
+/// `orderCount`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RpcL2Level {
+    pub px: String,
+    pub sz: String,
+    pub n: u32,
 }
 
 // ============================================================================

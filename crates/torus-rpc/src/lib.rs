@@ -7,6 +7,7 @@
 /// re-exported here for existing callers.
 pub use torus_mempool::addr_rate;
 pub mod account;
+pub mod book_stream;
 pub mod error;
 pub mod eth;
 pub mod ip_limit;
@@ -104,6 +105,7 @@ use tokio::sync::broadcast;
 use torus_evm::EvmExecutor;
 use torus_mempool::Mempool;
 use torus_state::cf::CF_BLOCK_HEADERS;
+use torus_state::order_events::BlockOrderEvents;
 use torus_state::trade_rows::BlockFills;
 
 use crate::streams::StreamBlock;
@@ -126,6 +128,10 @@ pub struct BlockNotifier {
     /// [`StreamBlock`] so a `newTrades` filter is serialized once per block
     /// and shared by its subscribers (s80 fix 2).
     pub new_trades: broadcast::Sender<Arc<StreamBlock>>,
+    /// s139: one message per executed block with order events (the
+    /// `orderUpdates` stream), recorded only while a receiver exists. Same
+    /// capacity and lag rule as `new_trades`.
+    pub order_updates: broadcast::Sender<Arc<BlockOrderEvents>>,
 }
 
 /// Blocks a `newTrades`/`userFills` subscriber may fall behind before it is
@@ -148,11 +154,13 @@ impl BlockNotifier {
         let (new_logs, _) = broadcast::channel(256);
         let (pending_txs, _) = broadcast::channel(1024);
         let (new_trades, _) = broadcast::channel(trade_blocks);
+        let (order_updates, _) = broadcast::channel(trade_blocks);
         Self {
             new_heads,
             new_logs,
             pending_txs,
             new_trades,
+            order_updates,
         }
     }
 
@@ -173,6 +181,12 @@ impl BlockNotifier {
     pub fn notify_fills(&self, block: Arc<BlockFills>) {
         let _ = self.new_trades.send(Arc::new(StreamBlock::new(block)));
     }
+
+    /// s139: publish one executed block's order events to the
+    /// `orderUpdates` stream. Never blocks.
+    pub fn notify_order_events(&self, block: Arc<BlockOrderEvents>) {
+        let _ = self.order_updates.send(block);
+    }
 }
 
 impl Default for BlockNotifier {
@@ -190,6 +204,16 @@ impl torus_state::trade_rows::FillSink for BlockNotifier {
 
     fn send_fills(&self, block: Arc<BlockFills>) {
         self.notify_fills(block);
+    }
+
+    /// s139: order events are recorded only while an `orderUpdates`
+    /// subscriber exists.
+    fn wants_order_events(&self) -> bool {
+        self.order_updates.receiver_count() > 0
+    }
+
+    fn send_order_events(&self, block: Arc<BlockOrderEvents>) {
+        self.notify_order_events(block);
     }
 }
 
@@ -303,6 +327,9 @@ pub struct RpcState {
     /// P0.0 phase 6: this node's activation schedule (`torus_getFeatureSchedule`).
     /// Default: the built-in table for `chain_id`; the node sets the genesis one.
     pub(crate) activations: torus_types::ActivationSchedule,
+    /// s139: the `l2Book` stream's feed (one publisher task while any
+    /// `l2Book` subscription exists).
+    pub(crate) book_feed: Arc<book_stream::BookFeed>,
 }
 
 /// JSON-RPC server combining eth, net, and web3 namespaces.
@@ -388,6 +415,10 @@ impl RpcServer {
                     &Default::default(),
                 )
                 .unwrap_or_default(),
+                book_feed: Arc::new(book_stream::BookFeed::new(
+                    book_stream::L2_CHANNEL_CAP,
+                    book_stream::L2_POLL,
+                )),
             },
             ip_limiter: None,
             max_subs_per_conn: ip_limit::DEFAULT_MAX_SUBS_PER_CONN,
@@ -398,6 +429,12 @@ impl RpcServer {
     /// `TORUS_RPC_MAX_SCAN_ROWS`, else [`scan::DEFAULT_MAX_SCAN_ROWS`].
     pub fn set_max_scan_rows(&mut self, max: usize) {
         self.state.max_scan_rows = max.max(1);
+    }
+
+    /// s139 (tests): the `l2Book` feed's tick capacity and poll interval.
+    #[cfg(test)]
+    pub(crate) fn set_book_feed(&mut self, capacity: usize, poll: std::time::Duration) {
+        self.state.book_feed = Arc::new(book_stream::BookFeed::new(capacity, poll));
     }
 
     /// Install the per-IP weight limit (anti-spam item D).

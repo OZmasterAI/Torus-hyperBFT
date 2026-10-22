@@ -5973,6 +5973,14 @@ impl ExecutionContext {
             // With no subscriber, exec records only what history needs (s78).
             // Checked once per block, before execution.
             ctx.record_fills = self.fill_sink.get().is_some_and(|s| s.wants_fills());
+            // s139: while an `orderUpdates` subscriber exists, the books log
+            // this block's order events and the executor records pre-book
+            // rejections (output-only). Checked once per block.
+            ctx.set_order_events(
+                self.fill_sink
+                    .get()
+                    .is_some_and(|s| s.wants_order_events()),
+            );
 
             let engine_timer = std::time::Instant::now();
             // Item 2: aggregate every listed market BEFORE any action, at the block
@@ -6190,6 +6198,16 @@ impl ExecutionContext {
             // index (timed: `exec_action_status_seconds`).
             #[cfg(test)]
             let oracle_results = (pre_results.clone(), post_results.clone());
+            // s139: the block's order events (every book's log, the triggered
+            // stops' pre-book rejections, then the action results' pre-book
+            // rejections), taken before `native_failures` moves the results'
+            // messages. Sent after the flush / hand-off, with the fills.
+            let order_events = ctx.order_events_on().then(|| {
+                let mut events = ctx.take_order_events();
+                crate::action_results::order_rejections(&pre_evm, &pre_results, &mut events);
+                crate::action_results::order_rejections(&post_evm, &post_results, &mut events);
+                events
+            });
             let action_status_timer = std::time::Instant::now();
             let core_writer = crate::action_results::core_writer_results(core_writer_drained);
             // s112: a block that drained CoreWriter rows has a record even
@@ -6653,6 +6671,16 @@ impl ExecutionContext {
             // A hard crash can lose the last few queued batches,
             // which is a cosmetic RPC trade-history gap, never consensus state.
             //
+            // s139: the order events go out the same way (only blocks with any).
+            if let (Some(events), Some(sink)) = (order_events, self.fill_sink.get()) {
+                if !events.is_empty() {
+                    sink.send_order_events(Arc::new(torus_state::order_events::BlockOrderEvents {
+                        height: fills_block,
+                        timestamp: fills_ts,
+                        events,
+                    }));
+                }
+            }
             // s80: the fills are wrapped once; the stream sink (if installed)
             // and the trade writer share the same Arc. Emitted here, after the
             // flush / hand-off, so a block whose hand-off failed (shutdown)
