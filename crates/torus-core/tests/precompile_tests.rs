@@ -267,6 +267,44 @@ fn order_book_reader_get_position() {
     assert_eq!(entry, fp(50_000).raw() as u128);
 }
 
+/// Codex P1 (s138): getPosition takes the pending funding off the UPnL with
+/// or without a usable price (it needs only the index). Long 2 entered at
+/// index 1, index 4: owes 6. RED before the fix: without a price the UPnL
+/// word was 0.
+#[test]
+fn order_book_reader_get_position_counts_pending_funding_without_a_price() {
+    use torus_core::funding::{write_row, FundingParams, FundingRow, INDEX_SCALE};
+    use torus_core::position::{MarginType, PositionFunding};
+    let (_dir, db) = setup();
+    let trader = addr(1);
+    PositionManager::new(db.clone())
+        .put_position(&Position {
+            trader,
+            market_id: 1,
+            is_long: true,
+            size: fp(2),
+            entry_price: fp(100),
+            cost_basis: fp(200),
+            realized_pnl: FixedPoint::ZERO,
+            isolated_margin: FixedPoint::ZERO,
+            margin_type: MarginType::Cross,
+            funding: Some(PositionFunding { entry_index: INDEX_SCALE, paid: FixedPoint::ZERO }),
+        })
+        .unwrap();
+    let mut row = FundingRow::new(1_000, &FundingParams::default());
+    row.cum_index = 4 * INDEX_SCALE;
+    write_row(&db, 1, &row).unwrap();
+    let address = precompile_address(ADDR_ORDER_BOOK_READER);
+    let input = build_input("getPosition(address,bytes32)", &[encode_addr(&trader), encode_market_id(1)]);
+    let upnl = || {
+        let out = execute_precompile(&address, &input, &addr(0), &db, 100, 0).unwrap();
+        i128::from_be_bytes(out[80..96].try_into().unwrap())
+    };
+    assert_eq!(upnl(), -fp(6).raw(), "no price: trade UPnL 0, the funding debt stays");
+    write_oracle_price(&db, 1, fp(110), 100, 1_000);
+    assert_eq!(upnl(), (fp(20) - fp(6)).raw(), "priced: 2 x (110 - 100) - 6");
+}
+
 /// s99 owner decision: getOpenOrders is removed from 0x0800 (it read
 /// cf_native_orders, which no production code writes, so it always answered
 /// empty). Its selector now reverts exactly like any unknown selector.

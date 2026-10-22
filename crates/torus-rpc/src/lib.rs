@@ -6279,7 +6279,11 @@ mod tests {
         assert_eq!((none.cum_index.as_str(), none.next_funding_time), ("0", 0));
         let p: Option<RpcPosition> =
             client.request("torus_getPosition", jsonrpsee::rpc_params![hex_address(trader), "0x1"]).await.unwrap();
-        assert_eq!(p.unwrap().funding_since_open, Some(dec_fp(fp(9))), "3 paid + 6 pending");
+        let p = p.unwrap();
+        assert_eq!(p.funding_since_open, Some(dec_fp(fp(9))), "3 paid + 6 pending");
+        // Codex P1 (s138): no oracle price here, and the pending funding is
+        // still off the UPnL (it needs only the index).
+        assert_eq!(p.unrealized_pnl, dec_fp(-fp(6)), "no mark: trade UPnL 0, 6 pending");
         let raw: serde_json::Value =
             client.request("torus_getPosition", jsonrpsee::rpc_params![hex_address(trader), "0x2"]).await.unwrap();
         assert!(raw.get("fundingSinceOpen").is_none(), "omitted without funding state: {raw}");
