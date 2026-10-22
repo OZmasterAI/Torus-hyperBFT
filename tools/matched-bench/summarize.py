@@ -1015,6 +1015,51 @@ def _nums(raw, cast=float):
 digest_quiescent = A.digest_quiescent != "0"
 
 
+def digest_ckpt_wait_record(path):
+    """run-cell.sh digest_ckpt_wait (s137): did every live node make durable a
+    checkpoint submitted after the drain before the digest (ckpt_wait.py)?
+    Under coalesced checkpoints validator RPC reads RocksDB only, so without it
+    the digest can read a state from before the last state change. None = no
+    record (older cell): nothing changes. outcome durable / skipped (checkpoints
+    off) pin the digest; fallback_sleep (a node without the metrics, older
+    binary, was only slept on: no durable evidence for it), timeout, error, and
+    a record that is unreadable or has no / an unknown outcome do not."""
+    try:
+        with open(path) as f:
+            rec = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {"outcome": "error", "note": "digest-ckpt-wait.json unreadable"}
+    return rec if isinstance(rec, dict) else {"outcome": "error", "note": "digest-ckpt-wait.json not an object"}
+
+
+DIGEST_CKPT_WAIT = digest_ckpt_wait_record(os.path.join(OUT, "digest-ckpt-wait.json"))
+# A record that exists is judged on its outcome, even {}: no / an unknown
+# outcome is a failed wait ("error"), never "no record".
+DIGEST_CKPT_WAIT_OUTCOME = None
+if DIGEST_CKPT_WAIT is not None:
+    DIGEST_CKPT_WAIT_OUTCOME = DIGEST_CKPT_WAIT.get("outcome")
+    if DIGEST_CKPT_WAIT_OUTCOME not in ("durable", "skipped", "fallback_sleep", "timeout", "error"):
+        DIGEST_CKPT_WAIT_OUTCOME = "error"
+# Anything but durable / skipped leaves the digest unpinned, like a
+# non-quiescent one. fallback_sleep too: the nodes without the metrics (older
+# binary) were only slept on, their checkpoints may never have advanced.
+digest_ckpt_failed = DIGEST_CKPT_WAIT is not None and DIGEST_CKPT_WAIT_OUTCOME not in (
+    "durable", "skipped")
+
+
+def digest_ckpt_reason():
+    """The unverified / crash-gate reason for a failed wait."""
+    if DIGEST_CKPT_WAIT_OUTCOME == "fallback_sleep":
+        nodes = DIGEST_CKPT_WAIT.get("nodes")
+        nodes = nodes if isinstance(nodes, dict) else {}
+        absent = sorted(n for n, v in nodes.items() if isinstance(v, dict) and v.get("missing"))
+        return ("state digest checkpoint wait fallback_sleep: no durable evidence on %s (older binary)"
+                % (" ".join(absent) or "the nodes without the metrics"))
+    return "state digest checkpoint wait %s (digest-ckpt-wait.json)" % DIGEST_CKPT_WAIT_OUTCOME
+
+
 def crash_record(path):
     """The raw crash.json (crash-kill.sh's record + run-cell.sh's log scan), or
     None when this cell never ran the kill -9 gate. Read BEFORE the agreement
@@ -1086,7 +1131,7 @@ if len(agree_rows) == len(LIVE_NODES):
     dh = agreement["state_digest_heights"]
     agreement["digest_height_spread"] = (max(dh) - min(dh)) if len(dh) == len(agree_rows) else None
     # The digests were NOT taken at one pinned instant of one pinned height.
-    digest_unpinned = bool(not digest_quiescent or A.drained != "1"
+    digest_unpinned = bool(not digest_quiescent or A.drained != "1" or digest_ckpt_failed
                            or (agreement["digest_height_spread"] or 0) > 0)
     # ...and the only counter apart is the action counter, by no more than the
     # scrape skew that explains it. Every settled-state counter still agrees.
@@ -1110,10 +1155,12 @@ if len(agree_rows) == len(LIVE_NODES):
         # taken at one pinned height. A sampling artifact, not a fork — and not
         # proof of agreement either.
         verdict = "DIGEST_UNVERIFIED"
-    elif consensus_ok and not (digest_quiescent and A.drained == "1"):
+    elif consensus_ok and not (digest_quiescent and A.drained == "1" and not digest_ckpt_failed):
         # r6-base-300m-r1 shape: equal block hash + equal counters, but the
         # digests were sampled while the chain still moved (drain timed out, or
-        # the counters moved during the digest window). That is a HARNESS
+        # the counters moved during the digest window), or (s137) before a
+        # checkpoint after the drain was durable on every node, so the RPC
+        # state could predate the last state change. That is a HARNESS
         # artifact, not a fork — and it is equally not proof of agreement.
         verdict = "DIGEST_UNVERIFIED"
     else:
@@ -1125,6 +1172,8 @@ if len(agree_rows) == len(LIVE_NODES):
 else:
     agreement["agreement_verdict"] = "INCOMPLETE"
     agreement["validators_agree"] = False
+# s137: the pre-digest checkpoint wait (None = no record, older cell).
+agreement["state_digest_ckpt_wait"] = DIGEST_CKPT_WAIT
 
 # ---------------------------------------------------------------- crash gate
 # bl3: a CRASH_KILL_AT_S cell SIGKILLs one devnet validator mid-load and restarts
@@ -1342,6 +1391,8 @@ def crash_gate(raw, agreement, node_env):
             fail.append("%s differs across the 3 nodes (fork)" % what)
     if not agreement.get("state_digest_quiescent"):
         fail.append("state digest was not taken at a quiescent chain")
+    if digest_ckpt_failed:
+        fail.append("%s: digest may predate the final state" % digest_ckpt_reason())
     if int(agreement.get("panic_or_failstop_lines") or 0) > 0:
         fail.append("panic/fail-stop somewhere in the 3-node run")
     # The survivors must still agree with each other on the funnel; only the
@@ -1640,6 +1691,14 @@ validity = acceptance(liveness, drained, int(A.bench_rc or -1),
 if NORESTART_CHECK and NORESTART_CHECK["action"] == "rejected":
     validity["fail_reasons"].append(NORESTART_CHECK["reason"])
     validity["verdict"], validity["accepted"] = "REJECT", False
+# s137: a failed pre-digest checkpoint wait (timeout / error / fallback_sleep
+# = no durable evidence) is a harness problem, never a silent pass: the cell
+# is at best UNVERIFIED, even with equal digests (they may both describe a
+# state from before the last state change).
+if digest_ckpt_failed:
+    validity["unverified_reasons"].append(digest_ckpt_reason())
+    if validity["verdict"] == "ACCEPT":
+        validity["verdict"], validity["accepted"] = "UNVERIFIED", False
 summary = {
     "status": "OK" if validity['accepted'] else "INVALID" if validity['verdict'] == 'REJECT' else "UNVERIFIED",
     "label": A.label, "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -1704,6 +1763,8 @@ summary = {
         "dissemination_clean": dissem.get("dissemination_clean") if dissem else None,
         "validators_agree": agreement.get("validators_agree"),
         "agreement_verdict": agreement.get("agreement_verdict"),
+        # s137: pre-digest checkpoint wait outcome (None = no record).
+        "digest_ckpt_wait": DIGEST_CKPT_WAIT_OUTCOME,
         "liveness_verdict": liveness['verdict'],
         "benchmark_accepted": validity['accepted'],
         "exec_resident_rebuilds": agreement.get("resident_rebuilds_per_node"),
@@ -1752,6 +1813,7 @@ print(f"SUMMARY {A.label}: matched/s avg={h['matched_s_avg']} first120={h['match
       f"agree={h['agreement_verdict']} ({h['validators_agree']}) "
       f"resident_rebuilds={h['exec_resident_rebuilds']} "
       f"digest_s={agreement.get('state_digest_seconds_per_node')} "
+      f"digest_ckpt={h['digest_ckpt_wait']} "
       f"drained={summary['timing']['drained']} bench_rc={A.bench_rc}")
 print(f"VALIDITY {A.label}: {validity['verdict']} liveness={liveness['verdict']} "
       f"reasons={validity['fail_reasons'] + validity['unverified_reasons']}")

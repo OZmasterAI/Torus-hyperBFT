@@ -272,6 +272,30 @@ python3 tools/matched-bench/test_harness.py
    min/node serial -> well under 1 min/node, all three inside one window.
    Per-RPC timeout is `RPC_TIMEOUT` (60 s, was 10 s).
 
+   **Checkpoint wait (s137).** Under coalesced checkpoints
+   (`TORUS_CHECKPOINT_INTERVAL_MS`, 15 s standard; unset = the validator
+   default unless the book mode is 2/3) validator RPC reads RocksDB only and
+   lags up to one checkpoint window by design, longer than the drain's 10 s
+   quiet window. After the drain (and the feed-stop settle) `ckpt_wait.py`
+   takes each live node's `torus_exec_checkpoints_total` (C0) and polls
+   `torus_exec_checkpoint_db_write_seconds_count` until it is >= C0 + 1 on
+   every live node (submits are serialized, so a checkpoint submitted after
+   the quiet point is on disk). One `digest checkpoint wait:` line per cell;
+   `digest-ckpt-wait.json` holds C0, the final write count and the wait per
+   node. Checkpoints off (and no node checkpointing) -> `skipped`, no wait.
+   Checkpoints on with both counters 0 (the first window not flushed yet) is
+   not a skip: the node waits for its first checkpoint (C0 + 1 = 1).
+   Metrics absent (older binary) -> sleep interval + 5 s (`fallback_sleep`;
+   the nodes that report them are still held to C0 + 1), but the sleep is no
+   durable evidence for the node without them: like a `timeout` (no checkpoint
+   within 2 x interval + 30 s) or `error` (no / unknown outcome in the record)
+   it gets a WARNING in run.log, and summarize.py treats the digest as
+   unpinned, so unequal digests read `DIGEST_UNVERIFIED` instead of
+   `DISAGREE`, and adds an unverified reason, so the cell is not accepted; the
+   crash gate fails. Only `durable` and `skipped` pin the digest. `summary.json`:
+   `agreement.state_digest_ckpt_wait`, `headline.digest_ckpt_wait`, and
+   `digest_ckpt=` on the SUMMARY line.
+
    Verdict (`agreement.agreement_verdict`, mirrored in `headline`):
 
    | verdict | meaning | `validators_agree` |

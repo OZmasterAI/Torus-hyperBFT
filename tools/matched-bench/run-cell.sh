@@ -1999,6 +1999,47 @@ if [ "$ORACLE_FEED_DRAIN" = 1 ]; then
     log "oracle feed paused (SIGSTOP) for the digest; settle drained=$SETTLED rc=$SETTLE_RC after ${SETTLE_S}s: $SETTLE_WHAT (feed-stop-settle/drain.json)"
 fi
 sleep 2
+# Checkpoint wait (s137): with item 6 Phase 3 coalesced checkpoints
+# (TORUS_CHECKPOINT_INTERVAL_MS, 15 s standard) validator RPC reads RocksDB
+# only and lags up to one checkpoint window by design (item6-phase3-design.md),
+# and the drain's quiet window (10 s) is shorter: the digest could read a
+# durable state from before the last state change (ozarchy-9k-smokek-smoke-s0,
+# books stale -> correct mid-digest, a false DISAGREE). Now that the chain is
+# quiet, wait until every LIVE node has made durable a checkpoint submitted
+# after this point: ckpt_wait.py (torus_exec_checkpoints_total at T0 = C0, then
+# torus_exec_checkpoint_db_write_seconds_count >= C0 + 1; a node with both
+# counters 0 waits for its first checkpoint). Checkpoints off -> one skip line,
+# no wait; metrics absent (older binary) -> sleep interval + 5 s
+# (fallback_sleep: no durable evidence for that node); fallback_sleep or a
+# timeout (2 x interval + 30 s) -> WARNING here, and summarize.py marks the
+# digest unpinned (DIGEST_UNVERIFIED instead of DISAGREE) and the cell
+# unverified (digest-ckpt-wait.json has the outcome). The 1 Hz sampler still runs, so
+# metrics-1hz shows the checkpoint landing. DIGEST_CKPT_TIMEOUT_S /
+# DIGEST_CKPT_POLL_S override the timeout and the 0.5 s poll.
+digest_ckpt_wait() {
+    local i line rc args=()
+    for i in "${LIVE_IDX[@]}"; do args+=(--metrics "val$i=http://127.0.0.1:${METS[$i]}/metrics"); done
+    [ -z "${DIGEST_CKPT_TIMEOUT_S:-}" ] || args+=(--timeout-s "$DIGEST_CKPT_TIMEOUT_S")
+    [ -z "${DIGEST_CKPT_POLL_S:-}" ] || args+=(--poll-s "$DIGEST_CKPT_POLL_S")
+    rm -f "${OUT:?}/digest-ckpt-wait.json"
+    line=$(python3 -I "$SELF_DIR/ckpt_wait.py" "${args[@]}" --node-env "$NODE_ENV_JSON" \
+        --genesis-book-mode "${GEN_BOOK_MODE_GOT:-}" --out "$OUT/digest-ckpt-wait.json" 2>>"$OUT/run.log")
+    rc=$?
+    DIGEST_CKPT_WAIT=$(jq -r '.outcome // "error"' "$OUT/digest-ckpt-wait.json" 2>/dev/null) || DIGEST_CKPT_WAIT=error
+    [ -n "$DIGEST_CKPT_WAIT" ] || DIGEST_CKPT_WAIT=error
+    if [ "$DIGEST_CKPT_WAIT" = error ]; then
+        printf '{"outcome":"error","rc":%s}\n' "$rc" > "$OUT/digest-ckpt-wait.json"
+        line="digest checkpoint wait: ERROR: ckpt_wait.py rc=$rc wrote no outcome (see run.log)"
+    fi
+    log "$line"
+    case "$DIGEST_CKPT_WAIT" in
+        durable|skipped) ;;
+        *) log "WARNING: digest checkpoint wait outcome=$DIGEST_CKPT_WAIT (rc=$rc): the state digest may read a durable state from before the last state change; summarize.py marks the digest unpinned and the cell unverified (digest-ckpt-wait.json)" ;;
+    esac
+    return 0
+}
+DIGEST_CKPT_WAIT=""
+digest_ckpt_wait
 stop_sampler || die "metrics sampler failed (see sampler.log)"
 kill "$CPU_PID" 2>/dev/null; CPU_PID=""
 
