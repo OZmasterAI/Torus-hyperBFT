@@ -1268,6 +1268,51 @@ pub(crate) fn liq_prevalue() -> LiqPrevalue {
 }
 
 #[cfg(test)]
+mod liq_prevalue_flag_tests {
+    use super::{liq_prevalue, parse_liq_prevalue_mask, with_liq_prevalue, LiqPrevalue, LIQ_PREVALUE_PIN};
+
+    /// s80: the flag's spellings (unset / 0 = off = 29bfc705's step), and the
+    /// pin wins over the env, nests, restores (also on unwind) and stays on
+    /// its thread (the pool's jobs never read it: `liq_view` does not).
+    #[test]
+    fn parse_and_pins() {
+        for (v, m) in [
+            (None, 0),
+            (Some(""), 0),
+            (Some("0"), 0),
+            (Some("false"), 0),
+            (Some("off"), 0),
+            (Some("1"), 3),
+            (Some(" true "), 3),
+            (Some("ON"), 3),
+            (Some("3"), 3),
+            (Some("2"), 2),
+            (Some("pool"), 1),
+            (Some("4"), 0),
+            (Some("yes"), 0),
+        ] {
+            assert_eq!(parse_liq_prevalue_mask(v), m, "{v:?}");
+        }
+        assert_eq!(LiqPrevalue::OFF.mask, 0, "OFF is off");
+        let pin = || LIQ_PREVALUE_PIN.with(std::cell::Cell::get);
+        assert_eq!(pin(), None);
+        let a = LiqPrevalue { mask: 1, workers: 3, min: 1 };
+        with_liq_prevalue(a, || {
+            assert_eq!(liq_prevalue(), a);
+            with_liq_prevalue(LiqPrevalue::OFF, || assert_eq!(liq_prevalue(), LiqPrevalue::OFF));
+            assert_eq!(liq_prevalue(), a);
+            std::thread::spawn(move || assert_eq!(LIQ_PREVALUE_PIN.with(std::cell::Cell::get), None))
+                .join()
+                .unwrap();
+        });
+        assert_eq!(pin(), None);
+        let unwound = std::panic::catch_unwind(|| with_liq_prevalue(a, || -> () { panic!("inside the pin") }));
+        assert!(unwound.is_err());
+        assert_eq!(pin(), None, "restored on unwind");
+    }
+}
+
+#[cfg(test)]
 mod settle_streamed_flag_tests {
     use super::{
         parse_settle_streamed, settle_streamed_enabled, with_settle_stream_probe,
