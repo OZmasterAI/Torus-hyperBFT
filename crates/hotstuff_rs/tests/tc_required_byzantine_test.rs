@@ -738,4 +738,5 @@ fn validator_set_update_window_timeout_loses_no_further_view() {
         "view w + 1 was lost: leader(w + 1) never proposed under TC(w); {trace}"
     );
     assert!(log.headers.iter().any(|h| h.justify_view == w + 1), "view w + 1 was lost: no header justifies on QC(w + 1); {trace}");
+    panic!("DEBUG TRACE: {trace}");
 }
