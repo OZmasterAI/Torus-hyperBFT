@@ -5480,6 +5480,11 @@ mod cancel_batch_toggle_tests {
     }
 }
 
+/// s80 (diagnostic): the parallel cancel-all pass's job CPU and cancelled
+/// orders (process-wide; read as a delta around one pass).
+static S80_CA_CPU_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static S80_CA_ORDERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Hard cap on parallel cancel-all book-pass jobs (`TORUS_PARALLEL_CANCEL_ALL`).
 const MAX_PARALLEL_CANCEL_ALL_WORKERS: usize = 64;
 
@@ -6537,6 +6542,13 @@ pub struct ExecPhaseAccum {
     pub cancel_alls: u64,
     pub cancel_all_books_visited: u64,
     pub cancel_all_books_hit: u64,
+    /// s80 (diagnostic): wall of the cancel-all book pass alone — the pool
+    /// scope of the parallel pass, or the serial per-market loop.
+    pub cancel_all_book_pass_ns: u128,
+    /// s80 (diagnostic): CPU of the book pass summed over its jobs (= wall
+    /// on the serial loop), and the resting orders it cancelled.
+    pub cancel_all_book_pass_cpu_ns: u128,
+    pub cancel_all_orders: u64,
     /// Step 0.2 (P2-1b): `CancelOrder` / `ModifyOrder` executed, and the
     /// books they probed to find the order.
     pub by_id_actions: u64,
@@ -14068,6 +14080,7 @@ impl NativeExecutor {
         )> = Vec::new();
         let mut senders: Vec<Address> = Vec::with_capacity(run.len());
         let mut stops_k: Vec<(bool, FixedPoint)> = Vec::with_capacity(run.len());
+        let pass_t0 = std::time::Instant::now();
         for group in visits.chunk_by(|a, b| a.0 == b.0) {
             let mid = group[0].0;
             let Some(book) = ctx.order_books.get_mut(&mid) else {
@@ -14089,6 +14102,8 @@ impl NativeExecutor {
                 senders.push(sender);
             }
             let cancelled = book.cancel_all_many(&senders);
+            ctx.phase_accum.cancel_all_orders +=
+                cancelled.iter().map(|o| o.len() as u64).sum::<u64>();
             for ((&(_, k), &(took_stops, stops)), orders) in
                 group.iter().zip(&stops_k).zip(cancelled)
             {
@@ -14097,6 +14112,9 @@ impl NativeExecutor {
                 }
             }
         }
+        let pass_ns = pass_t0.elapsed().as_nanos();
+        ctx.phase_accum.cancel_all_book_pass_ns += pass_ns;
+        ctx.phase_accum.cancel_all_book_pass_cpu_ns += pass_ns;
         // Per action in run order, its markets ascending (stable sort).
         hits.sort_by_key(|h| h.0);
 
@@ -14142,7 +14160,10 @@ impl NativeExecutor {
         // reservations) for every visit that removed something, markets
         // ascending.
         let mut hits: Vec<(usize, MarketId, FixedPoint, FixedPoint)> = Vec::new();
-        match Self::cancel_all_groups_parallel(ctx, &groups, run) {
+        let pass_t0 = std::time::Instant::now();
+        let pass = Self::cancel_all_groups_parallel(ctx, &groups, run);
+        ctx.phase_accum.cancel_all_book_pass_ns += pass_t0.elapsed().as_nanos();
+        match pass {
             Ok(done) => {
                 for (mid, members, group_hits) in done {
                     ctx.phase_accum.cancel_all_books_visited += members as u64;
@@ -14212,6 +14233,10 @@ impl NativeExecutor {
             senders.push(sender);
         }
         let cancelled = book.cancel_all_many(senders);
+        S80_CA_ORDERS.fetch_add(
+            cancelled.iter().map(|o| o.len() as u64).sum::<u64>(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let mut hits = Vec::new();
         for ((&(_, k), &(took_stops, stops)), orders) in
             group.iter().zip(stops_k.iter()).zip(cancelled)
@@ -14307,6 +14332,7 @@ impl NativeExecutor {
                 .collect();
             chunk_mids.push(mine.iter().map(|(_, item)| item.0).collect());
             jobs.push(move || {
+                let job_t0 = std::time::Instant::now();
                 let mut out = Vec::with_capacity(mine.len());
                 let (mut senders, mut stops_k) = (Vec::new(), Vec::new());
                 for (i, (mid, group, book, cfg)) in mine {
@@ -14323,15 +14349,28 @@ impl NativeExecutor {
                         break;
                     }
                 }
+                S80_CA_CPU_NS.fetch_add(
+                    job_t0.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 out
             });
         }
 
+        let (cpu0, ord0) = (
+            S80_CA_CPU_NS.load(std::sync::atomic::Ordering::Relaxed),
+            S80_CA_ORDERS.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let joined_all = crate::exec_pool::run_jobs(jobs);
+        ctx.phase_accum.cancel_all_book_pass_cpu_ns +=
+            (S80_CA_CPU_NS.load(std::sync::atomic::Ordering::Relaxed) - cpu0) as u128;
+        ctx.phase_accum.cancel_all_orders +=
+            S80_CA_ORDERS.load(std::sync::atomic::Ordering::Relaxed) - ord0;
         let mut per_item: Vec<Option<Vec<(usize, FixedPoint, FixedPoint)>>> =
             (0..members.len()).map(|_| None).collect();
         let mut failed: Option<crate::market_workers::MarketWorkerPanic> = None;
         let mut poisoned: Vec<MarketId> = Vec::new();
-        for (job_mids, joined) in chunk_mids.into_iter().zip(crate::exec_pool::run_jobs(jobs)) {
+        for (job_mids, joined) in chunk_mids.into_iter().zip(joined_all) {
             match joined {
                 Ok(out) => {
                     for (i, r) in out {

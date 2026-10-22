@@ -526,3 +526,276 @@ fn cancel_all_many_timing_probe_deep_levels() {
         );
     }
 }
+
+/// s80 cancel-all-generation-bump premise probe (run with `--ignored
+/// --nocapture`, release). The bench shape: 300 books, 600 traders, GTC
+/// limits within 5 ticks of the mid, one side per (trader, market), no
+/// cloids / reduce-only; `PROBE_RESTING` resting orders (default 104k and
+/// 1.1M); per block 24 distinct cancel-all senders, then the cancelled count
+/// is re-placed by random traders (untimed, identical in both arms).
+///
+/// Arm A (today): per book, ascending, `plan` + `apply` of
+/// `cancel_all_many` over the block's senders holding orders there, plus the
+/// per-order margin term. Arm B (generation bump, lean): per (sender, book)
+/// an O(1) bump (the book's `trader_orders` entry moved to a stale list, the
+/// trader's generation +1, reduce-only forget, the maintained-sum read); per
+/// block a top purge (stale fronts of the best bid/ask popped with their
+/// index removal, so BBO is live; stale = the order's placement generation
+/// differs from its trader's); at window close (every `PROBE_WINDOW` = 100
+/// blocks) the deferred index removal of every stale order and one `retain`
+/// per touched level. Also timed: the maintained-sum upkeep a rest and a fill
+/// would pay (`upkeep`: two map updates per event). After the window both
+/// arms' books must be identical (borsh bytes, levels, ids).
+#[test]
+#[ignore]
+fn cancel_all_gen_bump_probe_bench_shape() {
+    use std::time::Instant;
+    fn trader(n: u64) -> Address {
+        let mut bytes = [0u8; 20];
+        bytes[..8].copy_from_slice(&(n + 1).to_be_bytes());
+        bytes[19] = 0xAB;
+        Address::from(bytes)
+    }
+    fn bench_order(id: u64, t: u64, m: u64, d: u64) -> Order {
+        let is_buy = (t + m).is_multiple_of(2);
+        let price = if is_buy { 1_000 - d as i64 } else { 1_000 + d as i64 };
+        Order {
+            id: id as OrderId,
+            trader: trader(t),
+            side: if is_buy { Side::Buy } else { Side::Sell },
+            price: fp(price),
+            remaining_qty: fp(5),
+            original_qty: fp(5),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            timestamp: id,
+            reduce_only: false,
+            client_order_id: None,
+        }
+    }
+    /// Stale iff the order's placement generation is not its trader's.
+    fn is_stale(gens: &HashMap<Address, u32>, order_gen: &HashMap<OrderId, u32>, o: &Order) -> bool {
+        gens.get(&o.trader).copied().unwrap_or(0) != order_gen[&o.id]
+    }
+    const BOOKS: u64 = 300;
+    const TRADERS: u64 = 600;
+    const CA: usize = 24;
+    let env = |k: &str| std::env::var(k).ok();
+    let window: u64 = env("PROBE_WINDOW").and_then(|v| v.parse().ok()).unwrap_or(100);
+    let upkeep_events: u64 = env("PROBE_UPKEEP").and_then(|v| v.parse().ok()).unwrap_or(21_000);
+    let mode: usize = env("PROBE_MODE").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let restings: Vec<u64> = env("PROBE_RESTING")
+        .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+        .unwrap_or_else(|| vec![104_000, 1_100_000]);
+    for resting in restings {
+        let mut rng = Lcg(0x5EED_80CA ^ resting);
+        let mut next_id = 1u64;
+        let mut a: Vec<OrderBook> = (0..BOOKS).map(|_| new_book(mode)).collect();
+        let mut b: Vec<OrderBook> = (0..BOOKS).map(|_| new_book(mode)).collect();
+        let mut gens: Vec<HashMap<Address, u32>> = vec![HashMap::default(); BOOKS as usize];
+        let mut order_gen: Vec<HashMap<OrderId, u32>> = vec![HashMap::default(); BOOKS as usize];
+        let mut sums: Vec<HashMap<Address, FixedPoint>> = vec![HashMap::default(); BOOKS as usize];
+        let mut stale: Vec<Vec<TraderOrders>> = (0..BOOKS).map(|_| Vec::new()).collect();
+        let mut place = |a: &mut Vec<OrderBook>,
+                         b: &mut Vec<OrderBook>,
+                         gens: &Vec<HashMap<Address, u32>>,
+                         order_gen: &mut Vec<HashMap<OrderId, u32>>,
+                         rng: &mut Lcg| {
+            let (t, m, d) = (rng.below(TRADERS), rng.below(BOOKS), 1 + rng.below(5));
+            let o = bench_order(next_id, t, m, d);
+            next_id += 1;
+            let m = m as usize;
+            order_gen[m].insert(o.id, gens[m].get(&o.trader).copied().unwrap_or(0));
+            a[m].insert_order(o.clone());
+            b[m].insert_order(o);
+        };
+        for _ in 0..resting {
+            place(&mut a, &mut b, &gens, &mut order_gen, &mut rng);
+        }
+        for book in a.iter_mut().chain(b.iter_mut()) {
+            prime(book);
+        }
+        let (mut a_plan, mut a_apply, mut a_margin) = (0u128, 0u128, 0u128);
+        let (mut b_bump, mut b_purge, mut c_reclaim, mut upkeep) = (0u128, 0u128, 0u128, 0u128);
+        let (mut hits, mut cancelled_n, mut purged_n, mut stale_max) = (0u64, 0u64, 0u64, 0usize);
+        let mut sink = FixedPoint::ZERO;
+        for _blk in 0..window {
+            let mut senders: Vec<Address> = Vec::with_capacity(CA);
+            while senders.len() < CA {
+                let s = trader(rng.below(TRADERS));
+                if !senders.contains(&s) {
+                    senders.push(s);
+                }
+            }
+            let mut blk_cancelled = 0u64;
+            // ---- Arm A: today's per-book plan + apply + margin terms.
+            for book in a.iter_mut() {
+                let members: Vec<Address> =
+                    senders.iter().copied().filter(|s| book.trader_orders.contains_key(s)).collect();
+                if members.is_empty() {
+                    continue;
+                }
+                hits += members.len() as u64;
+                let t0 = Instant::now();
+                let plan = book.plan_cancel_all_many(&members);
+                let t1 = Instant::now();
+                let out = match plan {
+                    Some(plan) => book.apply_cancel_all_many(&members, plan),
+                    None => members.iter().map(|s| book.cancel_all(*s, None)).collect(),
+                };
+                let t2 = Instant::now();
+                for orders in &out {
+                    for o in orders {
+                        sink += o.price * o.remaining_qty / fp(20);
+                    }
+                    blk_cancelled += orders.len() as u64;
+                }
+                let t3 = Instant::now();
+                a_plan += (t1 - t0).as_nanos();
+                a_apply += (t2 - t1).as_nanos();
+                a_margin += (t3 - t2).as_nanos();
+                drop(out);
+            }
+            cancelled_n += blk_cancelled;
+            // ---- Arm B: O(1) bump per (sender, book) with an entry ...
+            let t0 = Instant::now();
+            for (m, book) in b.iter_mut().enumerate() {
+                for s in &senders {
+                    let Some(ids) = book.trader_orders.remove(s) else { continue };
+                    *gens[m].entry(*s).or_insert(0) += 1;
+                    book.forget_reduce_only_trader(s);
+                    if let Some(sum) = sums[m].remove(s) {
+                        sink += sum;
+                    }
+                    stale[m].push(ids);
+                }
+            }
+            let t1 = Instant::now();
+            // ... then the top purge: stale fronts of the best levels popped,
+            // with their index removal, until BBO is live.
+            for (m, book) in b.iter_mut().enumerate() {
+                let cache_on = book.level_hash_cache.is_some();
+                let chunked_on = book.level_hash_chunked;
+                for side in [Side::Buy, Side::Sell] {
+                    loop {
+                        let levels = match side {
+                            Side::Buy => &mut book.bids,
+                            Side::Sell => &mut book.asks,
+                        };
+                        let mut entry = match side {
+                            Side::Buy => levels.last_entry(),
+                            Side::Sell => levels.first_entry(),
+                        };
+                        let Some(queue) = entry.as_mut() else { break };
+                        let price = *queue.key();
+                        let q = queue.get_mut();
+                        while q.front().is_some_and(|o| is_stale(&gens[m], &order_gen[m], o)) {
+                            let o = q.pop_front().expect("front");
+                            book.order_index.remove(&o.id);
+                            let seq = book.order_seq.remove(&o.id);
+                            let tag = crate::book_rows::side_tag(side);
+                            book.row_journal.insert(o.id);
+                            book.level_journal.insert((tag, price.raw()));
+                            OrderBook::bump_level_epoch(cache_on, &mut book.level_epoch, tag, price.raw());
+                            OrderBook::mark_chunk_dirty(chunked_on, &mut book.dirty_chunks, tag, price.raw(), seq);
+                            purged_n += 1;
+                        }
+                        if q.is_empty() {
+                            entry.expect("level").remove();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+            let t2 = Instant::now();
+            b_bump += (t1 - t0).as_nanos();
+            b_purge += (t2 - t1).as_nanos();
+            stale_max = stale_max.max(stale.iter().flatten().map(TraderOrders::len).sum());
+            // ---- Untimed: re-place the cancelled count in both arms; timed
+            // separately: the maintained-sum upkeep per rest (+) and per fill
+            // (-, emulated as a second update of the same entry).
+            // `PROBE_UPKEEP` events per block (default 21k: the bench's
+            // ~11k fills + ~10k resting placements), one sum update each.
+            let t3 = Instant::now();
+            let mut rng2 = Lcg(rng.0);
+            for _ in 0..upkeep_events {
+                let (t, m) = (rng2.below(TRADERS), rng2.below(BOOKS));
+                let e = sums[m as usize].entry(trader(t)).or_insert(FixedPoint::ZERO);
+                *e += fp(5);
+            }
+            upkeep += t3.elapsed().as_nanos();
+            for _ in 0..blk_cancelled {
+                place(&mut a, &mut b, &gens, &mut order_gen, &mut rng);
+            }
+        }
+        // ---- Arm B window close: deferred index removal + one retain per
+        // touched level.
+        let t0 = Instant::now();
+        for (m, book) in b.iter_mut().enumerate() {
+            if stale[m].is_empty() {
+                continue;
+            }
+            let cache_on = book.level_hash_cache.is_some();
+            let chunked_on = book.level_hash_chunked;
+            let mut touched: Vec<(u8, FixedPoint)> = Vec::new();
+            for list in std::mem::take(&mut stale[m]) {
+                for &id in list.iter() {
+                    let Some(loc) = book.order_index.remove(&id) else { continue };
+                    let seq = book.order_seq.remove(&id);
+                    let tag = crate::book_rows::side_tag(loc.side);
+                    book.row_journal.insert(id);
+                    book.level_journal.insert((tag, loc.price.raw()));
+                    OrderBook::bump_level_epoch(cache_on, &mut book.level_epoch, tag, loc.price.raw());
+                    OrderBook::mark_chunk_dirty(chunked_on, &mut book.dirty_chunks, tag, loc.price.raw(), seq);
+                    touched.push((tag, loc.price));
+                }
+            }
+            touched.sort_unstable();
+            touched.dedup();
+            let (g, og) = (&gens[m], &order_gen[m]);
+            for (tag, price) in touched {
+                let levels = if tag == crate::book_rows::side_tag(Side::Buy) {
+                    &mut book.bids
+                } else {
+                    &mut book.asks
+                };
+                let q = levels.get_mut(&price).expect("touched level");
+                q.retain(|o| !is_stale(g, og, o));
+                if q.is_empty() {
+                    levels.remove(&price);
+                }
+            }
+        }
+        c_reclaim += t0.elapsed().as_nanos();
+        for (x, y) in a.iter_mut().zip(b.iter_mut()) {
+            assert_books_equal(x, y);
+        }
+        let w = window as f64;
+        let ms = |ns: u128| ns as f64 / 1e6 / w;
+        let a_tot = ms(a_plan + a_apply + a_margin);
+        let b_tot = ms(b_bump + b_purge) + ms(c_reclaim) + ms(upkeep);
+        eprintln!(
+            "PROBE mode={mode} resting={resting} window={window} hits/blk={:.0} cancelled/blk={:.0} purged/blk={:.0} stale_max={stale_max} \
+             | A/blk plan={:.3} apply={:.3} margin={:.3} total={:.3} ms ({:.0} ns/cancelled) | B/blk bump={:.3} purge={:.3} upkeep={:.3} \
+             reclaim/window={:.2} ms (={:.3}/blk) total={:.3} ms | net CPU saving/blk={:.3} ms ({:.0}% of A) sink={}",
+            hits as f64 / w,
+            cancelled_n as f64 / w,
+            purged_n as f64 / w,
+            ms(a_plan),
+            ms(a_apply),
+            ms(a_margin),
+            a_tot,
+            a_tot * 1e6 * w / cancelled_n.max(1) as f64,
+            ms(b_bump),
+            ms(b_purge),
+            ms(upkeep),
+            c_reclaim as f64 / 1e6,
+            ms(c_reclaim),
+            b_tot,
+            a_tot - b_tot,
+            100.0 * (a_tot - b_tot) / a_tot,
+            sink.raw() % 7,
+        );
+    }
+}

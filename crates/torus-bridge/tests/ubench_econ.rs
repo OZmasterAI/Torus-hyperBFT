@@ -54,6 +54,20 @@ struct Sample {
     margin_ms: f64,
     match_ms: f64,
     settle_ms: f64,
+    /// s80 cancel-all-generation-bump: phase 1 (cancel-all runs) wall.
+    phase1_ms: f64,
+    /// s80: the cancel-all book pass alone (pool scope or serial loop).
+    ca_pass_ms: f64,
+    /// s80: the book pass's CPU summed over its jobs, and its cancelled orders.
+    ca_cpu_ms: f64,
+    ca_pass_orders: u64,
+    /// s80: cancel-alls, books visited / hit, and the resting orders the
+    /// block's cancel-all senders held at block start (= orders cancelled:
+    /// phase 1 runs before the block's places).
+    cancel_alls: u64,
+    ca_visited: u64,
+    ca_hit: u64,
+    ca_orders: u64,
     /// `own_pending_delta` + `end_resident` (R's end-of-block upkeep).
     r_end_ms: f64,
     /// `end_resident` alone (item 6 step 1).
@@ -93,6 +107,7 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
     let resident = env("UB_NO_R", 0) != 1;
     let worker = env("UB_R_WORKER", 0) == 1;
     let mut holder = ResidentBooks::default();
+    let resident_books = env("UB_RESIDENT_BOOKS", 0) == 1;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let db = StateDb::open(dir.path()).expect("open db");
@@ -139,20 +154,57 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
             // After the join of block `warm`'s worker (step 2).
             subs0 = END_SUBS.iter().map(|n| hist_sum(&metrics, n)).collect();
         }
-        let mut ctx = NativeExecContext::new(
-            overlay.clone(),
-            h + 1,
-            1000 + h,
-            0,
-            1_000_000,
-            100,
-            special(99),
-            special(100),
-            special(101),
-        );
+        // s80: `UB_RESIDENT_BOOKS=1` runs the node's resident-book path
+        // (Classic, L3.1 coalesce, P2-1 cancel-all index, parallel cancel-all
+        // pass); the default carries the books by `set_order_books` (every
+        // cancel-all visits every book). Resident: block height `h` so the
+        // books' applied-marker check (marker == held height) passes.
+        let mut ctx = if resident_books {
+            let mut c = NativeExecContext::new_with_mode(
+                overlay.clone(),
+                h,
+                1000 + h,
+                0,
+                1_000_000,
+                100,
+                special(99),
+                special(100),
+                special(101),
+                torus_types::book_mode::BookMode::Classic,
+                Some(&mut holder),
+            );
+            c.coalesce_books = true;
+            c
+        } else {
+            NativeExecContext::new(
+                overlay.clone(),
+                h + 1,
+                1000 + h,
+                0,
+                1_000_000,
+                100,
+                special(99),
+                special(100),
+                special(101),
+            )
+        };
         ctx.attach_resident_block(&mut rows);
-        ctx.set_order_books(std::mem::take(&mut books));
-        ctx.next_global_order_id = next_id;
+        // s80: orders the block's cancel-all senders hold (first occurrence).
+        let ca_orders: u64 = {
+            let mut seen = std::collections::HashSet::new();
+            block
+                .iter()
+                .filter(|(_, a)| matches!(a, torus_types::NativeAction::CancelAllOrders { .. }))
+                .filter(|(s, _)| seen.insert(*s))
+                .map(|(s, _)| {
+                    books.values().map(|b: &torus_core::order_book::OrderBook| b.open_order_count(s) as u64).sum::<u64>()
+                })
+                .sum()
+        };
+        if !resident_books {
+            ctx.set_order_books(std::mem::take(&mut books));
+            ctx.next_global_order_id = next_id;
+        }
         ctx.metrics = Some(metrics.clone());
         if fed {
             // Before the timed block start, stamped with this block (s85 feeder M1b).
@@ -177,8 +229,16 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
         assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
         let pa = ctx.phase_accum;
         let fills = ctx.trade_index as u64;
-        books = ctx.take_order_books();
-        next_id = ctx.next_global_order_id;
+        if resident_books {
+            // Untimed, as the node: the Classic save (coalesced), then the
+            // hand-back.
+            ctx.save_order_books();
+            ctx.stash_resident(&mut holder);
+            assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
+        } else {
+            books = ctx.take_order_books();
+            next_id = ctx.next_global_order_id;
+        }
         ctx.detach_resident_block(&mut rows);
         drop(ctx);
         overlay.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes()).unwrap();
@@ -209,6 +269,14 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
                 margin_ms: pa.margin_ns as f64 / 1e6,
                 match_ms: pa.match_ns as f64 / 1e6,
                 settle_ms: pa.settle_ns as f64 / 1e6,
+                phase1_ms: pa.phase1_actions_ns as f64 / 1e6,
+                ca_pass_ms: pa.cancel_all_book_pass_ns as f64 / 1e6,
+                ca_cpu_ms: pa.cancel_all_book_pass_cpu_ns as f64 / 1e6,
+                ca_pass_orders: pa.cancel_all_orders,
+                cancel_alls: pa.cancel_alls,
+                ca_visited: pa.cancel_all_books_visited,
+                ca_hit: pa.cancel_all_books_hit,
+                ca_orders,
                 r_end_ms: r_end.as_secs_f64() * 1e3,
                 end_ms: end.as_secs_f64() * 1e3,
                 fills,
@@ -278,6 +346,13 @@ fn ubench_econ() {
         let margin: f64 = s.iter().map(|x| x.margin_ms).sum();
         let mtch: f64 = s.iter().map(|x| x.match_ms).sum();
         let settle: f64 = s.iter().map(|x| x.settle_ms).sum();
+        let phase1: f64 = s.iter().map(|x| x.phase1_ms).sum();
+        let ca_pass: f64 = s.iter().map(|x| x.ca_pass_ms).sum();
+        let ca_cpu: f64 = s.iter().map(|x| x.ca_cpu_ms).sum();
+        let ca_po: u64 = s.iter().map(|x| x.ca_pass_orders).sum();
+        let (cas, cav, cah, cao) = s.iter().fold((0u64, 0u64, 0u64, 0u64), |a, x| {
+            (a.0 + x.cancel_alls, a.1 + x.ca_visited, a.2 + x.ca_hit, a.3 + x.ca_orders)
+        });
         let r_end: f64 = s.iter().map(|x| x.r_end_ms).sum();
         let end: f64 = s.iter().map(|x| x.end_ms).sum();
         let n = s.len() as f64;
@@ -312,6 +387,25 @@ fn ubench_econ() {
             rb.bytes,
             rb.ms,
             rb.ms * 1e6 / rb.rows.max(1) as f64,
+        );
+        println!(
+            "UB80 run={r} phase1/blk={:.3}ms book_pass/blk={:.3}ms phase1/1k={:.3} engine/blk={:.2}ms cancel_alls/blk={:.1} \
+             visited/ca={:.1} hit/ca={:.1} orders_cancelled/blk={:.0} orders/ca={:.0} ns/cancelled_order(E wall)={:.0} \
+             book_pass_cpu/blk={:.3}ms par={:.2} pass_orders/blk={:.0} pass_cpu_ns/order={:.0}",
+            phase1 / n,
+            ca_pass / n,
+            phase1 / k,
+            (exec + tail) / n,
+            cas as f64 / n,
+            cav as f64 / cas.max(1) as f64,
+            cah as f64 / cas.max(1) as f64,
+            cao as f64 / n,
+            cao as f64 / cas.max(1) as f64,
+            phase1 * 1e6 / cao.max(1) as f64,
+            ca_cpu / n,
+            ca_cpu / ca_pass.max(1e-9),
+            ca_po as f64 / n,
+            ca_cpu * 1e6 / ca_po.max(1) as f64,
         );
         per_run.push(per1k);
     }
