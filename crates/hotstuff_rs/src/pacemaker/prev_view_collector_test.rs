@@ -533,3 +533,55 @@ fn window_timeout_blames_the_views_fresh_proposer() {
         assert_eq!(reputation.score_bps(&spared), 10_000, "view {view}: the other set's leader is not");
     }
 }
+
+// ---------------------------------------------------------------------------
+// tc-liveness (s136): every timeout vote carries its sender's highest TC, and
+// the pacemaker checked that TC's signatures again for every vote (plus its
+// high QC and high tip). With tens of milliseconds per check (a debug build on
+// a loaded host) the algorithm thread fell seconds behind and the cluster
+// stopped committing (p00_cluster_tests under `cargo test`). A TC whose
+// signatures this replica already checked (here: as the votes it collected
+// into TC(5)) costs no further check.
+//
+// RED-first: on 56923063 each of the four votes below costs 1 + 3 checks.
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// Deliver a TimeoutVote for `view` from validator `i` carrying `highest_tc`.
+    fn timeout_vote_with_tc(&mut self, i: usize, view: u64, highest_tc: Option<crate::pacemaker::types::TimeoutCertificate>) {
+        let msg = PacemakerMessage::timeout_vote(
+            &Keypair::new(self.keys[i].clone()),
+            CHAIN,
+            ViewNumber::new(view),
+            highest_tc,
+            None,
+            None,
+        );
+        let origin = self.keys[i].verifying_key();
+        self.pacemaker.on_receive_msg(msg, &origin, &mut self.tree).unwrap();
+    }
+}
+
+#[test]
+fn timeout_votes_carrying_a_checked_tc_cost_one_signature_check_each() {
+    use crate::types::crypto_primitives::signature_checks_on_this_thread;
+    let mut f = fixture(5);
+    for i in 0..3 {
+        f.timeout_vote(i, 5);
+    }
+    let tc5 = f.tree.highest_tc().unwrap().expect("TC(5)");
+    f.enter(6);
+    let before = signature_checks_on_this_thread();
+    for i in 0..4 {
+        f.timeout_vote_with_tc(i, 6, Some(tc5.clone()));
+    }
+    assert_eq!(f.highest_tc_view(), Some(6), "the votes still form TC(6)");
+    assert_eq!(
+        signature_checks_on_this_thread() - before,
+        4,
+        "one check per vote (its own signature); TC(5)'s signatures were already checked"
+    );
+    let before = signature_checks_on_this_thread();
+    assert!(tc5.is_correct(&f.tree).unwrap());
+    assert_eq!(signature_checks_on_this_thread() - before, 0, "TC(5) again: no check");
+}

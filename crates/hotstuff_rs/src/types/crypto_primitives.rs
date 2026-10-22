@@ -70,3 +70,54 @@ pub fn signature_checks_on_this_thread() -> u64 {
 pub fn set_signature_check_delay_for_tests(delay: std::time::Duration) {
     SIGNATURE_CHECK_DELAY_US.store(delay.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
 }
+
+/// tc-liveness (s136): a signature this thread has already seen pass is not checked again, and the
+/// answer is always the one a fresh check gives.
+#[cfg(test)]
+mod signature_check_tests {
+    use super::*;
+
+    fn key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn checks() -> u64 {
+        signature_checks_on_this_thread()
+    }
+
+    #[test]
+    fn a_passed_check_is_not_run_again() {
+        let signer = key(11);
+        let message = b"tc-liveness: passed once".to_vec();
+        let signature = signer.sign(&message);
+        let before = checks();
+        assert!(verify_signature(&signer.verifying_key(), &message, &signature));
+        assert!(verify_signature(&signer.verifying_key(), &message, &signature));
+        assert!(verify_signature(&signer.verifying_key(), &message, &signature));
+        assert_eq!(checks() - before, 1, "the same (key, signature, message) is checked once");
+    }
+
+    #[test]
+    fn a_failed_check_is_never_remembered() {
+        let signer = key(12);
+        let message = b"tc-liveness: fails".to_vec();
+        let mut forged = signer.sign(&message).to_bytes();
+        forged[0] ^= 1;
+        let forged = Signature::from_bytes(&forged);
+        let before = checks();
+        assert!(!verify_signature(&signer.verifying_key(), &message, &forged));
+        assert!(!verify_signature(&signer.verifying_key(), &message, &forged));
+        assert_eq!(checks() - before, 2, "a failed check runs every time");
+        assert!(verify_signature(&signer.verifying_key(), &message, &signer.sign(&message)));
+    }
+
+    #[test]
+    fn a_passed_check_does_not_vouch_for_another_key_or_message() {
+        let signer = key(13);
+        let message = b"tc-liveness: one message".to_vec();
+        let signature = signer.sign(&message);
+        assert!(verify_signature(&signer.verifying_key(), &message, &signature));
+        assert!(!verify_signature(&signer.verifying_key(), b"tc-liveness: another message", &signature));
+        assert!(!verify_signature(&key(14).verifying_key(), &message, &signature));
+    }
+}
