@@ -213,3 +213,6 @@ mod lock_reflexive_test;
 
 #[cfg(test)]
 mod vsu_sibling_unlock_test;
+
+#[cfg(test)]
+mod tc_tip_ordinary_stall_test;
