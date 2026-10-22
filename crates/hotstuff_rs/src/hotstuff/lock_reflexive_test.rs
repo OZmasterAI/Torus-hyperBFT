@@ -320,6 +320,7 @@ struct MixedCommit {
 /// `a_updates`: A's own validator-set updates (A then has a Decide PC at view 2, which is U's
 /// justify); `None`: A is a plain block and U justifies on QC(A) at view 1.
 fn mixed_commit_replica(replica: usize, committed: bool, a_updates: bool) -> MixedCommit {
+    use crate::types::signed_messages::Certificate;
     let keys = signing_keys(&[1, 2, 3, 4]);
     let set = validator_set(&keys);
     let (mut block_tree, _vss) = steady_block_tree(&set);
