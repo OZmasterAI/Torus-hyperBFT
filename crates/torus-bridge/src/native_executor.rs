@@ -1124,6 +1124,107 @@ fn settle_streamed_enabled() -> bool {
     })
 }
 
+/// s80 prototype (`TORUS_S80_PASSB_COTHREAD`, node-local, default 0 = off):
+/// pure parse. `1`: the L2.1 streamed region hands each market ready for
+/// pass B to one scoped co-thread that runs the unchanged pass B in market
+/// order; the exec thread keeps the plans' position caches and writes them
+/// (the position flush) while the co-thread finishes, then joins before the
+/// balance flush. `2`: the same hand-off, joined BEFORE the position flush
+/// (the hand-off cost alone). Anything else (unset, empty, `0`, unknown) = 0.
+#[doc(hidden)]
+pub fn parse_passb_cothread(v: Option<&str>) -> u8 {
+    match v.map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        None | Some("") | Some("0") => 0,
+        Some(other) => {
+            tracing::warn!(value = other, "TORUS_S80_PASSB_COTHREAD: not 0, 1 or 2; using 0 (off)");
+            0
+        }
+    }
+}
+
+thread_local! {
+    /// s80: [`with_passb_cothread`]'s per-thread pin; `None` = the env.
+    static PASSB_COTHREAD_PIN: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+    /// s80: calls on this thread whose pass B ran (at least one market) on
+    /// the co-thread.
+    static PASSB_COTHREAD_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// s80: of those, calls whose position flush overlapped the co-thread.
+    static PASSB_COTHREAD_OVERLAPPED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// s80 test seam: pass B of this market panics (any mode).
+    static PASSB_PANIC_MARKET: std::cell::Cell<Option<MarketId>> = const { std::cell::Cell::new(None) };
+}
+
+/// s80: runs `f` with `TORUS_S80_PASSB_COTHREAD` pinned to `mode` on this
+/// (exec) thread; restored on return or unwind.
+#[doc(hidden)]
+pub fn with_passb_cothread<R>(mode: u8, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<u8>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PASSB_COTHREAD_PIN.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(PASSB_COTHREAD_PIN.with(|c| c.replace(Some(mode))));
+    f()
+}
+
+/// s80 test seam: runs `f` with pass B of `market` planted to panic (read
+/// on the exec thread when it builds the pass B sink); restored after.
+#[doc(hidden)]
+pub fn with_passb_panic_market<R>(market: Option<MarketId>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<MarketId>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PASSB_PANIC_MARKET.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(PASSB_PANIC_MARKET.with(|c| c.replace(market)));
+    f()
+}
+
+/// s80: calls this thread ran with pass B on the co-thread.
+#[doc(hidden)]
+pub fn passb_cothread_calls_on_this_thread() -> u64 {
+    PASSB_COTHREAD_CALLS.with(std::cell::Cell::get)
+}
+
+/// s80: calls this thread ran whose position flush overlapped the co-thread.
+#[doc(hidden)]
+pub fn passb_cothread_overlapped_on_this_thread() -> u64 {
+    PASSB_COTHREAD_OVERLAPPED.with(std::cell::Cell::get)
+}
+
+/// s80: the co-thread mode (0 = off). The thread's pin if set, else the env
+/// read once per process (logged once: `TORUS_S80_PASSB_COTHREAD on=..`).
+fn passb_cothread_mode() -> u8 {
+    if let Some(mode) = PASSB_COTHREAD_PIN.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = parse_passb_cothread(std::env::var("TORUS_S80_PASSB_COTHREAD").ok().as_deref());
+        tracing::info!(
+            on = mode != 0,
+            mode,
+            "TORUS_S80_PASSB_COTHREAD: settle pass B on one co-thread (1: overlapped with the position flush, 2: joined before it)"
+        );
+        mode
+    })
+}
+
+/// s80: a panic payload's message (`&str` or `String`).
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
 #[cfg(test)]
 mod settle_streamed_flag_tests {
     use super::{
@@ -6034,6 +6135,9 @@ struct PassBSink<'c> {
     /// call's matching has succeeded, see [`NativeExecutor::match_settle_streamed`]).
     absorb_indexes: bool,
     trades: TradeSink<'c>,
+    /// s80 test seam ([`with_passb_panic_market`]): pass B of this market
+    /// panics. Read on the exec thread when the sink is built.
+    panic_market: Option<MarketId>,
 }
 
 /// A [`PassBSink`] over `$ctx`'s fields (`$ctx`: `&mut NativeExecContext`).
@@ -6049,6 +6153,7 @@ macro_rules! pass_b_sink {
             metrics: $ctx.metrics.as_deref(),
             absorb_indexes: true,
             trades: trade_sink!($ctx),
+            panic_market: PASSB_PANIC_MARKET.with(std::cell::Cell::get),
         }
     };
 }
@@ -6525,6 +6630,18 @@ pub struct ExecPhaseAccum {
     pub settle_pass_b_ns: u128,
     /// Nested in `settle_ns`: `pos_cache.flush_all` + `bal_cache.flush_all`.
     pub cache_flush_ns: u128,
+    /// s80: nested in `cache_flush_ns`: the position part of the flush
+    /// (wherever it ran: with `TORUS_S80_PASSB_COTHREAD=1` it overlaps the
+    /// co-thread's pass B).
+    pub cache_flush_pos_ns: u128,
+    /// s80 (`TORUS_S80_PASSB_COTHREAD`): pass B time on the co-thread (also
+    /// in `settle_pass_b_ns`, which the exec thread did not spend), and the
+    /// exec thread's wait at the join.
+    pub passb_co_ns: u128,
+    pub passb_join_wait_ns: u128,
+    /// s80 premise probe (flag 0, L2.1 streamed): pass B time on the exec
+    /// thread for markets applied after every pool job had finished.
+    pub settle_pass_b_late_ns: u128,
     /// Parallel settles that fell back to the sequential loop (worker panic
     /// or a position-side fill failure).
     pub settle_fallbacks: u64,
@@ -9625,7 +9742,222 @@ impl NativeExecutor {
         // the waits for plans), added to the settle timer below.
         let mut settle_carry = std::time::Duration::ZERO;
         let settle_timer;
-        if streamed {
+        // s80 (`TORUS_S80_PASSB_COTHREAD`, default 0): 1 / 2 run the streamed
+        // region's pass B on one scoped co-thread (`match_settle_streamed_co`).
+        let co_mode = if streamed { passb_cothread_mode() } else { 0 };
+        // s80 mode 1, a clean call: the position flush, run while the
+        // co-thread finished pass B (latched with the rest of the flush).
+        let mut pos_flushed_early: Option<Result<(), CoreError>> = None;
+        if streamed && co_mode != 0 {
+            #[cfg(test)]
+            MATCH_SETUP_IN_JOBS.with(|c| c.set(c.get() + 1));
+            setup_items.sort_unstable_by_key(|item| item.0);
+            let jobs = match settle_mode {
+                SettleMode::Force {
+                    workers: Some(w), ..
+                } => w.max(1),
+                _ => MarketWorkerPool::resolve_worker_cap_named(None),
+            };
+            debug_assert!(pos_cache.is_empty() && pos_runs.is_empty() && vol_cache.is_empty());
+            let undo = StreamUndo::begin(
+                total_gas,
+                ctx.next_global_order_id,
+                &ctx.fatal_error,
+                trade_sink!(ctx),
+            );
+            bal_cache.begin_undo();
+            // The co-thread's out: everything pass B writes but the position
+            // caches, which stay here (`co_pos` only stands in for them, and
+            // pass B leaves it empty: every plan cache it gets is empty).
+            let mut co_pos = PositionCache::new();
+            let co_out = PassBOut::new(
+                &mut results,
+                &mut total_gas,
+                &mut bal_cache,
+                &mut co_pos,
+                None,
+                &mut vol_cache,
+            );
+            let typed = typed_rows_of(&ctx.sums);
+            let mut co_sink = pass_b_sink!(ctx);
+            // The streamed region feeds no index (see `match_settle_streamed`).
+            co_sink.absorb_indexes = false;
+            let metrics = ctx.metrics.as_deref();
+            let positions = &ctx.positions;
+            #[cfg(any(test, feature = "test-reference-paths"))]
+            let per_row = ctx.test_flush_per_row;
+            #[cfg(not(any(test, feature = "test-reference-paths")))]
+            let per_row = false;
+            let accum = &mut ctx.phase_accum;
+            let market_batches_ref = &market_batches;
+            let co_jitter = if probe.jitter_seed == 0 { 0 } else { probe.jitter_seed ^ 0xC0_7E5A };
+            let (mut streamed_out, mut out, region_end, pos_early, co_ns, join_wait) =
+                std::thread::scope(|scope| {
+                    let (tx, rx) = std::sync::mpsc::channel::<(
+                        crate::market_workers::MarketBatchResult,
+                        MarketSettlePlan,
+                    )>();
+                    let co = std::thread::Builder::new()
+                        .name("torus-passb-co".to_string())
+                        .spawn_scoped(scope, move || {
+                            let mut sink = co_sink;
+                            let mut out = co_out;
+                            let mut applied: Vec<AppliedMarket> = Vec::new();
+                            let mut busy = std::time::Duration::ZERO;
+                            for (mbr, plan) in rx {
+                                // L2.1 test seam: perturb pass B against the
+                                // exec thread (and its position flush) too.
+                                if co_jitter != 0 {
+                                    std::thread::sleep(std::time::Duration::from_micros(
+                                        crate::exec_pool::jitter_us(co_jitter, applied.len()),
+                                    ));
+                                }
+                                let t = std::time::Instant::now();
+                                let (market_id, next_order_id) = (mbr.market_id, mbr.next_order_id);
+                                let was_dirty = sink.dirty_books.contains(&market_id);
+                                let results = Self::settle_pass_b_market(
+                                    &mut sink,
+                                    positions,
+                                    typed,
+                                    mbr,
+                                    plan,
+                                    market_batches_ref,
+                                    &mut out,
+                                );
+                                busy += t.elapsed();
+                                applied.push(AppliedMarket {
+                                    market_id,
+                                    was_dirty,
+                                    results,
+                                    next_order_id,
+                                });
+                            }
+                            debug_assert!(out.pos_cache.is_empty());
+                            (out, applied, busy)
+                        })
+                        .expect("s80: spawn the pass B co-thread");
+                    let so = Self::match_settle_streamed_co(
+                        StreamJobs {
+                            reader: &reader,
+                            markets: &markets,
+                            pools: &pools,
+                            margin_configs: &ctx.margin_configs,
+                            positions,
+                            typed,
+                            record_fills: ctx.record_fills,
+                            timestamp: ctx.timestamp,
+                            probe,
+                            jobs,
+                        },
+                        setup_items,
+                        metrics,
+                        accum,
+                        market_batches_ref,
+                        fast_top_ups,
+                        &settle_gate,
+                        &mut triggered,
+                        tx,
+                        &mut pos_cache,
+                        settle_no_merge.then_some(&mut pos_runs),
+                    );
+                    let region_end = std::time::Instant::now();
+                    // Mode 1 on a clean call (every market went to the
+                    // co-thread): the position flush now. It writes only
+                    // position rows; pass B reads only balance rows (and
+                    // writes nothing to the backend), so the overlap changes
+                    // no read and no write.
+                    let clean = so.panic.is_none() && so.parallel && so.rest.is_empty();
+                    let pos_early = (co_mode == 1 && clean).then(|| {
+                        let t = std::time::Instant::now();
+                        let r = Self::flush_positions(
+                            positions,
+                            metrics,
+                            &mut pos_cache,
+                            &mut pos_runs,
+                            per_row,
+                        );
+                        (r, t.elapsed())
+                    });
+                    let t = std::time::Instant::now();
+                    let joined = co.join();
+                    let join_wait = t.elapsed();
+                    let (out, applied, co_ns) = match joined {
+                        Ok(v) => v,
+                        // Re-raised here, as a panic on the exec thread (the
+                        // node's fail-stop hook sees `torus-execution`).
+                        Err(payload) => panic!(
+                            "settle pass B co-thread panicked: {}",
+                            panic_payload_message(payload.as_ref())
+                        ),
+                    };
+                    let mut so = so;
+                    so.applied = applied;
+                    (so, out, region_end, pos_early, co_ns, join_wait)
+                });
+            if !streamed_out.applied.is_empty() {
+                PASSB_COTHREAD_CALLS.with(|c| c.set(c.get() + 1));
+            }
+            ctx.phase_accum.passb_co_ns += co_ns.as_nanos();
+            ctx.phase_accum.passb_join_wait_ns += join_wait.as_nanos();
+            if streamed_out.parallel {
+                ctx.phase_accum.settle_pass_b_ns += co_ns.as_nanos();
+            }
+            if let Some((r, took)) = pos_early {
+                PASSB_COTHREAD_OVERLAPPED.with(|c| c.set(c.get() + 1));
+                ctx.phase_accum.cache_flush_ns += took.as_nanos();
+                ctx.phase_accum.cache_flush_pos_ns += took.as_nanos();
+                pos_flushed_early = Some(r);
+            } else {
+                // Everything after the region writes the real position
+                // caches (the rest's pass B, the sequential loop, a
+                // fallback's undo and replay).
+                out.pos_cache = &mut pos_cache;
+                out.pos_runs = settle_no_merge.then_some(&mut pos_runs);
+            }
+            if let Some(panic) = streamed_out.panic.take() {
+                drop(out);
+                drop(undo.rollback(ctx, &mut total_gas, &streamed_out.applied));
+                return Self::match_panic_exit(
+                    ctx,
+                    panic,
+                    &place_order_indices,
+                    results,
+                    total_gas,
+                );
+            }
+            // The exec thread's region settle time is its plan waits (pass B
+            // ran on the co-thread); after the region: the early position
+            // flush (also in the cache-flush timer) and the join.
+            let in_region = streamed_out.plan_wait;
+            let match_elapsed = region_end
+                .duration_since(match_timer)
+                .saturating_sub(in_region);
+            ctx.phase_accum.match_ns += match_elapsed.as_nanos();
+            if let Some(ref m) = ctx.metrics {
+                m.exec_phase_match_seconds
+                    .observe(match_elapsed.as_secs_f64());
+            }
+            settle_carry = in_region + region_end.elapsed();
+            settle_timer = std::time::Instant::now();
+            let fallback = if streamed_out.parallel {
+                Self::plan_fallback(streamed_out.rest.iter().filter_map(|(_, p)| p.as_ref()))
+            } else {
+                None
+            };
+            if fallback.is_some() && !streamed_out.applied.is_empty() {
+                debug_assert!(pos_flushed_early.is_none());
+                Self::undo_streamed_prefix(ctx, undo, &mut streamed_out, &market_batches, &mut out);
+                SETTLE_STREAMED_HYBRID.with(|c| c.set(c.get() + 1));
+                if let Some(ref m) = ctx.metrics {
+                    m.exec_settle_streamed_resumed_fallbacks.inc();
+                }
+            } else {
+                out.bal_cache.commit_undo();
+                undo.commit(ctx);
+            }
+            Self::absorb_indexes_after_stream(ctx, &mut streamed_out);
+            Self::settle_streamed_rest(ctx, streamed_out, fallback, &market_batches, out);
+        } else if streamed {
             #[cfg(test)]
             MATCH_SETUP_IN_JOBS.with(|c| c.set(c.get() + 1));
             // Markets ascending: pass B's order, and the pool's take order.
@@ -9871,41 +10203,28 @@ impl NativeExecutor {
         // r6: the two sorted flush_all walks are the tail of Phase 4 and were
         // only ever visible lumped into `exec_phase_settle_seconds`.
         let cache_flush_timer = std::time::Instant::now();
-        // Plan 9.8: the per-row reference flushes one merged cache.
-        #[cfg(any(test, feature = "test-reference-paths"))]
-        if ctx.test_flush_per_row {
-            for run in pos_runs.drain(..) {
-                pos_cache.merge_disjoint(run);
+        // s80 (`TORUS_S80_PASSB_COTHREAD=1`): on a clean streamed call the
+        // position flush already ran, overlapped with the co-thread's pass B
+        // (its error is latched here, after pass B's: the flush message wins,
+        // as in this order).
+        let pos_flushed = match pos_flushed_early {
+            Some(r) => r,
+            None => {
+                let t = std::time::Instant::now();
+                #[cfg(any(test, feature = "test-reference-paths"))]
+                let per_row = ctx.test_flush_per_row;
+                #[cfg(not(any(test, feature = "test-reference-paths")))]
+                let per_row = false;
+                let r = Self::flush_positions(
+                    &ctx.positions,
+                    ctx.metrics.as_deref(),
+                    &mut pos_cache,
+                    &mut pos_runs,
+                    per_row,
+                );
+                ctx.phase_accum.cache_flush_pos_ns += t.elapsed().as_nanos();
+                r
             }
-        }
-        // 8k L2.2: pass B's unmerged runs and `pos_cache` in one sorted
-        // flush: the writes and their order are those of merge + flush_all.
-        // Runs not provably disjoint (an opaque row put one market's key in
-        // another market's cache) ARE merged + flush_all-ed, counted here
-        // (decided before any write, so a failing flush is counted too).
-        let pos_flushed = if !pos_runs.is_empty() {
-            if pos_cache.runs_disjoint(&pos_runs) {
-                SETTLE_NO_MERGE_FLUSHES.with(|c| c.set(c.get() + 1));
-            } else {
-                SETTLE_NO_MERGE_FALLBACKS.with(|c| c.set(c.get() + 1));
-                if let Some(ref m) = ctx.metrics {
-                    m.exec_settle_no_merge_fallbacks.inc();
-                }
-            }
-            pos_cache
-                .flush_with_runs(&mut pos_runs, &ctx.positions)
-                .map(|_| ())
-        } else {
-            // Plan 9.8: the test-only per-row reference (P2-2's comparison point).
-            #[cfg(any(test, feature = "test-reference-paths"))]
-            let flushed = if ctx.test_flush_per_row {
-                pos_cache.flush_all_per_row(&ctx.positions)
-            } else {
-                pos_cache.flush_all(&ctx.positions)
-            };
-            #[cfg(not(any(test, feature = "test-reference-paths")))]
-            let flushed = pos_cache.flush_all(&ctx.positions);
-            flushed
         };
         if let Err(e) = pos_flushed {
             ctx.fatal_error = Some(format!("position cache flush failed: {e}"));
@@ -10378,6 +10697,53 @@ impl NativeExecutor {
         Some((outcomes, merged))
     }
 
+    /// The position part of the end-of-call cache flush, unchanged (8k
+    /// L2.2: the batch cache and pass B's unmerged runs in one sorted flush,
+    /// or one merged cache; plan 9.8: the per-row reference). Runs not
+    /// provably disjoint (an opaque row put one market's key in another
+    /// market's cache) ARE merged + `flush_all`-ed, counted here (decided
+    /// before any write, so a failing flush is counted too). s80: factored
+    /// out so `TORUS_S80_PASSB_COTHREAD=1` can run it before the join.
+    fn flush_positions<T: StateBackend>(
+        positions: &PositionManager<T>,
+        metrics: Option<&torus_telemetry::Metrics>,
+        pos_cache: &mut PositionCache,
+        pos_runs: &mut Vec<PositionCache>,
+        per_row: bool,
+    ) -> Result<(), CoreError> {
+        // Plan 9.8: the per-row reference flushes one merged cache.
+        #[cfg(any(test, feature = "test-reference-paths"))]
+        if per_row {
+            for run in pos_runs.drain(..) {
+                pos_cache.merge_disjoint(run);
+            }
+        }
+        if !pos_runs.is_empty() {
+            if pos_cache.runs_disjoint(pos_runs) {
+                SETTLE_NO_MERGE_FLUSHES.with(|c| c.set(c.get() + 1));
+            } else {
+                SETTLE_NO_MERGE_FALLBACKS.with(|c| c.set(c.get() + 1));
+                if let Some(m) = metrics {
+                    m.exec_settle_no_merge_fallbacks.inc();
+                }
+            }
+            pos_cache.flush_with_runs(pos_runs, positions).map(|_| ())
+        } else {
+            #[cfg(any(test, feature = "test-reference-paths"))]
+            let flushed = if per_row {
+                pos_cache.flush_all_per_row(positions)
+            } else {
+                pos_cache.flush_all(positions)
+            };
+            #[cfg(not(any(test, feature = "test-reference-paths")))]
+            let flushed = {
+                let _ = per_row;
+                pos_cache.flush_all(positions)
+            };
+            flushed
+        }
+    }
+
     /// T1.5 FAIL-STOP: a market worker panicked. The panicking worker
     /// consumed its market's book (and this call's other books were consumed
     /// with it), so settlement cannot proceed and the block must never be
@@ -10632,6 +10998,8 @@ impl NativeExecutor {
             let mut early = 0u64;
             let (mut pass_b, mut plan_wait) =
                 (std::time::Duration::ZERO, std::time::Duration::ZERO);
+            // s80 premise probe: pass B time after every job had finished.
+            let mut late = std::time::Duration::ZERO;
             let mut panic = None;
             let parks_before = crate::exec_pool::stream_parks_on_this_thread().0;
             for (i, &id) in ids.iter().enumerate() {
@@ -10722,13 +11090,256 @@ impl NativeExecutor {
                         market_batches,
                         out,
                     );
-                    pass_b += t.elapsed();
+                    let took = t.elapsed();
+                    pass_b += took;
+                    if !is_early {
+                        late += took;
+                    }
                     applied.push(AppliedMarket {
                         market_id,
                         was_dirty,
                         results,
                         next_order_id,
                     });
+                    early += u64::from(is_early);
+                }
+            }
+            let parallel = panic.is_none() && decided == Some(true);
+            if parallel {
+                // Every remaining plan, as flag off's pass A computes all of
+                // them before its fallback check (its first local fault is
+                // latched from any market's plan).
+                let t = std::time::Instant::now();
+                for (mbr, plan) in pending.iter_mut() {
+                    if plan.is_none() {
+                        *plan = Some(plan_of(mbr));
+                    }
+                }
+                plan_wait += t.elapsed();
+                // Pass A is fused into the jobs; what the exec thread still
+                // waits for is the plans (>= 1 ns, so a streamed call counts
+                // as a parallel settle).
+                accum.settle_pass_a_ns += plan_wait.as_nanos().max(1);
+                accum.settle_pass_b_ns += pass_b.as_nanos();
+                accum.settle_pass_b_late_ns += late.as_nanos();
+            }
+            StreamedOut {
+                panic,
+                parallel,
+                rest: pending.into(),
+                applied,
+                early,
+                parks: crate::exec_pool::stream_parks_on_this_thread().0 - parks_before,
+                pass_b,
+                plan_wait,
+            }
+        })
+    }
+
+    /// s80 (`TORUS_S80_PASSB_COTHREAD` 1 / 2): [`Self::match_settle_streamed`]
+    /// with pass B on a co-thread: each market ready for pass B (same order,
+    /// same gate, same fallback rule) goes to `handoff` (its match result and
+    /// plan, minus the plan's position cache, which is merged into
+    /// `pos_cache` or pushed onto `pos_runs` here, in market order, as pass
+    /// B would). The co-thread owns the pass B sink and out and returns the
+    /// applied markets; `applied` and `pass_b` stay empty here. Dropping
+    /// `handoff` at the end tells the co-thread no more markets come.
+    #[allow(clippy::too_many_arguments)]
+    fn match_settle_streamed_co<'m, 'x, T: StateBackend>(
+        jobs_in: StreamJobs<'_, '_, T>,
+        items: Vec<(MarketId, OrderBook, &'m [PreparedOrder<'x>], usize)>,
+        metrics: Option<&torus_telemetry::Metrics>,
+        accum: &mut ExecPhaseAccum,
+        market_batches: &'m HashMap<MarketId, Vec<PreparedOrder<'x>>>,
+        fast_top_ups: bool,
+        settle_gate: &(dyn Fn(usize) -> bool + Sync),
+        triggered: &mut VecDeque<TriggeredStop>,
+        handoff: std::sync::mpsc::Sender<(crate::market_workers::MarketBatchResult, MarketSettlePlan)>,
+        pos_cache: &mut PositionCache,
+        mut pos_runs: Option<&mut Vec<PositionCache>>,
+    ) -> StreamedOut {
+        let StreamJobs {
+            reader,
+            markets,
+            pools,
+            margin_configs,
+            positions,
+            typed,
+            record_fills,
+            timestamp,
+            probe,
+            jobs,
+        } = jobs_in;
+        let ids: Vec<MarketId> = items.iter().map(|item| item.0).collect();
+        let n = ids.len();
+        let items: Vec<(MarketId, OrderBook, &'m [PreparedOrder<'x>])> =
+            items.into_iter().map(|(m, b, p, _)| (m, b, p)).collect();
+        type Plan = Option<Result<MarketSettlePlan, String>>;
+        type JobOut = Result<
+            (crate::market_workers::MarketBatchResult, Plan),
+            crate::market_workers::MarketWorkerPanic,
+        >;
+        // One market's contained plan, as flag-off pass A computes it.
+        let plan_of = |mbr: &crate::market_workers::MarketBatchResult| {
+            Self::market_settle_plan_contained(
+                positions,
+                typed,
+                margin_configs.get(&mbr.market_id),
+                mbr,
+                market_batches
+                    .get(&mbr.market_id)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]),
+                record_fills,
+                probe.plan_panic,
+            )
+        };
+        // Fills of the markets matched so far, in any order (a lower bound
+        // of the call's total: the gate passing on it is final). Relaxed: a
+        // stale (smaller) sum only leaves a plan to the exec thread.
+        let fills_matched = std::sync::atomic::AtomicUsize::new(0);
+        let work = |_: usize,
+                    (market_id, book, prepared): (MarketId, OrderBook, &'m [PreparedOrder<'x>])|
+         -> JobOut {
+            // Match: contained like the flag-off match jobs (a panic is this
+            // market's `MarketWorkerPanic`, the block's fatal exit).
+            let mbr = MarketWorkerPool::run_contained(market_id, move || {
+                if probe.match_panic == Some(market_id) {
+                    panic!("planted match panic (L2.1 test seam)");
+                }
+                let mut book = book;
+                let requests = Self::match_setup(
+                    reader,
+                    markets,
+                    pools,
+                    margin_configs,
+                    market_id,
+                    &mut book,
+                    prepared,
+                );
+                MarketWorkerPool::match_market(
+                    market_id,
+                    book,
+                    requests,
+                    timestamp,
+                    Some(reader as &dyn MakerAccountSource),
+                    true,
+                )
+            })?;
+            // Plan: contained and recovered like flag-off pass A, and only
+            // once the parallel settle is certain (no speculative reads).
+            let fills: usize = mbr.results.iter().map(|r| r.result.fills.len()).sum();
+            let matched =
+                fills_matched.fetch_add(fills, std::sync::atomic::Ordering::Relaxed) + fills;
+            let plan = settle_gate(matched).then(|| plan_of(&mbr));
+            Ok((mbr, plan))
+        };
+        let batch = crate::exec_pool::wake_batch(n);
+        crate::exec_pool::run_streamed(items, jobs, batch, probe.jitter_seed, &work, |rx| {
+            let mut pending: VecDeque<(crate::market_workers::MarketBatchResult, Plan)> =
+                VecDeque::with_capacity(n);
+            let mut decided: Option<bool> = None;
+            let mut fills_seen = 0usize;
+            let mut streaming = true;
+            // s80: filled by the caller from the co-thread after the join.
+            let applied: Vec<AppliedMarket> = Vec::new();
+            let mut handed = 0usize;
+            let mut early = 0u64;
+            // s80: pass B runs on the co-thread (its time comes from there).
+            let (pass_b, mut plan_wait) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+            let mut panic = None;
+            let parks_before = crate::exec_pool::stream_parks_on_this_thread().0;
+            for (i, &id) in ids.iter().enumerate() {
+                let wait_start = std::time::Instant::now();
+                let got = rx.take(i);
+                if decided == Some(true) {
+                    plan_wait += wait_start.elapsed();
+                }
+                let (mut mbr, plan) = match got {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(p)) => {
+                        panic = Some(p);
+                        break;
+                    }
+                    // Unreachable in practice (the job body is contained);
+                    // reported as flag off reports a job dying outside the
+                    // per-market containment.
+                    Err(_) => {
+                        panic = Some(crate::market_workers::MarketWorkerPanic {
+                            market_id: id,
+                            message: "worker thread died outside contained matching".to_string(),
+                        });
+                        break;
+                    }
+                };
+                Self::absorb_matched(
+                    None,
+                    metrics,
+                    market_batches,
+                    fast_top_ups,
+                    &mut mbr,
+                    triggered,
+                );
+                fills_seen += mbr
+                    .results
+                    .iter()
+                    .map(|r| r.result.fills.len())
+                    .sum::<usize>();
+                pending.push_back((mbr, plan));
+                if decided.is_none() && (i + 1 == n || settle_gate(fills_seen)) {
+                    decided = Some(settle_gate(fills_seen));
+                }
+                if decided != Some(true) || !streaming {
+                    continue;
+                }
+                while let Some((mbr, plan)) = pending.front_mut() {
+                    if plan.is_none() {
+                        // Matched before the gate was certain: its plan now
+                        // (exec-thread pass A time).
+                        let t = std::time::Instant::now();
+                        *plan = Some(plan_of(mbr));
+                        plan_wait += t.elapsed();
+                    }
+                    let ok = match plan.as_ref().expect("computed above") {
+                        Ok(p) => {
+                            p.orders.iter().all(|o| o.fill_error.is_none())
+                                && p.pos_cache
+                                    .market_range()
+                                    .is_none_or(|r| r == (mbr.market_id, mbr.market_id))
+                        }
+                        Err(_) => false,
+                    };
+                    if !ok {
+                        streaming = false;
+                        break;
+                    }
+                    let Some((mbr, Some(Ok(mut plan)))) = pending.pop_front() else {
+                        unreachable!("checked above");
+                    };
+                    if probe.jitter_seed != 0 {
+                        std::thread::sleep(std::time::Duration::from_micros(
+                            crate::exec_pool::jitter_us(
+                                probe.jitter_seed ^ 0xE8EC_7E5A,
+                                handed,
+                            ),
+                        ));
+                    }
+                    let is_early = !rx.all_done();
+                    // s80: the plan's position cache stays here, merged or
+                    // pushed in market order as pass B does it; the co-thread
+                    // runs pass B on the rest of the plan (an empty cache).
+                    let pc = std::mem::take(&mut plan.pos_cache);
+                    match pos_runs.as_deref_mut() {
+                        Some(runs) => runs.push(pc),
+                        None => pos_cache.merge_disjoint(pc),
+                    }
+                    if handoff.send((mbr, plan)).is_err() {
+                        // The co-thread is gone (it panicked): hand no more;
+                        // the caller's join re-raises its panic.
+                        streaming = false;
+                        break;
+                    }
+                    handed += 1;
                     early += u64::from(is_early);
                 }
             }
@@ -11468,6 +12079,9 @@ impl NativeExecutor {
         out: &mut PassBOut<'_, '_>,
     ) -> Vec<crate::market_workers::MatchResult> {
         let market_id = mbr.market_id;
+        if sink.panic_market == Some(market_id) {
+            panic!("planted pass B panic (s80 test seam), market {market_id}");
+        }
 
         // Reinsert updated book (8k L2.1 streamed region: its logs reach
         // the indexes once the call's matching succeeded).

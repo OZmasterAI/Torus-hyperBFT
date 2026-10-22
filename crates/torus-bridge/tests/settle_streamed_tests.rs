@@ -36,8 +36,9 @@ use std::sync::{Arc, Mutex};
 use alloy_primitives::{Address, B256};
 
 use torus_bridge::native_executor::{
-    in_maker_snapshot_read_on_this_thread, parse_settle_streamed,
-    settle_streamed_calls_on_this_thread, settle_streamed_early_on_this_thread,
+    in_maker_snapshot_read_on_this_thread, parse_passb_cothread, parse_settle_streamed,
+    passb_cothread_calls_on_this_thread, passb_cothread_overlapped_on_this_thread,
+    with_passb_cothread, with_passb_panic_market, settle_streamed_calls_on_this_thread, settle_streamed_early_on_this_thread,
     settle_streamed_hybrid_on_this_thread, with_settle_no_merge, with_settle_stream_probe,
     with_settle_stream_wake_batch, with_settle_streamed, BookMode, NativeActionResult,
     NativeExecContext, NativeExecutor, ResidentBooks, SettleStreamProbe,
@@ -1816,4 +1817,174 @@ fn settle_streamed_fault_matrix_c() {
 fn settle_streamed_fault_matrix_d() {
     let (replays, fatal) = fault_matrix(0x8C21_3A7A_0004, 12);
     assert!(replays > 0 && fatal > 0, "replays {replays}, fatal {fatal}");
+}
+
+// ---- s80 TORUS_S80_PASSB_COTHREAD: pass B on one scoped co-thread ----
+//
+// Mode 1: the streamed region hands each market ready for pass B (its match
+// result and its plan minus the position cache) to one co-thread that runs
+// the unchanged `settle_pass_b_market` in market order; the exec thread keeps
+// the plans' position caches and, on a clean call, writes them (the position
+// flush) while the co-thread finishes, then joins before the balance flush.
+// Mode 2: the same hand-off, joined before the position flush (the hand-off
+// cost alone). Every L2.1 scenario above must give flag off's bytes under
+// both modes (each test body re-run with the mode pinned on this thread),
+// and the co-thread must actually have run (and, mode 1, overlapped the
+// position flush on the clean calls).
+
+/// Runs one L2.1 scenario with the co-thread pinned to `mode`; `engages`:
+/// the scenario streams at least one call, so the co-thread must have run.
+fn under_cothread(mode: u8, engages: bool, scenario: fn()) {
+    let calls0 = passb_cothread_calls_on_this_thread();
+    let overlapped0 = passb_cothread_overlapped_on_this_thread();
+    with_passb_cothread(mode, scenario);
+    let calls = passb_cothread_calls_on_this_thread() - calls0;
+    let overlapped = passb_cothread_overlapped_on_this_thread() - overlapped0;
+    if engages {
+        assert!(calls > 0, "mode {mode}: the co-thread ran pass B");
+    } else {
+        assert_eq!(calls, 0, "mode {mode}: nothing streamed, no co-thread");
+    }
+    match mode {
+        1 => assert_eq!(overlapped > 0, engages, "mode 1 overlaps the position flush"),
+        _ => assert_eq!(overlapped, 0, "mode {mode}: joined before the flush"),
+    }
+    assert!(overlapped <= calls);
+}
+
+macro_rules! cothread_twin {
+    ($name:ident, $scenario:ident, $engages:expr) => {
+        #[test]
+        fn $name() {
+            for mode in [1u8, 2] {
+                under_cothread(mode, $engages, $scenario);
+            }
+        }
+    };
+}
+
+cothread_twin!(passb_cothread_identical_block_stream, settle_streamed_identical_block_stream, true);
+cothread_twin!(passb_cothread_identical_second_seed, settle_streamed_identical_second_seed, true);
+cothread_twin!(
+    passb_cothread_identical_randomized_shapes,
+    settle_streamed_identical_randomized_shapes,
+    true
+);
+cothread_twin!(
+    passb_cothread_identical_under_scheduling_perturbation,
+    settle_streamed_identical_under_scheduling_perturbation,
+    true
+);
+cothread_twin!(
+    passb_cothread_identical_with_plan_panic_fallback,
+    settle_streamed_identical_with_plan_panic_fallback,
+    true
+);
+cothread_twin!(
+    passb_cothread_identical_with_plan_read_fault,
+    settle_streamed_identical_with_plan_read_fault,
+    true
+);
+cothread_twin!(
+    passb_cothread_identical_with_fatal_flush_failure,
+    settle_streamed_identical_with_fatal_flush_failure,
+    true
+);
+cothread_twin!(
+    passb_cothread_identical_with_match_panic,
+    settle_streamed_identical_with_match_panic,
+    true
+);
+cothread_twin!(
+    passb_cothread_identical_with_aliased_opaque_rows,
+    settle_streamed_identical_with_aliased_opaque_rows,
+    true
+);
+cothread_twin!(passb_cothread_identical_auto_gate, settle_streamed_identical_auto_gate, true);
+cothread_twin!(passb_cothread_identical_engine_mode, settle_streamed_identical_engine_mode, true);
+cothread_twin!(
+    passb_cothread_forced_sequential_is_untouched,
+    settle_streamed_forced_sequential_is_untouched,
+    false
+);
+cothread_twin!(
+    passb_cothread_impure_prefix_plan_stops_the_stream,
+    settle_streamed_impure_prefix_plan_stops_the_stream,
+    true
+);
+cothread_twin!(
+    passb_cothread_match_panic_restores_context_across_block_rollover,
+    settle_streamed_match_panic_restores_context_across_block_rollover,
+    true
+);
+cothread_twin!(
+    passb_cothread_prefix_balance_fault_then_plan_panic_matches_flag_off,
+    settle_streamed_prefix_balance_fault_then_plan_panic_matches_flag_off,
+    true
+);
+cothread_twin!(passb_cothread_fault_matrix_a, settle_streamed_fault_matrix_a, true);
+cothread_twin!(passb_cothread_fault_matrix_b, settle_streamed_fault_matrix_b, true);
+
+/// A panic in pass B on the co-thread is re-raised on the exec (calling)
+/// thread, as a panic there (the node's fail-stop hook sees it on
+/// `torus-execution`), with the co-thread's message; flag off panics the
+/// same way from the same seam on the exec thread itself.
+#[test]
+fn passb_cothread_panic_is_reraised_on_the_exec_thread() {
+    let blocks = stream(0x8C21_C0C0_0001, 8, 1, 300);
+    let batch = &blocks[0][0];
+    for mode in [0u8, 1, 2] {
+        let result = std::panic::catch_unwind(|| {
+            with_passb_cothread(mode, || {
+                with_passb_panic_market(Some(5), || {
+                    with_settle_streamed(true, || {
+                        let dir = tempfile::tempdir().expect("temp dir");
+                        let db = StateDb::open(dir.path()).expect("open db");
+                        list_markets(&db);
+                        for n in 1..=TRADERS as u8 {
+                            let bal = NativeBalance {
+                                available: fp(1_000_000),
+                                order_margin: FixedPoint::ZERO,
+                            };
+                            torus_core::position::PositionManager::new(db.clone())
+                                .put_native_balance(&addr(n), &bal)
+                                .unwrap();
+                        }
+                        let mut ctx = NativeExecContext::new(
+                            NativeStateOverlay::new(db.clone()),
+                            1,
+                            1000,
+                            0,
+                            100,
+                            10,
+                            addr(99),
+                            addr(100),
+                            addr(101),
+                        );
+                        NativeExecutor::execute_batch_settle_workers(&mut ctx, batch, true, Some(4))
+                    })
+                })
+            })
+        });
+        let payload = result.expect_err("pass B panicked");
+        let msg = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&'static str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(msg.contains("planted pass B panic"), "mode {mode}: {msg:?}");
+        if mode != 0 {
+            assert!(msg.contains("co-thread"), "mode {mode}: re-raised on E: {msg:?}");
+        }
+    }
+}
+
+/// The flag: unset / empty / `0` = off (mode 0); `1` and `2` the two modes;
+/// anything else is off.
+#[test]
+fn passb_cothread_flag_parse() {
+    assert_eq!(parse_passb_cothread(None), 0);
+    for (v, m) in [("", 0u8), ("0", 0), ("1", 1), (" 2 ", 2), ("3", 0), ("on", 0)] {
+        assert_eq!(parse_passb_cothread(Some(v)), m, "{v:?}");
+    }
 }

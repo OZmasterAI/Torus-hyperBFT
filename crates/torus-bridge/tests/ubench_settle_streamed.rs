@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
 use torus_bridge::native_executor::{
-    settle_stream_parks_on_this_thread, with_settle_no_merge, with_settle_stream_wake_batch,
-    with_settle_streamed, NativeExecContext, NativeExecutor,
+    settle_stream_parks_on_this_thread, with_passb_cothread, with_settle_no_merge,
+    with_settle_stream_wake_batch, with_settle_streamed, NativeExecContext, NativeExecutor,
 };
 use torus_core::position::{NativeBalance, PositionManager};
 use torus_state::{NativeStateOverlay, StateDb};
@@ -126,6 +126,13 @@ struct Sample {
     match_ns: u128,
     settle_ns: u128,
     pass_b_ns: u128,
+    /// s80: cache flush (all), its position part, pass B on the co-thread,
+    /// the exec thread's join wait, flag-0 pass B after the pool finished.
+    flush_ns: u128,
+    flush_pos_ns: u128,
+    co_ns: u128,
+    join_ns: u128,
+    late_ns: u128,
     /// The calling (exec) thread's on-CPU and runqueue wait over the call.
     cpu_ns: u64,
     runq_ns: u64,
@@ -197,6 +204,11 @@ fn one(ladder: &[(Address, NativeAction)], storm: &[(Address, NativeAction)]) ->
         match_ns: ctx.phase_accum.match_ns - accum.match_ns,
         settle_ns: ctx.phase_accum.settle_ns - accum.settle_ns,
         pass_b_ns: ctx.phase_accum.settle_pass_b_ns - accum.settle_pass_b_ns,
+        flush_ns: ctx.phase_accum.cache_flush_ns - accum.cache_flush_ns,
+        flush_pos_ns: ctx.phase_accum.cache_flush_pos_ns - accum.cache_flush_pos_ns,
+        co_ns: ctx.phase_accum.passb_co_ns - accum.passb_co_ns,
+        join_ns: ctx.phase_accum.passb_join_wait_ns - accum.passb_join_wait_ns,
+        late_ns: ctx.phase_accum.settle_pass_b_late_ns - accum.settle_pass_b_late_ns,
         cpu_ns: cpu1 - cpu0,
         runq_ns: runq1 - runq0,
         parks: parks1 - parks0,
@@ -241,22 +253,39 @@ fn ubench_settle_streamed_exec_wall() {
             v => Some(v.parse().expect("UBENCH_BATCHES: numbers or auto")),
         })
         .collect();
-    let arms: Vec<Option<Option<usize>>> = std::iter::once(None)
-        .chain(batches.iter().map(|b| Some(*b)))
+    // s80: `UBENCH_CO` (comma list of TORUS_S80_PASSB_COTHREAD modes for
+    // the flag-on arms, default `0`); `UBENCH_OFF=0` drops the L2.1-off arm.
+    let cos: Vec<u8> = std::env::var("UBENCH_CO")
+        .unwrap_or_else(|_| "0".to_string())
+        .split(',')
+        .map(|c| c.trim().parse().expect("UBENCH_CO: 0, 1 or 2"))
         .collect();
-    let label = |arm: &Option<Option<usize>>| match arm {
-        None => "off".to_string(),
-        Some(None) => "on batch auto".to_string(),
-        Some(Some(b)) => format!("on batch {b}"),
+    let with_off = std::env::var("UBENCH_OFF").map_or(true, |v| v != "0");
+    type Arm = (Option<Option<usize>>, u8);
+    let arms: Vec<Arm> = with_off
+        .then_some((None, 0u8))
+        .into_iter()
+        .chain(batches.iter().flat_map(|b| cos.iter().map(move |c| (Some(*b), *c))))
+        .collect();
+    let label = |arm: &Arm| match arm {
+        (None, _) => "off".to_string(),
+        (Some(None), c) => format!("on auto co{c}"),
+        (Some(Some(b)), c) => format!("on b{b} co{c}"),
     };
-    let run = |arm: &Option<Option<usize>>, no_merge: bool, storm: &[(Address, NativeAction)]| {
+    let run = |arm: &Arm, no_merge: bool, storm: &[(Address, NativeAction)]| {
         with_settle_no_merge(no_merge, || {
-            with_settle_streamed(arm.is_some(), || {
-                with_settle_stream_wake_batch(arm.flatten(), || one(&ladder, storm))
+            with_settle_streamed(arm.0.is_some(), || {
+                with_passb_cothread(arm.1, || {
+                    with_settle_stream_wake_batch(arm.0.flatten(), || one(&ladder, storm))
+                })
             })
         })
     };
-    for (shape, per_market) in [("16.8k", 19usize), ("65k", 72)] {
+    let shapes: Vec<(&str, usize)> = [("16.8k", 19usize), ("65k", 72)]
+        .into_iter()
+        .filter(|(n, _)| std::env::var("UBENCH_SHAPES").map_or(true, |v| v.split(',').any(|x| x == *n)))
+        .collect();
+    for (shape, per_market) in shapes {
         let storm = storm(per_market);
         let l22: &[bool] = match std::env::var("UBENCH_L22").as_deref() {
             Ok("off") => &[false],
@@ -294,8 +323,10 @@ fn ubench_settle_streamed_exec_wall() {
                 let wall = med(v, &|s| s.wall.as_secs_f64() * 1e3);
                 let cpu = med(v, &|s| s.cpu_ns as f64 / 1e6);
                 println!(
-                    "    {:<14} wall ms {:7.2} (/ off {:.3}); exec on-CPU ms {:7.2} (/ off {:.3}); \
-                     runq ms {:6.2}; parks {:5.0}, parked ms {:6.2}; match ms {:6.2}; settle ms {:6.2}; pass B ms {:6.2}",
+                    "    {:<14} wall ms {:7.2} (/ first {:.3}); exec on-CPU ms {:7.2} (/ first {:.3}); \
+                     runq ms {:6.2}; parks {:5.0}, parked ms {:6.2}; match ms {:6.2}; settle ms {:6.2}; pass B ms {:6.2}; \
+                     flush ms {:6.2} (pos {:6.2}); co pass B ms {:6.2}; join wait ms {:6.2}; late pass B ms {:6.2}; \
+                     mean wall {:7.2} mean cpu {:7.2} mean join {:6.2}",
                     label(arm),
                     wall,
                     wall / off_wall,
@@ -307,6 +338,22 @@ fn ubench_settle_streamed_exec_wall() {
                     med(v, &|s| ms(s.match_ns)),
                     med(v, &|s| ms(s.settle_ns)),
                     med(v, &|s| ms(s.pass_b_ns)),
+                    med(v, &|s| ms(s.flush_ns)),
+                    med(v, &|s| ms(s.flush_pos_ns)),
+                    med(v, &|s| ms(s.co_ns)),
+                    med(v, &|s| ms(s.join_ns)),
+                    med(v, &|s| ms(s.late_ns)),
+                    v.iter().map(|s| s.wall.as_secs_f64() * 1e3).sum::<f64>() / v.len() as f64,
+                    v.iter().map(|s| s.cpu_ns as f64 / 1e6).sum::<f64>() / v.len() as f64,
+                    v.iter().map(|s| ms(s.join_ns)).sum::<f64>() / v.len() as f64,
+                );
+                // Raw per-rep values (wall, exec cpu, join), for the report.
+                println!(
+                    "      raw {}: wall {:?} cpu {:?} join {:?}",
+                    label(arm),
+                    v.iter().map(|s| (s.wall.as_secs_f64() * 1e5).round() / 1e2).collect::<Vec<_>>(),
+                    v.iter().map(|s| (s.cpu_ns as f64 / 1e4).round() / 1e2).collect::<Vec<_>>(),
+                    v.iter().map(|s| (ms(s.join_ns) * 1e2).round() / 1e2).collect::<Vec<_>>(),
                 );
             }
         }
