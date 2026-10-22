@@ -7,7 +7,6 @@
 //! Types specific to the Pacemaker protocol.
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use ed25519_dalek::Verifier;
 
 use crate::hotstuff::{
     messages::{is_header_signed_by, Proposal, ProposalHeader},
@@ -286,7 +285,7 @@ impl Certificate for TimeoutCertificate {
                     let (tip, qc) = self.voter_metadata[idx];
                     let msg = timeout_vote_bytes(self.chain_id, self.view, tip, qc);
 
-                    if _signer.verify(&msg, &signature).is_ok() {
+                    if crate::types::crypto_primitives::verify_signature(&_signer, &msg, &signature) {
                         total_power += power;
                     } else {
                         // tc contains incorrect signature.

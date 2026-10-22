@@ -17,7 +17,7 @@ use crate::{
         block::*,
         crypto_primitives::Keypair,
         data_types::*,
-        crypto_primitives::{Signature, SigningKey, Verifier, VerifyingKey},
+        crypto_primitives::{Signature, SigningKey, VerifyingKey},
         signed_messages::{SignedMessage, Vote},
         signing::{phase_vote_bytes, proposal_header_bytes, sign_proposal_header},
     },
@@ -501,7 +501,7 @@ pub(crate) fn is_header_signed_by(
     leader: &VerifyingKey,
 ) -> bool {
     let signature = Signature::from_bytes(&signature.bytes());
-    leader.verify(&proposal_header_bytes(chain_id, view, block_hash), &signature).is_ok()
+    crate::types::crypto_primitives::verify_signature(leader, &proposal_header_bytes(chain_id, view, block_hash), &signature)
 }
 
 impl From<ProposalHeader> for HotStuffMessage {

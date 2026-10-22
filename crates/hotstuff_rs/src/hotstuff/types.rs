@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use ed25519_dalek::Verifier;
 
 use super::messages::{PhaseVote, Proposal};
 use crate::{
@@ -164,10 +163,7 @@ impl Certificate for PhaseCertificate {
         {
             if let Some(signature) = signature {
                 if let Ok(signature) = Signature::from_slice(&signature.bytes()) {
-                    if signer
-                        .verify(&message, &signature)
-                        .is_ok()
-                    {
+                    if crate::types::crypto_primitives::verify_signature(&signer, &message, &signature) {
                         total_power += power;
                     } else {
                         // pc contains incorrect signature.
@@ -548,7 +544,7 @@ fn is_nec_correctly_signed(nec: &NoEndorsementCertificate, chain_id: ChainID, va
     {
         if let Some(signature) = signature {
             if let Ok(sig) = Signature::from_slice(&signature.bytes()) {
-                if signer.verify(&ne_message_bytes, &sig).is_ok() {
+                if crate::types::crypto_primitives::verify_signature(&signer, &ne_message_bytes, &sig) {
                     total_power += power;
                 } else {
                     return false;
@@ -666,7 +662,7 @@ impl NECollector {
             // Verify signature.
             let ne_message_bytes = no_endorsement_bytes(self.chain_id, ne_view, ne_high_tip_qc_view);
             if let Ok(sig) = Signature::from_slice(&signature.bytes()) {
-                if signer.verify(&ne_message_bytes, &sig).is_err() {
+                if !crate::types::crypto_primitives::verify_signature(signer, &ne_message_bytes, &sig) {
                     return None;
                 }
             } else {
