@@ -1,12 +1,19 @@
-//! An `--rpc-only` node syncs from a single validator (real `torus-node`
-//! binaries, debug build).
+//! An `--rpc-only` node catches up with and follows a live chain through one
+//! bootstrap peer (real `torus-node` binaries, debug build).
 //!
 //! Testnet wallets read from `--rpc-only` nodes (owner s138, RPC freshness
-//! option a), and fresh / archive nodes sync the same way, often from one
-//! honest peer. V is a 1-validator chain producing blocks as fast as a debug
-//! build can; R (`--rpc-only`) dials only V and must catch up and keep up.
-//! This failed on loaded runners (ubuntoz, cachyoz) with `max sub-streams
-//! reached` and fetch timeouts on R's side while it passed on 18c.
+//! option a), and fresh / archive nodes sync the same way. V0 and V1 run a
+//! 2-validator chain; R (`--rpc-only`) starts once the chain is a few hundred
+//! blocks ahead, dials only V0, and must catch up and keep up.
+//!
+//! Not a 1-validator chain: a debug 1-validator chain commits ~45 blocks/s
+//! with ~90 consensus gossip messages/s from its single author. That is more
+//! than a debug node's swarm loop drains on a slow or loaded runner (~120
+//! events/s on ubuntoz), so R's connection always has a gossip event ready and
+//! libp2p's `Connection::poll` never reaches stream open/accept: every
+//! request-response on it (block sync, by-hash fetches) starves and R never
+//! syncs. It also exceeds the 50 msg/s per-author consensus rate limit.
+//! Neither happens at release speed or testnet rates.
 #![cfg(unix)]
 
 use std::net::UdpSocket;
@@ -17,19 +24,20 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 
 const BOUND: Duration = Duration::from_secs(120);
-const VALIDATOR_KEY: [u8; 32] = {
-    let mut k = [0u8; 32];
-    k[0] = 1;
-    k
-};
+/// The devnet key of `devnet/genesis.json` validator `i` (0-based).
+fn validator_key(i: u8) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    key[0] = i + 1;
+    key
+}
 
-/// 1-validator genesis value from `devnet/genesis.json`.
+/// 2-validator genesis from `devnet/genesis.json`.
 fn genesis_text() -> String {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../devnet/genesis.json");
     let mut g: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&src).expect("read devnet genesis")).unwrap();
-    let first = g["validators"][0].clone();
-    g["validators"] = serde_json::Value::Array(vec![first]);
+    let two: Vec<serde_json::Value> = g["validators"].as_array().unwrap()[..2].to_vec();
+    g["validators"] = serde_json::Value::Array(two);
     serde_json::to_string_pretty(&g).unwrap()
 }
 
@@ -149,7 +157,10 @@ impl Drop for Node {
         // Diagnostics: keep every log, pass or fail.
         if let Ok(dir) = std::env::var("TORUS_TEST_KEEP_LOGS") {
             let _ = std::fs::create_dir_all(&dir);
-            let _ = std::fs::copy(&self.log, Path::new(&dir).join(self.log.file_name().unwrap()));
+            let _ = std::fs::copy(
+                &self.log,
+                Path::new(&dir).join(self.log.file_name().unwrap()),
+            );
         }
     }
 }
@@ -198,56 +209,67 @@ fn wait_until(
 }
 
 #[test]
-fn rpc_only_node_syncs_and_keeps_up_with_a_single_fast_validator() {
+fn rpc_only_node_catches_up_and_follows_through_one_bootstrap_peer() {
     let work = tempfile::tempdir().unwrap();
     let genesis = work.path().join("genesis.json");
     std::fs::write(&genesis, genesis_text()).unwrap();
 
-    let v_peer = torus_network::bridge::peer_id_from_verifying_key(
-        &SigningKey::from_bytes(&VALIDATOR_KEY).verifying_key(),
+    let v0_peer = torus_network::bridge::peer_id_from_verifying_key(
+        &SigningKey::from_bytes(&validator_key(0)).verifying_key(),
     );
-    let v_port = free_udp_port();
-    let v_addr = format!("/ip4/127.0.0.1/udp/{v_port}/quic-v1/p2p/{v_peer}");
-    let mut v = Node::start(
+    let v0_port = free_udp_port();
+    let v0_addr = format!("/ip4/127.0.0.1/udp/{v0_port}/quic-v1/p2p/{v0_peer}");
+    let validator = |i: u8, peers: &str| {
+        vec![
+            "--validator-key".to_string(),
+            hex::encode(validator_key(i)),
+            // Explicit (possibly empty): never the compiled testnet seeds.
+            format!("--p2p-peers={peers}"),
+        ]
+    };
+    let mut v0 = Node::start(work.path(), "v0", &genesis, v0_port, &validator(0, ""));
+    let mut v1 = Node::start(
         work.path(),
-        "v",
+        "v1",
         &genesis,
-        v_port,
-        &[
-            "--validator-key".into(),
-            hex::encode(VALIDATOR_KEY),
-            // No bootstrap peers (never the compiled testnet seeds).
-            "--p2p-peers=".into(),
-        ],
+        free_udp_port(),
+        &validator(1, &v0_addr),
     );
 
-    // Let V get ahead first, so R starts as a node that must catch up.
-    wait_until(work.path(), &mut [&mut v], "v executes blocks", |n| {
-        n[0].executed_height().is_some_and(|h| h >= 100)
-    });
+    // Let the chain get ahead, so R starts as a node that must catch up
+    // through several block-sync batches (128 blocks each).
+    wait_until(
+        work.path(),
+        &mut [&mut v0, &mut v1],
+        "the chain executes blocks",
+        |n| n[0].executed_height().is_some_and(|h| h >= 300),
+    );
 
     let mut r = Node::start(
         work.path(),
         "r",
         &genesis,
         free_udp_port(),
-        &["--rpc-only".to_string(), format!("--p2p-peers={v_addr}")],
+        &["--rpc-only".to_string(), format!("--p2p-peers={v0_addr}")],
     );
 
-    // Catch up: R reaches the height V had when R started...
-    let target = v.executed_height().unwrap();
-    wait_until(work.path(), &mut [&mut v, &mut r], "r catches up", |n| {
-        n[1].executed_height().is_some_and(|h| h >= target)
-    });
+    // Catch up: R reaches the height V0 had when R started...
+    let target = v0.executed_height().unwrap();
+    wait_until(
+        work.path(),
+        &mut [&mut v0, &mut v1, &mut r],
+        &format!("r catches up (target {target})"),
+        |n| n[2].executed_height().is_some_and(|h| h >= target),
+    );
 
-    // ...and keeps up: R reaches V's current height again, twice.
+    // ...and follows: R reaches V0's then-current height, twice.
     for round in 0..2 {
-        let target = v.executed_height().unwrap();
+        let target = v0.executed_height().unwrap();
         wait_until(
             work.path(),
-            &mut [&mut v, &mut r],
-            &format!("r keeps up (round {round}, target {target})"),
-            |n| n[1].executed_height().is_some_and(|h| h >= target),
+            &mut [&mut v0, &mut v1, &mut r],
+            &format!("r follows (round {round}, target {target})"),
+            |n| n[2].executed_height().is_some_and(|h| h >= target),
         );
     }
 }
