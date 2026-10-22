@@ -12,9 +12,9 @@
 //! - `broadcast()` also pushes a copy to the local inbound queue (self-delivery).
 
 pub mod behaviour;
-pub mod bridge;
 #[doc(hidden)]
 pub mod body_send_trace;
+pub mod bridge;
 pub mod caps;
 pub mod codec;
 pub mod config;

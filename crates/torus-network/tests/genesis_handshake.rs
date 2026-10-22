@@ -230,7 +230,10 @@ async fn refused_peer_is_not_redialed_by_ordinary_sends() {
     let (mut a, mut b) = pair(Some(DIGEST_A), Some(DIGEST_B)).await;
     wait_refusals(&a, &b, Duration::from_secs(20)).await;
     let before = refusals(&a, &b);
-    assert!(before.0 > 0 && before.1 > 0, "both sides refused: {before:?}");
+    assert!(
+        before.0 > 0 && before.1 > 0,
+        "both sides refused: {before:?}"
+    );
     let (a_heard, b_heard) = exchange(&mut a, &mut b, Duration::from_secs(6), false).await;
     let after = refusals(&a, &b);
     assert!(!a_heard && !b_heard, "nothing crosses");
@@ -249,7 +252,10 @@ async fn peer_restarted_with_the_right_genesis_is_accepted_after_cooldown() {
     let _ = tracing_subscriber::fmt::try_init();
     let (mut a, b) = pair(Some(DIGEST_A), Some(DIGEST_B)).await;
     wait_refusals(&a, &b, Duration::from_secs(20)).await;
-    assert!(a.metrics.p2p_genesis_mismatch_refusals.get() > 0, "a refused b");
+    assert!(
+        a.metrics.p2p_genesis_mismatch_refusals.get() > 0,
+        "a refused b"
+    );
     // Restart b with the same key, A's genesis, on a fresh port.
     drop(b);
     tokio::time::sleep(Duration::from_millis(300)).await;

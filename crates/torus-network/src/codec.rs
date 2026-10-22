@@ -1050,7 +1050,8 @@ mod tests {
                                 .read_request(&StreamProtocol::new("/torus/direct/1.0"), &mut io)
                                 .await
                                 .unwrap()
-                                .payload.to_vec()
+                                .payload
+                                .to_vec()
                         } else {
                             BlockDataCodec
                                 .read_response(
@@ -1104,7 +1105,10 @@ mod tests {
     /// including the `present == false` (not-custodied) case and the proof path.
     #[test]
     fn native_da_shards_protocol_roundtrip() {
-        let req = NativeDaShardRequest { body_hash: [7u8; 32], shard_index: 2 };
+        let req = NativeDaShardRequest {
+            body_hash: [7u8; 32],
+            shard_index: 2,
+        };
         let bytes = req.try_to_vec().expect("serialize shard request");
         let back = NativeDaShardRequest::try_from_slice(&bytes).expect("deserialize");
         assert_eq!(back.body_hash, req.body_hash);

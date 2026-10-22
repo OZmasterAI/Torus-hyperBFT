@@ -186,17 +186,29 @@ mod tests {
         let ceiling = DIRECT_PUSH_BODY_BYTES_CEILING;
         // Unset / malformed / 0 => the compiled 8 MB default.
         assert_eq!(resolve_direct_push_body_bytes(None, ceiling), 8_000_000);
-        assert_eq!(resolve_direct_push_body_bytes(Some("junk"), ceiling), 8_000_000);
+        assert_eq!(
+            resolve_direct_push_body_bytes(Some("junk"), ceiling),
+            8_000_000
+        );
         assert_eq!(resolve_direct_push_body_bytes(Some(""), ceiling), 8_000_000);
-        assert_eq!(resolve_direct_push_body_bytes(Some("0"), ceiling), 8_000_000);
+        assert_eq!(
+            resolve_direct_push_body_bytes(Some("0"), ceiling),
+            8_000_000
+        );
         // Lowering to the pre-O5 straggler floor is honored verbatim.
         assert_eq!(
             resolve_direct_push_body_bytes(Some("4194304"), ceiling),
             LEGACY_FLEET_DIRECT_MSG_FLOOR
         );
-        assert_eq!(resolve_direct_push_body_bytes(Some("  6000000 "), ceiling), 6_000_000);
+        assert_eq!(
+            resolve_direct_push_body_bytes(Some("  6000000 "), ceiling),
+            6_000_000
+        );
         // Above our own codec cap => clamped: no peer could read such a push.
-        assert_eq!(resolve_direct_push_body_bytes(Some("16000000"), ceiling), ceiling);
+        assert_eq!(
+            resolve_direct_push_body_bytes(Some("16000000"), ceiling),
+            ceiling
+        );
         assert_eq!(
             resolve_direct_push_body_bytes(Some(&MAX_DIRECT_MSG_SIZE.to_string()), ceiling),
             ceiling

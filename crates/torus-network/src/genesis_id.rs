@@ -30,14 +30,15 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::fmt;
+use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use libp2p::core::transport::PortUse;
 use libp2p::core::Endpoint;
 use libp2p::swarm::{
-    dummy, ConnectionDenied, ConnectionId, FromSwarm, NetworkBehaviour, THandler, THandlerInEvent,
-    THandlerOutEvent, ToSwarm,
+    dummy, CloseConnection, ConnectionDenied, ConnectionId, FromSwarm, NetworkBehaviour, THandler,
+    THandlerInEvent, THandlerOutEvent, ToSwarm,
 };
 use libp2p::{Multiaddr, PeerId, StreamProtocol};
 
@@ -227,6 +228,14 @@ pub const MISMATCH_COOLDOWN_MAX: Duration = Duration::from_secs(60);
 /// Entries kept before stale ones (cooldown long over) are pruned.
 const COOLDOWN_PRUNE_AT: usize = 1024;
 
+/// A refused connection is closed this long after our own identify info has
+/// gone out on it (see [`GenesisGate::refuse`]), so the peer reads it and
+/// refuses us too instead of seeing only a closed connection.
+pub const REFUSAL_CLOSE_LINGER: Duration = Duration::from_millis(250);
+/// A refused connection is closed at the latest this long after the refusal,
+/// whether or not the peer ever asked for our identify info.
+pub const REFUSAL_CLOSE_MAX_WAIT: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Copy, Debug)]
 struct Cooldown {
     until: Instant,
@@ -315,17 +324,78 @@ impl std::error::Error for GenesisCooldown {}
 ///   connections has passed the genesis check, until its last connection
 ///   closes. Buffered sends are flushed to a peer only once it is accepted,
 ///   and direct sends to a connected but not yet accepted peer are buffered.
+/// - **Refusal close**: a refused connection is closed once our identify info
+///   has been sent on it (plus [`REFUSAL_CLOSE_LINGER`]), or after
+///   [`REFUSAL_CLOSE_MAX_WAIT`]. Identify runs both ways at once; closing at
+///   the refusal itself let the side that read the other's info first cut the
+///   connection before answering the other's request, so only one side ever
+///   saw the mismatch (under load, every time). Nothing crosses meanwhile:
+///   the app protocols and topics carry the genesis tag.
 #[derive(Debug, Default)]
 pub struct GenesisGate {
     cooldown: MismatchCooldown,
     accepted: HashSet<PeerId>,
+    /// Open connections on which identify sent our info, and when.
+    identify_sent: HashMap<ConnectionId, Instant>,
+    /// Refused connections still open: peer, close-at.
+    closing: HashMap<ConnectionId, (PeerId, Instant)>,
+    /// Wakes `poll` at the earliest close-at.
+    timer: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl GenesisGate {
-    /// Refuse `peer`: start or extend its cooldown and drop its acceptance.
-    pub fn refuse(&mut self, peer: PeerId) -> (Duration, u32) {
+    /// Refuse `peer` on `connection`: start or extend its cooldown, drop its
+    /// acceptance and schedule the close of its connections (see the type
+    /// docs: not before our identify info went out on `connection`).
+    pub fn refuse(&mut self, peer: PeerId, connection: ConnectionId) -> (Duration, u32) {
+        self.refuse_at(peer, connection, Instant::now())
+    }
+
+    fn refuse_at(
+        &mut self,
+        peer: PeerId,
+        connection: ConnectionId,
+        now: Instant,
+    ) -> (Duration, u32) {
         self.accepted.remove(&peer);
-        self.cooldown.record(peer, Instant::now())
+        let close_at = match self.identify_sent.get(&connection) {
+            Some(sent) => (*sent + REFUSAL_CLOSE_LINGER).max(now),
+            None => now + REFUSAL_CLOSE_MAX_WAIT,
+        };
+        self.closing.insert(connection, (peer, close_at));
+        self.timer = None;
+        self.cooldown.record(peer, now)
+    }
+
+    /// Identify sent our info to the peer on `connection`.
+    pub fn identify_sent(&mut self, connection: ConnectionId) {
+        self.identify_sent_at(connection, Instant::now())
+    }
+
+    fn identify_sent_at(&mut self, connection: ConnectionId, now: Instant) {
+        self.identify_sent.entry(connection).or_insert(now);
+        if let Some((_, close_at)) = self.closing.get_mut(&connection) {
+            *close_at = (*close_at).min(now + REFUSAL_CLOSE_LINGER);
+            self.timer = None;
+        }
+    }
+
+    /// Refused connections due to close at `now` (removed from the schedule).
+    fn take_due(&mut self, now: Instant) -> Vec<(PeerId, ConnectionId)> {
+        let due: Vec<(PeerId, ConnectionId)> = self
+            .closing
+            .iter()
+            .filter(|(_, (_, at))| *at <= now)
+            .map(|(c, (p, _))| (*p, *c))
+            .collect();
+        for (_, c) in &due {
+            self.closing.remove(c);
+        }
+        due
+    }
+
+    fn next_close_at(&self) -> Option<Instant> {
+        self.closing.values().map(|(_, at)| *at).min()
     }
 
     /// Identify accepted `peer`; true when it was not accepted before (its
@@ -393,6 +463,8 @@ impl NetworkBehaviour for GenesisGate {
 
     fn on_swarm_event(&mut self, event: FromSwarm) {
         if let FromSwarm::ConnectionClosed(c) = event {
+            self.identify_sent.remove(&c.connection_id);
+            self.closing.remove(&c.connection_id);
             if c.remaining_established == 0 {
                 self.accepted.remove(&c.peer_id);
             }
@@ -408,8 +480,29 @@ impl NetworkBehaviour for GenesisGate {
         match event {}
     }
 
-    fn poll(&mut self, _: &mut Context<'_>) -> Poll<ToSwarm<Infallible, THandlerInEvent<Self>>> {
-        Poll::Pending
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<ToSwarm<Infallible, THandlerInEvent<Self>>> {
+        loop {
+            if let Some((peer_id, connection)) = self.take_due(Instant::now()).into_iter().next() {
+                // Any other due entry is picked up by the next poll (the
+                // swarm polls a behaviour again after it returns Ready).
+                self.timer = None;
+                return Poll::Ready(ToSwarm::CloseConnection {
+                    peer_id,
+                    connection: CloseConnection::One(connection),
+                });
+            }
+            let Some(at) = self.next_close_at() else {
+                self.timer = None;
+                return Poll::Pending;
+            };
+            let timer = self
+                .timer
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(at.into())));
+            if timer.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            self.timer = None;
+        }
     }
 }
 
@@ -557,11 +650,61 @@ mod tests {
         assert!(g.enforce(&peer).is_ok());
         assert!(g.accept(peer), "first acceptance is new");
         assert!(!g.accept(peer), "second is not");
-        g.refuse(peer);
+        g.refuse(peer, ConnectionId::new_unchecked(1));
         assert!(!g.is_accepted(&peer), "refusal drops acceptance");
         assert!(g.enforce(&peer).is_err(), "cooling peer is denied");
         assert!(g.accept(peer));
         assert!(g.enforce(&peer).is_ok(), "accepted peer is let through");
+    }
+
+    /// Batch A 18c gate (load ~175): a node with a digest never counted the
+    /// refusal of a peer without one (a=0 b=3). Both sides identify at once;
+    /// the one that read the other's info first closed the connection before
+    /// answering the other's request. A refused connection now stays open
+    /// until our info went out on it (plus a linger), capped.
+    #[test]
+    fn refused_connection_closes_only_after_our_identify_went_out() {
+        let peer = PeerId::random();
+        let conn = ConnectionId::new_unchecked(7);
+        let mut g = GenesisGate::default();
+        let t0 = Instant::now();
+        g.refuse_at(peer, conn, t0);
+        assert!(
+            g.take_due(t0).is_empty(),
+            "not closed before our info went out"
+        );
+        assert!(g.take_due(t0 + REFUSAL_CLOSE_LINGER * 2).is_empty());
+        let t1 = t0 + Duration::from_millis(400);
+        g.identify_sent_at(conn, t1);
+        assert!(g.take_due(t1).is_empty(), "lingers after sending");
+        assert_eq!(g.take_due(t1 + REFUSAL_CLOSE_LINGER), vec![(peer, conn)]);
+        assert!(
+            g.take_due(t1 + REFUSAL_CLOSE_MAX_WAIT).is_empty(),
+            "closed once"
+        );
+    }
+
+    #[test]
+    fn refused_connection_whose_info_already_went_out_closes_after_the_linger() {
+        let peer = PeerId::random();
+        let conn = ConnectionId::new_unchecked(8);
+        let mut g = GenesisGate::default();
+        let t0 = Instant::now();
+        g.identify_sent_at(conn, t0);
+        let t1 = t0 + REFUSAL_CLOSE_LINGER * 4;
+        g.refuse_at(peer, conn, t1);
+        assert_eq!(g.take_due(t1), vec![(peer, conn)], "linger already over");
+    }
+
+    #[test]
+    fn refused_connection_is_closed_after_the_max_wait_without_identify() {
+        let peer = PeerId::random();
+        let conn = ConnectionId::new_unchecked(9);
+        let mut g = GenesisGate::default();
+        let t0 = Instant::now();
+        g.refuse_at(peer, conn, t0);
+        assert!(g.take_due(t0 + REFUSAL_CLOSE_MAX_WAIT / 2).is_empty());
+        assert_eq!(g.take_due(t0 + REFUSAL_CLOSE_MAX_WAIT), vec![(peer, conn)]);
     }
 
     #[test]
