@@ -30,7 +30,10 @@ use crate::{
         sending::SenderHandle,
     },
     pacemaker::implementation::{boot_view, Pacemaker, PacemakerConfiguration, ViewInfo},
-    types::data_types::{BufferSize, ChainID, ViewNumber},
+    types::{
+        data_types::{BufferSize, ChainID, ViewNumber},
+        validator_set::ValidatorSetState,
+    },
 };
 
 /// Instance of the algorithm thread.
@@ -438,7 +441,17 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
     /// senders entered `view`, which this replica leads but is behind on
     /// (restarted below the survivors). Entering it proposes (`enter_view`).
     fn skip_to_leader_view(&mut self, view: ViewNumber) {
-        self.enter_skipped_view(view, "NewViews (leader-skip)");
+        // Read what entering the view needs BEFORE the timeout vote below: a read error after the
+        // vote would leave this replica in the view it voted to leave, and its deadline would then
+        // send a second, possibly different, timeout vote for that view.
+        let Some(frontier) = self.skip_frontier(view) else {
+            return;
+        };
+        // s138: from the view right before it, time that view out first (its TC can need our vote).
+        if let Err(e) = self.pacemaker.time_out_before_leader_skip(view, &self.block_tree) {
+            log::error!("leader-skip to view {}: timeout vote error: {:?}", view.int(), e);
+        }
+        self.enter_skipped_view_with(view, "NewViews (leader-skip)", frontier);
         if self.hotstuff.take_sync_needed() {
             if let Err(e) = self.block_sync_client.trigger_sync(&mut self.block_tree) {
                 log::error!("BlockSync trigger_sync error: {:?}", e);
@@ -449,6 +462,16 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
     /// Move the pacemaker (which owns the view) to `view`, then let HotStuff
     /// enter it. True when HotStuff is now at `view`.
     fn enter_skipped_view(&mut self, view: ViewNumber, cause: &str) -> bool {
+        match self.skip_frontier(view) {
+            Some(frontier) => self.enter_skipped_view_with(view, cause, frontier),
+            None => false,
+        }
+    }
+
+    /// The block-tree values [`enter_skipped_view_with`](Self::enter_skipped_view_with) needs:
+    /// the validator-set state, the highest PC's view and the committed QC view. `None` (logged)
+    /// if the block tree cannot be read.
+    fn skip_frontier(&self, view: ViewNumber) -> Option<(ValidatorSetState, ViewNumber, ViewNumber)> {
         let frontier = (|| {
             Ok::<_, crate::block_tree::accessors::internal::BlockTreeError>((
                 self.block_tree.validator_set_state()?,
@@ -456,13 +479,22 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                 self.block_tree.committed_qc_view()?,
             ))
         })();
-        let (validator_set_state, highest_qc_view, committed_view) = match frontier {
-            Ok(frontier) => frontier,
+        match frontier {
+            Ok(frontier) => Some(frontier),
             Err(e) => {
                 log::error!("round-skip to view {}: block tree read failed: {:?}", view.int(), e);
-                return false;
+                None
             }
-        };
+        }
+    }
+
+    /// [`enter_skipped_view`](Self::enter_skipped_view) with its block-tree values already read.
+    fn enter_skipped_view_with(
+        &mut self,
+        view: ViewNumber,
+        cause: &str,
+        (validator_set_state, highest_qc_view, committed_view): (ValidatorSetState, ViewNumber, ViewNumber),
+    ) -> bool {
         let from = self.pacemaker.query().view;
         match self.pacemaker.skip_to_view(view, &validator_set_state, highest_qc_view, committed_view) {
             Ok(true) => log::info!(

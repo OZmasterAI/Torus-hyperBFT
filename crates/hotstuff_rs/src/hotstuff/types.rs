@@ -20,6 +20,7 @@ use crate::{
         data_types::*,
         signed_messages::{Certificate, Collector},
         signing::{no_endorsement_bytes, phase_vote_bytes},
+        update_sets::ValidatorSetUpdates,
         validator_set::*,
     },
 };
@@ -59,11 +60,15 @@ impl Certificate for PhaseCertificate {
         let validator_set_state = block_tree.validator_set_state()?;
 
         let result = match (block_height, validator_set_state.update_height()) {
-            // If the Block that the PC certifies is not in the block tree, **or** else if the validator set has
-            // never been updated in the history of the blockchain, validate the PC according to the current
-            // committed validator set.
-            (None, _) | (Some(_), &None) => {
-                self.is_correctly_signed(validator_set_state.committed_validator_set())
+            // If the Block that the PC certifies is not in the block tree, validate the PC according to the
+            // current committed validator set.
+            (None, _) => self.is_correctly_signed(validator_set_state.committed_validator_set()),
+
+            // Else if the validator set has never been updated in the history of the blockchain, validate the
+            // PC according to the current committed validator set (s138: unless it is a Decide PC on a block
+            // whose validator set updates are still Pending here, see `is_correct_above_latest_update`).
+            (Some(_), &None) => {
+                self.is_correct_above_latest_update(block_tree, &validator_set_state)?
             }
 
             // If the Block that the PC certifies is in the block tree at `height` **and** the validator set was
@@ -75,9 +80,9 @@ impl Certificate for PhaseCertificate {
                     self.is_correctly_signed(validator_set_state.previous_validator_set())
 
                 // Else if the Block comes after the latest validator set updating block, validate the PC according to
-                // the committed validator set.
+                // the committed validator set (s138: same exception as above).
                 } else if height > update_height {
-                    self.is_correctly_signed(validator_set_state.committed_validator_set())
+                    self.is_correct_above_latest_update(block_tree, &validator_set_state)?
 
                 // Else if the Block **is** the latest validator set updating block:
                 } else {
@@ -91,18 +96,15 @@ impl Certificate for PhaseCertificate {
                                     validator_set_state.committed_validator_set(),
                                 ),
 
-                                // If the block's validator set updates have not been committed, then apply the validator set updates
-                                // to the committed validator set and validate the PC according to the resulting validator set.
-                                //
-                                // Note (from Karolina): this may be the case if the block justified by this PC is received via sync
-                                // hence the updates have not been applied yet. In this case we need to compute the validator set
-                                // expected to have voted "Decide" for the block.
-                                ValidatorSetUpdatesStatus::Pending(vs_updates) => {
-                                    let mut new_validator_set =
-                                        block_tree.committed_validator_set()?;
-                                    new_validator_set.apply_updates(&vs_updates);
-                                    self.is_correctly_signed(&new_validator_set)
-                                }
+                                // If the block's validator set updates have not been committed (a block at the height
+                                // of the committed updating block that is not that block), the same rule as for any
+                                // block whose updates are Pending here applies (s138).
+                                ValidatorSetUpdatesStatus::Pending(vs_updates) => self
+                                    .is_correct_decide_on_pending_update(
+                                        block_tree,
+                                        validator_set_state.committed_validator_set(),
+                                        &vs_updates,
+                                    )?,
 
                                 // If the block does not have validator set updates, then it should be justified by a Generic PC, not
                                 // a phased mode PC like a Decide PC. Therefore, the PC is invalid.
@@ -178,6 +180,161 @@ impl Certificate for PhaseCertificate {
 
         // Check if the signatures form a quorum.
         total_power >= validator_set.quorum()
+    }
+}
+
+/// s138 D2 (docs/plans/disjoint-vset-livelock.md §3.3): a replica that has not committed an updating
+/// block U (it missed U's Commit PC: a laggard, a late joiner, a node syncing across U) must still be
+/// able to check U's Decide PC, or it can never commit U and cross the update.
+impl PhaseCertificate {
+    /// [`is_correct`](Certificate::is_correct) for a PC on a block above the latest committed
+    /// validator set update (or with no update yet): checked against the committed validator set,
+    /// except a Decide PC on a block whose validator set updates are still Pending at this replica
+    /// ([`is_correct_decide_on_pending_update`](Self::is_correct_decide_on_pending_update)).
+    fn is_correct_above_latest_update<K: KVStore>(
+        &self,
+        block_tree: &BlockTreeSingleton<K>,
+        validator_set_state: &ValidatorSetState,
+    ) -> Result<bool, BlockTreeError> {
+        if self.phase.is_decide() {
+            if let ValidatorSetUpdatesStatus::Pending(updates) =
+                block_tree.validator_set_updates_status(&self.block)?
+            {
+                return self.is_correct_decide_on_pending_update(
+                    block_tree,
+                    validator_set_state.committed_validator_set(),
+                    &updates,
+                );
+            }
+        }
+        Ok(self.is_correctly_signed(validator_set_state.committed_validator_set()))
+    }
+
+    /// Whether this Decide PC on U, a block whose `updates` are still Pending at this replica, is
+    /// correct. Only the post-update set `S_new = committed ⊕ updates` votes Decide on U, so the PC
+    /// must be correctly signed for `S_new`. That alone is not enough: U's chain carries no signature
+    /// of the old set on U (U's Commit PC travels only in nudges), and `S_new` comes from U itself, so
+    /// anyone who can put an app-valid U* on this replica's committed tip (a Byzantine leader, or a
+    /// Byzantine sync server) could empower keys it holds and sign U*'s Decide PC with them. So the
+    /// PC must also hold, among its signers, more power of the committed (old) set than that set's
+    /// fault bound (`total - quorum`): then at least one honest old member signed. An honest replica
+    /// votes Decide on U only after it committed U on a correct Commit PC of the old set, so U is
+    /// the old set's committed block and `S_new` the legitimate next set.
+    ///
+    /// A Decide PC whose signers hold no more old power than that cannot be checked from the chain:
+    /// a disjoint replacement, or a power shift that hands the new quorum to members holding at most
+    /// the old fault bound. Such a replica stays on the old set (it needs U's Commit PC).
+    ///
+    /// U must extend the committed block through blocks that update nothing
+    /// ([`extends_committed_block_without_updates`]), so that `committed` is the set U's updates apply to.
+    fn is_correct_decide_on_pending_update<K: KVStore>(
+        &self,
+        block_tree: &BlockTreeSingleton<K>,
+        committed: &ValidatorSet,
+        updates: &ValidatorSetUpdates,
+    ) -> Result<bool, BlockTreeError> {
+        Ok(matches!(
+            self.check_decide_on_pending_update(block_tree, committed, updates)?,
+            PendingUpdateDecide::Correct
+        ))
+    }
+
+    /// Whether this PC is a Decide PC on a block whose updates are Pending here, correctly signed by
+    /// the post-update set, but without enough old-set signers to show that the old set committed
+    /// the block (see [`is_correct_decide_on_pending_update`](Self::is_correct_decide_on_pending_update)).
+    /// Block sync does not blacklist a server for such a PC: the server may be honest, this replica
+    /// just cannot check it.
+    pub(crate) fn is_unprovable_decide_on_pending_update<K: KVStore>(
+        &self,
+        block_tree: &BlockTreeSingleton<K>,
+    ) -> Result<bool, BlockTreeError> {
+        if !self.phase.is_decide() || block_tree.block_height(&self.block)?.is_none() {
+            return Ok(false);
+        }
+        let ValidatorSetUpdatesStatus::Pending(updates) =
+            block_tree.validator_set_updates_status(&self.block)?
+        else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            self.check_decide_on_pending_update(
+                block_tree,
+                &block_tree.committed_validator_set()?,
+                &updates
+            )?,
+            PendingUpdateDecide::NoOldSetEvidence
+        ))
+    }
+
+    fn check_decide_on_pending_update<K: KVStore>(
+        &self,
+        block_tree: &BlockTreeSingleton<K>,
+        committed: &ValidatorSet,
+        updates: &ValidatorSetUpdates,
+    ) -> Result<PendingUpdateDecide, BlockTreeError> {
+        if !extends_committed_block_without_updates(block_tree, &self.block)? {
+            return Ok(PendingUpdateDecide::Incorrect);
+        }
+        let mut post_update = committed.clone();
+        post_update.apply_updates(updates);
+        if !self.is_correctly_signed(&post_update) {
+            return Ok(PendingUpdateDecide::Incorrect);
+        }
+        let mut old_power = TotalPower::new(0);
+        for (signature, signer) in self.signatures.iter().zip(post_update.validators()) {
+            if let (Some(_), Some(power)) = (signature, committed.power(signer)) {
+                old_power += *power;
+            }
+        }
+        let fault_bound = TotalPower::new(
+            committed
+                .total_power()
+                .int()
+                .saturating_sub(committed.quorum().int()),
+        );
+        Ok(if old_power > fault_bound {
+            PendingUpdateDecide::Correct
+        } else {
+            PendingUpdateDecide::NoOldSetEvidence
+        })
+    }
+}
+
+/// Outcome of [`PhaseCertificate::check_decide_on_pending_update`].
+enum PendingUpdateDecide {
+    Correct,
+    NoOldSetEvidence,
+    Incorrect,
+}
+
+/// Whether `block`'s ancestors back to this replica's highest committed block (or back to genesis,
+/// when nothing is committed) are all in the tree, above the committed height, and update nothing.
+fn extends_committed_block_without_updates<K: KVStore>(
+    block_tree: &BlockTreeSingleton<K>,
+    block: &CryptoHash,
+) -> Result<bool, BlockTreeError> {
+    let committed = block_tree.highest_committed_block()?;
+    let committed_height = block_tree.highest_committed_block_height()?;
+    let mut justify = block_tree.block_justify(block)?;
+    loop {
+        if justify.is_genesis_pc() {
+            return Ok(committed.is_none());
+        }
+        let parent = justify.block;
+        if Some(parent) == committed {
+            return Ok(true);
+        }
+        let Some(height) = block_tree.block_height(&parent)? else {
+            return Ok(false);
+        };
+        if committed_height.is_some_and(|committed| height <= committed)
+            || block_tree
+                .validator_set_updates_status(&parent)?
+                .contains_updates()
+        {
+            return Ok(false);
+        }
+        justify = block_tree.block_justify(&parent)?;
     }
 }
 
@@ -823,5 +980,165 @@ impl LeaderReputation {
             entry.total /= 2;
         }
         self.entries.retain(|(_, e)| e.total > 0);
+    }
+}
+
+/// s138 D2 (docs/plans/disjoint-vset-livelock.md §3.3, §6 T7): which set a Decide PC on an updating
+/// block U is checked against while U's updates are still Pending at this replica (a laggard, a
+/// late joiner, a node syncing from genesis).
+#[cfg(test)]
+mod pending_update_decide_pc_tests {
+    use super::*;
+    use crate::block_tree::accessors::internal::BlockTreeWriteBatch;
+    use crate::hotstuff::header_fast_path_regression_test::MemKV;
+    use crate::test_keys::key_of;
+    use crate::types::{
+        block::Block,
+        crypto_primitives::{Keypair, SigningKey, VerifyingKey},
+        update_sets::{AppStateUpdates, ValidatorSetUpdates},
+    };
+
+    const CHAIN: ChainID = ChainID::new(0);
+
+    fn vk(seed: u8) -> VerifyingKey {
+        SigningKey::from_bytes(&[seed; 32]).verifying_key()
+    }
+
+    fn set(members: &[(u8, u64)]) -> ValidatorSet {
+        let mut set = ValidatorSet::new();
+        for &(seed, power) in members {
+            set.put(&vk(seed), Power::new(power));
+        }
+        set
+    }
+
+    fn generic_pc(view: u64, block: CryptoHash) -> PhaseCertificate {
+        PhaseCertificate {
+            chain_id: CHAIN,
+            view: ViewNumber::new(view),
+            block,
+            phase: Phase::Generic,
+            signatures: SignatureSet::new(0),
+        }
+    }
+
+    /// A Decide PC on `block` in `view`, laid out for `set`, signed by `signers`.
+    fn decide_pc(
+        block: CryptoHash,
+        view: u64,
+        set: &ValidatorSet,
+        signers: &[u8],
+    ) -> PhaseCertificate {
+        let view = ViewNumber::new(view);
+        let message = phase_vote_bytes(CHAIN, view, &block, Phase::Decide);
+        let mut signatures = SignatureSet::new(set.len());
+        for (pos, member) in set.validators().enumerate() {
+            if signers.iter().any(|&seed| vk(seed) == *member) {
+                signatures.set(pos, Some(Keypair::new(key_of(member)).sign(&message)));
+            }
+        }
+        PhaseCertificate {
+            chain_id: CHAIN,
+            view,
+            block,
+            phase: Phase::Decide,
+            signatures,
+        }
+    }
+
+    /// Committed set `S_old` = {1..4} (power 1 each), last changed by an update committed at
+    /// height 1 (from `{1, 2, 3}`), decided. Blocks h0 and h1 committed. U at h2 (child of h1)
+    /// carries `updates`, still Pending: h2 is above the update height.
+    fn tree_with_pending_update(
+        updates: &ValidatorSetUpdates,
+    ) -> (BlockTreeSingleton<MemKV>, CryptoHash) {
+        let mut bt = BlockTreeSingleton::new(MemKV::default());
+        let state = ValidatorSetState::new(
+            set(&[(1, 1), (2, 1), (3, 1), (4, 1)]),
+            set(&[(1, 1), (2, 1), (3, 1)]),
+            Some(BlockHeight::new(1)),
+            true,
+        );
+        bt.initialize(&AppStateUpdates::new(), &state).unwrap();
+        let b0 = Block::new(
+            BlockHeight::new(0),
+            PhaseCertificate::genesis_pc(),
+            CryptoHash::new([10; 32]),
+            Data::new(vec![]),
+        );
+        bt.insert(&b0, None, None).unwrap();
+        let b1 = Block::new(
+            BlockHeight::new(1),
+            generic_pc(1, b0.hash),
+            CryptoHash::new([11; 32]),
+            Data::new(vec![]),
+        );
+        bt.insert(&b1, None, None).unwrap();
+        let mut wb = BlockTreeWriteBatch::new();
+        bt.commit(&mut wb, &b1.hash).unwrap();
+        bt.write(wb);
+        let u = Block::new(
+            BlockHeight::new(2),
+            generic_pc(2, b1.hash),
+            CryptoHash::new([12; 32]),
+            Data::new(vec![]),
+        );
+        bt.insert(&u, None, Some(updates)).unwrap();
+        assert!(bt
+            .validator_set_updates_status(&u.hash)
+            .unwrap()
+            .is_pending());
+        (bt, u.hash)
+    }
+
+    /// T7 `decide_pc_on_pending_update_checked_against_post_update_set`: U adds n5. The new set's
+    /// Decide PC (n1, n2, n3, n5: 4 of 5; old power 3 of 4) must pass; an old-set-laid-out Decide PC
+    /// (n1, n2, n3: 3 of 4) must fail, since `S_old` does not vote Decide on U.
+    #[test]
+    fn decide_pc_on_pending_update_checked_against_post_update_set() {
+        let mut updates = ValidatorSetUpdates::new();
+        updates.insert(vk(5), Power::new(1));
+        let (bt, u) = tree_with_pending_update(&updates);
+        let s_old = bt.committed_validator_set().unwrap();
+        let mut s_new = s_old.clone();
+        s_new.apply_updates(&updates);
+
+        assert!(
+            decide_pc(u, 5, &s_new, &[1, 2, 3, 5])
+                .is_correct(&bt)
+                .unwrap(),
+            "a Decide PC of the post-update set on a Pending U must pass"
+        );
+        assert!(
+            !decide_pc(u, 5, &s_old, &[1, 2, 3]).is_correct(&bt).unwrap(),
+            "a Decide PC laid out for the pre-update set must fail"
+        );
+    }
+
+    /// T7b (safety guard on A2): the chain U -> child carries no old-set signature on U. U* adds a
+    /// fresh key n9 with power 100, a quorum of `S_old ⊕ U*` alone (100 of 104). A Decide PC signed
+    /// by n9 alone is correctly signed for that set but proves nothing about U*: no old-set member
+    /// signed it, so nothing shows the old set committed U* (a Byzantine sync server can build U*
+    /// on any committed tip). It must fail.
+    #[test]
+    fn decide_pc_on_pending_update_needs_an_old_set_signer() {
+        let mut updates = ValidatorSetUpdates::new();
+        updates.insert(vk(9), Power::new(100));
+        let (bt, u) = tree_with_pending_update(&updates);
+        let mut s_new = bt.committed_validator_set().unwrap();
+        s_new.apply_updates(&updates);
+
+        assert!(
+            decide_pc(u, 5, &s_new, &[9]).is_correctly_signed(&s_new),
+            "fixture: n9 alone is a quorum of the post-update set"
+        );
+        assert!(
+            !decide_pc(u, 5, &s_new, &[9]).is_correct(&bt).unwrap(),
+            "a Decide PC no pre-update member signed must fail"
+        );
+        assert!(
+            !decide_pc(u, 5, &s_new, &[1, 9]).is_correct(&bt).unwrap(),
+            "old power 1 of 4 does not exceed the old set's fault bound (4 - 3 = 1): fail"
+        );
     }
 }

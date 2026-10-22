@@ -340,6 +340,17 @@ impl Node {
             .expect("should have been able to get the committed validator set from the block tree")
     }
 
+    /// Whether the node's latest committed validator-set update is decided (its Decide PC was seen).
+    #[allow(dead_code)]
+    pub(crate) fn validator_set_update_decided(&self) -> bool {
+        self.replica
+            .block_tree_camera()
+            .snapshot()
+            .validator_set_state()
+            .expect("should have been able to get the validator set state from the block tree")
+            .update_decided()
+    }
+
     /// Query the height of the highest *committed* block in the node's local block tree, or `None`
     /// if the node has not committed any block yet.
     ///
