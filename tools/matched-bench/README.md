@@ -690,7 +690,8 @@ VALIDATOR_STAKES=2,2,1 BENCH_RPCS=0,1 KILL_NO_RESTART=val2 KILL_NO_RESTART_AT_S=
   with 2/2/1 and val2 down val0+val1 (4/5) still certify every checkpoint.
   `state_attest.py scan --exclude val2` reads the survivors only and does not
   require the dead validator's votes. (Equal stakes are refused anyway: no
-  consensus quorum.) A 4-validator devnet is not supported by the harness.
+  consensus quorum.) A 4-validator devnet: see the next section
+  (`N_VALIDATORS=4`).
 - **summary.json `kill_no_restart`**: `killed_node`, `kill_at_s`, `kill_ts`,
   `height_at_kill`, `committed_at_kill`, `survivors`, and per node the load
   window split at the kill (`windows.before` = `[t_bench0, kill_ts]`,
@@ -710,6 +711,79 @@ VALIDATOR_STAKES=2,2,1 BENCH_RPCS=0,1 KILL_NO_RESTART=val2 KILL_NO_RESTART_AT_S=
   (`campaign/run_cell.py` allows them too). `watch_nodes` accepts the death of
   exactly the pid named in the marker line; any other node death still aborts
   the cell.
+
+## Four validators and the dead-leader window — `N_VALIDATORS=4`, `DL_K` / `DL_JCAP`, `DL_REPORT` (bench 9p)
+
+Owner s138: dead-leader phase 4 (bench 9p) runs on a 4-validator devnet (at
+2:2:1 with the stake-1 node down no validator-set update can commit —
+docs/plans/dead-leader-skip.md section 8 finding 4 on feat/dead-leader-p3).
+
+```
+# 9p smoke shape: 4 equal validators, val3 killed 30 s into a 120 s load, never restarted
+N_VALIDATORS=4 BENCH_RPCS=0,1,2 KILL_NO_RESTART=val3 KILL_NO_RESTART_AT_S=30 \
+  [DL_K=3 DL_JCAP=6] [HOTSTUFF_CPUS=2/6/10/14] \
+  tools/matched-bench/run-cell.sh <wt> dl4-smoke 10 120 20000
+```
+
+- **`N_VALIDATORS=3|4`** (default 3: every 3-validator cell is unchanged byte
+  for byte — genesis md5, node argv / env, URL lists, drain bounds, log
+  texts; pinned by `test_four_validators.py ThreeNodeExpansionTest` and the
+  existing suites). 4 adds val3: ed25519 key `04..` (devnet/genesis.json's 4th
+  validator), RPC 8648, metrics 9164, p2p 30404, dialing val0..val2 (full
+  mesh). Its account key and oracle signer are in `devnet/wsl/keys-4val/`
+  (indices 0..2 = the 3-validator files verbatim; 3 = mnemonic indices
+  106 / 107), used by the genesis, `ORACLE_FEED` and `STATE_HASH_ATTEST`.
+  Every per-node step covers val3 (health: all 4 committing, peers >= 3;
+  samplers; metrics-before/after; schedstat / procstat; drain; digest;
+  agreement; attest scan; log collection and `.gz` copies; summary.json per
+  node fields; `.cell.n_validators = 4`). Attest-live / feed-live drain
+  mempool bounds scale as 2 x N.
+- **Stakes and the kill:** `VALIDATOR_STAKES=a,b,c,d`. `KILL_NO_RESTART`
+  takes val1, val2 or val3 (never val0: it serves the bench RPC and the
+  headline). Quorum (`crash_norestart_quorum_ok`, > 2/3 of the power): equal
+  stakes keep 3/4 with any one down; `2,2,1,1` keeps 5/6 with val2 or val3
+  down and is refused with val1 down (4/6). `BENCH_RPCS` takes indices 0..3
+  and must leave the killed node out (e.g. `0,1,2`).
+- **`HOTSTUFF_CPUS=a/b/c/d`** with 4 nodes. Unset = unpinned (default). On a
+  32-thread host (16 cores x 2 SMT; check `lscpu -e=CPU,CORE` that CPU i and
+  i+16 are siblings) put each consensus thread on its own core:
+  `2/6/10/14` (3 nodes: `2/6/10`).
+- **`DL_K=K` / `DL_JCAP=J`**: genesis `consensus.leader_miss_threshold`
+  (0 = off or 2..=64, node default 3) and `consensus.leader_exclusion_cap`
+  (0..=10, default 6), written only when set (genesis-cache inputs). The
+  genesis loader has no `deny_unknown_fields`, so a binary without the feature
+  would ignore them silently: pre-flight refuses a torus-node that does not
+  contain the name `leader_miss_threshold`. Recorded as summary.json
+  `.genesis.leader_miss_threshold` / `.leader_exclusion_cap`.
+- **`DL_REPORT`** (default 1 with `N_VALIDATORS=4` + `KILL_NO_RESTART`, else 0;
+  needs the kill): `dl_window.py` splits the load window into `pre_kill`
+  `[bench start, kill]`, `kill_to_exclusion` `[kill, exclusion committed]`,
+  `post_exclusion` `[committed, bench end]`, per survivor `blk_s`,
+  `committed_blk_s`, `matched_s`, `timeouts_per_min`, `views_per_min`
+  (headline = val0). How the exclusion is observed on feat/dead-leader-p3
+  (no RPC or metric names an excluded leader; hotstuff's UpdateValidatorSet
+  event is not logged): the survivors' INFO line `epoch boundary: leader
+  exclusion delta from the execution plan height=H exclude=X readmit=Y
+  excluded=Z` (logged by the boundary block's builder / validators; counts
+  only) gives the boundary height H and the delta time; the update is
+  committed with block H, taken as the first sampler.csv row whose committed
+  height (`torus_block_height + torus_exec_queue_depth`) reaches H (1 s
+  resolution). Corroboration: the last `torus_consensus_timeout_total_total`
+  increment per survivor after the kill. Output: `dl-window.json`,
+  summary.json `.dead_leader` (`exclusion.kill_to_exclusion_s`,
+  `boundary_height`, `heights` at the kill / commit, the windows), and the
+  run.log line `dead-leader window: ...`. Report-only, never a verdict.
+- **The worktree must carry this harness:** run-cell.sh launches
+  `<worktree>/devnet/wsl` and scores with `<worktree>/tools/matched-bench`
+  (TOOLS_FROM_WORKTREE=1). With `N_VALIDATORS=4` pre-flight refuses a
+  worktree whose devnet/wsl or summarize.py / health.py / collect_logs.py /
+  crash-kill.sh lack 4-node support: merge this harness branch into the
+  feat/dead-leader-p3 worktree (they touch disjoint files).
+- **Campaign driver:** the knobs are allowed in `harness_env`
+  (`campaign/run_cell.py` also checks ports 8648 / 9164 free). The driver's
+  own samplers (`dusamp`, `ckptsamp`, fd sums, `hardscan`, `dumeas`,
+  `savelog`) still cover val0..val2 only; `watch_nodes` follows every pid in
+  `run/pids` (val3 included).
 
 ## Liveness and benchmark acceptance
 

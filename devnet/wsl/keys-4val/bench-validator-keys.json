@@ -1,0 +1,25 @@
+{
+  "note": "TEST-ONLY keys, publicly known, never use on a real network. The 4-validator matched-bench devnet (tools/matched-bench/run-cell.sh N_VALIDATORS=4, dead-leader bench 9p): indices 0..2 are devnet/wsl/bench-validator-keys.json verbatim (mnemonic indices 100..102); index 3 = val3 (RPC 8648) is the hardhat/anvil dev mnemonic 'test test test test test test test test test test test junk' at m/44'/60'/0'/0/106 (cast wallet private-key --mnemonic-index 106). devnet/wsl/gen-3val-genesis.sh N_VALIDATORS=4 writes these addresses into the 4 validator entries. A separate file (not a 4th entry in the 3-validator file): state_attest.py keys and bench-throughput oracle-feed take every entry of their file as a validator, so the 3-validator cells keep exactly their 3.",
+  "validators": [
+    {
+      "index": 0,
+      "address": "0x8c3229ec621644789d7f61faa82c6d0e5f97d43d",
+      "private_key": "0xdae4671006c60a3619556ace98eca6f6e092948d05b13070a27ac492a4fba419"
+    },
+    {
+      "index": 1,
+      "address": "0x9586a4833970847aef259ad5bfb7aa8901ddf746",
+      "private_key": "0x13986e078393fca89aedc2ecd014df01dfbff153434c04b2e38cfedcbef710f7"
+    },
+    {
+      "index": 2,
+      "address": "0x0e9971c0005d91336c1441b8f03c1c4fe5fb4584",
+      "private_key": "0x7382cc0c1dd9fc4ff87ed969fafac4c040ebd4890d0b8fa35781524df5b15476"
+    },
+    {
+      "index": 3,
+      "address": "0x4548774216f19914493d051481feb56246bc13f0",
+      "private_key": "0xc69422615b990ce3dbed91d6ed41e378ff92f0ebf23b8d18bf3db912c6797fa1"
+    }
+  ]
+}

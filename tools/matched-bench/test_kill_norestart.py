@@ -136,7 +136,7 @@ class QuorumAndPidLineTest(unittest.TestCase):
             ("", "2,2,1"),
             (2, "2,2"),
             (2, "0,1,1"),
-            (2, "2,2,1,1"),
+            (2, "2,2,1,1,1"),  # 4 weights = the 4-validator devnet (test_four_validators.py)
             (2, "a,b,c"),
             (2, ""),
         ):
@@ -956,6 +956,7 @@ class RunCellKnobTest(unittest.TestCase):
     def preflight(self, **env):
         script = (
             "set -uo pipefail\n"
+            + "N_VALIDATORS=3; ALL_IDX=(0 1 2); DL_REPORT=; SELF_DIR=$TOOLS_DIR\n"
             + self.urls_fn
             + "RPCS=(http://a:1 http://b:2 http://c:3)\nBENCH_RPC_URLS=$(bench_rpc_urls) || exit 2\n"
             + 'evm_load_on() { [ "${EVM_ON:-0}" = 1 ]; }\n'
@@ -1164,8 +1165,14 @@ class RunIdentityTest(unittest.TestCase):
 # ------------------------------------------------------------------ VALIDATOR_STAKES: genesis + cache key
 class ValidatorStakesTest(unittest.TestCase):
     def patch(self, stakes):
-        check = src_between(
-            GEN_3VAL, 'if [ -n "${VALIDATOR_STAKES:-}" ]; then\n    [[', "\nfi\n"
+        check = (
+            src_between(
+                GEN_3VAL,
+                'N_VALIDATORS="${N_VALIDATORS:-3}"',
+                "\n# Dead-leader skip",
+                include_end=False,
+            )
+            + "\n"
         )
         block = src_between(GEN_3VAL, "# 2b. Optional stake weights", "\nfi\n")
         script = (

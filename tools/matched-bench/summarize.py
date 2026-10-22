@@ -54,6 +54,13 @@ def genesis_book_mode_digit(v):
 
 GENESIS_BOOK_MODE = genesis_book_mode_digit(A.genesis_book_mode)
 
+# run-cell.sh N_VALIDATORS=4 (the 4-validator devnet, dead-leader bench 9p): val3 is a
+# validator like the other three. A cell has a val3 iff run-cell.sh scraped
+# metrics-before-val3.txt (every node gets one at the bench start); any other cell
+# (every 3-validator cell, also re-summarized old ones) is val0..val2, as before.
+ALL_NODES = ("val0", "val1", "val2") + (
+    ("val3",) if os.path.exists(os.path.join(OUT, "metrics-before-val3.txt")) else ())
+
 # ---------------------------------------------------------------- no-restart kill
 # run-cell.sh KILL_NO_RESTART=val<i> (the one-validator-down baseline):
 # crash-kill.sh norestart SIGKILLed one validator KILL_NO_RESTART_AT_S into the
@@ -94,8 +101,8 @@ def norestart_record(path, run):
     if not isinstance(raw, dict) or not raw.get("enabled"):
         return None, None
     node = raw.get("kill_node")
-    if node not in ("val1", "val2"):
-        sys.exit("summarize.py: %s names kill_node %r (val1 or val2)" % (path, node))
+    if node not in ALL_NODES[1:]:
+        sys.exit("summarize.py: %s names kill_node %r (%s)" % (path, node, " or ".join(ALL_NODES[1:])))
     rec_id = raw.get("run_id")
     cur_id = run.get("run_id") if run else None
     check = {"record_run_id": rec_id, "run_id": cur_id, "record_kill_node": node}
@@ -123,10 +130,10 @@ NORESTART, NORESTART_CHECK = norestart_record(os.path.join(OUT, "kill-norestart.
 if NORESTART_CHECK:
     sys.stderr.write("WARNING summarize.py: %s\n" % NORESTART_CHECK["reason"])
 DEAD_NODE = NORESTART["kill_node"] if NORESTART else None
-LIVE_NODES = tuple(n for n in ("val0", "val1", "val2") if n != DEAD_NODE)
+LIVE_NODES = tuple(n for n in ALL_NODES if n != DEAD_NODE)
 
 # ---------------------------------------------------------------- load sampler
-rows = {"val0": [], "val1": [], "val2": []}
+rows = {n: [] for n in ALL_NODES}
 with open(os.path.join(OUT, "sampler.csv")) as f:
     rd = csv.DictReader(f)
     for r in rd:
@@ -830,7 +837,7 @@ def read_metrics(path):
 
 
 consensus = {}
-for node in ("val0", "val1", "val2"):
+for node in ALL_NODES:
     before = read_metrics(os.path.join(OUT, "metrics-before-%s.txt" % node))
     after = read_metrics(os.path.join(OUT, "metrics-after-%s.txt" % node))
     if not before or not after:
@@ -1540,7 +1547,7 @@ if dissem:
     dissem["total_pacing_lines"] = sum((d.get("pacing") or 0) for n, d in dissem.items() if n.startswith("val"))
     evidence_complete = all(
         isinstance(dissem.get(n, {}).get(k), int) and dissem[n][k] >= 0
-        for n in ('val0', 'val1', 'val2') for k in fail_keys)
+        for n in ALL_NODES for k in fail_keys)
     dissem["dissemination_clean"] = (False if dissem["total_failures"] > 0 else
                                      True if evidence_complete else None)
 
@@ -1622,7 +1629,7 @@ def norestart_windows(raw):
     if not isinstance(kill_ts, (int, float)):
         return {"error": "kill-norestart.json has no kill_ts"}
     per_node = {}
-    for node in ("val0", "val1", "val2"):
+    for node in ALL_NODES:
         rs = sorted(rows.get(node) or [], key=lambda r: r["ts"])
         if not rs:
             continue
@@ -1681,7 +1688,7 @@ if DEAD_NODE:
     liveness = assess_liveness(rows, t0, td, DEFAULT_STALL_S, nodes=LIVE_NODES)
     liveness["excluded_nodes"] = [DEAD_NODE]
 else:
-    liveness = assess_liveness(rows, t0, td, DEFAULT_STALL_S)
+    liveness = assess_liveness(rows, t0, td, DEFAULT_STALL_S, nodes=ALL_NODES)
 # Keep the runner's historical observation for audit, but a known stall cannot
 # count as a successfully drained performance cell. Agreement stays independent.
 drained = A.drained == "1" and liveness['verdict'] != 'FAIL'

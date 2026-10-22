@@ -9,6 +9,8 @@ import time
 from urllib.request import urlopen
 
 NODES = ('val0', 'val1', 'val2')
+# run-cell.sh N_VALIDATORS=4 (the 4-validator devnet): drain --urls takes 4 URLs, the nodes are val0..val3.
+MAX_NODES = ('val0', 'val1', 'val2', 'val3')
 COMMITTED = 'torus_blocks_committed_total'
 MEMPOOL = 'torus_mempool_native_size'
 EXEC_QUEUE = 'torus_exec_queue_depth'
@@ -408,7 +410,7 @@ def wait_for_drain(urls, out, timeout_s, quiet_s, feed_live=False, max_lag=DEFAU
     rows, previous = [], [{} for _ in urls]
     start = time.monotonic()
     result = {'drained': False, 'reason': 'timeout before a complete scrape'}
-    with ThreadPoolExecutor(max_workers=3) as pool, (out/'drain-samples.jsonl').open('w') as log:
+    with ThreadPoolExecutor(max_workers=max(3, len(urls))) as pool, (out/'drain-samples.jsonl').open('w') as log:
         while time.monotonic()-start < timeout_s:
             samples = list(pool.map(lambda url: fetch(url, extra), urls))
             elapsed = time.monotonic()-start
@@ -500,7 +502,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
     drain = sub.add_parser('drain')
-    drain.add_argument('--urls', nargs=3, required=True)
+    drain.add_argument('--urls', nargs='+', required=True,
+                       help='the validators\' metrics URLs, val0 first: 3 (4 with run-cell N_VALIDATORS=4)')
     drain.add_argument('--out', type=Path, required=True)
     drain.add_argument('--timeout', type=float, required=True)
     drain.add_argument('--quiet', type=float, default=10)
@@ -516,10 +519,10 @@ def main():
     drain.add_argument('--attest-mempool-max', type=int, default=DEFAULT_ATTEST_MEMPOOL_MAX,
                        help='--attest-live: max native mempool size from attestations inside the '
                             'quiet window (added to --feed-mempool-max with --feed-live)')
-    drain.add_argument('--attest-rpc', nargs=3, default=None,
-                       help="--attest-live (required): the validators' JSON-RPC URLs; the quiet "
-                            'window\'s block bodies are read by action kind (attest_traffic.py)')
-    drain.add_argument('--exclude', action='append', default=[], choices=NODES[1:],
+    drain.add_argument('--attest-rpc', nargs='+', default=None,
+                       help="--attest-live (required): the validators' JSON-RPC URLs, one per --urls; "
+                            'the quiet window\'s block bodies are read by action kind (attest_traffic.py)')
+    drain.add_argument('--exclude', action='append', default=[], choices=MAX_NODES[1:],
                        help='run-cell KILL_NO_RESTART: a validator killed without restart; its '
                             '--urls / --attest-rpc entry is dropped and only the others must drain')
     drain.add_argument('--to-height', type=to_height_arg, default=None,
@@ -539,11 +542,18 @@ def main():
     if args.attest_live and not args.attest_rpc:
         parser.error('--attest-live needs --attest-rpc (3 URLs): without the block bodies the '
                      'quiet window cannot tell attestations from other native actions')
+    if len(args.urls) not in (3, 4):
+        parser.error('--urls: 3 metrics URLs (4 on the 4-validator devnet), got %d' % len(args.urls))
+    all_nodes = MAX_NODES[:len(args.urls)]
+    if args.attest_rpc and len(args.attest_rpc) != len(args.urls):
+        parser.error('--attest-rpc: one URL per --urls entry (%d), got %d' % (len(args.urls), len(args.attest_rpc)))
     excluded = sorted(set(args.exclude))
     if len(excluded) > 1:
         parser.error('--exclude: at most one validator (two survivors of three)')
-    keep = [i for i, n in enumerate(NODES) if n not in excluded]
-    nodes = tuple(NODES[i] for i in keep)
+    if any(n not in all_nodes for n in excluded):
+        parser.error('--exclude %s: not one of the %d validators' % (excluded[0], len(all_nodes)))
+    keep = [i for i, n in enumerate(all_nodes) if n not in excluded]
+    nodes = tuple(all_nodes[i] for i in keep)
     urls = [args.urls[i] for i in keep]
     attest_rpc = [args.attest_rpc[i] for i in keep] if args.attest_rpc else args.attest_rpc
     return wait_for_drain(urls, args.out, args.timeout, args.quiet, args.feed_live,

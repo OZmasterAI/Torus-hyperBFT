@@ -56,6 +56,10 @@ RUNNER_ENV_KEYS = {
     "KILL_NO_RESTART",
     "KILL_NO_RESTART_AT_S",
     "VALIDATOR_STAKES",
+    "N_VALIDATORS",
+    "DL_K",
+    "DL_JCAP",
+    "DL_REPORT",
 }
 p = argparse.ArgumentParser(
     description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -149,7 +153,10 @@ while not a.no_idle_wait and (os.getloadavg()[0] >= 1.5 or maintenance_active())
         flush=True,
     )
     time.sleep(20)
-for port in [8645, 8646, 8647, 9161, 9162, 9163]:
+ports = [8645, 8646, 8647, 9161, 9162, 9163]
+if runner_env.get("N_VALIDATORS") == "4":
+    ports += [8648, 9164]  # run-cell.sh N_VALIDATORS=4: val3
+for port in ports:
     with socket.socket() as sock:
         if sock.connect_ex(("127.0.0.1", port)) == 0:
             raise SystemExit(f"Port {port} occupied")

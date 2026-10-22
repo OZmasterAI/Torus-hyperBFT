@@ -4,6 +4,7 @@
 #
 #   crash-kill.sh <worktree> <idx 1|2> <out-dir> [record=crash-kill.json]
 #   crash-kill.sh norestart <worktree> <idx 1|2> <out-dir> [kill_at_s]
+#   (N_VALIDATORS=4 in the env, the 4-validator devnet: idx 3 = val3 too)
 #   CRASH_KILL_LIB=1 source crash-kill.sh      # functions only (unit tests)
 #   (multi-crash: run-cell.sh runs this once per kill; kill k>=2 -> crash-kill-<k>.json)
 #
@@ -33,7 +34,8 @@
 # SAFETY. This script sends SIGKILL. A live testnet validator runs on this box
 # from ~/.cargo-target against testnet/data (ports 8555/9090/30333) and must
 # NEVER be a target. `crash_target_ok` therefore refuses unless ALL of:
-#   * idx is 1 or 2  (val0 serves the bench RPC and every headline number)
+#   * idx is 1 or 2, or 3 when N_VALIDATORS=4 (the 4-validator devnet)
+#     (val0 serves the bench RPC and every headline number)
 #   * the pid is listed in the devnet's own $RUN_DIR/pids
 #   * the pid's /proc cmdline carries `--data-dir=$DATA_ROOT/data/val<idx>`
 #     (the `=` form launch-3val.sh uses; the testnet unit uses the space form)
@@ -60,6 +62,8 @@ crash_target_ok() {
     local idx=${1-} pid=${2-} cmdline=${3-} root=${4-} pidsf=${5-} marker
     case "$idx" in
         1|2) ;;
+        3) [ "${N_VALIDATORS:-3}" = 4 ] || {
+               echo "crash-kill: REFUSED idx='$idx' (val3 exists only on the 4-validator devnet, N_VALIDATORS=4)" >&2; return 1; } ;;
         *) echo "crash-kill: REFUSED idx='$idx' (only val1/val2 may be killed; val0 serves the bench RPC and every headline number)" >&2; return 1 ;;
     esac
     case "$pid" in
@@ -129,6 +133,9 @@ crash_kill_list_ok() {
 
 # crash_norestart_quorum_ok <idx 1|2> <w0,w1,w2> — the two validators that
 # stay up after a no-restart kill of val<idx> still hold a consensus quorum.
+# 4-validator devnet (run-cell.sh N_VALIDATORS=4): <idx 1|2|3> <w0,w1,w2,w3>,
+# the three survivors; equal stakes (1,1,1,1) keep 3/4 > 2/3, 2,2,1,1 keeps
+# 5/6 with a stake-1 node down and exactly 2/3 (a halt) with a stake-2 one.
 # Weights are VALIDATOR_STAKES (gen-3val-genesis.sh: stake = weight x the
 # devnet base stake, so power = weight x 1e6). hotstuff needs power >=
 # floor(2P/3) + 1 (validator_set.rs quorum), the state hash attestation
@@ -137,8 +144,12 @@ crash_kill_list_ok() {
 # at the kill, so the knob refuses it.
 crash_norestart_quorum_ok() {
     local idx=${1-} w=${2-} total=0 live=0 i=0 x
-    case "$idx" in 1|2) ;; *) return 1 ;; esac
-    [[ "$w" =~ ^[1-9][0-9]{0,5},[1-9][0-9]{0,5},[1-9][0-9]{0,5}$ ]] || return 1
+    if [[ "$w" =~ ^[1-9][0-9]{0,5},[1-9][0-9]{0,5},[1-9][0-9]{0,5},[1-9][0-9]{0,5}$ ]]; then
+        case "$idx" in 1|2|3) ;; *) return 1 ;; esac
+    else
+        case "$idx" in 1|2) ;; *) return 1 ;; esac
+        [[ "$w" =~ ^[1-9][0-9]{0,5},[1-9][0-9]{0,5},[1-9][0-9]{0,5}$ ]] || return 1
+    fi
     for x in ${w//,/ }; do
         total=$(( total + x ))
         [ "$i" = "$idx" ] || live=$(( live + x ))

@@ -101,7 +101,8 @@
 #                values). BLOCK_CAP=200 = the r3-s75 default; BLOCK_CAP=100
 #                = the pre-r4 cap-100 control.
 #   BENCH_RPCS=all  bench ingress over all three validators (the bench pins
-#                sender i to url i % 3). DEFAULT since s76 (unset = all).
+#                sender i to url i % 3; all four, i % 4, with N_VALIDATORS=4).
+#                DEFAULT since s76 (unset = all).
 #                BENCH_RPCS=0 = val0 only, the ingress every pre-s76 cell used.
 #                BENCH_RPCS=0,1 (a comma list of distinct validator indices)
 #                = those validators only (KILL_NO_RESTART needs the killed one
@@ -145,12 +146,14 @@
 #                restart from the next kill, the remaining kills are SKIPPED
 #                (logged, crash-kill.skipped). Per-kill chain freeze:
 #                tools/matched-bench/crash-freeze.py <results-dir>.
-#   KILL_NODE    which validator the crash gate kills: val1 (default) or val2.
+#   KILL_NODE    which validator the crash gate kills: val1 (default) or val2
+#                (or val3 with N_VALIDATORS=4).
 #                NEVER val0 (it serves the bench RPC and every headline number),
 #                and never anything outside this devnet — see the guard in
 #                crash-kill.sh.
 #   KILL_NO_RESTART=val1|val2  KILL_NO_RESTART_AT_S=N  ONE VALIDATOR DOWN (s134
-#                baseline): N seconds into the load, SIGKILL that validator and
+#                baseline; val3 too with N_VALIDATORS=4, never val0): N
+#                seconds into the load, SIGKILL that validator and
 #                NEVER restart it (crash-kill.sh norestart: the same target guard;
 #                its line in $RUN_DIR/pids is blanked, kill-norestart.json records
 #                the pid, kill time and its height / committed / exec queue at the
@@ -160,7 +163,9 @@
 #                validators), EVM_LOAD_RATE > 0 (pinned per-validator senders),
 #                and unless the survivors keep a consensus quorum (> 2/3 of the
 #                power: VALIDATOR_STAKES=2,2,1 with KILL_NO_RESTART=val2; with
-#                equal stakes the chain halts at the kill) and the bench ingress
+#                equal stakes the chain halts at the kill; N_VALIDATORS=4: equal
+#                stakes keep 3/4, 2,2,1,1 keeps 5/6 with val2 or val3 down and
+#                halts with val1 down) and the bench ingress
 #                (BENCH_RPCS) leaves the killed node out (e.g. BENCH_RPCS=0,1;
 #                give the all-up arm the same ingress). After the load every step
 #                runs over the SURVIVORS only: the drain (health.py --exclude), the
@@ -176,11 +181,13 @@
 #                age p50/p90/p99; .headline.killed_node. MAX_IN_FLIGHT's block
 #                tail reads val1 instead of val2 when val2 is the one killed.
 #   VALIDATOR_STAKES=a,b,c  per-validator stake weights of the cell genesis
+#                (a,b,c,d with N_VALIDATORS=4, val0..val3)
 #                (gen-3val-genesis.sh: stake = weight x the 1M TRS base stake;
 #                positive integers). A genesis input (genesis_cache.py keys it).
 #                Unset (default) = the equal base stakes, genesis byte-identical.
 #                A run-cell.sh knob, never EXTRA_ENV (refused there).
-#   HOTSTUFF_CPUS=a/b/c  pin each node's "hotstuff-algo" thread (the consensus
+#   HOTSTUFF_CPUS=a/b/c  (a/b/c/d with N_VALIDATORS=4) pin each node's
+#                "hotstuff-algo" thread (the consensus
 #                thread, named by the node binary) to CPU list a / b / c (one
 #                CPU or a range per node, taskset syntax, e.g. 2/6/10 or
 #                2-3/6-7/10-11). Applied with `taskset -pc` right after the
@@ -188,7 +195,13 @@
 #                thread is logged as a WARNING and the cell continues unpinned.
 #                If the process also runs under a cpuset, the chosen CPU must
 #                lie inside that cpuset (not enforced here). Logged in the
-#                "node env" line next to the TORUS_* vars.
+#                "node env" line next to the TORUS_* vars. Unset (default) =
+#                unpinned, for 3 and 4 nodes alike. Suggested split on a
+#                32-thread host (16 cores x 2 SMT; check `lscpu -e=CPU,CORE`
+#                that CPU i and i+16 share a core): one physical core per
+#                consensus thread, HOTSTUFF_CPUS=2/6/10 (3 nodes) or 2/6/10/14
+#                (4 nodes); the siblings and every other CPU stay free for the
+#                execution / flush / RocksDB threads and the load generator.
 #   (schedstat)  For every node the harness snapshots
 #                /proc/<pid>/task/<tid>/schedstat (on_cpu_ns runqueue_wait_ns
 #                timeslices) of the main thread and of the threads named
@@ -444,6 +457,58 @@
 #   PRELOAD_DISTANCE=D (default 1000 ticks; > BAND)  PRELOAD_LEVELS=L (default
 #                100 price levels per side)  PRELOAD_RATE=R (default 50
 #                actions/s)  PRELOAD_TIMEOUT=S (default 900 s to reach N).
+#   N_VALIDATORS=3|4  the devnet's validator count (default 3: everything as
+#                before, byte for byte). 4 = the dead-leader bench 9p devnet
+#                (owner s138: at 2:2:1 with the stake-1 node down no
+#                validator-set update can commit, docs/plans/dead-leader-skip.md
+#                section 8 finding 4): val3 = devnet/genesis.json's 4th
+#                validator (ed25519 key 04), RPC 8648 / metrics 9164 / p2p 30404,
+#                account and oracle signer keys in devnet/wsl/keys-4val/ (the
+#                oracle feed, STATE_HASH_ATTEST and the genesis use that file:
+#                4 validators). Every per-node step covers val3: genesis
+#                (gen-3val-genesis.sh N_VALIDATORS=4), launch (launch-3val.sh,
+#                val3 dials val0..val2), health (all 4 committing, peers >= 3),
+#                samplers (sampler.csv / funnel / phase / buckets val3),
+#                metrics-before/after, schedstat / procstat, drain, digest,
+#                agreement, attestation scan, log collection, summary.json per
+#                node fields (summarize.py finds val3 by metrics-before-val3.txt);
+#                summary.json .cell.n_validators = 4. The worktree's
+#                devnet/wsl and the scoring tools (TOOLS_DIR: summarize.py,
+#                health.py, collect_logs.py, crash-kill.sh) must have 4-node
+#                support (this harness's branch merged in): pre-flight refuses
+#                otherwise. The state-hash attest drain bound and the feed-live
+#                mempool bound scale with the validator count (2 x N). A
+#                run-cell.sh knob, never EXTRA_ENV.
+#   DL_K=K  DL_JCAP=J  dead-leader skip genesis parameters (branch
+#                feat/dead-leader-p3): consensus.leader_miss_threshold = K (0 =
+#                off, else 2..=64; node default 3) and
+#                consensus.leader_exclusion_cap = J (0..=10; node default 6),
+#                each written into the cell genesis ONLY when set (unset = the
+#                field absent, the genesis byte-identical). Genesis inputs (the
+#                genesis cache keys them). A binary without the feature would
+#                ignore the fields silently (the genesis loader tolerates
+#                unknown fields), so pre-flight refuses a torus-node binary that
+#                does not contain the name leader_miss_threshold. Logged and
+#                recorded as summary.json .genesis.leader_miss_threshold /
+#                .leader_exclusion_cap. run-cell.sh knobs, never EXTRA_ENV.
+#   DL_REPORT=0|1  the dead-leader window report (bench 9p, dl_window.py beside
+#                this script): needs KILL_NO_RESTART; default 1 when
+#                N_VALIDATORS=4 and KILL_NO_RESTART are set, else 0. Splits the
+#                load window into pre_kill [bench start, kill], kill_to_exclusion
+#                [kill, exclusion update committed] and post_exclusion
+#                [committed, bench end], per survivor: blk/s, committed blk/s,
+#                matched/s, timeouts/min, views/min. The exclusion is read from
+#                the survivors' logs (the INFO line "epoch boundary: leader
+#                exclusion delta from the execution plan height=H exclude=1 ..."
+#                that the boundary block's builder / validators log) and is
+#                committed when a survivor's committed height (sampler.csv
+#                torus_block_height + torus_exec_queue_depth) reaches H; the
+#                kill-to-exclusion time in s, the heights (killed node at the
+#                kill, boundary H, survivors at kill and at commit) and the last
+#                timeout after the kill per survivor corroborate it. Artifacts:
+#                dl-window.json, summary.json .dead_leader, the
+#                "dead-leader window:" run.log line. Report-only: never a
+#                verdict.
 #   TOOLS_FROM_WORKTREE  1 (default) scores the cell with <worktree>/tools/
 #                matched-bench/summarize.py, i.e. the CANDIDATE's own summarizer,
 #                whichever copy of run-cell.sh was invoked. 0 keeps the old
@@ -544,6 +609,17 @@ KILL_NODE=${KILL_NODE:-val1}
 KILL_NO_RESTART=${KILL_NO_RESTART:-}
 KILL_NO_RESTART_AT_S=${KILL_NO_RESTART_AT_S:-}
 VALIDATOR_STAKES=${VALIDATOR_STAKES:-}
+N_VALIDATORS=${N_VALIDATORS:-3}
+DL_K=${DL_K:-}
+DL_JCAP=${DL_JCAP:-}
+DL_REPORT=${DL_REPORT:-}
+case "$N_VALIDATORS" in
+    3|4) ;;
+    *) echo "FATAL: N_VALIDATORS must be 3 or 4 (got '$N_VALIDATORS')" >&2; exit 2 ;;
+esac
+# every validator index; ALL_IDX = 0 1 2 unless N_VALIDATORS=4
+ALL_IDX=(0 1 2)
+[ "$N_VALIDATORS" = 3 ] || ALL_IDX+=(3)
 HOTSTUFF_CPUS=${HOTSTUFF_CPUS:-}
 SCHED_THREADS="hotstuff-algo torus-execution torus-flush-worker"
 ORACLE_FEED=${ORACLE_FEED:-0}
@@ -574,6 +650,8 @@ LIQUIDATOR_VAULT=0x746f7275732d6c697175696461746f722d766c74
 ADL_ESCROW_LONG=0x746f7275732d61646c2d657363726f772d6c6e67
 ADL_ESCROW_SHORT=0x746f7275732d61646c2d657363726f772d736874
 ORACLE_KEYS="$MAINREPO/devnet/wsl/bench-validator-keys.json"
+# 4-validator devnet: the same 3 keys + val3's (and its oracle signer beside it)
+[ "$N_VALIDATORS" = 3 ] || ORACLE_KEYS="$MAINREPO/devnet/wsl/keys-4val/bench-validator-keys.json"
 ORACLE_FRESH_TIMEOUT=90
 OUT="$RESULTS_ROOT/$LABEL"
 
@@ -725,15 +803,16 @@ else
 fi
 
 RPCS=(http://127.0.0.1:8645 http://127.0.0.1:8646 http://127.0.0.1:8647)
+[ "$N_VALIDATORS" = 3 ] || RPCS+=(http://127.0.0.1:8648)
 # s76: which validators take bench ingress (see BENCH_RPCS in the usage).
 bench_rpc_urls() {
-    local i seen=, out=()
+    local i seen=, out=() hi=$(( ${#RPCS[@]} - 1 ))
     case "${BENCH_RPCS:-}" in
         0) printf '%s\n' "${RPCS[0]}" ;;
         ""|all) (IFS=,; printf '%s\n' "${RPCS[*]}") ;;
         *)
             # a comma list of distinct validator indices, e.g. 0,1 (KILL_NO_RESTART=val2)
-            if [[ "$BENCH_RPCS" =~ ^[0-2](,[0-2]){0,2}$ ]]; then
+            if [[ "$BENCH_RPCS" =~ ^[0-$hi](,[0-$hi]){0,$hi}$ ]]; then
                 for i in ${BENCH_RPCS//,/ }; do
                     case "$seen" in *",$i,"*) echo "FATAL: BENCH_RPCS=$BENCH_RPCS lists val$i twice" >&2; return 2 ;; esac
                     seen+="$i,"; out+=("${RPCS[$i]}")
@@ -746,6 +825,8 @@ bench_rpc_urls() {
 }
 BENCH_RPC_URLS=$(bench_rpc_urls) || exit 2
 METS=(9161 9162 9163)
+[ "$N_VALIDATORS" = 3 ] || METS+=(9164)
+METS_URLS=(); for i in "${ALL_IDX[@]}"; do METS_URLS+=("http://127.0.0.1:${METS[$i]}/metrics"); done
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$OUT/run.log"; }
 die() { log "FATAL: $*"; finish_fail; exit 1; }
@@ -843,7 +924,7 @@ case "$DEFER_REPORT_SCANS" in 0|1) ;; *) echo "FATAL: DEFER_REPORT_SCANS must be
 # EXTRA_ENV is exported mid-run: there a harness variable would overwrite this script's own (DEFER_REPORT_SCANS
 # before the report scans read it; GENESIS_CACHE_DIR reaches only the nodes). Set them in run-cell.sh's env.
 for kv in $EXTRA_ENV; do case $kv in DEFER_REPORT_SCANS=*|GENESIS_CACHE_DIR=*) echo "FATAL: ${kv%%=*} in EXTRA_ENV (the node env): a run-cell.sh variable, set it in run-cell.sh's own env (the campaign driver sets it from its preflight)" >&2; exit 2 ;; esac; done
-for kv in $EXTRA_ENV; do case $kv in VALIDATOR_STAKES=*|KILL_NO_RESTART=*|KILL_NO_RESTART_AT_S=*) echo "FATAL: ${kv%%=*} in EXTRA_ENV (the node env, exported after the genesis and the launch): a run-cell.sh knob, set it in run-cell.sh's own env (a campaign arm: harness_env)" >&2; exit 2 ;; esac; done
+for kv in $EXTRA_ENV; do case $kv in VALIDATOR_STAKES=*|KILL_NO_RESTART=*|KILL_NO_RESTART_AT_S=*|N_VALIDATORS=*|DL_K=*|DL_JCAP=*|DL_REPORT=*) echo "FATAL: ${kv%%=*} in EXTRA_ENV (the node env, exported after the genesis and the launch): a run-cell.sh knob, set it in run-cell.sh's own env (a campaign arm: harness_env)" >&2; exit 2 ;; esac; done
 # shellcheck source=log-scans.sh
 . "$SELF_DIR/log-scans.sh" 2>/dev/null || { echo "FATAL: $SELF_DIR/log-scans.sh missing (copy it beside run-cell.sh)" >&2; exit 1; }
 [ -z "$GENESIS_CACHE_DIR" ] || [ -f "$SELF_DIR/genesis_cache.py" ] \
@@ -900,8 +981,22 @@ for v in EXPECT_NODE_MD5 EXPECT_BENCH_MD5; do
 done
 [[ "$ORACLE_WALK_BP" =~ ^[0-9]+$ ]] && [ "$ORACLE_WALK_BP" -lt 1250 ] \
     || { echo "FATAL: ORACLE_WALK_BP must be an integer in 0..1249 (got '$ORACLE_WALK_BP')" >&2; exit 2; }
-[ -z "$VALIDATOR_STAKES" ] || [[ "$VALIDATOR_STAKES" =~ ^[1-9][0-9]{0,5},[1-9][0-9]{0,5},[1-9][0-9]{0,5}$ ]] \
-    || { echo "FATAL: VALIDATOR_STAKES must be three positive integer stake weights a,b,c (val0,val1,val2; got '$VALIDATOR_STAKES')" >&2; exit 2; }
+if [ "$N_VALIDATORS" = 3 ]; then
+    [ -z "$VALIDATOR_STAKES" ] || [[ "$VALIDATOR_STAKES" =~ ^[1-9][0-9]{0,5},[1-9][0-9]{0,5},[1-9][0-9]{0,5}$ ]] \
+        || { echo "FATAL: VALIDATOR_STAKES must be three positive integer stake weights a,b,c (val0,val1,val2; got '$VALIDATOR_STAKES')" >&2; exit 2; }
+else
+    [ -z "$VALIDATOR_STAKES" ] || [[ "$VALIDATOR_STAKES" =~ ^[1-9][0-9]{0,5},[1-9][0-9]{0,5},[1-9][0-9]{0,5},[1-9][0-9]{0,5}$ ]] \
+        || { echo "FATAL: VALIDATOR_STAKES must be four positive integer stake weights a,b,c,d with N_VALIDATORS=4 (val0..val3; got '$VALIDATOR_STAKES')" >&2; exit 2; }
+fi
+# Dead-leader skip genesis knobs (torus_types::DeadLeaderParams::check ranges); the binary must know them.
+[ -z "$DL_K" ] || { [[ "$DL_K" =~ ^(0|[1-9][0-9]?)$ ]] && { [ "$DL_K" = 0 ] || { [ "$DL_K" -ge 2 ] && [ "$DL_K" -le 64 ]; }; }; } \
+    || { echo "FATAL: DL_K (genesis consensus.leader_miss_threshold) must be 0 (off) or 2..=64 (got '$DL_K')" >&2; exit 2; }
+[ -z "$DL_JCAP" ] || [[ "$DL_JCAP" =~ ^([0-9]|10)$ ]] \
+    || { echo "FATAL: DL_JCAP (genesis consensus.leader_exclusion_cap) must be 0..=10 (got '$DL_JCAP')" >&2; exit 2; }
+if [ -n "$DL_K$DL_JCAP" ]; then
+    grep -aqF leader_miss_threshold "$SRC_NODE" 2>/dev/null \
+        || { echo "FATAL: DL_K / DL_JCAP set but $SRC_NODE has no dead-leader skip (no 'leader_miss_threshold' in the binary): its genesis loader would ignore the fields. Build it from feat/dead-leader-p3 (or a branch with it)" >&2; exit 1; }
+fi
 [[ "$LIQ_THIN" =~ ^[0-9]{1,9}$ ]] || { echo "FATAL: LIQ_THIN must be a non-negative integer (got '$LIQ_THIN')" >&2; exit 2; }
 LIQ_THIN=$((10#$LIQ_THIN))
 if [ "$LIQ_THIN" -gt 0 ]; then
@@ -1001,7 +1096,7 @@ preload_on() { [ "$PRELOAD" -gt 0 ]; }
 # --target-margin 1500, and band as the load; owners past the load's senders).
 preload_cmd() {
     PRELOAD_CMD=("$BENCH" preload --rpc-urls "$(IFS=,; printf '%s' "${RPCS[*]}")" \
-        --metrics-urls "http://127.0.0.1:${METS[0]}/metrics,http://127.0.0.1:${METS[1]}/metrics,http://127.0.0.1:${METS[2]}/metrics" \
+        --metrics-urls "$(printf 'http://127.0.0.1:%s/metrics,' "${METS[@]}" | sed 's/,$//')" \
         --target "$PRELOAD" --markets "$MARKETS" --per-owner "$PRELOAD_PER_OWNER" --owner-offset "$PRELOAD_OWNER_OFFSET" \
         --sender-offset 60 --senders "$SENDERS" --funded-bulk-end "$((60 + BULK_COUNT))" \
         --target-margin 1500 --band "$BAND" --distance "$PRELOAD_DISTANCE" --levels "$PRELOAD_LEVELS" \
@@ -1041,11 +1136,26 @@ if [ -n "$CRASH_KILL_AT_S" ]; then
     case "$KILL_NODE" in
         val1) KILL_IDX=1 ;;
         val2) KILL_IDX=2 ;;
-        *) echo "FATAL: KILL_NODE must be val1 or val2 (never val0 — it serves the bench RPC and every headline number)" >&2; exit 2 ;;
+        val3) [ "$N_VALIDATORS" = 4 ] && KILL_IDX=3 ;;
     esac
+    [ -n "$KILL_IDX" ] || { echo "FATAL: KILL_NODE must be val1 or val2$([ "$N_VALIDATORS" = 4 ] && echo ' or val3') (never val0 — it serves the bench RPC and every headline number)" >&2; exit 2; }
     crash_kill_list_ok "$CRASH_KILL_AT_S" "$DUR" || {
         echo "FATAL: CRASH_KILL_AT_S=$CRASH_KILL_AT_S is not a valid kill list for a ${DUR}s cell (each offset >= 10 and <= $((DUR-30)); killing during the drain hangs the agreement probe; a list must strictly increase with >= ${CRASH_KILL_MIN_GAP_S}s between kills)" >&2; exit 2; }
     IFS=, read -r -a CRASH_AT <<< "$CRASH_KILL_AT_S"
+fi
+
+# ---- 4-validator devnet (N_VALIDATORS=4) pre-flight: the worktree's devnet/wsl starts val3, and the scoring tools
+# (TOOLS_DIR) know a 4th node; an older copy would launch 3 nodes against a 4-validator genesis (no quorum with
+# 2:2:1:1-like stakes, a skipped leader every 4th view) or refuse 4 URLs mid-cell.
+if [ "$N_VALIDATORS" = 4 ]; then
+    { grep -q '^KEY3=' "$WSL/env.sh" 2>/dev/null && grep -q 'N_VALIDATORS' "$WSL/launch-3val.sh" 2>/dev/null \
+        && grep -q 'PEER_TO_V2' "$WSL/start-node.sh" 2>/dev/null; } \
+        || { echo "FATAL: N_VALIDATORS=4 but $WSL (env.sh / launch-3val.sh / start-node.sh) has no 4-validator devnet: merge the harness branch (tools/run-cell-4val) into the worktree" >&2; exit 1; }
+    for f in summarize.py health.py collect_logs.py crash-kill.sh; do
+        grep -q 'N_VALIDATORS=4' "$TOOLS_DIR/$f" 2>/dev/null \
+            || { echo "FATAL: N_VALIDATORS=4 but $TOOLS_DIR/$f has no 4-node support (TOOLS_FROM_WORKTREE=$TOOLS_FROM_WORKTREE; point TOOLS_DIR= at a tools/matched-bench with it, or merge the harness branch into the worktree)" >&2; exit 1; }
+    done
+    [ -s "$ORACLE_KEYS" ] || { echo "FATAL: N_VALIDATORS=4 needs $ORACLE_KEYS (the 4 validators' account keys)" >&2; exit 1; }
 fi
 
 # ---- no-restart kill (KILL_NO_RESTART) pre-flight. Off (the default): KNR_IDX
@@ -1053,6 +1163,7 @@ fi
 # LIVE_IDX = the validators that take part after the load (the survivors).
 KNR_IDX=""
 LIVE_IDX=(0 1 2)
+[ "$N_VALIDATORS" = 3 ] || LIVE_IDX+=(3)
 if [ -n "$KILL_NO_RESTART" ] || [ -n "$KILL_NO_RESTART_AT_S" ]; then
     [ -n "$KILL_NO_RESTART" ] && [ -n "$KILL_NO_RESTART_AT_S" ] \
         || { echo "FATAL: KILL_NO_RESTART (val1|val2) and KILL_NO_RESTART_AT_S (seconds into the load) go together" >&2; exit 2; }
@@ -1063,8 +1174,9 @@ if [ -n "$KILL_NO_RESTART" ] || [ -n "$KILL_NO_RESTART_AT_S" ]; then
     case "$KILL_NO_RESTART" in
         val1) KNR_IDX=1 ;;
         val2) KNR_IDX=2 ;;
-        *) echo "FATAL: KILL_NO_RESTART must be val1 or val2 (never val0 — it serves the bench RPC and every headline number)" >&2; exit 2 ;;
+        val3) [ "$N_VALIDATORS" = 4 ] && KNR_IDX=3 ;;
     esac
+    [ -n "$KNR_IDX" ] || { echo "FATAL: KILL_NO_RESTART must be val1 or val2$([ "$N_VALIDATORS" = 4 ] && echo ' or val3') (never val0 — it serves the bench RPC and every headline number)" >&2; exit 2; }
     # the selected tools must know the mode: a candidate worktree's older copies would kill and restart, drain
     # all three nodes (never quiet), or score two agreement rows as INCOMPLETE
     { declare -F crash_norestart_quorum_ok >/dev/null && grep -q -- '--exclude' "$TOOLS_DIR/health.py" 2>/dev/null \
@@ -1072,17 +1184,35 @@ if [ -n "$KILL_NO_RESTART" ] || [ -n "$KILL_NO_RESTART_AT_S" ]; then
         || { echo "FATAL: KILL_NO_RESTART needs crash-kill.sh norestart, health.py drain --exclude and a summarize.py that reads kill-norestart.json, and $TOOLS_DIR lacks one (TOOLS_FROM_WORKTREE=$TOOLS_FROM_WORKTREE; point TOOLS_DIR= at a newer tools/matched-bench)" >&2; exit 1; }
     crash_kill_at_ok "$KILL_NO_RESTART_AT_S" "$DUR" \
         || { echo "FATAL: KILL_NO_RESTART_AT_S=$KILL_NO_RESTART_AT_S is not inside the load window of a ${DUR}s cell (>= 10 and <= $((DUR-30)); DUR >= 40)" >&2; exit 2; }
-    crash_norestart_quorum_ok "$KNR_IDX" "${VALIDATOR_STAKES:-1,1,1}" \
-        || { echo "FATAL: KILL_NO_RESTART=$KILL_NO_RESTART: the two validators left would hold no consensus quorum (> 2/3 of the power) under stakes ${VALIDATOR_STAKES:-1,1,1} (VALIDATOR_STAKES): the chain would halt at the kill. Use VALIDATOR_STAKES=2,2,1 with KILL_NO_RESTART=val2" >&2; exit 2; }
+    KNR_STAKES=${VALIDATOR_STAKES:-1,1,1}
+    [ "$N_VALIDATORS" = 3 ] || KNR_STAKES=${VALIDATOR_STAKES:-1,1,1,1}
+    if [ "$N_VALIDATORS" = 3 ]; then
+        crash_norestart_quorum_ok "$KNR_IDX" "$KNR_STAKES" \
+            || { echo "FATAL: KILL_NO_RESTART=$KILL_NO_RESTART: the two validators left would hold no consensus quorum (> 2/3 of the power) under stakes ${VALIDATOR_STAKES:-1,1,1} (VALIDATOR_STAKES): the chain would halt at the kill. Use VALIDATOR_STAKES=2,2,1 with KILL_NO_RESTART=val2" >&2; exit 2; }
+    else
+        crash_norestart_quorum_ok "$KNR_IDX" "$KNR_STAKES" \
+            || { echo "FATAL: KILL_NO_RESTART=$KILL_NO_RESTART: the three validators left would hold no consensus quorum (> 2/3 of the power) under stakes $KNR_STAKES (VALIDATOR_STAKES): the chain would halt at the kill. Equal stakes (unset) keep 3/4; 2,2,1,1 needs val2 or val3 down" >&2; exit 2; }
+    fi
     [ "$ORACLE_FEED" != 1 ] || { echo "FATAL: KILL_NO_RESTART with ORACLE_FEED=1: a fresh oracle aggregate needs all 3 validators, the marks would go stale at the kill" >&2; exit 2; }
     ! evm_load_on || { echo "FATAL: KILL_NO_RESTART with EVM_LOAD_RATE > 0: the EVM senders are pinned one validator each" >&2; exit 2; }
     case ",$BENCH_RPC_URLS," in
         *",${RPCS[$KNR_IDX]},"*) echo "FATAL: KILL_NO_RESTART=$KILL_NO_RESTART but the bench sends to it (BENCH_RPCS='${BENCH_RPCS:-all}': $BENCH_RPC_URLS): its senders would fail from the kill on. Set BENCH_RPCS to the survivors (e.g. BENCH_RPCS=0,1), and the same on the all-up arm for a like-for-like ingress" >&2; exit 2 ;;
     esac
     LIVE_IDX=()
-    for i in 0 1 2; do [ "$i" = "$KNR_IDX" ] || LIVE_IDX+=("$i"); done
+    for i in "${ALL_IDX[@]}"; do [ "$i" = "$KNR_IDX" ] || LIVE_IDX+=("$i"); done
 fi
 LIVE_RPCS=(); for i in "${LIVE_IDX[@]}"; do LIVE_RPCS+=("${RPCS[$i]}"); done
+# Dead-leader window report (DL_REPORT): default on for a 4-validator no-restart kill cell.
+case "$DL_REPORT" in
+    '') if [ "$N_VALIDATORS" = 4 ] && [ -n "$KNR_IDX" ]; then DL_REPORT=1; else DL_REPORT=0; fi ;;
+    0) ;;
+    1) [ -n "$KNR_IDX" ] || { echo "FATAL: DL_REPORT=1 needs KILL_NO_RESTART (the windows start at the kill)" >&2; exit 2; } ;;
+    *) echo "FATAL: DL_REPORT must be 0 or 1 (got '$DL_REPORT')" >&2; exit 2 ;;
+esac
+dl_report_on() { [ "$DL_REPORT" = 1 ]; }
+if dl_report_on; then
+    [ -f "$SELF_DIR/dl_window.py" ] || { echo "FATAL: DL_REPORT=1 needs $SELF_DIR/dl_window.py" >&2; exit 1; }
+fi
 # Drain / attest scan: the killed node is excluded (empty = every node)
 KNR_EXCLUDE_ARGS=()
 [ -z "$KNR_IDX" ] || KNR_EXCLUDE_ARGS=(--exclude "$KILL_NO_RESTART")
@@ -1219,6 +1349,22 @@ record_genesis_book_mode() {
     fi
 }
 
+# record_cell_shape <summary.json>: .cell.n_validators = N_VALIDATORS and, with DL_K / DL_JCAP,
+# .genesis.leader_miss_threshold / .leader_exclusion_cap (the cell genesis' values; "absent" = the node default).
+# Called only off the default shape. rc 1, file untouched, on failure.
+record_cell_shape() {
+    local p=$1 tmp
+    tmp="$p.shape.tmp"
+    if ! jq --argjson n "$N_VALIDATORS" --arg k "$GEN_DL_K" --arg j "$GEN_DL_JCAP" \
+            '.cell.n_validators = $n
+             | if $k != "" then .genesis.leader_miss_threshold = ($k | tonumber? // $k) else . end
+             | if $j != "" then .genesis.leader_exclusion_cap = ($j | tonumber? // $j) else . end' "$p" > "$tmp" \
+            || ! mv -f "$tmp" "$p"; then
+        rm -f -- "${tmp:?}"
+        return 1
+    fi
+}
+
 # record_genesis_bulk_count <summary.json> <n>: .genesis.bulk_count = n (the
 # BULK_COUNT this cell's genesis was built with). rc 1, file untouched, on failure.
 record_genesis_bulk_count() {
@@ -1274,7 +1420,8 @@ if [ -f "$RUN_DIR/pids" ] && xargs -a "$RUN_DIR/pids" -r -I{} kill -0 {} 2>/dev/
     echo "FATAL: a devnet is already running ($RUN_DIR/pids) — run $WSL/stop-3val.sh first" >&2; exit 1
 fi
 # The live testnet validator (8555/9090/30333) is never touched: we only use
-# 8645-8647 / 9161-9163 / 30401-30403 and never write into ~/.cargo-target.
+# 8645-8647 / 9161-9163 / 30401-30403 (+ 8648 / 9164 / 30404 with N_VALIDATORS=4)
+# and never write into ~/.cargo-target.
 if [ -d "$OUT" ] && [ -n "$(ls -A "$OUT" 2>/dev/null)" ] && [ "${OVERWRITE:-0}" != 1 ]; then
     echo "FATAL: $OUT exists and is non-empty (pick a new label or OVERWRITE=1)" >&2; exit 1
 fi
@@ -1401,7 +1548,7 @@ if liq_stress_on; then
 fi
 [ "$ORACLE_FEED" = 1 ] && log "oracle feed ON: price=$ORACLE_PRICE walk_bp=$ORACLE_WALK_BP shock_bp=$ORACLE_SHOCK_BP shock_round=$ORACLE_SHOCK_ROUND interval=${ORACLE_INTERVAL_MS}ms markets=$MARKETS keys=$ORACLE_KEYS fresh_timeout=${ORACLE_FRESH_TIMEOUT}s"
 if evm_load_on; then
-    log "EVM load ON: rate=$EVM_LOAD_RATE tx/s senders=$EVM_LOAD_SENDERS (bench senders $EVM_LOAD_OFFSET..$((EVM_LOAD_OFFSET + EVM_LOAD_SENDERS - 1)), the k-th sender -> val k % 3 only) tx_flood=$TX_FLOOD md5=$(md5sum "$TX_FLOOD" | cut -d' ' -f1)"
+    log "EVM load ON: rate=$EVM_LOAD_RATE tx/s senders=$EVM_LOAD_SENDERS (bench senders $EVM_LOAD_OFFSET..$((EVM_LOAD_OFFSET + EVM_LOAD_SENDERS - 1)), the k-th sender -> val k % ${#ALL_IDX[@]} only) tx_flood=$TX_FLOOD md5=$(md5sum "$TX_FLOOD" | cut -d' ' -f1)"
     if awk -v r="$EVM_LOAD_RATE" -v s="$EVM_LOAD_SENDERS" 'BEGIN{exit !(r / s > 2)}'; then
         log "WARNING: EVM_LOAD_RATE / EVM_LOAD_SENDERS > 2 tx/s per sender: the node's per-sender limits (16 pooled, 50 per 10 s at the RPC, nonce <= executed + 64) will refuse some txs"
     fi
@@ -1409,6 +1556,8 @@ fi
 WT_COMMIT=$(git -C "$WT" rev-parse HEAD)
 WT_DIRTY=$(git -C "$WT" status --porcelain --untracked-files=no | wc -l)
 log "worktree commit=$WT_COMMIT dirty_files=$WT_DIRTY"
+[ "$N_VALIDATORS" = 3 ] || log "4-validator devnet: N_VALIDATORS=4 (val0..val3; rpc ${RPCS[*]}; metrics ${METS[*]}; keys $ORACLE_KEYS)"
+[ -z "$DL_K$DL_JCAP" ] || log "dead-leader skip genesis knobs: DL_K='${DL_K:-unset (node default 3)}' DL_JCAP='${DL_JCAP:-unset (node default 6)}' (torus-node knows them: leader_miss_threshold found in $SRC_NODE)"
 
 # ---------------------------------------------------------------- 1. stage binary
 mkdir -p "$(dirname "$DST_NODE")"
@@ -1438,7 +1587,8 @@ genesis_key() { # key | store ARGS...: genesis_cache.py with this cell's key inp
     python3 -I "$SELF_DIR/genesis_cache.py" "$cmd" --root "$MAINREPO" --run-cell "$SELF_DIR/run-cell.sh" \
         --param MARKETS="$MARKETS" --param BULK_COUNT="$BULK_COUNT" --param TIMEOUT_BASE_MS="$GEN_TIMEOUT_BASE_MS" \
         --param EVM_BLOCK_INTERVAL="$GEN_EVM_BLOCK_INTERVAL" --param LIQ_THIN="$LIQ_THIN" --param LIQ_THIN_AVAIL="$LIQ_THIN_AVAIL" \
-        --param BOOK_MODE="$GEN_BOOK_MODE" --param VALIDATOR_STAKES="$VALIDATOR_STAKES" "$@"
+        --param BOOK_MODE="$GEN_BOOK_MODE" --param VALIDATOR_STAKES="$VALIDATOR_STAKES" \
+        --param N_VALIDATORS="$N_VALIDATORS" --param DL_K="$DL_K" --param DL_JCAP="$DL_JCAP" "$@"
 }
 genesis_key_store() {
     genesis_key store --dir "$GENESIS_CACHE_DIR" --genesis "$GENESIS" --md5 "$GEN_MD5" $GEN_FORCED \
@@ -1470,18 +1620,18 @@ if [ "$GEN_REUSED" = 1 ]; then
     # run.log gets the build path's lines in their form (checks and spec expectations read them, e.g. the
     # generator's "  state_hash_activation = off"): this line, then the generator's output as it prints it for
     # this cell (genesis_cache.py replay: its summary from the entry), then the reuse line (test_genesis_reuse_lines.py).
-    log "generating $MARKETS-market 3-val genesis -> $GENESIS"
+    log "generating $MARKETS-market ${N_VALIDATORS}-val genesis -> $GENESIS"
     jq -r '.replay[]' <<<"$GEN_META" >> "$OUT/run.log" || die "genesis cache entry $GEN_KEY: no generator lines to replay"
     log "genesis reused (key $GEN_KEY, md5 $GEN_MD5) from $GENESIS_CACHE_DIR (built $GEN_BUILT${GEN_FORCED:+ under FORCE=1}): generator, weighted-full check and jq passes skipped, the generator lines above replayed from the entry -> $GENESIS"
     log "genesis timeout_base_ms=$GEN_TBMS"
 else
-    log "generating $MARKETS-market 3-val genesis -> $GENESIS"
+    log "generating $MARKETS-market ${N_VALIDATORS}-val genesis -> $GENESIS"
     if [ "${FORCE:-0}" != 1 ]; then
         WHY=$(weighted_full_check "$MAINREPO/testnet/genesis-weighted-full.json" "$SENDERS") || die "$WHY"
     fi
     # The generator's run.log bytes (GEN_LOG_FROM..GEN_LOG_TO) go into the cache entry (genesis_key_store).
     GEN_LOG_FROM=$(stat -c %s -- "$OUT/run.log")
-    TIMEOUT_BASE_MS=$GEN_TIMEOUT_BASE_MS EVM_BLOCK_INTERVAL=$GEN_EVM_BLOCK_INTERVAL BOOK_MODE=$GEN_BOOK_MODE VALIDATOR_STAKES=$VALIDATOR_STAKES MARKETS=$MARKETS BULK_COUNT=$BULK_COUNT OUT="$GENESIS" BENCH_BIN="$BENCH" "$MAINREPO/devnet/wsl/gen-3val-genesis.sh" >>"$OUT/run.log" 2>&1 \
+    TIMEOUT_BASE_MS=$GEN_TIMEOUT_BASE_MS EVM_BLOCK_INTERVAL=$GEN_EVM_BLOCK_INTERVAL BOOK_MODE=$GEN_BOOK_MODE N_VALIDATORS=$N_VALIDATORS DL_K=$DL_K DL_JCAP=$DL_JCAP VALIDATOR_STAKES=$VALIDATOR_STAKES MARKETS=$MARKETS BULK_COUNT=$BULK_COUNT OUT="$GENESIS" BENCH_BIN="$BENCH" "$MAINREPO/devnet/wsl/gen-3val-genesis.sh" >>"$OUT/run.log" 2>&1 \
         || die "genesis generation failed (see run.log)"
     GEN_LOG_TO=$(stat -c %s -- "$OUT/run.log")
     GEN_TBMS=$(jq '.consensus.timeout_base_ms' "$GENESIS")
@@ -1522,8 +1672,19 @@ log "genesis markets=$GEN_MARKETS native_balances=$GEN_ACCTS bulk_count=$GEN_BUL
 [ "$GEN_BOOK_MODE_GOT" = "${GEN_BOOK_MODE:-classic}" ] \
     || die "genesis consensus.book_mode=$GEN_BOOK_MODE_GOT, wanted ${GEN_BOOK_MODE:-classic} (${GEN_BOOK_MODE_SRC:-no TORUS_BOOK_ROWS / BOOK_MODE in EXTRA_ENV}): gen-3val-genesis.sh copies .consensus from $MAINREPO/testnet/genesis-weighted-full.json; remove a hand patch there (set the mode per cell with EXTRA_ENV BOOK_MODE= or TORUS_BOOK_ROWS=)"
 log "genesis consensus.book_mode=$GEN_BOOK_MODE_GOT (${GEN_BOOK_MODE_SRC:-absent: classic})"
-[ -z "$VALIDATOR_STAKES" ] || log "genesis validator stakes: VALIDATOR_STAKES=$VALIDATOR_STAKES (val0,val1,val2 weights x the base stake; gen-3val-genesis.sh validator_stakes line above)"
-[ -z "$KNR_IDX" ] || log "no-restart kill: KILL_NO_RESTART=$KILL_NO_RESTART at bench+${KILL_NO_RESTART_AT_S}s, never restarted; stakes ${VALIDATOR_STAKES:-1,1,1}; bench ingress $BENCH_RPC_URLS; after the load only val${LIVE_IDX[0]} val${LIVE_IDX[1]} are drained, digested and compared"
+[ -z "$VALIDATOR_STAKES" ] || log "genesis validator stakes: VALIDATOR_STAKES=$VALIDATOR_STAKES ($(IFS=,; echo "${ALL_IDX[*]/#/val}") weights x the base stake; gen-3val-genesis.sh validator_stakes line above)"
+[ -z "$KNR_IDX" ] || log "no-restart kill: KILL_NO_RESTART=$KILL_NO_RESTART at bench+${KILL_NO_RESTART_AT_S}s, never restarted; stakes ${KNR_STAKES}; bench ingress $BENCH_RPC_URLS; after the load only ${LIVE_IDX[*]/#/val} are drained, digested and compared"
+# 4-validator devnet / dead-leader knobs: the genesis must carry what the cell asked for (one jq pass; a hand-patched
+# or cached genesis from another shape is refused). 3 validators without DL knobs: no pass, nothing changes.
+GEN_DL_K=""; GEN_DL_JCAP=""
+if [ "$N_VALIDATORS" != 3 ] || [ -n "$DL_K$DL_JCAP" ]; then
+    read -r GEN_NVAL GEN_DL_K GEN_DL_JCAP < <(jq -r '[(.validators | length), (.consensus.leader_miss_threshold // "absent"),
+        (.consensus.leader_exclusion_cap // "absent")] | @tsv' "$GENESIS")
+    [ "$GEN_NVAL" = "$N_VALIDATORS" ] || die "genesis has $GEN_NVAL validators, wanted N_VALIDATORS=$N_VALIDATORS"
+    [ "$GEN_DL_K" = "${DL_K:-absent}" ] || die "genesis consensus.leader_miss_threshold=$GEN_DL_K, wanted DL_K='${DL_K:-absent}'"
+    [ "$GEN_DL_JCAP" = "${DL_JCAP:-absent}" ] || die "genesis consensus.leader_exclusion_cap=$GEN_DL_JCAP, wanted DL_JCAP='${DL_JCAP:-absent}'"
+    log "genesis validators=$GEN_NVAL consensus.leader_miss_threshold=$GEN_DL_K consensus.leader_exclusion_cap=$GEN_DL_JCAP"
+fi
 if [ "$GEN_REUSED" != 1 ]; then
     if [ -n "$GENESIS_CACHE_DIR" ]; then
         # Keyed again by the store, after the build: a first (or FORCE=1) build writes the weighted-full genesis.
@@ -1584,6 +1745,8 @@ NODE_ENV_JSON=$(env | grep -E '^(TORUS_|HOTSTUFF_CPUS=)' | sort | python3 -c 'im
 log "node env: $NODE_ENV_JSON"
 log "cell=$LABEL $(node_flags_line "$GEN_BOOK_MODE_GOT")"
 T_LAUNCH=$(date +%s)
+# 4-validator devnet: launch-3val.sh (env.sh) and crash-kill.sh read it; never exported for 3 (their default)
+[ "$N_VALIDATORS" = 3 ] || export N_VALIDATORS
 CLEAN=1 "$WSL/launch-3val.sh" >>"$OUT/run.log" 2>&1 || die "launch-3val.sh failed"
 sleep 2
 mapfile -t PIDS < "$RUN_DIR/pids"
@@ -1592,7 +1755,7 @@ log "node pids: ${PIDS[*]}"
 ENV_VERIFY=$(for p in "${PIDS[@]}"; do tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -E '^TORUS_' | sort | md5sum | cut -c1-8; done | sort -u | tr '\n' ' ')
 log "per-node TORUS_* env digest(s): $ENV_VERIFY (must be a single value)"
 if state_attest_on; then
-    for i in 0 1 2; do
+    for i in "${ALL_IDX[@]}"; do
         tr '\0' ' ' < "/proc/${PIDS[$i]}/cmdline" 2>/dev/null | grep -qF -- "--state-hash-attest-key=$STATE_HASH_ATTEST_KEY_DIR/val$i.key" \
             || die "STATE_HASH_ATTEST=1: val$i (pid ${PIDS[$i]}) was started without --state-hash-attest-key=$STATE_HASH_ATTEST_KEY_DIR/val$i.key"
     done
@@ -1603,21 +1766,22 @@ fi
 scrape_one() { curl -fsS -m 3 "http://127.0.0.1:$1/metrics"; }
 mval() { awk -v m="$1" '$1==m {print $2; f=1} END{if(!f) print 0}'; }
 
-log "waiting for health (all 3 committing, peers>=2, timeout ${HEALTH_TIMEOUT}s)"
+MIN_PEERS=$(( ${#ALL_IDX[@]} - 1 ))
+log "waiting for health (all ${#ALL_IDX[@]} committing, peers>=$MIN_PEERS, timeout ${HEALTH_TIMEOUT}s)"
 ok=0; t0=$(date +%s)
-declare -a C0=(0 0 0)
+declare -a C0=(); for i in "${ALL_IDX[@]}"; do C0[$i]=0; done
 while [ $(( $(date +%s) - t0 )) -lt "$HEALTH_TIMEOUT" ]; do
     good=0
-    for i in 0 1 2; do
+    for i in "${ALL_IDX[@]}"; do
         M=$(scrape_one "${METS[$i]}") || true
         c=$(printf '%s' "$M" | mval torus_blocks_committed_total)
         pc=$(printf '%s' "$M" | mval torus_peers_connected)
         c=${c%.*}; pc=${pc%.*}
-        if [ "${c:-0}" -ge $(( ${C0[$i]} + 5 )) ] && [ "${pc:-0}" -ge 2 ]; then good=$((good+1)); fi
+        if [ "${c:-0}" -ge $(( ${C0[$i]} + 5 )) ] && [ "${pc:-0}" -ge "$MIN_PEERS" ]; then good=$((good+1)); fi
         [ "${C0[$i]}" = 0 ] && C0[$i]=${c:-0}
     done
     for p in "${PIDS[@]}"; do kill -0 "$p" 2>/dev/null || die "node pid $p died during startup"; done
-    [ "$good" = 3 ] && { ok=1; break; }
+    [ "$good" = "${#ALL_IDX[@]}" ] && { ok=1; break; }
     sleep 2
 done
 [ "$ok" = 1 ] || die "devnet not healthy after ${HEALTH_TIMEOUT}s"
@@ -1626,9 +1790,13 @@ log "healthy after $((T_HEALTHY - T_LAUNCH))s"
 # ---- HOTSTUFF_CPUS: pin each node's consensus thread -----------------------
 if [ -n "$HOTSTUFF_CPUS" ]; then
     IFS=/ read -r -a HS_CPU <<< "$HOTSTUFF_CPUS"
-    [ "${#HS_CPU[@]}" = 3 ] || die "HOTSTUFF_CPUS must be a/b/c (one CPU list per node), got '$HOTSTUFF_CPUS'"
+    if [ "$N_VALIDATORS" = 3 ]; then
+        [ "${#HS_CPU[@]}" = 3 ] || die "HOTSTUFF_CPUS must be a/b/c (one CPU list per node), got '$HOTSTUFF_CPUS'"
+    else
+        [ "${#HS_CPU[@]}" = 4 ] || die "HOTSTUFF_CPUS must be a/b/c/d with N_VALIDATORS=4 (one CPU list per node), got '$HOTSTUFF_CPUS'"
+    fi
     command -v taskset >/dev/null || die "HOTSTUFF_CPUS set but taskset not found"
-    for i in 0 1 2; do
+    for i in "${ALL_IDX[@]}"; do
         p=${PIDS[$i]}
         tid=""
         for _try in $(seq 1 20); do tid=$(find_tid "$p" hotstuff-algo) && break; sleep 0.5; done
@@ -1787,7 +1955,7 @@ fi
 WIDE_COLS="$WIDE_COLS scrape_valid"
 echo "ts,node,$(echo $WIDE_COLS | tr ' ' ',')" > "$OUT/sampler.csv"
 echo "ts,node,metric,le,count" > "$OUT/buckets.csv"
-for i in 0 1 2; do
+for i in "${ALL_IDX[@]}"; do
     echo "ts,actions_processed,placed_accepted,matched,resting,rej_margin,rej_book,rej_cancelled,rej_other,self_trade_cancels,cancelled_partial_fill,blocks_committed,block_height,exec_queue_depth" > "$OUT/funnel-val$i.csv"
     echo "ts,committed,height,placed,matched,resting,exec_resting,lb_s,lb_c,root_s,root_c,sw_s,sw_c,evm_s,evm_c,fl_s,fl_c,db_s,db_c,execq,bscan,mc_hit,mc_miss,mc_evict,mc_resident" > "$OUT/phase-val$i.csv"
 done
@@ -1800,13 +1968,13 @@ cpusampler() {
         sleep 10
     done
 }
-for i in 0 1 2; do scrape_one "${METS[$i]}" > "$OUT/metrics-before-val$i.txt"; done
+for i in "${ALL_IDX[@]}"; do scrape_one "${METS[$i]}" > "$OUT/metrics-before-val$i.txt"; done
 : > "$OUT/schedstat.raw"; : > "$OUT/procstat.raw"; schedstat_snapshot before "${PIDS[@]}"
 # This collector belongs to the runner; scoring scripts still come from
 # TOOLS_DIR. Keeping it beside run-cell.sh also supports older node worktrees.
 python3 "$SELF_DIR/sample_metrics.py" --out "$OUT" \
     --wide "$WIDE_COLS" --funnel "$FUNNEL_COLS" --phase "$PHASE_COLS" --buckets "$BUCKET_METRICS" \
-    "http://127.0.0.1:${METS[0]}/metrics" "http://127.0.0.1:${METS[1]}/metrics" "http://127.0.0.1:${METS[2]}/metrics" \
+    "${METS_URLS[@]}" \
     >"$OUT/sampler.log" 2>&1 & SAMPLER_PID=$!
 sleep 3
 kill -0 "$SAMPLER_PID" 2>/dev/null || die "metrics sampler exited (see sampler.log)"
@@ -1901,7 +2069,7 @@ fi
 if [ -n "$KNR_IDX" ] && [ ! -s "$OUT/kill-norestart.json" ]; then
     die "no-restart kill did not complete (no kill-norestart.json) — $KILL_NO_RESTART was not killed as planned, see run.log"
 fi
-[ -z "$KNR_IDX" ] || log "no-restart kill: $(jq -c '{kill_node, killed_pid, kill_at_s, height_at_kill: .pre_kill.block_height, committed_at_kill: .pre_kill.blocks_committed}' "$OUT/kill-norestart.json" 2>/dev/null); survivors val${LIVE_IDX[0]} val${LIVE_IDX[1]}"
+[ -z "$KNR_IDX" ] || log "no-restart kill: $(jq -c '{kill_node, killed_pid, kill_at_s, height_at_kill: .pre_kill.block_height, committed_at_kill: .pre_kill.blocks_committed}' "$OUT/kill-norestart.json" 2>/dev/null); survivors ${LIVE_IDX[*]/#/val}"
 # multi-crash: every planned kill needs its record, except a logged SKIP tail.
 CRASH_DONE=0
 if [ -n "$CRASH_KILL_AT_S" ]; then
@@ -1949,10 +2117,10 @@ fi
 QUIET_S=${QUIET_S:-10}
 log "draining (quiet counters, no pending work, per-node commit progress for ${QUIET_S}s; timeout ${DRAIN_TIMEOUT}s)"
 DRAINED=0
-DRAIN_URLS=("http://127.0.0.1:${METS[0]}/metrics" "http://127.0.0.1:${METS[1]}/metrics" "http://127.0.0.1:${METS[2]}/metrics")
+DRAIN_URLS=(); for p in "${METS[@]}"; do DRAIN_URLS+=("http://127.0.0.1:$p/metrics"); done
 FEED_DRAIN_ARGS=()
 if [ "$ORACLE_FEED_DRAIN" = 1 ]; then
-    FEED_DRAIN_ARGS=(--feed-live --feed-mempool-max $(( 6 * ((MARKETS + 255) / 256) )) --max-lag "$ORACLE_FEED_DRAIN_MAX_LAG")
+    FEED_DRAIN_ARGS=(--feed-live --feed-mempool-max $(( 2 * ${#METS[@]} * ((MARKETS + 255) / 256) )) --max-lag "$ORACLE_FEED_DRAIN_MAX_LAG")
     log "feed-live drain: ${FEED_DRAIN_ARGS[*]} (order counters quiet, exec lag <= $ORACLE_FEED_DRAIN_MAX_LAG; the feed's actions may move)"
 fi
 # STATE_HASH_ATTEST=1: every validator signs one AttestStateHash per 100-block
@@ -1966,7 +2134,7 @@ fi
 # attestations inside the window and empty on the accepting sample).
 ATTEST_DRAIN_ARGS=()
 if state_attest_on; then
-    ATTEST_DRAIN_ARGS=(--attest-live --attest-mempool-max 6 --attest-rpc "${RPCS[@]}")
+    ATTEST_DRAIN_ARGS=(--attest-live --attest-mempool-max $(( 2 * ${#RPCS[@]} )) --attest-rpc "${RPCS[@]}")
     log "attest-live drain: ${ATTEST_DRAIN_ARGS[*]} (order counters quiet and no other native action executed; the validators' AttestStateHash actions may move the native counter and mempool)"
 fi
 if python3 "$TOOLS_DIR/health.py" drain --out "$OUT" --timeout "$DRAIN_TIMEOUT" --quiet "$QUIET_S" \
@@ -2292,12 +2460,13 @@ cat "$OUT/agreement.jsonl" >> "$OUT/run.log"
 # campaign end pass scans each preserved log up to its length now (log-scans.sh).
 # [report-scans:ingest]
 BENCH_SUBMITTED=$(grep -oE 'Submitted \(load-gen accepted\): [0-9,]+' "$OUT/bench.log" | grep -oE '[0-9,]+$' | tr -d ,)
+NODE_LOGS=(); for i in $(node_indices); do NODE_LOGS+=("$RUN_DIR/val$i.log"); done
 if [ "$DEFER_REPORT_SCANS" = 1 ]; then
     EVICTED=""
-    INGEST_LOG_BYTES=$(file_bytes "$RUN_DIR/val0.log" "$RUN_DIR/val1.log" "$RUN_DIR/val2.log")
+    INGEST_LOG_BYTES=$(file_bytes "${NODE_LOGS[@]}")
     log "ingest scan deferred to the campaign end pass (DEFER_REPORT_SCANS=1; node log bytes $INGEST_LOG_BYTES; bench submitted=${BENCH_SUBMITTED:-?} actions)"
 else
-    EVICTED=$(for i in 0 1 2; do ingest_evicted "$RUN_DIR/val$i.log"; done)
+    EVICTED=$(for i in $(node_indices); do ingest_evicted "$RUN_DIR/val$i.log"; done)
     log "$(ingest_line "$BENCH_SUBMITTED" "$EVICTED")"
 fi
 # [/report-scans:ingest]
@@ -2321,11 +2490,11 @@ fi
 # carry the newest checkpoint's votes). state-attest.json; the verdict is
 # folded into summary.json below (state_attest.py summary).
 if state_attest_on; then
+    SA_ARGS=(); for i in "${ALL_IDX[@]}"; do SA_ARGS+=(--rpc "${RPCS[$i]}"); done
+    for i in "${ALL_IDX[@]}"; do SA_ARGS+=(--metrics "${METS_URLS[$i]}"); done
+    for i in "${ALL_IDX[@]}"; do SA_ARGS+=(--log "$RUN_DIR/val$i.log"); done
     STATE_ATTEST_LINE=$(python3 -I "$SELF_DIR/state_attest.py" scan \
-        --rpc "${RPCS[0]}" --rpc "${RPCS[1]}" --rpc "${RPCS[2]}" \
-        --metrics "http://127.0.0.1:${METS[0]}/metrics" --metrics "http://127.0.0.1:${METS[1]}/metrics" \
-        --metrics "http://127.0.0.1:${METS[2]}/metrics" \
-        --log "$RUN_DIR/val0.log" --log "$RUN_DIR/val1.log" --log "$RUN_DIR/val2.log" \
+        "${SA_ARGS[@]}" \
         --keys "$ORACLE_KEYS" --wait-s 90 --hole-wait-s 100 --activation "$STATE_HASH_ACTIVATION" --out "$OUT/state-attest.json" \
         ${KNR_EXCLUDE_ARGS[@]+"${KNR_EXCLUDE_ARGS[@]}"} 2>&1) \
         || STATE_ATTEST_LINE="state attest: ok=0 scan failed: $(tail -c 400 <<<"$STATE_ATTEST_LINE")"
@@ -2344,14 +2513,14 @@ fi
 #   da_outbound_fail = native-da / block-data OUTBOUND FAILURE
 #   starvation = header-first body starvation
 #   pacing = exec-backlog pacing lines (selection caps scaled down / cancels-only)
-DISSEM=$(python3 "$TOOLS_DIR/collect_logs.py" --logs "$RUN_DIR/val0.log" "$RUN_DIR/val1.log" "$RUN_DIR/val2.log" \
+DISSEM=$(python3 "$TOOLS_DIR/collect_logs.py" --logs "${NODE_LOGS[@]}" \
     --out "$OUT/log-summary.json") || { log "log collection failed"; exit 1; }
 log "dissemination/pacing log counts: $DISSEM"
 # The node logs are preserved here (val<i>.log.gz, always in-line: the next cell's
 # launch overwrites RUN_DIR/val<i>.log); the excerpt is report-only (DEFER_REPORT_SCANS=1:
 # the campaign end pass writes it from the .gz, deferred-scans.json marks the cell).
 # [report-scans:save]
-for i in 0 1 2; do
+for i in $(node_indices); do
     [ "$DEFER_REPORT_SCANS" = 1 ] || log_excerpt "$RUN_DIR/val$i.log" > "$OUT/val$i.log.excerpt"
     gzip -c "$RUN_DIR/val$i.log" > "$OUT/val$i.log.gz"
 done
@@ -2382,7 +2551,7 @@ if [ -n "$CRASH_KILL_AT_S" ] && [ -s "$OUT/crash-kill.json" ]; then
 fi
 
 # ---------------------------------------------------------------- 10. analysis
-for i in 0 1 2; do
+for i in "${ALL_IDX[@]}"; do
     { echo "== win60 val$i (all samples)"; awk -f "$TOOLS_DIR/win60.awk" "$OUT/funnel-val$i.csv";
       echo "== phase60 val$i"; awk -f "$TOOLS_DIR/phase60.awk" "$OUT/phase-val$i.csv"; } > "$OUT/analysis-val$i.txt" 2>&1
 done
@@ -2453,6 +2622,17 @@ fi
 # summary.json .state_attest (+ its REJECT fold): from state-attest.json.
 if state_attest_on && [ "$rc" = 0 ]; then
     python3 -I "$SELF_DIR/state_attest.py" summary --dir "$OUT" >/dev/null || log "WARNING: summary.json .state_attest not written"
+fi
+# 4-validator devnet / dead-leader knobs: summary.json .cell.n_validators, .genesis.leader_* (3 validators without
+# DL knobs: nothing written, the summary as before).
+if [ "$rc" = 0 ] && { [ "$N_VALIDATORS" != 3 ] || [ -n "$DL_K$DL_JCAP" ]; }; then
+    record_cell_shape "$OUT/summary.json" || log "WARNING: summary.json .cell.n_validators / .genesis.leader_* not written"
+fi
+# summary.json .dead_leader (DL_REPORT=1): the three windows around the kill and the exclusion (dl_window.py).
+if dl_report_on && [ "$rc" = 0 ]; then
+    DL_LINE=$(python3 -I "$SELF_DIR/dl_window.py" --dir "$OUT" --t-bench0 "$T_BENCH0" --t-bench1 "$T_BENCH1" \
+        --dl-k "${DL_K:-}" --dl-jcap "${DL_JCAP:-}" 2>&1) || DL_LINE="dead-leader window: FAILED: $(tail -c 400 <<<"$DL_LINE")"
+    log "$DL_LINE"
 fi
 # summary.json .evm_load: tx-flood stats + the scan + per-node torus_exec_evm_seconds deltas.
 if evm_load_on && [ "$rc" = 0 ]; then

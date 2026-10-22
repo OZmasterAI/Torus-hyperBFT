@@ -16,21 +16,24 @@ L=$(basename "$D")
 . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/log-scans.sh" || exit 1
 M=$D/$DEFERRED_MARKER
 [ -f "$M" ] || { echo "END PASS $L: nothing deferred (no $DEFERRED_MARKER)"; exit 0; }
-read -r SUB B0 B1 B2 < <(python3 -I -c '
+# ingest_log_bytes: one entry per validator log, 3 (4 on the 4-validator devnet, run-cell N_VALIDATORS=4)
+read -r SUB B0 B1 B2 B3 < <(python3 -I -c '
 import json, sys
 m = json.load(open(sys.argv[1]))
 b = m["ingest_log_bytes"]
-assert len(b) == 3 and all(isinstance(x, int) and x >= 0 for x in b)
+assert len(b) in (3, 4) and all(isinstance(x, int) and x >= 0 for x in b)
 print(m.get("bench_submitted") or "-", *b)' "$M") || { echo "END PASS FAIL $L: unreadable $M"; exit 1; }
 [ "$SUB" = - ] && SUB=
 BYTES=("$B0" "$B1" "$B2")
-for i in 0 1 2; do
+NODE_IDX="0 1 2"
+if [ -n "$B3" ]; then BYTES+=("$B3"); NODE_IDX="0 1 2 3"; fi
+for i in $NODE_IDX; do
     g=$D/val$i.log.gz
     [ -s "$g" ] && gzip -t "$g" 2>/dev/null || { echo "END PASS FAIL $L: $g missing or corrupt (marker kept)"; exit 1; }
 done
 T0=$(date +%s)
 EVICTED=
-for i in 0 1 2; do
+for i in $NODE_IDX; do
     zcat "$D/val$i.log.gz" 2>/dev/null | log_excerpt > "$D/val$i.log.excerpt"
     EVICTED+=$(zcat "$D/val$i.log.gz" 2>/dev/null | head -c "${BYTES[$i]}" | ingest_evicted)
 done

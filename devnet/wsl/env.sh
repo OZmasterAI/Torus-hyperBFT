@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# env.sh — shared topology for the WSL bare-metal 3-validator devnet.
-# Sourced by launch/stop/health scripts. Localhost only. NO docker, NO remote.
+# env.sh — shared topology for the WSL bare-metal 3-validator devnet (4 with
+# N_VALIDATORS=4, see below). Sourced by launch/stop/health scripts.
+# Localhost only. NO docker, NO remote.
 #
 # Host ports are chosen to avoid ANY collision with a live testnet node
 # (which conventionally holds 8545 / 30333 / 9090).
@@ -9,6 +10,12 @@
 # The libp2p PeerId is derived from the same ed25519 key, so the ids below are
 # fixed. val0/val1 ids are taken from devnet/docker-compose.yml (same keys);
 # val2 dials out to val0+val1 so no node needs val2's id up front.
+#
+# N_VALIDATORS=3 (default) | 4: how many validators launch-3val.sh starts
+# (tools/matched-bench/run-cell.sh N_VALIDATORS; the 4-validator devnet of the
+# dead-leader bench 9p, owner s138). val3 = KEY3 (devnet/genesis.json's 4th
+# validator pubkey), ports 30404 / 8648 / 9164, and it dials val0+val1+val2
+# (PID2, so the 4 nodes form a full mesh). Everything N=3 reads is unchanged.
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 BIN="$REPO/target/release/torus-node"
@@ -20,19 +27,32 @@ RUN_DIR="$DATA_ROOT/run"       # pids + logs
 KEY0=0100000000000000000000000000000000000000000000000000000000000000
 KEY1=0200000000000000000000000000000000000000000000000000000000000000
 KEY2=0300000000000000000000000000000000000000000000000000000000000000
+KEY3=0400000000000000000000000000000000000000000000000000000000000000
 
 # libp2p peer ids (deterministic from KEY0/KEY1)
 PID0=12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X
 PID1=12D3KooWH3uVF6wv47WnArKHk5p6cvgCJEb74UTmxztmQDc298L3
+# (KEY2/KEY3: base58(identity multihash of the protobuf ed25519 public key);
+# only val3 dials val2, PID3 is for reference)
+PID2=12D3KooWQYhTNQdmr3ArTeUHRYzFg94BKyTkoWBDWez9kSCVe2Xo
+PID3=12D3KooWLJtG8fd2hkQzTn96MrLvThmnNQjTUFZwGEsLRz5EmSzc
 
 # per-node ports
 P2P0=30401; RPC0=8645; MET0=9161
 P2P1=30402; RPC1=8646; MET1=9162
 P2P2=30403; RPC2=8647; MET2=9163
+P2P3=30404; RPC3=8648; MET3=9164
 
 # dial edges (localhost multiaddrs)
 PEER_TO_V0=/ip4/127.0.0.1/udp/$P2P0/quic-v1/p2p/$PID0
 PEER_TO_V1=/ip4/127.0.0.1/udp/$P2P1/quic-v1/p2p/$PID1
+PEER_TO_V2=/ip4/127.0.0.1/udp/$P2P2/quic-v1/p2p/$PID2
+
+N_VALIDATORS="${N_VALIDATORS:-3}"
+case "$N_VALIDATORS" in
+    3|4) ;;
+    *) echo "env.sh: N_VALIDATORS must be 3 or 4 (got '$N_VALIDATORS')" >&2; return 1 2>/dev/null || exit 1 ;;
+esac
 
 # node runtime env — mirror the S415/S458 devnet body-push tuning so a later
 # bench run (A3) executes against the same consensus config as idle bring-up.
@@ -95,3 +115,7 @@ fi
 
 METRICS_PORTS="$MET0 $MET1 $MET2"
 RPC_URLS="http://localhost:$RPC0 http://localhost:$RPC1 http://localhost:$RPC2"
+if [ "$N_VALIDATORS" = 4 ]; then
+    METRICS_PORTS="$METRICS_PORTS $MET3"
+    RPC_URLS="$RPC_URLS http://localhost:$RPC3"
+fi

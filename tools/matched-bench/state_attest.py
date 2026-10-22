@@ -88,7 +88,8 @@ REASON = "state hash attestation failed: "
 
 # ------------------------------------------------------------------ keys
 def read_keys(path):
-    """[(index, address lowercase, private key hex without 0x)] sorted by index, exactly indices 0, 1, 2"""
+    """[(index, address lowercase, private key hex without 0x)] sorted by index, exactly indices 0, 1, 2 (0..3 for
+    the 4-validator devnet's devnet/wsl/keys-4val/bench-validator-keys.json, run-cell N_VALIDATORS=4)"""
     with open(path) as f:
         d = json.load(f)
     out = []
@@ -105,7 +106,7 @@ def read_keys(path):
             )
         out.append((int(v["index"]), a, k.lower()))
     out.sort()
-    if [i for i, _, _ in out] != [0, 1, 2]:
+    if [i for i, _, _ in out] not in ([0, 1, 2], [0, 1, 2, 3]):
         raise ValueError(
             "%s: need validators with index 0, 1, 2 (got %s)"
             % (path, [i for i, _, _ in out])
@@ -787,7 +788,7 @@ def main(argv=None):
         "--exclude",
         action="append",
         default=[],
-        choices=("val1", "val2"),
+        choices=("val1", "val2", "val3"),
         help="run-cell KILL_NO_RESTART: a validator killed without restart (its --rpc/--metrics/--log are not read, "
         "its votes not required)",
     )
@@ -818,6 +819,10 @@ def main(argv=None):
                 % len(keys),
                 file=sys.stderr,
             )
+            return 2
+        if any(int(n[3:]) >= len(keys) for n in a.exclude):
+            print("state_attest.py scan: --exclude %s: not one of the %d validators" % (" ".join(a.exclude), len(keys)),
+                  file=sys.stderr)
             return 2
         out = scan(
             [Rpc(u) for u in a.rpc],
