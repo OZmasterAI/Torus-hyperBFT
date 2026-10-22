@@ -4016,6 +4016,11 @@ impl FetchPeers {
         Self { live, quiet }
     }
 
+    /// Fast-phase attempt budget (RED stub: the current fixed budget).
+    fn fast_budget(&self, _quiet_tail: u8) -> u8 {
+        MAX_BODY_RETRIES_TOTAL
+    }
+
     /// Fast-phase target for attempt `attempt` (0-based, `< MAX_BODY_RETRIES_TOTAL`); the last
     /// `min(quiet, quiet_tail)` attempts go to the quiet validators. `None` when there is no
     /// validator besides the origin (the old "no remaining targets" give-up).
@@ -4187,6 +4192,42 @@ mod body_fetch_rotation_tests {
         // Silent proposer: live validators take its asks, the quiet one still gets its one.
         let slow: Vec<_> = (0..4).map(|s| mixed.slow_target(s, &origin, false)).collect();
         assert_eq!(slow, vec![vk(5), vk(3), vk(5), vk(5)]);
+    }
+
+    /// Codex P2 on 5f216e6a, every split: the justify schedule (with its reserved quiet slots)
+    /// asks every validator the old committed-order rotation asked, asks no quiet validator
+    /// before a live one, and is exactly the old schedule when nobody is quiet.
+    #[test]
+    fn justify_schedule_covers_the_old_schedule_for_every_quiet_split() {
+        let origin = vk(200);
+        let rot = (MAX_BODY_RETRIES_TOTAL - MAX_BODY_RETRIES) as usize;
+        for n in 0..=10u8 {
+            let others: Vec<VerifyingKey> = (0..n).map(|i| vk(i + 1)).collect();
+            for mask in 0u32..(1 << n) {
+                let p = FetchPeers::split(others.iter().copied(), &vk(250), &origin, |k| {
+                    let i = others.iter().position(|o| o == k).unwrap();
+                    mask & (1 << i) == 0
+                });
+                let budget = p.fast_budget(QUIET_JUSTIFY_FETCH_SLOTS);
+                assert!(budget >= MAX_BODY_RETRIES_TOTAL);
+                let new: Vec<_> = (0..budget).map(|a| p.fast_target(a, &origin, QUIET_JUSTIFY_FETCH_SLOTS)).collect();
+                if mask == 0 {
+                    assert_eq!(budget, MAX_BODY_RETRIES_TOTAL, "all up: budget unchanged");
+                    let old: Vec<_> = (0..budget).map(|a| rotated_body_fetch_target(a, MAX_BODY_RETRIES, &origin, &others)).collect();
+                    assert_eq!(new, old, "all up: schedule unchanged");
+                }
+                if n > 0 {
+                    for old_target in others.iter().take(rot) {
+                        assert!(new.contains(&Some(*old_target)), "n={n} mask={mask:b}: old target dropped");
+                    }
+                }
+                let last_live = new.iter().rposition(|t| t.is_some_and(|t| p.live.contains(&t)));
+                let first_quiet = new.iter().position(|t| t.is_some_and(|t| p.quiet.contains(&t)));
+                if let (Some(l), Some(q)) = (last_live, first_quiet) {
+                    assert!(l < q, "n={n} mask={mask:b}: quiet asked before a live one");
+                }
+            }
+        }
     }
 
     #[test]
@@ -5212,7 +5253,13 @@ mod s63_body_fetch_tests {
     /// armed exactly as in production), with the tracker pinned to
     /// `(t0, count, origin, first)` for deterministic timing.
     fn fetch_fixture(t0: Instant, count: u8, first: Instant) -> FetchFixture {
-        let keys = signing_keys(&[1, 2, 3, 4]);
+        fetch_fixture_n(t0, count, first, 4)
+    }
+
+    /// [`fetch_fixture`] with `n` equal-power validators.
+    fn fetch_fixture_n(t0: Instant, count: u8, first: Instant, n: u8) -> FetchFixture {
+        let seeds: Vec<u8> = (1..=n).collect();
+        let keys = signing_keys(&seeds);
         let set = validator_set(&keys);
         let (mut tree, vss) = steady_block_tree(&set);
         let view = ViewNumber::new(1);
@@ -5526,6 +5573,45 @@ mod s63_body_fetch_tests {
         assert!(first_quiet >= (MAX_BODY_RETRIES_TOTAL as usize) - quiet.len(),
             "quiet validators asked before the late reserved slots: {:?}", label(&f, &seen));
         assert!(seen[..first_quiet].iter().all(|(_, t)| *t == f.origin));
+    }
+
+    /// Codex P2 on 5f216e6a: reserving quiet-validator slots must not cost a live validator its
+    /// ask. 10 validators: requester, proposer, six live, two quiet; only `live[5]` holds the
+    /// justify block. The old schedule asked it (attempt 7); it must still be asked before the
+    /// justify fetch gives up to sync (there is no slow phase), and the quiet ones still last.
+    #[test]
+    fn justify_fetch_reserving_quiet_slots_still_asks_every_live_validator() {
+        let t0 = Instant::now();
+        let mut f = fetch_fixture_n(t0, 0, t0, 10);
+        assert_eq!(f.others.len(), 8);
+        let quiet = f.others[6..].to_vec();
+        let holder = f.others[5];
+        let hash = CryptoHash::new([97; 32]);
+        f.hotstuff.set_started_at_for_test(t0.checked_sub(Duration::from_secs(60)).unwrap());
+        let mut seen = Vec::new();
+        let mut gave_up = false;
+        for attempt in 0..32u8 {
+            let now = Instant::now();
+            for vk in f.others.iter().chain(std::iter::once(&f.origin)).filter(|vk| !quiet.contains(vk)) {
+                f.hotstuff.note_peer_heard(vk, now);
+            }
+            let stale = now.checked_sub(BODY_RETRY_INTERVAL * 2).unwrap();
+            f.hotstuff.justify_fetch_tracker.insert(hash, (stale, attempt, f.origin, ViewNumber::new(1)));
+            f.hotstuff.tick_justify_fetch_retries(&f.tree);
+            let asked = f.net.take();
+            if asked.is_empty() {
+                gave_up = !f.hotstuff.justify_fetch_tracker.contains_key(&hash);
+                break;
+            }
+            seen.extend(asked);
+            if seen.contains(&holder) {
+                break;
+            }
+        }
+        assert!(seen.contains(&holder), "live[5] never asked before the sync fallback (gave_up={gave_up}, {} asks)", seen.len());
+        assert!(!gave_up && !f.hotstuff.take_sync_needed());
+        let first_live5 = seen.iter().position(|t| *t == holder).unwrap();
+        assert!(seen[..first_live5].iter().all(|t| !quiet.contains(t)), "a quiet validator was asked before a live one");
     }
 
     /// Slow-phase retries stop quietly once the block reached the tree by
