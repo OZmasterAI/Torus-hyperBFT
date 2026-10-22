@@ -107,6 +107,8 @@ fn set_grace(db: &StateDb, n: u64) {
 fn setup(traders: &[u8]) -> (tempfile::TempDir, StateDb) {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let s = FixedPoint::SCALE;
     for m in [M, OTHER] {
         let row = borsh::to_vec(&("BTC".to_string(), "USD".to_string(), s, s, 5 * s)).unwrap();

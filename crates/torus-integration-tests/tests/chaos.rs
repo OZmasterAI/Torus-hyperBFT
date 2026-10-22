@@ -247,6 +247,8 @@ fn test_state_recovery_after_crash() {
 #[test]
 #[ignore]
 fn test_replay_determinism() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let num_blocks = 20;
     let initial_funding = fp(10_000_000);
     let num_traders = 12; // traders 1-10 for orders, 11 for oracle, 12 for lockbox
@@ -330,6 +332,8 @@ fn test_replay_determinism() {
 /// the actual native-CF write patterns of orders / cancels / oracle / lockbox / governance / fees.
 #[test]
 fn native_incremental_root_matches_full_scan_under_real_execution() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
     use torus_state::native_trie::{
         build_native_trie_to_cf, native_root_full, persisted_native_root,
@@ -391,6 +395,8 @@ fn native_incremental_root_matches_full_scan_under_real_execution() {
 /// keeps the incremental native root equal to the full scan.
 #[test]
 fn oracle_block_start_step_keeps_incremental_root_equal_to_full_scan() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
     use torus_economics::{StakingManager, ValidatorState, ValidatorStatus, MIN_SELF_DELEGATION};
     use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_ORACLE};
@@ -457,6 +463,8 @@ fn oracle_block_start_step_keeps_incremental_root_equal_to_full_scan() {
 /// vault positions) keeps the incremental native root equal to the full scan.
 #[test]
 fn liquidation_step_keeps_incremental_root_equal_to_full_scan() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
     use torus_core::liquidation::LIQUIDATOR_VAULT;
     use torus_core::position::{MarginType, PositionManager};

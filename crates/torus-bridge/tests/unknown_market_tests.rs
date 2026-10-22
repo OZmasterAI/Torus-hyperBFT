@@ -31,6 +31,8 @@ fn fp(n: i64) -> FixedPoint {
 /// A DB with market 1 listed (placeholder row: tick / lot 1) and traders
 /// 1..=4 funded.
 fn listed_db() -> (tempfile::TempDir, StateDb) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().expect("tempdir");
     let db = StateDb::open(dir.path()).expect("open db");
     db.put_cf_raw(CF_NATIVE_MARKETS, &LISTED.to_be_bytes(), b"listed")

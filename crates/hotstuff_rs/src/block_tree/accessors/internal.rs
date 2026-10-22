@@ -1724,19 +1724,19 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         Ok(())
     }
 
-    /// Get the highest QC for inclusion in a timeout vote.
+    /// Get the highest QC for inclusion in a timeout vote: the highest PC, unless it is the genesis
+    /// PC.
+    ///
+    /// s138 (Codex P1 on 138a9219): reported even when the local tip is newer (it was omitted then).
+    /// The TC's high QC then bounds every signer's lock (a lock is at most the highest PC), which
+    /// the winner rule ([`high_tip_wins`](crate::pacemaker::types::high_tip_wins)) relies on: a
+    /// replica locked on QC(W, 3) whose tip is (U, 4) on another branch hid its QC, the TC's tip U
+    /// won against a lower high QC, and the replica refused U's re-proposals forever.
     pub fn highest_qc_for_timeout(
         &self,
     ) -> Result<Option<crate::hotstuff::types::PhaseCertificate>, BlockTreeError> {
         let highest_pc = self.highest_pc()?;
-        if highest_pc.is_genesis_pc() {
-            return Ok(None);
-        }
-        let local_tip = self.local_tip()?;
-        match local_tip {
-            Some(tip) if highest_pc.view < tip.view => Ok(None),
-            _ => Ok(Some(highest_pc)),
-        }
+        Ok((!highest_pc.is_genesis_pc()).then_some(highest_pc))
     }
 
     /// MonadBFT B2: Get the (view, block_hash) of the last proposal this validator voted for.

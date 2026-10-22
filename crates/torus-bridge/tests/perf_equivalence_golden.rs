@@ -132,6 +132,8 @@ const REPORTERS: [u8; 3] = [150, 151, 152];
 
 /// Three Active validators (the mark reporters) and `markets` listed.
 fn listed_db(markets: &[MarketId]) -> (tempfile::TempDir, StateDb) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().expect("tempdir");
     let db = StateDb::open(dir.path()).expect("open db");
     configure_activation(&db, Some(1)).unwrap();

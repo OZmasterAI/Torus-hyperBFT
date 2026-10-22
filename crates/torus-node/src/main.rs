@@ -941,6 +941,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         listen_addr,
         bootstrap_peers,
         allow_private_addrs: cli.p2p_private_addrs,
+        // Owner s138 (K question, option B): peers compare genesis digests
+        // (the P0.0 phase 4 digest this data dir is bound to) at connect time
+        // and refuse a mismatch. No `--genesis`: none (default chain config),
+        // and every peer with a genesis file refuses this node.
+        genesis_digest: genesis_file.as_ref().map(|(_, digest)| digest.digest.0),
         ..NetworkConfig::default()
     };
 

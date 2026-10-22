@@ -216,6 +216,62 @@ fn aggregated_price_key(market_id: MarketId) -> Vec<u8> {
     key
 }
 
+#[cfg(feature = "test-unmarked-markets")]
+static TEST_UNMARKED_AS_MARKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// TEST-ONLY (feature `test-unmarked-markets`, enabled from dev-dependencies
+/// only: no node build compiles it). From this call on, in this PROCESS,
+/// [`ever_marked`] answers `true` for every market, as before owner s138's
+/// never-marked rule: fixtures written before the rule keep trading on
+/// markets without an oracle mark (their engine mechanics, not the rule, are
+/// under test). Sticky and process-wide: never call it in a test binary that
+/// tests the rule itself (`first_mark_tests`, `oracle_tests`, the RPC
+/// `first_mark_ingress_tests` share no binary with a caller).
+#[cfg(feature = "test-unmarked-markets")]
+#[doc(hidden)]
+pub fn test_treat_unmarked_as_marked() {
+    TEST_UNMARKED_AS_MARKED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "test-unmarked-markets")]
+thread_local! {
+    static TEST_UNMARKED_ON_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// TEST-ONLY: [`test_treat_unmarked_as_marked`] for the CALLING THREAD only
+/// (for a test binary that also tests the rule, e.g. torus-rpc's lib tests:
+/// `cargo test` runs its tests on separate threads of one process). Only
+/// reads on this thread see it: single-path and batch placements check the
+/// rule on the calling thread.
+#[cfg(feature = "test-unmarked-markets")]
+#[doc(hidden)]
+pub fn test_treat_unmarked_as_marked_on_this_thread() {
+    TEST_UNMARKED_ON_THREAD.with(|c| c.set(true));
+}
+
+/// Owner s138: whether `market_id` has EVER had an oracle mark — its
+/// aggregate row exists with a price > 0 (fresh or stale: a stale one keeps
+/// the band's stale fallback). No row (never aggregated) is `Ok(false)`: the
+/// market has no price band, so the executor refuses orders there
+/// (`FailureReason::MarketNeverMarked`) and the RPC intake answers the same.
+/// Only aggregation writes the row and nothing deletes it, so once `true`
+/// it stays `true`. `Err` is a local fault (read failed, row undecodable).
+pub fn ever_marked<S: StateBackend>(state: &S, market_id: MarketId) -> Result<bool, CoreError> {
+    #[cfg(feature = "test-unmarked-markets")]
+    if TEST_UNMARKED_AS_MARKED.load(std::sync::atomic::Ordering::Relaxed)
+        || TEST_UNMARKED_ON_THREAD.with(std::cell::Cell::get)
+    {
+        return Ok(true);
+    }
+    match state.get_cf_raw(CF_NATIVE_ORACLE, &aggregated_price_key(market_id))? {
+        None => Ok(false),
+        Some(data) => Ok(StoredAggregatedPrice::try_from_slice(&data)
+            .map_err(|e| CoreError::Borsh(e.to_string()))?
+            .price
+            > FixedPoint::ZERO),
+    }
+}
+
 // ============================================================================
 // OracleManager
 // ============================================================================
@@ -399,6 +455,11 @@ impl<T: StateBackend> OracleManager<T> {
             Err(CoreError::NoOraclePrice(_)) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Owner s138: [`ever_marked`] on this manager's state.
+    pub fn ever_marked(&self, market_id: MarketId) -> Result<bool, CoreError> {
+        ever_marked(&self.state, market_id)
     }
 
     /// Block-start step: delete every submission row (all markets) whose block

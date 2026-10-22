@@ -141,6 +141,8 @@ struct Scenario {
 }
 
 fn run(s: &Scenario, mode: Mode, fast: bool) -> RunFingerprint {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     with_fast_sell_top_ups(fast, || {
         let dir = tempfile::tempdir().expect("temp dir");
         let db = StateDb::open(dir.path()).expect("open db");

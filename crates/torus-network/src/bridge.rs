@@ -217,6 +217,9 @@ impl LibP2PNetwork {
 
         let (native_inbound_tx, native_inbound_rx) = mpsc::unbounded_channel();
         let (evm_inbound_tx, evm_inbound_rx) = mpsc::unbounded_channel();
+        // Owner s138: protocol / topic names and the identify check are keyed
+        // by the genesis digest (crate::genesis_id).
+        let genesis = crate::genesis_id::NetworkGenesis::new(config.genesis_digest);
         let shared = Arc::new(SharedState {
             inbound: Mutex::new(VecDeque::new()),
             peer_map: RwLock::new(PeerMap::default()),
@@ -253,6 +256,7 @@ impl LibP2PNetwork {
             outbound_forward_batches: Mutex::new(HashMap::new()),
             leader_resolver: RwLock::new(None),
             validate_tee: OnceLock::new(),
+            genesis,
         });
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -299,12 +303,13 @@ impl LibP2PNetwork {
             .with_dns()
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
             .with_behaviour(|key| {
-                TorusBehaviour::with_limits_and_heartbeat(
+                TorusBehaviour::with_genesis(
                     key,
                     max_peers,
                     gossipsub_heartbeat_ms,
                     gossip_max_transmit,
                     gossipsub_queue_len,
+                    genesis,
                 )
                 .expect("failed to create TorusBehaviour")
             })
@@ -314,6 +319,12 @@ impl LibP2PNetwork {
             })
             .build();
 
+        info!(
+            local_peer_id = %swarm.local_peer_id(),
+            genesis_digest = %genesis,
+            identify = %genesis.identify_protocol_version(),
+            "p2p identity: peers with another genesis digest are refused"
+        );
         swarm.listen_on(config.listen_addr.clone())?;
 
         for (peer_id, addr) in &config.bootstrap_peers {
@@ -858,6 +869,7 @@ mod tests {
             outbound_forward_batches: Mutex::new(HashMap::new()),
             leader_resolver: RwLock::new(None),
             validate_tee: OnceLock::new(),
+            genesis: crate::genesis_id::NetworkGenesis::default(),
         })
     }
 

@@ -51,7 +51,7 @@ criterion = { workspace = true }
 foldhash = "0.2"
 # Item 6 Phase 2 (plan 9.8): this crate's own tests reach the core reference
 # paths (`PositionCache::flush_all_per_row`) the feature build does.
-torus-core = { workspace = true, features = ["test-reference-paths"] }
+torus-core = { workspace = true, features = ["test-reference-paths", "test-unmarked-markets"] }
 # Item 6 Phase 4 step 2: raw R (`ResidentRows::build`), the reference of the
 # Users-source differentials.
 torus-state = { workspace = true, features = ["test-reference-paths"] }

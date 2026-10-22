@@ -544,6 +544,8 @@ fn seed_aliases(db: &StateDb) {
 /// market (placeholder rows, tick / lot 1, as the old implicit book; as
 /// `settle_no_merge_tests.rs`).
 fn list_markets(db: &StateDb) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     for m in 1..=64u64 {
         db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed")
             .unwrap();
