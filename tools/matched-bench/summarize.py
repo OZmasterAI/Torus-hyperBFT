@@ -14,7 +14,7 @@ thread's own timer, so counting worker ms into it drives residual_untimed
 negative and the percentages past 100 %.
 """
 import argparse, csv, json, os, re, statistics, sys, time
-from health import assess_liveness, acceptance, DEFAULT_STALL_S
+from health import assess_liveness, acceptance, kill_dissemination, DEFAULT_STALL_S
 
 ap = argparse.ArgumentParser()
 for a in ["out", "label", "worktree", "commit", "dirty", "markets", "dur", "rate", "senders",
@@ -1543,6 +1543,24 @@ if dissem:
         for n in ('val0', 'val1', 'val2') for k in fail_keys)
     dissem["dissemination_clean"] = (False if dissem["total_failures"] > 0 else
                                      True if evidence_complete else None)
+    # KILL_NO_RESTART (s138, bench 9k2): the survivors' sends to the killed
+    # validator fail once it is gone; those lines alone do not fail the cell.
+    # The per-peer evidence is collect_logs.py's log-summary.json (from the
+    # node logs): a line is exempt only if it failed toward the killed node,
+    # at or after its kill; everything else (between the survivors,
+    # unattributed, no per-line records) still fails it.
+    # total_failures keeps the raw count.
+    if DEAD_NODE and dissem["total_failures"] > 0:
+        try:
+            with open(os.path.join(OUT, "log-summary.json")) as f:
+                log_summary = json.load(f)
+        except (OSError, ValueError):
+            log_summary = {}
+        kd = kill_dissemination(log_summary, DEAD_NODE, NORESTART.get("kill_ts"),
+                                counts={n: d for n, d in dissem.items() if n.startswith("val")})
+        dissem["kill_exemption"] = kd
+        if evidence_complete:
+            dissem["dissemination_clean"] = kd["clean"]
 
 # ---------------------------------------------------------------- cpu
 cpu = {}
