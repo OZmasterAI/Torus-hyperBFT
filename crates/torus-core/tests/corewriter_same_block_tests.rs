@@ -643,7 +643,7 @@ impl<T: StateBackend> StateBackend for PointReads<T> {
 /// (10M gas every two blocks: ~450 enqueues per two blocks) grows the
 /// same-block backlog every block, and a walk from the queuing block that
 /// reads every full target costs O(backlog) unmetered point reads per call.
-/// Here 600 enqueues every second block (300 a block against a drain of
+/// Here 800 enqueues every second block (400 a block against a drain of
 /// 200), 10% of them orders, step 2's rules before the activation `H` (its
 /// backlog of full targets runs past `H`) and T's from `H`; txs of 1 to 3
 /// calls in a block journal, a fifth of them reverted; each block drains
@@ -682,7 +682,7 @@ fn t_sustained_same_block_overload_keeps_reads_per_enqueue_constant() {
                 };
                 let ov = NativeStateOverlay::new(db.clone());
                 let mut max_reads = 0usize;
-                let mut left: u64 = if block % 2 == 0 { 600 } else { 0 };
+                let mut left: u64 = if block % 2 == 0 { 800 } else { 0 };
                 while left > 0 {
                     let calls = (1 + next(3)).min(left);
                     left -= calls;
@@ -780,11 +780,6 @@ fn t_sustained_same_block_overload_keeps_reads_per_enqueue_constant() {
             "replay after crashes = the straight run ({cf})"
         );
     }
-    assert!(
-        straight.backlog_targets >= 100,
-        "the backlog grows: {} full targets after {TO}",
-        straight.backlog_targets
-    );
     let first = straight.reads.iter().map(|r| r.1).max().unwrap();
     let late = straight
         .reads
@@ -795,6 +790,11 @@ fn t_sustained_same_block_overload_keeps_reads_per_enqueue_constant() {
         .unwrap();
     eprintln!(
         "backlog {} targets; max point reads per non-order T enqueue: all {first}, from H + 20 {late}",
+        straight.backlog_targets
+    );
+    assert!(
+        straight.backlog_targets >= 100,
+        "the backlog grows: {} full targets after {TO}",
         straight.backlog_targets
     );
     // Constant: the T cursor, step 2's cursor and run rows, one probe (and
