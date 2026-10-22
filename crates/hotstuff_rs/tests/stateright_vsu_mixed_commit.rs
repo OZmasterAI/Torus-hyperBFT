@@ -229,8 +229,7 @@ impl VsuModel {
             .chain(replicas.iter().map(|r| r.hvv))
             .max()
             .unwrap_or(QA_VIEW);
-        let mut view = last + offset;
-        for _ in 0..SUFFIX_VIEWS {
+        for view in (last + offset..).take(SUFFIX_VIEWS as usize) {
             // The TC (or the nudge) of the previous view: every honest replica learns the highest PC.
             let high = replicas.iter().filter_map(|r| r.highest).max_by_key(|pc| pc.view);
             if let Some(high) = high {
@@ -268,7 +267,6 @@ impl VsuModel {
             if let Some(pc) = formed {
                 replicas.iter_mut().for_each(|r| r.update(pc));
             }
-            view += 1;
         }
         replicas.iter().all(|r| r.decided)
     }
