@@ -1,0 +1,39 @@
+# summary-owned-keys.txt: every top-level summary.json key summarize.py writes (always or
+# conditionally: crash_kills, kill_no_restart, kill_record_check) or one of the scripts
+# resummarize.sh runs after it re-derives (preload.py, evm_load.py, state_attest.py,
+# dl_window.py). resummarize.sh restores an old-summary key the new summary lacks ONLY when
+# it is not listed here: a listed key missing from the new summary was dropped on purpose
+# (e.g. kill_no_restart once its kill record is rejected) and must stay dropped.
+# One key per line; test_harness.SummaryOwnedKeysTest fails when a writer adds a key not here.
+agreement
+bench_log_tail
+binaries
+cell
+commit
+consensus_by_node
+cpu
+crash
+crash_kills
+dead_leader
+dirty_files
+dissemination
+evm_load
+funnel_by_node
+generated_at
+genesis
+headline
+idle_blk_s
+ingest
+kill_no_restart
+kill_record_check
+label
+liveness
+phase_by_node
+preload
+proc_cpu_by_node
+sched_by_node
+state_attest
+status
+timing
+validity
+worktree

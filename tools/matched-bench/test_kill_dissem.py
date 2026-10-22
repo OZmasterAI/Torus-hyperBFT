@@ -23,6 +23,7 @@ import gzip
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -40,6 +41,7 @@ PIDS = {
     "val0": "12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X",
     "val1": "12D3KooWH3uVF6wv47WnArKHk5p6cvgCJEb74UTmxztmQDc298L3",
     "val2": "12D3KooWQYhTNQdmr3ArTeUHRYzFg94BKyTkoWBDWez9kSCVe2Xo",
+    "val3": "12D3KooWRh4vYq7nE2sXk8cNfUwLdGmTpA9zBj5HyQe3VtKoC1Ms",  # N_VALIDATORS=4
 }
 KILL_TS = BENCH_START + KILL_AT + 0.5  # write_kill_record's default kill_ts
 HASH_V1 = bytes(range(1, 33))  # a block val1 proposed (val1 re-sent its header)
@@ -109,10 +111,10 @@ def resend(t, h, view=2508):
     )
 
 
-def write_logs(d, extra, gz=False):
+def write_logs(d, extra, gz=False, nodes=("val0", "val1", "val2")):
     """val<i>.log (or .log.gz) per node: its local_peer_id line, some noise, then extra[node] lines."""
     paths = []
-    for node in ("val0", "val1", "val2"):
+    for node in nodes:
         text = (
             startup(node)
             + line(BENCH_START, "FULL-BODY push bytes=10")
@@ -128,8 +130,8 @@ def write_logs(d, extra, gz=False):
     return paths
 
 
-def summary_of(d, extra, gz=False):
-    return collect_all(write_logs(d, extra, gz))
+def summary_of(d, extra, gz=False, nodes=("val0", "val1", "val2")):
+    return collect_all(write_logs(d, extra, gz, nodes))
 
 
 AFTER = (
@@ -292,6 +294,81 @@ class KillDisseminationTest(unittest.TestCase):
                 summary_of(self.d, {"val0": [outbound(AFTER, "val2")]}), None, None
             )
         )
+
+
+FOUR = ("val0", "val1", "val2", "val3")
+
+
+class FourValidatorKillDisseminationTest(unittest.TestCase):
+    """run-cell.sh N_VALIDATORS=4: the killed node may be val3, three survivors
+    stay strict among themselves, and val3's own lines are judged like any node's."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="kd-4val-")
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+
+    def judge(self, extra, killed="val3", nodes=FOUR):
+        return kill_dissemination(
+            summary_of(self.d, extra, nodes=FOUR), killed, KILL_TS, nodes=nodes
+        )
+
+    def test_collect_all_resolves_peers_and_proposers_across_four_logs(self):
+        s = summary_of(
+            self.d,
+            {"val0": [body_fallback(AFTER, HASH_V2)], "val3": [resend(AFTER - 5, HASH_V2)]},
+            nodes=FOUR,
+        )
+        self.assertEqual(sorted(s), list(FOUR))
+        self.assertEqual(s["val3"]["local_peer_id"], PIDS["val3"])
+        self.assertEqual(s["val0"]["failures"][0]["proposers"], ["val3"])
+
+    def test_failures_toward_a_killed_val3_after_its_kill_are_exempt(self):
+        r = self.judge(
+            {
+                "val0": [outbound(AFTER, "val3")] * 4,
+                "val1": [outbound(AFTER, "val3", "block-data")],
+                "val2": [outbound(AFTER + 2, "val3")] * 2,
+            }
+        )
+        self.assertIs(r["clean"], True, r)
+        self.assertEqual(r["exempt_toward_killed"], 7)
+
+    def test_failures_between_any_two_of_three_survivors_still_reject(self):
+        for src, dst in (("val0", "val1"), ("val1", "val2"), ("val2", "val0")):
+            r = self.judge({src: [outbound(AFTER, "val3"), outbound(AFTER, dst)]})
+            self.assertIs(r["clean"], False, (src, dst))
+            self.assertEqual(r["exempt_toward_killed"], 1)
+            self.assertEqual(r["live_by_node"][src]["toward"], {dst: 1})
+
+    def test_val3s_failures_count_when_another_node_is_killed(self):
+        # killed val2: a surviving val3's failure toward val2 is exempt, toward val1 is not
+        r = self.judge({"val3": [outbound(AFTER, "val2")]}, killed="val2")
+        self.assertIs(r["clean"], True, r)
+        r = self.judge({"val3": [outbound(AFTER, "val1")]}, killed="val2")
+        self.assertIs(r["clean"], False)
+        self.assertEqual(r["live_by_node"]["val3"]["toward"], {"val1": 1})
+
+    def test_killed_val3s_own_pre_kill_lines_and_pre_kill_sends_toward_it_count(self):
+        self.assertIs(self.judge({"val3": [outbound(KILL_TS - 2, "val0")]})["clean"], False)
+        self.assertIs(self.judge({"val0": [outbound(KILL_TS - 1, "val3")]})["clean"], False)
+
+    def test_a_val3_failure_is_never_dropped_by_the_default_node_set(self):
+        # nodes=None: val3 in the log summary (or the counts) puts it in the node set
+        s = summary_of(self.d, {"val3": [outbound(AFTER, "val1")]}, nodes=FOUR)
+        self.assertIs(kill_dissemination(s, "val2", KILL_TS)["clean"], False)
+        s = summary_of(self.d, {"val0": [outbound(AFTER, "val3")]}, nodes=FOUR)
+        self.assertIs(kill_dissemination(s, "val3", KILL_TS)["clean"], True)
+
+    def test_collect_logs_cli_takes_four_logs_and_rejects_two(self):
+        paths = write_logs(self.d, {"val1": [outbound(AFTER, "val3")]}, nodes=FOUR)
+        out = Path(self.d) / "log-summary.json"
+        cli = [sys.executable, os.path.join(HERE, "collect_logs.py"), "--out", str(out), "--logs"]
+        p = subprocess.run(cli + [str(x) for x in paths], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("val3:", p.stdout)
+        self.assertEqual(sorted(json.loads(out.read_text())), list(FOUR))
+        p = subprocess.run(cli + [str(x) for x in paths[:2]], capture_output=True, text=True)
+        self.assertNotEqual(p.returncode, 0)
 
 
 def dissem_arg(log_summary):

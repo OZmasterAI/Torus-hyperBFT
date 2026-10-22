@@ -10,7 +10,8 @@
 # tools/matched-bench/test_harness.py (test_restart_uses_the_same_argv_as_launch).
 #
 # Requires env.sh to have been sourced first (BIN, GENESIS, DATA_ROOT, RUN_DIR,
-# KEY0..2, P2P0..2, RPC0..2, MET0..2, PEER_TO_V0/V1).
+# KEY0..3, P2P0..3, RPC0..3, MET0..3, PEER_TO_V0/V1/V2; val3 only with
+# N_VALIDATORS=4).
 #
 #   start_node <idx> [truncate|append]   ->  sets $STARTED_PID
 #
@@ -23,12 +24,14 @@
 # shellcheck disable=SC2154
 node_var() { local v="$1$2"; printf '%s' "${!v-}"; }
 
-# val0 dials val1; val1 dials val0; val2 dials both. All edges use known ids.
+# val0 dials val1; val1 dials val0; val2 dials both; val3 (N_VALIDATORS=4) dials
+# all three, so the 4 nodes form a full mesh. All edges use known ids.
 node_peers() {
     case "$1" in
         0) printf '%s' "$PEER_TO_V1" ;;
         1) printf '%s' "$PEER_TO_V0" ;;
         2) printf '%s' "$PEER_TO_V0,$PEER_TO_V1" ;;
+        3) printf '%s' "$PEER_TO_V0,$PEER_TO_V1,$PEER_TO_V2" ;;
         *) return 1 ;;
     esac
 }

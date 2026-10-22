@@ -152,7 +152,10 @@ def hist_tail(cell, name="torus_view_duration_seconds"):
             elif line.startswith(name + "_count "):
                 c = float(line.split()[-1])
         return b, s, c
-    for node in ["val0", "val1", "val2"]:
+    # val3: run-cell.sh N_VALIDATORS=4 (the 4-validator devnet) only
+    nodes = ["val0", "val1", "val2"] + (
+        ["val3"] if os.path.exists(os.path.join(cell, "metrics-before-val3.txt")) else [])
+    for node in nodes:
         try:
             b0, s0, c0 = h(os.path.join(cell, f"metrics-before-{node}.txt"))
             b1, s1, c1 = h(os.path.join(cell, f"metrics-after-{node}.txt"))
@@ -176,6 +179,9 @@ def _node_logs(cell):
     for sub in ("run", ""):
         paths = {n: os.path.join(cell, sub, n + ".log") for n in ("val0", "val1", "val2")}
         if all(os.path.exists(p) for p in paths.values()):
+            val3 = os.path.join(cell, sub, "val3.log")  # run-cell.sh N_VALIDATORS=4 only
+            if os.path.exists(val3):
+                paths["val3"] = val3
             return paths
     return None
 

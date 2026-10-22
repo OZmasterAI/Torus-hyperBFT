@@ -136,7 +136,7 @@ class QuorumAndPidLineTest(unittest.TestCase):
             ("", "2,2,1"),
             (2, "2,2"),
             (2, "0,1,1"),
-            (2, "2,2,1,1"),
+            (2, "2,2,1,1,1"),  # 4 weights = the 4-validator devnet (test_four_validators.py)
             (2, "a,b,c"),
             (2, ""),
         ):
@@ -773,6 +773,27 @@ class SummarizeKillTest(unittest.TestCase):
         self.assertIn("no run-id.json", s["kill_record_check"]["reason"])
         self.assert_not_excluded(s)
 
+    def test_resummarize_does_not_restore_a_kill_record_summarize_now_rejects(self):
+        """Codex P2 (s138): the old summary has .kill_no_restart; once run-id.json is gone summarize.py omits it,
+        and resummarize.sh's keep-old-keys merge must not put the obsolete kill windows back."""
+        write_kill_cell(self.d)
+        s, _ = self.summ()
+        self.assertIn("kill_no_restart", s)
+        os.remove(os.path.join(self.d, "run-id.json"))
+        r = subprocess.run(
+            ["bash", os.path.join(HERE, "resummarize.sh"), self.d],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(self.d, "summary.json")) as f:
+            s = json.load(f)
+        self.assertNotIn("kill_no_restart", sorted(s))
+        self.assertNotIn("killed_node", s["headline"])
+        self.assertEqual(s["kill_record_check"]["action"], "rejected")
+        self.assertEqual(s["validity"]["verdict"], "REJECT")
+
     # ---- Codex P2b: one shared boundary sample between 'before' and 'after'
     def test_boundary_increment_between_the_last_pre_and_first_post_kill_scrape_counts_in_after(self):
         """the probe: one timeout and the kill's order-age observations land between the scrape at kill-0.5 s and
@@ -956,6 +977,7 @@ class RunCellKnobTest(unittest.TestCase):
     def preflight(self, **env):
         script = (
             "set -uo pipefail\n"
+            + "N_VALIDATORS=3; ALL_IDX=(0 1 2); DL_REPORT=; SELF_DIR=$TOOLS_DIR\n"
             + self.urls_fn
             + "RPCS=(http://a:1 http://b:2 http://c:3)\nBENCH_RPC_URLS=$(bench_rpc_urls) || exit 2\n"
             + 'evm_load_on() { [ "${EVM_ON:-0}" = 1 ]; }\n'
@@ -1164,8 +1186,14 @@ class RunIdentityTest(unittest.TestCase):
 # ------------------------------------------------------------------ VALIDATOR_STAKES: genesis + cache key
 class ValidatorStakesTest(unittest.TestCase):
     def patch(self, stakes):
-        check = src_between(
-            GEN_3VAL, 'if [ -n "${VALIDATOR_STAKES:-}" ]; then\n    [[', "\nfi\n"
+        check = (
+            src_between(
+                GEN_3VAL,
+                'N_VALIDATORS="${N_VALIDATORS:-3}"',
+                "\n# Dead-leader skip",
+                include_end=False,
+            )
+            + "\n"
         )
         block = src_between(GEN_3VAL, "# 2b. Optional stake weights", "\nfi\n")
         script = (

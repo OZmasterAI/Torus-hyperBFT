@@ -4,6 +4,15 @@
 set -euo pipefail
 D=$(cd "$1" && pwd); T=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 j() { jq -r "$@" "$D/summary.json"; }
+# The old summary as a whole: any top-level key still missing once everything below has run
+# (summarize.py rewrites summary.json from scratch) is put back from it. That keeps every
+# record run-cell.sh adds after summarize.py and nothing here re-derives (.oracle_feed for
+# ORACLE_FEED=1|seed, and any later one) without a hand list; keys present in the new
+# summary (validity, headline, the re-derived records below) always win, and a key summarize.py or a
+# re-deriving script owns (summary-owned-keys.txt) is never put back.
+OLD_SUMMARY=$(mktemp "${TMPDIR:-/tmp}/resummarize-old.XXXXXX")
+trap 'rm -f "${OLD_SUMMARY:?}"' EXIT
+cp "$D/summary.json" "$OLD_SUMMARY"
 # EVM_LOAD_RATE cells: summarize.py rewrites summary.json without .evm_load;
 # it is re-derived below from the retained evm-load-* artifacts.
 EVM_LOAD=$(jq -c '.evm_load // empty' "$D/summary.json")
@@ -16,6 +25,11 @@ EVM_N=$(jq -r '.genesis.evm_block_interval // empty' "$D/summary.json")
 BULK_N=$(jq -r '.genesis.bulk_count // empty' "$D/summary.json")
 # ... nor .genesis.book_mode / .cell.book_mode (s131; run-cell.sh records them after summarize.py).
 BOOK_MODE=$(jq -r '.genesis.book_mode // empty' "$D/summary.json")
+# ... nor .cell.n_validators / .genesis.leader_miss_threshold / .leader_exclusion_cap (run-cell.sh
+# record_cell_shape, N_VALIDATORS=4 or DL_K / DL_JCAP cells) nor .dead_leader (dl_window.py, DL_REPORT
+# cells): the shape is restored below, .dead_leader re-derived from the cell's artifacts.
+SHAPE=$(jq -c '{n: .cell.n_validators, k: .genesis.leader_miss_threshold, j: .genesis.leader_exclusion_cap}' "$D/summary.json")
+DEAD_LEADER=$(jq -c '.dead_leader // empty' "$D/summary.json")
 python3 "$T/summarize.py" --out "$D" --label "$(j .label)" --worktree "$(j .worktree)" --commit "$(j .commit)" \
   --dirty "$(j .dirty_files)" --markets "$(j .cell.markets)" --dur "$(j .cell.duration_s)" --rate "$(j .cell.rate_total)" \
   --senders "$(j .cell.senders)" --t-bench0 "$(j .timing.t_bench0)" --t-bench1 "$(j .timing.t_bench1)" \
@@ -54,6 +68,22 @@ if [ -n "$BOOK_MODE" ]; then
     tmp="$D/summary.json.book-mode.tmp"
     jq --arg n "$BOOK_MODE" --arg l "$label" '.genesis.book_mode = $n | .cell.book_mode = $l' "$D/summary.json" > "$tmp" && mv -f "$tmp" "$D/summary.json"
 fi
+if [ "$SHAPE" != '{"n":null,"k":null,"j":null}' ]; then
+    tmp="$D/summary.json.shape.tmp"
+    jq --argjson s "$SHAPE" '(if $s.n != null then .cell.n_validators = $s.n else . end)
+        | (if $s.k != null then .genesis.leader_miss_threshold = $s.k else . end)
+        | (if $s.j != null then .genesis.leader_exclusion_cap = $s.j else . end)' "$D/summary.json" > "$tmp" \
+        && mv -f "$tmp" "$D/summary.json"
+fi
+if [ -n "$DEAD_LEADER" ]; then
+    # re-derived (same window bounds and knobs); a cell the report cannot be rebuilt for keeps its old one
+    if ! python3 -I "$T/dl_window.py" --dir "$D" --t-bench0 "$(j .timing.t_bench0)" --t-bench1 "$(j .timing.t_bench1)" \
+            --dl-k "$(jq -r '.dl_k // ""' <<<"$DEAD_LEADER")" --dl-jcap "$(jq -r '.dl_jcap // ""' <<<"$DEAD_LEADER")" >/dev/null; then
+        echo "WARNING resummarize.sh: dl_window.py failed; .dead_leader kept from the old summary.json" >&2
+        tmp="$D/summary.json.dl.tmp"
+        jq --argjson v "$DEAD_LEADER" '.dead_leader = $v' "$D/summary.json" > "$tmp" && mv -f "$tmp" "$D/summary.json"
+    fi
+fi
 # PRELOAD cells: .preload (and its REJECT fold) is re-derived from preload-cell.json + preload.json.
 if [ -f "$D/preload-cell.json" ]; then
     python3 "$T/preload.py" summary --dir "$D" >/dev/null
@@ -67,3 +97,12 @@ fi
 if [ -f "$D/state-attest.json" ] || [ -n "$STATE_ATTEST" ]; then
     python3 -I "$T/state_attest.py" summary --dir "$D" >/dev/null
 fi
+# Top-level keys of the old summary nothing above regenerated (see OLD_SUMMARY), except the keys
+# summarize.py and the re-deriving scripts own (summary-owned-keys.txt): one of those missing from
+# the new summary was omitted on purpose (kill_no_restart after its kill record is rejected, ...).
+OWNED=$(grep -v '^#' "$T/summary-owned-keys.txt" | grep . | jq -R . | jq -sc .)
+[ "$OWNED" != "[]" ] || { echo "resummarize.sh: empty $T/summary-owned-keys.txt" >&2; exit 1; }
+tmp="$D/summary.json.keep.tmp"
+jq --slurpfile old "$OLD_SUMMARY" --argjson owned "$OWNED" \
+    '($old[0] | with_entries(select(.key as $k | $owned | any(. == $k) | not))) + .' \
+    "$D/summary.json" > "$tmp" && mv -f "$tmp" "$D/summary.json"

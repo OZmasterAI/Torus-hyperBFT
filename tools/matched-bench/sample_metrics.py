@@ -235,8 +235,10 @@ def main():
         parser.add_argument(f"--{name}", required=True)
     parser.add_argument("--interval", type=float, default=1.0)
     parser.add_argument("--timeout", type=float, default=3.0)
-    parser.add_argument("urls", nargs=3)
+    parser.add_argument("urls", nargs="+", help="val0..valN-1 metrics URLs: 3 (4 with run-cell N_VALIDATORS=4)")
     args = parser.parse_args()
+    if len(args.urls) not in (3, 4):
+        parser.error("3 metrics URLs (4 on the 4-validator devnet), got %d" % len(args.urls))
     if not all(math.isfinite(v) and v > 0 for v in (args.interval, args.timeout)):
         parser.error("interval and timeout must be finite and positive")
     asyncio.run(run(args))

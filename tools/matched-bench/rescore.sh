@@ -13,11 +13,17 @@ LABEL=$(basename "$SRC")
 mkdir -p "$2"; DEST="$(cd "$2" && pwd)/$LABEL"
 [ ! -e "$DEST" ] || { echo "rescore: $DEST exists (refusing to overwrite)" >&2; exit 1; }
 [ "$DEST" != "$SRC" ] || { echo "rescore: dest is the source" >&2; exit 1; }
-for f in summary.json val0.log.gz val1.log.gz val2.log.gz; do
+# val0..val2, plus val3 on a 4-validator cell (run-cell.sh N_VALIDATORS=4: run-id.json n_validators)
+N=$(jq -r '.n_validators // 3' "$SRC/run-id.json" 2>/dev/null || echo 3)
+case "$N" in 3|4) ;; *) echo "rescore: $SRC/run-id.json n_validators=$N (3 or 4)" >&2; exit 1 ;; esac
+LOGS=()
+for i in $(seq 0 $((N - 1))); do LOGS+=("val$i.log.gz"); done
+for f in summary.json "${LOGS[@]}"; do
     [ -s "$SRC/$f" ] || { echo "rescore: $SRC/$f missing (incomplete cell: rerun it)" >&2; exit 1; }
 done
 cp -a --reflink=auto "$SRC" "$DEST"
-python3 "$T/collect_logs.py" --logs "$DEST/val0.log.gz" "$DEST/val1.log.gz" "$DEST/val2.log.gz" \
+DEST_LOGS=(); for f in "${LOGS[@]}"; do DEST_LOGS+=("$DEST/$f"); done
+python3 "$T/collect_logs.py" --logs "${DEST_LOGS[@]}" \
     --out "$DEST/log-summary.json" > "$DEST/rescore-dissem.txt"
 # the counts must be the ones the cell was scored on (same logs, same patterns)
 OLD=$(jq -r '.dissemination.raw // ""' "$SRC/summary.json")

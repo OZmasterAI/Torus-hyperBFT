@@ -60,6 +60,21 @@
 #               Patches only OUT (the validator set this script writes). Unset or
 #               empty = the base stakes and OUT is byte-identical to a run
 #               without the knob.
+#   N_VALIDATORS=3|4  the validator count (default 3). 4 = the dead-leader
+#               bench 9p devnet (owner s138): devnet/genesis.json's first 4
+#               validators (key 04's pubkey is the 4th) with the addresses of
+#               devnet/wsl/keys-4val/bench-validator-keys.json (indices 0..2 =
+#               bench-validator-keys.json, 3 = mnemonic index 106). 3 (or unset)
+#               = OUT byte-identical to a run without the knob.
+#   VALIDATOR_STAKES with N_VALIDATORS=4 takes four weights a,b,c,d.
+#   DL_K=K  DL_JCAP=J  dead-leader skip genesis parameters (branch
+#               feat/dead-leader-p3, docs/plans/dead-leader-skip.md):
+#               .consensus.leader_miss_threshold = K (0 = off, else 2..=64;
+#               node default 3) and .consensus.leader_exclusion_cap = J
+#               (0..=10; node default 6). Each written ONLY when given (unset
+#               or empty = the field stays absent, OUT byte-identical). A
+#               binary without the fields ignores them (the genesis loader
+#               has no deny_unknown_fields): run-cell.sh refuses that.
 #   BENCH_BIN=  bench-throughput binary (default: cargo-bin resolution, which
 #               honours CARGO_TARGET_DIR, then <repo>/target/release).
 set -euo pipefail
@@ -90,9 +105,28 @@ if [ -n "${BOOK_MODE:-}" ]; then
     esac
 fi
 
+N_VALIDATORS="${N_VALIDATORS:-3}"
+case "$N_VALIDATORS" in
+    3|4) ;;
+    *) echo "FATAL: N_VALIDATORS must be 3 or 4 (got '$N_VALIDATORS')" >&2; exit 1 ;;
+esac
 if [ -n "${VALIDATOR_STAKES:-}" ]; then
-    [[ "$VALIDATOR_STAKES" =~ ^[1-9][0-9]{0,5},[1-9][0-9]{0,5},[1-9][0-9]{0,5}$ ]] \
-        || { echo "FATAL: VALIDATOR_STAKES must be three positive integer weights a,b,c (got '$VALIDATOR_STAKES')" >&2; exit 1; }
+    if [ "$N_VALIDATORS" = 4 ]; then
+        [[ "$VALIDATOR_STAKES" =~ ^[1-9][0-9]{0,5},[1-9][0-9]{0,5},[1-9][0-9]{0,5},[1-9][0-9]{0,5}$ ]] \
+            || { echo "FATAL: VALIDATOR_STAKES must be four positive integer weights a,b,c,d with N_VALIDATORS=4 (got '$VALIDATOR_STAKES')" >&2; exit 1; }
+    else
+        [[ "$VALIDATOR_STAKES" =~ ^[1-9][0-9]{0,5},[1-9][0-9]{0,5},[1-9][0-9]{0,5}$ ]] \
+            || { echo "FATAL: VALIDATOR_STAKES must be three positive integer weights a,b,c (got '$VALIDATOR_STAKES')" >&2; exit 1; }
+    fi
+fi
+# Dead-leader skip K / j cap (torus_types::DeadLeaderParams::check ranges).
+if [ -n "${DL_K:-}" ]; then
+    [[ "$DL_K" =~ ^(0|[1-9][0-9]?)$ ]] && { [ "$DL_K" = 0 ] || { [ "$DL_K" -ge 2 ] && [ "$DL_K" -le 64 ]; }; } \
+        || { echo "FATAL: DL_K (consensus.leader_miss_threshold) must be 0 (off) or 2..=64 (got '$DL_K')" >&2; exit 1; }
+fi
+if [ -n "${DL_JCAP:-}" ]; then
+    [[ "$DL_JCAP" =~ ^([0-9]|10)$ ]] \
+        || { echo "FATAL: DL_JCAP (consensus.leader_exclusion_cap) must be 0..=10 (got '$DL_JCAP')" >&2; exit 1; }
 fi
 
 BULK_COUNT="${BULK_COUNT:-100000}"
@@ -135,14 +169,16 @@ fi
 #    hold, so each validator can sign oracle price submissions. Consensus uses
 #    the ed25519 pubkeys only; the address is the validator's account identity.
 KEYS="$REPO/devnet/wsl/bench-validator-keys.json"
+[ "$N_VALIDATORS" = 4 ] && KEYS="$REPO/devnet/wsl/keys-4val/bench-validator-keys.json"
 [ -f "$KEYS" ] || { echo "FATAL: missing $KEYS" >&2; exit 1; }
-VALS=$(jq --slurpfile k "$KEYS" '
-    [.validators[0:3] | to_entries[] | .key as $i
+VALS=$(jq --slurpfile k "$KEYS" --argjson n "$N_VALIDATORS" '
+    if (.validators | length) < $n then error("devnet/genesis.json has \(.validators | length) validators, need \($n)") else . end
+    | [.validators[0:$n] | to_entries[] | .key as $i
         | ([$k[0].validators[] | select(.index == $i) | .address]) as $a
         | if ($a|length) != 1 then error("bench-validator-keys.json: need exactly one entry with index \($i)")
           else .value | .address = ($a[0] | ascii_downcase) end]' "$REPO/devnet/genesis.json")
-[ "$(jq '[.[].address | select(test("^0x[0-9a-f]{40}$"))] | unique | length' <<<"$VALS")" = 3 ] \
-    || { echo "FATAL: bench-validator-keys.json must give 3 distinct 20-byte addresses" >&2; exit 1; }
+[ "$(jq '[.[].address | select(test("^0x[0-9a-f]{40}$"))] | unique | length' <<<"$VALS")" = "$N_VALIDATORS" ] \
+    || { echo "FATAL: $(basename "$KEYS") must give $N_VALIDATORS distinct 20-byte addresses" >&2; exit 1; }
 # 2b. Optional stake weights: stake = weight x the base stake, as decimal
 #     strings (a 1 followed by zeros, so the product is the weight followed by
 #     those zeros; jq numbers would lose the 25 digits).
@@ -234,6 +270,15 @@ tmp=$(mktemp) && jq --arg sha "${STATE_HASH_ACTIVATION:-}" --argjson win "$win" 
           + (if $win and ($m == "classic" or $m == "0") then {book_window_commit: 1} else {} end))
       end' "$OUT" > "$tmp" && mv "$tmp" "$OUT"
 
+# 5b. Optional dead-leader skip K / j cap (feat/dead-leader-p3). CHAIN-WIDE;
+#     validated at the top; written only when given (absent = node defaults 3 / 6).
+if [ -n "${DL_K:-}" ]; then
+    tmp=$(mktemp) && jq --argjson k "$DL_K" '.consensus.leader_miss_threshold = $k' "$OUT" > "$tmp" && mv "$tmp" "$OUT"
+fi
+if [ -n "${DL_JCAP:-}" ]; then
+    tmp=$(mktemp) && jq --argjson j "$DL_JCAP" '.consensus.leader_exclusion_cap = $j' "$OUT" > "$tmp" && mv "$tmp" "$OUT"
+fi
+
 # 6. Optional L6.1 window-committed Classic books (docs/plans/l61-window-committed-books.md).
 #    CHAIN-WIDE genesis field (alias of activations.book_window_commit at the running
 #    hash's height); needs the running hash (the node refuses it otherwise).
@@ -252,6 +297,9 @@ jq -r '
     (if (.consensus.activations.book_window_commit // null) != null or .consensus.book_window_commit == true
      then "  book_window_commit = on (L6.1)" else empty end),
     "  book_mode  = \(.consensus.book_mode // "absent (classic)")",
+    (if .consensus.leader_miss_threshold != null or .consensus.leader_exclusion_cap != null
+     then "  dead_leader = leader_miss_threshold \(.consensus.leader_miss_threshold // "absent (node default 3)") leader_exclusion_cap \(.consensus.leader_exclusion_cap // "absent (node default 6)")"
+     else empty end),
     "  chain_id   = \(.chain_id)",
     "  validators = \(.validators|length)  (\([.validators[].address] | join(" ")) )",
     "  native_bal = \(.native_balances|length)",

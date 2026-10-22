@@ -143,7 +143,16 @@ class DigestOrderTest(unittest.TestCase):
             with open(acct, "w") as f:
                 f.write("".join(a + "\n" for a in accounts))
             out = os.path.join(d, "state-digest.txt")
-            argv = ["bash", DIGEST_SH, self.url, str(markets), acct, out, str(par), "10"]
+            argv = [
+                "bash",
+                DIGEST_SH,
+                self.url,
+                str(markets),
+                acct,
+                out,
+                str(par),
+                "10",
+            ]
             if pos_accounts == "":
                 argv.append("")
             elif pos_accounts is not None:
@@ -234,8 +243,17 @@ class DigestOrderTest(unittest.TestCase):
             with open(acct, "w") as f:
                 f.write("0xaa01\n")
             r = subprocess.run(
-                ["bash", DIGEST_SH, self.url, "2", acct, os.path.join(d, "o"),
-                 "2", "10", os.path.join(d, "missing.txt")],
+                [
+                    "bash",
+                    DIGEST_SH,
+                    self.url,
+                    "2",
+                    acct,
+                    os.path.join(d, "o"),
+                    "2",
+                    "10",
+                    os.path.join(d, "missing.txt"),
+                ],
                 capture_output=True,
                 text=True,
                 timeout=60,
@@ -1475,7 +1493,8 @@ class StartNodeAttestKeyTest(StartNodeRetentionTest):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(
             both,
-            plain + ["--retention-blocks=5000", "--state-hash-attest-key=%s/val1.key" % d],
+            plain
+            + ["--retention-blocks=5000", "--state-hash-attest-key=%s/val1.key" % d],
         )
         pids = os.path.join(self.d, "pids")
         with open(pids, "w") as f:
@@ -1541,21 +1560,31 @@ class StateHashAttestHarnessTest(unittest.TestCase):
             gate = self.src.rindex("if state_attest_on", 0, i)
             self.assertNotIn("\nfi\n", self.src[gate:i], marker)
         # an inherited key dir never reaches a cell that did not ask for it
-        self.assertIn("unset STATE_HASH_ATTEST_KEY_DIR\nif state_attest_on; then", self.src)
+        self.assertIn(
+            "unset STATE_HASH_ATTEST_KEY_DIR\nif state_attest_on; then", self.src
+        )
 
     def test_order_failstop_before_extra_env_scan_before_stop(self):
         s = self.src
         fs = s.index("    export TORUS_STATE_HASH_FAILSTOP=1")
-        self.assertLess(s.index("for v in $(env | grep -oE '^TORUS_[A-Za-z0-9_]+'); do unset"), fs)
-        self.assertLess(fs, s.index('for kv in $EXTRA_ENV; do export "$kv"; done\n# HOTSTUFF_CPUS'))
-        self.assertLess(fs, s.index('NODE_ENV_JSON=$(env | grep'))  # recorded in the node env
+        self.assertLess(
+            s.index("for v in $(env | grep -oE '^TORUS_[A-Za-z0-9_]+'); do unset"), fs
+        )
+        self.assertLess(
+            fs, s.index('for kv in $EXTRA_ENV; do export "$kv"; done\n# HOTSTUFF_CPUS')
+        )
+        self.assertLess(
+            fs, s.index("NODE_ENV_JSON=$(env | grep")
+        )  # recorded in the node env
         argv = s.index("--state-hash-attest-key=$STATE_HASH_ATTEST_KEY_DIR/val$i.key")
         self.assertLess(s.index('mapfile -t PIDS < "$RUN_DIR/pids"'), argv)
         scan = s.index('"$SELF_DIR/state_attest.py" scan')
         self.assertLess(s.index('cat "$OUT/agreement.jsonl" >> "$OUT/run.log"'), scan)
         self.assertLess(
             scan,
-            s.index("# ---------------------------------------------------------------- 9. stop + collect logs"),
+            s.index(
+                "# ---------------------------------------------------------------- 9. stop + collect logs"
+            ),
         )
         summ = s.index('"$SELF_DIR/state_attest.py" summary')
         self.assertLess(s.index('python3 "$TOOLS_DIR/summarize.py"'), summ)
@@ -1566,12 +1595,33 @@ class StateHashAttestHarnessTest(unittest.TestCase):
         try:
             fake_target(tmp)
             script, wt = sandbox_repo(tmp)
-            env0 = {k: v for k, v in os.environ.items() if k not in ("STATE_HASH_ACTIVATION", "STATE_HASH_ATTEST")}
-            env0.update(TARGET_DIR=tmp, RESULTS_ROOT=tmp, DATA_ROOT=tmp, BENCH_ALLOW_UNDETACHED="1")
+            env0 = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("STATE_HASH_ACTIVATION", "STATE_HASH_ATTEST")
+            }
+            env0.update(
+                TARGET_DIR=tmp,
+                RESULTS_ROOT=tmp,
+                DATA_ROOT=tmp,
+                BENCH_ALLOW_UNDETACHED="1",
+            )
             cases = [
-                (dict(STATE_HASH_ATTEST="yes"), 2, "STATE_HASH_ATTEST must be unset, 0 or 1"),
-                (dict(STATE_HASH_ATTEST="1"), 2, "STATE_HASH_ATTEST=1 needs STATE_HASH_ACTIVATION"),
-                (dict(STATE_HASH_ATTEST="1", STATE_HASH_ACTIVATION="1"), 1, "state_attest.py"),
+                (
+                    dict(STATE_HASH_ATTEST="yes"),
+                    2,
+                    "STATE_HASH_ATTEST must be unset, 0 or 1",
+                ),
+                (
+                    dict(STATE_HASH_ATTEST="1"),
+                    2,
+                    "STATE_HASH_ATTEST=1 needs STATE_HASH_ACTIVATION",
+                ),
+                (
+                    dict(STATE_HASH_ATTEST="1", STATE_HASH_ACTIVATION="1"),
+                    1,
+                    "state_attest.py",
+                ),
             ]
             for env, rc, msg in cases:
                 r = subprocess.run(
@@ -1583,12 +1633,20 @@ class StateHashAttestHarnessTest(unittest.TestCase):
                 )
                 self.assertEqual(r.returncode, rc, r.stderr)
                 self.assertIn(msg, r.stderr)
-                self.assertFalse(os.path.exists(os.path.join(tmp, "attest-pre-x")), "must fail before any launch")
+                self.assertFalse(
+                    os.path.exists(os.path.join(tmp, "attest-pre-x")),
+                    "must fail before any launch",
+                )
             # with state_attest.py beside run-cell.sh: the attestation-window reader and a
             # health.py that uses it (--attest-rpc) are required next
             shutil.copy2(os.path.join(HERE, "state_attest.py"), os.path.dirname(script))
-            for missing, msg in (("attest_traffic.py", "needs %s/attest_traffic.py" % os.path.dirname(script)),
-                                 ("health.py", "has no --attest-rpc")):
+            for missing, msg in (
+                (
+                    "attest_traffic.py",
+                    "needs %s/attest_traffic.py" % os.path.dirname(script),
+                ),
+                ("health.py", "has no --attest-rpc"),
+            ):
                 r = subprocess.run(
                     [script, wt, "attest-pre-x"],
                     capture_output=True,
@@ -1631,15 +1689,30 @@ class ResummarizeStateAttestTest(unittest.TestCase):
         return d
 
     def resummarize(self, d):
-        r = subprocess.run(["bash", os.path.join(HERE, "resummarize.sh"), d],
-                           capture_output=True, text=True, timeout=120)
+        r = subprocess.run(
+            ["bash", os.path.join(HERE, "resummarize.sh"), d],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(os.path.join(d, "summary.json")) as f:
             return json.load(f)
 
     def attest_summary(self, d):
-        r = subprocess.run([sys.executable, "-I", os.path.join(HERE, "state_attest.py"), "summary", "--dir", d],
-                           capture_output=True, text=True, timeout=60)
+        r = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                os.path.join(HERE, "state_attest.py"),
+                "summary",
+                "--dir",
+                d,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_scan_without_file_stays_rejected(self):
@@ -2092,7 +2165,9 @@ class CheckpointRewindBoundTest(unittest.TestCase):
         s, _ = run_summarize(self.d, extra=self.env())
         c = s["crash"]
         self.assertEqual(c["verdict"], "FAIL")
-        self.assertTrue(any("rewind 203" in r for r in c["fail_reasons"]), c["fail_reasons"])
+        self.assertTrue(
+            any("rewind 203" in r for r in c["fail_reasons"]), c["fail_reasons"]
+        )
         self.assertEqual(s["headline"]["crash_gate"], "FAIL")
 
     def test_per_block_configs_keep_the_tight_bound(self):
@@ -2125,7 +2200,7 @@ class CheckpointRewindBoundTest(unittest.TestCase):
             ("order_rows", None, 15.0, "mode1"),
             ("classic", "3", 15.0, "classic"),
             ("0", None, 15.0, "classic"),
-            ("", "3", None, "mode3"),      # legacy cell: the node env
+            ("", "3", None, "mode3"),  # legacy cell: the node env
             ("", None, 15.0, "classic"),
         )
         for mode, rows, want, label in cases:
@@ -2135,15 +2210,21 @@ class CheckpointRewindBoundTest(unittest.TestCase):
                 s, _ = run_summarize(self.d, extra=extra)
                 c = s["crash"]
                 self.assertEqual(c["checkpoint_interval_s"], want)
-                self.assertEqual(c["max_rewind_beyond_exec_queue"], 2 if want is None else 202)
-                self.assertEqual(c["verdict"], "FAIL" if want is None else "PASS", c["fail_reasons"])
+                self.assertEqual(
+                    c["max_rewind_beyond_exec_queue"], 2 if want is None else 202
+                )
+                self.assertEqual(
+                    c["verdict"], "FAIL" if want is None else "PASS", c["fail_reasons"]
+                )
                 self.assertEqual(s["cell"]["book_mode"], label)
 
     def test_bad_genesis_book_mode_is_refused(self):
         for mode in ("mode3", "Classic", "4", "x"):
             with self.subTest(mode=mode):
                 with self.assertRaises(AssertionError) as cm:
-                    run_summarize(self.d, extra=self.env() + ["--genesis-book-mode", mode])
+                    run_summarize(
+                        self.d, extra=self.env() + ["--genesis-book-mode", mode]
+                    )
                 self.assertIn("is not a book mode", str(cm.exception))
 
     def test_interval_parse_matches_the_node(self):
@@ -2156,7 +2237,7 @@ class CheckpointRewindBoundTest(unittest.TestCase):
             ("+15000", 15.0),
             (" 15000 ", 15.0),
             ("\t15000\n", 15.0),
-            ("   ", 15.0),            # blank = unset = role default
+            ("   ", 15.0),  # blank = unset = role default
             ("18446744073709551615", 18446744073709551615 / 1000.0),  # u64::MAX
             ("18446744073709551616", None),  # overflow -> Err -> off
             ("0", None),
@@ -2181,8 +2262,13 @@ class CheckpointRewindBoundTest(unittest.TestCase):
     def test_each_kill_of_a_multi_crash_cell_gets_the_checkpoint_bound(self):
         self.crash(gap=27, queue=4, seq=1)
         write_crash(
-            self.d, gap=4 + 203, queue=4, name="crash-2.json", seq=2,
-            kill_at=180, kill_ts=BENCH_START + 180.0,
+            self.d,
+            gap=4 + 203,
+            queue=4,
+            name="crash-2.json",
+            seq=2,
+            kill_at=180,
+            kill_ts=BENCH_START + 180.0,
         )
         s, _ = run_summarize(self.d, extra=self.env())
         ks = s["crash_kills"]
@@ -2875,23 +2961,35 @@ class OracleFeedHarnessTest(unittest.TestCase):
         (pause, bench-end marks, summary) stay ORACLE_FEED=1 only."""
         self.assertIn("ORACLE_FEED=${ORACLE_FEED:-seed}", self.src)
         self.assertIn("ORACLE_STALE_TIMEOUT=${ORACLE_STALE_TIMEOUT:-150}", self.src)
-        seed = self.src.index('    if [ "$ORACLE_FEED" = seed ]; then\n        # Owner s138')
+        seed = self.src.index(
+            '    if [ "$ORACLE_FEED" = seed ]; then\n        # Owner s138'
+        )
         fresh = self.src.index('log "oracle marks fresh on all')
         stop = self.src.index("        stop_oracle_feed\n", seed)
         stale = self.src.index('[ "$(jq -r .usable <<<"$ORACLE_M")" = 0 ]', seed)
         # the stale gate needs a COMPLETE scan (oracle_marks stops at its 30 s
         # budget): every market checked, no error, none usable
-        gate_src = self.src[self.src.rindex("\n", 0, stale) : self.src.index("break; }", stale)]
+        gate_src = self.src[
+            self.src.rindex("\n", 0, stale) : self.src.index("break; }", stale)
+        ]
         self.assertIn('[ "$(jq -r .checked <<<"$ORACLE_M")" = "$MARKETS" ]', gate_src)
-        self.assertIn('[ "$(jq -r .errors <<<"$ORACLE_M")" = 0 ]', self.src[stale : self.src.index("break; }", stale)])
+        self.assertIn(
+            '[ "$(jq -r .errors <<<"$ORACLE_M")" = 0 ]',
+            self.src[stale : self.src.index("break; }", stale)],
+        )
         load = self.src.index('"${BENCH_CMD[@]}" >')
         self.assertLess(fresh, seed)
         self.assertLess(seed, stop)
         self.assertLess(stop, stale)
         self.assertLess(stale, load)
-        gate = self.src.rindex('if [ "$ORACLE_FEED" = 1 ] || [ "$ORACLE_FEED" = seed ]; then', 0, seed)
+        gate = self.src.rindex(
+            'if [ "$ORACLE_FEED" = 1 ] || [ "$ORACLE_FEED" = seed ]; then', 0, seed
+        )
         self.assertNotIn("\nfi\n", self.src[gate:seed])
-        self.assertIn("if [ \"$ORACLE_FEED\" = 1 ] || [ \"$ORACLE_FEED\" = seed ]; then trap 'stop_oracle_feed' EXIT", self.src)
+        self.assertIn(
+            'if [ "$ORACLE_FEED" = 1 ] || [ "$ORACLE_FEED" = seed ]; then trap \'stop_oracle_feed\' EXIT',
+            self.src,
+        )
         for marker in ('kill -STOP "$ORACLE_PID"', "d['oracle_feed'] = o"):
             i = self.src.index(marker)
             g = self.src.rindex('if [ "$ORACLE_FEED" = 1 ]', 0, i)
@@ -2900,23 +2998,27 @@ class OracleFeedHarnessTest(unittest.TestCase):
     def test_seed_stale_gate_waits_for_a_complete_scan(self):
         """Codex stop review: a partial oracle_marks pass (its 30 s budget hit:
         checked < markets) must not open the load, even with usable 0."""
-        start = self.src.index('    if [ "$ORACLE_FEED" = seed ]; then\n        # Owner s138')
+        start = self.src.index(
+            '    if [ "$ORACLE_FEED" = seed ]; then\n        # Owner s138'
+        )
         end = self.src.index("\n    fi\n", start) + len("\n    fi\n")
         block = self.src[start:end]
         script = (
             "MARKETS=2; ORACLE_STALE_TIMEOUT=20; OUT=$(mktemp -d)\n"
-            "stop_oracle_feed() { :; }; sleep() { :; }; log() { echo \"LOG $*\"; }\n"
-            "die() { echo \"DIE $*\"; exit 3; }\n"
-            "oracle_marks() { echo x >> \"$OUT/calls\"; N=$(wc -l < \"$OUT/calls\");\n"
-            "  case $N in 1) echo '{\"markets\":2,\"checked\":1,\"usable\":0,\"errors\":0}';;\n"
-            "    2) echo '{\"markets\":2,\"checked\":2,\"usable\":1,\"errors\":0}';;\n"
-            "    3) echo '{\"markets\":2,\"checked\":2,\"usable\":0,\"errors\":1}';;\n"
-            "    *) echo '{\"markets\":2,\"checked\":2,\"usable\":0,\"errors\":0}';; esac; }\n"
+            'stop_oracle_feed() { :; }; sleep() { :; }; log() { echo "LOG $*"; }\n'
+            'die() { echo "DIE $*"; exit 3; }\n'
+            'oracle_marks() { echo x >> "$OUT/calls"; N=$(wc -l < "$OUT/calls");\n'
+            '  case $N in 1) echo \'{"markets":2,"checked":1,"usable":0,"errors":0}\';;\n'
+            '    2) echo \'{"markets":2,"checked":2,"usable":1,"errors":0}\';;\n'
+            '    3) echo \'{"markets":2,"checked":2,"usable":0,"errors":1}\';;\n'
+            '    *) echo \'{"markets":2,"checked":2,"usable":0,"errors":0}\';; esac; }\n'
             "ORACLE_FEED=seed\n"
             + block
             + 'echo "calls=$(wc -l < "$OUT/calls") stale=[$ORACLE_STALE_S]"\n'
         )
-        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+        r = subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True, timeout=30
+        )
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("calls=4 stale=[", r.stdout)
         self.assertNotIn("stale=[]", r.stdout)
@@ -2934,9 +3036,15 @@ class OracleFeedHarnessTest(unittest.TestCase):
             script, wt = sandbox_repo(tmp)
             for env, msg in (
                 (dict(ORACLE_WALK_BP="10"), "ORACLE_WALK_BP=10 needs ORACLE_FEED=1"),
-                (dict(ORACLE_FEED="seed", ORACLE_SHOCK_BP="50"), "ORACLE_SHOCK_BP=50 needs ORACLE_FEED=1"),
+                (
+                    dict(ORACLE_FEED="seed", ORACLE_SHOCK_BP="50"),
+                    "ORACLE_SHOCK_BP=50 needs ORACLE_FEED=1",
+                ),
                 (dict(ORACLE_STALE_TIMEOUT="x"), "ORACLE_STALE_TIMEOUT must be"),
-                (dict(ORACLE_FEED_DRAIN="1"), "ORACLE_FEED_DRAIN=1 needs ORACLE_FEED=1"),
+                (
+                    dict(ORACLE_FEED_DRAIN="1"),
+                    "ORACLE_FEED_DRAIN=1 needs ORACLE_FEED=1",
+                ),
             ):
                 r = subprocess.run(
                     [script, wt, "oracle-seed-x"],
@@ -3067,8 +3175,16 @@ class OracleFeedHarnessTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp)
 
-    def _run_drain_flow(self, mode, max_lag="2", settle_max="600", settle_rc=0, settle=None,
-                        attest="0", feed="1"):
+    def _run_drain_flow(
+        self,
+        mode,
+        max_lag="2",
+        settle_max="600",
+        settle_rc=0,
+        settle=None,
+        attest="0",
+        feed="1",
+    ):
         """Run run-cell.sh's real bench-end pause block and drain block with
         python3 stubbed: each health.py call prints the feed's process state
         (T = SIGSTOPped) and its argv; the feed-stop-settle call returns
@@ -3117,8 +3233,12 @@ class OracleFeedHarnessTest(unittest.TestCase):
             + '\nlog() { echo "LOG $*"; }\n'
             + 'oracle_marks() { echo \'{"markets":300,"usable":300}\'; }\n'
             + 'python3() { echo "PY $(ps -o stat= -p "$FEED" | cut -c1) $*" >> "%s/py.log"; '
-            'case "$*" in *feed-stop-settle*) return %d;; esac; }\n' % (tmp, settle_rc)
-            + next(l for l in self.src.splitlines() if l.startswith("state_attest_on() {")) + "\n"
+            'case "$*" in *feed-stop-settle*) return %d;; esac; }\n'
+            % (tmp, settle_rc)
+            + next(
+                l for l in self.src.splitlines() if l.startswith("state_attest_on() {")
+            )
+            + "\n"
             + "sleep 300 & ORACLE_PID=$!; FEED=$ORACLE_PID\n"
             + "trap 'kill -KILL $FEED 2>/dev/null' EXIT\n"
             + "OUT=%s TOOLS_DIR=/tools DRAIN_TIMEOUT=780 MARKETS=300 ORACLE_H0=7 "
@@ -3202,7 +3322,8 @@ class OracleFeedHarnessTest(unittest.TestCase):
         ]
         self.assertEqual(len(settle), 1, out)
         self.assertRegex(
-            settle[0], r"settle drained=1 rc=0 after 12s: every node executed target height 4321"
+            settle[0],
+            r"settle drained=1 rc=0 after 12s: every node executed target height 4321",
         )
         self.assertIn(
             "quiet_window_native_block_exec_ms (oracle-only proxy) p50=50.0 p95=200.0 "
@@ -3236,7 +3357,11 @@ class OracleFeedHarnessTest(unittest.TestCase):
         )
         py = [l for l in out.splitlines() if l.startswith("PY ")]
         self.assertIn(" --timeout 1500 --quiet 10 --to-height auto ", py[1])
-        settle = [l for l in out.splitlines() if "feed-stop-settle" in l and l.startswith("LOG ")]
+        settle = [
+            l
+            for l in out.splitlines()
+            if "feed-stop-settle" in l and l.startswith("LOG ")
+        ]
         self.assertEqual(len(settle), 1, out)
         self.assertIn("settle drained=0 rc=3 after 1500s", settle[0])
         self.assertIn(
@@ -3257,22 +3382,36 @@ class OracleFeedHarnessTest(unittest.TestCase):
         urls = " ".join("http://127.0.0.1:%d/metrics" % p for p in (9161, 9162, 9163))
         self.assertEqual(
             py,
-            ["PY S /tools/health.py drain --out %s --timeout 780 --quiet 10 --urls %s "
-             "--attest-live --attest-mempool-max 6 --attest-rpc %s" % (out_dir, urls, ATTEST_RPCS)],
+            [
+                "PY S /tools/health.py drain --out %s --timeout 780 --quiet 10 --urls %s "
+                "--attest-live --attest-mempool-max 6 --attest-rpc %s"
+                % (out_dir, urls, ATTEST_RPCS)
+            ],
         )
-        self.assertIn("LOG attest-live drain: --attest-live --attest-mempool-max 6 --attest-rpc "
-                      + ATTEST_RPCS, out)
+        self.assertIn(
+            "LOG attest-live drain: --attest-live --attest-mempool-max 6 --attest-rpc "
+            + ATTEST_RPCS,
+            out,
+        )
 
     def test_attest_with_feed_drain_reaches_both_drains(self):
         out_dir, out = self._run_drain_flow("1", attest="1")
         py = [l for l in out.splitlines() if l.startswith("PY ")]
         self.assertEqual(len(py), 2, out)
-        self.assertTrue(py[0].endswith(
-            " --feed-live --feed-mempool-max 12 --max-lag 2 --attest-live --attest-mempool-max 6"
-            " --attest-rpc " + ATTEST_RPCS), py[0])
+        self.assertTrue(
+            py[0].endswith(
+                " --feed-live --feed-mempool-max 12 --max-lag 2 --attest-live --attest-mempool-max 6"
+                " --attest-rpc " + ATTEST_RPCS
+            ),
+            py[0],
+        )
         # the paused settle: the feed is stopped, the attestations are not
-        self.assertTrue(py[1].endswith(" --attest-live --attest-mempool-max 6 --attest-rpc "
-                                       + ATTEST_RPCS), py[1])
+        self.assertTrue(
+            py[1].endswith(
+                " --attest-live --attest-mempool-max 6 --attest-rpc " + ATTEST_RPCS
+            ),
+            py[1],
+        )
         self.assertIn(" --to-height auto ", py[1])
         self.assertNotIn("--feed-live", py[1])
 
@@ -3301,9 +3440,18 @@ class OracleFeedHarnessTest(unittest.TestCase):
         script, wt = sandbox_repo(tmp)
         drain_on = dict(ORACLE_FEED="1", ORACLE_FEED_DRAIN="1")
         for env, msg in (
-            (dict(drain_on, FEED_STOP_SETTLE_MAX_S="x"), "FEED_STOP_SETTLE_MAX_S must be a positive integer"),
-            (dict(drain_on, FEED_STOP_SETTLE_MAX_S="0"), "FEED_STOP_SETTLE_MAX_S must be a positive integer"),
-            (dict(ORACLE_FEED="1", FEED_STOP_SETTLE_MAX_S="900"), "FEED_STOP_SETTLE_MAX_S=900 needs ORACLE_FEED_DRAIN=1"),
+            (
+                dict(drain_on, FEED_STOP_SETTLE_MAX_S="x"),
+                "FEED_STOP_SETTLE_MAX_S must be a positive integer",
+            ),
+            (
+                dict(drain_on, FEED_STOP_SETTLE_MAX_S="0"),
+                "FEED_STOP_SETTLE_MAX_S must be a positive integer",
+            ),
+            (
+                dict(ORACLE_FEED="1", FEED_STOP_SETTLE_MAX_S="900"),
+                "FEED_STOP_SETTLE_MAX_S=900 needs ORACLE_FEED_DRAIN=1",
+            ),
         ):
             r = subprocess.run(
                 [script, wt, "settle-max-pre-x"],
@@ -3372,7 +3520,6 @@ class OracleFeedHarnessTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp)
 
-
     def test_separate_signer_feed_needs_the_signer_key_file(self):
         """s134: a bench binary whose oracle-feed has --signer (separate oracle
         signers by default) needs devnet/wsl/bench-oracle-signer-keys.json next
@@ -3388,7 +3535,9 @@ class OracleFeedHarnessTest(unittest.TestCase):
                 script, wt = sandbox_repo(tmp)
                 if with_file:
                     shutil.copy2(
-                        os.path.join(REPO, "devnet", "wsl", "bench-oracle-signer-keys.json"),
+                        os.path.join(
+                            REPO, "devnet", "wsl", "bench-oracle-signer-keys.json"
+                        ),
                         os.path.join(wt, "devnet", "wsl"),
                     )
                 r = subprocess.run(
@@ -3408,7 +3557,9 @@ class OracleFeedHarnessTest(unittest.TestCase):
                 if rc is not None:
                     self.assertEqual(r.returncode, rc, r.stderr)
                     self.assertIn("bench-oracle-signer-keys.json is missing", r.stderr)
-                    self.assertFalse(os.path.exists(os.path.join(tmp, "oracle-signer-pre-x")))
+                    self.assertFalse(
+                        os.path.exists(os.path.join(tmp, "oracle-signer-pre-x"))
+                    )
                 else:
                     self.assertNotIn("bench-oracle-signer-keys.json", r.stderr)
             finally:
@@ -3437,7 +3588,9 @@ def sandbox_repo(tmp):
     os.makedirs(tools)
     os.makedirs(wsl)
     shutil.copy2(RUN_CELL_SH, tools)
-    shutil.copy2(os.path.join(HERE, "log-scans.sh"), tools)  # run-cell.sh sources it at preflight
+    shutil.copy2(
+        os.path.join(HERE, "log-scans.sh"), tools
+    )  # run-cell.sh sources it at preflight
     shutil.copy2(os.path.join(REPO, "devnet", "wsl", "bench-validator-keys.json"), wsl)
     for p in (
         os.path.join(tools, "digest-node.sh"),
@@ -3976,7 +4129,8 @@ class LiqStressHarnessTest(unittest.TestCase):
             want = "0x" + m.group(1).encode().hex()
             self.assertIn(f"\n{name}={want}\n", self.src, name)
         self.assertIn(
-            "*a == ADL_ESCROW_LONG || *a == ADL_ESCROW_SHORT", rs,
+            "*a == ADL_ESCROW_LONG || *a == ADL_ESCROW_SHORT",
+            rs,
             "is_adl_escrow no longer names exactly the two escrows: update the digest",
         )
 
@@ -3990,9 +4144,14 @@ class LiqStressHarnessTest(unittest.TestCase):
             '"$BENCH" gen-accounts --offset 60 --count 50',
             "DIG_POS_ACCTS=",
         )
-        block = block + self.src[
-            self.src.index("DIG_POS_ACCTS=", self.src.index(block)) + len("DIG_POS_ACCTS=") :
-        ].split("\n", 1)[0] + "\n"
+        block = (
+            block
+            + self.src[
+                self.src.index("DIG_POS_ACCTS=", self.src.index(block))
+                + len("DIG_POS_ACCTS=") :
+            ].split("\n", 1)[0]
+            + "\n"
+        )
         tmp = tempfile.mkdtemp(prefix="liq-dig-")
         try:
             bench = os.path.join(tmp, "bt")
@@ -4056,9 +4215,7 @@ class LiqStressHarnessTest(unittest.TestCase):
             ):
                 script = (
                     "set -u\nTOOLS_DIR=%s\nOUT=%s\nRPCS=(u0 u1 u2)\nLIVE_IDX=(0 1 2)\nMARKETS=3\n"
-                    "DIGEST_PAR=2\nRPC_TIMEOUT=5\n%s\n" % (tmp, tmp, pos)
-                    + loop
-                    + "\n"
+                    "DIGEST_PAR=2\nRPC_TIMEOUT=5\n%s\n" % (tmp, tmp, pos) + loop + "\n"
                 )
                 r = self._run(script)
                 self.assertEqual(r.returncode, 0, r.stderr)
@@ -4071,7 +4228,8 @@ class LiqStressHarnessTest(unittest.TestCase):
     def test_vault_is_read_per_node_only_when_enabled(self):
         on = self.fn("liq_stress_on() {", "\n}\n")
         block = self.fn(
-            'if liq_stress_on; then\n    for i in "${LIVE_IDX[@]}"; do\n        rpc ', "\nfi\n"
+            'if liq_stress_on; then\n    for i in "${LIVE_IDX[@]}"; do\n        rpc ',
+            "\nfi\n",
         )
         self.assertIn("torus_getLiquidatorVault", block)
         # After the digests and their quiescence snapshot.
@@ -4407,9 +4565,7 @@ class LiqStressHarnessTest(unittest.TestCase):
         try:
             script = (
                 'log() { echo "$*" >&2; }\nLIQUIDATOR_VAULT=0x1\nADL_ESCROW_LONG=0x2\n'
-                "ADL_ESCROW_SHORT=0x3\nMARKETS=4\nOUT=%s\n" % tmp
-                + on
-                + block
+                "ADL_ESCROW_SHORT=0x3\nMARKETS=4\nOUT=%s\n" % tmp + on + block
             )
             stress = dict(LIQ_THIN="5", ORACLE_SHOCK_BP="0")
             r = self._run(script, DIGEST_HAS_POS="1", **stress)
@@ -4518,11 +4674,17 @@ class DetachTest(unittest.TestCase):
             capture_output=True,
             text=True,
             timeout=30,
-            env=dict(os.environ, HOME=home, DETACH_PROBE="carried", **(extra_env or {})),
+            env=dict(
+                os.environ, HOME=home, DETACH_PROBE="carried", **(extra_env or {})
+            ),
             cwd=self.d,
         )
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertNotIn("holds the build lock", r.stdout, "the test unit must not queue on the shared build lock")
+        self.assertNotIn(
+            "holds the build lock",
+            r.stdout,
+            "the test unit must not queue on the shared build lock",
+        )
         deadline = time.time() + 20
         text = None
         while time.time() < deadline:
@@ -4546,7 +4708,9 @@ class DetachTest(unittest.TestCase):
         )
         kv = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
         self.assertTrue(kv["CG"].endswith("/bench-%s.service" % name), kv["CG"])
-        self.assertEqual(kv["PARENT"], "systemd")  # no build lock (_detach): no flock in between
+        self.assertEqual(
+            kv["PARENT"], "systemd"
+        )  # no build lock (_detach): no flock in between
         self.assertEqual(
             kv["PROBE"], "carried", "caller's exported env must carry over"
         )
@@ -4633,7 +4797,9 @@ class DetachBuildLockTest(unittest.TestCase):
         self.argv_file = os.path.join(self.d, "argv")
         self.cgroup = os.path.join(self.d, "cgroup")
         with open(self.cgroup, "w") as f:  # an agent's shell, not a bench unit
-            f.write("0::/user.slice/user-1000.slice/user@1000.service/app.slice/x.scope\n")
+            f.write(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/x.scope\n"
+            )
         self.lock = os.path.join(self.home, "projects", "wt", ".cargo-heavy.lock")
 
     def _env(self):
@@ -4649,7 +4815,11 @@ class DetachBuildLockTest(unittest.TestCase):
         """detach.sh's systemd-run argv after `--`: what the unit runs."""
         r = subprocess.run(
             ["bash", DETACH_SH, "camp", os.path.join(self.d, "c.log"), *cmd],
-            capture_output=True, text=True, timeout=30, env=self._env(), cwd=self.d,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=self._env(),
+            cwd=self.d,
         )
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         with open(self.argv_file) as f:
@@ -4698,7 +4868,9 @@ class DetachBuildLockTest(unittest.TestCase):
     def test_cell_started_inside_a_bench_unit_takes_no_lock(self):
         os.makedirs(os.path.dirname(self.lock))
         with open(self.cgroup, "w") as f:
-            f.write("0::/user.slice/user-1000.slice/user@1000.service/app.slice/bench-camp.service\n")
+            f.write(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/bench-camp.service\n"
+            )
         cmd = self._unit_cmd("bash", "-c", "echo cell")
         self.assertEqual(cmd, ["bash", "-c", "echo cell"])
 
@@ -4708,7 +4880,6 @@ class DetachBuildLockTest(unittest.TestCase):
         self.assertIn('"$HOME/projects/wt"', src)
         self.assertIn(".cargo-heavy.lock", src)
         self.assertIn("flock -o", src)
-
 
 
 class BuildGuardTest(unittest.TestCase):
@@ -4734,8 +4905,20 @@ class BuildGuardTest(unittest.TestCase):
 
     def test_lock_waiter_does_not_abort_cell(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self._spawn([sys.executable, "-c", "import time; time.sleep(30)",
-                         "flock", "-w", "60", "-o", "/tmp/x.lock", "cargo", "build"])
+            self._spawn(
+                [
+                    sys.executable,
+                    "-c",
+                    "import time; time.sleep(30)",
+                    "flock",
+                    "-w",
+                    "60",
+                    "-o",
+                    "/tmp/x.lock",
+                    "cargo",
+                    "build",
+                ]
+            )
             r = self._guard(tmp)
             self.assertEqual(r.returncode, 0, r.stderr)
 
@@ -4800,11 +4983,11 @@ class EvmBlockIntervalKnobTest(unittest.TestCase):
                 "printf '%%s\\n' \"${BOOK_MODE-<unset>}\" >> '%s.book-mode'\n"
                 "n=${EVM_BLOCK_INTERVAL:-%s}\n"
                 "bm=${BOOK_MODE:-%s}\n"
-                "jq -n --argjson m \"$MARKETS\" --arg n \"$n\" --arg bm \"$bm\" --argjson b \"%s\" '{markets: [range($m)],"
-                " native_balances: [range($b) | {note: \"bulk-test \\(. + 60)\"}],"
-                " consensus: ({timeout_base_ms: 500} + (if $bm == \"\" then {} else {book_mode: $bm} end)),"
+                'jq -n --argjson m "$MARKETS" --arg n "$n" --arg bm "$bm" --argjson b "%s" \'{markets: [range($m)],'
+                ' native_balances: [range($b) | {note: "bulk-test \\(. + 60)"}],'
+                ' consensus: ({timeout_base_ms: 500} + (if $bm == "" then {} else {book_mode: $bm} end)),'
                 " evm: ({chain_id: 7778}"
-                " + (if $n == \"\" then {} else {block_interval: ($n|tonumber)} end))}' > \"$OUT\"\n"
+                ' + (if $n == "" then {} else {block_interval: ($n|tonumber)} end))}\' > "$OUT"\n'
                 % (self.seen, self.seen, stale_n, stale_book_mode, bulk)
             )
         os.chmod(self.gen, 0o755)
@@ -4860,7 +5043,11 @@ class EvmBlockIntervalKnobTest(unittest.TestCase):
         r, log = self.run_cell("TORUS_X=1 EVM_BLOCK_INTERVAL=22 TIMEOUT_BASE_MS=1200")
         self.assertEqual(self.generator_saw(), ["22"], r.stdout + r.stderr + log)
         self.assertIn("genesis evm.block_interval=22 (EVM_BLOCK_INTERVAL=22)", log)
-        self.assertIn("launch-3val.sh failed", log, "stops at the launch, after the genesis checks")
+        self.assertIn(
+            "launch-3val.sh failed",
+            log,
+            "stops at the launch, after the genesis checks",
+        )
         # next cell, knob unset (an ambient EVM_BLOCK_INTERVAL must not leak in)
         r, log = self.run_cell("TORUS_X=1", EVM_BLOCK_INTERVAL="33")
         self.assertEqual(self.generator_saw(), ["22", ""], r.stdout + r.stderr + log)
@@ -4886,7 +5073,9 @@ class EvmBlockIntervalKnobTest(unittest.TestCase):
             with self.subTest(v=v):
                 r, _ = self.run_cell("EVM_BLOCK_INTERVAL=%s" % v)
                 self.assertEqual(r.returncode, 2, r.stderr)
-                self.assertIn("EVM_BLOCK_INTERVAL must be an integer in 2..=100", r.stderr)
+                self.assertIn(
+                    "EVM_BLOCK_INTERVAL must be an integer in 2..=100", r.stderr
+                )
                 self.assertEqual(self.generator_saw(), [])
                 self.assertFalse(os.path.exists(os.path.join(self.tmp, "results")))
 
@@ -4896,7 +5085,11 @@ class EvmBlockIntervalKnobTest(unittest.TestCase):
         scans read it; GENESIS_CACHE_DIR there is read by nothing but the nodes. Both
         are harness variables (the campaign driver sets them from its preflight):
         refused before anything runs"""
-        for kv in ("DEFER_REPORT_SCANS=1", "DEFER_REPORT_SCANS=0", "GENESIS_CACHE_DIR=/x"):
+        for kv in (
+            "DEFER_REPORT_SCANS=1",
+            "DEFER_REPORT_SCANS=0",
+            "GENESIS_CACHE_DIR=/x",
+        ):
             with self.subTest(kv=kv):
                 r, _ = self.run_cell("TORUS_X=1 " + kv)
                 self.assertEqual(r.returncode, 2, r.stderr)
@@ -4933,12 +5126,21 @@ class EvmBlockIntervalKnobTest(unittest.TestCase):
         p = os.path.join(d, "summary.json")
         with open(p, "w") as f:
             json.dump({"genesis": {"md5": "ab", "markets": 300}, "label": "x"}, f)
-        r = subprocess.run(["bash", "-c", fn + '\nrecord_genesis_evm_n "$1" 33', "_", p],
-                           capture_output=True, text=True, timeout=10)
+        r = subprocess.run(
+            ["bash", "-c", fn + '\nrecord_genesis_evm_n "$1" 33', "_", p],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(p) as f:
-            self.assertEqual(json.load(f), {"genesis": {"md5": "ab", "markets": 300,
-                                                        "evm_block_interval": 33}, "label": "x"})
+            self.assertEqual(
+                json.load(f),
+                {
+                    "genesis": {"md5": "ab", "markets": 300, "evm_block_interval": 33},
+                    "label": "x",
+                },
+            )
         self.assertEqual(sorted(os.listdir(d)), ["summary.json"], "no temp file left")
 
     def test_resummarize_keeps_the_genesis_n(self):
@@ -4953,11 +5155,244 @@ class EvmBlockIntervalKnobTest(unittest.TestCase):
         s["genesis"]["evm_block_interval"] = 22
         with open(p, "w") as f:
             json.dump(s, f)
-        r = subprocess.run(["bash", os.path.join(HERE, "resummarize.sh"), d],
-                           capture_output=True, text=True, timeout=120)
+        r = subprocess.run(
+            ["bash", os.path.join(HERE, "resummarize.sh"), d],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(p) as f:
             self.assertEqual(json.load(f)["genesis"]["evm_block_interval"], 22)
+
+
+SEED_FEED = {
+    "oracle_feed": "seed",
+    "price": 100000000,
+    "shock_bp": 0,
+    "shock_round": 0,
+    "walk_bp": 0,
+    "fresh_after_s": 1.5,
+    "stale_marks_at_bench_end": 0,
+}
+
+
+OWNED_KEYS_FILE = os.path.join(HERE, "summary-owned-keys.txt")
+# (script, functions that write summary.json, the summary dict's variable name there)
+SUMMARY_WRITERS = (
+    ("preload.py", ("summary", "fold_verdict"), "d"),
+    ("evm_load.py", ("main", "fold_verdict"), "d"),
+    ("state_attest.py", ("summary", "fold_verdict"), "d"),
+    ("dl_window.py", ("main",), "s"),
+)
+
+
+def owned_keys():
+    with open(OWNED_KEYS_FILE) as f:
+        return {
+            ln.strip() for ln in f if ln.strip() and not ln.lstrip().startswith("#")
+        }
+
+
+def written_top_level_keys(tree, var, funcs=None):
+    """constant top-level keys assigned to `var` (var["k"] = ..., var.setdefault("k", ...),
+    and for summarize.py the `summary = {...}` literal), optionally only inside `funcs`."""
+    import ast
+
+    scopes = (
+        [tree]
+        if funcs is None
+        else [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name in funcs
+        ]
+    )
+    keys = set()
+    for scope in scopes:
+        for n in ast.walk(scope):
+            if isinstance(n, ast.Assign):
+                for t in n.targets:
+                    if (
+                        isinstance(t, ast.Subscript)
+                        and isinstance(t.value, ast.Name)
+                        and t.value.id == var
+                        and isinstance(t.slice, ast.Constant)
+                    ):
+                        keys.add(t.slice.value)
+                    if (
+                        isinstance(t, ast.Name)
+                        and t.id == var
+                        and isinstance(n.value, ast.Dict)
+                    ):
+                        keys.update(
+                            k.value for k in n.value.keys if isinstance(k, ast.Constant)
+                        )
+            if (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr in ("setdefault", "update")
+                and isinstance(n.func.value, ast.Name)
+                and n.func.value.id == var
+            ):
+                if (
+                    n.func.attr == "setdefault"
+                    and n.args
+                    and isinstance(n.args[0], ast.Constant)
+                ):
+                    keys.add(n.args[0].value)
+                if n.func.attr == "update":
+                    keys.add("<%s.update(...): list its keys by hand>" % var)
+    return keys
+
+
+class SummaryOwnedKeysTest(unittest.TestCase):
+    """Codex P2 (s138): resummarize.sh restores only old top-level keys outside
+    summary-owned-keys.txt. Every key summarize.py (or a re-deriving script resummarize.sh
+    runs) can write, even conditionally, must be listed, or a rescore resurrects a record the
+    regenerated summary deliberately omits (kill_no_restart after its kill record is rejected)."""
+
+    def test_every_key_summarize_py_writes_is_owned(self):
+        import ast
+
+        with open(os.path.join(HERE, "summarize.py")) as f:
+            keys = written_top_level_keys(ast.parse(f.read()), "summary")
+        self.assertTrue(
+            {
+                "validity",
+                "headline",
+                "kill_no_restart",
+                "crash_kills",
+                "kill_record_check",
+            }
+            <= keys,
+            keys,
+        )
+        self.assertEqual(
+            keys - owned_keys(), set(), "add these to summary-owned-keys.txt"
+        )
+
+    def test_every_key_a_re_deriving_script_writes_is_owned(self):
+        import ast
+
+        for script, funcs, var in SUMMARY_WRITERS:
+            with open(os.path.join(HERE, script)) as f:
+                keys = written_top_level_keys(ast.parse(f.read()), var, funcs)
+            self.assertTrue(keys, script)
+            self.assertEqual(
+                keys - owned_keys(),
+                set(),
+                "%s: add these to summary-owned-keys.txt" % script,
+            )
+
+    def test_every_script_resummarize_runs_is_scanned(self):
+        with open(os.path.join(HERE, "resummarize.sh")) as f:
+            src = f.read()
+        ran = set(re.findall(r'"\$T/([a-z_]+\.py)"', src))
+        self.assertEqual(ran, {"summarize.py"} | {s for s, _, _ in SUMMARY_WRITERS})
+
+    def test_run_cell_records_are_not_owned(self):
+        self.assertNotIn("oracle_feed", owned_keys())
+
+
+class ResummarizeSupplementalKeysTest(unittest.TestCase):
+    """Codex P2 (s138): top-level keys run-cell.sh adds after summarize.py (.oracle_feed for
+    ORACLE_FEED=1|seed, ...) are not regenerated by summarize.py; resummarize.sh / rescore.sh
+    must keep them, not silently drop them."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="resumm-supp-")
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+
+    def cell(self, d, dissem=""):
+        write_cell(d, 1000, 1000, dur=120)
+        write_agreement(d, ["0xaa"] * 3)
+        run_summarize(d, dur=120, extra=["--dissem", dissem] if dissem else ())
+        p = os.path.join(d, "summary.json")
+        with open(p) as f:
+            s = json.load(f)
+        s["oracle_feed"] = SEED_FEED
+        s["some_future_record"] = {"x": 1}
+        with open(p, "w") as f:
+            json.dump(s, f)
+        return p
+
+    def test_resummarize_keeps_the_oracle_feed_and_other_supplemental_keys(self):
+        p = self.cell(self.d)
+        r = subprocess.run(
+            ["bash", os.path.join(HERE, "resummarize.sh"), self.d],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(p) as f:
+            s = json.load(f)
+        self.assertEqual(s["oracle_feed"], SEED_FEED)
+        self.assertEqual(s["some_future_record"], {"x": 1})
+        self.assertIn("validity", s)
+        self.assertEqual(
+            sorted(os.listdir(self.d)),
+            sorted(f for f in os.listdir(self.d) if ".tmp" not in f),
+            "no temp file left",
+        )
+
+    def test_regenerated_keys_come_from_the_new_summary(self):
+        p = self.cell(self.d)
+        with open(p) as f:
+            s = json.load(f)
+        s["validity"] = {"verdict": "STALE", "accepted": False}
+        s["generated_at"] = "old"
+        with open(p, "w") as f:
+            json.dump(s, f)
+        r = subprocess.run(
+            ["bash", os.path.join(HERE, "resummarize.sh"), self.d],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(p) as f:
+            s = json.load(f)
+        self.assertNotEqual(s["validity"]["verdict"], "STALE")
+        self.assertNotEqual(s["generated_at"], "old")
+
+    def test_rescore_of_a_seed_mode_cell_keeps_the_oracle_feed(self):
+        src = os.path.join(self.d, "cell-seed")
+        os.makedirs(src)
+        logs = []
+        for i in range(3):
+            lp = os.path.join(src, "val%d.log.gz" % i)
+            with gzip.open(lp, "wt") as f:
+                f.write("2026-10-22T00:00:00.000000Z  INFO torus_node: started\n")
+            logs.append(lp)
+        r = subprocess.run(
+            [
+                sys.executable,
+                os.path.join(HERE, "collect_logs.py"),
+                "--logs",
+                *logs,
+                "--out",
+                os.path.join(self.d, "ls.json"),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.cell(src, dissem=r.stdout.rstrip("\n"))
+        dest = os.path.join(self.d, "out")
+        r = subprocess.run(
+            ["bash", os.path.join(HERE, "rescore.sh"), src, dest],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(os.path.join(dest, "cell-seed", "summary.json")) as f:
+            s = json.load(f)
+        self.assertEqual(s["oracle_feed"], SEED_FEED)
+        self.assertEqual(s["some_future_record"], {"x": 1})
 
 
 class EvmLoadHarnessTest(unittest.TestCase):
@@ -5192,10 +5627,19 @@ class EvmLoadHarnessTest(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="evm-accept-")
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         accepted = {"verdict": "ACCEPT", "accepted": True, "fail_reasons": []}
-        rejected = {"verdict": "REJECT", "accepted": False,
-                    "fail_reasons": ["EVM load failed: tx-flood rc=1"]}
+        rejected = {
+            "verdict": "REJECT",
+            "accepted": False,
+            "fail_reasons": ["EVM load failed: tx-flood rc=1"],
+        }
         for rate, evm_load, validity, rc, said in (
-            ("5", {"ok": False, "problems": ["tx-flood rc=1"]}, rejected, 2, '["tx-flood rc=1"]'),
+            (
+                "5",
+                {"ok": False, "problems": ["tx-flood rc=1"]},
+                rejected,
+                2,
+                '["tx-flood rc=1"]',
+            ),
             ("5", None, accepted, 1, '["no .evm_load in summary.json"]'),
             ("5", {"ok": True, "problems": []}, accepted, 0, None),
             ("0", None, accepted, 0, None),
@@ -5205,13 +5649,17 @@ class EvmLoadHarnessTest(unittest.TestCase):
                 d["evm_load"] = evm_load
             with open(os.path.join(tmp, "summary.json"), "w") as f:
                 json.dump(d, f)
-            script = "\n".join([
-                'OUT="%s"; TOOLS_DIR="%s"; EVM_LOAD_RATE=%s' % (tmp, HERE, rate),
-                'log() { echo "LOG $*"; }',
-                line,
-                tail,
-            ])
-            r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+            script = "\n".join(
+                [
+                    'OUT="%s"; TOOLS_DIR="%s"; EVM_LOAD_RATE=%s' % (tmp, HERE, rate),
+                    'log() { echo "LOG $*"; }',
+                    line,
+                    tail,
+                ]
+            )
+            r = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=30
+            )
             self.assertEqual(r.returncode, rc, (rate, evm_load, r.stdout, r.stderr))
             if said is None:
                 self.assertNotIn("NOT accepted", r.stdout)
@@ -5454,11 +5902,25 @@ class EvmLoadScanTest(unittest.TestCase):
         load as a rejected cell. Idempotent; an ok EVM load changes nothing."""
         tmp = tempfile.mkdtemp(prefix="evm-fold-")
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
-        base = {"label": "x", "status": "OK", "headline": {"benchmark_accepted": True},
-                "validity": {"verdict": "ACCEPT", "accepted": True, "fail_reasons": [],
-                             "unverified_reasons": []}}
-        scan = {"evm_txs": 9, "evm_blocks": 3, "interval": 11, "off_cadence_blocks": 0,
-                "complete": True, "read_errors": 0}
+        base = {
+            "label": "x",
+            "status": "OK",
+            "headline": {"benchmark_accepted": True},
+            "validity": {
+                "verdict": "ACCEPT",
+                "accepted": True,
+                "fail_reasons": [],
+                "unverified_reasons": [],
+            },
+        }
+        scan = {
+            "evm_txs": 9,
+            "evm_blocks": 3,
+            "interval": 11,
+            "off_cadence_blocks": 0,
+            "complete": True,
+            "read_errors": 0,
+        }
         for rc, want_ok in (("0", True), ("1", False)):
             with open(os.path.join(tmp, "summary.json"), "w") as f:
                 json.dump(base, f)
@@ -5467,22 +5929,38 @@ class EvmLoadScanTest(unittest.TestCase):
             with open(os.path.join(tmp, "evm-load-scan.json"), "w") as f:
                 json.dump(scan, f)
             for _ in range(2):
-                r = self.run_py("summary", "--dir", tmp, "--rate", "3", "--senders", "4", "--rc", rc)
+                r = self.run_py(
+                    "summary", "--dir", tmp, "--rate", "3", "--senders", "4", "--rc", rc
+                )
                 self.assertEqual(r.returncode, 0, r.stderr)
             with open(os.path.join(tmp, "summary.json")) as f:
                 d = json.load(f)
             self.assertIs(d["evm_load"]["ok"], want_ok)
             if want_ok:
-                self.assertEqual((d["status"], d["validity"], d["headline"]),
-                                 (base["status"], base["validity"], base["headline"]))
+                self.assertEqual(
+                    (d["status"], d["validity"], d["headline"]),
+                    (base["status"], base["validity"], base["headline"]),
+                )
             else:
                 self.assertEqual(d["status"], "INVALID")
-                self.assertEqual((d["validity"]["verdict"], d["validity"]["accepted"]), ("REJECT", False))
-                self.assertEqual(d["validity"]["fail_reasons"], ["EVM load failed: tx-flood rc=1"],
-                                 "one EVM reason, however often it runs")
+                self.assertEqual(
+                    (d["validity"]["verdict"], d["validity"]["accepted"]),
+                    ("REJECT", False),
+                )
+                self.assertEqual(
+                    d["validity"]["fail_reasons"],
+                    ["EVM load failed: tx-flood rc=1"],
+                    "one EVM reason, however often it runs",
+                )
                 self.assertIs(d["headline"]["benchmark_accepted"], False)
-                rc_h = subprocess.run([sys.executable, os.path.join(HERE, "health.py"), "accept",
-                                       os.path.join(tmp, "summary.json")]).returncode
+                rc_h = subprocess.run(
+                    [
+                        sys.executable,
+                        os.path.join(HERE, "health.py"),
+                        "accept",
+                        os.path.join(tmp, "summary.json"),
+                    ]
+                ).returncode
                 self.assertEqual(rc_h, 2, "health.py accept rejects it")
 
     def test_resummarize_keeps_the_evm_load_and_its_verdict(self):
@@ -5497,20 +5975,39 @@ class EvmLoadScanTest(unittest.TestCase):
         with open(os.path.join(d, "evm-load-stats.json"), "w") as f:
             json.dump({"accepted": 30, "elapsed_s": 120.0, "fanout": "pinned"}, f)
         with open(os.path.join(d, "evm-load-scan.json"), "w") as f:
-            json.dump({"evm_txs": 30, "evm_blocks": 10, "interval": 11, "off_cadence_blocks": 1,
-                       "complete": True, "read_errors": 0}, f)
-        r = self.run_py("summary", "--dir", d, "--rate", "0.25", "--senders", "40", "--rc", "0")
+            json.dump(
+                {
+                    "evm_txs": 30,
+                    "evm_blocks": 10,
+                    "interval": 11,
+                    "off_cadence_blocks": 1,
+                    "complete": True,
+                    "read_errors": 0,
+                },
+                f,
+            )
+        r = self.run_py(
+            "summary", "--dir", d, "--rate", "0.25", "--senders", "40", "--rc", "0"
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
-        r = subprocess.run(["bash", os.path.join(HERE, "resummarize.sh"), d],
-                           capture_output=True, text=True, timeout=120)
+        r = subprocess.run(
+            ["bash", os.path.join(HERE, "resummarize.sh"), d],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(os.path.join(d, "summary.json")) as f:
             s = json.load(f)
         e = s["evm_load"]
-        self.assertEqual((e["rate"], e["senders"], e["rc"], e["landed"]), ("0.25", 40, 0, 30))
+        self.assertEqual(
+            (e["rate"], e["senders"], e["rc"], e["landed"]), ("0.25", 40, 0, 30)
+        )
         self.assertEqual(e["problems"], ["1 blocks carry EVM txs off the N=11 cadence"])
-        self.assertIn("EVM load failed: 1 blocks carry EVM txs off the N=11 cadence",
-                      s["validity"]["fail_reasons"])
+        self.assertIn(
+            "EVM load failed: 1 blocks carry EVM txs off the N=11 cadence",
+            s["validity"]["fail_reasons"],
+        )
         self.assertIs(s["headline"]["benchmark_accepted"], False)
 
     def test_funded_needs_every_sender_in_the_genesis_accounts(self):
@@ -5628,38 +6125,80 @@ class EvmLoadScanTest(unittest.TestCase):
         """Codex review: a cell whose EVM load failed must not pass as a
         normal cell. .evm_load.problems names why; ok is false."""
         cases = (
-            ("137", None, {"evm_txs": 5, "evm_blocks": 1, "interval": 11, "off_cadence_blocks": 2,
-                           "complete": True, "read_errors": 0},
-             ["tx-flood rc=137", "no evm-load-stats.json",
-              "2 blocks carry EVM txs off the N=11 cadence"]),
-            ("0", {"accepted": 40, "elapsed_s": 10.0}, {"evm_txs": 0, "evm_blocks": 0, "interval": 11,
-                                                        "off_cadence_blocks": 0, "complete": False,
-                                                        "read_errors": 3},
-             ["scan incomplete: val0's eth head stayed below the committed head",
-              "3 heights unreadable", "no EVM tx landed"]),
-            ("0", {"accepted": 0, "elapsed_s": 10.0}, None,
-             ["no EVM tx accepted", "no evm-load-scan.json"]),
-            ("", {"accepted": 4, "elapsed_s": 2.0}, {"evm_txs": 4, "evm_blocks": 1, "interval": 11,
-                                                     "off_cadence_blocks": 0, "complete": True,
-                                                     "read_errors": 0},
-             ["tx-flood rc=None"]),
+            (
+                "137",
+                None,
+                {
+                    "evm_txs": 5,
+                    "evm_blocks": 1,
+                    "interval": 11,
+                    "off_cadence_blocks": 2,
+                    "complete": True,
+                    "read_errors": 0,
+                },
+                [
+                    "tx-flood rc=137",
+                    "no evm-load-stats.json",
+                    "2 blocks carry EVM txs off the N=11 cadence",
+                ],
+            ),
+            (
+                "0",
+                {"accepted": 40, "elapsed_s": 10.0},
+                {
+                    "evm_txs": 0,
+                    "evm_blocks": 0,
+                    "interval": 11,
+                    "off_cadence_blocks": 0,
+                    "complete": False,
+                    "read_errors": 3,
+                },
+                [
+                    "scan incomplete: val0's eth head stayed below the committed head",
+                    "3 heights unreadable",
+                    "no EVM tx landed",
+                ],
+            ),
+            (
+                "0",
+                {"accepted": 0, "elapsed_s": 10.0},
+                None,
+                ["no EVM tx accepted", "no evm-load-scan.json"],
+            ),
+            (
+                "",
+                {"accepted": 4, "elapsed_s": 2.0},
+                {
+                    "evm_txs": 4,
+                    "evm_blocks": 1,
+                    "interval": 11,
+                    "off_cadence_blocks": 0,
+                    "complete": True,
+                    "read_errors": 0,
+                },
+                ["tx-flood rc=None"],
+            ),
         )
         for rc, stats, scan, want in cases:
             tmp = tempfile.mkdtemp(prefix="evm-problems-")
             self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
             with open(os.path.join(tmp, "summary.json"), "w") as f:
                 json.dump({"label": "x"}, f)
-            for name, obj in (("evm-load-stats.json", stats), ("evm-load-scan.json", scan)):
+            for name, obj in (
+                ("evm-load-stats.json", stats),
+                ("evm-load-scan.json", scan),
+            ):
                 if obj is not None:
                     with open(os.path.join(tmp, name), "w") as f:
                         json.dump(obj, f)
-            r = self.run_py("summary", "--dir", tmp, "--rate", "2", "--senders", "4", "--rc", rc)
+            r = self.run_py(
+                "summary", "--dir", tmp, "--rate", "2", "--senders", "4", "--rc", rc
+            )
             self.assertEqual(r.returncode, 0, r.stderr)
             with open(os.path.join(tmp, "summary.json")) as f:
                 e = json.load(f)["evm_load"]
             self.assertEqual(e["problems"], want, rc)
             self.assertIs(e["ok"], False)
-
 
 
 # ------------------------- run-cell.sh: BULK_COUNT and PRELOAD (bench queue 8f)
@@ -5681,13 +6220,19 @@ class BulkCountAndPreloadHarnessTest(unittest.TestCase):
         self.real_full = _stat(WEIGHTED_FULL)
         self.tmp = tempfile.mkdtemp(prefix="bulk-preload-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        fake_target(self.tmp, "Usage: oracle-feed --price <PRICE> --walk-bp <N>; preload --per-owner <P>")
+        fake_target(
+            self.tmp,
+            "Usage: oracle-feed --price <PRICE> --walk-bp <N>; preload --per-owner <P>",
+        )
         self.script, self.wt = sandbox_repo(self.tmp)
         shutil.copy2(os.path.join(HERE, "preload.py"), os.path.dirname(self.script))
         self.called = os.path.join(self.tmp, "generator-called")
         gen = os.path.join(self.wt, "devnet", "wsl", "gen-3val-genesis.sh")
         with open(gen, "w") as f:
-            f.write("#!/bin/sh\necho \"BULK_COUNT=${BULK_COUNT-unset}\" > '%s'\n" % self.called)
+            f.write(
+                "#!/bin/sh\necho \"BULK_COUNT=${BULK_COUNT-unset}\" > '%s'\n"
+                % self.called
+            )
         os.chmod(gen, 0o755)
         self.bin = os.path.join(self.tmp, "bin")
         os.makedirs(self.bin)
@@ -5696,7 +6241,9 @@ class BulkCountAndPreloadHarnessTest(unittest.TestCase):
         os.chmod(os.path.join(self.bin, "pgrep"), 0o755)
 
     def tearDown(self):
-        self.assertEqual(_stat(WEIGHTED_FULL), self.real_full, "the real worktree was touched")
+        self.assertEqual(
+            _stat(WEIGHTED_FULL), self.real_full, "the real worktree was touched"
+        )
 
     def run_cell(self, **env):
         e = {
@@ -5716,8 +6263,13 @@ class BulkCountAndPreloadHarnessTest(unittest.TestCase):
             OVERWRITE="1",
             **env,
         )
-        r = subprocess.run([self.script, self.wt, "bulk-x"], capture_output=True, text=True,
-                           timeout=60, env=e)
+        r = subprocess.run(
+            [self.script, self.wt, "bulk-x"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=e,
+        )
         try:
             with open(os.path.join(self.tmp, "results", "bulk-x", "run.log")) as f:
                 log = f.read()
@@ -5752,12 +6304,24 @@ class BulkCountAndPreloadHarnessTest(unittest.TestCase):
                 self.assertFalse(os.path.exists(self.called))
 
     def test_funded_bulk_end_reaches_the_bench_only_off_the_default(self):
-        lines = [l for l in self.src.splitlines() if "--funded-bulk-end" in l and "BENCH_CMD+=" in l]
+        lines = [
+            l
+            for l in self.src.splitlines()
+            if "--funded-bulk-end" in l and "BENCH_CMD+=" in l
+        ]
         self.assertEqual(len(lines), 1, lines)
         snippet = "BENCH_CMD=()\n" + lines[0] + '\necho "${BENCH_CMD[*]}"'
-        for bulk, want in (("100000", ""), ("1000000", "--funded-bulk-end 1000060"), ("2000", "--funded-bulk-end 2060")):
-            r = subprocess.run(["bash", "-c", snippet], capture_output=True, text=True,
-                               env=dict(os.environ, BULK_COUNT=bulk))
+        for bulk, want in (
+            ("100000", ""),
+            ("1000000", "--funded-bulk-end 1000060"),
+            ("2000", "--funded-bulk-end 2060"),
+        ):
+            r = subprocess.run(
+                ["bash", "-c", snippet],
+                capture_output=True,
+                text=True,
+                env=dict(os.environ, BULK_COUNT=bulk),
+            )
             self.assertEqual(r.stdout.strip(), want, r.stderr)
 
     def test_bulk_count_is_recorded_in_the_summary_and_kept_by_resummarize(self):
@@ -5766,12 +6330,19 @@ class BulkCountAndPreloadHarnessTest(unittest.TestCase):
         p = os.path.join(self.tmp, "summary.json")
         with open(p, "w") as f:
             json.dump({"genesis": {"md5": "x"}}, f)
-        r = subprocess.run(["bash", "-c", fn + 'record_genesis_bulk_count "%s" 1000000' % p],
-                           capture_output=True, text=True)
+        r = subprocess.run(
+            ["bash", "-c", fn + 'record_genesis_bulk_count "%s" 1000000' % p],
+            capture_output=True,
+            text=True,
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(p) as f:
-            self.assertEqual(json.load(f)["genesis"], {"md5": "x", "bulk_count": 1000000})
-        self.assertIn('record_genesis_bulk_count "$OUT/summary.json" "$BULK_COUNT"', self.src)
+            self.assertEqual(
+                json.load(f)["genesis"], {"md5": "x", "bulk_count": 1000000}
+            )
+        self.assertIn(
+            'record_genesis_bulk_count "$OUT/summary.json" "$BULK_COUNT"', self.src
+        )
         with open(os.path.join(HERE, "resummarize.sh")) as f:
             resum = f.read()
         self.assertIn(".genesis.bulk_count", resum)
@@ -5779,19 +6350,39 @@ class BulkCountAndPreloadHarnessTest(unittest.TestCase):
 
     def test_knobs_are_documented_and_allowlisted(self):
         head = self.src[: self.src.index("set -uo pipefail")]
-        for k in ("BULK_COUNT", "PRELOAD=N", "PRELOAD_PER_OWNER", "PRELOAD_OWNER_OFFSET",
-                  "PRELOAD_DISTANCE", "PRELOAD_LEVELS", "PRELOAD_RATE", "PRELOAD_TIMEOUT"):
+        for k in (
+            "BULK_COUNT",
+            "PRELOAD=N",
+            "PRELOAD_PER_OWNER",
+            "PRELOAD_OWNER_OFFSET",
+            "PRELOAD_DISTANCE",
+            "PRELOAD_LEVELS",
+            "PRELOAD_RATE",
+            "PRELOAD_TIMEOUT",
+        ):
             self.assertIn(k, head)
         with open(os.path.join(HERE, "campaign", "run_cell.py")) as f:
             allow = f.read()
-        for k in ("BULK_COUNT", "PRELOAD", "PRELOAD_PER_OWNER", "PRELOAD_OWNER_OFFSET",
-                  "PRELOAD_DISTANCE", "PRELOAD_LEVELS", "PRELOAD_RATE", "PRELOAD_TIMEOUT"):
+        for k in (
+            "BULK_COUNT",
+            "PRELOAD",
+            "PRELOAD_PER_OWNER",
+            "PRELOAD_OWNER_OFFSET",
+            "PRELOAD_DISTANCE",
+            "PRELOAD_LEVELS",
+            "PRELOAD_RATE",
+            "PRELOAD_TIMEOUT",
+        ):
             self.assertIn('"%s",' % k, allow)
 
     # ---- PRELOAD
     def test_preload_defaults_off_and_every_step_is_gated(self):
         self.assertIn("PRELOAD=${PRELOAD:-0}", self.src)
-        for marker in ('"${PRELOAD_CMD[@]}" >', '$(preload_record "', 'preload.py" summary --dir "$OUT" >/dev/null'):
+        for marker in (
+            '"${PRELOAD_CMD[@]}" >',
+            '$(preload_record "',
+            'preload.py" summary --dir "$OUT" >/dev/null',
+        ):
             i = self.src.index(marker)
             gate = self.src.rindex("if preload_on", 0, i)
             self.assertNotIn("\nfi\n", self.src[gate:i], marker)
@@ -5806,20 +6397,24 @@ class BulkCountAndPreloadHarnessTest(unittest.TestCase):
         # after the oracle marks are fresh (orders are banded around the mark) ...
         self.assertGreater(run, self.src.index('log "oracle marks fresh on all'))
         # ... and before anything that measures the load.
-        for later in ('scrape_one "${METS[$i]}" > "$OUT/metrics-before-val$i.txt"',
-                      'python3 "$SELF_DIR/sample_metrics.py"', 'T_BENCH0=$(date +%s)',
-                      '"${BENCH_CMD[@]}" >'):
+        for later in (
+            'scrape_one "${METS[$i]}" > "$OUT/metrics-before-val$i.txt"',
+            'python3 "$SELF_DIR/sample_metrics.py"',
+            "T_BENCH0=$(date +%s)",
+            '"${BENCH_CMD[@]}" >',
+        ):
             self.assertLess(run, self.src.index(later), later)
 
     def test_preload_cmd_carries_the_cell_shape(self):
         i = self.src.index("preload_cmd() {")
         fn = self.src[i : self.src.index("\n}\n", i) + 3]
         script = (
-            'BENCH=/b; OUT=/o; MARKETS=300; SENDERS=5000; BULK_COUNT=1000000; BAND=5\n'
-            'RPCS=(http://r0 http://r1 http://r2); METS=(1 2 3)\n'
-            'PRELOAD=1000000; PRELOAD_PER_OWNER=900; PRELOAD_OWNER_OFFSET=5060; PRELOAD_DISTANCE=1000\n'
-            'PRELOAD_LEVELS=100; PRELOAD_RATE=50; PRELOAD_TIMEOUT=900\n'
-            + fn + 'preload_cmd; printf "%s\\n" "${PRELOAD_CMD[@]}"'
+            "BENCH=/b; OUT=/o; MARKETS=300; SENDERS=5000; BULK_COUNT=1000000; BAND=5\n"
+            "RPCS=(http://r0 http://r1 http://r2); METS=(1 2 3)\n"
+            "PRELOAD=1000000; PRELOAD_PER_OWNER=900; PRELOAD_OWNER_OFFSET=5060; PRELOAD_DISTANCE=1000\n"
+            "PRELOAD_LEVELS=100; PRELOAD_RATE=50; PRELOAD_TIMEOUT=900\n"
+            + fn
+            + 'preload_cmd; printf "%s\\n" "${PRELOAD_CMD[@]}"'
         )
         r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -5827,12 +6422,26 @@ class BulkCountAndPreloadHarnessTest(unittest.TestCase):
         self.assertEqual(args[:2], ["/b", "preload"])
         pairs = dict(zip(args[2::2], args[3::2]))
         self.assertEqual(pairs["--rpc-urls"], "http://r0,http://r1,http://r2")
-        self.assertEqual(pairs["--metrics-urls"],
-                         "http://127.0.0.1:1/metrics,http://127.0.0.1:2/metrics,http://127.0.0.1:3/metrics")
-        want = {"--target": "1000000", "--markets": "300", "--per-owner": "900", "--owner-offset": "5060",
-                "--sender-offset": "60", "--senders": "5000", "--funded-bulk-end": "1000060",
-                "--target-margin": "1500", "--band": "5", "--distance": "1000", "--levels": "100",
-                "--rate": "50", "--timeout-s": "900", "--out": "/o/preload.json"}
+        self.assertEqual(
+            pairs["--metrics-urls"],
+            "http://127.0.0.1:1/metrics,http://127.0.0.1:2/metrics,http://127.0.0.1:3/metrics",
+        )
+        want = {
+            "--target": "1000000",
+            "--markets": "300",
+            "--per-owner": "900",
+            "--owner-offset": "5060",
+            "--sender-offset": "60",
+            "--senders": "5000",
+            "--funded-bulk-end": "1000060",
+            "--target-margin": "1500",
+            "--band": "5",
+            "--distance": "1000",
+            "--levels": "100",
+            "--rate": "50",
+            "--timeout-s": "900",
+            "--out": "/o/preload.json",
+        }
         for k, v in want.items():
             self.assertEqual(pairs.get(k), v, k)
         # The load uses the same econ mid (--target-margin 1500) and band.
@@ -5844,21 +6453,38 @@ class BulkCountAndPreloadHarnessTest(unittest.TestCase):
     def test_bad_preload_env_fails_preflight(self):
         for env, msg in (
             ({"PRELOAD": "lots"}, "PRELOAD must be"),
-            ({"PRELOAD": "20000", "PRELOAD_PER_OWNER": "0"}, "PRELOAD_PER_OWNER must be"),
-            ({"PRELOAD": "20000", "PRELOAD_PER_OWNER": "1001"}, "PRELOAD_PER_OWNER must be"),
+            (
+                {"PRELOAD": "20000", "PRELOAD_PER_OWNER": "0"},
+                "PRELOAD_PER_OWNER must be",
+            ),
+            (
+                {"PRELOAD": "20000", "PRELOAD_PER_OWNER": "1001"},
+                "PRELOAD_PER_OWNER must be",
+            ),
             ({"PRELOAD": "20000", "PRELOAD_RATE": "fast"}, "PRELOAD_RATE must be"),
             ({"PRELOAD": "20000", "PRELOAD_DISTANCE": "x"}, "PRELOAD_DISTANCE must be"),
             # 1M / 900 = 1112 owners from 65: past a 1000-account genesis.
             ({"PRELOAD": "1000000", "BULK_COUNT": "1000"}, "not all genesis-funded"),
             # the top 50 funded indices are the spam keys
-            ({"PRELOAD": "900", "BULK_COUNT": "60", "PRELOAD_OWNER_OFFSET": "100",
-              "SPAM_CANCEL_KEYS": "30", "SPAM_CANCEL_RATE": "1", "SPAM_CANCEL_FUNDED": "1"}, "spam keys"),
+            (
+                {
+                    "PRELOAD": "900",
+                    "BULK_COUNT": "60",
+                    "PRELOAD_OWNER_OFFSET": "100",
+                    "SPAM_CANCEL_KEYS": "30",
+                    "SPAM_CANCEL_RATE": "1",
+                    "SPAM_CANCEL_FUNDED": "1",
+                },
+                "spam keys",
+            ),
         ):
             with self.subTest(env=env):
                 r, _ = self.run_cell(**env)
                 self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
                 self.assertIn(msg, r.stderr)
-                self.assertFalse(os.path.exists(self.called), "refused before the genesis")
+                self.assertFalse(
+                    os.path.exists(self.called), "refused before the genesis"
+                )
 
     def test_bench_without_preload_fails_preflight(self):
         for name in ("torus-node", "bench-throughput"):
@@ -5870,8 +6496,10 @@ class BulkCountAndPreloadHarnessTest(unittest.TestCase):
 
     def test_bench_dry_run_refusal_fails_preflight(self):
         with open(os.path.join(self.tmp, "release", "bench-throughput"), "w") as f:
-            f.write("#!/bin/sh\ncase \"$*\" in *--dry-run*) echo 'preload: --distance 4 must exceed' >&2; exit 2;; esac\n"
-                    "echo 'preload --per-owner'\n")
+            f.write(
+                "#!/bin/sh\ncase \"$*\" in *--dry-run*) echo 'preload: --distance 4 must exceed' >&2; exit 2;; esac\n"
+                "echo 'preload --per-owner'\n"
+            )
         r, _ = self.run_cell(PRELOAD="20000")
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("--distance 4 must exceed", r.stderr)
@@ -5879,8 +6507,14 @@ class BulkCountAndPreloadHarnessTest(unittest.TestCase):
     def test_preload_phase_records_and_fails_the_cell_on_a_miss(self):
         """Run the real 4c block with a stub bench: a miss writes .preload with
         a REJECT and dies; a hit records and continues."""
-        i = self.src.index("# ---------------------------------------------------------------- 4c. pre-load")
-        block = self.src[i : self.src.index("# ---------------------------------------------------------------- 5. samplers")]
+        i = self.src.index(
+            "# ---------------------------------------------------------------- 4c. pre-load"
+        )
+        block = self.src[
+            i : self.src.index(
+                "# ---------------------------------------------------------------- 5. samplers"
+            )
+        ]
         i = self.src.index("preload_record() {")
         rec = self.src[i : self.src.index("\n}\n", i) + 3]
         out = os.path.join(self.tmp, "cell")
@@ -5889,22 +6523,35 @@ class BulkCountAndPreloadHarnessTest(unittest.TestCase):
             with self.subTest(reached=reached):
                 for f in os.listdir(out):
                     os.remove(os.path.join(out, f))
-                rep = {"resting": 20000 if reached else 10, "reached": reached, "actions_failed": 0,
-                       "owners": 23, "orders_placed": 20000}
+                rep = {
+                    "resting": 20000 if reached else 10,
+                    "reached": reached,
+                    "actions_failed": 0,
+                    "owners": 23,
+                    "orders_placed": 20000,
+                }
                 stub = os.path.join(self.tmp, "stub-preload")
                 with open(stub, "w") as f:
-                    f.write("#!/bin/sh\necho '%s' > '%s/preload.json'; exit %d\n" % (json.dumps(rep), out, rc))
+                    f.write(
+                        "#!/bin/sh\necho '%s' > '%s/preload.json'; exit %d\n"
+                        % (json.dumps(rep), out, rc)
+                    )
                 os.chmod(stub, 0o755)
                 script = (
                     'OUT="%s"; SELF_DIR="%s"; PRELOAD=20000; MARKETS=10; PIDS=(); T_LAUNCH=100; T_HEALTHY=130\n'
-                    'PRELOAD_TIMEOUT=900; PRELOAD_KILL_GRACE=60\n'
+                    "PRELOAD_TIMEOUT=900; PRELOAD_KILL_GRACE=60\n"
                     'PRELOAD_OWNERS="23 5060 5083"\n'
                     'log() { echo "LOG $*"; }; die() { echo "DIE $*"; exit 1; }\n'
-                    'preload_on() { true; }\n'
-                    'PRELOAD_CMD=("%s")\n' % (out, HERE, stub)
-                    + rec + block + 'echo "CONTINUED"\n'
+                    "preload_on() { true; }\n"
+                    'PRELOAD_CMD=("%s")\n'
+                    % (out, HERE, stub)
+                    + rec
+                    + block
+                    + 'echo "CONTINUED"\n'
                 )
-                r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+                r = subprocess.run(
+                    ["bash", "-c", script], capture_output=True, text=True, timeout=30
+                )
                 with open(os.path.join(out, "summary.json")) as f:
                     s = json.load(f)
                 p = s["preload"]
@@ -5927,8 +6574,14 @@ class BulkCountAndPreloadHarnessTest(unittest.TestCase):
         it under `timeout` (PRELOAD_TIMEOUT + PRELOAD_KILL_GRACE), so a hung
         pre-load fails the cell (rc 124) instead of blocking it."""
         self.assertIn("PRELOAD_KILL_GRACE=60", self.src)
-        i = self.src.index("# ---------------------------------------------------------------- 4c. pre-load")
-        block = self.src[i : self.src.index("# ---------------------------------------------------------------- 5. samplers")]
+        i = self.src.index(
+            "# ---------------------------------------------------------------- 4c. pre-load"
+        )
+        block = self.src[
+            i : self.src.index(
+                "# ---------------------------------------------------------------- 5. samplers"
+            )
+        ]
         i = self.src.index("preload_record() {")
         rec = self.src[i : self.src.index("\n}\n", i) + 3]
         out = os.path.join(self.tmp, "hung")
@@ -5941,12 +6594,17 @@ class BulkCountAndPreloadHarnessTest(unittest.TestCase):
             'OUT="%s"; SELF_DIR="%s"; PRELOAD=20000; MARKETS=10; PIDS=(); T_LAUNCH=100; T_HEALTHY=130\n'
             'PRELOAD_TIMEOUT=1; PRELOAD_KILL_GRACE=1; PRELOAD_OWNERS="23 5060 5083"\n'
             'log() { echo "LOG $*"; }; die() { echo "DIE $*"; exit 1; }\n'
-            'preload_on() { true; }\n'
-            'PRELOAD_CMD=("%s")\n' % (out, HERE, stub)
-            + rec + block + 'echo "CONTINUED"\n'
+            "preload_on() { true; }\n"
+            'PRELOAD_CMD=("%s")\n'
+            % (out, HERE, stub)
+            + rec
+            + block
+            + 'echo "CONTINUED"\n'
         )
         t0 = time.monotonic()
-        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+        r = subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True, timeout=30
+        )
         self.assertLess(time.monotonic() - t0, 10)
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("rc=124", r.stdout)
@@ -5957,9 +6615,10 @@ class BulkCountAndPreloadHarnessTest(unittest.TestCase):
 
     def test_preload_is_re_recorded_after_summarize(self):
         summ = self.src.index('python3 "$TOOLS_DIR/summarize.py"')
-        again = self.src.index('python3 "$SELF_DIR/preload.py" summary --dir "$OUT"', summ)
+        again = self.src.index(
+            'python3 "$SELF_DIR/preload.py" summary --dir "$OUT"', summ
+        )
         self.assertLess(again, self.src.index('python3 "$TOOLS_DIR/health.py" accept'))
-
 
 
 AUDITED_FLAGS = (
@@ -6039,7 +6698,9 @@ class BookModeNotPinnedTest(unittest.TestCase):
         self.assertNotIn("TORUS_BOOK_ROWS", block)
 
     def test_no_override_runs_and_records_classic(self):
-        r, log = self.run_cell("TORUS_X=1", TORUS_BOOK_ROWS="3")  # ambient: must not leak
+        r, log = self.run_cell(
+            "TORUS_X=1", TORUS_BOOK_ROWS="3"
+        )  # ambient: must not leak
         self.assertIn("launch-3val.sh failed", log, r.stdout + r.stderr + log)
         lines = self.flags_line(log)
         self.assertEqual(len(lines), 1, log)
@@ -6094,7 +6755,9 @@ class BookModeNotPinnedTest(unittest.TestCase):
             ("TORUS_RETENTION_BLOCKS=1000", "retention=1000"),
         ]:
             with self.subTest(extra=extra):
-                r, log = self.run_cell(extra, TORUS_RETENTION_BLOCKS="7")  # ambient: must not leak
+                r, log = self.run_cell(
+                    extra, TORUS_RETENTION_BLOCKS="7"
+                )  # ambient: must not leak
                 lines = self.flags_line(log)
                 self.assertEqual(len(lines), 1, r.stdout + r.stderr + log)
                 self.assertIn(" book_mode=", lines[0])
@@ -6104,11 +6767,18 @@ class BookModeNotPinnedTest(unittest.TestCase):
         fn = self.node_flags_fn()
         for v, want in RETENTION_CASES:
             with self.subTest(v=v):
-                env = {k: x for k, x in os.environ.items() if not k.startswith("TORUS_")}
+                env = {
+                    k: x for k, x in os.environ.items() if not k.startswith("TORUS_")
+                }
                 if v is not None:
                     env["TORUS_RETENTION_BLOCKS"] = v
-                r = subprocess.run(["bash", "-c", fn + "\nnode_flags_line"],
-                                   capture_output=True, text=True, timeout=10, env=env)
+                r = subprocess.run(
+                    ["bash", "-c", fn + "\nnode_flags_line"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    env=env,
+                )
                 self.assertEqual(r.returncode, 0, r.stderr)
                 self.assertIn(" retention=%s " % want, r.stdout, (v, r.stdout))
 
@@ -6139,13 +6809,25 @@ class BookModeNotPinnedTest(unittest.TestCase):
         for name, label in GENESIS_BOOK_MODES:
             for v in (None, "", "3", "x"):
                 with self.subTest(name=name, v=v):
-                    env = {k: x for k, x in os.environ.items() if not k.startswith("TORUS_")}
+                    env = {
+                        k: x
+                        for k, x in os.environ.items()
+                        if not k.startswith("TORUS_")
+                    }
                     if v is not None:
                         env["TORUS_BOOK_ROWS"] = v
-                    r = subprocess.run(["bash", "-c", fn + "\nnode_flags_line " + name],
-                                       capture_output=True, text=True, timeout=10, env=env)
+                    r = subprocess.run(
+                        ["bash", "-c", fn + "\nnode_flags_line " + name],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        env=env,
+                    )
                     self.assertEqual(r.returncode, 0, r.stderr)
-                    self.assertTrue(r.stdout.startswith("book_mode=%s " % label), (name, v, r.stdout))
+                    self.assertTrue(
+                        r.stdout.startswith("book_mode=%s " % label),
+                        (name, v, r.stdout),
+                    )
 
     def test_summary_records_book_mode_and_flags(self):
         d = tempfile.mkdtemp(prefix="book-mode-sum-")
@@ -6163,8 +6845,13 @@ class BookModeNotPinnedTest(unittest.TestCase):
                 self.assertEqual(list(flags), list(AUDITED_FLAGS))
                 self.assertEqual(flags["TORUS_EVM_FAST_PATH"], "0")
                 self.assertEqual(flags["TORUS_SETTLE_NO_MERGE"], "unset (default)")
-                want = ("unset (default)" if v is None
-                        else "empty (default)" if v == "" else v)
+                want = (
+                    "unset (default)"
+                    if v is None
+                    else "empty (default)"
+                    if v == ""
+                    else v
+                )
                 self.assertEqual(flags["TORUS_BOOK_ROWS"], want)
         # an empty node env (all defaults) is Classic too
         s, _ = run_summarize(d, extra=["--node-env", "{}"])
@@ -6197,14 +6884,18 @@ class BookModeGenesisTest(unittest.TestCase):
         "import argparse\nap = argparse.ArgumentParser()\n"
         "ap.add_argument('--genesis-book-mode', default='')\nap.parse_args()\n"
     )
-    OLD_SUMMARIZER = "import argparse\nap = argparse.ArgumentParser()\nap.parse_args()\n"
+    OLD_SUMMARIZER = (
+        "import argparse\nap = argparse.ArgumentParser()\nap.parse_args()\n"
+    )
 
     def setUp(self):
         EvmBlockIntervalKnobTest.setUp(self)
         self.write_summarizer(self.NEW_SUMMARIZER)
 
     def write_summarizer(self, body):
-        with open(os.path.join(self.wt, "tools", "matched-bench", "summarize.py"), "w") as f:
+        with open(
+            os.path.join(self.wt, "tools", "matched-bench", "summarize.py"), "w"
+        ) as f:
             f.write(body)
 
     def book_mode_seen(self):
@@ -6227,8 +6918,13 @@ class BookModeGenesisTest(unittest.TestCase):
         r, log = self.run_cell("TORUS_X=1 TORUS_BOOK_ROWS=3")
         out = r.stdout + r.stderr + log
         self.assertEqual(self.book_mode_seen(), ["level_authority_chunked"], out)
-        self.assertEqual(self.genesis()["consensus"]["book_mode"], "level_authority_chunked")
-        self.assertIn("genesis consensus.book_mode=level_authority_chunked (TORUS_BOOK_ROWS=3)", log)
+        self.assertEqual(
+            self.genesis()["consensus"]["book_mode"], "level_authority_chunked"
+        )
+        self.assertIn(
+            "genesis consensus.book_mode=level_authority_chunked (TORUS_BOOK_ROWS=3)",
+            log,
+        )
         lines = self.flags_line(log)
         self.assertEqual(len(lines), 1, out)
         self.assertIn("cell=knob-x book_mode=mode3", lines[0])
@@ -6241,9 +6937,17 @@ class BookModeGenesisTest(unittest.TestCase):
             with self.subTest(v=v):
                 r, log = self.run_cell("TORUS_X=1 BOOK_MODE=%s" % v)
                 out = r.stdout + r.stderr + log
-                self.assertEqual(self.book_mode_seen()[-1], "level_authority_chunked", out)
-                self.assertEqual(self.genesis()["consensus"]["book_mode"], "level_authority_chunked")
-                self.assertIn("genesis consensus.book_mode=level_authority_chunked (BOOK_MODE=%s)" % v, log)
+                self.assertEqual(
+                    self.book_mode_seen()[-1], "level_authority_chunked", out
+                )
+                self.assertEqual(
+                    self.genesis()["consensus"]["book_mode"], "level_authority_chunked"
+                )
+                self.assertIn(
+                    "genesis consensus.book_mode=level_authority_chunked (BOOK_MODE=%s)"
+                    % v,
+                    log,
+                )
                 self.assertIn("cell=knob-x book_mode=mode3", self.flags_line(log)[0])
                 self.assertNotIn("TORUS_BOOK_ROWS", self.node_env(log))
                 self.assertIn("launch-3val.sh failed", log)
@@ -6254,8 +6958,12 @@ class BookModeGenesisTest(unittest.TestCase):
                 r, log = self.run_cell("TORUS_BOOK_ROWS=%d" % n)
                 # Classic is the absent field: the generator gets an empty BOOK_MODE
                 want = "" if name == "classic" else name
-                self.assertEqual(self.book_mode_seen()[-1], want, r.stdout + r.stderr + log)
-                self.assertIn("cell=knob-x book_mode=%s" % label, self.flags_line(log)[0])
+                self.assertEqual(
+                    self.book_mode_seen()[-1], want, r.stdout + r.stderr + log
+                )
+                self.assertIn(
+                    "cell=knob-x book_mode=%s" % label, self.flags_line(log)[0]
+                )
 
     def test_no_knob_is_classic_and_the_genesis_has_no_field(self):
         # ambient values must not leak into the cell
@@ -6292,7 +7000,12 @@ class BookModeGenesisTest(unittest.TestCase):
         self.assertIn("needs a summarizer that accepts --genesis-book-mode", r.stderr)
         self.assertEqual(self.book_mode_seen(), [])
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "results")))
-        for kv in ("TORUS_BOOK_ROWS=3", "BOOK_MODE=3 TORUS_BOOK_ROWS=3", "BOOK_MODE=classic", ""):
+        for kv in (
+            "TORUS_BOOK_ROWS=3",
+            "BOOK_MODE=3 TORUS_BOOK_ROWS=3",
+            "BOOK_MODE=classic",
+            "",
+        ):
             with self.subTest(kv=kv):
                 r, log = self.run_cell("TORUS_X=1 " + kv)
                 self.assertIn("launch-3val.sh failed", log, r.stdout + r.stderr + log)
@@ -6306,7 +7019,10 @@ class BookModeGenesisTest(unittest.TestCase):
         before = src[src.rindex("SUMMARIZE_BOOK_ARGS=(", 0, i) : i]
         self.assertIn('--genesis-book-mode "$GEN_BOOK_MODE_GOT"', before)
         # the check runs in preflight, before the results dir exists
-        self.assertLess(src.index("summarizer_has_genesis_book_mode; then"), src.index('mkdir -p "$OUT"'))
+        self.assertLess(
+            src.index("summarizer_has_genesis_book_mode; then"),
+            src.index('mkdir -p "$OUT"'),
+        )
 
     def test_empty_torus_book_rows_is_classic(self):
         r, log = self.run_cell("TORUS_BOOK_ROWS=")
@@ -6315,18 +7031,31 @@ class BookModeGenesisTest(unittest.TestCase):
 
     def test_agreeing_knobs_run_and_disagreeing_ones_fail_preflight(self):
         r, log = self.run_cell("BOOK_MODE=level_authority_chunked TORUS_BOOK_ROWS=3")
-        self.assertIn("cell=knob-x book_mode=mode3", self.flags_line(log)[0], r.stdout + r.stderr + log)
+        self.assertIn(
+            "cell=knob-x book_mode=mode3",
+            self.flags_line(log)[0],
+            r.stdout + r.stderr + log,
+        )
         shutil.rmtree(os.path.join(self.tmp, "results"))
         os.remove(self.seen + ".book-mode")
         r, _ = self.run_cell("BOOK_MODE=3 TORUS_BOOK_ROWS=0")
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-        self.assertIn("BOOK_MODE=3 and TORUS_BOOK_ROWS=0 name different book modes", r.stderr)
+        self.assertIn(
+            "BOOK_MODE=3 and TORUS_BOOK_ROWS=0 name different book modes", r.stderr
+        )
         self.assertEqual(self.book_mode_seen(), [])
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "results")))
 
     def test_bad_values_fail_preflight(self):
-        for kv in ("TORUS_BOOK_ROWS=x", "TORUS_BOOK_ROWS=4", "TORUS_BOOK_ROWS=03",
-                   "BOOK_MODE=mode3", "BOOK_MODE=", "BOOK_MODE=Classic", "BOOK_MODE=4"):
+        for kv in (
+            "TORUS_BOOK_ROWS=x",
+            "TORUS_BOOK_ROWS=4",
+            "TORUS_BOOK_ROWS=03",
+            "BOOK_MODE=mode3",
+            "BOOK_MODE=",
+            "BOOK_MODE=Classic",
+            "BOOK_MODE=4",
+        ):
             with self.subTest(kv=kv):
                 r, _ = self.run_cell("TORUS_X=1 " + kv)
                 self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
@@ -6357,19 +7086,45 @@ class BookModeGenesisTest(unittest.TestCase):
         for name, label in GENESIS_BOOK_MODES:
             with self.subTest(name=name):
                 with open(p, "w") as f:
-                    json.dump({"genesis": {"md5": "ab"}, "cell": {"book_mode": "classic", "x": 1}}, f)
-                r = subprocess.run(["bash", "-c", fn + '\nrecord_genesis_book_mode "$1" "$2"', "_", p, name],
-                                   capture_output=True, text=True, timeout=10)
+                    json.dump(
+                        {
+                            "genesis": {"md5": "ab"},
+                            "cell": {"book_mode": "classic", "x": 1},
+                        },
+                        f,
+                    )
+                r = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        fn + '\nrecord_genesis_book_mode "$1" "$2"',
+                        "_",
+                        p,
+                        name,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
                 self.assertEqual(r.returncode, 0, r.stderr)
                 with open(p) as f:
-                    self.assertEqual(json.load(f), {"genesis": {"md5": "ab", "book_mode": name},
-                                                    "cell": {"book_mode": label, "x": 1}})
-                self.assertEqual(sorted(os.listdir(d)), ["summary.json"], "no temp file left")
+                    self.assertEqual(
+                        json.load(f),
+                        {
+                            "genesis": {"md5": "ab", "book_mode": name},
+                            "cell": {"book_mode": label, "x": 1},
+                        },
+                    )
+                self.assertEqual(
+                    sorted(os.listdir(d)), ["summary.json"], "no temp file left"
+                )
 
     def test_book_mode_is_recorded_after_summarize_and_kept_by_resummarize(self):
         with open(RUN_CELL_SH) as f:
             src = f.read()
-        rec = src.index('record_genesis_book_mode "$OUT/summary.json" "$GEN_BOOK_MODE_GOT"')
+        rec = src.index(
+            'record_genesis_book_mode "$OUT/summary.json" "$GEN_BOOK_MODE_GOT"'
+        )
         self.assertLess(src.index('python3 "$TOOLS_DIR/summarize.py"'), rec)
         self.assertLess(rec, src.index('log "done -> $OUT/summary.json"'))
         self.assertIn('--param BOOK_MODE="$GEN_BOOK_MODE"', src)
