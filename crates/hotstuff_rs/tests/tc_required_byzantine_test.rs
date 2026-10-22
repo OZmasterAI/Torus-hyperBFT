@@ -618,7 +618,9 @@ struct WindowLog {
 /// fails under the committed set. The Decide votes reach only the committed set's leader of the
 /// next view (w), and the other messages carrying the Decide PC are lost until a proposal after w
 /// is out. Its fresh proposal (justified by the Decide PC, so only it has applied that PC)
-/// is lost, and so are one
+/// is lost, so is the previous set's leader of w's Commit nudge for w (s138: still undecided when
+/// TC(w - 1) brings it into w, it re-runs the Decide phase there and w gets a QC, depending on which
+/// replica's pacemaker deadline comes first), and so are one
 /// power-1 validator's timeout votes for w, so TC(w) carries the leader of w's vote: its high QC
 /// is the Decide PC (case 3) and its high tip the pre-update tip. leader(w + 1) applies the Decide
 /// PC and proposes with that TC. Under the decided-ness rule that leader and leader(w) (both
@@ -679,6 +681,16 @@ fn validator_set_update_window_timeout_loses_no_further_view() {
         {
             let view = m.view().int();
             if w.skipped.contains(&view) || w.dropped == Some(view) {
+                return None;
+            }
+        }
+        // While undecided, the previous set's leader of w is a proposer of w as well (nudges,
+        // `is_proposer`). If TC(w - 1) brings it into w before the Decide PC reaches it, it nudges
+        // the Commit PC, the Decide phase runs again in w and w ends with a QC, not a timeout (the
+        // scenario is missed; a race of pacemaker deadlines across replicas, lost under CPU load).
+        // Its nudge for w is lost too.
+        if let Message::ProgressMessage(ProgressMessage::HotStuffMessage(HotStuffMessage::Nudge(nudge))) = &message {
+            if w.dropped == Some(nudge.view.int()) {
                 return None;
             }
         }
