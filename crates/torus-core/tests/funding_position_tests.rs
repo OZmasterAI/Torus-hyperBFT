@@ -262,3 +262,28 @@ fn escrows_are_exempt_from_funding_and_the_vault_carries_their_share() {
         assert_eq!(move_collateral(&pm, &escrow, &LIQUIDATOR_VAULT).unwrap(), FixedPoint::ZERO, "no dust");
     }
 }
+
+/// `settle_funding` (ADL's settle-first, Codex P1 s138 round 2): a touch
+/// without a fill. The owed amount moves from pending to cash (equity
+/// unchanged), the entry index moves, `paid` grows; with nothing owed (no
+/// index, or settled already) it writes nothing.
+#[test]
+fn settle_funding_moves_pending_funding_to_cash_without_a_fill() {
+    let (_d, mut pm) = setup();
+    with_index(&mut pm, 0);
+    pm.apply_fill(&addr(1), 1, true, fp(2), fp(100), MarginType::Cross).unwrap();
+    let p = pm.get_position(&addr(1), 1).unwrap().unwrap();
+    with_index(&mut pm, 5 * E18);
+    // No index: nothing owed, nothing written.
+    assert_eq!(pm.settle_funding(&p, None).unwrap().funding, p.funding);
+    assert_eq!(pm.get_native_balance(&addr(1)).unwrap().available, fp(1_000));
+    let s = pm.settle_funding(&p, Some(5 * E18)).unwrap();
+    assert_eq!(s.funding.map(|f| (f.entry_index, f.paid)), Some((5 * E18, fp(10))));
+    assert_eq!(pm.get_position(&addr(1), 1).unwrap().unwrap().funding, s.funding, "stored");
+    assert_eq!(pm.get_native_balance(&addr(1)).unwrap().available, fp(990), "long 2 paid 2 × 5");
+    assert_eq!(s.funding_owed(Some(5 * E18)), FixedPoint::ZERO, "nothing pending");
+    assert_eq!((s.size, s.cost_basis), (p.size, p.cost_basis), "not a fill");
+    // Settled already: no second payment.
+    pm.settle_funding(&s, Some(5 * E18)).unwrap();
+    assert_eq!(pm.get_native_balance(&addr(1)).unwrap().available, fp(990));
+}

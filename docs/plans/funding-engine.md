@@ -63,19 +63,24 @@ count.
   checks, withdrawals, liquidation and ADL ranking, the sums cache, the getPosition precompile, RPC):
   `upnl_funded = upnl − owed`. When there is no mark, the trade UPnL is 0 as before (s517 decision 2), but the
   pending funding still counts: it needs only the index, `(cum_index − entry_index) × size`. (Codex P1, s138: with
-  the funding term gated on the mark, a stale mark raised equity by the debt and let it be withdrawn.) One
-  exception: the bankruptcy price of an ADL account's marked positions (`adl_to_escrow`'s `rest`) leaves an
-  unmarked position out entirely, trade UPnL and funding, because that position stays with the account (H2) with
-  its debt. Counting the debt there would price the closes to leave that much cash, which D9 then hands to the
-  vault (a positive D9 remainder). Settling moves the owed amount from UPnL to cash, so equity does not change at
-  the touch (tested).
+  the funding term gated on the mark, a stale mark raised equity by the debt and let it be withdrawn.)
+  Settling moves the owed amount from UPnL to cash, so equity does not change at the touch (tested).
+- **ADL settles first** (Codex P1, s138 round 2). `adl_to_escrow` settles all of the bankrupt account's pending
+  funding, on marked and unmarked positions, in cash (`PositionManager::settle_funding`, a touch without a fill)
+  before it computes the bankruptcy prices and before the D9 sweep. Every funding credit and debt is then in the
+  cash the prices leave at zero, and D9 sweeps exactly the remainder, so no funding survives ADL: an unmarked
+  position stays with the account (H2) with nothing pending. (Leaving unmarked funding out of the bankruptcy
+  price, the earlier rule, kept a credit the trader could withdraw later while the counterparties absorbed the loss
+  it should have covered; counting it without settling would let D9 sweep the offsetting cash.)
 - **ADL escrows are exempt** (adl-budget §8, owner decision 5). `Position::funding_owed` is 0 for a position held
   by `ADL_ESCROW_LONG` / `ADL_ESCROW_SHORT`, in every valuation and every settlement, so an escrow neither pays nor
   receives and ends at 0 (its dust sweep stays real dust). Counterparties keep paying and receiving until their
   row is drained. To keep funding zero-sum, the escrow's share (what its position accrued since its entry index,
   `Position::funding_accrued`) is charged to the liquidator vault when the escrow's position is touched (the
   drain's transfer, `cross_close`; `PositionManager::apply_fill`). The vault is the escrows' residual owner
-  already (deficit at B, the pairing difference, the dust), so it carries their funding too. Without that charge
+  already (deficit at B, the pairing difference, the dust), so it carries their funding too. The charge changes
+  the vault's account value, so the drain drops the vault's cached ranking value after every escrow close (Codex
+  P1, s138 round 2: a stale value ranked the vault in the next market as if uncharged). Without that charge
   the counterparties' receipts (or payments) on the escrowed size would be unbacked: value created or destroyed.
   Between a settlement and the drain's touch, the share is not yet in the vault's valuation (the escrow holds a
   position for more than its bankruptcy block only in an S=750-type storm). The cached fill path (orders) writes

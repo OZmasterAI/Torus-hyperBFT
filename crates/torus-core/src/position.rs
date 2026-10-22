@@ -651,6 +651,26 @@ impl<T: StateBackend> PositionManager<T> {
         Ok(effect)
     }
 
+    /// Funding engine: settle `pos`'s pending funding at the market's
+    /// `index` in cash without a fill (as a touch does: cash −= owed, entry
+    /// index = `index`, `paid` += owed). Used by ADL (`adl_to_escrow`) so the
+    /// bankrupt account's funding, on unmarked positions too, is cash before
+    /// its bankruptcy prices and the D9 sweep. Nothing owed (no index, an
+    /// ADL escrow, or a 0 amount): no write, `pos` unchanged. Returns the
+    /// position as stored.
+    pub fn settle_funding(&self, pos: &Position, index: Option<i128>) -> Result<Position, CoreError> {
+        let owed = pos.funding_owed(index);
+        let Some(index) = index.filter(|_| owed != FixedPoint::ZERO) else {
+            return Ok(pos.clone());
+        };
+        let mut p = pos.clone();
+        let paid = p.funding.map_or(FixedPoint::ZERO, |f| f.paid);
+        p.funding = Some(PositionFunding { entry_index: index, paid: paid + owed });
+        self.put_position(&p)?;
+        self.credit_realized_pnl(&p.trader, FixedPoint::ZERO - owed)?;
+        Ok(p)
+    }
+
     /// C1: `apply_fill`, but the position read-modify-write goes through a
     /// write-back [`PositionCache`] and NO balance is touched — the realized
     /// PnL (if the fill had a close component) is returned for the caller to
