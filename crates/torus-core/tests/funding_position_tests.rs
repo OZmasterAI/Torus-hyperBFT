@@ -185,10 +185,80 @@ fn valuation_takes_pending_funding_off_the_upnl() {
         (plain.notional, plain.position_im, plain.maintenance)
     );
     assert_eq!(position_terms_funded(&p, Some(fp(110)), None, None).unwrap(), plain);
-    // No mark: UPnL 0 and no funding term (s517 decision 2).
-    assert_eq!(position_terms_funded(&p, None, Some(2 * E18), None).unwrap().upnl, FixedPoint::ZERO);
+    // No mark: the trade UPnL is 0 (s517 decision 2), the pending funding
+    // still counts (it needs only the index; Codex P1 s138).
+    assert_eq!(position_terms_funded(&p, None, Some(2 * E18), None).unwrap().upnl, -fp(6));
     let bal = NativeBalance { available: fp(50), order_margin: FixedPoint::ZERO };
     let v = AccountView::build_funded(&bal, &[p.clone()], |_| Some(fp(110)), |_| Ok(Some(2 * E18)), |_| None).unwrap();
     let v0 = AccountView::build(&bal, &[p], |_| Some(fp(110)), |_| None).unwrap();
     assert_eq!(v.equity(), v0.equity() - fp(6));
+}
+
+/// Codex P1 (s138): a stale mark must not erase funding debt. Cash 1000,
+/// long 1 @ 100 opened at index 0, index 800 per unit: owes 800. With or
+/// without a mark the equity is 200, so withdrawing 800 is refused (with no
+/// mark it was 1000 and allowed). RED before the fix: the funding term
+/// needed a mark.
+#[test]
+fn pending_funding_counts_without_a_mark_and_blocks_the_withdrawal() {
+    let p = Position {
+        size: fp(1),
+        cost_basis: fp(100),
+        ..base(Some(PositionFunding { entry_index: 0, paid: FixedPoint::ZERO }))
+    };
+    let bal = NativeBalance { available: fp(1_000), order_margin: FixedPoint::ZERO };
+    for mark in [Some(fp(100)), None] {
+        let v = AccountView::build_funded(&bal, &[p.clone()], |_| mark, |_| Ok(Some(800 * E18)), |_| None).unwrap();
+        assert_eq!(v.upnl, -fp(800), "mark {mark:?}: the funding debt is in the UPnL");
+        assert_eq!(v.equity(), fp(200), "mark {mark:?}");
+        assert!(!v.withdrawal_allowed(fp(800)), "mark {mark:?}: 800 of 200 equity");
+        assert!(v.withdrawal_allowed(fp(100)), "mark {mark:?}: 100 leaves 100 >= 10% x 100");
+    }
+}
+
+/// Codex P1 (s138): the ADL escrows are exempt from funding (adl-budget §8,
+/// owner decision 5): their positions owe nothing in any valuation and a
+/// touch pays nothing into their balance, so an escrow ends at 0. Their
+/// share (what the position would owe) goes to the liquidator vault at the
+/// touch, so funding stays zero-sum: the counterparty still receives (or
+/// pays) it. Bankrupt `u` (either side) moves 10 @ 100 to its escrow at
+/// index 0; the index moves to 6 per unit; the drain closes the escrow
+/// against `c` at 100. RED before the fix: the escrow paid the 60 itself
+/// (escrow cash −60 / +60, the vault 0).
+#[test]
+fn escrows_are_exempt_from_funding_and_the_vault_carries_their_share() {
+    use torus_core::liquidation::{adl_escrow, move_collateral, transfer, LIQUIDATOR_VAULT};
+    for u_long in [true, false] {
+        let (_d, mut pm) = setup();
+        let (u, c, escrow) = (addr(1), addr(2), adl_escrow(u_long));
+        let cash = |pm: &PositionManager<StateDb>, a: &torus_types::Address| {
+            let b = pm.get_native_balance(a).unwrap();
+            b.available + b.order_margin
+        };
+        let total = |pm: &PositionManager<StateDb>| [u, c, escrow, LIQUIDATOR_VAULT].iter().map(|a| cash(pm, a)).fold(FixedPoint::ZERO, |s, x| s + x);
+        with_index(&mut pm, 0);
+        pm.apply_fill(&u, 1, u_long, fp(10), fp(100), MarginType::Cross).unwrap();
+        pm.apply_fill(&c, 1, !u_long, fp(10), fp(100), MarginType::Cross).unwrap();
+        transfer(&pm, &u, &escrow, 1, fp(10), fp(100)).unwrap(); // block B
+        let before = total(&pm);
+        // A funding settlement before the drain.
+        with_index(&mut pm, 6 * E18);
+        let e = pm.get_position(&escrow, 1).unwrap().unwrap();
+        assert_eq!(e.funding_owed(Some(6 * E18)), FixedPoint::ZERO, "u_long {u_long}: exempt");
+        assert_eq!(e.funding_since_open(Some(6 * E18)), FixedPoint::ZERO, "u_long {u_long}");
+        assert_eq!(
+            position_terms_funded(&e, Some(fp(100)), Some(6 * E18), None).unwrap(),
+            position_terms(&e, Some(fp(100)), None).unwrap(),
+            "u_long {u_long}: no funding in the escrow's valuation"
+        );
+        // The drain: the escrow closes against c at the stored price.
+        transfer(&pm, &escrow, &c, 1, fp(10), fp(100)).unwrap();
+        assert!(pm.get_position(&escrow, 1).unwrap().is_none());
+        assert_eq!(cash(&pm, &escrow), FixedPoint::ZERO, "u_long {u_long}: the escrow neither pays nor receives");
+        let share = if u_long { fp(60) } else { -fp(60) }; // + = the escrow's side pays
+        assert_eq!(cash(&pm, &c), fp(1_000) + share, "u_long {u_long}: c keeps its funding");
+        assert_eq!(cash(&pm, &LIQUIDATOR_VAULT), FixedPoint::ZERO - share, "u_long {u_long}: the vault carries the escrow's share");
+        assert_eq!(total(&pm), before, "u_long {u_long}: zero-sum");
+        assert_eq!(move_collateral(&pm, &escrow, &LIQUIDATOR_VAULT).unwrap(), FixedPoint::ZERO, "no dust");
+    }
 }

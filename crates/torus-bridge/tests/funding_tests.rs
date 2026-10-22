@@ -301,6 +301,91 @@ fn pending_funding_counts_in_liquidation_and_the_close_settles_it() {
     }
 }
 
+/// Codex P1 (s138): a stale mark must not erase funding debt in the
+/// production withdrawal check. t: cash 1000, long 1 @ 100 opened at index
+/// 0, index 800 per unit (owes 800): equity 200 with or without a mark, so a
+/// withdrawal of 800 is refused as under-margined in both cases. RED before
+/// the fix: without a mark the funding term was dropped (equity 1000) and
+/// the withdrawal went through.
+#[test]
+fn a_stale_mark_keeps_pending_funding_in_the_withdrawal_check() {
+    for fresh in [true, false] {
+        let (_d, db) = setup(1, 0, 0);
+        let mut ctx = ctx_at(db.clone(), 1, 1_000, FUND);
+        let (t, s) = (addr(1), addr(2));
+        for (who, amount) in [(t, 1_000), (s, 1_000_000)] {
+            ctx.positions
+                .put_native_balance(&who, &NativeBalance { available: fp(amount), order_margin: FixedPoint::ZERO })
+                .unwrap();
+        }
+        let mut row = FundingRow::new(1_000, &FundingParams::default());
+        funding::write_row(&ctx.state, 1, &row).unwrap();
+        ctx.positions.set_funding(Some(Arc::new([(1u64, 0i128)].into_iter().collect())));
+        ctx.positions.apply_fill(&t, 1, true, fp(1), fp(100), MarginType::Cross).unwrap();
+        ctx.positions.apply_fill(&s, 1, false, fp(1), fp(100), MarginType::Cross).unwrap();
+        row.cum_index = 800 * E18;
+        funding::write_row(&ctx.state, 1, &row).unwrap();
+        ctx.positions.set_funding(Some(Arc::new([(1u64, 800 * E18)].into_iter().collect())));
+        if fresh {
+            set_mark(&ctx.state, 1, fp(100), 1_000);
+        }
+        let w = NativeAction::Withdraw { amount: wei(800), to: addr(50) };
+        let r = NativeExecutor::execute(&mut ctx, &t, &w);
+        assert!(!r.success, "fresh {fresh}: withdrew 800 against 200 of equity");
+        let why = r.error.clone().unwrap_or_default();
+        assert!(why.contains("under-margined"), "fresh {fresh}: {why}");
+        assert_eq!(cash(&ctx.state, &t), fp(1_000), "fresh {fresh}: nothing left the account");
+    }
+}
+
+/// Codex P1 (s138): a drain spanning a funding settlement. Bankrupt u's long
+/// 10 @ 100 sits in the long escrow (obligation row at block 1, index 0);
+/// the index moves to 6 per unit; the liquidation step's drain closes the
+/// escrow against c at 100. The escrow is exempt (adl-budget §8): it pays
+/// nothing, so it ends at exactly 0 with no dust; its share (60) is charged
+/// to the vault at the touch, c still receives its 60 and the cash total is
+/// unchanged (zero-sum). RED before the fix: the escrow paid the 60 and the
+/// drain swept it to the vault as 60 tokens of "dust".
+#[test]
+fn a_drain_across_a_funding_settlement_leaves_the_escrow_exempt() {
+    use torus_core::liquidation::{put_obligation, transfer, Obligation, ADL_ESCROW_LONG, LIQUIDATOR_VAULT};
+    let (_d, db) = setup(1, 0, 0);
+    let mut ctx = ctx_at(db.clone(), 2, 1_000, FUND);
+    let metrics = Arc::new(torus_telemetry::Metrics::new());
+    ctx.metrics = Some(metrics.clone());
+    let (u, c) = (addr(1), addr(2));
+    for (who, amount) in [(u, 1_000), (c, 1_000_000)] {
+        ctx.positions
+            .put_native_balance(&who, &NativeBalance { available: fp(amount), order_margin: FixedPoint::ZERO })
+            .unwrap();
+    }
+    let mut row = FundingRow::new(1_000, &FundingParams::default());
+    funding::write_row(&ctx.state, 1, &row).unwrap();
+    ctx.positions.set_funding(Some(Arc::new([(1u64, 0i128)].into_iter().collect())));
+    ctx.positions.apply_fill(&u, 1, true, fp(10), fp(100), MarginType::Cross).unwrap();
+    ctx.positions.apply_fill(&c, 1, false, fp(10), fp(100), MarginType::Cross).unwrap();
+    // Block B = 1: u's long moves to the escrow, its obligation is queued.
+    transfer(&ctx.positions, &u, &ADL_ESCROW_LONG, 1, fp(10), fp(100)).unwrap();
+    let o = Obligation { height: 1, market: 1, is_long: true, trader: u, size: fp(10), price: fp(100) };
+    put_obligation(&ctx.state, &o).unwrap();
+    let total = |s: &StateDb| [u, c, ADL_ESCROW_LONG, LIQUIDATOR_VAULT].iter().map(|a| cash(s, a)).fold(FixedPoint::ZERO, |a, x| a + x);
+    let before = total(&db);
+    // A funding settlement before the drain.
+    row.cum_index = 6 * E18;
+    funding::write_row(&ctx.state, 1, &row).unwrap();
+    ctx.positions.set_funding(Some(Arc::new([(1u64, 6 * E18)].into_iter().collect())));
+    set_mark(&ctx.state, 1, fp(100), 1_000);
+    NativeExecutor::run_liquidations(&mut ctx);
+    assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
+    assert!(position(&db, &ADL_ESCROW_LONG, 1).is_none(), "drained");
+    assert_eq!(position(&db, &c, 1).map(|p| p.size), None, "c closed against the escrow");
+    assert_eq!(cash(&db, &ADL_ESCROW_LONG), FixedPoint::ZERO);
+    assert_eq!(metrics.liquidation_adl_dust.get(), 0.0, "no funding swept as dust");
+    assert_eq!(cash(&db, &c), fp(1_000_000) + fp(60), "c receives its funding");
+    assert_eq!(cash(&db, &LIQUIDATOR_VAULT), -fp(60), "the vault carries the escrow's share");
+    assert_eq!(total(&db), before, "zero-sum");
+}
+
 // ---- Determinism / activation / restart ----
 
 /// One block: its timestamp, each market's mark, its two batches.
