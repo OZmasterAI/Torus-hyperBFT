@@ -475,9 +475,11 @@ DISSEM_FAIL_KEYS = ('exhausted', 'sync_fallback', 'da_outbound_fail', 'starvatio
 
 
 def failure_targets(record, peer_nodes):
-    """The nodes a dissemination-failure line (a collect_logs.py record) failed
-    toward: the OUTBOUND FAILURE peer, else the fetched block's proposers;
-    [] when the evidence names none (or names an unknown peer id)."""
+    """The nodes a dissemination-failure line (a collect_logs.py record) is
+    reported toward: the OUTBOUND FAILURE peer, else the fetched block's
+    proposers (report only: a fetch rotates across every other validator
+    before it falls back to sync); [] when the evidence names none (or names
+    an unknown peer id)."""
     if record.get('peer_id') is not None:
         node = peer_nodes.get(record['peer_id'])
         return [node] if node else []
@@ -489,12 +491,15 @@ def kill_dissemination(log_summary, killed, kill_ts, counts=None):
     (collect_logs.py's log-summary.json); None when no node was killed (that
     cell is judged on its counts, as always).
 
-    A failure line is EXEMPT only when it is dated at or after kill_ts and the
-    only node it names as its target is the killed one (a send toward its peer
-    id, or a fetch of a block only it proposed). Everything else counts:
-    failures between the survivors, toward the killed node before its kill,
-    the killed node's own lines (all from before its SIGKILL), lines whose
-    target the logs do not name, and counted lines without a per-line record
+    A failure line is EXEMPT only when the line itself names the killed node
+    as its peer (an OUTBOUND FAILURE toward its peer id) and is dated at or
+    after kill_ts. Everything else counts: failures between the survivors,
+    toward the killed node before its kill, the killed node's own lines (all
+    from before its SIGKILL), lines that name no peer, every body / justify
+    fetch fallback (the fetch rotates across all other validators before it
+    falls back to sync, so a survivor failed too, whoever proposed the block;
+    its proposer is reported in live_by_node, never exempted), and counted
+    lines without a per-line record
     (truncated, or a log-summary.json from before the records). counts
     (summarize.py's --dissem, per node) must equal the log summary's own,
     else nothing is exempt.
@@ -529,7 +534,8 @@ def kill_dissemination(log_summary, killed, kill_ts, counts=None):
                 tally[k] = tally.get(k, 0) + 1
             targets = failure_targets(r, peer_nodes)
             ts = r.get('ts')
-            if (n != killed and set(targets) == {killed} and ts is not None
+            toward_killed = r.get('peer_id') is not None and peer_nodes.get(r['peer_id']) == killed
+            if (n != killed and toward_killed and ts is not None
                     and kill_ts is not None and ts >= kill_ts):
                 exempt += 1
             else:

@@ -715,12 +715,13 @@ VALIDATOR_STAKES=2,2,1 BENCH_RPCS=0,1 KILL_NO_RESTART=val2 KILL_NO_RESTART_AT_S=
   `live_by_node` {node: {lines, toward}}, `evidence`). Per-peer evidence is
   `log-summary.json` from `collect_logs.py` (the node logs): each node's
   `local_peer_id=` line maps peer ids to nodes; OUTBOUND FAILURE lines name
-  their peer; a body / justify fetch fallback names only the block, whose
-  proposer is the node that logged `header re-send: ... block=<prefix>` for
-  it (none: proposer unknown). A line is exempt only when it is dated at or
-  after `kill_ts` and the killed node is the only target it names. Still
-  counted: failures between the survivors, toward the killed node before its
-  kill, the killed node's own lines, unattributed lines, counted lines without
+  their peer. A line is exempt only when it names the killed node as its
+  peer and is dated at or after `kill_ts`. Still counted: failures between
+  the survivors, toward the killed node before its kill, the killed node's
+  own lines, lines naming no peer, every body / justify fetch fallback (the
+  fetch rotates across all other validators before it falls back to sync, so
+  a survivor failed too; the block's proposer, from the `header re-send: ...
+  block=<prefix>` line, is reported in `live_by_node` only), counted lines without
   a per-line record (an older `log-summary.json`), and any `--dissem` /
   `log-summary.json` count mismatch. Cells without a kill are unchanged.
   `rescore.sh <cell> <dest-root>` re-scores a finished cell in a reflink copy

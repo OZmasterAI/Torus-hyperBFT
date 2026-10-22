@@ -1546,9 +1546,10 @@ if dissem:
     # KILL_NO_RESTART (s138, bench 9k2): the survivors' sends to the killed
     # validator fail once it is gone; those lines alone do not fail the cell.
     # The per-peer evidence is collect_logs.py's log-summary.json (from the
-    # node logs): a line is exempt only if it failed toward the killed node,
-    # at or after its kill; everything else (between the survivors,
-    # unattributed, no per-line records) still fails it.
+    # node logs): a line is exempt only if it names the killed node as its
+    # peer (OUTBOUND FAILURE toward it), at or after its kill; everything else
+    # (between the survivors, any sync fallback, unattributed, no per-line
+    # records) still fails it.
     # total_failures keeps the raw count.
     if DEAD_NODE and dissem["total_failures"] > 0:
         try:
