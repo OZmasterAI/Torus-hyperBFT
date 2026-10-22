@@ -853,3 +853,97 @@ fn shared_absorb_crossover_ubench() {
         println!("len {len:6}: two one-shot {two:8.1} ns  fork {fork:8.1} ns");
     }
 }
+
+// ---- s80 keyed-local-trust-key: SHA-256 node-local trust key ----
+
+/// Frozen SHA-256 local trust key: the frozen keccak trust key's preimage
+/// (`C || nonce || v || r || s`), hashed with SHA-256.
+fn legacy_local_trust_key(action: &SignedNativeAction) -> Option<B256> {
+    use sha2::Digest;
+    let ActionSignature::Eip712(sig) = &action.signature else {
+        return None;
+    };
+    let mut data = legacy_canonical_bytes(&action.action);
+    data.extend_from_slice(&action.nonce.to_be_bytes());
+    data.push(sig.v);
+    data.extend_from_slice(&sig.r);
+    data.extend_from_slice(&sig.s);
+    Some(B256::from_slice(&sha2::Sha256::digest(&data)))
+}
+
+#[test]
+fn local_trust_key_matches_frozen_sha256_preimage_for_all_actions_and_signatures() {
+    let mut scratch = vec![0x77; 300];
+    for (i, action) in actions().into_iter().enumerate() {
+        for session in [false, true] {
+            for nonce in [0, 1, u64::MAX] {
+                let envelope = signed(action.clone(), session, nonce);
+                let expected = legacy_local_trust_key(&envelope);
+                assert_eq!(expected.is_none(), session, "eligibility {i}");
+                assert_eq!(local_trust_key(&envelope), expected, "wrapper {i}");
+                assert_eq!(
+                    local_trust_key_with_scratch(&envelope, &mut scratch),
+                    expected,
+                    "scratch {i}"
+                );
+                // The seed pair an ingress node stores: (keccak(C), local key).
+                let (sort, key) =
+                    sort_hash_and_local_trust_key_with_scratch(&envelope, &mut scratch);
+                assert_eq!(sort, legacy_sort_hash(&envelope.action), "sort {i}");
+                assert_eq!(key, expected, "pair {i}");
+                if let Some(k) = expected {
+                    // Distinct from both keccak keys of the same action.
+                    assert_ne!(Some(k), legacy_verified_cache_key(&envelope), "{i}");
+                    assert_ne!(k, compute_action_hash(&envelope), "{i}");
+                }
+                // Dirty scratch must not leak into the next action's key.
+                scratch.extend_from_slice(&[0x3c; 23]);
+            }
+        }
+    }
+}
+
+#[test]
+fn local_trust_key_commits_each_signature_field_and_the_body() {
+    let base = signed(
+        NativeAction::PlaceOrderBatch((0..400).map(order_params).collect()),
+        false,
+        7,
+    );
+    let mut scratch = Vec::new();
+    let original = local_trust_key_with_scratch(&base, &mut scratch).unwrap();
+    let mut seen = std::collections::HashSet::from([original]);
+    for field in 0..5 {
+        let mut changed = base.clone();
+        match field {
+            0..=2 => {
+                let ActionSignature::Eip712(sig) = &mut changed.signature else { unreachable!() };
+                match field {
+                    0 => sig.v ^= 1,
+                    1 => sig.r[0] ^= 1,
+                    _ => sig.s[31] ^= 1,
+                }
+            }
+            3 => changed.nonce ^= 1,
+            _ => {
+                let NativeAction::PlaceOrderBatch(orders) = &mut changed.action else { unreachable!() };
+                orders[399].quantity = FixedPoint::from_raw(orders[399].quantity.raw() ^ 1);
+            }
+        }
+        let key = local_trust_key_with_scratch(&changed, &mut scratch).unwrap();
+        assert_eq!(Some(key), legacy_local_trust_key(&changed), "field {field}");
+        assert!(seen.insert(key), "field {field} must change the key");
+    }
+}
+
+#[test]
+fn sha256_backend_report_is_consistent_with_cpuid() {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        let cpuid = std::arch::is_x86_feature_detected!("sha")
+            && std::arch::is_x86_feature_detected!("sse2")
+            && std::arch::is_x86_feature_detected!("ssse3")
+            && std::arch::is_x86_feature_detected!("sse4.1");
+        assert_eq!(sha256_hw_accelerated(), cpuid);
+    }
+}

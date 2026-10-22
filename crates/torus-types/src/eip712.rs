@@ -3776,4 +3776,165 @@ mod tests {
         assert!(!SessionScope::Trading.allows(&action));
         assert!(!SessionScope::TransfersOnly.allows(&action));
     }
+
+    // --- s80 keyed-local-trust-key: SHA-256 local key, sort hash memoized ---
+
+    /// A mixed block (warm batches on both sides of the keccak rate, warm
+    /// small actions, a session action, a cold valid action, a cold action
+    /// with a broken signature), the keccak trust-cache and the memo an
+    /// ingress node would have seeded for the warm ones, and the sessions.
+    #[allow(clippy::type_complexity)]
+    fn memo_fixture() -> (
+        Vec<SignedNativeAction>,
+        std::collections::HashMap<B256, Address>,
+        std::collections::HashMap<B256, (Address, B256)>,
+        std::collections::HashMap<[u8; 32], SessionData>,
+    ) {
+        let k1 = test_key();
+        let k2 = test_key_2();
+        let owner = Address::from([0x11; 20]);
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let mut sessions = std::collections::HashMap::new();
+        sessions.insert(ed.verifying_key().to_bytes(), make_session(owner));
+        let mut block = Vec::new();
+        for i in 0..12u64 {
+            let key = if i % 3 == 0 { &k2 } else { &k1 };
+            let action = match i % 4 {
+                0 => NativeAction::CancelAllOrders { market_id: Some(i) },
+                1 => keys_order_batch(1, false, i),
+                2 => keys_order_batch(400, true, i),
+                _ => keys_order_batch(2 + i, true, i),
+            };
+            block.push(sign_native_action(action, TEST_NONCE + i, key));
+        }
+        let mut keccak_cache = std::collections::HashMap::new();
+        let mut memo = std::collections::HashMap::new();
+        let mut scratch = Vec::new();
+        for a in &block {
+            let sender = a.recover_sender().unwrap();
+            keccak_cache.insert(crate::verified_cache_key(a).unwrap(), sender);
+            let (sort, key) = crate::sort_hash_and_local_trust_key_with_scratch(a, &mut scratch);
+            memo.insert(key.unwrap(), (sender, sort));
+        }
+        // Cold: a valid action, a broken signature, a session action.
+        block.insert(3, sign_native_action(keys_order_batch(300, true, 77), TEST_NONCE + 77, &k1));
+        let mut bad = sign_native_action(keys_order_batch(5, false, 88), TEST_NONCE + 88, &k2);
+        if let ActionSignature::Eip712(ref mut sig) = bad.signature {
+            sig.r = [0; 32];
+            sig.s = [0; 32];
+        }
+        block.insert(8, bad);
+        block.insert(
+            5,
+            sign_action_with_session(NativeAction::CancelOrder { order_id: 9 }, TEST_NONCE, &ed),
+        );
+        (block, keccak_cache, memo, sessions)
+    }
+
+    /// The memo path returns the senders and the sort hashes of today's
+    /// keccak path (hits, misses, a broken signature, a session action), in
+    /// every verify mode, and both equal the ground truth.
+    #[test]
+    fn local_key_memo_path_matches_keccak_path_senders_and_sort_hashes() {
+        let (block, keccak_cache, memo, sessions) = memo_fixture();
+        let truth: Vec<Option<Address>> = block
+            .iter()
+            .map(|a| match &a.signature {
+                ActionSignature::Eip712(_) => a.recover_sender().ok(),
+                ActionSignature::Session { .. } => Some(Address::from([0x11; 20])),
+            })
+            .collect();
+        assert!(truth.iter().filter(|s| s.is_none()).count() == 1, "one broken signature");
+        let sort_truth: Vec<B256> = block
+            .iter()
+            .map(|a| alloy_primitives::keccak256(a.action.canonical_bytes()))
+            .collect();
+        for mode in [VerifyMode::Serial, VerifyMode::Default, VerifyMode::Pool(2)] {
+            let pool = match mode {
+                VerifyMode::Pool(n) => rayon::ThreadPoolBuilder::new().num_threads(n).build().ok(),
+                _ => None,
+            };
+            let today = batch_verify_impl_keyed(
+                &block,
+                TEST_NONCE,
+                |pk| sessions.get(pk).cloned(),
+                |k| keccak_cache.get(k).copied(),
+                mode,
+                pool.as_ref(),
+                false,
+                true,
+            );
+            let memo_path = batch_verify_native_actions_local_key_memo_with_mode(
+                &block,
+                TEST_NONCE,
+                |pk| sessions.get(pk).cloned(),
+                |k| memo.get(k).copied(),
+                mode,
+            );
+            assert_eq!(memo_path, today, "{mode:?}");
+            assert_eq!(memo_path.0, truth, "{mode:?}: senders");
+            assert_eq!(memo_path.1, sort_truth, "{mode:?}: sort hashes");
+        }
+    }
+
+    /// The memo contract: a hit is reused verbatim (sender AND sort hash:
+    /// only this node's verified ingress seeds the memo), the lookup sees one
+    /// local key per EIP-712 action in input order (none for a session
+    /// action), and a memo keyed by the keccak trust key never hits.
+    #[test]
+    fn local_key_memo_hit_is_verbatim_and_keccak_keys_never_hit() {
+        let (block, keccak_cache, memo, sessions) = memo_fixture();
+        let sentinel: std::collections::HashMap<B256, (Address, B256)> = memo
+            .keys()
+            .enumerate()
+            .map(|(i, k)| (*k, (Address::from([0xC0 + i as u8; 20]), B256::from([0xD0 + i as u8; 32]))))
+            .collect();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let (senders, sorts) = batch_verify_native_actions_local_key_memo_with_mode(
+            &block,
+            TEST_NONCE,
+            |pk| sessions.get(pk).cloned(),
+            |k| {
+                seen.borrow_mut().push(*k);
+                sentinel.get(k).copied()
+            },
+            VerifyMode::Serial,
+        );
+        let want_keys: Vec<B256> = block.iter().filter_map(crate::local_trust_key).collect();
+        assert_eq!(*seen.borrow(), want_keys, "one lookup per EIP-712 action, in order");
+        for (i, a) in block.iter().enumerate() {
+            match crate::local_trust_key(a).and_then(|k| sentinel.get(&k)) {
+                Some((s, h)) => assert_eq!((senders[i], sorts[i]), (Some(*s), *h), "hit {i}"),
+                None => assert_eq!(
+                    sorts[i],
+                    alloy_primitives::keccak256(a.action.canonical_bytes()),
+                    "miss {i} hashes C itself"
+                ),
+            }
+        }
+        // A memo keyed by the keccak key: every EIP-712 action misses and
+        // recovers; the result is still the ground truth.
+        let wrong: std::collections::HashMap<B256, (Address, B256)> = keccak_cache
+            .iter()
+            .map(|(k, s)| (*k, (*s, B256::ZERO)))
+            .collect();
+        let got = batch_verify_native_actions_local_key_memo_with_mode(
+            &block,
+            TEST_NONCE,
+            |pk| sessions.get(pk).cloned(),
+            |k| wrong.get(k).copied(),
+            VerifyMode::Serial,
+        );
+        let today = batch_verify_impl_keyed(
+            &block,
+            TEST_NONCE,
+            |pk| sessions.get(pk).cloned(),
+            |_| None,
+            VerifyMode::Serial,
+            None,
+            false,
+            true,
+        );
+        assert_eq!(got, today);
+    }
 }
