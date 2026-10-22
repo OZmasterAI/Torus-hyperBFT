@@ -238,6 +238,47 @@ impl TimeoutCertificate {
         };
         tip_ok && qc_ok && high_tip_wins(self.high_tip.as_ref(), self.high_qc.as_ref()) == self.high_tip_is_winner
     }
+
+    /// Review M2 (s138, re-proposal freshness): whether the signers whose SIGNED tip
+    /// (`voter_metadata`, bound by their signature) is this TC's `high_tip` hold more than the
+    /// faulty power (`total - quorum`) of a validator set this TC is correctly signed under, so at
+    /// least one honest replica voted for that block (a tip is set only by a vote) while it was
+    /// new. Power is counted per set only under a set that authenticates the signatures and
+    /// reaches its quorum (during an update the TC may verify under either set; one set's signers
+    /// must not borrow the other's positional weights: pre-testnet P1 62a6f8f4).
+    ///
+    /// Precondition: the TC [is correct](Certificate::is_correct) (the high tip is a real header).
+    pub fn tip_vouched<K: KVStore>(&self, block_tree: &BlockTreeSingleton<K>) -> Result<bool, BlockTreeError> {
+        let Some(tip) = &self.high_tip else {
+            return Ok(false);
+        };
+        let summary = tip.summary();
+        let validator_set_state = block_tree.validator_set_state()?;
+        Ok(self.tip_power_exceeds_faulty(&summary, validator_set_state.committed_validator_set())
+            || (!validator_set_state.update_decided()
+                && self.tip_power_exceeds_faulty(&summary, validator_set_state.previous_validator_set())))
+    }
+
+    fn tip_power_exceeds_faulty(&self, summary: &TipSummary, validator_set: &ValidatorSet) -> bool {
+        if self.signatures.len() != validator_set.len() || self.voter_metadata.len() != validator_set.len() {
+            return false;
+        }
+        let mut power: u128 = 0;
+        for ((signature, (_, p)), (tip, _)) in self
+            .signatures
+            .iter()
+            .zip(validator_set.validators_and_powers())
+            .zip(&self.voter_metadata)
+        {
+            if signature.is_some() && tip.as_ref() == Some(summary) {
+                power += u128::from(p.int());
+            }
+        }
+        let faulty = validator_set.total_power().int() - validator_set.quorum().int();
+        // Verify last (one ed25519 check per signer, memoized): count only signers authenticated
+        // under this same set.
+        power > faulty && self.is_correctly_signed(validator_set)
+    }
 }
 
 impl Certificate for TimeoutCertificate {

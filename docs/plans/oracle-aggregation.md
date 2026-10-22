@@ -7,8 +7,8 @@ block (T0), block-timestamp validation (T0b/T1), time-based aggregation 10 s /
 60 s (T2/T8), submission hardening (T3/T4), block-start aggregation (T5–T7).
 Review follow-ups (s517): fresh price needs >= 3 reporters holding
 > 2/3 of the Active stake (see *Decisions* 4–5, *Notes* below). The
-timestamp lower bound (M2) is NOT implemented. It is a pre-mainnet item
-(owner s131), see Decision 5.
+timestamp lower bound (M2) is in the testnet genesis (owner s138, branch
+`fix/m2-timestamp-lower-bound`), see Decision 5.
 Not merged / pushed. Liquidation (item 3): done on `feat/liquidation`
 (`docs/plans/liquidation.md`). Next: B (feeder), then C (HL mark). Client / deploy notes: `docs/parity-audit-fixes-s515.md`.
 
@@ -120,7 +120,9 @@ A now, on this branch (it is the "item 2" as listed), then B as its own item
    low-stake head-count majority cut the honest high-stake reports and set
    the price. Otherwise the last price is kept and goes stale. HL documents
    only a stake-weighted median; > 2/3 matches the BFT honest-stake bound.
-5. **Timestamp lower bound (review M2) — OPEN, not implemented.** A
+5. **Timestamp lower bound (review M2) — built for the testnet genesis
+   (owner s138, `fix/m2-timestamp-lower-bound`); status at the end of this
+   item.** A
    byzantine leader can propose `ts = parent.ts` after a stall, so an old
    aggregate has age 0 in that block. A "reject ts < local − 30 s" rule
    cannot be enforced today: every body (fresh or recovered late) reaches
@@ -151,10 +153,46 @@ A now, on this branch (it is the "item 2" as listed), then B as its own item
      (not > f), and header-first votes (`cast_header_vote`) never set
      `local_tip`. So every honest replica refuses B, in every view.
 
-   The rule lands after "validate before voting" (CometBFT PBTS), as above.
-   It can ship after genesis through P0.0 activation gating. As a vote-rule
-   change it falls under P0.0 open question 4: old binaries must stop at
-   the activation height.
+   (s131 plan, superseded: land after genesis through P0.0 gating.)
+
+   **As built (s138, on main's TC-required set).** Main now validates bodies
+   before the vote and signs tips (F1-F5: a tip is a leader-signed header,
+   voters sign the tip view, header-first votes set the tip), so round 2's
+   forged view and missing tips are gone. The rule:
+   - `check_timestamp_lag` (torus-consensus `app.rs`): no vote when
+     `ts + 30 < local clock`, next to the 5 s ahead bound, pre-vote only
+     (`check_proposal_data`). Never at insertion, block sync, execution or
+     crash replay: a certified old block is always accepted, so catch-up and
+     replay never read the local clock.
+   - It applies to FRESH blocks only. hotstuff asks
+     `App::check_reproposal_data` (every rule but the lower bound) when
+     `HotStuff::freshness_exempt` holds: the block is certified (this
+     replica's highest or locked PC, or the TC's high QC: the VSU
+     re-proposal, including the reflexive-lock re-proposal of the locked
+     block), it is the block this replica last voted for, or it is a TC
+     re-proposal whose tip is this replica's own tip or is vouched by signed
+     tips of more than f power (`TimeoutCertificate::tip_vouched`, counted
+     under a set that authenticates the TC, as `62a6f8f4`).
+   - Round 2's wedge in its main-era form (a byzantine LEADER proposes B
+     with ts = parent.ts, nobody votes, it reports B as its tip, B wins the
+     TC): the next honest leader does not re-propose a tip it would refuse
+     itself on a freshness rule alone and that is not exempt for it
+     (`refused_as_stale`). It runs RECOVER without the block request (NE
+     requests only, case 4) or drops a recovered tip (case 5); honest
+     replicas never voted B, so they sign No-Endorsements and the NEC block
+     replaces B. The hole stays closed and the chain moves on.
+   - Residual (liveness, needs > 30 s of asynchrony): an uncertified tip B
+     voted by between f + 1 and 2f of the power while it was new, stale
+     after a long partition, with at most f signed B-tips in the TC: the
+     non-voters refuse it and no NEC forms while B's voters refuse NEs at
+     `tc.view`; a later TC that vouches B (or an NEC once
+     `tc.view` moves past B's view) resolves it. Skewed clocks: a voter more
+     than 30 s ahead refuses every fresh block (it acts as a non-voter;
+     more than f such power halts the chain until the clocks are fixed), a
+     voter more than 5 s behind refuses by the ahead bound (as before); a
+     leader whose clock is behind proposes `max(now, parent.ts)` and passes
+     in steady state, after a stall its blocks are refused and its views
+     time out.
 
 ## Notes (review, s517)
 

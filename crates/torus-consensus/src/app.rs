@@ -3513,6 +3513,46 @@ fn check_timestamp_drift(ts: u64, local_now: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// Pre-testnet P0 (review M2): max seconds a proposal's header timestamp may
+/// run behind this node's clock before it refuses to VOTE for it (pre-vote
+/// only, see [`check_timestamp_lag`]).
+pub(crate) const MAX_BLOCK_TIMESTAMP_LAG_SECS: u64 = 30;
+
+/// Whether [`check_timestamp_lag`] applies to a pre-vote check: always,
+/// except for a block hotstuff asks about through `check_reproposal_data`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LagBound {
+    Apply,
+    Exempt,
+}
+
+/// Pre-testnet P0 (review M2, `docs/plans/oracle-aggregation.md` decision
+/// 5): the lower half of the local-clock timestamp rule. A replica refuses
+/// to vote for a proposal whose timestamp is more than
+/// [`MAX_BLOCK_TIMESTAMP_LAG_SECS`] behind its clock, so a byzantine leader
+/// cannot propose `ts = parent.ts` after a stall and make an old oracle
+/// aggregate look fresh (CometBFT PBTS-style). Same placement as
+/// [`check_timestamp_drift`]: pre-vote ONLY (bodies are validated before the
+/// vote since 973cc74 / e89eaaa, which is what M2 waited for). A certified
+/// block is accepted at insertion, on block sync, at execution and in crash
+/// replay however old it is (catch-up never reads the local clock), so it
+/// cannot wedge the chain. An honest proposer passes: it uses `max(now,
+/// parent.ts)`, and a proposal delivered later than the bound gets no vote,
+/// the view times out and the next leader proposes with a fresh clock.
+/// Review M2 (s138): except a block consensus may force a leader to propose
+/// again unchanged (hotstuff's `check_reproposal_data`: certified, last
+/// voted by this replica, or an authenticated TC re-proposal), whose
+/// timestamp is fixed by its hash: exempt ([`LagBound::Exempt`]), else a
+/// stall longer than the bound would make it unvotable forever.
+fn check_timestamp_lag(ts: u64, local_now: u64) -> Result<(), String> {
+    if ts.saturating_add(MAX_BLOCK_TIMESTAMP_LAG_SECS) < local_now {
+        return Err(format!(
+            "timestamp {ts} + {MAX_BLOCK_TIMESTAMP_LAG_SECS}s < local clock {local_now}"
+        ));
+    }
+    Ok(())
+}
+
 /// This node's wall clock, UNIX seconds (the header timestamp unit).
 fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -10349,10 +10389,35 @@ impl TorusApp {
     /// presence-only DA read. No wait and no network pull here:
     /// `validate_block` (run right after on the same body) and its retries
     /// hand misses to the recovery worker.
+    /// Review M2 (s138): [`Self::check_proposal_data`] for a block hotstuff
+    /// may force a leader to propose again unchanged (its
+    /// `check_reproposal_data`: certified, last voted by this replica, or an
+    /// authenticated TC re-proposal). Every rule but the timestamp LOWER
+    /// bound applies: the block's timestamp is fixed by its hash and an
+    /// honest replica judged it within the bound when it was new, so after a
+    /// stall longer than [`MAX_BLOCK_TIMESTAMP_LAG_SECS`] the bound would
+    /// refuse it forever. The ahead bound stays (time only helps it).
+    fn check_reproposal_proposal_data(
+        &mut self,
+        block: &Block,
+        parent: impl FnOnce(&CryptoHash) -> ParentHeader,
+    ) -> BlockDataCheck {
+        self.check_proposal_data_with(block, parent, LagBound::Exempt)
+    }
+
     fn check_proposal_data(
         &mut self,
         block: &Block,
         parent: impl FnOnce(&CryptoHash) -> ParentHeader,
+    ) -> BlockDataCheck {
+        self.check_proposal_data_with(block, parent, LagBound::Apply)
+    }
+
+    fn check_proposal_data_with(
+        &mut self,
+        block: &Block,
+        parent: impl FnOnce(&CryptoHash) -> ParentHeader,
+        lag: LagBound,
     ) -> BlockDataCheck {
         // T1.5 FAIL-STOP: refuse to vote for blocks this node will never execute.
         if self.is_exec_failed() {
@@ -10416,8 +10481,14 @@ impl TorusApp {
             return link;
         }
         // T0b (rebase s87): refuse to vote for a block too far ahead of this
-        // node's clock. Vote-time only: `validate_block` never applies it.
-        if let Err(reason) = check_timestamp_drift(header.timestamp, self.local_now_secs()) {
+        // node's clock; pre-testnet P0 (review M2): or too far behind it.
+        // Vote-time only: `validate_block` never applies either.
+        let now = self.local_now_secs();
+        // Review M2 (s138): a re-proposal hotstuff vouches for skips the lower bound.
+        if let Err(reason) = check_timestamp_drift(header.timestamp, now).and_then(|()| match lag {
+            LagBound::Apply => check_timestamp_lag(header.timestamp, now),
+            LagBound::Exempt => Ok(()),
+        }) {
             tracing::warn!(height = header.height, %reason, "not voting -- block timestamp");
             return BlockDataCheck::Invalid;
         }
@@ -10853,6 +10924,17 @@ impl App<RocksKVStore> for TorusApp {
     /// parent built the same block and certified it (9k2 deep r4-U, s138).
     fn refuses_proposal(&self, response: &ProduceBlockResponse) -> bool {
         response.data.vec().is_empty()
+    }
+
+    /// Review M2 (s138): the pre-vote check of a block hotstuff may force a
+    /// leader to propose again unchanged. See
+    /// [`TorusApp::check_reproposal_proposal_data`].
+    fn check_reproposal_data(
+        &mut self,
+        block: &Block,
+        block_tree: &AppBlockTreeView<'_, RocksKVStore>,
+    ) -> BlockDataCheck {
+        self.check_reproposal_proposal_data(block, |hash| tree_parent_header(block_tree, hash))
     }
 
     /// Send committed block to the execution pipeline thread.
@@ -17331,6 +17413,9 @@ mod crash_recovery_tests {
             torus_mempool::MempoolConfig::default(),
         ));
         let mut app = TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
+        // `make_block` time (1000 + height): inside the pre-vote timestamp
+        // window (pre-testnet P0, M2: at most 30 s behind the clock).
+        app.test_now_secs = Some(1_005);
         let hs_block = |datums: Vec<Vec<u8>>, data_hash: [u8; 32]| {
             Block::new(
                 BlockHeight::new(1),
@@ -18284,6 +18369,9 @@ mod crash_recovery_tests {
                 )
                 .unwrap();
             let mut app = TorusApp::new(state_db.clone(), &config, None, None, None);
+            // `make_block` time (1000 + height): inside the pre-vote timestamp
+            // window (pre-testnet P0, M2: at most 30 s behind the clock).
+            app.test_now_secs = Some(1_005);
             let ctx = make_exec_ctx(&config, &state_db);
             for h in 1..=3 {
                 ctx.execute_committed_block(&make_block(h, vec![]), vec![]);
@@ -19039,6 +19127,9 @@ mod crash_recovery_tests {
     fn vote_requires_the_header_to_link_to_its_parent() {
         let (config, state_db) = make_test_config_and_db();
         let mut app = TorusApp::new(state_db, &config, None, None, None);
+        // `make_block` time (1000 + height): inside the pre-vote timestamp
+        // window (pre-testnet P0, M2: at most 30 s behind the clock).
+        app.test_now_secs = Some(1_005);
         let no_lookup =
             |_: &CryptoHash| -> ParentHeader { panic!("genesis justify needs no lookup") };
 
@@ -26571,6 +26662,131 @@ mod crash_recovery_tests {
         );
     }
 
+    // ---- Pre-testnet P0 (review M2): block timestamp lower bound ----
+
+    #[test]
+    fn proposal_timestamp_lag_bound() {
+        assert!(check_timestamp_lag(1_000 - MAX_BLOCK_TIMESTAMP_LAG_SECS, 1_000).is_ok(), "lag 30");
+        assert!(check_timestamp_lag(1_000 - MAX_BLOCK_TIMESTAMP_LAG_SECS - 1, 1_000).is_err(), "lag 31");
+        assert!(check_timestamp_lag(1_000, 1_000).is_ok(), "on the clock");
+        assert!(check_timestamp_lag(2_000, 1_000).is_ok(), "ahead: the drift bound's business");
+        assert!(check_timestamp_lag(0, 0).is_ok(), "clock at 0");
+        assert!(check_timestamp_lag(0, 10).is_ok(), "no underflow below the bound");
+        assert!(check_timestamp_lag(0, u64::MAX).is_err(), "far behind");
+        assert!(check_timestamp_lag(u64::MAX, u64::MAX).is_ok(), "no overflow");
+    }
+
+    /// M2: a proposal more than MAX_BLOCK_TIMESTAMP_LAG_SECS behind the local
+    /// clock gets no vote (a byzantine leader cannot reuse an old timestamp
+    /// after a stall, so an old oracle aggregate is not age 0 in its block);
+    /// at the bound it votes, and a normal block passes.
+    #[test]
+    fn too_old_proposal_is_refused_before_the_vote() {
+        let parent = tip_2000();
+        let mut app = ts_app(2_040);
+        assert_eq!(pre_vote(&mut app, &parent, &child_of(&parent, 2_040)), BlockDataCheck::Held, "normal");
+        assert_eq!(pre_vote(&mut app, &parent, &child_of(&parent, 2_011)), BlockDataCheck::Held, "lag 29");
+        assert_eq!(pre_vote(&mut app, &parent, &child_of(&parent, 2_010)), BlockDataCheck::Held, "lag 30");
+        assert_eq!(pre_vote(&mut app, &parent, &child_of(&parent, 2_009)), BlockDataCheck::Invalid, "lag 31");
+        // The M2 case: a leader reuses the parent's timestamp after a stall.
+        assert_eq!(pre_vote(&mut app, &parent, &child_of(&parent, 2_000)), BlockDataCheck::Invalid, "ts = parent after a 40 s stall");
+    }
+
+    /// [`pre_vote`] on the re-proposal path (hotstuff's `check_reproposal_data`).
+    fn pre_vote_reproposal(app: &mut TorusApp, parent: &TorusBlock, block: &TorusBlock) -> BlockDataCheck {
+        let hs_parent = hs_block(parent, PhaseCertificate::genesis_pc());
+        let header = parent.header.clone();
+        app.check_reproposal_proposal_data(&hs_block(block, justify_for(&hs_parent)), move |_| {
+            ParentHeader::Header(Box::new(header))
+        })
+    }
+
+    /// Review M2: a block consensus may force a leader to propose again unchanged (certified, last
+    /// voted by this replica, or an authenticated TC re-proposal: hotstuff decides, and asks
+    /// `check_reproposal_data`) is voted however long the stall, so the bound cannot wedge the
+    /// chain; a FRESH proposal of the same block is still refused. Every other rule applies to the
+    /// re-proposal: the ahead bound and the parent link (ts >= parent).
+    #[test]
+    fn reproposal_after_a_long_stall_is_voted_fresh_proposal_still_refused() {
+        let parent = tip_2000();
+        let tip = child_of(&parent, 2_004);
+        for now in [2_035, 2_004 + 3_600, 9_999_999] {
+            let mut app = ts_app(now);
+            assert_eq!(pre_vote(&mut app, &parent, &tip), BlockDataCheck::Invalid, "fresh, now {now}");
+            assert_eq!(pre_vote_reproposal(&mut app, &parent, &tip), BlockDataCheck::Held, "re-proposal, now {now}");
+        }
+        let mut app = ts_app(2_010);
+        assert_eq!(
+            pre_vote_reproposal(&mut app, &parent, &child_of(&parent, 2_016)),
+            BlockDataCheck::Invalid,
+            "the ahead bound still applies"
+        );
+        assert_eq!(
+            pre_vote_reproposal(&mut app, &parent, &child_of(&parent, 1_999)),
+            BlockDataCheck::Invalid,
+            "the parent link still applies"
+        );
+        assert_eq!(pre_vote_reproposal(&mut app, &parent, &child_of(&parent, 2_010)), BlockDataCheck::Held);
+    }
+
+    /// First block (genesis justify): the lag bound applies too.
+    #[test]
+    fn proposal_timestamp_first_block_has_the_lag_bound() {
+        let mut app = ts_app(1_700_000_000);
+        let no_lookup = |_: &CryptoHash| -> ParentHeader { panic!("genesis justify") };
+        let mut b1 = make_block(1, vec![]);
+        b1.header.timestamp = 1_700_000_000 - MAX_BLOCK_TIMESTAMP_LAG_SECS;
+        assert_eq!(app.check_proposal_data(&hs_block(&b1, PhaseCertificate::genesis_pc()), no_lookup), BlockDataCheck::Held);
+        b1.header.timestamp -= 1;
+        assert_eq!(app.check_proposal_data(&hs_block(&b1, PhaseCertificate::genesis_pc()), no_lookup), BlockDataCheck::Invalid);
+    }
+
+    /// No wedge, catch-up and replay unaffected: an old block (certified
+    /// long ago, or delivered late) is accepted wherever it is inserted —
+    /// validate_block's link check, the datum path (also block sync) — and
+    /// executes on the live path and in crash replay. Only the vote reads
+    /// the local clock.
+    #[test]
+    fn old_block_is_accepted_at_insertion_sync_execution_and_replay() {
+        let parent = tip_2000();
+        let old = child_of(&parent, 2_000);
+        let mut app = ts_app(9_999_999);
+        assert_eq!(pre_vote(&mut app, &parent, &old), BlockDataCheck::Invalid, "no vote");
+        let hs_parent = hs_block(&parent, PhaseCertificate::genesis_pc());
+        let header = parent.header.clone();
+        assert_eq!(
+            check_parent_link(
+                &old.header,
+                &justify_for(&hs_parent),
+                &app.genesis_header,
+                &app.activations,
+                app.known_features,
+                move |_| ParentHeader::Header(Box::new(header)),
+                |_| Ok(None)
+            ),
+            BlockDataCheck::Held
+        );
+        let datum = encode_proposal_datum(&old, false);
+        assert!(matches!(
+            app.validate_datum(&datum, &data_hash_of(&datum)),
+            ValidateBlockResponse::Valid { .. }
+        ));
+        for replay in [false, true] {
+            let (config, db) = make_test_config_and_db();
+            let ctx = make_exec_ctx(&config, &db);
+            let mut b1 = make_block(1, vec![]);
+            b1.header.timestamp = 1; // far behind every clock
+            if replay {
+                persist_committed_block_durably(&db, &b1);
+                assert_eq!(TorusApp::replay_committed(&db, &ctx).1, None);
+            } else {
+                ctx.execute_committed_block(&b1, vec![]);
+            }
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "replay={replay}");
+            assert_eq!(read_native_applied_height(&db), Some(1), "replay={replay}");
+        }
+    }
+
     /// The proposer never emits a timestamp below its parent's, even when the
     /// parent's is ahead of the local clock (within drift), and the block it
     /// produces passes the pre-vote rule on a validator with the same clock.
@@ -27075,11 +27291,14 @@ mod crash_recovery_tests {
                 resp.data.clone(),
             )
         };
-        // The voters' clock runs an hour ahead: the proposals carry the real
+        // The voters' clock runs 25 s ahead: the proposals carry the real
         // clock, and under a loaded parallel run building an app took > 5 s,
         // so a clock pinned before it tripped the 5 s drift check (Invalid
-        // for the wrong reason). This test is about bits, not drift.
-        let clock = || unix_now_secs() + 3_600;
+        // for the wrong reason). This test is about bits, not drift. Not more
+        // than 30 s ahead (review M2: the 30 s lower bound would refuse a
+        // proposal stamped before the pinned clock), and a proposal stamped
+        // after the pin trips the ahead bound only if it comes > 30 s later.
+        let clock = || unix_now_secs() + 25;
         let mut from_1 = gated_app(clock(), rsh_at(1));
         assert_eq!(from_1.genesis_header.features, rsh, "genesis parent header");
         assert_eq!(from_1.last_header.features, rsh);
@@ -28277,7 +28496,10 @@ mod crash_recovery_tests {
     /// without a panic. RED before: off-cadence EVM txs were `Held`.
     #[test]
     fn evm_txs_off_the_cadence_are_refused_before_the_vote() {
-        let parent3 = make_block(3, vec![]);
+        // At `tip_2000`'s time, within the pre-vote timestamp window of the
+        // 2_010 clock (pre-testnet P0, M2: at most 30 s behind).
+        let mut parent3 = make_block(3, vec![]);
+        parent3.header.timestamp = 2_000;
         let parent4 = tip_2000();
         let mut app = ts_app(2_010);
         for compact in [false, true] {
@@ -28398,6 +28620,9 @@ mod crash_recovery_tests {
     /// default N, which the n11 branch moves to 11).
     fn lane_block(height: u64, m: u64) -> TorusBlock {
         let mut b = make_block(height, vec![]);
+        // `tip_2000`'s time: inside the pre-vote window of the tests' 2_010
+        // clock (pre-testnet P0, M2).
+        b.header.timestamp = 2_000;
         b.header.evm_block_interval = 5;
         b.header.evm_big_block_interval = m;
         b
