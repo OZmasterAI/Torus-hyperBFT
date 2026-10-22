@@ -18,16 +18,27 @@
 //! The fix (standard HotStuff unlock, `safe_proposal_lock`): a proposed block that a PC newer
 //! than the lock certifies (here Prepare(U', 4), view 4 > 3, the TC's high QC and this replica's
 //! highest PC) satisfies the lock, as a block justified by such a PC does.
+//!
+//! Second livelock, found by the extended Stateright model (`stateright_vsu_mixed_commit.rs`,
+//! `copied_validator_set_update_tips_strand_the_update`), on every rule: the Byzantine validator
+//! leads view 4 and signs a header of U' there. A TC(4) with its tip wins over Prepare(U, 2), the
+//! honest leader re-proposes U' (V2), and the two unlocked replicas voting for it COPIED the TC's
+//! tip (U', 4). Every later honest TC then has that tip beating the locked replica's
+//! Precommit(U, 3), so leaders re-propose U', which no PC certifies, and the locked replica
+//! refuses it forever. Fix: a vote on a validator-set-updating block never takes a tip (honest
+//! votes on such blocks never set one, so the tail-fork argument has nothing to keep).
+
+use std::time::{Duration, Instant};
 
 use crate::app::{App, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest, ValidateBlockResponse};
 use crate::block_tree::accessors::internal::BlockTreeSingleton;
-use crate::block_tree::invariants::repropose_block;
 use crate::events::Event;
 use crate::hotstuff::header_fast_path_regression_test::{
     generic_pc, hotstuff_at_with_events, proposer_for, signing_keys, steady_block_tree, validator_set, MemKV,
 };
 use crate::hotstuff::messages::{HotStuffMessage, NewView, Nudge, PhaseVote, ProposalHeader};
 use crate::hotstuff::types::{valid_proposal_certificates, Phase, PhaseCertificate, PhaseVoteCollector};
+use crate::pacemaker::implementation::ViewInfo;
 use crate::pacemaker::types::{TimeoutCertificate, TimeoutVoteCollector, TipInfo};
 use crate::test_keys::signed_by;
 use crate::types::block::Block;
@@ -121,171 +132,313 @@ fn timeout_certificate(
     tc.expect("the timeout votes form a quorum")
 }
 
+/// Four equal validators, one Byzantine, the honest replicas' block trees, all holding A, QC(A, 1)
+/// and both validator-set-updating siblings U and U' (justify QC(A, 1)).
+struct Cluster {
+    keys: Vec<SigningKey>,
+    set: ValidatorSet,
+    byzantine: SigningKey,
+    honest: Vec<SigningKey>,
+    trees: Vec<BlockTreeSingleton<MemKV>>,
+    qc_a: PhaseCertificate,
+    u: Block,
+    u_prime: Block,
+}
+
+impl Cluster {
+    /// The Byzantine validator is the leader of `byzantine_view`.
+    fn new(byzantine_view: u64) -> Cluster {
+        let keys = signing_keys(&[1, 2, 3, 4]);
+        let set = validator_set(&keys);
+        let (template, vss) = steady_block_tree(&set);
+        let byzantine_vk = proposer_for(ViewNumber::new(byzantine_view), &keys, &vss, &template);
+        let byzantine = keys.iter().find(|k| k.verifying_key() == byzantine_vk).unwrap().clone();
+        let honest: Vec<SigningKey> = keys.iter().filter(|k| k.verifying_key() != byzantine_vk).cloned().collect();
+        let a = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(), CryptoHash::new([10; 32]), Data::new(vec![]));
+        let qc_a = generic_pc(ViewNumber::new(1), a.hash, &honest, &set);
+        let u = Block::new(BlockHeight::new(1), qc_a.clone(), CryptoHash::new([11; 32]), Data::new(vec![]));
+        let u_prime = Block::new(BlockHeight::new(1), qc_a.clone(), CryptoHash::new([12; 32]), Data::new(vec![]));
+        let trees = honest
+            .iter()
+            .map(|_| {
+                let (mut tree, _) = steady_block_tree(&set);
+                tree.insert(&a, None, None).unwrap();
+                tree.update(&qc_a, &None).unwrap();
+                let mut updates = ValidatorSetUpdates::new();
+                updates.insert(honest[0].verifying_key(), Power::new(2));
+                tree.insert(&u, None, Some(&updates)).unwrap();
+                tree.insert(&u_prime, None, Some(&updates)).unwrap();
+                tree
+            })
+            .collect();
+        Cluster { keys, set, byzantine, honest, trees, qc_a, u, u_prime }
+    }
+
+    fn leader(&self, view: u64) -> VerifyingKey {
+        let vss = self.trees[0].validator_set_state().unwrap();
+        proposer_for(ViewNumber::new(view), &self.keys, &vss, &self.trees[0])
+    }
+
+    fn honest_index(&self, key: &VerifyingKey) -> Option<usize> {
+        self.honest.iter().position(|k| k.verifying_key() == *key)
+    }
+
+    /// Every honest replica processes `msg` from `origin` in `view`; the votes they cast.
+    fn deliver(&mut self, view: u64, msg: &HotStuffMessage, origin: &VerifyingKey) -> Vec<(SigningKey, PhaseVote)> {
+        let mut votes = Vec::new();
+        for (i, tree) in self.trees.iter_mut().enumerate() {
+            let cast = run(tree, &self.honest[i], view, msg.clone(), origin);
+            votes.extend(cast.into_iter().map(|vote| (self.honest[i].clone(), vote)));
+        }
+        votes
+    }
+
+    /// Every honest replica learns `pc` (a NewView / TC summary carrying it).
+    fn share(&mut self, view: u64, pc: &PhaseCertificate, origin: &VerifyingKey) {
+        let msg = HotStuffMessage::NewView(NewView { chain_id: CHAIN_ID, view: ViewNumber::new(view), highest_pc: pc.clone() });
+        self.deliver(view, &msg, origin);
+    }
+
+    /// TC(`view`) from the honest replicas' timeout votes (their local tip and highest QC).
+    fn honest_tc(&self, view: u64) -> TimeoutCertificate {
+        let entries = self
+            .honest
+            .iter()
+            .zip(&self.trees)
+            .map(|(k, tree)| (k.clone(), tree.local_tip().unwrap(), tree.highest_qc_for_timeout().unwrap()))
+            .collect();
+        timeout_certificate(view, entries, &self.set)
+    }
+
+    /// What the honest leader of `view` sends, holding `tc` = TC(view - 1) or not: its own
+    /// `enter_view` (`propose_as_leader`, leader rules L1-L4) run on its block tree, read from
+    /// its Propose / Nudge event.
+    fn leader_message(&mut self, view: u64, tc: Option<&TimeoutCertificate>) -> HotStuffMessage {
+        let leader = self.leader(view);
+        let i = self.honest_index(&leader).expect("an honest leader");
+        let tree = &mut self.trees[i];
+        if let Some(tc) = tc {
+            tree.set_highest_tc(tc).unwrap();
+        }
+        let (mut hotstuff, events) =
+            hotstuff_at_with_events(ViewNumber::new(view - 1), self.honest[i].clone(), tree.validator_set_state().unwrap());
+        hotstuff
+            .enter_view(ViewInfo::new(ViewNumber::new(view), Instant::now() + Duration::from_secs(3600)), tree, &mut TreeApp)
+            .expect("the leader enters its view");
+        events
+            .try_iter()
+            .find_map(|event| match event {
+                Event::Propose(event) => {
+                    let has_updates = tree.validator_set_updates_status(&event.proposal.block.hash).unwrap().contains_updates();
+                    Some(HotStuffMessage::ProposalHeader(ProposalHeader::from_proposal(&event.proposal, has_updates)))
+                }
+                Event::Nudge(event) => Some(HotStuffMessage::Nudge(event.nudge)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the leader of view {view} proposes or nudges"))
+    }
+
+    /// The synchronous suffix from `first` (TC(first - 1) from the honest replicas if
+    /// `previous_failed`): the Byzantine validator is silent (no votes; no message in the views
+    /// it leads), honest leaders run their own leader rules, every honest replica receives every
+    /// message, and every PC the honest votes form reaches every honest replica. Runs until every
+    /// honest replica committed a block or 30 views passed; returns a log line per view.
+    fn synchronous_suffix(&mut self, first: u64, mut previous_failed: bool) -> Vec<String> {
+        let byzantine_vk = self.byzantine.verifying_key();
+        let mut log = Vec::new();
+        for view in first..first + 30 {
+            if self.trees.iter().all(|tree| tree.highest_committed_block().unwrap().is_some()) {
+                break;
+            }
+            let leader = self.leader(view);
+            if leader == byzantine_vk {
+                log.push(format!("view {view}: Byzantine leader silent"));
+                previous_failed = true;
+                continue;
+            }
+            let tc = previous_failed.then(|| self.honest_tc(view - 1));
+            let msg = self.leader_message(view, tc.as_ref());
+            let what = match &msg {
+                HotStuffMessage::ProposalHeader(h) => format!("proposal of {}", self.name(&h.block_hash)),
+                HotStuffMessage::Nudge(n) => format!("nudge {:?}({}, {})", n.justify.phase, self.name(&n.justify.block), n.justify.view.int()),
+                _ => unreachable!(),
+            };
+            let votes = self.deliver(view, &msg, &leader);
+            log.push(format!("view {view}: {what}, {} honest votes", votes.len()));
+            if votes.len() < self.honest.len() {
+                previous_failed = true;
+                continue;
+            }
+            let pc = certify(view, votes, &self.set);
+            self.share(view, &pc, &leader);
+            previous_failed = false;
+        }
+        log
+    }
+
+    fn name(&self, hash: &CryptoHash) -> &'static str {
+        if *hash == self.u.hash {
+            "U"
+        } else if *hash == self.u_prime.hash {
+            "U'"
+        } else {
+            "?"
+        }
+    }
+
+    /// Every honest replica votes Prepare(`block`, 2) on leader(2)'s header; the PC.
+    fn prepare_in_view_2(&mut self, block: &Block) -> PhaseCertificate {
+        let leader2 = self.leader(2);
+        let msg = HotStuffMessage::ProposalHeader(signed_by(header(block, 2, None), &leader2));
+        let votes = self.deliver(2, &msg, &leader2);
+        assert_eq!(votes.len(), 3, "every honest replica votes Prepare in view 2");
+        certify(2, votes, &self.set)
+    }
+
+    /// Every honest replica votes Precommit on leader(3)'s nudge of `prepare`; the votes.
+    fn precommit_votes_in_view_3(&mut self, prepare: &PhaseCertificate) -> Vec<(SigningKey, PhaseVote)> {
+        let leader3 = self.leader(3);
+        let msg = HotStuffMessage::Nudge(Nudge { chain_id: CHAIN_ID, view: ViewNumber::new(3), justify: prepare.clone() });
+        let votes = self.deliver(3, &msg, &leader3);
+        assert_eq!(votes.len(), 3, "every honest replica votes Precommit in view 3");
+        votes
+    }
+}
+
 /// The Codex P1 trace (every certificate is real: signed votes the replicas cast, a TC that
-/// passes V1-V4), then a synchronous suffix: the Byzantine validator is silent (no votes, no
-/// proposals in the views it leads), every honest leader does what `propose_from_highest_pc`
-/// does (re-propose the highest PC's block under TC(v-1), or nudge it), and every PC the honest
-/// votes form reaches every honest replica. All three honest replicas must commit U'.
+/// passes V1-V4), then a synchronous suffix in which every honest leader runs its own leader
+/// rules. All three honest replicas must commit U'.
 ///
 /// RED before the fix: from view 6 on, every re-proposal of U' gets two honest votes (the
 /// replica locked on Precommit(U, 3) refuses), no PC forms, and nothing is ever committed.
 #[test]
 fn locked_replica_votes_for_a_sibling_certified_above_its_lock() {
-    let keys = signing_keys(&[1, 2, 3, 4]);
-    let set = validator_set(&keys);
-    let (template, vss) = steady_block_tree(&set);
-    let byzantine_vk = proposer_for(ViewNumber::new(3), &keys, &vss, &template);
-    let byzantine = keys.iter().find(|k| k.verifying_key() == byzantine_vk).unwrap().clone();
-    let honest: Vec<SigningKey> = keys.iter().filter(|k| k.verifying_key() != byzantine_vk).cloned().collect();
-
-    // A <- U and A <- U' (siblings on the same justify QC(A, 1), both validator-set-updating).
-    let a = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(), CryptoHash::new([10; 32]), Data::new(vec![]));
-    let qc_a = generic_pc(ViewNumber::new(1), a.hash, &honest, &set);
-    let u = Block::new(BlockHeight::new(1), qc_a.clone(), CryptoHash::new([11; 32]), Data::new(vec![]));
-    let u_prime = Block::new(BlockHeight::new(1), qc_a.clone(), CryptoHash::new([12; 32]), Data::new(vec![]));
-    let mut trees: Vec<BlockTreeSingleton<MemKV>> = honest
-        .iter()
-        .map(|_| {
-            let (mut tree, _) = steady_block_tree(&set);
-            tree.insert(&a, None, None).unwrap();
-            tree.update(&qc_a, &None).unwrap();
-            let mut updates = ValidatorSetUpdates::new();
-            updates.insert(honest[0].verifying_key(), Power::new(2));
-            tree.insert(&u, None, Some(&updates)).unwrap();
-            tree.insert(&u_prime, None, Some(&updates)).unwrap();
-            tree
-        })
-        .collect();
-
-    // Every honest replica casts Prepare(U, 2) and Precommit(U, 3).
-    let leader2 = proposer_for(ViewNumber::new(2), &keys, &vss, &trees[0]);
-    let mut votes = Vec::new();
-    for (i, tree) in trees.iter_mut().enumerate() {
-        let msg = HotStuffMessage::ProposalHeader(signed_by(header(&u, 2, None), &leader2));
-        let cast = run(tree, &honest[i], 2, msg, &leader2);
-        assert_eq!(cast.len(), 1, "replica {i} votes Prepare(U, 2)");
-        votes.push((honest[i].clone(), cast[0].clone()));
-    }
-    let prepare2 = certify(2, votes, &set);
-    let mut votes = Vec::new();
-    for (i, tree) in trees.iter_mut().enumerate() {
-        let msg = HotStuffMessage::Nudge(Nudge { chain_id: CHAIN_ID, view: ViewNumber::new(3), justify: prepare2.clone() });
-        let cast = run(tree, &honest[i], 3, msg, &byzantine_vk);
-        assert_eq!(cast.len(), 1, "replica {i} votes Precommit(U, 3)");
-        votes.push((honest[i].clone(), cast[0].clone()));
-    }
-    let precommit3 = certify(3, votes.clone(), &set);
+    let mut c = Cluster::new(3);
+    let (u, u_prime, qc_a) = (c.u.clone(), c.u_prime.clone(), c.qc_a.clone());
+    let byzantine_vk = c.byzantine.verifying_key();
+    let prepare2 = c.prepare_in_view_2(&u);
+    let votes = c.precommit_votes_in_view_3(&prepare2);
+    let precommit3 = certify(3, votes.clone(), &c.set);
 
     // The backup aggregator leader(5) alone collects Precommit(U, 3) and locks on U.
-    let backup = proposer_for(ViewNumber::new(5), &keys, &vss, &trees[0]);
-    let locked = honest.iter().position(|k| k.verifying_key() == backup).expect("leader(5) is honest");
+    let backup = c.leader(5);
+    let locked = c.honest_index(&backup).expect("leader(5) is honest");
     let (mut aggregator, events) = hotstuff_at_with_events(
         ViewNumber::new(3),
-        honest[locked].clone(),
-        trees[locked].validator_set_state().unwrap(),
+        c.honest[locked].clone(),
+        c.trees[locked].validator_set_state().unwrap(),
     );
     for (key, vote) in votes {
         aggregator
-            .on_receive_msg(HotStuffMessage::PhaseVote(vote), &key.verifying_key(), &mut trees[locked], &mut TreeApp)
+            .on_receive_msg(HotStuffMessage::PhaseVote(vote), &key.verifying_key(), &mut c.trees[locked], &mut TreeApp)
             .unwrap();
     }
     assert!(events
         .try_iter()
         .any(|e| matches!(e, Event::CollectPC(e) if e.phase_certificate == precommit3)));
-    assert_eq!(trees[locked].locked_pc().unwrap().block, u.hash, "leader(5) is locked on U");
+    assert_eq!(c.trees[locked].locked_pc().unwrap().block, u.hash, "leader(5) is locked on U");
 
     // The Byzantine leader(3) reports its own signed header of U' as its tip(3), which beats
     // Prepare(U, 2) in TC(3).
     let tip = TipInfo::from_header(&signed_by(header(&u_prime, 3, None), &byzantine_vk));
-    assert!(tip.is_correct(CHAIN_ID, &trees[0]).unwrap(), "a correctly signed tip of leader(3)");
-    let mut entries: Vec<_> = honest
+    assert!(tip.is_correct(CHAIN_ID, &c.trees[0]).unwrap(), "a correctly signed tip of leader(3)");
+    let mut entries: Vec<_> = c
+        .honest
         .iter()
         .enumerate()
         .filter(|(i, _)| *i != locked)
         .map(|(_, k)| (k.clone(), None, Some(prepare2.clone())))
         .collect();
-    entries.push((byzantine.clone(), Some(tip), Some(prepare2.clone())));
-    let tc3 = timeout_certificate(3, entries, &set);
+    entries.push((c.byzantine.clone(), Some(tip), Some(prepare2.clone())));
+    let tc3 = timeout_certificate(3, entries, &c.set);
     assert!(tc3.high_tip_is_winner);
 
     // Honest leader(4) re-proposes U' (V2). The locked replica refuses it; the other two and
     // the Byzantine one certify Prepare(U', 4), which every honest replica learns.
-    let leader4 = proposer_for(ViewNumber::new(4), &keys, &vss, &trees[0]);
+    let leader4 = c.leader(4);
     assert_ne!(leader4, backup);
-    let mut votes = Vec::new();
-    for (i, tree) in trees.iter_mut().enumerate() {
+    for tree in &c.trees {
         assert!(valid_proposal_certificates(CHAIN_ID, ViewNumber::new(4), &u_prime.hash, &qc_a, Some(&tc3), None, tree).unwrap());
-        let msg = HotStuffMessage::ProposalHeader(signed_by(header(&u_prime, 4, Some(tc3.clone())), &leader4));
-        let cast = run(tree, &honest[i], 4, msg, &leader4);
-        assert_eq!(cast.len(), usize::from(i != locked), "only the unlocked replicas vote for U' in view 4");
-        votes.extend(cast.into_iter().map(|vote| (honest[i].clone(), vote)));
     }
-    votes.push((byzantine.clone(), PhaseVote::new(&Keypair::new(byzantine.clone()), CHAIN_ID, ViewNumber::new(4), u_prime.hash, Phase::Prepare)));
-    let prepare4 = certify(4, votes, &set);
-    for (i, tree) in trees.iter_mut().enumerate() {
-        let msg = HotStuffMessage::NewView(NewView { chain_id: CHAIN_ID, view: ViewNumber::new(4), highest_pc: prepare4.clone() });
-        run(tree, &honest[i], 4, msg, &backup);
+    let msg = c.leader_message(4, Some(&tc3));
+    assert!(matches!(&msg, HotStuffMessage::ProposalHeader(h) if h.block_hash == u_prime.hash), "leader(4) re-proposes U'");
+    let mut votes = c.deliver(4, &msg, &leader4);
+    assert_eq!(votes.len(), 2, "only the unlocked replicas vote for U' in view 4");
+    votes.push((c.byzantine.clone(), PhaseVote::new(&Keypair::new(c.byzantine.clone()), CHAIN_ID, ViewNumber::new(4), u_prime.hash, Phase::Prepare)));
+    let prepare4 = certify(4, votes, &c.set);
+    c.share(4, &prepare4, &backup);
+    for (i, tree) in c.trees.iter().enumerate() {
         assert!(tree.highest_pc().unwrap() == prepare4, "replica {i} learns Prepare(U', 4)");
     }
-    assert!(trees[locked].locked_pc().unwrap() == precommit3, "the lock on U stays");
+    assert!(c.trees[locked].locked_pc().unwrap() == precommit3, "the lock on U stays");
 
     // View 5's nudge is lost. Synchronous suffix from view 6.
-    let mut previous_view_failed = true;
-    let mut log = Vec::new();
-    for view in 6..=30u64 {
-        if trees.iter().all(|tree| tree.highest_committed_block().unwrap() == Some(u_prime.hash)) {
-            break;
-        }
-        let leader = proposer_for(ViewNumber::new(view), &keys, &vss, &trees[0]);
-        if leader == byzantine_vk {
-            log.push(format!("view {view}: Byzantine leader silent"));
-            previous_view_failed = true;
-            continue;
-        }
-        let tc = previous_view_failed.then(|| {
-            let entries = honest
-                .iter()
-                .enumerate()
-                .map(|(i, k)| (k.clone(), trees[i].local_tip().unwrap(), trees[i].highest_qc_for_timeout().unwrap()))
-                .collect();
-            timeout_certificate(view - 1, entries, &set)
-        });
-        let li = honest.iter().position(|k| k.verifying_key() == leader).unwrap();
-        let msg = match repropose_block(ViewNumber::new(view), &trees[li]).unwrap() {
-            Some(block_hash) => {
-                let block = trees[li].block(&block_hash).unwrap().unwrap();
-                assert!(tc.is_some(), "a re-proposal with a stale justify needs TC(v-1)");
-                HotStuffMessage::ProposalHeader(signed_by(header(&block, view, tc), &leader))
-            }
-            None => {
-                let justify = trees[li].highest_pc().unwrap();
-                assert!(justify.phase.is_prepare() || justify.phase.is_precommit() || justify.phase.is_commit());
-                HotStuffMessage::Nudge(Nudge { chain_id: CHAIN_ID, view: ViewNumber::new(view), justify })
-            }
-        };
-        let mut votes = Vec::new();
-        for (i, tree) in trees.iter_mut().enumerate() {
-            let cast = run(tree, &honest[i], view, msg.clone(), &leader);
-            votes.extend(cast.into_iter().map(|vote| (honest[i].clone(), vote)));
-        }
-        log.push(format!("view {view}: {} honest votes", votes.len()));
-        if votes.len() < honest.len() {
-            previous_view_failed = true;
-            continue;
-        }
-        let pc = certify(view, votes, &set);
-        for (i, tree) in trees.iter_mut().enumerate() {
-            let msg = HotStuffMessage::NewView(NewView { chain_id: CHAIN_ID, view: ViewNumber::new(view), highest_pc: pc.clone() });
-            run(tree, &honest[i], view, msg, &leader);
-        }
-        previous_view_failed = false;
-    }
-    for (i, tree) in trees.iter().enumerate() {
+    let log = c.synchronous_suffix(6, true);
+    for (i, tree) in c.trees.iter().enumerate() {
         assert_eq!(
             tree.highest_committed_block().unwrap(),
             Some(u_prime.hash),
             "replica {i} (locked on U: {}) must commit U' in the synchronous suffix; {log:?}",
             i == locked
+        );
+    }
+}
+
+/// The copied-tip livelock (module docs). Replica 0 alone locks on Precommit(U, 3). The
+/// Byzantine leader(4) signs a header of U' and wins TC(4) with it over Prepare(U, 2); honest
+/// leader(5) re-proposes U' (V2); the two unlocked replicas vote for it, the locked one refuses,
+/// the Byzantine one withholds. In the synchronous suffix every honest replica must commit, and
+/// no honest replica may have taken U' as its tip.
+///
+/// RED before the fix: the two voters copied the TC's tip (U', 4); every honest TC from then on
+/// has that tip winning over Precommit(U, 3), every leader re-proposes U', the locked replica
+/// refuses it (no PC certifies U'), and nothing is ever committed.
+#[test]
+fn a_copied_byzantine_tip_does_not_strand_the_update() {
+    let mut c = Cluster::new(4);
+    let (u, u_prime) = (c.u.clone(), c.u_prime.clone());
+    let byzantine_vk = c.byzantine.verifying_key();
+    let prepare2 = c.prepare_in_view_2(&u);
+    let votes = c.precommit_votes_in_view_3(&prepare2);
+    let precommit3 = certify(3, votes, &c.set);
+
+    // Only replica 0 learns Precommit(U, 3) (the Byzantine leader(4) collected it).
+    run(&mut c.trees[0], &c.honest[0].clone(), 4, HotStuffMessage::NewView(NewView {
+        chain_id: CHAIN_ID,
+        view: ViewNumber::new(3),
+        highest_pc: precommit3.clone(),
+    }), &byzantine_vk);
+    assert!(c.trees[0].locked_pc().unwrap() == precommit3, "replica 0 is locked on U");
+
+    // TC(4): replicas 1 and 2 (Prepare(U, 2)) and the Byzantine one with its tip (U', 4).
+    let tip = TipInfo::from_header(&signed_by(header(&u_prime, 4, None), &byzantine_vk));
+    let entries = vec![
+        (c.honest[1].clone(), None, Some(prepare2.clone())),
+        (c.honest[2].clone(), None, Some(prepare2.clone())),
+        (c.byzantine.clone(), Some(tip), Some(prepare2.clone())),
+    ];
+    let tc4 = timeout_certificate(4, entries, &c.set);
+    assert!(tc4.high_tip_is_winner);
+
+    let leader5 = c.leader(5);
+    let msg = c.leader_message(5, Some(&tc4));
+    assert!(matches!(&msg, HotStuffMessage::ProposalHeader(h) if h.block_hash == u_prime.hash), "leader(5) re-proposes U' (V2)");
+    let votes = c.deliver(5, &msg, &leader5);
+    assert_eq!(votes.len(), 2, "the unlocked replicas vote for U', the locked one refuses");
+    for (i, tree) in c.trees.iter().enumerate() {
+        assert!(
+            tree.local_tip().unwrap().is_none_or(|tip| tip.block_hash != u_prime.hash),
+            "replica {i} took the Byzantine tip of the validator-set-updating U'"
+        );
+    }
+
+    // The Byzantine one withholds its vote: no PC in view 5. Synchronous suffix from view 6.
+    let log = c.synchronous_suffix(6, true);
+    for (i, tree) in c.trees.iter().enumerate() {
+        assert_eq!(
+            tree.highest_committed_block().unwrap(),
+            Some(u.hash),
+            "replica {i} must commit U (re-proposed on Precommit(U, 3)) in the synchronous suffix; {log:?}"
         );
     }
 }
