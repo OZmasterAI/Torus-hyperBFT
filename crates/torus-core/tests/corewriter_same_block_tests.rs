@@ -637,3 +637,169 @@ impl<T: StateBackend> StateBackend for PointReads<T> {
         self.inner.atomic_write(ops)
     }
 }
+
+/// Codex torus-adversarial on T (s138; the step 2 cursor finding, memory
+/// ad5a8203c6de102f, again): non-order intake above the 200-row drain cap
+/// (10M gas every two blocks: ~450 enqueues per two blocks) grows the
+/// same-block backlog every block, and a walk from the queuing block that
+/// reads every full target costs O(backlog) unmetered point reads per call.
+/// Here 600 enqueues every second block (300 a block against a drain of
+/// 200), 10% of them orders, step 2's rules before the activation `H` (its
+/// backlog of full targets runs past `H`) and T's from `H`; txs of 1 to 3
+/// calls in a block journal, a fifth of them reverted; each block drains
+/// after its EVM part; every 7th block crashes once (its journal dropped)
+/// and is replayed. Point reads per non-order T enqueue stay constant while
+/// the backlog grows, every sampled row lands on the first target from its
+/// block with room, and the state equals a run without crashes.
+#[test]
+fn t_sustained_same_block_overload_keeps_reads_per_enqueue_constant() {
+    const FROM: u64 = 1_000;
+    const H: u64 = 1_060;
+    const TO: u64 = 1_300;
+    struct Run {
+        _dir: tempfile::TempDir,
+        db: StateDb,
+        /// Max point reads of a non-order T enqueue, per block.
+        reads: Vec<(u64, usize)>,
+        backlog_targets: u64,
+    }
+    let run = |crash: bool| -> Run {
+        let (dir, db) = setup();
+        let mut rng = 0xd1b5_4a32_d192_ed03u64;
+        let mut id = 0u64;
+        let mut reads = Vec::new();
+        for block in FROM..TO {
+            let t_on = block >= H;
+            let attempts = if crash && block % 7 == 0 { 2 } else { 1 };
+            let (rng0, id0) = (rng, id);
+            for attempt in 0..attempts {
+                (rng, id) = (rng0, id0);
+                let mut next = |n: u64| {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    rng % n
+                };
+                let ov = NativeStateOverlay::new(db.clone());
+                let mut max_reads = 0usize;
+                let mut left: u64 = if block % 2 == 0 { 600 } else { 0 };
+                while left > 0 {
+                    let calls = (1 + next(3)).min(left);
+                    left -= calls;
+                    let revert = next(5) == 0;
+                    ov.begin_tx();
+                    for _ in 0..calls {
+                        id += 1;
+                        let order = next(10) == 0;
+                        let kind = if order {
+                            QueuedActionKind::CancelOrder {
+                                order_id: u128::from(id),
+                            }
+                        } else {
+                            QueuedActionKind::LockboxWithdraw {
+                                amount: FixedPoint::from_raw(id as i128),
+                            }
+                        };
+                        let counted = PointReads::new(ov.clone());
+                        let seq =
+                            CoreWriterQueue::enqueue_with(&counted, &qa(kind, block), t_on).unwrap();
+                        if t_on && !order {
+                            max_reads = max_reads.max(counted.count());
+                            if id % 97 == 0 {
+                                // The first target from `block` with room.
+                                let full = |t: u64| {
+                                    ov.get_cf_raw(CF_CORE_WRITER_QUEUE, &queue_key(t, CAP - 1))
+                                        .unwrap()
+                                        .is_some()
+                                };
+                                let mut t = block;
+                                while full(t) {
+                                    t += 1;
+                                }
+                                let row_at = |t: u64| {
+                                    ov.get_cf_raw(CF_CORE_WRITER_QUEUE, &queue_key(t, seq))
+                                        .unwrap()
+                                };
+                                let mine = |t: u64| {
+                                    row_at(t).is_some_and(|v| {
+                                        matches!(
+                                            borsh::from_slice::<QueuedAction>(&v).unwrap().kind,
+                                            QueuedActionKind::LockboxWithdraw { amount }
+                                                if amount.raw() == id as i128
+                                        )
+                                    })
+                                };
+                                // Either it is at `t` (room left) or it took
+                                // the last slot of the target before `t`.
+                                assert!(
+                                    mine(t) || (seq == CAP - 1 && t > block && mine(t - 1)),
+                                    "row {id} of {block} (seq {seq}): first open target {t}"
+                                );
+                            }
+                        }
+                    }
+                    if revert {
+                        ov.revert_tx();
+                    } else {
+                        ov.keep_tx();
+                    }
+                }
+                CoreWriterQueue::drain_keyed(&ov, block).unwrap();
+                if attempt + 1 < attempts {
+                    drop(ov); // crash: the block's writes never land
+                    continue;
+                }
+                ov.commit_tx(&db).unwrap();
+                if t_on {
+                    reads.push((block, max_reads));
+                }
+            }
+        }
+        let mut backlog_targets = 0;
+        let mut t = TO;
+        while db
+            .get_cf_raw(CF_CORE_WRITER_QUEUE, &queue_key(t, CAP - 1))
+            .unwrap()
+            .is_some()
+        {
+            backlog_targets += 1;
+            t += 1;
+        }
+        Run {
+            _dir: dir,
+            db,
+            reads,
+            backlog_targets,
+        }
+    };
+    let crashed = run(true);
+    let straight = run(false);
+    for cf in [CF_CORE_WRITER_QUEUE, CF_FEE_CONFIG] {
+        assert!(
+            crashed.db.iterate_cf(cf, None).unwrap() == straight.db.iterate_cf(cf, None).unwrap(),
+            "replay after crashes = the straight run ({cf})"
+        );
+    }
+    assert!(
+        straight.backlog_targets >= 100,
+        "the backlog grows: {} full targets after {TO}",
+        straight.backlog_targets
+    );
+    let first = straight.reads.iter().map(|r| r.1).max().unwrap();
+    let late = straight
+        .reads
+        .iter()
+        .filter(|(b, _)| *b >= H + 20)
+        .map(|r| r.1)
+        .max()
+        .unwrap();
+    eprintln!(
+        "backlog {} targets; max point reads per non-order T enqueue: all {first}, from H + 20 {late}",
+        straight.backlog_targets
+    );
+    // Constant: the T cursor, step 2's cursor and run rows, one probe (and
+    // the run row again past a full probe); the walk right after `H` may
+    // still cross step 2's uncovered full targets (below H - 1 + K) once.
+    assert!(late <= 5, "max point reads per enqueue after H + 20: {late}");
+    assert!(first <= 5 + 12, "max point reads per enqueue from H: {first}");
+}
