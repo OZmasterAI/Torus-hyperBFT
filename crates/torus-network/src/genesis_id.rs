@@ -122,7 +122,9 @@ impl NetworkGenesis {
 
     /// `0x<64 hex>`, or `none`.
     pub fn display_digest(&self) -> String {
-        self.digest.as_ref().map_or_else(|| "none".to_string(), hex32)
+        self.digest
+            .as_ref()
+            .map_or_else(|| "none".to_string(), hex32)
     }
 
     /// The protocol / topic tag (`g` + 16 hex digits), `None` without a digest.
@@ -254,10 +256,15 @@ mod tests {
     #[test]
     fn a_peer_without_a_digest_and_a_foreign_peer_are_refused() {
         let ours = NetworkGenesis::new(Some(d(1)));
-        let err = ours.check_peer("/torus/1.0").expect_err("no digest refused");
+        let err = ours
+            .check_peer("/torus/1.0")
+            .expect_err("no digest refused");
         assert_eq!(err.theirs, "none");
         assert!(ours.check_peer("/ipfs/0.1.0").is_err());
-        assert!(ours.check_peer("/torus/1.0/genesis/0x1234").is_err(), "short digest");
+        assert!(
+            ours.check_peer("/torus/1.0/genesis/0x1234").is_err(),
+            "short digest"
+        );
         assert!(ours.check_peer("/torus/1.0/genesis/").is_err());
     }
 
@@ -291,7 +298,10 @@ mod tests {
             format!("/torus/{tag}/kad/1.0.0")
         );
         // The zstd dispatch keys on the "/2.0" suffix: it survives.
-        assert!(g.protocol("/torus/native-da/2.0").as_ref().ends_with("/2.0"));
+        assert!(g
+            .protocol("/torus/native-da/2.0")
+            .as_ref()
+            .ends_with("/2.0"));
         // Another digest, other names.
         let other = NetworkGenesis::new(Some(d(0xac)));
         assert_ne!(
@@ -303,7 +313,10 @@ mod tests {
     #[test]
     fn without_a_digest_names_are_the_legacy_ones() {
         let g = NetworkGenesis::new(None);
-        assert_eq!(g.protocol("/torus/direct/2.0").as_ref(), "/torus/direct/2.0");
+        assert_eq!(
+            g.protocol("/torus/direct/2.0").as_ref(),
+            "/torus/direct/2.0"
+        );
         assert_eq!(g.topic("/torus/consensus/1.0"), "/torus/consensus/1.0");
         assert!(g.kad_protocol().is_none());
     }

@@ -527,6 +527,9 @@ pub struct SharedState {
     /// worker. Installed once at startup; an empty cell (flag off, tests,
     /// observers) costs a presence check but no lock acquisition or datum copy.
     pub(crate) validate_tee: OnceLock<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+    /// Owner s138: the genesis this node's network is keyed by (gossip topic
+    /// names, the identify check; see [`crate::genesis_id`]).
+    pub genesis: crate::genesis_id::NetworkGenesis,
 }
 
 /// Capacity of the B2 dual-path dedup LRU. Sized for arrival skew, not
@@ -910,9 +913,15 @@ fn deserialize_native_batch(data: &[u8]) -> Option<Vec<&[u8]>> {
 /// gossip therefore rides only the raw v1 topic; per-peer zstd lives on the
 /// request_response body paths (`/torus/{native-da,block-data,direct}/2.0`),
 /// which DO negotiate per peer and stay.
-fn subscribe_gossip_topics(gossipsub: &mut gossipsub::Behaviour) {
-    for topic in [CONSENSUS_TOPIC, TX_TOPIC, NATIVE_ACTION_TOPIC] {
-        let ident = gossipsub::IdentTopic::new(topic);
+///
+/// Topic names carry the genesis tag (owner s138, [`crate::genesis_id`]).
+fn subscribe_gossip_topics(
+    gossipsub: &mut gossipsub::Behaviour,
+    genesis: &crate::genesis_id::NetworkGenesis,
+) {
+    for base in [CONSENSUS_TOPIC, TX_TOPIC, NATIVE_ACTION_TOPIC] {
+        let topic = genesis.topic(base);
+        let ident = gossipsub::IdentTopic::new(topic.clone());
         if let Err(e) = gossipsub.subscribe(&ident) {
             warn!(topic, "failed to subscribe to gossip topic: {e:?}");
         }
@@ -1125,16 +1134,17 @@ pub async fn run_swarm_with_config(
     local_key: VerifyingKey,
     config: &NetworkConfig,
 ) {
-    let consensus_topic = gossipsub::IdentTopic::new(CONSENSUS_TOPIC);
-    let tx_topic = gossipsub::IdentTopic::new(TX_TOPIC);
+    let consensus_topic = gossipsub::IdentTopic::new(shared.genesis.topic(CONSENSUS_TOPIC));
+    let tx_topic = gossipsub::IdentTopic::new(shared.genesis.topic(TX_TOPIC));
     // Native-action batches gossip ONLY on the raw v1 topic. The zstd v2 topic
     // was removed (s364): gossipsub cannot negotiate compression per-peer, so a
     // v2 subscriber had to inflate any peer's frames — a cluster-wide DoS that
     // `--no-gossip-zstd` could not close (it only stopped local publishing).
     // Per-peer zstd survives on the request_response body paths, not gossip.
-    let native_action_topic = gossipsub::IdentTopic::new(NATIVE_ACTION_TOPIC);
+    let native_action_topic =
+        gossipsub::IdentTopic::new(shared.genesis.topic(NATIVE_ACTION_TOPIC));
 
-    subscribe_gossip_topics(&mut swarm.behaviour_mut().gossipsub);
+    subscribe_gossip_topics(&mut swarm.behaviour_mut().gossipsub, &shared.genesis);
 
     let mut tx_gossip_state =
         TxGossipState::new(config.tx_dedup_window_secs, config.tx_rate_limit_per_peer);
@@ -1464,7 +1474,8 @@ fn handle_event(
                 m.gossip_messages_received.inc();
             }
 
-            let consensus_hash = gossipsub::IdentTopic::new(CONSENSUS_TOPIC).hash();
+            let consensus_hash =
+                gossipsub::IdentTopic::new(shared.genesis.topic(CONSENSUS_TOPIC)).hash();
             if message.topic == consensus_hash {
                 // Message size validation (Phase 3: 3.1.7). Penalty goes to the
                 // AUTHOR — the forwarder merely relayed it (s350 FIX B).
@@ -1518,7 +1529,9 @@ fn handle_event(
                     return;
                 }
                 handle_consensus_gossip(&message.data, shared, peer_scoring, &author);
-            } else if message.topic == gossipsub::IdentTopic::new(NATIVE_ACTION_TOPIC).hash() {
+            } else if message.topic
+                == gossipsub::IdentTopic::new(shared.genesis.topic(NATIVE_ACTION_TOPIC)).hash()
+            {
                 if message.data.len() > max_tx_msg_size {
                     // Penalty goes to the AUTHOR, never the relayer — forwarder
                     // penalties on this exact path banned friend2 (validator) for
@@ -1869,6 +1882,19 @@ fn handle_event(
             info,
             ..
         })) => {
+            // Owner s138 (K question, option B): a peer of another genesis is
+            // refused before it enters the address book or the peer map. Its
+            // app protocols and topics already carry another genesis tag, so
+            // nothing else crossed; this names the mismatch and drops it.
+            if let Err(mismatch) = shared.genesis.check_peer(&info.protocol_version) {
+                warn!(%peer_id, "peer {peer_id} {mismatch}: refusing");
+                if let Some(ref m) = shared.metrics {
+                    m.p2p_genesis_mismatch_refusals.inc();
+                }
+                swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
+                let _ = swarm.disconnect_peer_id(peer_id);
+                return;
+            }
             // Validator-set peers exempt (s350 FIX B): identify keeps the peer
             // map fresh, which the validator exemption itself depends on.
             if should_drop_banned_gossip(&mut *peer_scoring, shared, &peer_id) {
@@ -3520,7 +3546,10 @@ mod tests {
     fn no_node_subscribes_to_v2_gossip_topic() {
         let key = libp2p::identity::Keypair::generate_ed25519();
         let mut behaviour = TorusBehaviour::new(&key).expect("build behaviour");
-        subscribe_gossip_topics(&mut behaviour.gossipsub);
+        subscribe_gossip_topics(
+            &mut behaviour.gossipsub,
+            &crate::genesis_id::NetworkGenesis::default(),
+        );
 
         let subscribed: Vec<_> = behaviour.gossipsub.topics().cloned().collect();
         let v2 = gossipsub::IdentTopic::new("/torus/native-actions/2.0").hash();
@@ -3796,6 +3825,7 @@ mod tests {
             outbound_forward_batches: Mutex::new(HashMap::new()),
             leader_resolver: RwLock::new(None),
             validate_tee: OnceLock::new(),
+            genesis: crate::genesis_id::NetworkGenesis::default(),
         }
     }
 

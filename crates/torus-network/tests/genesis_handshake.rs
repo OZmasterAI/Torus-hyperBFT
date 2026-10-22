@@ -117,7 +117,12 @@ async fn pair(digest_a: Option<[u8; 32]>, digest_b: Option<[u8; 32]>) -> (Node, 
 /// For `budget`: each side sends a direct message and a gossip broadcast to
 /// the other every 200 ms. Returns (a heard b, b heard a); stops early once
 /// both heard and `stop_when_both` is set.
-async fn exchange(a: &mut Node, b: &mut Node, budget: Duration, stop_when_both: bool) -> (bool, bool) {
+async fn exchange(
+    a: &mut Node,
+    b: &mut Node,
+    budget: Duration,
+    stop_when_both: bool,
+) -> (bool, bool) {
     let start = Instant::now();
     let (mut a_heard, mut b_heard) = (false, false);
     let mut n = 0u64;
@@ -158,7 +163,10 @@ async fn same_genesis_peers_connect_and_exchange_messages() {
     let _ = tracing_subscriber::fmt::try_init();
     let (mut a, mut b) = pair(Some(DIGEST_A), Some(DIGEST_A)).await;
     let (a_heard, b_heard) = exchange(&mut a, &mut b, Duration::from_secs(30), true).await;
-    assert!(a_heard && b_heard, "same genesis must peer: a_heard={a_heard} b_heard={b_heard}");
+    assert!(
+        a_heard && b_heard,
+        "same genesis must peer: a_heard={a_heard} b_heard={b_heard}"
+    );
     assert_eq!(a.metrics.p2p_genesis_mismatch_refusals.get(), 0);
     assert_eq!(b.metrics.p2p_genesis_mismatch_refusals.get(), 0);
 }

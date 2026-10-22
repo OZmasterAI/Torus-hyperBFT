@@ -2,12 +2,13 @@ use std::time::Duration;
 
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{
-    allow_block_list, connection_limits, gossipsub, identify, kad, request_response, StreamProtocol,
+    allow_block_list, connection_limits, gossipsub, identify, kad, request_response,
 };
 
 use crate::codec::{
     BlockDataCodec, BorshCodec, NativeDaCodec, NativeDaShardsCodec, NATIVE_DA_SHARDS_PROTOCOL,
 };
+use crate::genesis_id::NetworkGenesis;
 use crate::sync::{SyncRequest, SyncResponse};
 
 pub const CONSENSUS_TOPIC: &str = "/torus/consensus/1.0";
@@ -123,6 +124,27 @@ impl TorusBehaviour {
         gossip_max_transmit: usize,
         gossipsub_queue_len: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::with_genesis(
+            key,
+            max_peers,
+            gossipsub_heartbeat_ms,
+            gossip_max_transmit,
+            gossipsub_queue_len,
+            NetworkGenesis::default(),
+        )
+    }
+
+    /// [`Self::with_limits_and_heartbeat`] keyed by a genesis digest (owner
+    /// s138): every request-response and kademlia protocol name carries its
+    /// tag, and identify advertises it (see [`crate::genesis_id`]).
+    pub fn with_genesis(
+        key: &libp2p::identity::Keypair,
+        max_peers: usize,
+        gossipsub_heartbeat_ms: u64,
+        gossip_max_transmit: usize,
+        gossipsub_queue_len: usize,
+        genesis: NetworkGenesis,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let peer_id = key.public().to_peer_id();
 
         // GossipSub
@@ -143,11 +165,11 @@ impl TorusBehaviour {
         let direct = request_response::Behaviour::<BorshCodec>::new(
             [
                 (
-                    StreamProtocol::new("/torus/direct/2.0"),
+                    genesis.protocol("/torus/direct/2.0"),
                     request_response::ProtocolSupport::Full,
                 ),
                 (
-                    StreamProtocol::new("/torus/direct/1.0"),
+                    genesis.protocol("/torus/direct/1.0"),
                     request_response::ProtocolSupport::Full,
                 ),
             ],
@@ -159,11 +181,11 @@ impl TorusBehaviour {
         let block_data = request_response::Behaviour::<BlockDataCodec>::new(
             [
                 (
-                    StreamProtocol::new("/torus/block-data/2.0"),
+                    genesis.protocol("/torus/block-data/2.0"),
                     request_response::ProtocolSupport::Full,
                 ),
                 (
-                    StreamProtocol::new("/torus/block-data/1.0"),
+                    genesis.protocol("/torus/block-data/1.0"),
                     request_response::ProtocolSupport::Full,
                 ),
             ],
@@ -176,11 +198,11 @@ impl TorusBehaviour {
         let native_da = request_response::Behaviour::<NativeDaCodec>::new(
             [
                 (
-                    StreamProtocol::new("/torus/native-da/2.0"),
+                    genesis.protocol("/torus/native-da/2.0"),
                     request_response::ProtocolSupport::Full,
                 ),
                 (
-                    StreamProtocol::new("/torus/native-da/1.0"),
+                    genesis.protocol("/torus/native-da/1.0"),
                     request_response::ProtocolSupport::Full,
                 ),
             ],
@@ -194,7 +216,7 @@ impl TorusBehaviour {
         // safe by the same construction the zstd 2.0-first work proved (s356).
         let native_da_shards = request_response::Behaviour::<NativeDaShardsCodec>::new(
             [(
-                StreamProtocol::new(NATIVE_DA_SHARDS_PROTOCOL),
+                genesis.protocol(NATIVE_DA_SHARDS_PROTOCOL),
                 request_response::ProtocolSupport::Full,
             )],
             request_response::Config::default().with_request_timeout(Duration::from_secs(10)),
@@ -203,7 +225,7 @@ impl TorusBehaviour {
         // Block sync request-response (cbor codec)
         let sync_proto = request_response::cbor::Behaviour::<SyncRequest, SyncResponse>::new(
             [(
-                StreamProtocol::new("/torus/sync/1.0"),
+                genesis.protocol("/torus/sync/1.0"),
                 request_response::ProtocolSupport::Full,
             )],
             request_response::Config::default().with_request_timeout(Duration::from_secs(10)),
@@ -211,12 +233,21 @@ impl TorusBehaviour {
 
         // Kademlia DHT — server mode so nodes respond to bootstrap queries
         // and share peer addresses with each other.
-        let mut kademlia = kad::Behaviour::new(peer_id, kad::store::MemoryStore::new(peer_id));
+        // Owner s138: keyed by the genesis digest, so a node of another chain
+        // never enters our routing table (libp2p's default name without one).
+        let store = kad::store::MemoryStore::new(peer_id);
+        let mut kademlia = match genesis.kad_protocol() {
+            Some(protocol) => kad::Behaviour::with_config(peer_id, store, kad::Config::new(protocol)),
+            None => kad::Behaviour::new(peer_id, store),
+        };
         kademlia.set_mode(Some(kad::Mode::Server));
 
-        // Identify protocol
-        let identify =
-            identify::Behaviour::new(identify::Config::new("/torus/1.0".into(), key.public()));
+        // Identify protocol. Its protocol version carries the full genesis
+        // digest; the swarm refuses a peer advertising another one (owner s138).
+        let identify = identify::Behaviour::new(identify::Config::new(
+            genesis.identify_protocol_version(),
+            key.public(),
+        ));
 
         // Connection limits (Phase 3: 3.1.7)
         // 80% inbound, 20% reserved for outbound

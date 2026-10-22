@@ -55,7 +55,11 @@ fn reversed_keys_json(v: &serde_json::Value) -> String {
         }
         serde_json::Value::Array(items) => format!(
             "[{}]",
-            items.iter().map(reversed_keys_json).collect::<Vec<_>>().join(",")
+            items
+                .iter()
+                .map(reversed_keys_json)
+                .collect::<Vec<_>>()
+                .join(",")
         ),
         scalar => serde_json::to_string(scalar).unwrap(),
     }
@@ -151,6 +155,27 @@ impl Node {
             .max()
     }
 
+    /// Connection / sync / refusal lines (the first 40), for a failure report.
+    fn key_lines(&self) -> String {
+        const KEYS: [&str; 8] = [
+            "peer connected",
+            "refusing",
+            "block_sync: starting",
+            "cannot sync",
+            "blacklist",
+            "worker returned",
+            "ERROR",
+            "p2p identity",
+        ];
+        let text = self.log_text();
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| KEYS.iter().any(|k| l.contains(k)))
+            .take(40)
+            .collect();
+        lines.join("\n")
+    }
+
     fn assert_running(&mut self) {
         if let Ok(Some(st)) = self.child.try_wait() {
             panic!("node exited early ({st}):\n{}", self.tail());
@@ -178,7 +203,14 @@ fn wait_until(nodes: &mut [&mut Node], what: &str, mut cond: impl FnMut(&[&mut N
         if start.elapsed() > BOUND {
             let tails: Vec<String> = nodes
                 .iter()
-                .map(|n| format!("--- {}:\n{}", n.log.display(), n.tail()))
+                .map(|n| {
+                    format!(
+                        "--- {} key lines:\n{}\n--- tail:\n{}",
+                        n.log.display(),
+                        n.key_lines(),
+                        n.tail()
+                    )
+                })
                 .collect();
             panic!("{what}: not within {BOUND:?}\n{}", tails.join("\n"));
         }
@@ -205,7 +237,10 @@ fn genesis_digest_is_canonical_and_a_k_difference_is_refused_at_connect() {
     );
     let d5 = GenesisDigest::of_json(&r2_text).unwrap();
     assert_ne!(d5.digest, d3.digest, "K must change the digest");
-    assert_eq!(d3.changed_fields(&d5), vec!["consensus.leader_miss_threshold"]);
+    assert_eq!(
+        d3.changed_fields(&d5),
+        vec!["consensus.leader_miss_threshold"]
+    );
 
     let v_genesis = write(work.path(), "genesis-v.json", &v_text);
     let r1_genesis = write(work.path(), "genesis-r1.json", &r1_text);
@@ -231,29 +266,48 @@ fn genesis_digest_is_canonical_and_a_k_difference_is_refused_at_connect() {
     );
     let v_addr = format!("/ip4/127.0.0.1/udp/{v_port}/quic-v1/p2p/{v_peer}");
     let rpc = |peers: &str| vec!["--rpc-only".to_string(), format!("--p2p-peers={peers}")];
-    let mut r1 = Node::start(work.path(), "r1", &r1_genesis, free_udp_port(), &rpc(&v_addr));
-    let mut r2 = Node::start(work.path(), "r2", &r2_genesis, free_udp_port(), &rpc(&v_addr));
+    let mut r1 = Node::start(
+        work.path(),
+        "r1",
+        &r1_genesis,
+        free_udp_port(),
+        &rpc(&v_addr),
+    );
+    let mut r2 = Node::start(
+        work.path(),
+        "r2",
+        &r2_genesis,
+        free_udp_port(),
+        &rpc(&v_addr),
+    );
 
     // The same genesis, reformatted: peers and syncs.
-    wait_until(&mut [&mut v, &mut r1, &mut r2], "r1 syncs blocks from v", |n| {
-        n[1].executed_height().is_some_and(|h| h >= 2)
-    });
+    wait_until(
+        &mut [&mut v, &mut r1, &mut r2],
+        "r1 syncs blocks from v",
+        |n| n[1].executed_height().is_some_and(|h| h >= 2),
+    );
 
     // K differs: both ends refuse, naming both digests.
     let x3 = format!("{:#x}", d3.digest);
     let x5 = format!("{:#x}", d5.digest);
     let v_line = format!("genesis digest {x5} != ours {x3}: refusing");
     let r2_line = format!("genesis digest {x3} != ours {x5}: refusing");
-    wait_until(&mut [&mut v, &mut r1, &mut r2], "both ends refuse r2", |n| {
-        n[0].log_text().contains(&v_line) && n[2].log_text().contains(&r2_line)
-    });
+    wait_until(
+        &mut [&mut v, &mut r1, &mut r2],
+        "both ends refuse r2",
+        |n| n[0].log_text().contains(&v_line) && n[2].log_text().contains(&r2_line),
+    );
     assert!(
-        !v.log_text().contains(&format!("genesis digest {x3} != ours {x3}")),
+        !v.log_text()
+            .contains(&format!("genesis digest {x3} != ours {x3}")),
         "r1 must not be refused:\n{}",
         v.tail()
     );
     assert!(
-        r1.log_text().lines().all(|l| !l.contains("genesis digest") || !l.contains("refusing")),
+        r1.log_text()
+            .lines()
+            .all(|l| !l.contains("genesis digest") || !l.contains("refusing")),
         "r1 refused nothing:\n{}",
         r1.tail()
     );
