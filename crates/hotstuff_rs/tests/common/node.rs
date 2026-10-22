@@ -461,6 +461,8 @@ fn receive_proposal_handler(
                     NumberAppTransaction::SetValidator(_, _) => String::from("Set Validator"),
                     NumberAppTransaction::DeleteValidator(_) => String::from("Delete Validator"),
                     NumberAppTransaction::Invalid => String::from("Invalid"),
+                    NumberAppTransaction::ExcludeLeader(_) => String::from("Exclude Leader"),
+                    NumberAppTransaction::ReadmitLeader(_) => String::from("Readmit Leader"),
                 })
                 .collect();
             all.join(", ")
