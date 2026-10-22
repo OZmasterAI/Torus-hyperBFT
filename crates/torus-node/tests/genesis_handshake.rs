@@ -1,15 +1,16 @@
 //! Owner s138 (K question, option B): the real `torus-node` binary refuses a
 //! peer whose genesis digest differs from its own, at connect time.
 //!
-//! A 1-validator chain V runs from a genesis carrying
-//! `consensus.leader_miss_threshold = 3` (K; dead-leader phase 3 found that a
-//! K differing across nodes diverges state from height 1). Two `--rpc-only`
-//! nodes dial it:
+//! Genesis G: 2 validators (equal stakes, so both must vote for every block)
+//! and `consensus.leader_miss_threshold = 3` (K; dead-leader phase 3 found
+//! that a K differing across nodes diverges state from height 1).
 //!
-//! - R1's genesis is the same JSON, compact and with every object's keys in
-//!   reverse order: the same canonical digest, so it peers and syncs blocks;
-//! - R2's genesis differs only in K (5): both V and R2 log
-//!   `genesis digest <x> != ours <y>: refusing`, and R2 never executes a block.
+//! - V0 runs G pretty-printed; V1 runs G compact with every object's keys in
+//!   reverse order. Same canonical digest, so they peer and the chain
+//!   commits blocks (it cannot without both);
+//! - R1 (`--rpc-only`, G) connects to V0 and passes its identify check;
+//! - R2 (`--rpc-only`, G with K = 5) is refused by both ends, each logging
+//!   `genesis digest <x> != ours <y>: refusing`, and never executes a block.
 #![cfg(unix)]
 
 use std::net::UdpSocket;
@@ -21,15 +22,21 @@ use ed25519_dalek::SigningKey;
 use torus_genesis::GenesisDigest;
 
 const BOUND: Duration = Duration::from_secs(120);
-const VALIDATOR_KEY: &str = "0100000000000000000000000000000000000000000000000000000000000000";
 
-/// 1-validator genesis value from `devnet/genesis.json` with K = `k`.
+/// The devnet key of `devnet/genesis.json` validator `i` (0-based).
+fn validator_key(i: u8) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    key[0] = i + 1;
+    key
+}
+
+/// 2-validator genesis value from `devnet/genesis.json` with K = `k`.
 fn genesis_value(k: u64) -> serde_json::Value {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../devnet/genesis.json");
     let mut g: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&src).expect("read devnet genesis")).unwrap();
-    let first = g["validators"][0].clone();
-    g["validators"] = serde_json::Value::Array(vec![first]);
+    let two: Vec<serde_json::Value> = g["validators"].as_array().unwrap()[..2].to_vec();
+    g["validators"] = serde_json::Value::Array(two);
     g["consensus"]["leader_miss_threshold"] = k.into();
     g
 }
@@ -218,20 +225,28 @@ fn wait_until(nodes: &mut [&mut Node], what: &str, mut cond: impl FnMut(&[&mut N
     }
 }
 
+/// `local_peer_id=<id>` from the node's `p2p identity` line.
+fn local_peer_id(node: &Node) -> Option<String> {
+    let text = node.log_text();
+    let line = text.lines().find(|l| l.contains("p2p identity"))?;
+    let rest = &line[line.find("local_peer_id=")? + "local_peer_id=".len()..];
+    Some(rest.split_whitespace().next()?.to_string())
+}
+
 #[test]
 fn genesis_digest_is_canonical_and_a_k_difference_is_refused_at_connect() {
     let work = tempfile::tempdir().unwrap();
     let g3 = genesis_value(3);
     let g5 = genesis_value(5);
-    let v_text = serde_json::to_string_pretty(&g3).unwrap();
-    let r1_text = reversed_keys_json(&g3);
+    let v0_text = serde_json::to_string_pretty(&g3).unwrap();
+    let v1_text = reversed_keys_json(&g3);
     let r2_text = serde_json::to_string_pretty(&g5).unwrap();
-    assert_ne!(v_text, r1_text);
+    assert_ne!(v0_text, v1_text);
 
     // Unit level: the canonical digest P0.0 binds data dirs to.
-    let d3 = GenesisDigest::of_json(&v_text).unwrap();
+    let d3 = GenesisDigest::of_json(&v0_text).unwrap();
     assert_eq!(
-        GenesisDigest::of_json(&r1_text).unwrap(),
+        GenesisDigest::of_json(&v1_text).unwrap(),
         d3,
         "whitespace / key order must not change the digest"
     );
@@ -242,81 +257,98 @@ fn genesis_digest_is_canonical_and_a_k_difference_is_refused_at_connect() {
         vec!["consensus.leader_miss_threshold"]
     );
 
-    let v_genesis = write(work.path(), "genesis-v.json", &v_text);
-    let r1_genesis = write(work.path(), "genesis-r1.json", &r1_text);
+    let v0_genesis = write(work.path(), "genesis-v0.json", &v0_text);
+    let v1_genesis = write(work.path(), "genesis-v1.json", &v1_text);
     let r2_genesis = write(work.path(), "genesis-r2.json", &r2_text);
 
-    let mut key = [0u8; 32];
-    key[0] = 1;
-    let v_peer = torus_network::bridge::peer_id_from_verifying_key(
-        &SigningKey::from_bytes(&key).verifying_key(),
+    let v0_peer = torus_network::bridge::peer_id_from_verifying_key(
+        &SigningKey::from_bytes(&validator_key(0)).verifying_key(),
     );
-    let v_port = free_udp_port();
-    let mut v = Node::start(
-        work.path(),
-        "v",
-        &v_genesis,
-        v_port,
-        &[
-            "--validator-key".into(),
-            VALIDATOR_KEY.into(),
-            // No bootstrap peers (not the compiled testnet seeds).
-            "--p2p-peers=".into(),
-        ],
-    );
-    let v_addr = format!("/ip4/127.0.0.1/udp/{v_port}/quic-v1/p2p/{v_peer}");
+    let v0_port = free_udp_port();
+    let v0_addr = format!("/ip4/127.0.0.1/udp/{v0_port}/quic-v1/p2p/{v0_peer}");
+    let validator = |i: u8, peers: &str| {
+        vec![
+            "--validator-key".to_string(),
+            hex::encode(validator_key(i)),
+            // Explicit (possibly empty): never the compiled testnet seeds.
+            format!("--p2p-peers={peers}"),
+        ]
+    };
     let rpc = |peers: &str| vec!["--rpc-only".to_string(), format!("--p2p-peers={peers}")];
+
+    let mut v0 = Node::start(work.path(), "v0", &v0_genesis, v0_port, &validator(0, ""));
+    let mut v1 = Node::start(
+        work.path(),
+        "v1",
+        &v1_genesis,
+        free_udp_port(),
+        &validator(1, &v0_addr),
+    );
+
+    // The same genesis, reformatted: the two validators peer, so the chain
+    // (which needs both votes) commits and executes blocks on both.
+    wait_until(
+        &mut [&mut v0, &mut v1],
+        "the 2-validator chain executes blocks",
+        |n| {
+            n.iter()
+                .all(|n| n.executed_height().is_some_and(|h| h >= 3))
+        },
+    );
+
+    // An rpc-only node with the same genesis passes the identify check.
     let mut r1 = Node::start(
         work.path(),
         "r1",
-        &r1_genesis,
+        &v0_genesis,
         free_udp_port(),
-        &rpc(&v_addr),
+        &rpc(&v0_addr),
     );
+    wait_until(&mut [&mut v0, &mut v1, &mut r1], "v0 accepts r1", |n| {
+        local_peer_id(n[2]).is_some_and(|pid| {
+            n[0].log_text()
+                .lines()
+                .any(|l| l.contains("registered peer from identify exchange") && l.contains(&pid))
+        })
+    });
+
+    // K differs: both ends refuse, naming both digests.
     let mut r2 = Node::start(
         work.path(),
         "r2",
         &r2_genesis,
         free_udp_port(),
-        &rpc(&v_addr),
+        &rpc(&v0_addr),
     );
-
-    // The same genesis, reformatted: peers and syncs.
-    wait_until(
-        &mut [&mut v, &mut r1, &mut r2],
-        "r1 syncs blocks from v",
-        |n| n[1].executed_height().is_some_and(|h| h >= 2),
-    );
-
-    // K differs: both ends refuse, naming both digests.
     let x3 = format!("{:#x}", d3.digest);
     let x5 = format!("{:#x}", d5.digest);
-    let v_line = format!("genesis digest {x5} != ours {x3}: refusing");
+    let v0_line = format!("genesis digest {x5} != ours {x3}: refusing");
     let r2_line = format!("genesis digest {x3} != ours {x5}: refusing");
     wait_until(
-        &mut [&mut v, &mut r1, &mut r2],
+        &mut [&mut v0, &mut v1, &mut r1, &mut r2],
         "both ends refuse r2",
-        |n| n[0].log_text().contains(&v_line) && n[2].log_text().contains(&r2_line),
+        |n| n[0].log_text().contains(&v0_line) && n[3].log_text().contains(&r2_line),
     );
-    assert!(
-        !v.log_text()
-            .contains(&format!("genesis digest {x3} != ours {x3}")),
-        "r1 must not be refused:\n{}",
-        v.tail()
-    );
-    assert!(
-        r1.log_text()
+    // Every refusal involves r2's digest: no same-genesis peer was refused.
+    for (name, node) in [("v0", &v0), ("v1", &v1), ("r1", &r1)] {
+        let text = node.log_text();
+        let bad: Vec<&str> = text
             .lines()
-            .all(|l| !l.contains("genesis digest") || !l.contains("refusing")),
-        "r1 refused nothing:\n{}",
-        r1.tail()
-    );
+            .filter(|l| l.contains(": refusing") && !l.contains(&x5))
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "{name} refused a same-genesis peer: {bad:?}"
+        );
+    }
 
-    // R2 keeps getting nothing while R1 keeps syncing.
-    let h1 = r1.executed_height().unwrap();
-    wait_until(&mut [&mut v, &mut r1, &mut r2], "r1 keeps syncing", |n| {
-        n[1].executed_height().is_some_and(|h| h > h1 + 2)
-    });
+    // R2 gets nothing while the chain keeps going.
+    let h = v0.executed_height().unwrap();
+    wait_until(
+        &mut [&mut v0, &mut v1, &mut r1, &mut r2],
+        "the chain keeps executing",
+        |n| n[0].executed_height().is_some_and(|x| x > h + 3),
+    );
     assert_eq!(
         r2.executed_height(),
         None,
