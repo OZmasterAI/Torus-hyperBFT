@@ -43,6 +43,8 @@ mod account_margins_p1_tests;
 #[cfg(test)]
 mod mark_charge_tests;
 #[cfg(test)]
+mod fok_bound_tests;
+#[cfg(test)]
 mod cloid_tests;
 
 // perf/cloid-engine-cost fix 4.
@@ -650,6 +652,135 @@ mod shape_tests;
 #[cfg(test)]
 mod price_band_tests;
 
+/// s80 adversarial-worst-block (`TORUS_S80_FOK_BOUND`, node-local, OFF by
+/// default = the 29bfc705 pre-check). With it on, the FOK pre-check of
+/// [`OrderBook::place_order_with_accounts`]:
+///
+/// - (a) rejects at once a FOK whose quantity exceeds the other traders'
+///   resting quantity up to its limit ([`OrderBook::fok_depth_orders`]):
+///   the walk takes at most each such order's remaining quantity and skips
+///   the taker's own, so it could only return "not fillable";
+/// - (b) walks on copy-on-first-touch scratch maps (only the taker and the
+///   walked makers are copied in from the live maps,
+///   [`OrderBook::seed_fok_scratch`]) instead of cloning the whole
+///   [`AccountMargins`] and [`ReduceOnlyPositions`] per FOK — when the
+///   maps hold more than [`FOK_SCRATCH_RATIO`] entries per order (a)
+///   counted (a deep walk over small maps keeps the clone: seeding costs
+///   a lookup per visited order).
+///
+/// Results are byte-identical (the pre-check never touches live state; the
+/// walk and its checks are unchanged). A FOK that passes (a) but cannot
+/// fill (margin- or reduce-only-skipped makers, or its own margin) still
+/// walks its depth: only a consensus work budget bounds that.
+pub fn fok_bound_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = FOK_BOUND_OVERRIDE.with(|c| c.get()) {
+        return on;
+    }
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        let v = std::env::var("TORUS_S80_FOK_BOUND").ok();
+        let on = matches!(v.as_deref().map(str::trim), Some("1" | "true"));
+        tracing::info!("TORUS_S80_FOK_BOUND on={on}");
+        on
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static FOK_BOUND_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static FOK_RATIO_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static FOK_BOUND_STATS: std::cell::Cell<FokBoundStats> = const { std::cell::Cell::new(FokBoundStats::ZERO) };
+}
+
+/// s80 (tests): `TORUS_S80_FOK_BOUND` (and the scratch ratio) for this
+/// thread while held (and the stats reset).
+#[cfg(test)]
+pub(crate) struct FokBoundOverride(Option<bool>, Option<usize>);
+
+#[cfg(test)]
+impl FokBoundOverride {
+    pub(crate) fn set(on: bool) -> Self {
+        Self::set_ratio(on, None)
+    }
+
+    /// `ratio`: `Some(0)` = every flag-on walk on scratch maps; `None` =
+    /// [`FOK_SCRATCH_RATIO`].
+    pub(crate) fn set_ratio(on: bool, ratio: Option<usize>) -> Self {
+        let prev = FOK_BOUND_OVERRIDE.with(|c| c.replace(Some(on)));
+        let prev_ratio = FOK_RATIO_OVERRIDE.with(|c| c.replace(ratio));
+        FokBoundStats::take();
+        Self(prev, prev_ratio)
+    }
+}
+
+#[cfg(test)]
+impl Drop for FokBoundOverride {
+    fn drop(&mut self) {
+        FOK_BOUND_OVERRIDE.with(|c| c.set(self.0));
+        FOK_RATIO_OVERRIDE.with(|c| c.set(self.1));
+    }
+}
+
+/// s80 (`TORUS_S80_FOK_BOUND`, (b)): the flag-on pre-check walks on scratch
+/// maps when the installed maps hold more than this many entries per order
+/// the quantity bound counted (a lower bound on the orders the walk checks),
+/// else on the whole-map clone, as before. Measured on 29bfc705 (s80
+/// adversarial ubench): the clone costs ~2 ns per map entry, the scratch
+/// ~40 ns per checked order (its first-touch lookups): break-even ~20.
+/// A cost heuristic only: both give the same result.
+pub const FOK_SCRATCH_RATIO: usize = 16;
+
+fn fok_scratch_ratio() -> usize {
+    #[cfg(test)]
+    if let Some(r) = FOK_RATIO_OVERRIDE.with(|c| c.get()) {
+        return r;
+    }
+    FOK_SCRATCH_RATIO
+}
+
+/// s80 (tests): which flag-on pre-check paths ran on this thread.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FokBoundStats {
+    /// (a): rejected by the quantity bound, without a walk.
+    pub early_rejects: u64,
+    /// (b): walks on the scratch maps.
+    pub scratch_walks: u64,
+    /// Flag-on walks on the whole-map clone (maps small for the walk).
+    pub clone_walks: u64,
+    /// FOKs rejected after a walk (flag on).
+    pub walk_rejects: u64,
+    /// Largest scratch map after a walk.
+    pub scratch_entries_max: usize,
+}
+
+#[cfg(test)]
+impl FokBoundStats {
+    const ZERO: Self =
+        Self { early_rejects: 0, scratch_walks: 0, clone_walks: 0, walk_rejects: 0, scratch_entries_max: 0 };
+
+    pub(crate) fn take() -> Self {
+        FOK_BOUND_STATS.with(|c| c.replace(Self::ZERO))
+    }
+
+    pub(crate) fn add(&mut self, o: &Self) {
+        self.early_rejects += o.early_rejects;
+        self.scratch_walks += o.scratch_walks;
+        self.clone_walks += o.clone_walks;
+        self.walk_rejects += o.walk_rejects;
+        self.scratch_entries_max = self.scratch_entries_max.max(o.scratch_entries_max);
+    }
+
+    fn bump(f: impl FnOnce(&mut Self)) {
+        FOK_BOUND_STATS.with(|c| {
+            let mut s = c.get();
+            f(&mut s);
+            c.set(s);
+        });
+    }
+}
+
 /// F1 (s517): account-level margin state of ONE book for the current
 /// placement / batch — the running free margin (and position valuation
 /// price) of each trader whose fills the book must check. Installed by the
@@ -765,6 +896,19 @@ impl AccountMargins {
     /// lookup).
     fn taker(&self, trader: &Address) -> (Option<AccountMargin>, bool) {
         self.traders.get(trader).map_or((None, false), |e| (e.taker, e.taker_only))
+    }
+
+    /// s80 (`TORUS_S80_FOK_BOUND`): the FOK pre-check's scratch: this map's
+    /// settings and counter with no trader entries. The walk copies each
+    /// trader in before it reads it ([`OrderBook::seed_fok_scratch`]).
+    fn fok_scratch(&self) -> Self {
+        Self {
+            tiers: self.tiers.clone(),
+            traders: HashMap::default(),
+            mark: self.mark,
+            pre_batch: self.pre_batch,
+            charged_maker_fills: self.charged_maker_fills,
+        }
     }
 
     fn set_free(&mut self, trader: &Address, free: FixedPoint) {
@@ -1744,14 +1888,44 @@ impl OrderBook {
             _ => None,
         };
         if params.time_in_force == TimeInForce::FOK {
+            // s80 (`TORUS_S80_FOK_BOUND`, see [`fok_bound_enabled`]): (a) a
+            // FOK the other traders' depth cannot fill is rejected without
+            // a walk (the walk could only reject it).
+            let bound = fok_bound_enabled();
+            let mut scratch = false;
+            if bound {
+                let Some(counted) = self.fok_depth_orders(side, params.price, quantity, trader) else {
+                    #[cfg(test)]
+                    FokBoundStats::bump(|s| s.early_rejects += 1);
+                    return PlaceResult::rejected(order_id, FailureReason::FokCancel);
+                };
+                // (b) when the maps are large for the walk (cost only).
+                let ratio = fok_scratch_ratio();
+                let entries = self.account_margins.traders.len() + self.reduce_only_positions.positions.len();
+                scratch = makers.is_some() && (ratio == 0 || entries > ratio.saturating_mul(counted));
+            }
             let free = self.reduce_only_positions.get(&trader).map_or(FixedPoint::ZERO, |p| {
                 reduce_only_allowance(p, params.is_buy)
             });
             // F1 (s517 #4): the pre-check skips makers matching would
             // cancel — on CLONES, so it never mutates the book. s94 option
             // 1: an unchecked taker's charged fills are checked there too.
-            let mut acc_c = makers.map(|_| self.account_margins.clone());
-            let mut ro_c = makers.map(|_| self.reduce_only_positions.clone());
+            // s80 (b): with the flag and large maps, on scratch maps filled
+            // on first touch.
+            let mut acc_c = makers.map(|_| {
+                if scratch {
+                    self.account_margins.fok_scratch()
+                } else {
+                    self.account_margins.clone()
+                }
+            });
+            let mut ro_c = makers.map(|_| {
+                if scratch {
+                    ReduceOnlyPositions::default()
+                } else {
+                    self.reduce_only_positions.clone()
+                }
+            });
             let pre = match (makers, acc_c.as_mut(), ro_c.as_mut()) {
                 (Some(src), Some(acc), Some(ro)) => Some((src, acc, ro)),
                 _ => None,
@@ -1766,7 +1940,18 @@ impl OrderBook {
                 pre,
                 unchecked.map(|u| u.reserved),
                 taker_mark.map(|mk| (mk, match_margin.as_ref().and_then(|m| m.limit.tiers.clone()))),
+                scratch,
             );
+            #[cfg(test)]
+            if scratch {
+                let n = acc_c.as_ref().map_or(0, |a| a.traders.len()).max(ro_c.as_ref().map_or(0, |r| r.positions.len()));
+                FokBoundStats::bump(|s| {
+                    s.scratch_walks += 1;
+                    s.scratch_entries_max = s.scratch_entries_max.max(n);
+                });
+            } else if bound && makers.is_some() {
+                FokBoundStats::bump(|s| s.clone_walks += 1);
+            }
             let fits = match walk {
                 None => false,
                 // F1: a purely closing FOK always fits; otherwise the
@@ -1794,6 +1979,10 @@ impl OrderBook {
                 }),
             };
             if !fits {
+                #[cfg(test)]
+                if bound {
+                    FokBoundStats::bump(|s| s.walk_rejects += 1);
+                }
                 return PlaceResult::rejected(order_id, FailureReason::FokCancel);
             }
         }
@@ -3231,7 +3420,15 @@ impl OrderBook {
         mut makers: Option<(&dyn MakerAccountSource, &mut AccountMargins, &mut ReduceOnlyPositions)>,
         unchecked: Option<FixedPoint>,
         taker_mark: Option<(FixedPoint, Option<std::sync::Arc<[crate::margin::MarginTier]>>)>,
+        scratch: bool,
     ) -> Option<(Option<FixedPoint>, crate::margin::MarkLoss)> {
+        // s80 (b): `makers`' maps are scratch maps (`TORUS_S80_FOK_BOUND`):
+        // copy the taker in now, each maker before its first check.
+        if scratch {
+            if let Some((_, acc, ro)) = makers.as_mut() {
+                self.seed_fok_scratch(acc, ro, trader);
+            }
+        }
         let mut remaining = qty;
         let mut notional = Some(FixedPoint::ZERO);
         let mut loss = crate::margin::MarkLoss::NONE;
@@ -3259,6 +3456,9 @@ impl OrderBook {
                 // `maker_fill_fits`, on the caller's clones).
                 if let Some((src, acc, ro)) = makers.as_mut() {
                     if take > FixedPoint::ZERO {
+                        if scratch {
+                            self.seed_fok_scratch(acc, ro, order.trader);
+                        }
                         let is_buy = order.side == Side::Buy;
                         if !maker_fill_fits(
                             acc,
@@ -3326,6 +3526,63 @@ impl OrderBook {
             }
         }
         None
+    }
+
+    /// s80 (`TORUS_S80_FOK_BOUND`, (a)): does the other traders' resting
+    /// quantity on the levels a `side` taker limited at `price` crosses
+    /// (the levels [`Self::can_fill_completely`] walks) reach `qty`? It is
+    /// an upper bound on what that walk can fill — each order gives at most
+    /// its remaining quantity and the taker's own are skipped — so `None`
+    /// means the walk returns `None`. Stops at the first order that reaches
+    /// `qty`; an overflowing sum counts as reaching it (walk as before).
+    /// `Some(n)`: the other traders' orders it counted (the walk checks at
+    /// least as many, (b)'s cost estimate).
+    fn fok_depth_orders(&self, side: Side, price: FixedPoint, qty: FixedPoint, trader: Address) -> Option<usize> {
+        let reach = |levels: &mut dyn Iterator<Item = (&FixedPoint, &VecDeque<Order>)>| {
+            let mut sum = FixedPoint::ZERO;
+            let mut n = 0usize;
+            for (_, queue) in levels {
+                for order in queue {
+                    if order.trader == trader {
+                        continue;
+                    }
+                    n += 1;
+                    sum = match sum.checked_add(order.remaining_qty) {
+                        Ok(s) => s,
+                        Err(_) => return Some(n),
+                    };
+                    if sum >= qty {
+                        return Some(n);
+                    }
+                }
+            }
+            None
+        };
+        match side {
+            Side::Buy => reach(&mut self.asks.iter().take_while(|(&p, _)| p <= price)),
+            Side::Sell => reach(&mut self.bids.iter().rev().take_while(|(&p, _)| p >= price)),
+        }
+    }
+
+    /// s80 (`TORUS_S80_FOK_BOUND`, (b)): copy `t`'s live entries into the
+    /// pre-check's scratch maps unless the scratch holds them already. An
+    /// absent scratch entry was never written (every write of the walk to a
+    /// trader inserts it: [`maker_slot`]'s `entry` / `ro.insert`, or updates
+    /// a present one), so copying the live entry then gives exactly what the
+    /// whole-map clone holds; a trader absent from the live map stays absent.
+    /// Called before every read of `t` in the walk (the taker once, each
+    /// maker before its check), so the walk sees the clone's values.
+    fn seed_fok_scratch(&self, acc: &mut AccountMargins, ro: &mut ReduceOnlyPositions, t: Address) {
+        if !acc.traders.contains_key(&t) {
+            if let Some(e) = self.account_margins.traders.get(&t) {
+                acc.traders.insert(t, *e);
+            }
+        }
+        if !ro.positions.contains_key(&t) {
+            if let Some(&p) = self.reduce_only_positions.positions.get(&t) {
+                ro.positions.insert(t, p);
+            }
+        }
     }
 
     /// Evaluate pending stop orders against the last trade price.

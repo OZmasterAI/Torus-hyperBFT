@@ -6756,6 +6756,9 @@ impl<T: StateBackend> NativeExecContext<T> {
         book_mode: BookMode,
         resident: Option<&mut ResidentBooks>,
     ) -> Self {
+        // s80 adversarial-worst-block: read (and log) `TORUS_S80_FOK_BOUND`
+        // at the first block, not at the first FOK.
+        let _ = torus_core::order_book::fok_bound_enabled();
         let positions = PositionManager::new(state.clone());
         let oracle = OracleManager::new(state.clone(), OracleConfig::default());
         let staking = StakingManager::new(state.clone());
