@@ -391,6 +391,125 @@ fn a_drain_across_a_funding_settlement_leaves_the_escrow_exempt() {
     assert_eq!(total(&db), before, "zero-sum");
 }
 
+/// Codex P1 (s138, round 2, issue 94c05371): ADL settles ALL of the bankrupt
+/// account's funding (marked and unmarked positions) into cash before its
+/// bankruptcy prices and the D9 sweep, so no funding credit or debt survives
+/// ADL. u: long 1 @ 100 in market 1 (mark 1: trade loss 99) and an UNMARKED
+/// position of 1 @ 100 in market 2 with 50 of pending funding: a credit
+/// (short, cash 10: equity −39) or a debt (long, cash 100: equity −49). The
+/// step moves the marked long to the escrow; u keeps the unmarked position,
+/// its funding settled (nothing pending), and 0 cash. Closing that position
+/// at its entry afterwards leaves u at 0: nothing to withdraw, nothing owed.
+/// RED before the fix: the unmarked funding was left out of the bankruptcy
+/// price and stayed pending, so the credit case ended with 50 withdrawable
+/// (the counterparties over-socialized) and the debt case with −50.
+#[test]
+fn adl_settles_all_of_the_accounts_funding_before_bankruptcy_pricing() {
+    for credit in [true, false] {
+        let (_d, db) = setup(2, 0, 0);
+        let mut ctx = ctx_at(db.clone(), 2, 1_000, FUND);
+        let (u, c1, c2) = (addr(1), addr(2), addr(3));
+        for (who, amount) in [(u, if credit { 10 } else { 100 }), (c1, 1_000), (c2, 1_000)] {
+            ctx.positions
+                .put_native_balance(&who, &NativeBalance { available: fp(amount), order_margin: FixedPoint::ZERO })
+                .unwrap();
+        }
+        let mut row = FundingRow::new(1_000, &FundingParams::default());
+        for m in [1, 2] {
+            funding::write_row(&ctx.state, m, &row).unwrap();
+        }
+        ctx.positions.set_funding(Some(Arc::new([(1u64, 0i128), (2, 0)].into_iter().collect())));
+        // Market 1 (marked): u long, c1 short. Market 2 (unmarked): u short
+        // (receives 50) or long (pays 50), c2 opposite.
+        ctx.positions.apply_fill(&u, 1, true, fp(1), fp(100), MarginType::Cross).unwrap();
+        ctx.positions.apply_fill(&c1, 1, false, fp(1), fp(100), MarginType::Cross).unwrap();
+        ctx.positions.apply_fill(&u, 2, !credit, fp(1), fp(100), MarginType::Cross).unwrap();
+        ctx.positions.apply_fill(&c2, 2, credit, fp(1), fp(100), MarginType::Cross).unwrap();
+        row.cum_index = 50 * E18;
+        funding::write_row(&ctx.state, 2, &row).unwrap();
+        let table = Arc::new([(1u64, 0i128), (2, 50 * E18)].into_iter().collect());
+        ctx.positions.set_funding(Some(Arc::clone(&table)));
+        set_mark(&ctx.state, 1, fp(1), 1_000);
+        let equity = |s: &StateDb| {
+            let pm = PositionManager::new(s.clone());
+            let marks = |m| (m == 1).then_some(fp(1));
+            let index = |m| Ok(Some(if m == 2 { 50 * E18 } else { 0 }));
+            let (bal, ps) = (pm.get_native_balance(&u).unwrap(), pm.positions_for_trader(&u).unwrap());
+            AccountView::build_funded(&bal, &ps, marks, index, |_| None).unwrap().equity()
+        };
+        let label = if credit { "credit" } else { "debt" };
+        assert_eq!(equity(&db), if credit { fp(-39) } else { fp(-49) }, "{label}: bankrupt before ADL");
+        NativeExecutor::run_liquidations(&mut ctx);
+        assert!(ctx.fatal_error.is_none(), "{label}: {:?}", ctx.fatal_error);
+        assert!(position(&db, &u, 1).is_none(), "{label}: the marked long moved to the escrow");
+        let kept = position(&db, &u, 2).expect("the unmarked position stays (H2)");
+        assert_eq!(kept.funding_owed(Some(50 * E18)), FixedPoint::ZERO, "{label}: its funding was settled");
+        assert_eq!(cash(&db, &u), FixedPoint::ZERO, "{label}: no cash survives ADL");
+        assert_eq!(equity(&db), FixedPoint::ZERO, "{label}: no credit or debt survives ADL");
+        // Restore market 2 at entry: closing at 100 realizes no trade PnL.
+        ctx.positions.apply_fill(&u, 2, credit, fp(1), fp(100), MarginType::Cross).unwrap();
+        ctx.positions.apply_fill(&c2, 2, !credit, fp(1), fp(100), MarginType::Cross).unwrap();
+        assert_eq!(cash(&db, &u), FixedPoint::ZERO, "{label}: nothing withdrawable, nothing owed");
+    }
+}
+
+/// Codex P1 (s138, round 2, issue b877c32d): an escrow's funding share
+/// charged to the vault at an ordinary drain close (not a pairing) changes
+/// the vault's account value, so the drain's ranking cache must drop it.
+/// Two markets, symmetric OI, marks 100; market 1's escrow long 10 accrued 60
+/// (index 6), the vault holds short 1 in each market (cash 100, +6 pending in
+/// market 1: AV 106). Market 1's row closes the escrow against user a1 (the
+/// vault ranked, not chosen), charging the vault 60: AV 46. Market 2's row
+/// ranks the vault (46) against user a2 (70) and must close the vault, the
+/// same as a fresh ranking in a later block (the split run: one row per
+/// block). RED before the fix: the vault's stale 106 closed a2 instead.
+#[test]
+fn an_escrow_funding_charge_drops_the_vaults_cached_ranking_value() {
+    use torus_core::liquidation::{put_obligation, Obligation, ADL_ESCROW_LONG as E, LIQUIDATOR_VAULT as V};
+    let run = |split: bool| {
+        let (_d, db) = setup(2, 0, 0);
+        let mut ctx = ctx_at(db.clone(), 2, 1_000, FUND);
+        ctx.positions.set_funding(Some(Arc::new([(1u64, 0i128), (2, 0)].into_iter().collect())));
+        for (who, bal) in [(addr(1), 100), (addr(2), 70), (addr(3), 1_000), (V, 100)] {
+            ctx.positions
+                .put_native_balance(&who, &NativeBalance { available: fp(bal), order_margin: FixedPoint::ZERO })
+                .unwrap();
+        }
+        for (who, m, long, q) in [
+            (E, 1, true, 10),
+            (addr(3), 1, true, 1),
+            (addr(1), 1, false, 10),
+            (V, 1, false, 1),
+            (E, 2, true, 1),
+            (addr(3), 2, true, 1),
+            (addr(2), 2, false, 1),
+            (V, 2, false, 1),
+        ] {
+            ctx.positions.apply_fill(&who, m, long, fp(q), fp(100), MarginType::Cross).unwrap();
+        }
+        for m in [1u64, 2] {
+            set_mark(&ctx.state, m, fp(100), 1_000);
+            let mut row = FundingRow::new(1_000, &FundingParams::default());
+            row.cum_index = if m == 1 { 6 * E18 } else { 0 };
+            funding::write_row(&ctx.state, m, &row).unwrap();
+            let size = fp(if m == 1 { 10 } else { 1 });
+            put_obligation(&ctx.state, &Obligation { height: 1, market: m, is_long: true, trader: addr(9), size, price: fp(100) })
+                .unwrap();
+        }
+        ctx.positions.set_funding(Some(Arc::new([(1u64, 6 * E18), (2, 0)].into_iter().collect())));
+        NativeExecutor::run_liquidations_with(&mut ctx, 0, 0, if split { 1 } else { 100_000 });
+        assert!(ctx.fatal_error.is_none(), "split {split}: {:?}", ctx.fatal_error);
+        if split {
+            NativeExecutor::run_liquidations_with(&mut ctx, 0, 0, 100_000);
+            assert!(ctx.fatal_error.is_none(), "split {split}: {:?}", ctx.fatal_error);
+        }
+        (cash(&db, &V), position(&db, &V, 2).is_some(), position(&db, &addr(2), 2).is_some())
+    };
+    let fresh = run(true);
+    assert_eq!(fresh, (fp(40), false, true), "a fresh ranking closes the vault (AV 46 < 70)");
+    assert_eq!(run(false), fresh, "one drain ranks market 2 as a fresh ranking does");
+}
+
 // ---- Determinism / activation / restart ----
 
 /// One block: its timestamp, each market's mark, its two batches.
