@@ -37,7 +37,9 @@ state (and the running state hash) is byte-identical to today. Pinned by
 - **Maker rebate allowed but off by default.** The maker rate may be negative (a
   rebate) down to -1000 ppm; at read time it is clamped to `>= -taker`, so every fill
   nets `taker_fee + maker_fee >= 0` and the treasury never pays out more than it took on
-  that fill. Recommendation: keep maker >= 0 for testnet (HL pays rebates only above a
+  that fill. A fee waiver (below) keeps this: the rebate part of a taker fee is never
+  waived ([claude-review] P3-1), so a fill's net to the treasury stays `>= 0` even when
+  its taker is a flat account in deficit. Recommendation: keep maker >= 0 for testnet (HL pays rebates only above a
   maker-share threshold, which we do not model).
 
 ## Where and how fees are charged
@@ -73,18 +75,36 @@ state (and the running state hash) is byte-identical to today. Pinned by
 The fee is charged anyway. `available` may go below zero, exactly as a realized loss
 already can; account health (and liquidation / the vault backstop) handles it while
 the trader holds a position. **A trader left flat** (no position) with negative
-collateral (`available + order_margin`) is never visited by a liquidation scan, so
-it is reconciled at once (Codex s138 #2): it pays at most what it held, the unpaid
-part of its fees (`min(-collateral, fee)`) is waived (not debited, not in its
-`cfee` row, not credited to the treasury: the treasury never keeps a credit nobody
-paid), and a deficit still left (a realized loss) moves to the liquidator vault
-through D9 `settle_flat_deficit`, as every flat deficit does. Batch path: once per
-`execute_batch` call after the position flush, over the call's traders whose cached
-balance is negative (only those cost a position read), ascending; single path: per
-order after its fills. Chosen over capping each closing fill's fee at
-`available + pnl`: that makes the fee depend on the balance at the fill, which C3
-pass A plans without, and a capped fee still leaves the realized-loss deficit on a
-flat account. The `userFills` row shows the fee as charged on the fill. No fee
+collateral (`available + order_margin`) is never visited by a liquidation scan. Owner
+s138 ("fees only", [claude-review] P2): only the **unpaid fee** is waived; a loss-only
+debt keeps main's behaviour (stays on the account, negative, repaid by the next
+deposit; nothing moves to the liquidator vault, no D9 here).
+
+How a flat trader's shortfall splits (exact i128, per trader, over the fills it
+settled in the batch call / the single-path order):
+
+- `c` = collateral after its fills (realized PnL and fees); `F` = its net fee;
+  `W` = the treasury's share of `F` (below). If `c < 0`, `F > 0` and `W > 0`:
+  `waived = min(-c, F, W)`, else nothing. The waived amount goes back to `available`
+  and is not in its `cfee` row nor credited to the treasury (the treasury never keeps a
+  credit nobody paid).
+- **Loss first**: the cash pays the realized loss (and any older debt) first, then the
+  fees; the shortfall is waived up to the fee. Examples (taker 450 ppm): cash 50, loss
+  70, fee 0 -> balance -20 stays; cash 50, loss 50, fee 0.4275 -> fee waived, balance
+  0; cash 50.10, loss 50, fee 0.4275 -> 0.10 paid, 0.3275 waived, balance 0; cash 0.10,
+  loss 100, fee 0.405 -> fee waived, balance -99.90 stays.
+- **The treasury's share `W`** (P3-1): per fill side, a maker fee `>= 0` in full, a
+  maker rebate 0, a taker fee minus the rebate its maker was credited on that fill.
+  The rebate stays credited to the maker (not clawed back) and the taker owes it like
+  a loss (taker 450 / maker -300 ppm, cash 0.10, no PnL: 0.15 waived, balance -0.20).
+  Per fill the two shares sum to the fill's net, so no waiver makes the treasury pay
+  out. Without rebates `W = F` and the rule is `min(-c, F)`.
+
+Batch path: once per `execute_batch` call after the position flush, over the call's
+traders whose cached balance is negative (only those cost a position read),
+ascending; single path: per order after its applied fill sides. Chosen over capping
+each closing fill's fee at `available + pnl`: that makes the fee depend on the balance
+at the fill, which C3 pass A plans without. The `userFills` row shows the fee as charged on the fill. No fee
 is reserved at placement in v1 (the A5 telescoping reservation stays as is) and the F1
 match-time margin check does not include the fee: at <= 1 % of notional against an IM
 of >= 2 % this is a small overshoot. Owner option: add the taker fee to the placement
@@ -110,7 +130,10 @@ reservation later (Phase 2 change, all three settle paths unaffected).
   with the bit on) and handed to pass A and the streamed jobs.
 - Single-action path (`place_order_inner`: triggered stops, stage-1 liquidations,
   `NativeExecutor::execute`): same per-side fee, written directly, treasury credited
-  after the order's fills.
+  after the order's fills. A side's fee counts once its fill applied (position and
+  `cum_volume`); if a later fill fails (a local fault, fail-stop), the sides already
+  applied are still charged before the order returns ([claude-review] P3-2), as the
+  batch path's settle keeps the fees of its applied sides.
 - **CoreWriter / EVM orders** enter the native batch as `PlaceOrder` actions: same
   fees, no special case.
 

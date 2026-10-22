@@ -655,12 +655,15 @@ fn a_full_rebate_waives_nothing() {
 
 // ---- [claude-review] P3-2: a fill failing after earlier fills applied ----
 
+/// The armed `(cf, key)` row of [`FailOneWrite`].
+type ArmedRow = std::sync::Arc<std::sync::Mutex<Option<(&'static str, Vec<u8>)>>>;
+
 /// A backend whose writes of one armed `(cf, key)` row fail (a local
 /// fault); everything else delegates.
 #[derive(Clone)]
 struct FailOneWrite {
     inner: StateDb,
-    armed: std::sync::Arc<std::sync::Mutex<Option<(&'static str, Vec<u8>)>>>,
+    armed: ArmedRow,
 }
 
 impl FailOneWrite {

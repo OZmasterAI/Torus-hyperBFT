@@ -232,16 +232,18 @@ struct BalanceUndo {
 
 /// One trader's per-call fill totals: traded notional (`cum_volume`) and,
 /// with the `trading_fees` feature, the fees its sides paid (the `cfee` row
-/// and the treasury credit). A fill side counts for both or for neither.
+/// and the treasury credit) and the treasury's share of them (`waivable`,
+/// [`fill_side_totals`]). A fill side counts for all or for none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FillTotals {
     volume: FixedPoint,
     fee: FixedPoint,
+    waivable: FixedPoint,
 }
 
 impl Default for FillTotals {
     fn default() -> Self {
-        Self { volume: FixedPoint::ZERO, fee: FixedPoint::ZERO }
+        Self { volume: FixedPoint::ZERO, fee: FixedPoint::ZERO, waivable: FixedPoint::ZERO }
     }
 }
 
@@ -249,6 +251,7 @@ impl std::ops::AddAssign for FillTotals {
     fn add_assign(&mut self, rhs: Self) {
         self.volume += rhs.volume;
         self.fee += rhs.fee;
+        self.waivable += rhs.waivable;
     }
 }
 
@@ -266,19 +269,47 @@ fn side_fees(fees: Option<TradingFeeRates>, notional: FixedPoint) -> (FixedPoint
     }
 }
 
+/// Trading fees: the `(taker, maker)` totals of one fill of `notional`.
+/// `waivable` is the part of a side's fee that is the treasury's to waive
+/// ([claude-review] P3-1): a maker fee >= 0 in full, a rebate nothing, and
+/// a taker fee less the rebate its maker was credited on that fill (the
+/// rebate is passed through to the maker, never the treasury's). Per fill
+/// the two `waivable`s sum to the fill's net to the treasury (>= 0, the
+/// [`TradingFeeRates::new`] clamp), so no waiver makes the treasury pay out.
+fn fill_side_totals(
+    fees: Option<TradingFeeRates>,
+    notional: FixedPoint,
+) -> (FillTotals, FillTotals) {
+    let (taker_fee, maker_fee) = side_fees(fees, notional);
+    let rebate = std::cmp::min(maker_fee, FixedPoint::ZERO);
+    (
+        FillTotals { volume: notional, fee: taker_fee, waivable: taker_fee + rebate },
+        FillTotals { volume: notional, fee: maker_fee, waivable: maker_fee - rebate },
+    )
+}
+
 /// Trading fees: `available + order_margin` (`None` on i128 overflow).
 fn collateral_of(b: &NativeBalance) -> Option<FixedPoint> {
     b.available.checked_add(b.order_margin).ok()
 }
 
-/// Trading fees (Codex s138 #2): the part of a flat trader's net `fee` it
-/// could not pay, given its `collateral` after the fee: `min(-collateral,
-/// fee)` when the collateral is negative and the fee positive, else zero.
-fn unpaid_fee(collateral: FixedPoint, fee: FixedPoint) -> FixedPoint {
-    if collateral >= FixedPoint::ZERO || fee <= FixedPoint::ZERO {
+/// Trading fees (Codex s138 #2, owner s138 "fees only"): the part of a flat
+/// trader's fees it could not pay and that is waived, given its
+/// `collateral` after its fills (realized PnL and fees): the cash pays any
+/// loss (or older debt) first, then the fees, so the shortfall
+/// `-collateral` is waived up to the trader's net fee and up to the
+/// treasury's share of it (`waivable`, [`fill_side_totals`]):
+/// `min(-collateral, fee, waivable)`, zero when the collateral is not
+/// negative or the fee not positive. A debt left after it (a realized
+/// loss, or a rebate pass-through) stays on the account, as on main.
+fn unpaid_fee(collateral: FixedPoint, totals: &FillTotals) -> FixedPoint {
+    if collateral >= FixedPoint::ZERO
+        || totals.fee <= FixedPoint::ZERO
+        || totals.waivable <= FixedPoint::ZERO
+    {
         return FixedPoint::ZERO;
     }
-    std::cmp::min(FixedPoint::ZERO - collateral, fee)
+    std::cmp::min(FixedPoint::ZERO - collateral, std::cmp::min(totals.fee, totals.waivable))
 }
 
 /// Adds the first `sides` fill sides of `fills` (in order: fill 0 taker, fill
@@ -291,12 +322,10 @@ fn add_fill_volumes(
     fees: Option<TradingFeeRates>,
 ) {
     for (k, fill) in fills.iter().enumerate().take(sides.div_ceil(2)) {
-        let notional = fill.price * fill.quantity;
-        let (taker_fee, maker_fee) = side_fees(fees, notional);
-        *volumes.entry(fill.taker).or_default() += FillTotals { volume: notional, fee: taker_fee };
+        let (taker, maker) = fill_side_totals(fees, fill.price * fill.quantity);
+        *volumes.entry(fill.taker).or_default() += taker;
         if 2 * k + 1 < sides {
-            *volumes.entry(fill.maker).or_default() +=
-                FillTotals { volume: notional, fee: maker_fee };
+            *volumes.entry(fill.maker).or_default() += maker;
         }
     }
 }
@@ -10004,16 +10033,13 @@ impl NativeExecutor {
         if let Err(e) = pos_flushed {
             ctx.fatal_error = Some(format!("position cache flush failed: {e}"));
         }
-        // Trading fees (Codex s138 #2): a trader the call left FLAT with
-        // negative collateral pays at most what it held: the unpaid part of
-        // its fees is waived (never credited), and any deficit left (a
-        // realized loss) moves to the vault after the flush below, as every
-        // flat deficit does (D9). Feature off: nothing (no read, no write).
-        let flat_deficits = if ctx.trade_fees.is_some() {
-            Self::waive_unpaid_fees(ctx, &mut bal_cache, &mut vol_cache)
-        } else {
-            Vec::new()
-        };
+        // Trading fees (Codex s138 #2, owner s138 "fees only"): a trader the
+        // call left FLAT with negative collateral has the unpaid part of its
+        // fees waived (never credited); a loss-only debt stays on the
+        // account, as on main. Feature off: nothing (no read, no write).
+        if ctx.trade_fees.is_some() {
+            Self::waive_unpaid_fees(ctx, &mut bal_cache, &mut vol_cache);
+        }
         // Trading fees: the treasury takes the exact sum of every fee the
         // call's fill sides paid (rebates subtracted; exact i128 sum, so the
         // order is irrelevant), through the balance cache before its flush.
@@ -10046,16 +10072,6 @@ impl NativeExecutor {
                 if let Err(e) = ctx.positions.add_cum_fee(&trader, add.fee) {
                     ctx.fatal_error = Some(format!("cum_fee flush failed: {e}"));
                 }
-            }
-        }
-        // D9 for the flat accounts still in deficit (sorted; written straight
-        // to the overlay after the flush, as the liquidation step does).
-        for trader in flat_deficits {
-            let vault = torus_core::liquidation::LIQUIDATOR_VAULT;
-            if let Err(e) =
-                torus_core::liquidation::settle_flat_deficit(&ctx.positions, &trader, &vault)
-            {
-                Self::latch_core_fault(ctx, "trading fee flat deficit", &e);
             }
         }
         ctx.phase_accum.cache_flush_ns += cache_flush_timer.elapsed().as_nanos();
@@ -11139,8 +11155,9 @@ impl NativeExecutor {
                 }
                 for fill in &result.fills {
                     let taker_is_buy = fill.maker_side != Side::Buy;
-                    let notional = fill.price * fill.quantity;
-                    let (taker_fee, maker_fee) = side_fees(ctx.trade_fees, notional);
+                    let (taker_totals, maker_totals) =
+                        fill_side_totals(ctx.trade_fees, fill.price * fill.quantity);
+                    let (taker_fee, maker_fee) = (taker_totals.fee, maker_totals.fee);
                     let taker = match Self::apply_fill_via_caches(
                         &ctx.positions,
                         ctx.typed_rows(),
@@ -11166,8 +11183,7 @@ impl NativeExecutor {
                             break;
                         }
                     };
-                    *vol_cache.entry(fill.taker).or_default() +=
-                        FillTotals { volume: notional, fee: taker_fee };
+                    *vol_cache.entry(fill.taker).or_default() += taker_totals;
                     let maker = match Self::apply_fill_via_caches(
                         &ctx.positions,
                         ctx.typed_rows(),
@@ -11191,8 +11207,7 @@ impl NativeExecutor {
                             break;
                         }
                     };
-                    *vol_cache.entry(fill.maker).or_default() +=
-                        FillTotals { volume: notional, fee: maker_fee };
+                    *vol_cache.entry(fill.maker).or_default() += maker_totals;
                     if record_fills {
                         ctx.fill_effects_scratch.push([taker, maker]);
                     }
@@ -12356,20 +12371,22 @@ impl NativeExecutor {
             .collect()
     }
 
-    /// Trading fees (Codex s138 #2), batch path, after the position flush:
-    /// for each trader of the call (`vol_cache`) whose cached balance has
-    /// negative collateral (`available + order_margin`) and who holds no
-    /// position, the unpaid part of its net fees, `min(-collateral, fee)`, is
-    /// given back (balance) and taken off its `fee` total (so the `cfee` row
-    /// and the treasury credit count only what was paid). Returns, sorted,
-    /// the flat traders still in deficit (a realized loss), for D9 after the
-    /// balance flush. A trader with a position is left to the liquidation
-    /// step, which values it. Only negative accounts cost a position read.
+    /// Trading fees (Codex s138 #2, owner s138 "fees only"), batch path,
+    /// after the position flush: for each trader of the call (`vol_cache`)
+    /// whose cached balance has negative collateral (`available +
+    /// order_margin`) and who holds no position, the unpaid part of its fees
+    /// ([`unpaid_fee`]: loss first, fee waived up to the shortfall and up to
+    /// the treasury's share) is given back (balance) and taken off its `fee`
+    /// total (so the `cfee` row and the treasury credit count only what was
+    /// paid). A debt left (a realized loss) stays on the flat account, as on
+    /// main (repaid by its next deposit; nothing moves to the vault). A
+    /// trader with a position is left to the liquidation step, which values
+    /// it. Only negative accounts cost a position read.
     fn waive_unpaid_fees<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         bal_cache: &mut BalanceCache,
         vol_cache: &mut VolumeCache,
-    ) -> Vec<Address> {
+    ) {
         let mut negative: Vec<Address> = vol_cache
             .keys()
             .filter(|t| {
@@ -12381,7 +12398,6 @@ impl NativeExecutor {
             .copied()
             .collect();
         negative.sort_unstable();
-        let mut deficits = Vec::new();
         for trader in negative {
             match ctx.positions.positions_for_trader(&trader) {
                 Ok(p) if !p.is_empty() => continue,
@@ -12394,53 +12410,44 @@ impl NativeExecutor {
             let Some(mut bal) = bal_cache.peek(&trader).cloned() else { continue };
             let Some(c) = collateral_of(&bal) else { continue };
             let totals = vol_cache.entry(trader).or_default();
-            let unpaid = unpaid_fee(c, totals.fee);
+            let unpaid = unpaid_fee(c, totals);
             if unpaid != FixedPoint::ZERO {
                 bal.available += unpaid;
                 bal_cache.set(&trader, bal);
                 totals.fee -= unpaid;
             }
-            if c + unpaid < FixedPoint::ZERO {
-                deficits.push(trader);
-            }
         }
-        deficits
     }
 
     /// Trading fees on the single-action path (no write-back caches), after
-    /// the order's fills: per trader (ascending), debit its summed fee from
-    /// `available`; a trader left FLAT with negative collateral pays at most
-    /// what it held (the unpaid part is waived, as on the batch path,
-    /// [`Self::waive_unpaid_fees`]) and a deficit still left moves to the
-    /// vault (D9). The paid part goes to the trader's `cfee` row and, summed,
-    /// to the treasury in one write. All straight to the backend.
+    /// the order's applied fill sides (all of them, or those before a fill
+    /// that failed): per trader (ascending), debit its summed fee from
+    /// `available`; a trader left FLAT with negative collateral has the
+    /// unpaid part waived, as on the batch path ([`Self::waive_unpaid_fees`],
+    /// [`unpaid_fee`]); a loss-only debt stays. The paid part goes to the
+    /// trader's `cfee` row and, summed, to the treasury in one write. All
+    /// straight to the backend.
     fn charge_order_fees<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
-        fees: std::collections::BTreeMap<Address, FixedPoint>,
+        fees: std::collections::BTreeMap<Address, FillTotals>,
     ) -> Result<(), CoreError> {
         let positions = &ctx.positions;
         let mut total = FixedPoint::ZERO;
-        for (trader, fee) in fees {
+        for (trader, totals) in fees {
             let mut bal = positions.get_native_balance(&trader)?;
-            bal.available -= fee;
-            let mut paid = fee;
-            let mut deficit = false;
+            bal.available -= totals.fee;
+            let mut paid = totals.fee;
             if let Some(c) = collateral_of(&bal).filter(|c| *c < FixedPoint::ZERO) {
                 if positions.positions_for_trader(&trader)?.is_empty() {
-                    let unpaid = unpaid_fee(c, fee);
+                    let unpaid = unpaid_fee(c, &totals);
                     bal.available += unpaid;
                     paid -= unpaid;
-                    deficit = c + unpaid < FixedPoint::ZERO;
                 }
             }
             if paid != FixedPoint::ZERO {
                 positions.put_native_balance(&trader, &bal)?;
                 positions.add_cum_fee(&trader, paid)?;
                 total += paid;
-            }
-            if deficit {
-                let vault = torus_core::liquidation::LIQUIDATOR_VAULT;
-                torus_core::liquidation::settle_flat_deficit(positions, &trader, &vault)?;
             }
         }
         if total != FixedPoint::ZERO {
@@ -12450,6 +12457,20 @@ impl NativeExecutor {
             positions.put_native_balance(&treasury, &t)?;
         }
         Ok(())
+    }
+
+    /// [`Self::charge_order_fees`] for a non-empty `fees` (feature on and a
+    /// side applied); a failure latches (R02).
+    fn charge_applied_order_fees<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        fees: std::collections::BTreeMap<Address, FillTotals>,
+    ) {
+        if fees.is_empty() {
+            return;
+        }
+        if let Err(e) = Self::charge_order_fees(ctx, fees) {
+            Self::latch_core_fault(ctx, "place order trading fees", &e);
+        }
     }
 
     /// Add `amount` to `trader`'s stored lifetime volume (`cum_volume`).
@@ -13920,18 +13941,17 @@ impl NativeExecutor {
         } else {
             Self::resolve_trade_fees(ctx)
         };
-        // Each fill side's fee, summed per trader, charged once after the
-        // fills (`charge_order_fees`): every side is listed with the feature
-        // on (a zero fee too: its flat check), none with it off.
-        let mut order_fees: std::collections::BTreeMap<Address, FixedPoint> = Default::default();
+        // Each APPLIED fill side's fee, summed per trader, charged once after
+        // the fills (`charge_order_fees`), also when a later fill fails
+        // ([claude-review] P3-2: the sides that applied pay, as per-side
+        // charging did): every applied side is listed with the feature on (a
+        // zero fee too: its flat check), none with it off.
+        let mut order_fees: std::collections::BTreeMap<Address, FillTotals> = Default::default();
         for fill in &result.fills {
             let taker_is_buy = fill.maker_side != Side::Buy;
             let notional = fill.price * fill.quantity;
-            let (taker_fee, maker_fee) = side_fees(fees, notional);
-            if fees.is_some() {
-                *order_fees.entry(fill.taker).or_insert(FixedPoint::ZERO) += taker_fee;
-                *order_fees.entry(fill.maker).or_insert(FixedPoint::ZERO) += maker_fee;
-            }
+            let (taker_totals, maker_totals) = fill_side_totals(fees, notional);
+            let (taker_fee, maker_fee) = (taker_totals.fee, maker_totals.fee);
             let taker = match ctx
                 .positions
                 .apply_fill(
@@ -13952,6 +13972,7 @@ impl NativeExecutor {
                     // R02: a local fault fail-stops (the book has matched;
                     // the result is kept meanwhile).
                     Self::latch_core_fault(ctx, "place order taker fill", &e);
+                    Self::charge_applied_order_fees(ctx, order_fees);
                     // Funnel (perf A1): died on fill application, not on the book.
                     if let Some(ref m) = ctx.metrics {
                         m.orders_rejected_other.inc();
@@ -13963,6 +13984,9 @@ impl NativeExecutor {
                     );
                 }
             };
+            if fees.is_some() {
+                *order_fees.entry(fill.taker).or_default() += taker_totals;
+            }
             let maker = match ctx
                 .positions
                 .apply_fill(
@@ -13981,6 +14005,7 @@ impl NativeExecutor {
                 Ok(effect) => effect,
                 Err(e) => {
                     Self::latch_core_fault(ctx, "place order maker fill", &e);
+                    Self::charge_applied_order_fees(ctx, order_fees);
                     // Funnel (perf A1): died on fill application, not on the book.
                     if let Some(ref m) = ctx.metrics {
                         m.orders_rejected_other.inc();
@@ -13992,15 +14017,14 @@ impl NativeExecutor {
                     );
                 }
             };
+            if fees.is_some() {
+                *order_fees.entry(fill.maker).or_default() += maker_totals;
+            }
             if record_fills {
                 ctx.fill_effects_scratch.push([taker, maker]);
             }
         }
-        if !order_fees.is_empty() {
-            if let Err(e) = Self::charge_order_fees(ctx, order_fees) {
-                Self::latch_core_fault(ctx, "place order trading fees", &e);
-            }
-        }
+        Self::charge_applied_order_fees(ctx, order_fees);
 
         // Persist trades to CF_NATIVE_TRADES and CF_NATIVE_USER_TRADES.
         // These CFs are NOT in the state root, so writes cannot affect consensus.
