@@ -565,6 +565,12 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
   WAN, the push-manifest threshold, the 250 ms header re-send check, L4.1-L4.4 from `docs/perf/8k-explore-ideas.md`
   and the T3.1 follow-ups. Also decided at the trial net: which node runs `--archive` (owner s134). The genesis
   questions it needs answered first are in `plans/testnet-genesis-checklist.md`.
+- **Known livelock: replacing the whole validator set at once (s136, pre-existing).** `crates/hotstuff_rs/tests/
+  multiple_validator_set_updates_test.rs:28` is `#[ignore]`d: "step-4 disjoint-set replacement livelocks: new set
+  cannot bootstrap quorum (known limitation, fix deferred)". A testnet won't swap to a fully disjoint set, so it does
+  not block the testnet, but dead-leader skip and jailing make validator-set updates frequent. **Status s136: OPEN, not
+  started.** First step: confirm partial changes (one member added / removed, power changes, exclusion-only updates)
+  never hit it, then decide on a fix before mainnet.
 - **Deep-book capacity re-check before the testnet (s136).** The 1M-account RAM check (bench 8f, perf doc section 93,
   s68) PASSED: 8.1-9.2 GB per node under load (limit ~15 GB), restarts 2-11 s (limit 60 s). Its open finding is
   throughput with ~1-1.7M resting orders: matched/s -14.3%, native blocks/s 13.3 -> 3.0, p50 15 -> 240 ms, book save

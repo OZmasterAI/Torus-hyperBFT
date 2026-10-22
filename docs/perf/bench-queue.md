@@ -1091,7 +1091,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
 9k. **[HOLD, owner s136: queued, NOT ready; do not start until the owner says go] One-validator-down baseline on
    main (before TC-required and dead-leader skip land).** The "before" numbers for 9o (TC phase D) and 9p
    (dead-leader phase 4). Prepared by archy s136 (kill knob `cee86e4b` / `87e91dfd`, procstat fix `6f228433`, digest
-   wait `9ea22dbd` + counter validation). Main WITHOUT the TC set (or TC off if it has landed; say which), feed off,
+   wait `9ea22dbd` + counter validation). The pre-TC main commit `896240d4` (owner s136: the TC set lands first; build this commit for 9k so it stays a clean "before" for 9o / 9p), feed off,
    `VALIDATOR_STAKES=2,2,1`, `KILL_NO_RESTART=val2` (the stake-1 node), `KILL_NO_RESTART_AT_S=120`, `BENCH_RPCS=0,1`,
    600 s cells, plus the all-up arm; standard + deep shapes, per shape U K K U K U U K (U = all up, K = kill). Check
    every restart path passes `--genesis` (P0.0 refuses a genesis-bound dir without it) and that hash-off arms set
