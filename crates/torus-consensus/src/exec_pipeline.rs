@@ -861,9 +861,15 @@ impl FlushWorker {
         });
         let shared_w = shared.clone();
         let gate = env.gate.clone();
+        // s80 exec join: the worker's follows() checks see the spawning
+        // thread's join settings (the node default, or a test's scope).
+        let join = torus_state::exec_join::settings();
         let handle = std::thread::Builder::new()
             .name("torus-flush-worker".into())
-            .spawn(move || worker_loop(rx, env, shared_w))
+            .spawn(move || {
+                let _join = torus_state::exec_join::scope(join);
+                worker_loop(rx, env, shared_w)
+            })
             .expect("spawn flush worker thread");
         Self {
             tx: Some(tx),

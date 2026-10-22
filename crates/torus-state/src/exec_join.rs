@@ -15,17 +15,36 @@
 //!
 //! With `K = 1` (the default) every helper here is exactly the per-block
 //! rule it replaces (`prev + 1 == height`, `target == height`).
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+//!
+//! Settings (review fix 4): the process default is read ONCE from the env
+//! (`TORUS_S80_EXEC_JOIN`, `TORUS_S80_EXEC_JOIN_LIQ`) and never written
+//! afterwards. A [`Scope`] overrides it for the CURRENT thread only (tests,
+//! and the node's own exec / flush-worker / replay threads, which install the
+//! value their `ExecutionContext` captured), so a test running units can never
+//! change what another test's threads see.
+use std::cell::Cell;
 use std::sync::OnceLock;
 
-/// The unit size in force (1 = off). Set once from the env by
-/// [`init_from_env`] (node start) or directly by tests ([`set_k`]).
-static K: AtomicU64 = AtomicU64::new(1);
+/// The join settings: unit size `k` (1 = off) and the liquidation cadence
+/// (`liq_per_unit`: one pass per unit instead of one per member block).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Settings {
+    pub k: u64,
+    pub liq_per_unit: bool,
+}
 
-/// `TORUS_S80_EXEC_JOIN_LIQ=unit`: ONE liquidation pass per unit (the scan
-/// cadence drops to one pass per `K` blocks). Default (false): one pass per
-/// member block, so the per-block scan / act / ADL budgets are kept.
-static LIQ_PER_UNIT: AtomicBool = AtomicBool::new(false);
+impl Settings {
+    /// Join off: the exact per-block rule.
+    pub const OFF: Settings = Settings {
+        k: 1,
+        liq_per_unit: false,
+    };
+}
+
+thread_local! {
+    /// This thread's override of the process default (see [`Scope`]).
+    static OVERRIDE: Cell<Option<Settings>> = const { Cell::new(None) };
+}
 
 /// Largest accepted `K` (a prototype bound; larger values are clamped).
 pub const MAX_K: u64 = 8;
@@ -43,49 +62,87 @@ pub fn parse(v: Option<&str>) -> u64 {
     }
 }
 
-/// Read `TORUS_S80_EXEC_JOIN` once per process, apply it and log one INFO
-/// line (`TORUS_S80_EXEC_JOIN on=<bool> k=<K>`). Later calls return the
-/// first value and do not touch [`K`] again.
-pub fn init_from_env() -> u64 {
-    static ONCE: OnceLock<u64> = OnceLock::new();
-    *ONCE.get_or_init(|| {
+/// The process default: read from the env ONCE (first call), logging one
+/// INFO line (`TORUS_S80_EXEC_JOIN on=<bool> k=<K> liq=<member|unit>`).
+fn process_default() -> Settings {
+    static DEFAULT: OnceLock<Settings> = OnceLock::new();
+    *DEFAULT.get_or_init(|| {
         let k = parse(std::env::var("TORUS_S80_EXEC_JOIN").ok().as_deref());
-        K.store(k, Ordering::SeqCst);
-        let liq_unit = std::env::var("TORUS_S80_EXEC_JOIN_LIQ").is_ok_and(|v| v.trim() == "unit");
-        LIQ_PER_UNIT.store(liq_unit, Ordering::SeqCst);
+        let liq_per_unit =
+            std::env::var("TORUS_S80_EXEC_JOIN_LIQ").is_ok_and(|v| v.trim() == "unit");
         tracing::info!(
             on = k > 1,
             k,
-            liq_per_unit = liq_unit,
+            liq_per_unit,
             "TORUS_S80_EXEC_JOIN on={} k={} liq={}",
             k > 1,
             k,
-            if liq_unit { "unit" } else { "member" }
+            if liq_per_unit { "unit" } else { "member" }
         );
-        k
+        Settings { k, liq_per_unit }
     })
 }
 
-/// The unit size in force (1 = off).
+/// Read the env default (once per process; logs the INFO line) and return
+/// its unit size. Idempotent.
+pub fn init_from_env() -> u64 {
+    process_default().k
+}
+
+/// The settings in force on this thread: its [`Scope`] override, else the
+/// process default.
+pub fn settings() -> Settings {
+    OVERRIDE.with(|o| o.get()).unwrap_or_else(process_default)
+}
+
+/// The unit size in force on this thread (1 = off).
 pub fn k() -> u64 {
-    K.load(Ordering::Relaxed).max(1)
+    settings().k.max(1)
 }
 
-/// Set the unit size (tests; `0` and `1` = off).
-pub fn set_k(k: u64) {
-    K.store(k.clamp(1, MAX_K), Ordering::SeqCst);
+/// The liquidation cadence in force on this thread (`true` = one pass per unit).
+pub fn liq_per_unit() -> bool {
+    settings().liq_per_unit
 }
 
-/// Set the liquidation cadence (tests / µbench): `true` = one pass per unit.
-pub fn set_liq_per_unit(on: bool) {
-    LIQ_PER_UNIT.store(on, Ordering::SeqCst);
+/// A thread-local override of the join settings; dropping it restores the
+/// previous value (panic-safe).
+#[must_use = "the override lasts as long as the guard"]
+pub struct Scope {
+    prev: Option<Settings>,
+}
+
+/// Override the settings on THIS thread until the guard drops (`k` is
+/// clamped to `1..=MAX_K`).
+pub fn scope(s: Settings) -> Scope {
+    let s = Settings {
+        k: s.k.clamp(1, MAX_K),
+        liq_per_unit: s.liq_per_unit,
+    };
+    Scope {
+        prev: OVERRIDE.with(|o| o.replace(Some(s))),
+    }
+}
+
+/// [`scope`] with unit size `k` and the default (per-member) liquidation cadence.
+pub fn scope_k(k: u64) -> Scope {
+    scope(Settings {
+        k,
+        liq_per_unit: false,
+    })
+}
+
+impl Drop for Scope {
+    fn drop(&mut self) {
+        OVERRIDE.with(|o| o.set(self.prev));
+    }
 }
 
 /// Liquidation passes for an execution at `height` whose unit starts at
 /// `first` (`0` = a single block): one per member block (the per-block scan
 /// cadence), or one per unit with `TORUS_S80_EXEC_JOIN_LIQ=unit`.
 pub fn liq_passes(first: u64, height: u64) -> u64 {
-    liq_passes_with(first, height, LIQ_PER_UNIT.load(Ordering::Relaxed))
+    liq_passes_with(first, height, liq_per_unit())
 }
 
 /// [`liq_passes`] for an explicit cadence.
@@ -140,6 +197,38 @@ pub fn reaches_k(height: u64, target: u64, k: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review fix 4: a scope overrides THIS thread only and restores on drop
+    /// (also on a panic); other threads keep the process default (1 in tests:
+    /// the env var is unset).
+    #[test]
+    fn scope_is_thread_local_and_restores() {
+        assert_eq!(k(), 1);
+        {
+            let _g = scope_k(3);
+            assert_eq!(k(), 3);
+            assert!(!liq_per_unit());
+            std::thread::spawn(|| assert_eq!(k(), 1, "another thread is unaffected"))
+                .join()
+                .unwrap();
+            {
+                let _inner = scope(Settings { k: 99, liq_per_unit: true });
+                assert_eq!(k(), MAX_K);
+                assert!(liq_per_unit());
+                assert_eq!(liq_passes(5, 6), 1);
+            }
+            assert_eq!(k(), 3, "the inner scope restored the outer one");
+            assert_eq!(liq_passes(5, 6), 2);
+        }
+        assert_eq!(k(), 1);
+        let r = std::panic::catch_unwind(|| {
+            let _g = scope_k(2);
+            panic!("boom");
+        });
+        assert!(r.is_err());
+        assert_eq!(k(), 1, "a panic inside the scope restores the default");
+        assert_eq!(settings(), Settings::OFF);
+    }
 
     #[test]
     fn parse_is_off_unless_two_or_more() {
