@@ -19,7 +19,9 @@ use crate::behaviour::TorusBehaviour;
 use crate::config::NetworkConfig;
 use crate::peer::PeerMap;
 use crate::pending_send::PendingSendQueue;
-use crate::swarm::{run_swarm_with_config, NetworkCommand, PushScheduler, SharedState};
+use crate::swarm::{
+    run_swarm_with_config, BlockDataInflight, NetworkCommand, PushScheduler, SharedState,
+};
 use crate::tx_gossip::{NativeGossipHandle, TxGossipHandle};
 
 /// Derive a libp2p PeerId from a validator's ed25519 VerifyingKey.
@@ -234,6 +236,7 @@ impl LibP2PNetwork {
             native_da_shards_inbound: Mutex::new(VecDeque::new()),
             pending_native_pushes: Mutex::new(PendingSendQueue::new(8)),
             push_scheduler: Mutex::new(PushScheduler::for_pushes()),
+            block_data_inflight: Mutex::new(BlockDataInflight::for_block_data()),
             recently_deposed: RwLock::new(HashMap::new()),
             redial_backoff: Mutex::new(HashMap::new()),
             allow_private_addrs: config.allow_private_addrs,
@@ -842,6 +845,7 @@ mod tests {
             native_da_shards_inbound: Mutex::new(VecDeque::new()),
             pending_native_pushes: Mutex::new(PendingSendQueue::new(8)),
             push_scheduler: Mutex::new(PushScheduler::for_pushes()),
+            block_data_inflight: Mutex::new(BlockDataInflight::for_block_data()),
             recently_deposed: RwLock::new(HashMap::new()),
             redial_backoff: Mutex::new(HashMap::new()),
             allow_private_addrs: false,
