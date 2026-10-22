@@ -329,7 +329,7 @@ fn a_stale_mark_keeps_pending_funding_in_the_withdrawal_check() {
         if fresh {
             set_mark(&ctx.state, 1, fp(100), 1_000);
         }
-        let w = NativeAction::Withdraw { amount: wei(800), to: addr(50) };
+        let w = NativeAction::Withdraw { amount: alloy_primitives::U256::from(fp(800).raw() as u128), to: addr(50) }; // raw units
         let r = NativeExecutor::execute(&mut ctx, &t, &w);
         assert!(!r.success, "fresh {fresh}: withdrew 800 against 200 of equity");
         let why = r.error.clone().unwrap_or_default();
