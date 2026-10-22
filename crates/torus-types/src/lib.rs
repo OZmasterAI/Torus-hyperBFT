@@ -797,6 +797,13 @@ pub const DEFAULT_CORE_WRITER_ORDER_DELAY: u64 = 10;
 /// Item 7 step 2 (owner decision 4): most CoreWriter rows one block drains; a row whose target is
 /// full queues for the next block with room (`CoreWriterQueue::enqueue`).
 pub const CORE_WRITER_DRAIN_CAP: u64 = 200;
+/// Item 7 T (`Feature::SameBlockCoreWriter`): with the feature on, each target block holds two seq
+/// ranges in the same key layout (target 8 BE ‖ seq 8 BE), each capped at
+/// [`CORE_WRITER_DRAIN_CAP`]: seqs `0 .. CORE_WRITER_ORDER_SEQ_BASE` for the same-block (non-order)
+/// kinds, `CORE_WRITER_ORDER_SEQ_BASE .. CORE_WRITER_ORDER_SEQ_BASE + CORE_WRITER_DRAIN_CAP` for
+/// the order kinds. A target drains in key order, the same-block range first, so at most
+/// `2 * CORE_WRITER_DRAIN_CAP` rows per block. Feature off: one range from 0, as before.
+pub const CORE_WRITER_ORDER_SEQ_BASE: u64 = CORE_WRITER_DRAIN_CAP;
 
 /// s94 option 2 (HL "Order price too far from oracle"): the governance key
 /// (`CF_FEE_CONFIG`, a decimal string, `ParameterChange`) of the chain-wide

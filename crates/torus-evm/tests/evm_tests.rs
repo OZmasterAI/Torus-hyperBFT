@@ -2439,3 +2439,68 @@ fn block_runs_at_the_spec_of_its_feature_bits() {
         assert_eq!(one, included, "execute_tx, bits {bits:#x}");
     }
 }
+
+/// Item 7 T (`Feature::SameBlockCoreWriter`): the EVM provider queues by the
+/// executed block's header bits (`BlockEnvCfg::features`). A lockbox deposit
+/// in block 5 targets block 5 with the bit (drained after 5's native
+/// batches) and block 6 without (h + 1, unchanged); a CoreWriter cancel (an
+/// order kind) keeps h + K either way, in the order range under T.
+#[test]
+fn same_block_core_writer_bit_retargets_non_order_rows_to_the_queuing_block() {
+    let t = torus_types::Feature::SameBlockCoreWriter.bit();
+    let core_writer = Address::new([
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x10,
+    ]);
+    for (features, target) in [(0u128, 6u64), (t, 5)] {
+        let (_dir, db) = open_test_db();
+        db.put_account(&ALICE, &test_account(tokens_wei(10))).unwrap();
+        let executor = EvmExecutor::new(TORUS_CHAIN_ID);
+        let cfg = BlockEnvCfg {
+            features,
+            ..zero_fee_block_cfg(5)
+        };
+        let result = executor
+            .execute_block(
+                &db,
+                &cfg,
+                vec![
+                    call_tx(ALICE, LOCKBOX, deposit_calldata(tokens_wei(2)), tokens_wei(2), 0),
+                    call_tx(ALICE, core_writer, cancel_order_calldata(7), U256::ZERO, 1),
+                ],
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            result.receipts.iter().map(|r| r.status).collect::<Vec<_>>(),
+            vec![true, true],
+            "features {features:#x}"
+        );
+        let (_root, batch) = torus_state::incremental::evm_block_batch_incremental(
+            &db,
+            &result.bundle,
+            None,
+            Some(&result.native_writes),
+        )
+        .unwrap();
+        db.write(batch).unwrap();
+        let deposits = queued_for(&db, target);
+        assert_eq!(deposits.len(), 1, "features {features:#x}: deposit at {target}");
+        assert!(matches!(
+            deposits[0].kind,
+            QueuedActionKind::LockboxDeposit { .. }
+        ));
+        let other = if features == 0 { 5 } else { 6 };
+        assert!(queued_for(&db, other).is_empty(), "features {features:#x}: nothing at {other}");
+        // K = 10 (default): the cancel waits for 15; under T in seq 200.
+        let rows = torus_state::StateBackend::iterate_cf(
+            &db,
+            torus_state::cf::CF_CORE_WRITER_QUEUE,
+            Some(&15u64.to_be_bytes()),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        let seq = u64::from_be_bytes(rows[0].0[8..16].try_into().unwrap());
+        let want = if features == 0 { 0 } else { torus_types::CORE_WRITER_ORDER_SEQ_BASE };
+        assert_eq!(seq, want, "features {features:#x}: order seq");
+    }
+}

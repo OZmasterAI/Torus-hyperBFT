@@ -454,6 +454,7 @@ pub fn execute_precompile(
         state_db,
         current_block,
         current_timestamp,
+        0,
         false,
         &mut ReadMeter::unlimited(),
     )
@@ -484,6 +485,7 @@ pub fn execute_precompile_with_value(
         state_db,
         current_block,
         current_timestamp,
+        0,
         false,
         &mut ReadMeter::unlimited(),
     )
@@ -513,6 +515,7 @@ pub fn execute_precompile_read_only(
         state_db,
         current_block,
         current_timestamp,
+        0,
         true,
         &mut ReadMeter::unlimited(),
     )
@@ -543,9 +546,50 @@ pub fn execute_precompile_metered(
         state_db,
         current_block,
         current_timestamp,
+        0,
         read_only,
         meter,
     )
+}
+
+/// [`execute_precompile_metered`] for a block whose header carries the P0.0
+/// feature bits `features`: the EVM provider's entry. Item 7 T: with
+/// [`torus_types::Feature::SameBlockCoreWriter`] in `features`, the writers
+/// queue non-order kinds for `current_block` itself
+/// ([`CoreWriterQueue::enqueue_with`]). Every other entry runs with no bits
+/// (the rules before T).
+#[allow(clippy::too_many_arguments)]
+pub fn execute_precompile_metered_at(
+    address: &Address,
+    input: &[u8],
+    caller: &Address,
+    call_value: U256,
+    state_db: &impl StateBackend,
+    current_block: u64,
+    current_timestamp: u64,
+    features: u128,
+    read_only: bool,
+    meter: &mut ReadMeter,
+) -> Result<Vec<u8>, CoreError> {
+    execute_precompile_inner(
+        address,
+        input,
+        caller,
+        call_value,
+        state_db,
+        current_block,
+        current_timestamp,
+        features,
+        read_only,
+        meter,
+    )
+}
+
+/// Item 7 T: whether a block with the P0.0 header bits `features` queues
+/// non-order CoreWriter kinds for itself
+/// ([`torus_types::Feature::SameBlockCoreWriter`]).
+pub const fn same_block_core_writer(features: u128) -> bool {
+    features & torus_types::Feature::SameBlockCoreWriter.bit() != 0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -557,9 +601,11 @@ fn execute_precompile_inner(
     state_db: &impl StateBackend,
     current_block: u64,
     current_timestamp: u64,
+    features: u128,
     read_only: bool,
     meter: &mut ReadMeter,
 ) -> Result<Vec<u8>, CoreError> {
+    let same_block = same_block_core_writer(features);
     let bytes = address.as_slice();
     if !bytes[..18].iter().all(|&b| b == 0) {
         return Err(CoreError::InvalidPrecompileInput(
@@ -598,9 +644,13 @@ fn execute_precompile_inner(
         ADDR_ORACLE_READER => read(oracle_reader(input, state_db, current_timestamp, meter), meter),
         ADDR_STAKING_READER => read(staking_reader(input, state_db, meter), meter),
         ADDR_BBO_READER => read(bbo_reader(input, state_db), meter),
-        ADDR_CORE_WRITER => core_writer(input, caller, state_db, current_block),
-        ADDR_CORE_WRITER_STAKING => core_writer_staking(input, caller, state_db, current_block),
-        ADDR_LOCKBOX => lockbox_precompile(input, caller, call_value, state_db, current_block),
+        ADDR_CORE_WRITER => core_writer(input, caller, state_db, current_block, same_block),
+        ADDR_CORE_WRITER_STAKING => {
+            core_writer_staking(input, caller, state_db, current_block, same_block)
+        }
+        ADDR_LOCKBOX => {
+            lockbox_precompile(input, caller, call_value, state_db, current_block, same_block)
+        }
         _ => Err(CoreError::InvalidPrecompileInput(format!(
             "unknown precompile 0x{id:04x}"
         ))),
@@ -1049,6 +1099,7 @@ fn core_writer(
     caller: &Address,
     state_db: &impl StateBackend,
     current_block: u64,
+    same_block: bool,
 ) -> Result<Vec<u8>, CoreError> {
     let sel = abi::selector(input)?;
 
@@ -1111,7 +1162,7 @@ fn core_writer(
             block_queued: current_block,
         };
 
-        CoreWriterQueue::enqueue(state_db, &action)?;
+        CoreWriterQueue::enqueue_with(state_db, &action, same_block)?;
         // HL-parity: no order id. The executor assigns the real one from the
         // global counter when the queue drains (K blocks later), so it cannot be known
         // here (the old `(block + 1) << 64 | seq` never matched it).
@@ -1124,7 +1175,7 @@ fn core_writer(
             kind: QueuedActionKind::CancelOrder { order_id },
             block_queued: current_block,
         };
-        CoreWriterQueue::enqueue(state_db, &action)?;
+        CoreWriterQueue::enqueue_with(state_db, &action, same_block)?;
         Ok(abi::encode_bool(true).to_vec())
     } else if sel == selector_for("cancelByCloid(bytes32,uint128)") {
         // s114: cancel the caller's open order (resting or a pending stop)
@@ -1136,7 +1187,7 @@ fn core_writer(
             kind: QueuedActionKind::CancelByCloid { market_id, cloid },
             block_queued: current_block,
         };
-        CoreWriterQueue::enqueue(state_db, &action)?;
+        CoreWriterQueue::enqueue_with(state_db, &action, same_block)?;
         Ok(abi::encode_bool(true).to_vec())
     } else if sel == selector_for("cancelAll(bytes32)") {
         let market_id = abi::decode_market_id(&abi::word(input, 0)?);
@@ -1146,7 +1197,7 @@ fn core_writer(
             kind: QueuedActionKind::CancelAll { market_id },
             block_queued: current_block,
         };
-        CoreWriterQueue::enqueue(state_db, &action)?;
+        CoreWriterQueue::enqueue_with(state_db, &action, same_block)?;
         // Return 0 (actual count determined at execution time)
         Ok(abi::encode_u32(0).to_vec())
     } else {
@@ -1163,6 +1214,7 @@ fn core_writer_staking(
     caller: &Address,
     state_db: &impl StateBackend,
     current_block: u64,
+    same_block: bool,
 ) -> Result<Vec<u8>, CoreError> {
     let sel = abi::selector(input)?;
 
@@ -1184,7 +1236,7 @@ fn core_writer_staking(
             },
             block_queued: current_block,
         };
-        CoreWriterQueue::enqueue(state_db, &action)?;
+        CoreWriterQueue::enqueue_with(state_db, &action, same_block)?;
         Ok(abi::encode_bool(true).to_vec())
     } else if sel == selector_for("undelegate(address,uint128)") {
         let validator = abi::decode_address(&abi::word(input, 0)?);
@@ -1204,7 +1256,7 @@ fn core_writer_staking(
             },
             block_queued: current_block,
         };
-        CoreWriterQueue::enqueue(state_db, &action)?;
+        CoreWriterQueue::enqueue_with(state_db, &action, same_block)?;
         Ok(abi::encode_bool(true).to_vec())
     } else if sel == selector_for("claimRewards()") {
         let action = QueuedAction {
@@ -1212,7 +1264,7 @@ fn core_writer_staking(
             kind: QueuedActionKind::ClaimRewards,
             block_queued: current_block,
         };
-        CoreWriterQueue::enqueue(state_db, &action)?;
+        CoreWriterQueue::enqueue_with(state_db, &action, same_block)?;
         // Actual amount determined at execution time
         Ok(abi::encode_u128(0).to_vec())
     } else if sel == selector_for("claimUnbonded()") {
@@ -1222,7 +1274,7 @@ fn core_writer_staking(
             kind: QueuedActionKind::ClaimUnbonded,
             block_queued: current_block,
         };
-        CoreWriterQueue::enqueue(state_db, &action)?;
+        CoreWriterQueue::enqueue_with(state_db, &action, same_block)?;
         // Actual amount determined at execution time
         Ok(abi::encode_u128(0).to_vec())
     } else if sel == selector_for("lockPermanent(uint128)") {
@@ -1241,7 +1293,7 @@ fn core_writer_staking(
             },
             block_queued: current_block,
         };
-        CoreWriterQueue::enqueue(state_db, &action)?;
+        CoreWriterQueue::enqueue_with(state_db, &action, same_block)?;
         Ok(abi::encode_bool(true).to_vec())
     } else {
         Err(CoreError::UnknownSelector(sel))
@@ -1279,6 +1331,7 @@ fn lockbox_precompile(
     call_value: U256,
     state_db: &impl StateBackend,
     current_block: u64,
+    same_block: bool,
 ) -> Result<Vec<u8>, CoreError> {
     let sel = abi::selector(input)?;
 
@@ -1324,13 +1377,14 @@ fn lockbox_precompile(
         return Err(CoreError::UnknownSelector(sel));
     };
 
-    CoreWriterQueue::enqueue(
+    CoreWriterQueue::enqueue_with(
         state_db,
         &QueuedAction {
             trader: *caller,
             kind,
             block_queued: current_block,
         },
+        same_block,
     )?;
     Ok(abi::encode_bool(true).to_vec())
 }
@@ -1516,6 +1570,20 @@ impl CoreWriterQueue {
             )?;
         }
         Ok(seq)
+    }
+
+    /// [`Self::enqueue`] under the rules of a block with or without item 7 T
+    /// (`same_block` = [`torus_types::Feature::SameBlockCoreWriter`] in the
+    /// queuing block's header, [`same_block_core_writer`]). `false` is
+    /// exactly [`Self::enqueue`].
+    pub fn enqueue_with(
+        state_db: &impl StateBackend,
+        action: &QueuedAction,
+        same_block: bool,
+    ) -> Result<u64, CoreError> {
+        // RED stub: the T rules are not built yet.
+        let _ = same_block;
+        Self::enqueue(state_db, action)
     }
 
     /// Drain all rows queued for the given block_number, in key (sequence)
