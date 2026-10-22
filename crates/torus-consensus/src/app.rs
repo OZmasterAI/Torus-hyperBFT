@@ -45228,7 +45228,7 @@ mod crash_recovery_tests {
         f()
     }
 
-    /// 8k L2.1 (`TORUS_SETTLE_STREAMED`, node-local, off by default): fused
+    /// 8k L2.1 (`TORUS_SETTLE_STREAMED`, node-local, on by default since s136): fused
     /// match + plan jobs, pass B streamed in market order on the exec thread.
     /// Over the 130 P2 blocks (reduce-only places and cloids; fills, closes
     /// and flips in three markets, cancels, liquidations, epoch boundaries),
@@ -45242,7 +45242,8 @@ mod crash_recovery_tests {
             parse_settle_streamed, settle_streamed_calls_on_this_thread, with_settle_no_merge,
             with_settle_streamed, BookMode,
         };
-        assert!(!parse_settle_streamed(None), "off by default");
+        assert!(parse_settle_streamed(None), "on by default (s136)");
+        assert!(!parse_settle_streamed(Some("0")), "explicit 0 = off");
         let (blocks, _, cloid_places) = p2_blocks_with(true, true);
         assert!(!cloid_places.is_empty(), "the stream places cloids");
         let run = |no_merge: bool, on: bool| {

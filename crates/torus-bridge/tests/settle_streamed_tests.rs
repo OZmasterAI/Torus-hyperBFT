@@ -895,14 +895,15 @@ fn last_block_position_key(clean: &RunOut, pick: impl Fn(&[&Write]) -> usize) ->
     rows[pick(&rows)].1.clone()
 }
 
-/// Off by default; `1` / `true` (trimmed, any case) turn it on.
+/// On by default (s136); `0` / `false` (trimmed, any case) turn it off;
+/// empty and anything else take the default (on).
 #[test]
 fn settle_streamed_flag_parse() {
-    assert!(!parse_settle_streamed(None));
-    for v in ["1", " 1", "true", "TRUE", " True "] {
+    assert!(parse_settle_streamed(None), "on by default");
+    for v in ["", "1", " 1", "true", "TRUE", " True ", "2", "on", "yes"] {
         assert!(parse_settle_streamed(Some(v)), "{v:?}");
     }
-    for v in ["", "0", "false", "2", "on", "yes"] {
+    for v in ["0", " 0 ", "false", "FALSE", " False "] {
         assert!(!parse_settle_streamed(Some(v)), "{v:?}");
     }
 }

@@ -1166,6 +1166,17 @@ mod settle_streamed_flag_tests {
             SettleStreamProbe::default()
         );
     }
+
+    /// s136 owner decision: a default node (env unset, no pin) streams; an
+    /// explicit `0` still turns it off.
+    #[test]
+    fn default_node_streams_explicit_zero_turns_it_off() {
+        assert!(parse_settle_streamed(None), "unset = on");
+        assert!(!parse_settle_streamed(Some("0")), "explicit 0 = off");
+        if std::env::var_os("TORUS_SETTLE_STREAMED").is_none() {
+            assert!(settle_streamed_enabled(), "a default node streams");
+        }
+    }
 }
 
 thread_local! {
