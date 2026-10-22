@@ -469,8 +469,13 @@ fn window_split_view(from: u64) -> u64 {
 
 /// A window fixture at `init_view` (update committed, undecided, update view `update_view`).
 fn window_fixture(init_view: u64, update_view: u64) -> Fixture {
+    window_fixture_as(false, init_view, update_view)
+}
+
+/// [`window_fixture`] with the update decided (`decided`) or not.
+fn window_fixture_as(decided: bool, init_view: u64, update_view: u64) -> Fixture {
     let (old, new) = window_sets();
-    let vss = ValidatorSetState::new(new, old, Some(crate::types::data_types::BlockHeight::new(0)), false)
+    let vss = ValidatorSetState::new(new, old, Some(crate::types::data_types::BlockHeight::new(0)), decided)
         .with_update_view(Some(ViewNumber::new(update_view)));
     let mut tree = BlockTreeSingleton::new(MemKV::default());
     tree.initialize(&crate::types::update_sets::AppStateUpdates::new(), &vss).unwrap();
@@ -522,6 +527,48 @@ fn window_timeout_blames_the_views_fresh_proposer() {
         (late, early, &new, &old),
     ] {
         let mut f = window_fixture(view, update_view);
+        for i in 0..3 {
+            f.timeout_vote(i, view);
+        }
+        assert_eq!(f.highest_tc_view(), Some(view), "fixture: TC({view}) forms");
+        let reputation = f.tree.leader_reputation().unwrap();
+        let blamed = select_leader(ViewNumber::new(view), blamed);
+        let spared = select_leader(ViewNumber::new(view), spared);
+        assert!(reputation.score_bps(&blamed) < 10_000, "view {view}: its fresh proposer is blamed");
+        assert_eq!(reputation.score_bps(&spared), 10_000, "view {view}: the other set's leader is not");
+    }
+}
+
+/// s136 ([claude-review] P3): a replica that has applied the update's Decide PC still collects a
+/// timeout vote reporting a tip the previous set's leader signed at the update view (the honest
+/// tip of every replica that has not voted for a fresh block since), and the TC it forms is
+/// correct. On c300a015 the decided replica dropped such votes.
+#[test]
+fn window_decided_replica_collects_a_pre_update_tip() {
+    let (old, _) = window_sets();
+    let u = window_split_view(1);
+    let v = u + 1;
+    for decided in [false, true] {
+        let mut f = window_fixture_as(decided, v, u);
+        let tip = f.tip_signed_by(9, u, &select_leader(ViewNumber::new(u), &old));
+        for i in 0..3 {
+            f.timeout_vote_with_tip(i, v, Some(tip.clone()));
+        }
+        let tc = f.tree.highest_tc().unwrap().unwrap_or_else(|| panic!("decided={decided}: TC({v}) forms"));
+        assert!(tc.high_tip.as_ref() == Some(&tip), "decided={decided}: TC({v}) names the pre-update tip");
+        assert!(tc.is_correct(&f.tree).unwrap(), "decided={decided}: and is correct");
+    }
+}
+
+/// s136: the timeout of a view up to the update view blames the previous set's leader whether or
+/// not the update is decided; after it, the committed set's.
+#[test]
+fn window_decided_timeout_blames_the_views_fresh_proposer() {
+    let (old, new) = window_sets();
+    let early = window_split_view(1);
+    let late = window_split_view(early + 1);
+    for (view, blamed, spared) in [(early, &old, &new), (late, &new, &old)] {
+        let mut f = window_fixture_as(true, view, early);
         for i in 0..3 {
             f.timeout_vote(i, view);
         }

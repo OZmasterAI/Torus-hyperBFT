@@ -161,13 +161,23 @@ fn tip_by(block: &Block, view: u64, leader: &VerifyingKey) -> TipInfo {
 /// TC(`view`) as the collector forms it from timeout votes of the old set's validators 1..3,
 /// signer `i` reporting `tips[i]`.
 fn collected_tc(view: u64, tips: &[Option<TipInfo>]) -> TimeoutCertificate {
-    let set = old_set();
-    let mut collector = TimeoutVoteCollector::new(CHAIN_ID, ViewNumber::new(view), set.clone());
+    collected_tc_in(old_set(), view, tips, None)
+}
+
+/// TC(`view`) collected in `set` from timeout votes of validators 1..3 (in both sets), signer `i`
+/// reporting `tips[i]` and `high_qc`.
+fn collected_tc_in(set: ValidatorSet, view: u64, tips: &[Option<TipInfo>], high_qc: Option<PhaseCertificate>) -> TimeoutCertificate {
+    let mut collector = TimeoutVoteCollector::new(CHAIN_ID, ViewNumber::new(view), set);
     let mut tc = None;
     for (key, tip) in old_keys()[..3].iter().zip(tips) {
-        let PacemakerMessage::TimeoutVote(vote) =
-            PacemakerMessage::timeout_vote(&Keypair::new(key.clone()), CHAIN_ID, ViewNumber::new(view), None, tip.clone(), None)
-        else {
+        let PacemakerMessage::TimeoutVote(vote) = PacemakerMessage::timeout_vote(
+            &Keypair::new(key.clone()),
+            CHAIN_ID,
+            ViewNumber::new(view),
+            None,
+            tip.clone(),
+            high_qc.clone(),
+        ) else {
             unreachable!()
         };
         tc = collector.collect(&key.verifying_key(), vote).or(tc);
@@ -226,8 +236,20 @@ impl Replica {
 /// Whether a window replica (update view `update_view`, undecided) at `view` votes for `block`
 /// from `origin` on the header path and on the full path.
 fn window_votes(view: u64, update_view: u64, block: &Block, origin: &VerifyingKey, tc: Option<TimeoutCertificate>) -> (bool, bool) {
-    let mut header = replica(view, window_state(update_view, false), window_tree(update_view, false));
-    let mut full = replica(view, window_state(update_view, false), window_tree(update_view, false));
+    window_votes_as(false, view, update_view, block, origin, tc)
+}
+
+/// [`window_votes`] for a replica that has (`decided`) or has not applied the update's Decide PC.
+fn window_votes_as(
+    decided: bool,
+    view: u64,
+    update_view: u64,
+    block: &Block,
+    origin: &VerifyingKey,
+    tc: Option<TimeoutCertificate>,
+) -> (bool, bool) {
+    let mut header = replica(view, window_state(update_view, decided), window_tree(update_view, decided));
+    let mut full = replica(view, window_state(update_view, decided), window_tree(update_view, decided));
     (header.header_path(view, block, origin, tc.clone()), full.full_path(view, block, origin, tc))
 }
 
@@ -260,18 +282,39 @@ fn window_tip_after_the_update_view_is_the_committed_sets_leaders() {
     );
 }
 
+/// Whether the update is decided does not change a view's fresh proposer (s136): up to the update
+/// view it stays the previous set's leader, after it the committed set's, so replicas that already
+/// applied the Decide PC and replicas that have not judge every tip alike.
 #[test]
-fn decided_update_tip_is_the_committed_sets_leaders_only() {
+fn decided_update_keeps_one_fresh_proposer_per_view() {
     let early = split_view(1);
     let late = split_view(early + 1);
-    let tree = window_tree(early, true);
     let b = block(82);
-    for view in [early, late] {
-        assert!(tip_by(&b, view, &new_leader(view)).is_correct(CHAIN_ID, &tree).unwrap(), "committed-set leader, view {view}");
+    for decided in [false, true] {
+        let tree = window_tree(early, decided);
+        assert!(tip_by(&b, early, &old_leader(early)).is_correct(CHAIN_ID, &tree).unwrap(), "decided={decided}: previous-set leader up to the update view");
         assert!(
-            !tip_by(&b, view, &old_leader(view)).is_correct(CHAIN_ID, &tree).unwrap(),
-            "previous-set leader once the update is decided, view {view}"
+            !tip_by(&b, early, &new_leader(early)).is_correct(CHAIN_ID, &tree).unwrap(),
+            "decided={decided}: committed-set leader up to the update view"
         );
+        assert!(tip_by(&b, late, &new_leader(late)).is_correct(CHAIN_ID, &tree).unwrap(), "decided={decided}: committed-set leader after the update view");
+        assert!(
+            !tip_by(&b, late, &old_leader(late)).is_correct(CHAIN_ID, &tree).unwrap(),
+            "decided={decided}: previous-set leader after the update view"
+        );
+    }
+}
+
+/// No update ever committed (no update view): every view's fresh proposer is the committed set's
+/// leader, decided or not.
+#[test]
+fn without_an_update_view_the_committed_sets_leader_proposes() {
+    let view = split_view(1);
+    let b = block(95);
+    for decided in [false, true] {
+        let tree = tree_of(&ValidatorSetState::new(new_set(), old_set(), None, decided));
+        assert!(tip_by(&b, view, &new_leader(view)).is_correct(CHAIN_ID, &tree).unwrap(), "decided={decided}: committed-set leader");
+        assert!(!tip_by(&b, view, &old_leader(view)).is_correct(CHAIN_ID, &tree).unwrap(), "decided={decided}: previous-set leader");
     }
 }
 
@@ -459,4 +502,147 @@ fn full_path_drops_a_proposal_for_another_view() {
     assert!(!r.voted(), "proposal for view {} at view {view}", view + 1);
     assert!(r.tree.highest_view_voted().unwrap().is_none(), "no vote recorded");
     assert!(r.full_path(view, &b, &leader, None), "control: the same block proposed for view {view} is voted");
+}
+
+// ---------------------------------------------------------------------------
+// s136 ([claude-review] P3): a replica that already applied the update's Decide PC and one that
+// has not must judge a pre-update tip alike. VSU proposals and nudges do not set the tip, so every
+// honest tip in the window was signed by the previous set's leader at a view up to the update
+// view. Under the decided-ness rule a decided replica checked it against the committed set's
+// leader: it rejected every TC naming that tip and every proposal carrying such a TC, and a case-3
+// leader, decided by applying the TC's high QC (the Decide PC), dropped its own header.
+//
+// RED-first: on c300a015 each test in this section fails.
+// ---------------------------------------------------------------------------
+
+/// A quorum PC of `phase` on `block` at `view`, signed in `set` by validators 1..3.
+fn signed_pc(view: u64, block: &Block, phase: Phase, set: &ValidatorSet) -> PhaseCertificate {
+    let pc_view = ViewNumber::new(view);
+    let message = phase_vote_bytes(CHAIN_ID, pc_view, &block.hash, phase);
+    let mut signatures = SignatureSet::new(set.len());
+    for key in &old_keys()[..3] {
+        signatures.set(set.position(&key.verifying_key()).unwrap(), Some(Keypair::new(key.clone()).sign(&message)));
+    }
+    PhaseCertificate { chain_id: CHAIN_ID, view: pc_view, block: block.hash, phase, signatures }
+}
+
+/// TC(v) (v after the update view) whose high tip T was signed by the previous set's leader at the
+/// update view: correct for a decided and an undecided replica alike, and T's re-proposal in v + 1
+/// is voted by both on both paths. Control: the same TC without the tip.
+#[test]
+fn decided_and_undecided_replicas_accept_a_tc_naming_a_pre_update_tip() {
+    let u = split_view(1);
+    let v = u + 1;
+    let next = v + 1;
+    let t = block(98);
+    let tip = tip_by(&t, u, &old_leader(u));
+    let names_t = collected_tc_in(new_set(), v, &[Some(tip.clone()), Some(tip.clone()), Some(tip)], None);
+    let no_tip = collected_tc_in(new_set(), v, &[None, None, None], None);
+    for decided in [false, true] {
+        let tree = window_tree(u, decided);
+        assert!(no_tip.is_correct(&tree).unwrap(), "control, decided={decided}: the TC without a tip is correct");
+        assert!(names_t.is_correct(&tree).unwrap(), "decided={decided}: the TC naming the pre-update tip is correct");
+        assert_eq!(
+            window_votes_as(decided, next, u, &t, &new_leader(next), Some(names_t.clone())),
+            (true, true),
+            "decided={decided}: re-proposal of the pre-update tip (header path, full path)"
+        );
+    }
+}
+
+// The pacemaker of a replica that has applied the Decide PC (timeout votes, blame):
+// `pacemaker/prev_view_collector_test.rs` (`window_decided_*`).
+
+/// Produces empty blocks (the leader below); validates everything.
+struct LeaderApp;
+
+impl App<MemKV> for LeaderApp {
+    fn produce_block(&mut self, _: ProduceBlockRequest<MemKV>) -> ProduceBlockResponse {
+        ProduceBlockResponse {
+            data: Data::new(vec![]),
+            data_hash: CryptoHash::new([99; 32]),
+            app_state_updates: None,
+            validator_set_updates: None,
+        }
+    }
+    fn validate_block(&mut self, _: ValidateBlockRequest<MemKV>) -> ValidateBlockResponse {
+        ValidateBlockResponse::Valid { app_state_updates: None, validator_set_updates: None }
+    }
+    fn validate_block_for_sync(&mut self, _: ValidateBlockRequest<MemKV>) -> ValidateBlockResponse {
+        unreachable!("leader-side test")
+    }
+}
+
+/// Case 3 across the decision: the update U is committed by its Commit PC (the update view u) but
+/// not decided; TC(next - 1)'s high QC is U's Decide PC and its high tip the pre-update tip T. The
+/// committed set's leader of `next` applies the Decide PC (now decided), proposes on it with the TC
+/// and must vote for its own header.
+#[test]
+fn case3_leader_decided_by_the_tc_high_qc_votes_for_its_own_proposal() {
+    let t_view = split_view(1);
+    let u = t_view + 1;
+    let d = u + 1;
+    let next = split_view(d + 2);
+
+    let old = old_set();
+    let mut tree = tree_of(&ValidatorSetState::new(old.clone(), old, None, true));
+    let mut updates = ValidatorSetUpdates::new();
+    updates.insert(new_keys()[3].verifying_key(), Power::new(1));
+    updates.delete(old_keys()[3].verifying_key());
+    let updating = block(96);
+    tree.insert(&updating, None, Some(&updates)).unwrap();
+    tree.update(&pc(u, &updating, Phase::Commit), &None).unwrap();
+    let state = tree.validator_set_state().unwrap();
+    assert!(!state.update_decided(), "fixture: committed, not decided");
+    assert_eq!(state.update_view(), Some(ViewNumber::new(u)), "fixture: update view");
+    assert!(state.committed_validator_set() == &new_set(), "fixture: the committed set is the new set");
+
+    let decide = signed_pc(d, &updating, Phase::Decide, &new_set());
+    assert!(decide.is_correct(&tree).unwrap(), "fixture: the Decide PC is correct");
+    let tip = tip_by(&block(97), t_view, &old_leader(t_view));
+    let tc = collected_tc_in(new_set(), next - 1, &[Some(tip.clone()), Some(tip.clone()), Some(tip)], Some(decide.clone()));
+    assert!(!tc.high_tip_is_winner, "fixture: case 3 (the high QC wins)");
+    tree.set_highest_tc(&tc).unwrap();
+
+    let leader = new_leader(next);
+    let (tx, events) = std::sync::mpsc::channel();
+    let net = RecordingNetwork::default();
+    let mut hotstuff = HotStuff::new(
+        HotStuffConfiguration { chain_id: CHAIN_ID, keypair: Keypair::new(key_of(&leader)) },
+        ViewInfo::new(ViewNumber::new(next), Instant::now() + Duration::from_secs(3600)),
+        SenderHandle::new(net.clone()),
+        ValidatorSetUpdateHandle::new(net),
+        state,
+        Some(tx),
+    );
+    hotstuff
+        .enter_view(ViewInfo::new(ViewNumber::new(next), Instant::now() + Duration::from_secs(3600)), &mut tree, &mut LeaderApp)
+        .unwrap();
+    let proposal = events
+        .try_iter()
+        .find_map(|event| match event {
+            Event::Propose(e) => Some(e.proposal),
+            _ => None,
+        })
+        .expect("the leader proposes in case 3");
+    assert!(proposal.block.justify == decide, "case 3 extends the Decide PC");
+    assert!(proposal.tc.as_ref().is_some_and(|attached| attached.view == tc.view), "case 3 attaches the TC");
+    assert!(tree.validator_set_state().unwrap().update_decided(), "fixture: the leader applied the Decide PC");
+
+    let header = ProposalHeader::from_proposal(&proposal, false);
+    hotstuff.on_receive_msg(HotStuffMessage::ProposalHeader(header), &leader, &mut tree, &mut LeaderApp).unwrap();
+    let body = BlockDataResponse { view: ViewNumber::new(next), block: proposal.block.clone() };
+    hotstuff.on_receive_msg(HotStuffMessage::BlockDataResponse(body), &leader, &mut tree, &mut LeaderApp).unwrap();
+    assert!(
+        events.try_iter().any(|event| matches!(event, Event::PhaseVote(_))),
+        "the case-3 leader votes for its own proposal"
+    );
+
+    // Its peers judge that proposal alike, decided or not.
+    for decided in [false, true] {
+        let mut r = replica(next, window_state(u, decided), window_tree(u, decided));
+        r.tree.insert(&updating, None, None).unwrap();
+        let voted = r.header_path(next, &proposal.block, &leader, proposal.tc.clone());
+        assert!(voted, "decided={decided}: a peer votes for the case-3 proposal on the header path");
+    }
 }
