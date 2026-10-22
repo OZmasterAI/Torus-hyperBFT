@@ -215,3 +215,67 @@ joiners prove before U commits that they hold U and are live.
 4. With A2, a replica that commits U from the Decide PC records that PC's view as `update_view` (d3de0abb
    `internal.rs:576-590`), while the others record v+2. That is harmless while the window has no fresh proposals or
    tips, but it should be checked against the F2 tip rule (d3de0abb `types/validator_set.rs:329-335`).
+
+## 8. Reflexive lock rule (s138, fix/vsu-lock-reflexive)
+
+**Bug (D1 at the Precommit stage).** 4 validators, one silent and leading the view after U's Precommit PC. The
+backup aggregator forms U's Precommit PC and locks on it; that view times out. A Precommit PC is nudged only in the
+next view (`safe_nudge` 4), so later leaders re-propose U (`repropose_block`). U's justify is its parent's PC: older
+than the lock and not extending U, so the lock clause (checked on the justify only) made every replica locked on U
+refuse U itself. Test: `validator_set_update_survives_a_silent_leader_after_the_precommit_pc` (was 4/4 RED).
+
+**Rule.** For a *proposed block* B with justify J, the lock is satisfied if J satisfies the old clause
+(`J.view > locked.view` or J's block extends `locked.block`) **or** B is `locked.block` and B is not committed
+(`invariants::safe_proposal_lock`). This is PODC'19 `safeNode` ("node extends lockedQC.node", reflexive). PCs on
+their own (nudges, collected PCs, NewView, sync) keep `safe_pc` unchanged: a PC on the locked block already passes
+its "extends" arm.
+
+**Enforcement sites (all use the same rule).**
+- full proposal path and the recovery re-proposal (`on_receive_proposal`, `on_receive_proposal_response`):
+  `safe_block` -> `safe_proposal_pc` (`invariants.rs`);
+- header path, non-bypass branch: `safe_proposal_pc`; pending-justify bypass branch: `safe_proposal_lock`
+  (`on_receive_proposal_header`);
+- vote time on the header path: `cast_header_vote` -> `safe_proposal_lock`;
+- block sync: log-only lock warning uses `safe_proposal_lock` (sync never checked the lock; no behavior change).
+Unchanged on purpose: `safe_nudge`, collected-PC `safe_pc` / `safe_pc_lock_clause`, NewView `safe_pc`,
+`pc_to_lock`, `block_to_commit`.
+
+**Why it is safe.**
+1. *A vote counts only for its own block.* A phase vote signs `(chain, view, block hash, phase)`; a vote for B can
+   only be aggregated into a PC for B. B is the locked block, so the new votes never certify a block that conflicts
+   with the lock. Induction (standard): if a block C is committed and a quorum Q is locked on C (or a descendant) from
+   view r on, every PC formed after r certifies a descendant-or-self of C. A PC in view w > r needs an honest voter h
+   in Q; h votes for X only if X.justify is newer than h's lock (a PC after r: by induction it extends C, so X does),
+   or X.justify extends h's lock, or (new) X **is** h's locked block, which extends C by induction. So the new arm
+   keeps the invariant; the commit rules are unchanged.
+2. *The hash binds the justify.* `Block::hash(height, justify, data_hash)` is checked before the lock rule (full path
+   `is_correct`, header path hash check), so the reflexive arm admits B with its own justify only. "U re-proposed
+   with a different justify" (lower or higher view) is a different block U': lower or equal view and not extending
+   the lock means it is a sibling and is still refused; a higher-view justify passes the old liveness arm, as before.
+3. *Re-processing B's stale justify is a no-op.* After the vote check the replica runs `update` /
+   `update_locks_only` on J: highest PC moves only forward, `pc_to_lock` is monotone (strictly greater view), and
+   `block_to_commit(J)` only commits ancestors of B (already on the locked branch, and only by valid certificates).
+   This is the same processing every replica that is not locked on B already did for re-proposals of B. The
+   committed case is excluded: a committed B is never re-proposed by an honest leader (its Commit PC is nudged in any
+   view), and re-inserting a committed block or re-applying a Decide justify would touch state for nothing.
+4. *Phase votes in a later view.* A Prepare vote for U in view w (after the lock's view) is one vote in w
+   (`highest_view_voted`), on U; Precommit / Commit follow through nudges in w+1, w+2 under the unchanged
+   consecutive-view rule, so U commits with Prepare(w), Precommit(w+1), Commit(w+2).
+5. *TC-required rules (V1-V4).* Unchanged and checked before the lock: the re-proposal still needs QC(w-1) or
+   TC(w-1), and with the TC's high QC winning, V3 already allows "the block the high QC certifies".
+6. *Signed tips.* Votes on validator-set-updating blocks and on re-proposals set no new tip from the proposal (a TC
+   re-proposal keeps the TC's verified high tip); the fresh-proposer gate (`is_fresh_proposer`) still applies to any
+   tip-setting Generic vote, including one admitted by the reflexive arm.
+7. *Nudges.* Unchanged: `safe_nudge` checks a PC, whose block-is-locked case already passed.
+8. *VSU-window fresh-proposer rule.* Unchanged: it decides who may propose fresh; re-proposals and Prepare votes are
+   not fresh proposals.
+9. *Equivocation / slashing.* Proposal equivocation is keyed by `(view, leader)` with different hashes; a
+   re-proposal of B by another leader or in another view is a different key. `DoubleSignEvidence` needs the same
+   `(view, phase)` and different hashes; a replica votes once per view, and the reflexive votes are for the same
+   hash anyway. Nothing new counts as equivocation.
+
+**Model check.** `tests/stateright_2chain_safety.rs` now has re-proposals (a block certified again in a later view,
+children on any parent QC) and the reflexive arm: Agreement holds and the reflexive arm is used
+(`reflexive_lock_with_reproposals_upholds_agreement`, views 2..=4 in the suite; views 2..=5 `#[ignore]`d, ~9 min).
+
+No message, signing or DB format change.

@@ -197,6 +197,22 @@
 //! 1. **Safety clause**: `pc.block` extends from `locked_pc.block`, *or*
 //! 2. **Liveness clause**: `pc.view` is greater than `locked_pc.view`.
 //!
+//! For a *proposed block* (not a PC on its own), the predicate has a third, reflexive arm:
+//! 3. **Reflexive clause** (s138): the proposed block *is* `locked_pc.block`, not yet committed
+//!    ([`safe_proposal_lock`]).
+//!
+//! The lock is checked on the block's justify, i.e. on its parent, so without this arm a
+//! re-proposal of the locked block itself fails: its own justify is older than the lock and does
+//! not extend the locked block. PODC '19 HotStuff's `safeNode` checks the *node* ("node extends
+//! lockedQC.node", reflexive), which accepts it. HotStuff-rs re-proposes the highest Prepare or
+//! Precommit PC's block when that PC can no longer be nudged ([`repropose_block`]); a replica
+//! locked on that block (its Precommit PC) must be able to vote for it again, or the update
+//! window livelocks. Safe: a vote is for one `(view, block, phase)`, so a vote for the locked
+//! block can only ever count toward a PC for the locked block, which never conflicts with the
+//! lock; the block hash binds its justify, so the arm cannot be used with any other justify, and
+//! a sibling carrying the same stale justify still fails (docs/plans/disjoint-vset-livelock.md,
+//! "Reflexive lock rule").
+//!
 //! In stable cases--i.e., where in every view, either 1/3rd of replicas lock on the same `locked_pc`,
 //! or none lock--the safety clause will always be satisfied. This ensures that the `pc` extends the
 //! branch headed by the locked block.
@@ -345,7 +361,8 @@ fn note_pending_justify_deferral(block: &CryptoHash) -> Option<u64> {
 /// # Conditional checks
 ///
 /// `safe_block` returns `true` in case all of the following predicates are `true`:
-/// 1. `safe_pc(&block.justify, block_tree, chain_id)`.
+/// 1. `safe_proposal_pc(&block.hash, &block.justify, block_tree, chain_id)`: `safe_pc` on the
+///    justify, whose lock clause also accepts a proposal of the (uncommitted) locked block itself.
 /// 2. `block.pc.phase` is either `Generic` or `Decide`.
 ///
 /// # Precondition
@@ -358,9 +375,64 @@ pub(crate) fn safe_block<K: KVStore>(
 ) -> Result<bool, BlockTreeError> {
     Ok(
         /* 1 */
-        safe_pc(&block.justify, block_tree, chain_id)? &&
+        safe_proposal_pc(&block.hash, &block.justify, block_tree, chain_id)? &&
         /* 2 */ block.justify.is_block_justify(),
     )
+}
+
+/// [`safe_pc`] for the justify of a proposed block `block_hash` (a full proposal or a proposal
+/// header, whose `block_hash` the caller has checked to be `Block::hash(height, justify,
+/// data_hash)`): the same predicates, with the lock clause (3) replaced by
+/// [`safe_proposal_lock`], which also accepts a proposal of the uncommitted locked block itself.
+///
+/// # Precondition
+///
+/// [`is_correct`](crate::types::signed_messages::Certificate::is_correct) is `true` for `justify`.
+pub(crate) fn safe_proposal_pc<K: KVStore>(
+    block_hash: &CryptoHash,
+    justify: &PhaseCertificate,
+    block_tree: &BlockTreeSingleton<K>,
+    chain_id: ChainID,
+) -> Result<bool, BlockTreeError> {
+    safe_pc_with_lock(justify, block_tree, chain_id, || safe_proposal_lock(block_hash, justify, block_tree))
+}
+
+/// s138: the lock rule for a proposed block `block_hash` justified by `justify` (reflexive, as
+/// PODC '19 HotStuff's `safeNode`): either `justify` satisfies [`safe_pc_lock_clause`], or the
+/// block IS the locked block and that block is not committed yet.
+///
+/// The block hash binds the justify (`Block::hash(height, justify, data_hash)`, checked by the
+/// caller), so the reflexive arm only ever admits the locked block with its own justify; any other
+/// block carrying that (stale) justify is a sibling and still fails. A committed locked block is
+/// excluded: no honest leader re-proposes it (its Commit PC can be nudged in any view), and
+/// re-inserting it / re-applying its stale justify is not wanted. Like `safe_pc_lock_clause` it
+/// needs no tree membership (the locked block's body may be in flight; a block not in the tree
+/// is not committed), so the header fast path can enforce it unconditionally.
+///
+/// See the module docs ("Checking against the Lock") and docs/plans/disjoint-vset-livelock.md
+/// ("Reflexive lock rule") for the safety argument.
+pub(crate) fn safe_proposal_lock<K: KVStore>(
+    block_hash: &CryptoHash,
+    justify: &PhaseCertificate,
+    block_tree: &BlockTreeSingleton<K>,
+) -> Result<bool, BlockTreeError> {
+    Ok(is_uncommitted_locked_block(block_hash, block_tree)? || safe_pc_lock_clause(justify, block_tree)?)
+}
+
+/// Whether `block_hash` is `block_tree`'s `locked_pc.block` (never the genesis PC's) and that block
+/// is not committed: its height (if the block is in the tree) is above the highest committed one.
+fn is_uncommitted_locked_block<K: KVStore>(
+    block_hash: &CryptoHash,
+    block_tree: &BlockTreeSingleton<K>,
+) -> Result<bool, BlockTreeError> {
+    let locked_pc = block_tree.locked_pc()?;
+    if locked_pc.is_genesis_pc() || *block_hash != locked_pc.block {
+        return Ok(false);
+    }
+    Ok(match block_tree.block_height(block_hash)? {
+        None => true,
+        Some(height) => block_tree.highest_committed_block_height()?.is_none_or(|committed| height > committed),
+    })
 }
 
 /// Check whether `pc` can safely cause updates to `block_tree`, given the replica's `chain_id`.
@@ -384,11 +456,22 @@ pub(crate) fn safe_pc<K: KVStore>(
     block_tree: &BlockTreeSingleton<K>,
     chain_id: ChainID,
 ) -> Result<bool, BlockTreeError> {
+    safe_pc_with_lock(pc, block_tree, chain_id, || safe_pc_lock_clause(pc, block_tree))
+}
+
+/// [`safe_pc`]'s predicates with `lock` as predicate 3, evaluated in the same order (1, 2, 3, 4)
+/// with the same short-circuiting.
+fn safe_pc_with_lock<K: KVStore>(
+    pc: &PhaseCertificate,
+    block_tree: &BlockTreeSingleton<K>,
+    chain_id: ChainID,
+    lock: impl FnOnce() -> Result<bool, BlockTreeError>,
+) -> Result<bool, BlockTreeError> {
     Ok(
         /* 1 */
         (pc.chain_id == chain_id || pc.is_genesis_pc()) &&
         /* 2 */ (block_tree.contains(&pc.block) || pc.is_genesis_pc()) &&
-        /* 3 */ (pc.view > block_tree.locked_pc()?.view || extends_locked_pc_block(pc, block_tree)?) &&
+        /* 3 */ lock()? &&
         /* 4 */ (((pc.phase.is_prepare() || pc.phase.is_precommit() || pc.phase.is_commit() || pc.phase.is_decide()) &&
                    block_tree.validator_set_updates_status(&pc.block)?.contains_updates()) ||
         /* 4 (else) */ (pc.phase.is_generic() && !block_tree.validator_set_updates_status(&pc.block)?.contains_updates())),

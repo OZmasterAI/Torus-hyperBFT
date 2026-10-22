@@ -801,8 +801,10 @@ struct PrecommitWindowLog {
 /// v + 2 times out. A Precommit PC is nudged only in the view after it (`safe_nudge`), so each later
 /// leader re-proposes U (`repropose_block`, under a TC whose high QC is that Precommit PC). n2 is
 /// locked on U's Precommit PC and U's header justifies on U's parent, which neither extends U nor is
-/// newer than the lock (the `safe_pc` lock clause), so n2 never votes for U again and no later view
-/// reaches the quorum: the window livelocks. Deterministic: n2's lock alone blocks every quorum.
+/// newer than the lock. Before s138 the lock clause looked only at that justify, so n2 never voted
+/// for U again and no later view reached the quorum: the window livelocked (deterministic, n2's
+/// lock alone blocked every quorum). The lock rule of a proposal is now reflexive
+/// (`invariants::safe_proposal_lock`): n2 votes for the re-proposal of U, the block it is locked on.
 #[test]
 fn validator_set_update_survives_a_silent_leader_after_the_precommit_pc() {
     let mut cluster = Cluster::new();

@@ -23,7 +23,10 @@ use crate::{
     },
     block_tree::{
         accessors::internal::{BlockTreeError, BlockTreeSingleton, UpdateResult},
-        invariants::{repropose_block, safe_block, safe_nudge, safe_pc, safe_pc_lock_clause},
+        invariants::{
+            repropose_block, safe_block, safe_nudge, safe_pc, safe_pc_lock_clause, safe_proposal_lock,
+            safe_proposal_pc,
+        },
         pluggables::KVStore,
     },
     events::{
@@ -2430,12 +2433,16 @@ impl<N: Network> HotStuff<N> {
                 // locked block — exactly the votes the HotStuff safety argument forbids — and such
                 // headers are equally rejected by the non-bypass `safe_pc` path below, so no
                 // header that could contribute to a QC is lost.
+                //
+                // s138: the lock rule of a proposal is reflexive (`safe_proposal_lock`): a header
+                // of the uncommitted locked block itself satisfies it (its hash, checked above,
+                // binds its own justify). Same rule on both branches and in `cast_header_vote`.
                 header.justify.is_block_justify()
                     && (header.justify.chain_id == self.config.chain_id
                         || header.justify.is_genesis_pc())
-                    && safe_pc_lock_clause(&header.justify, block_tree)?
+                    && safe_proposal_lock(&header.block_hash, &header.justify, block_tree)?
             } else {
-                safe_pc(&header.justify, block_tree, self.config.chain_id)?
+                safe_proposal_pc(&header.block_hash, &header.justify, block_tree, self.config.chain_id)?
                     && header.justify.is_block_justify()
             }
         } else {
@@ -2947,7 +2954,7 @@ impl<N: Network> HotStuff<N> {
         if header.view != self.view_info.view
             || !is_phase_voter(&self.config.keypair.public(), &validator_set_state, &header.justify)
             || block_tree.highest_view_voted()?.is_some_and(|voted| voted >= header.view)
-            || !safe_pc_lock_clause(&header.justify, block_tree)?
+            || !safe_proposal_lock(&header.block_hash, &header.justify, block_tree)?
         {
             return Ok(());
         }

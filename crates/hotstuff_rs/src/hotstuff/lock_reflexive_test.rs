@@ -13,7 +13,7 @@
 //! stale justify is a sibling and stays refused.
 
 use crate::block_tree::accessors::internal::{BlockTreeSingleton, BlockTreeWriteBatch};
-use crate::block_tree::invariants::safe_block;
+use crate::block_tree::invariants::{safe_block, safe_proposal_lock};
 use crate::hotstuff::header_fast_path_regression_test::{
     bare_tc, generic_pc, hotstuff_at, proposer_for, signing_keys, steady_block_tree, validator_set,
     MemKV, MemWb,
@@ -228,4 +228,33 @@ fn header_sibling_of_the_locked_block_is_not_voted() {
         .on_receive_msg(HotStuffMessage::ProposalHeader(signed_by(header, &leader)), &leader, &mut block_tree, &mut TreeApp)
         .expect("processing the sibling header must not error");
     assert_eq!(block_tree.highest_view_voted().expect("highest_view_voted"), None, "the lock on U must refuse its sibling");
+}
+
+/// `safe_proposal_lock` (the header fast path's pending-justify branch and `cast_header_vote`)
+/// needs no tree membership: a locked block whose body is still in flight is not committed, so
+/// its re-proposal satisfies the lock; another hash with the same stale justify does not.
+#[test]
+fn proposal_lock_without_the_block_in_the_tree() {
+    let keys = signing_keys(&[1, 2, 3, 4]);
+    let set = validator_set(&keys);
+    let (mut block_tree, _vss) = steady_block_tree(&set);
+    let locked = CryptoHash::new([21u8; 32]); // NOT in the block tree (body in flight)
+    let other = CryptoHash::new([22u8; 32]);
+    let stale = generic_pc(ViewNumber::new(1), CryptoHash::new([20u8; 32]), &keys[..3], &set);
+
+    // Genesis lock: any PC above view 0 satisfies it (view arm).
+    assert!(safe_proposal_lock(&other, &stale, &block_tree).expect("lock"));
+
+    let lock = phase_pc(3, locked, Phase::Precommit, &keys[..3], &set);
+    let mut wb: BlockTreeWriteBatch<MemWb> = BlockTreeWriteBatch::new();
+    wb.set_locked_pc(&lock).expect("set_locked_pc");
+    block_tree.write(wb);
+    assert!(
+        safe_proposal_lock(&locked, &stale, &block_tree).expect("lock"),
+        "the uncommitted locked block (body pending) satisfies the lock with its stale justify"
+    );
+    assert!(
+        !safe_proposal_lock(&other, &stale, &block_tree).expect("lock"),
+        "another block with a stale justify that does not extend the lock must fail"
+    );
 }

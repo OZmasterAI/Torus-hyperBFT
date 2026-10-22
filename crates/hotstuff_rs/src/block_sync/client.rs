@@ -30,7 +30,7 @@ use crate::{
     block_sync::messages::{AdvertiseBlock, AdvertisePC, BlockSyncAdvertiseMessage},
     block_tree::{
         accessors::internal::{BlockTreeError, BlockTreeSingleton, UpdateResult},
-        invariants::{safe_pc, safe_pc_lock_clause},
+        invariants::{safe_pc, safe_proposal_lock},
         pluggables::KVStore,
     },
     events::{EndSyncEvent, Event, InsertBlockEvent, StartSyncEvent},
@@ -485,8 +485,9 @@ impl<N: Network> BlockSyncClient<N> {
         // chain supersedes a branch this replica was locked on. That is legal during catch-up
         // (the lock rule exists to prevent conflicting *votes*, and no vote is cast on synced
         // blocks), but it must be visible when it happens. Log-only: errors are swallowed and
-        // behavior is unchanged.
-        if !safe_pc_lock_clause(&block.justify, block_tree).unwrap_or(true) {
+        // behavior is unchanged. The proposal lock rule (`safe_proposal_lock`, reflexive since
+        // s138) is the one checked, so a synced copy of the locked block itself is no conflict.
+        if !safe_proposal_lock(&block.hash, &block.justify, block_tree).unwrap_or(true) {
             if let Ok(locked_pc) = block_tree.locked_pc() {
                 log::warn!(
                     "block_sync: synced block {:?} justify (block={:?}, view={}) conflicts with local locked_pc (block={:?}, view={}) — proceeding with catch-up, lock superseded by peer's committed chain",
