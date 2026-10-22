@@ -345,8 +345,56 @@ class WaitTests(unittest.TestCase):
             )
         self.assertEqual(rc, 0, err)
         self.assertEqual(rec["outcome"], "skipped")
+        # One scrape and no fallback sleep (that would be >= 15 s here); the
+        # bound is loose on purpose: a loaded host may take a while to scrape.
         self.assertEqual(old.hits, 1)
-        self.assertLess(rec["waited_s"], 0.3)
+        self.assertLess(rec["waited_s"], 10.0)
+
+    def test_checkpoints_off_but_writes_counted_is_activity_not_a_skip(self):
+        # s77 re-review (Codex P2): SUBMITS absent, WRITES=9, env resolves
+        # off: the writes are evidence that checkpoints ran, so this is not
+        # "checkpoints off". The missing SUBMITS leaves the node unverifiable
+        # (fallback_sleep, unpinned digest), never a skip. The negative margin
+        # only shortens the 15 s default interval's fallback sleep.
+        node = FakeNode([(0, None, 9)])
+        with node:
+            rc, out, err, rec, _ = run_wait(
+                [("val0", node)],
+                json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "0"}),
+                extra=["--fallback-margin-s", "-14.8"] + LONG,
+            )
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(rec["outcome"], "fallback_sleep", out)
+        self.assertFalse(rec["nodes"]["val0"]["durable"])
+
+    def test_checkpoints_off_unreadable_node_with_writes_elsewhere_is_waited_on(self):
+        # Same evidence rule in the retry decision: WRITES>0 on an answering
+        # node keeps asking the unreadable one instead of skipping.
+        ran = FakeNode([(0, None, 9)])
+        dead = FakeNode([(0, 0, 0)], fail=True)
+        with ran, dead:
+            rc, out, err, rec, _ = run_wait(
+                [("val0", ran), ("val1", dead)],
+                json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "0"}),
+                extra=["--timeout-s", "1"],
+            )
+        self.assertNotEqual(rec["outcome"], "skipped", out)
+        self.assertGreater(dead.hits, 1)
+
+    def test_negative_counters_are_not_durable_proof(self):
+        # s77 re-review (Codex P3): SUBMITS=-1, WRITES=0 gave target 0 and an
+        # immediate "durable". A counter must be a finite non-negative
+        # integer; anything else is unusable, so the node is unverifiable.
+        bad = FakeNode([(0, -1, 0)])
+        with bad:
+            rc, out, err, rec, _ = run_wait(
+                [("val0", bad)],
+                json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "300"}),
+                extra=["--fallback-margin-s", "0.1"] + LONG,
+            )
+        self.assertNotEqual(rec["outcome"], "durable", out)
+        self.assertFalse(rec["nodes"]["val0"]["durable"])
+        self.assertIn(rec["outcome"], ("fallback_sleep", "timeout"))
 
     def test_checkpoints_off_and_unreadable_metrics_skip_without_retrying(self):
         dead = FakeNode([(0, 0, 0)], fail=True)

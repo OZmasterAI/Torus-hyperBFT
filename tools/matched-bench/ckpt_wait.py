@@ -46,6 +46,7 @@ Standard library only: run-cell.sh runs it with python3 -I.
 
 import argparse
 import json
+import math
 import sys
 import time
 import urllib.request
@@ -120,15 +121,35 @@ def scrape(url, timeout=3.0):
             text = r.read().decode("utf-8", "replace")
     except (OSError, ValueError):
         return None
-    vals = {SUBMITS: None, WRITES: None}
+    vals = {SUBMITS: None, WRITES: None, "invalid": []}
     for line in text.splitlines():
         f = line.split()
-        if len(f) >= 2 and f[0] in vals:
-            try:
-                vals[f[0]] = int(float(f[1]))
-            except ValueError:
-                pass
+        if len(f) >= 2 and f[0] in (SUBMITS, WRITES):
+            n = counter_value(f[1])
+            if n is None:
+                vals["invalid"].append(f[0])
+            else:
+                vals[f[0]] = n
     return vals
+
+
+def counter_value(raw):
+    """A counter sample as a finite non-negative integer, None otherwise (a
+    negative, fractional, NaN or infinite value is no evidence of anything:
+    the node is treated as not reporting that metric)."""
+    try:
+        x = float(raw)
+    except ValueError:
+        return None
+    if not math.isfinite(x) or x < 0 or x != int(x):
+        return None
+    return int(x)
+
+
+def active(v):
+    """A node's T0 sample shows checkpoint activity: either counter > 0
+    (writes without submits still prove checkpoints ran)."""
+    return any((v.get(k) or 0) > 0 for k in (SUBMITS, WRITES))
 
 
 def parse_args(argv):
@@ -209,7 +230,7 @@ def new_record(nodes, interval_ms, timeout_s, poll_s):
             "poll_s": poll_s, "metrics": {"submits": SUBMITS, "writes": WRITES},
             "note": None, "waited_s": 0.0, "t0_unix": round(time.time(), 3),
             "nodes": {n: {"c0": None, "target": None, "write_count": None, "durable": False,
-                          "waited_s": None, "missing": []} for n, _ in nodes}}
+                          "waited_s": None, "missing": [], "invalid": []} for n, _ in nodes}}
 
 
 def main(argv=None):
@@ -236,27 +257,27 @@ def main(argv=None):
     # unless a node that answered did checkpoint: then they are on whatever
     # the env says, and an unreadable node must not let the wait be skipped.
     base = baseline(nodes, deadline, a.poll_s, retry=interval_ms is not None)
-    if interval_ms is None and len(base) < len(nodes) and any(
-            (v[SUBMITS] or 0) > 0 for v in base.values()):
+    if interval_ms is None and len(base) < len(nodes) and any(active(v) for v in base.values()):
         base = baseline(nodes, deadline, a.poll_s, retry=True, base=base)
     bad = [n for n, _ in nodes if n not in base]
-    ran_any = any((v[SUBMITS] or 0) > 0 for v in base.values())
+    ran_any = any(active(v) for v in base.values())
     if bad and interval_ms is None and not ran_any:
         rec["note"] = "metrics unreadable on %s" % " ".join(bad)
         return finish("skipped", "skipped, %s; metrics unreadable on %s" % (off, " ".join(bad)))
     if bad:
         if interval_ms is None:
             rec["note"] = ("WARNING: the node env resolves %s but %s ran checkpoints"
-                           % (off, " ".join(n for n, v in base.items() if (v[SUBMITS] or 0) > 0)))
+                           % (off, " ".join(n for n, v in base.items() if active(v))))
         return finish("timeout", "TIMEOUT after {waited}s: metrics unreadable on %s (%s)%s"
                       % (" ".join(bad), iv, " (%s)" % rec["note"] if rec["note"] else ""), TIMEOUT_RC)
     for name, v in base.items():
         node = rec["nodes"][name]
         node["c0"], node["write_count"] = v[SUBMITS], v[WRITES]
         node["missing"] = [k for k in (SUBMITS, WRITES) if v[k] is None]
+        node["invalid"] = v.get("invalid", [])
         node["target"] = None if v[SUBMITS] is None else v[SUBMITS] + 1
     missing = [n for n, _ in nodes if rec["nodes"][n]["missing"]]
-    ran = [n for n, _ in nodes if (base[n][SUBMITS] or 0) > 0]
+    ran = [n for n, _ in nodes if active(base[n])]
     # Checkpoints on (by the env, or by a node that ran one) and a counter at
     # 0 = the first window has not flushed yet, NOT "no checkpoints": the
     # node is held to its first durable checkpoint (target 1) like any other.
@@ -277,6 +298,10 @@ def main(argv=None):
         rec["note"] = ("checkpoint metrics absent on %s (older binary): slept interval + %.1f s, "
                        "no durable evidence on %s" % (" ".join(missing), a.fallback_margin_s,
                                                       " ".join(missing)))
+        bad_vals = ["%s (%s)" % (n, "/".join(rec["nodes"][n]["invalid"]))
+                    for n in missing if rec["nodes"][n]["invalid"]]
+        if bad_vals:
+            rec["note"] += "; invalid (not a non-negative integer) counter on %s" % " ".join(bad_vals)
         if fresh_note:
             rec["note"] += "; " + fresh_note
         capable = [(n, u) for n, u in nodes if n not in missing]
