@@ -350,8 +350,11 @@ fn locked_replica_votes_for_a_sibling_certified_above_its_lock() {
         .any(|e| matches!(e, Event::CollectPC(e) if e.phase_certificate == precommit3)));
     assert_eq!(c.trees[locked].locked_pc().unwrap().block, u.hash, "leader(5) is locked on U");
 
-    // The Byzantine leader(3) reports its own signed header of U' as its tip(3), which beats
-    // Prepare(U, 2) in TC(3).
+    // The Byzantine leader(3) reports its own signed header of U' as its tip(3), which wins TC(3)
+    // over QC(A, 1). s138 (fix/tc-tip-ordinary-stall): a tip whose block justifies below the high
+    // QC no longer wins, so the two unlocked replicas' timeout votes for view 3 are Bracha echoes
+    // sent before view 3's nudge brought them Prepare(U, 2) (the echo does not leave the view; they
+    // vote Precommit afterwards), reporting QC(A, 1); the Byzantine one reports QC(A, 1) too.
     let tip = TipInfo::from_header(&signed_by(header(&u_prime, 3, None), &byzantine_vk));
     assert!(tip.is_correct(CHAIN_ID, &c.trees[0]).unwrap(), "a correctly signed tip of leader(3)");
     let mut entries: Vec<_> = c
@@ -359,9 +362,9 @@ fn locked_replica_votes_for_a_sibling_certified_above_its_lock() {
         .iter()
         .enumerate()
         .filter(|(i, _)| *i != locked)
-        .map(|(_, k)| (k.clone(), None, Some(prepare2.clone())))
+        .map(|(_, k)| (k.clone(), None, Some(qc_a.clone())))
         .collect();
-    entries.push((c.byzantine.clone(), Some(tip), Some(prepare2.clone())));
+    entries.push((c.byzantine.clone(), Some(tip), Some(qc_a.clone())));
     let tc3 = timeout_certificate(3, entries, &c.set);
     assert!(tc3.high_tip_is_winner);
 
@@ -427,14 +430,14 @@ fn a_copied_byzantine_tip_does_not_strand_the_update() {
     assert_eq!(tips, vec![false; 3], "no replica takes the Byzantine tip of the validator-set-updating U'");
 }
 
-/// RESIDUAL, not fixed (docs/plans/disjoint-vset-livelock.md section 9, "Active Byzantine
-/// tip"): the same prefix, but the Byzantine validator stays active after it. It casts no vote,
-/// yet its timeout vote, carrying its own tip (U', 4), arrives first and is in every TC; the tip
-/// beats every honest QC (Precommit(U, 3) at most), so every honest leader re-proposes U' (V2),
-/// which no PC certifies, and replica 0, locked on U, refuses it. Needs a decision on the
-/// leader / NEC rules for a validator-set-updating tip (see the doc).
+/// The same prefix, but the Byzantine validator stays active after it. It casts no vote, yet its
+/// timeout vote, carrying its own tip (U', 4), arrives first and is in every TC, with replicas 0
+/// (locked on Precommit(U, 3)) and 1. Was the residual of docs/plans/disjoint-vset-livelock.md
+/// section 9 (the tip beat every honest QC by view, leaders re-proposed U' forever, replica 0
+/// refused it). Fixed by fix/tc-tip-ordinary-stall (docs/plans/tc-required-and-tip-signing.md §4,
+/// "Incompatible tips"): U' justifies on QC(A, 1), below the TC's high QC Precommit(U, 3), so the
+/// high QC wins. Still open: a TC with the Byzantine vote that omits replica 0.
 #[test]
-#[ignore = "residual liveness gap: an active Byzantine VSU tip (disjoint-vset-livelock.md section 9)"]
 fn an_active_byzantine_tip_does_not_strand_the_update() {
     let (mut c, byzantine_timeout) = byzantine_tip_of_the_sibling_in_view_4();
     let u = c.u.clone();
@@ -462,12 +465,16 @@ fn byzantine_tip_of_the_sibling_in_view_4() -> (Cluster, (TipInfo, PhaseCertific
     }), &byzantine_vk);
     assert!(c.trees[0].locked_pc().unwrap() == precommit3, "replica 0 is locked on U");
 
-    // TC(4): replicas 1 and 2 (Prepare(U, 2)) and the Byzantine one with its tip (U', 4).
+    // TC(4): replicas 1 and 2 and the Byzantine one with its tip (U', 4). s138
+    // (fix/tc-tip-ordinary-stall): U' justifies on QC(A, 1), so its tip wins only over a high QC
+    // no newer than that: replicas 1 and 2 sent their timeout votes for view 4 as Bracha echoes
+    // before view 3's nudge brought them Prepare(U, 2) (an echo does not leave the view), and the
+    // Byzantine one reports QC(A, 1).
     let tip = TipInfo::from_header(&signed_by(header(&u_prime, 4, None), &byzantine_vk));
     let entries = vec![
-        (c.honest[1].clone(), None, Some(prepare2.clone())),
-        (c.honest[2].clone(), None, Some(prepare2.clone())),
-        (c.byzantine.clone(), Some(tip.clone()), Some(prepare2.clone())),
+        (c.honest[1].clone(), None, Some(c.qc_a.clone())),
+        (c.honest[2].clone(), None, Some(c.qc_a.clone())),
+        (c.byzantine.clone(), Some(tip.clone()), Some(c.qc_a.clone())),
     ];
     let tc4 = timeout_certificate(4, entries, &c.set);
     assert!(tc4.high_tip_is_winner);
