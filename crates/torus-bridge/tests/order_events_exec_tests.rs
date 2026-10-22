@@ -16,6 +16,10 @@ use torus_state::{StateBackend, StateDb};
 use torus_types::{FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
 
 fn open_test_db() -> (tempfile::TempDir, StateDb) {
+    // Owner s138: a fixture from before the never-marked rule (test-only
+    // seam, as main's pre-s138 fixtures): it trades 90..=200 on placeholder
+    // markets, which no one mark keeps inside the price band.
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().expect("create temp dir");
     let db = StateDb::open(dir.path()).expect("open db");
     for m in 1..=8u64 {

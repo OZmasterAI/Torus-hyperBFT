@@ -38,8 +38,31 @@ fn open_test_db() -> (tempfile::TempDir, StateDb) {
     for m in 1..=16u64 {
         db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed")
             .expect("list market");
+        // Owner s138: no order opens on a never-marked market. A fresh mark
+        // (ts 1000 = every context's timestamp) in the 50% price band of
+        // every price the tests trade: 100 (fills at 93..=110), market 2 75
+        // (the flat-close fillers at 50, the fuzz at 95..=105).
+        let price = if m == 2 { 75 } else { 100 };
+        set_mark(&db, m, fp(price), 1000);
     }
     (dir, db)
+}
+
+/// The stored oracle aggregate row: price(16) ‖ block(8) ‖ reporters(4) ‖ ts(8).
+fn set_mark(db: &StateDb, m: MarketId, price: FixedPoint, ts: u64) {
+    let row = [
+        price.raw().to_be_bytes().as_slice(),
+        &7u64.to_be_bytes(),
+        &3u32.to_be_bytes(),
+        &ts.to_be_bytes(),
+    ]
+    .concat();
+    db.put_cf_raw(
+        torus_state::cf::CF_NATIVE_ORACLE,
+        &[b"agg".as_slice(), &m.to_be_bytes()].concat(),
+        &row,
+    )
+    .unwrap();
 }
 
 fn addr(n: u8) -> Address {

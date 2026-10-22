@@ -22656,6 +22656,85 @@ mod crash_recovery_tests {
         }
     }
 
+    /// s138 product batch: a sink with both a `userFills` and an
+    /// `orderUpdates` subscriber.
+    struct FillAndOrderSink {
+        fills: SeenFills,
+        orders: Arc<std::sync::Mutex<Vec<Arc<torus_state::order_events::BlockOrderEvents>>>>,
+    }
+
+    impl torus_state::trade_rows::FillSink for FillAndOrderSink {
+        fn wants_fills(&self) -> bool {
+            true
+        }
+        fn send_fills(&self, block: Arc<torus_state::trade_rows::BlockFills>) {
+            self.fills.lock().unwrap().push(block);
+        }
+        fn wants_order_events(&self) -> bool {
+            true
+        }
+        fn send_order_events(&self, block: Arc<torus_state::order_events::BlockOrderEvents>) {
+            self.orders.lock().unwrap().push(block);
+        }
+    }
+
+    /// s138 product batch (trading fees + node-local WS streams): the blocks
+    /// handed to the stream sink say whether they ran `trading_fees` (the
+    /// executed header's bit), so `userFills` rows carry a `fee` only from the
+    /// activation (each fill's extras then hold its non-zero fees, else 0);
+    /// `orderUpdates` events carry no fee and are the same with the bit on or
+    /// off. Serial and pipelined alike.
+    #[test]
+    fn stream_sink_fills_carry_fees_only_with_trading_fees() {
+        let fees_bit = torus_types::Feature::TradingFees.bit();
+        for on in [false, true] {
+            let mut order_runs = Vec::new();
+            for fees_on in [false, true] {
+                torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
+                let (_cfg, state_db) = make_test_config_and_db();
+                fund_pipeline_fixture(&state_db);
+                let mut ctx = pipeline_ctx(&state_db, on, None);
+                ctx.trade_history = true;
+                let fills: SeenFills = Default::default();
+                let orders: Arc<std::sync::Mutex<Vec<_>>> = Default::default();
+                let sink: Arc<dyn torus_state::trade_rows::FillSink> =
+                    Arc::new(FillAndOrderSink { fills: fills.clone(), orders: orders.clone() });
+                assert!(ctx.fill_sink.set(sink).is_ok());
+                let mut blocks = pipeline_fixture_blocks();
+                if fees_on {
+                    for b in &mut blocks {
+                        b.header.features |= fees_bit;
+                    }
+                    link_blocks(&mut blocks);
+                }
+                for b in &blocks {
+                    dispatch_and_execute(&ctx, &state_db, b);
+                }
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fixture must not fail-stop");
+                drop(ctx);
+                let fills = fills.lock().unwrap().clone();
+                let tag = format!("pipeline on={on} fees_on={fees_on}");
+                assert_eq!(fills.iter().map(|b| b.height).collect::<Vec<_>>(), vec![3, 6, 11], "{tag}");
+                for b in &fills {
+                    assert_eq!(b.trading_fees, fees_on, "{tag}: block {}", b.height);
+                    assert_eq!(b.extras.len(), b.fills.len(), "{tag}");
+                    for e in &b.extras {
+                        if fees_on {
+                            assert!(e.taker_fee_raw > 0 && e.maker_fee_raw > 0, "{tag}: {e:?}");
+                        } else {
+                            assert_eq!((e.taker_fee_raw, e.maker_fee_raw), (0, 0), "{tag}");
+                        }
+                    }
+                }
+                let orders: Vec<(u64, Vec<torus_state::order_events::OrderEvent>)> =
+                    orders.lock().unwrap().iter().map(|b| (b.height, b.events.clone())).collect();
+                assert!(!orders.is_empty(), "{tag}");
+                order_runs.push(orders);
+            }
+            assert_eq!(order_runs[0], order_runs[1], "pipeline on={on}: orderUpdates do not depend on fees");
+        }
+    }
+
     /// OFF yields byte-identical state in EVERY CF and the same persisted native
     /// root — across empties, an epoch boundary (serial), a duplicated action
     /// (nonce guard through the layer), a session created in k and used by verify

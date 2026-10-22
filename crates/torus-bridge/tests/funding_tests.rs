@@ -283,9 +283,11 @@ fn pending_funding_counts_in_liquidation_and_the_close_settles_it() {
         }
         ctx.positions.apply_fill(&t, 1, true, fp(10), fp(1_000), MarginType::Cross).unwrap();
         ctx.positions.apply_fill(&s, 1, false, fp(10), fp(1_000), MarginType::Cross).unwrap();
+        // Owner s138 (merge with main's never-marked rule): the mark comes
+        // before m's resting buy, which would otherwise be refused.
+        set_mark(&ctx.state, 1, fp(990), 1_001);
         let r = NativeExecutor::execute(&mut ctx, &m, &NativeAction::PlaceOrder(order(1, true, 985, 10, TimeInForce::GTC)));
         assert!(r.success, "{:?}", r.error);
-        set_mark(&ctx.state, 1, fp(990), 1_001);
         if with_funding {
             let mut row = FundingRow::new(1_001, &FundingParams::default());
             row.cum_index = 6 * E18;
