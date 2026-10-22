@@ -22,6 +22,8 @@ struct Rejoin {
     origin: VerifyingKey,
     header: ProposalHeader,
     events: Receiver<Event>,
+    /// The pacemaker's events (its timeout votes).
+    pacemaker_events: Receiver<Event>,
 }
 
 fn header_for(body: &Block, view: ViewNumber) -> ProposalHeader {
@@ -60,6 +62,7 @@ fn rejoin_at(local_view: u64, round_skip: bool) -> Rejoin {
         .find(|view| leader(*view, &f) != me)
         .unwrap();
     let local = ViewNumber::new(local_view);
+    let (pacemaker_tx, pacemaker_events) = std::sync::mpsc::channel();
     f.algorithm.pacemaker = Pacemaker::new(
         PacemakerConfiguration {
             chain_id: ChainID::new(0),
@@ -73,14 +76,14 @@ fn rejoin_at(local_view: u64, round_skip: bool) -> Rejoin {
         SenderHandle::new(NullNetwork),
         local,
         &vss,
-        None,
+        Some(pacemaker_tx),
     )
     .unwrap();
     let (mut hotstuff, events) = hotstuff_at_with_events(local, keys[0].clone(), vss);
     hotstuff.set_round_skip(round_skip);
     f.algorithm.hotstuff = hotstuff;
     let origin = leader(future, &f);
-    Rejoin { f, origin, header: header_for(&body(95), future), events }
+    Rejoin { f, origin, header: header_for(&body(95), future), events, pacemaker_events }
 }
 
 impl Rejoin {
@@ -250,6 +253,78 @@ fn rejoining_leader_skips_to_its_view_on_new_views_and_proposes() {
         .filter(|event| matches!(event, Event::Propose(p) if p.proposal.view == w))
         .count();
     assert_eq!(proposals, 1, "proposed once in w");
+}
+
+/// s138: under TC-required, leader(w) proposes in w only with QC(w - 1) or TC(w - 1). A
+/// leader-skip from w - 1 itself (NewViews from more than f power, no proposal seen in w - 1, no
+/// QC(w - 1)) leaves w - 1 before this replica's own deadline, and a replica never times out a view
+/// it has left. TC(w - 1) can need its timeout vote (its power, or another vote that is lost), and
+/// without TC(w - 1) its own view w is lost too. So it times w - 1 out first: its TimeoutVote for
+/// w - 1 goes out before it enters w.
+#[test]
+fn next_view_leader_skip_times_out_the_view_it_leaves() {
+    let keys = signing_keys(&[1, 2, 3, 4]);
+    let me = keys[0].verifying_key();
+    let probe = fixture();
+    let w = (LOCAL_VIEW + 2..)
+        .map(ViewNumber::new)
+        .find(|view| leader(*view, &probe) == me)
+        .unwrap();
+    let left = ViewNumber::new(w.int() - 1);
+    let mut r = rejoin_at(left.int(), true);
+    r.f.algorithm.app.produce = true;
+    for key in &keys[1..3] {
+        let new_view = NewView {
+            chain_id: ChainID::new(0),
+            view: left,
+            highest_pc: PhaseCertificate::genesis_pc(),
+        };
+        r.f.messages
+            .send((key.verifying_key(), ProgressMessage::HotStuffMessage(new_view.into())))
+            .unwrap();
+        r.poll();
+    }
+    assert_eq!(r.view(), w, "leader-skip into the next view, which this replica leads");
+    let timeout_votes: Vec<ViewNumber> = r
+        .pacemaker_events
+        .try_iter()
+        .filter_map(|event| match event {
+            Event::TimeoutVote(event) => Some(event.timeout_vote.view),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(timeout_votes, vec![left], "its own TimeoutVote for w - 1 went out when it left w - 1");
+}
+
+/// A leader-skip over more than one view leaves a view other than w - 1: no timeout vote (TC(w - 1)
+/// is formed by the validators that were in w - 1).
+#[test]
+fn leader_skip_over_several_views_sends_no_timeout_vote() {
+    let keys = signing_keys(&[1, 2, 3, 4]);
+    let me = keys[0].verifying_key();
+    let probe = fixture();
+    let w = (LOCAL_VIEW + 2..)
+        .map(ViewNumber::new)
+        .find(|view| leader(*view, &probe) == me)
+        .unwrap();
+    let mut r = rejoin(true);
+    r.f.algorithm.app.produce = true;
+    for key in &keys[1..3] {
+        let new_view = NewView {
+            chain_id: ChainID::new(0),
+            view: ViewNumber::new(w.int() - 1),
+            highest_pc: PhaseCertificate::genesis_pc(),
+        };
+        r.f.messages
+            .send((key.verifying_key(), ProgressMessage::HotStuffMessage(new_view.into())))
+            .unwrap();
+        r.poll();
+    }
+    assert_eq!(r.view(), w);
+    assert!(
+        !r.pacemaker_events.try_iter().any(|event| matches!(event, Event::TimeoutVote(_))),
+        "no timeout vote for the view it left ({LOCAL_VIEW}, below w - 1)"
+    );
 }
 
 #[test]
