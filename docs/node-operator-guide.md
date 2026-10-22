@@ -155,10 +155,13 @@ consensus data. A build reads only its own format and does not migrate an
 older one. The TC-required consensus (format 1: domain-tagged consensus
 signatures, leader-signed proposals and tips) cannot read a data dir written
 by an earlier build: its stored certificates would fail every signature
-check. Such a data dir refuses to start and is left as it was:
+check. Dead-leader skip (format 2) adds leader exclusions to the stored
+validator sets and leader evidence to commit manifests, which a format-1
+build would misread. A data dir of another format refuses to start and is
+left as it was:
 
 ```
-refusing to start: the consensus DB /data/consensus-db is written before TC-required phase C (no format key), and this build reads consensus DB format 1 only ...
+refusing to start: the consensus DB /data/consensus-db is format 1, and this build reads consensus DB format 2 only ...
 ```
 
 Upgrade every node of the chain together, and start each one from a fresh

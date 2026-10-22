@@ -185,9 +185,13 @@ pub const CONSENSUS_DB_FORMAT: [u8; 1] = [25];
 
 /// The [`CONSENSUS_DB_FORMAT`] this build writes and the only one it reads. 1: TC-required phase C
 /// (docs/plans/tc-required-and-tip-signing.md): domain-tagged signatures, leader-signed proposals
-/// and headers, signed local tips. Stores have no in-place migration: a store of another format is
-/// refused at boot (torus-node `open_node_dbs`), and the data dir must be started fresh.
-pub const CONSENSUS_DB_FORMAT_VERSION: u32 = 1;
+/// and headers, signed local tips. 2: dead-leader skip (docs/plans/dead-leader-skip.md): stored
+/// validator sets may carry a leader-excluded set after the legacy bytes (a format-1 build's
+/// borsh `deserialize` would drop it without error and pick other leaders), a pending update with
+/// exclusions has its own status tag, and commit manifests may carry the leader evidence
+/// envelope. Stores have no in-place migration: a store of another format is refused at boot
+/// (torus-node `open_node_dbs`), and the data dir must be started fresh.
+pub const CONSENSUS_DB_FORMAT_VERSION: u32 = 2;
 
 // Fields of Block
 pub const BLOCK_HEIGHT: [u8; 1] = [0];

@@ -226,7 +226,8 @@ recommended.
 (an old record no longer decodes), and every stored PC / TC / NEC was signed over the untagged layout (each fails
 `is_correct` under the tagged one). Without a check an old data dir would boot and stall: every proposal on an old
 justify and every TC over an old high QC fails verification, and the algorithm thread only logs it. So the block
-tree records `CONSENSUS_DB_FORMAT` (variable 25, `CONSENSUS_DB_FORMAT_VERSION` = 1) at `initialize`, and torus-node's
+tree records `CONSENSUS_DB_FORMAT` (variable 25, `CONSENSUS_DB_FORMAT_VERSION` = 1; 2 since dead-leader skip,
+docs/plans/dead-leader-skip.md §3 P0.0) at `initialize`, and torus-node's
 `open_node_dbs` refuses an initialized consensus DB of any other format (absent = pre-phase-C) before writing
 anything: start from a fresh data dir (docs/node-operator-guide.md, "Consensus DB format"). There is no migration;
 only local devnets exist.

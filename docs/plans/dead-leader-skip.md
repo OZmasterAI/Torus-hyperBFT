@@ -136,6 +136,18 @@ The hotstuff_rs `ValidatorSet` and update encodings are genesis-bound; P0.0 bits
 gate hotstuff_rs formats (same as TC doc §3). A1-A3 are execution logic and can be gated by a P0.0 feature if they
 land after genesis.
 
+**Consensus DB format 2 (s136, on the TC set).** `CONSENSUS_DB_FORMAT_VERSION` goes from 1 to 2: a format-1 build
+reads a stored validator set with borsh `deserialize`, which ignores the trailing leader-excluded set (it would name
+other leaders than its peers without an error), and cannot decode the `PendingWithLeaderExclusions` status tag; a
+format-2 build on a format-1 store would execute committed heights without leader evidence (fail-stop) and without
+`leader_stats:` history (another state than nodes that ran from genesis). Pre-genesis, so no migration: fresh data
+dirs. With K = 0 the stored bytes are the format-1 bytes except the format key.
+
+**Manifest height guard (Codex P3 on 0f3f6524).** A plain manifest starts with its height (u64 LE); heights whose
+bytes spell the envelope tag (`0xffff01564543514c` is `MANIFEST_EVIDENCE_V1`) would read back as an envelope.
+`manifest_value` refuses a plain manifest from height 2^48 on (and any datum shaped like an envelope); the commit
+hook then writes no manifest, as on a failed write.
+
 ## 4. Test plan
 
 - **Unit (hotstuff_rs):** `select_leader` never returns an excluded validator; empty set = identical schedule to
