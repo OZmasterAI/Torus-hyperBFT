@@ -2837,12 +2837,15 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
     /// overlay reads for a trader with nothing pending. `None` (read the
     /// overlay): no records, the trader is dirty, or it holds an irregular
     /// row.
-    fn resident_positions(&self, trader: &Address) -> Option<&'a [torus_core::position::Position]> {
+    ///
+    /// s80 users-position-key-index: as a [`users::Rec`] (its keys searched
+    /// when the record set keeps them).
+    fn resident_positions(&self, trader: &Address) -> Option<users::Rec<'a>> {
         let records = self.sums?.records.as_deref()?;
         if self.dirty(trader) {
             return None;
         }
-        records.get(trader)
+        records.rec(trader)
     }
 
     /// `trader`'s position in `market_id`: C7's record when clean, else the
@@ -2852,10 +2855,24 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
         trader: &Address,
         market_id: MarketId,
     ) -> Result<Option<torus_core::position::Position>, CoreError> {
-        let Some(ps) = self.resident_positions(trader) else {
+        self.get_position_in(self.resident_positions(trader), trader, market_id)
+    }
+
+    /// s80 users-position-key-index (hoist): [`Self::get_position`] with
+    /// `trader`'s [`Self::resident_positions`] already read (`rec`), so a
+    /// caller reading many markets of one trader pays the dirty probe and
+    /// the record lookup once. `rec` must be this reader's answer for
+    /// `trader` with no position write since (Phase 2 writes none).
+    fn get_position_in(
+        &self,
+        rec: Option<users::Rec<'a>>,
+        trader: &Address,
+        market_id: MarketId,
+    ) -> Result<Option<torus_core::position::Position>, CoreError> {
+        let Some(rec) = rec else {
             return self.positions.get_position(trader, market_id);
         };
-        let p = users::find(ps, market_id).cloned();
+        let p = rec.find(market_id).cloned();
         #[cfg(test)]
         if let Some(s) = self.sums {
             bump(&s.counters.records);
@@ -3105,16 +3122,16 @@ impl<T: StateBackend> MakerAccountSource for AccountReader<'_, T> {
 /// in their sender's state, and the latest sender's state is held out of the
 /// map ([`Self::state`]).
 #[derive(Default)]
-struct SenderFold {
-    senders: HashMap<Address, SenderState>,
+struct SenderFold<'r> {
+    senders: HashMap<Address, SenderState<'r>>,
     /// Item 6 cut 2: the previous order's sender and its state, out of
     /// `senders`. A PlaceOrderBatch's orders, and a sender's actions in a
     /// sorted list, are adjacent, so most orders need no map lookup.
-    cur: Option<(Address, SenderState)>,
+    cur: Option<(Address, SenderState<'r>)>,
 }
 
 /// Item 6 M1: one sender's Phase-2 state in a [`SenderFold`].
-struct SenderState {
+struct SenderState<'r> {
     /// O1: the sender's balance as Phase 2 left it (read through on first
     /// use; `None` until read, or after a failed read — retried), and
     /// whether Phase 2 changed it ([`BalanceCache`] semantics).
@@ -3149,6 +3166,11 @@ struct SenderState {
     /// Phase 3 gives its pool (was `d2_pool_takers`, a pass over the
     /// prepared orders: the same first order).
     pool: Option<MarketId>,
+    /// s80 users-position-key-index (hoist): the sender's record as the
+    /// Phase-2 reader reads it ([`AccountReader::resident_positions`];
+    /// outer `None`: not read yet). Phase 2 writes no position and the
+    /// batch reader's dirty set is frozen, so one read serves every market.
+    rec: Option<Option<users::Rec<'r>>>,
 }
 
 /// F1: (projected signed position, valuation price): the pre-batch
@@ -3335,7 +3357,7 @@ mod projections_tests {
     }
 }
 
-impl SenderFold {
+impl<'r> SenderFold<'r> {
     /// Pre-sized: `senders` expected.
     fn with_capacity(senders: usize) -> Self {
         Self {
@@ -3346,7 +3368,7 @@ impl SenderFold {
 
     /// `sender`'s state (default when new), held out of the map until the
     /// next order of another sender puts it back.
-    fn state(&mut self, sender: &Address) -> &mut SenderState {
+    fn state(&mut self, sender: &Address) -> &mut SenderState<'r> {
         if !matches!(&self.cur, Some((a, _)) if a == sender) {
             if let Some((a, st)) = self.cur.take() {
                 self.senders.insert(a, st);
@@ -3397,7 +3419,7 @@ impl SenderFold {
     }
 }
 
-impl Default for SenderState {
+impl Default for SenderState<'_> {
     fn default() -> Self {
         Self {
             balance: None,
@@ -3409,11 +3431,12 @@ impl Default for SenderState {
             open_slots: None,
             proj: Projections::default(),
             pool: None,
+            rec: None,
         }
     }
 }
 
-impl SenderState {
+impl SenderState<'_> {
     /// [`BalanceCache::load`] on the sender's own entry (`slot` =
     /// [`Self::balance`]; a field borrow, so the other fields stay usable).
     fn load_balance<'s, T: StateBackend>(
@@ -9956,12 +9979,12 @@ impl NativeExecutor {
     /// else [`unsplit_reject_label`] (the outcome's reason and message are
     /// the same).
     #[allow(clippy::too_many_arguments)]
-    fn prepare_one<T: StateBackend>(
-        reader: &AccountReader<'_, T>,
+    fn prepare_one<'r, T: StateBackend>(
+        reader: &AccountReader<'r, T>,
         open_at_start: &HashMap<Address, u32>,
         basis: &HashMap<usize, (FixedPoint, FixedPoint)>,
         markets: &HashMap<MarketId, Phase2Market<'_>>,
-        fold: &mut SenderFold,
+        fold: &mut SenderFold<'r>,
         i: usize,
         sender: &Address,
         params: &PlaceOrderParams,
@@ -10090,8 +10113,16 @@ impl NativeExecutor {
                     },
                 };
                 // `position_px` with the market's mark read once per call.
+                // s80 hoist: the sender's record read once per fold.
+                let rec_slot = &mut st.rec;
                 let e = match st.proj.get_or_try_insert(params.market_id, || {
-                    reader.get_position(sender, params.market_id).map(|pos| {
+                    let read = if users::pos_key_index().hoist {
+                        let rec = *rec_slot.get_or_insert_with(|| reader.resident_positions(sender));
+                        reader.get_position_in(rec, sender, params.market_id)
+                    } else {
+                        reader.get_position(sender, params.market_id)
+                    };
+                    read.map(|pos| {
                         let (signed, px) = AccountReader::<T>::signed_px(pos.as_ref(), market.mark);
                         Projection { signed, px, pre: (signed, px) }
                     })

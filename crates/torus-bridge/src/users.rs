@@ -100,6 +100,82 @@ pub(crate) type Sums = Option<Box<(u64, SumsResult)>>;
 /// with the trader's sums entry, which the callee moves on or clears.
 pub(crate) type Seen<'a> = dyn FnMut(&Address, Option<(&[Change], &[Position], &mut Sums)>) + 'a;
 
+/// s80 users-position-key-index (`TORUS_S80_POS_KEY_INDEX`, node-local, OFF
+/// by default = 29bfc705's behaviour): `keys` = each record keeps its
+/// positions' market ids in a parallel array, so a lookup binary-searches
+/// 8-byte keys (one page for ~280 positions) instead of 112-byte rows;
+/// `hoist` = Phase 2 looks a sender's record up once per fold (the dirty
+/// probe and the map probe), not once per (sender, market). `1` / `true` =
+/// both, `keys` / `hoist` = one; unset, empty, `0`, `false` = off. Read once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PosKeyIndex {
+    pub(crate) keys: bool,
+    pub(crate) hoist: bool,
+}
+
+/// s80: pure parse of `TORUS_S80_POS_KEY_INDEX` (anything else: off, warned).
+pub(crate) fn parse_pos_key_index(v: Option<&str>) -> PosKeyIndex {
+    let (keys, hoist) = match v.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("" | "0" | "false") => (false, false),
+        Some("1" | "true") => (true, true),
+        Some("keys") => (true, false),
+        Some("hoist") => (false, true),
+        Some(other) => {
+            tracing::warn!(value = other, "TORUS_S80_POS_KEY_INDEX: not 1, true, keys, hoist, 0 or false; off");
+            (false, false)
+        }
+    };
+    PosKeyIndex { keys, hoist }
+}
+
+/// s80: the process's `TORUS_S80_POS_KEY_INDEX`, read (and logged) once.
+pub(crate) fn pos_key_index() -> PosKeyIndex {
+    static FLAG: std::sync::OnceLock<PosKeyIndex> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        let f = parse_pos_key_index(std::env::var("TORUS_S80_POS_KEY_INDEX").ok().as_deref());
+        tracing::info!(
+            "TORUS_S80_POS_KEY_INDEX on={} keys={} hoist={}",
+            f.keys || f.hoist,
+            f.keys,
+            f.hoist
+        );
+        f
+    })
+}
+
+/// s80: [`Users::key_index`], defaulting to the process flag.
+#[derive(Clone, Copy, Debug)]
+struct KeyIndexOn(bool);
+
+impl Default for KeyIndexOn {
+    fn default() -> Self {
+        Self(pos_key_index().keys)
+    }
+}
+
+/// s80 users-position-key-index: a record's positions with their market ids
+/// (`keys` empty: the key index is off, or no positions).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Rec<'a> {
+    keys: &'a [MarketId],
+    ps: &'a [Position],
+}
+
+impl<'a> Rec<'a> {
+    /// No positions (a trader without rows).
+    pub(crate) const EMPTY: Rec<'static> = Rec { keys: &[], ps: &[] };
+
+    /// The position in `market_id` ([`find`], over the keys when kept).
+    #[inline]
+    pub(crate) fn find(&self, market_id: MarketId) -> Option<&'a Position> {
+        if self.keys.is_empty() {
+            return find(self.ps, market_id);
+        }
+        debug_assert_eq!(self.keys.len(), self.ps.len(), "keys in step");
+        self.keys.binary_search(&market_id).ok().map(|i| &self.ps[i])
+    }
+}
+
 /// One regular trader's record: its rows of both CFs, decoded.
 #[derive(Debug, Default)]
 pub(crate) struct UserState {
@@ -109,6 +185,9 @@ pub(crate) struct UserState {
     pub(crate) cum_volume: Option<FixedPoint>,
     /// Market order (= key order), without growth slack after a rebuild.
     pub(crate) positions: Vec<Position>,
+    /// s80 users-position-key-index: `positions`' market ids, in step, when
+    /// the record set keeps the key index ([`Users::key_index`]); else empty.
+    pub(crate) keys: Vec<MarketId>,
     /// Phase 4 step 3 (plan section 3, "Sums"; was C3's `SumsCache`): the
     /// trader's margin sums over these positions, tagged with the mark
     /// version they are valued at. Read only while the tag equals the
@@ -122,6 +201,59 @@ pub(crate) struct UserState {
 impl UserState {
     fn is_empty(&self) -> bool {
         self.balance.is_none() && self.cum_volume.is_none() && self.positions.is_empty()
+    }
+
+    /// s80: its positions as a [`Rec`].
+    #[inline]
+    pub(crate) fn rec(&self) -> Rec<'_> {
+        Rec { keys: &self.keys, ps: &self.positions }
+    }
+
+    /// s80: the index of `m` in `positions` (`Err`: where it would go), over
+    /// the keys when `on`.
+    #[inline]
+    fn search(&self, on: bool, m: MarketId) -> Result<usize, usize> {
+        if on {
+            self.keys.binary_search(&m)
+        } else {
+            self.positions.binary_search_by_key(&m, |q| q.market_id)
+        }
+    }
+
+    /// s80: `p` inserted at `i` (keys too when `on`).
+    #[inline]
+    fn insert_at(&mut self, on: bool, i: usize, p: Position) {
+        if on {
+            self.keys.insert(i, p.market_id);
+        }
+        self.positions.insert(i, p);
+    }
+
+    /// s80: the position at `i`, removed (keys too when `on`).
+    #[inline]
+    fn remove_at(&mut self, on: bool, i: usize) -> Position {
+        if on {
+            self.keys.remove(i);
+        }
+        self.positions.remove(i)
+    }
+
+    /// s80: `keys` rebuilt from `positions` (`on`), or dropped.
+    fn sync_keys(&mut self, on: bool) {
+        self.keys = if on {
+            self.positions.iter().map(|p| p.market_id).collect()
+        } else {
+            Vec::new()
+        };
+    }
+
+    /// s80: `keys` == `positions`' market ids (`on`), else empty.
+    fn keys_in_step(&self, on: bool) -> bool {
+        if on {
+            self.keys.len() == self.positions.len() && self.keys.iter().zip(&self.positions).all(|(k, p)| *k == p.market_id)
+        } else {
+            self.keys.is_empty()
+        }
     }
 
     /// Phase 4 step 2: its rows and their key + value bytes (every regular
@@ -192,6 +324,10 @@ pub(crate) struct Users {
     /// Phase 5 step 1: the keys [`UsersMut`] changed since the last drain.
     #[cfg_attr(not(test), allow(dead_code))]
     dirty: Dirty,
+    /// s80 users-position-key-index: every record keeps `keys`
+    /// ([`UserState::keys`]); the process flag unless set
+    /// ([`Self::set_key_index`]).
+    key_index: KeyIndexOn,
 }
 
 type Holders = HashMap<MarketId, HashSet<Address>>;
@@ -275,7 +411,7 @@ fn put(map: &mut BTreeMap<Vec<u8>, Vec<u8>>, key: &[u8], value: Option<&[u8]>) {
 
 /// `t`'s record from its rows (`Ok(None)`: no rows), `Err`: an irregular
 /// row (the rows come back).
-fn classify(raw: RawRows) -> Result<Option<UserState>, RawRows> {
+fn classify(raw: RawRows, key_index: bool) -> Result<Option<UserState>, RawRows> {
     let mut u = UserState::default();
     for (k, v) in &raw.positions {
         match decode(k, v) {
@@ -297,6 +433,7 @@ fn classify(raw: RawRows) -> Result<Option<UserState>, RawRows> {
         return Ok(None);
     }
     u.positions.shrink_to_fit();
+    u.sync_keys(key_index);
     Ok(Some(u))
 }
 
@@ -320,6 +457,7 @@ impl Users {
     /// Every trader of the rows `pos` (positions CF) and `bal` (balances CF).
     fn build_maps(pos: &BTreeMap<Vec<u8>, Vec<u8>>, bal: &BTreeMap<Vec<u8>, Vec<u8>>) -> Self {
         let mut out = Self::default();
+        let key_index = out.key_index.0;
         // Traders with an irregular row: their rows are copied raw below.
         let mut bad: HashSet<Address> = HashSet::default();
         let mut cur: Option<(Address, Option<Vec<Position>>)> = None;
@@ -327,7 +465,9 @@ impl Users {
             Some((t, Some(mut ps))) => {
                 // ~112 bytes per position, without the build's growth slack.
                 ps.shrink_to_fit();
-                out.map.entry(t).or_default().positions = ps;
+                let u = out.map.entry(t).or_default();
+                u.positions = ps;
+                u.sync_keys(key_index);
             }
             Some((t, None)) => {
                 bad.insert(t);
@@ -452,7 +592,7 @@ impl Users {
 
     /// `t`'s rows (`raw`) as its record, opaque, or nothing.
     fn set(&mut self, t: Address, raw: RawRows) {
-        match classify(raw) {
+        match classify(raw, self.key_index.0) {
             Ok(Some(u)) => {
                 self.opaque.remove(&t);
                 self.map.insert(t, u);
@@ -583,7 +723,8 @@ impl Users {
         if let Some(x) = volume {
             u.cum_volume = x;
         }
-        let ps = &mut u.positions;
+        // s80: the key index follows every insert / remove of a position.
+        let on = self.key_index.0;
         let mut keyed = false;
         for (&(k, _), p) in group.iter().zip(decoded.drain(..)) {
             keyed |= k.len() == KEY;
@@ -592,9 +733,9 @@ impl Users {
                 None if k.len() != KEY => {}
                 None => {
                     let m = market_of(k);
-                    if let Ok(i) = ps.binary_search_by_key(&m, |p| p.market_id) {
+                    if let Ok(i) = u.search(on, m) {
                         Self::set_holder(&mut self.holders, t, m, false);
-                        let old = ps.remove(i);
+                        let old = u.remove_at(on, i);
                         if collect {
                             changes.push((Some(old), None));
                         }
@@ -602,11 +743,11 @@ impl Users {
                 }
                 Some(p) => {
                     let new = collect.then(|| p.clone());
-                    let old = match ps.binary_search_by_key(&p.market_id, |q| q.market_id) {
-                        Ok(i) => Some(std::mem::replace(&mut ps[i], p)),
+                    let old = match u.search(on, p.market_id) {
+                        Ok(i) => Some(std::mem::replace(&mut u.positions[i], p)),
                         Err(i) => {
                             Self::set_holder(&mut self.holders, t, p.market_id, true);
-                            ps.insert(i, p);
+                            u.insert_at(on, i, p);
                             None
                         }
                     };
@@ -707,6 +848,35 @@ impl Users {
             return None;
         }
         Some(self.map.get(trader).map_or(&[], |u| u.positions.as_slice()))
+    }
+
+    /// s80 users-position-key-index: [`Self::get`] with the record's keys
+    /// (its lookups search them when the key index is on).
+    #[inline]
+    pub(crate) fn rec(&self, trader: &Address) -> Option<Rec<'_>> {
+        if self.opaque_of(trader).is_some() {
+            return None;
+        }
+        Some(self.map.get(trader).map_or(Rec::EMPTY, UserState::rec))
+    }
+
+    /// s80: the key index on / off for this record set (tests and
+    /// differential runs; the node takes the process flag): every record's
+    /// keys rebuilt or dropped.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_key_index(&mut self, on: bool) {
+        self.key_index = KeyIndexOn(on);
+        for u in self.map.values_mut() {
+            u.sync_keys(on);
+        }
+    }
+
+    /// s80: every record's keys in step with its positions (index on), or
+    /// none kept (off).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn keys_in_step(&self) -> bool {
+        let on = self.key_index.0;
+        self.map.values().all(|u| u.keys_in_step(on))
     }
 
     /// Phase 4 step 3: `trader`'s sums entry if it is tagged `version` (an
@@ -825,7 +995,10 @@ impl Users {
     pub(crate) fn self_consistent(&self) -> bool {
         let rows = |cf| self.encode_rows(cf);
         let cold = Self::build_maps(&rows(CF_NATIVE_POSITIONS), &rows(CF_NATIVE_BALANCES));
-        self.same_as(&cold) && (self.rows, self.bytes) == self.recount() && (cold.rows, cold.bytes) == (self.rows, self.bytes)
+        self.same_as(&cold)
+            && (self.rows, self.bytes) == self.recount()
+            && (cold.rows, cold.bytes) == (self.rows, self.bytes)
+            && self.keys_in_step()
     }
 }
 
@@ -1006,11 +1179,12 @@ impl UsersMut<'_> {
             return;
         }
         let old = users.map.get(&t).map_or((0, 0), UserState::footprint);
+        let on = users.key_index.0;
         let u = users.map.entry(t).or_default();
-        match u.positions.binary_search_by_key(&m, |q| q.market_id) {
+        match u.search(on, m) {
             Ok(i) => u.positions[i] = p,
             Err(i) => {
-                u.positions.insert(i, p);
+                u.insert_at(on, i, p);
                 Users::set_holder(&mut users.holders, t, m, true);
                 users.traders.insert(t);
             }
@@ -1027,14 +1201,15 @@ impl UsersMut<'_> {
             users.reload(*t, &[(&position_key(t, m), None)], BalanceDelta::default());
             return;
         }
+        let on = users.key_index.0;
         let Some(u) = users.map.get_mut(t) else {
             return;
         };
-        let Ok(i) = u.positions.binary_search_by_key(&m, |q| q.market_id) else {
+        let Ok(i) = u.search(on, m) else {
             return;
         };
         let old = u.footprint();
-        u.positions.remove(i);
+        u.remove_at(on, i);
         Users::set_holder(&mut users.holders, *t, m, false);
         if u.positions.is_empty() {
             users.traders.remove(t);
@@ -1263,7 +1438,7 @@ impl Users {
         if key.len() != KEY {
             return None;
         }
-        find(&self.map.get(&t)?.positions, market_of(key)).map(Row::Position)
+        self.map.get(&t)?.rec().find(market_of(key)).map(Row::Position)
     }
 
     /// The balances row at `key`, as R held it.
@@ -1395,12 +1570,12 @@ impl Users {
 impl TypedRows for Users {
     #[inline]
     fn position(&self, trader: &Address, market_id: MarketId) -> Option<Option<Position>> {
-        let Some(ps) = self.get(trader) else {
+        let Some(rec) = self.rec(trader) else {
             self.count_typed(None);
             return None;
         };
         self.count_typed(Some(0));
-        Some(find(ps, market_id).cloned())
+        Some(rec.find(market_id).cloned())
     }
 
     #[inline]

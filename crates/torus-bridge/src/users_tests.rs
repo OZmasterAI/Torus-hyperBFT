@@ -555,7 +555,9 @@ fn users_size_of_pins() {
     let (user, position) = (std::mem::size_of::<UserState>(), std::mem::size_of::<Position>());
     println!("USERS size_of UserState {user} Position {position}");
     assert_eq!(position, 112, "Position");
-    assert_eq!(user, 112, "UserState");
+    // s80 users-position-key-index: + the `keys` Vec (24 B, padded to the
+    // 16-B alignment; empty, no allocation, while the key index is off).
+    assert_eq!(user, 144, "UserState");
 }
 
 /// A trader without rows reads as no positions; `find` misses a market it
@@ -2725,4 +2727,149 @@ fn ubench_dirty_set_btree_vs_hash_sort() {
         btree,
         hash
     );
+}
+
+/// s80 users-position-key-index (`TORUS_S80_POS_KEY_INDEX`): with the key
+/// index on, every record keeps `keys` == its positions' market ids (off:
+/// empty), through cold builds, `apply` (in place and re-decoded traders,
+/// opaque ones coming and going) and the typed / raw `UsersMut` calls; and
+/// every lookup through it (`rec().find`, `TypedRows::position`, the
+/// positions source's `get`) answers exactly what the record set without it
+/// answers, for every trader and market (held, missing, out of range).
+#[test]
+fn pos_key_index_keys_in_step_and_lookups_equal() {
+    let lookups_equal = |on: &Users, off: &Users, tag: &str| {
+        assert!(on.same_as(off), "{tag}: records with / without the key index");
+        assert!(on.keys_in_step(), "{tag}: key index on: keys == market ids");
+        assert!(off.keys_in_step(), "{tag}: key index off: no keys");
+        let mut traders: BTreeSet<Address> = (0..=TRADERS).map(trader).collect();
+        traders.extend(on.map.keys().copied());
+        for t in &traders {
+            assert_eq!(on.get(t).is_some(), off.get(t).is_some(), "{tag}: {t} opaque");
+            for m in (0..=MARKETS + 1).chain([MarketId::MAX]) {
+                let want = off.get(t).map(|ps| find(ps, m).map(bytes));
+                assert_eq!(on.rec(t).map(|r| r.find(m).map(bytes)), want, "{tag}: {t} rec find {m}");
+                assert_eq!(off.rec(t).map(|r| r.find(m).map(bytes)), want, "{tag}: {t} rec find {m} (off)");
+                assert_eq!(
+                    TypedRows::position(on, t, m).map(|p| p.as_ref().map(bytes)),
+                    TypedRows::position(off, t, m).map(|p| p.as_ref().map(bytes)),
+                    "{tag}: {t} typed position {m}"
+                );
+                let key = position_key(t, m);
+                assert_eq!(
+                    ResidentSource::get(on, POSITIONS, &key),
+                    ResidentSource::get(off, POSITIONS, &key),
+                    "{tag}: {t} source get {m}"
+                );
+            }
+        }
+    };
+    let mut ops = 0usize;
+    for seed in 1..=6u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let mut rng = Lcg(seed * 0x2545_F491);
+        for _ in 0..4 {
+            let o = NativeStateOverlay::new(db.clone());
+            random_block(&o, &mut rng);
+            random_balance_block(&o, &mut rng);
+            o.flush(&db).unwrap();
+        }
+        let rows = ResidentRows::build(&db).unwrap();
+        let mut on = Users::build(&rows);
+        on.set_key_index(true);
+        let mut off = Users::build(&rows);
+        off.set_key_index(false);
+        lookups_equal(&on, &off, &format!("seed {seed} start"));
+        for h in 1..=80 {
+            let o = NativeStateOverlay::new(db.clone());
+            random_block(&o, &mut rng);
+            random_balance_block(&o, &mut rng);
+            let delta = o.own_pending_delta();
+            o.flush(&db).unwrap();
+            on.apply(&delta, None);
+            off.apply(&delta, None);
+            lookups_equal(&on, &off, &format!("seed {seed} block {h}"));
+            // The write-through calls (Phase 5): typed and raw, every shape.
+            for _ in 0..8 {
+                let t = trader(rng.below(TRADERS));
+                let op = p5_random_op(&mut rng, t);
+                assert_eq!(op.on_users(&mut on), op.on_users(&mut off), "seed {seed} block {h}: {op:?}");
+                ops += 1;
+            }
+            on.drain_dirty();
+            off.drain_dirty();
+            lookups_equal(&on, &off, &format!("seed {seed} block {h} ops"));
+            assert!(on.self_consistent(), "seed {seed} block {h}: self-consistent with keys");
+        }
+        // A cold build with the index on keeps keys too.
+        let mut cold = Users::build(&rows);
+        cold.set_key_index(false);
+        cold.set_key_index(true);
+        assert!(cold.keys_in_step(), "seed {seed}: index turned on after the build");
+    }
+    assert!(ops > 3_000, "non-vacuous: {ops}");
+}
+
+/// s80 users-position-key-index: one trader holding many markets (the bench
+/// shape, ~280 positions) through random inserts / removes, both ways.
+#[test]
+fn pos_key_index_many_markets_per_trader() {
+    let mut on = Users::build(&ResidentRows::default());
+    on.set_key_index(true);
+    let mut off = Users::build(&ResidentRows::default());
+    off.set_key_index(false);
+    let mut rng = Lcg(77);
+    let ts = [trader(1), trader(2), trader(3)];
+    for step in 0..20_000u64 {
+        let t = ts[rng.below(3) as usize];
+        let m = 1 + rng.below(400);
+        let op = if rng.below(3) == 0 {
+            P5Op::RemovePosition(t, m)
+        } else {
+            P5Op::SetPosition(position(t, m, step % 997, rng.below(2) == 0))
+        };
+        op.on_users(&mut on);
+        op.on_users(&mut off);
+        if step % 1_000 == 999 {
+            assert!(on.keys_in_step() && off.keys_in_step(), "step {step}");
+            for t in &ts {
+                for m in 0..=401 {
+                    assert_eq!(
+                        on.rec(t).map(|r| r.find(m).map(bytes)),
+                        off.get(t).map(|ps| find(ps, m).map(bytes)),
+                        "step {step} {t} {m}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(on.get(&ts[0]).unwrap().len() > 200, "many markets per trader");
+}
+
+/// s80: `TORUS_S80_POS_KEY_INDEX` parses `1` / `true` as both parts, `keys`
+/// and `hoist` as one, unset / empty / `0` / `false` / junk as off; a new
+/// record set takes the process flag (printed, so a flag-on run shows it).
+#[test]
+fn pos_key_index_flag_parse_and_default() {
+    let both = PosKeyIndex { keys: true, hoist: true };
+    for (v, want) in [
+        (None, PosKeyIndex::default()),
+        (Some(""), PosKeyIndex::default()),
+        (Some("0"), PosKeyIndex::default()),
+        (Some("false"), PosKeyIndex::default()),
+        (Some("junk"), PosKeyIndex::default()),
+        (Some("1"), both),
+        (Some(" TRUE "), both),
+        (Some("keys"), PosKeyIndex { keys: true, hoist: false }),
+        (Some("hoist"), PosKeyIndex { keys: false, hoist: true }),
+    ] {
+        assert_eq!(parse_pos_key_index(v), want, "{v:?}");
+    }
+    let flag = pos_key_index();
+    let env = std::env::var("TORUS_S80_POS_KEY_INDEX").ok();
+    println!("S80 TORUS_S80_POS_KEY_INDEX env={env:?} flag={flag:?}");
+    assert_eq!(flag, parse_pos_key_index(env.as_deref()));
+    let u = Users::build(&ResidentRows::default());
+    assert_eq!(u.key_index.0, flag.keys, "a new record set takes the process flag");
 }
