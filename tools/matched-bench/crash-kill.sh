@@ -198,7 +198,7 @@ crash_log_field() {
 # "CRITICAL SAFETY VIOLATION ... conflicting blocks ... Latching fail-stop");
 # INFO/WARN only MENTION it, e.g. the startup line
 #   INFO torus_consensus::state_hash: running state hash fail-stop
-#        (TORUS_STATE_HASH_FAILSTOP) on=false
+#        (TORUS_STATE_HASH_FAILSTOP) on=false   (on=true by default since s136)
 # which bench 8l (perf doc 107.6) counted as a fail-stop and so REJECTed a
 # valid crash cell. The level is the FIRST TRACE|DEBUG|INFO|WARN|ERROR word on
 # the line after ANSI colour codes are stripped: the fmt layer prints it right
