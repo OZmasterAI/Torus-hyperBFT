@@ -2,9 +2,13 @@
 //! input, from the committed block's justify QC.
 //!
 //! * At commit (`on_committed_block`, consensus thread) the block's justify QC is reduced to a
-//!   [`LeaderEvidence`] and written to a NODE-LOCAL row (`leader_qc:` ‖ height, in
-//!   `CF_CONSENSUS_META`, outside every hashed prefix) before the block is handed to execution.
-//!   The QC is part of the committed block, so every replica writes the same evidence.
+//!   [`LeaderEvidence`] and carried in the height's commit manifest ([`manifest_value`], the
+//!   hook's one durable write, consensus DB), then written to a NODE-LOCAL row (`leader_qc:` ‖
+//!   height, in `CF_CONSENSUS_META`, outside every hashed prefix) in the block's header + body
+//!   batch ([`put_leader_evidence`]) before the block is executed. A durable manifest or a
+//!   durable header each imply durable evidence; a height parked from its manifest after a
+//!   crash takes the evidence from it ([`split_manifest`]). The QC is part of the committed
+//!   block, so every replica writes the same evidence.
 //! * Execution of that height ([`block_leader_rows`]) reads the row (also after a crash: the
 //!   boot replay re-executes from durable rows and finds it), turns it into a
 //!   [`BlockAttribution`] with leader(v) = `select_leader` over the INSTALLED set (members and
@@ -71,7 +75,76 @@ pub fn leader_qc_key(height: u64) -> Vec<u8> {
     key
 }
 
-/// Write `height`'s evidence row (consensus thread, at commit, before dispatch).
+/// The leader evidence envelope of a commit manifest, version 1:
+/// `MANIFEST_EVIDENCE_V1` ‖ evidence length (u32 LE) ‖ borsh(evidence) ‖ datum.
+///
+/// The commit hook's only durable write is the manifest (consensus DB, the WAL of hotstuff's
+/// delivered height), so the evidence rides in it: a durable manifest implies durable
+/// evidence, and a parked height (boot, FIX 6 / F-1) gets its evidence from the manifest it is
+/// parked from. A plain manifest is the datum verbatim (bincode of a `TorusBlock` or
+/// `CompactBlock`, both starting with the header's height, u64 LE); read as that height, the
+/// tag's last two bytes (`0xff 0xff`) put it above 2^64 - 2^48, which no committed height
+/// reaches, so the two never collide. Feature off (K = 0) writes plain manifests, byte for
+/// byte as before; old manifests decode as plain.
+pub const MANIFEST_EVIDENCE_V1: [u8; 8] = [b'L', b'Q', b'C', b'E', b'V', 1, 0xff, 0xff];
+
+/// The prefix every envelope version shares (the version is byte 5).
+fn is_envelope(value: &[u8]) -> bool {
+    value.len() >= 8 && value[..5] == MANIFEST_EVIDENCE_V1[..5] && value[6..8] == [0xff, 0xff]
+}
+
+/// The manifest value for `datum`: the datum verbatim without `evidence`, else the envelope.
+pub fn manifest_value<'a>(
+    datum: &'a [u8],
+    evidence: Option<&LeaderEvidence>,
+) -> std::borrow::Cow<'a, [u8]> {
+    let Some(evidence) = evidence else {
+        return std::borrow::Cow::Borrowed(datum);
+    };
+    let ev = borsh::to_vec(evidence).expect("borsh into a Vec cannot fail");
+    let mut out = Vec::with_capacity(12 + ev.len() + datum.len());
+    out.extend_from_slice(&MANIFEST_EVIDENCE_V1);
+    out.extend_from_slice(&(ev.len() as u32).to_le_bytes());
+    out.extend_from_slice(&ev);
+    out.extend_from_slice(datum);
+    std::borrow::Cow::Owned(out)
+}
+
+/// A manifest value split into its leader evidence (`None`: a plain manifest) and its datum.
+/// `Err` for an envelope of an unknown version or a truncated one.
+pub fn split_manifest(value: &[u8]) -> Result<(Option<LeaderEvidence>, &[u8]), String> {
+    if !is_envelope(value) {
+        return Ok((None, value));
+    }
+    if value[5] != MANIFEST_EVIDENCE_V1[5] {
+        return Err(format!("manifest evidence envelope version {}", value[5]));
+    }
+    let len = value
+        .get(8..12)
+        .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")) as usize)
+        .ok_or("manifest evidence envelope: truncated length")?;
+    let ev = value
+        .get(12..12 + len)
+        .ok_or("manifest evidence envelope: truncated evidence")?;
+    let evidence = LeaderEvidence::try_from_slice(ev)
+        .map_err(|e| format!("manifest evidence envelope: {e}"))?;
+    Ok((Some(evidence), &value[12 + len..]))
+}
+
+/// Put `height`'s evidence row into `batch` (the commit-persist writer's header + body batch:
+/// a durable header implies durable evidence, also once the manifest is pruned).
+pub fn put_leader_evidence(
+    batch: &mut rocksdb::WriteBatch,
+    meta_cf: &rocksdb::ColumnFamily,
+    height: u64,
+    evidence: &LeaderEvidence,
+) {
+    let bytes = borsh::to_vec(evidence).expect("borsh into a Vec cannot fail");
+    batch.put_cf(meta_cf, leader_qc_key(height), bytes);
+}
+
+/// Write `height`'s evidence row on its own (tests: plant the row a committed height's header
+/// batch writes).
 pub fn persist_leader_evidence<B: StateBackend>(
     db: &B,
     height: u64,
@@ -466,6 +539,44 @@ mod tests {
         assert_eq!(a.misses.len(), 19);
         assert!(!a.misses.contains(&x), "excluded: never a leader");
         assert_ne!(a.success, Some(x));
+    }
+
+    /// The manifest envelope: with evidence it round-trips (evidence + datum); without, the
+    /// manifest is the datum verbatim, and a plain datum (bincode of a block, height first)
+    /// splits as no evidence + itself, at any height, `u64::MAX - 2^48` included (the highest
+    /// height whose bytes come nearest the tag). Unknown versions and truncations are errors.
+    #[test]
+    fn manifest_envelope_round_trips_and_plain_manifests_pass_through() {
+        let e = ev(9, QC_GENERIC, vec![true, false, true]);
+        let datum = b"some committed datum".to_vec();
+        let off = manifest_value(&datum, None);
+        assert!(matches!(off, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(&*off, datum.as_slice());
+        let on = manifest_value(&datum, Some(&e));
+        assert_eq!(on[..8], MANIFEST_EVIDENCE_V1);
+        assert_eq!(
+            split_manifest(&on).unwrap(),
+            (Some(e.clone()), datum.as_slice())
+        );
+        assert_eq!(split_manifest(&datum).unwrap(), (None, datum.as_slice()));
+        assert_eq!(split_manifest(&[]).unwrap(), (None, &[][..]));
+
+        // A plain datum: bincode (fixint, LE) of a block, its header's height first.
+        for height in [0u64, 1, 5, 1 << 40, u64::MAX - (1 << 48)] {
+            let mut plain = bincode::serialize(&height).unwrap();
+            plain.extend_from_slice(b"rest of the block");
+            assert_eq!(
+                split_manifest(&plain).unwrap(),
+                (None, plain.as_slice()),
+                "height {height}"
+            );
+        }
+
+        let mut v2 = on.to_vec();
+        v2[5] = 2;
+        assert!(split_manifest(&v2).is_err(), "unknown version");
+        assert!(split_manifest(&on[..10]).is_err(), "truncated length");
+        assert!(split_manifest(&on[..14]).is_err(), "truncated evidence");
     }
 
     /// Execution's row set: the evidence row is required (missing = error, never a guess), and

@@ -663,6 +663,8 @@ impl CommittedBlockMsg {
 /// go back with it (the DA body GC's restore source then).
 struct PersistJob {
     block: TorusBlock,
+    /// Dead-leader skip: the block's leader evidence, written in the header's batch.
+    evidence: Option<crate::leader_skip::LeaderEvidence>,
     ticket: PersistTicket,
 }
 
@@ -728,6 +730,7 @@ impl CommitPersistWriter {
                     let durable = persist_committed_block_durably_timed(
                         &state_db,
                         &job.block,
+                        job.evidence.as_ref(),
                         metrics.as_deref(),
                         false,
                     );
@@ -809,11 +812,17 @@ impl CommitPersistWriter {
         ));
     }
 
-    /// Queue `block`'s header + body write; the ticket fills once it returned.
-    fn submit(&self, block: TorusBlock) -> PersistTicket {
+    /// Queue `block`'s header + body write (with its leader `evidence` row, if any); the
+    /// ticket fills once it returned.
+    fn submit(
+        &self,
+        block: TorusBlock,
+        evidence: Option<crate::leader_skip::LeaderEvidence>,
+    ) -> PersistTicket {
         let ticket = PersistTicket::default();
         let job = PersistJob {
             block,
+            evidence,
             ticket: ticket.clone(),
         };
         if let Some(tx) = &self.tx {
@@ -2274,7 +2283,7 @@ impl Drop for ObserveOnDrop {
 /// same batch.
 #[cfg(test)]
 fn persist_committed_block_durably(state_db: &StateDb, block: &TorusBlock) -> DurableRows {
-    persist_committed_block_durably_timed(state_db, block, None, true)
+    persist_committed_block_durably_timed(state_db, block, None, None, true)
 }
 
 /// [`persist_committed_block_durably`] with the consensus-thread timers
@@ -2286,9 +2295,14 @@ fn persist_committed_block_durably(state_db: &StateDb, block: &TorusBlock) -> Du
 /// pre-T5.3 layout), so its row is deleted in the same batch as the body.
 /// With the manifest in the consensus DB the caller hands the height to the
 /// [`ManifestPruner`], which deletes the row only after a state-WAL sync.
+///
+/// `evidence` (dead-leader skip on): the block's leader evidence row goes into the same
+/// batch, so a durable header implies durable evidence. The manifest carries it until then
+/// ([`crate::leader_skip::manifest_value`]), and it goes only after this batch is synced.
 fn persist_committed_block_durably_timed(
     state_db: &StateDb,
     block: &TorusBlock,
+    evidence: Option<&crate::leader_skip::LeaderEvidence>,
     metrics: Option<&torus_telemetry::Metrics>,
     prune_manifest_in_batch: bool,
 ) -> DurableRows {
@@ -2310,6 +2324,19 @@ fn persist_committed_block_durably_timed(
             tracing::error!(%e, height = block.header.height, "FIX1a: header CF missing");
         }
         (_, None) => {}
+    }
+    if let Some(evidence) = evidence {
+        match state_db.cf_handle(CF_CONSENSUS_META) {
+            Ok(cf) => crate::leader_skip::put_leader_evidence(
+                &mut batch,
+                cf,
+                block.header.height,
+                evidence,
+            ),
+            Err(e) => {
+                tracing::error!(%e, height = block.header.height, "leader evidence: meta CF missing");
+            }
+        }
     }
 
     let encode_timer = std::time::Instant::now();
@@ -2425,6 +2452,10 @@ fn sync_committed_wal(state_db: &StateDb, enabled: bool) -> bool {
 /// consensus DB the row also shares a WAL with the HotStuff app-fed height,
 /// advanced after this callback returns, so the row cannot be lost while that
 /// advance survives (before T5.3 they sat in different WALs).
+///
+/// Dead-leader skip on: the value is the datum inside the leader evidence
+/// envelope ([`crate::leader_skip::manifest_value`]); readers split it
+/// ([`crate::leader_skip::split_manifest`]). Off: the datum verbatim.
 fn persist_commit_manifest(manifest_db: &StateDb, height: u64, datum_bytes: &[u8]) {
     if let Err(e) = manifest_db.put_cf_raw(CF_COMMIT_MANIFEST, &height.to_be_bytes(), datum_bytes) {
         tracing::error!(
@@ -2714,11 +2745,20 @@ fn load_commit_manifest(manifest_db: &StateDb, height: u64) -> Option<Vec<u8>> {
 /// needed). Only when NO manifest exists (legacy pre-fix DBs) does this fall back
 /// to `ExecSource::Durable`, which can heal solely from a local durable body.
 fn recovery_exec_source(manifest_db: &StateDb, height: u64) -> ExecSource {
-    if let Some(datum) = load_commit_manifest(manifest_db, height) {
-        if let Ok(full) = bincode::deserialize::<TorusBlock>(&datum) {
+    if let Some(value) = load_commit_manifest(manifest_db, height) {
+        // Dead-leader skip: the datum behind the leader evidence envelope (the evidence is
+        // read at dispatch, `TorusApp::take_leader_evidence`).
+        let datum = match crate::leader_skip::split_manifest(&value) {
+            Ok((_, datum)) => datum,
+            Err(e) => {
+                tracing::error!(%e, height, "crash recovery: commit manifest envelope undecodable");
+                &[]
+            }
+        };
+        if let Ok(full) = bincode::deserialize::<TorusBlock>(datum) {
             return ExecSource::Ready(full);
         }
-        if let Ok(compact) = bincode::deserialize::<CompactBlock>(&datum) {
+        if let Ok(compact) = bincode::deserialize::<CompactBlock>(datum) {
             return ExecSource::Compact(compact);
         }
         tracing::error!(
@@ -6847,8 +6887,12 @@ pub struct TorusApp {
     /// The worker died (or could not spawn) and that was logged.
     da_gc_dead_logged: bool,
     /// Dead-leader skip: the chain config whose [`ChainConfig::dead_leader_skip`] hook decides,
-    /// per committed header, whether the commit path writes the block's leader evidence row.
+    /// per committed header, whether the commit path carries the block's leader evidence.
     leader_skip_config: ChainConfig,
+    /// Dead-leader skip: the leader evidence of committed heights not yet dispatched (the
+    /// commit hook's, already durable in their manifests), taken by their header + body
+    /// batch ([`Self::take_leader_evidence`]).
+    leader_evidence: std::collections::BTreeMap<u64, crate::leader_skip::LeaderEvidence>,
     /// A DA body GC pass at least this long (ns) logs one warn line with its
     /// phases and counts `torus_da_gc_slow_passes` (`TORUS_DA_GC_SLOW_MS`,
     /// default [`crate::da_gc::DA_GC_SLOW_PASS_MS`]; read in
@@ -8057,6 +8101,7 @@ impl TorusApp {
             da_gc_inline: false,
             da_gc_dead_logged: false,
             leader_skip_config: config.clone(),
+            leader_evidence: std::collections::BTreeMap::new(),
             da_gc_slow_pass_nanos: Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::da_gc::DA_GC_SLOW_PASS_MS * 1_000_000,
             )),
@@ -10279,28 +10324,25 @@ impl App<RocksKVStore> for TorusApp {
         // durable (`dispatch_to_exec`). Without this, a SIGKILL in the
         // commit->persist window strands the hole with no way to pull bodies
         // (`missing=0`, t12-r3-full h1165).
+        //
+        // Dead-leader skip (A1): the justify QC's evidence rides in the manifest value (the
+        // same write: a durable manifest implies durable evidence, so a height parked from
+        // its manifest after a crash or power loss executes), then in the block's header +
+        // body batch (`dispatch_to_exec`, from `leader_evidence`), which execution reads.
+        // Nothing here touches the state DB (T5.3). Feature off: the manifest is the datum
+        // verbatim, as before.
+        let evidence = self
+            .leader_skip_config
+            .dead_leader_skip(&header)
+            .map(|_| crate::leader_skip::LeaderEvidence::of(&block.justify));
         {
             let _manifest_span =
                 ObserveOnDrop::new(self.metrics.clone(), |m| &m.commit_manifest_seconds);
-            persist_commit_manifest(&self.manifest_db, height, datum_bytes);
+            let value = crate::leader_skip::manifest_value(datum_bytes, evidence.as_ref());
+            persist_commit_manifest(&self.manifest_db, height, &value);
         }
-
-        // Dead-leader skip (A1): the justify QC's evidence, node-local, BEFORE the block can
-        // reach execution (which needs it, also in a crash replay: the row is in the state DB
-        // ahead of the block's header row, so a durable header implies a durable row).
-        if self.leader_skip_config.dead_leader_skip(&header).is_some() {
-            let evidence = crate::leader_skip::LeaderEvidence::of(&block.justify);
-            if let Err(e) =
-                crate::leader_skip::persist_leader_evidence(&self.state_db, height, &evidence)
-            {
-                tracing::error!(
-                    %e,
-                    height,
-                    "FATAL: dead-leader skip: leader evidence row write failed — fail-stop"
-                );
-                self.exec_failed.store(true, Ordering::SeqCst);
-                return;
-            }
+        if let Some(evidence) = evidence {
+            self.leader_evidence.insert(height, evidence);
         }
 
         // Committed: these hashes leave the in-flight window. The mempool prunes
@@ -10951,6 +10993,36 @@ impl TorusApp {
         }
     }
 
+    /// Dead-leader skip: the leader evidence of the committed `header`'s height, for its
+    /// header and body batch: the commit hook's (in memory), else its manifest's (a height
+    /// parked at boot). `None` with the feature off, or when neither has it (a height whose
+    /// header is already durable, its evidence row with it). Drops the entries up to it.
+    fn take_leader_evidence(
+        &mut self,
+        header: &torus_types::TorusBlockHeader,
+    ) -> Option<crate::leader_skip::LeaderEvidence> {
+        let height = header.height;
+        let held = self.leader_evidence.remove(&height);
+        while self
+            .leader_evidence
+            .first_key_value()
+            .is_some_and(|(h, _)| *h < height)
+        {
+            self.leader_evidence.pop_first();
+        }
+        self.leader_skip_config.dead_leader_skip(header)?;
+        held.or_else(|| {
+            let value = load_commit_manifest(&self.manifest_db, height)?;
+            match crate::leader_skip::split_manifest(&value) {
+                Ok((evidence, _)) => evidence,
+                Err(e) => {
+                    tracing::error!(%e, height, "dead-leader skip: commit manifest evidence undecodable");
+                    None
+                }
+            }
+        })
+    }
+
     /// Regime-B. Send a fully-reconstructed committed block to the execution
     /// thread, in order. Carries the mempool bookkeeping that must happen once a
     /// block is actually executed (prune committed native hashes, pin the base
@@ -11004,15 +11076,17 @@ impl TorusApp {
             // `ManifestPruner` deletes it only after a state-WAL sync made the write
             // durable. The pre-T5.3 layout (manifest in the state DB) keeps the
             // synchronous write here, the manifest prune in its batch.
+            let evidence = self.take_leader_evidence(&torus_block.header);
             let (durable, ticket) = match &self.commit_persist {
                 Some(writer) => (
                     DurableRows::default(),
-                    Some(writer.submit(torus_block.clone())),
+                    Some(writer.submit(torus_block.clone(), evidence)),
                 ),
                 None => (
                     persist_committed_block_durably_timed(
                         &self.state_db,
                         &torus_block,
+                        evidence.as_ref(),
                         self.metrics.as_deref(),
                         self.manifest_in_state_db,
                     ),
@@ -15396,38 +15470,77 @@ mod crash_recovery_tests {
             .all(|(k, _)| !k.starts_with(b"leader_stats:")));
     }
 
-    /// The commit path writes the justify QC's evidence row before dispatching the block (on),
-    /// and nothing with the feature off.
+    /// The commit path carries the justify QC's evidence in the height's manifest and writes
+    /// the evidence row in the block's header + body batch at dispatch (on); with the feature
+    /// off, the manifest is the datum verbatim (byte-identical to before) and there is no row.
+    /// Both manifest layouts: the state DB (synchronous dispatch write) and the consensus DB
+    /// (the commit-persist writer).
     #[test]
     fn dead_leader_commit_writes_the_evidence_row() {
         for on in [true, false] {
-            let (mut config, db) = dls_fixture();
-            if !on {
-                config.leader_miss_threshold = 0;
+            for node_layout in [false, true] {
+                let (mut config, db) = dls_fixture();
+                if !on {
+                    config.leader_miss_threshold = 0;
+                }
+                let (mut app, rx) = if node_layout {
+                    let (app, rx, _mempool) = app_with_recording_exec(&config, &db);
+                    (app, rx)
+                } else {
+                    let mut app = TorusApp::new(db.clone(), &config, None, None, None);
+                    let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(64);
+                    app.replace_exec_tx(tx);
+                    (app, rx)
+                };
+                let commit = |app: &mut TorusApp, h: u64| {
+                    let datum = bincode::serialize(&make_block(h, vec![])).unwrap();
+                    let committed = Block::new(
+                        hotstuff_rs::types::data_types::BlockHeight::new(h),
+                        PhaseCertificate::genesis_pc(),
+                        CryptoHash::new(TorusApp::hash_datum(&datum)),
+                        Data::new(vec![Datum::new(datum.clone())]),
+                    );
+                    app.on_committed_block(&committed, committed.hash);
+                    datum
+                };
+                let tag = format!("on={on} node_layout={node_layout}");
+                // Height 2 first: it waits for 1, so its manifest stays.
+                app.exec_next_height = Some(1);
+                let datum2 = commit(&mut app, 2);
+                assert!(rx.try_recv().is_err(), "{tag}: 2 waits for 1");
+                let value = load_commit_manifest(&app.manifest_db, 2).expect("manifest of 2");
+                let (ev, inner) = crate::leader_skip::split_manifest(&value).unwrap();
+                if on {
+                    assert_eq!(ev, Some(dls_evidence(1)), "{tag}: genesis QC evidence");
+                    assert_eq!(inner, datum2.as_slice(), "{tag}");
+                } else {
+                    assert_eq!(value, datum2, "{tag}: off: the datum verbatim");
+                    assert_eq!((ev, inner), (None, datum2.as_slice()), "{tag}");
+                }
+                assert!(
+                    db.get_cf_raw(CF_CONSENSUS_META, &crate::leader_skip::leader_qc_key(2))
+                        .unwrap()
+                        .is_none(),
+                    "{tag}: no state-DB row at commit"
+                );
+                commit(&mut app, 1);
+                for want in [1u64, 2] {
+                    let msg = rx.try_recv().expect("dispatched in order");
+                    assert_eq!(msg.torus_block.header.height, want);
+                    assert!(msg.settled_durable().header, "{tag}");
+                    let row = db
+                        .get_cf_raw(CF_CONSENSUS_META, &crate::leader_skip::leader_qc_key(want))
+                        .unwrap();
+                    if on {
+                        let ev: crate::leader_skip::LeaderEvidence =
+                            borsh::from_slice(&row.expect("evidence row with the header")).unwrap();
+                        assert_eq!(ev, dls_evidence(1), "{tag} h{want}");
+                    } else {
+                        assert_eq!(row, None, "{tag}: off: no row");
+                    }
+                }
+                assert!(app.leader_evidence.is_empty(), "{tag}: taken at dispatch");
             }
-            let mut app = TorusApp::new(db.clone(), &config, None, None, None);
-            let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
-            app.replace_exec_tx(tx);
-            let block = make_block(1, vec![]);
-            let datum = bincode::serialize(&block).unwrap();
-            let committed = Block::new(
-                hotstuff_rs::types::data_types::BlockHeight::new(1),
-                PhaseCertificate::genesis_pc(),
-                CryptoHash::new(TorusApp::hash_datum(&datum)),
-                Data::new(vec![Datum::new(datum)]),
-            );
-            app.on_committed_block(&committed, committed.hash);
-            let row = db
-                .get_cf_raw(CF_CONSENSUS_META, &crate::leader_skip::leader_qc_key(1))
-                .unwrap();
-            if on {
-                let ev: crate::leader_skip::LeaderEvidence =
-                    borsh::from_slice(&row.expect("evidence row written at commit")).unwrap();
-                assert_eq!(ev, dls_evidence(1));
-            } else {
-                assert_eq!(row, None, "off: no row");
-            }
-            drop(rx);
         }
     }
 
@@ -21164,7 +21277,11 @@ mod crash_recovery_tests {
             "the healed height fail-stopped: its leader evidence was lost with the state rows"
         );
         assert_eq!(applied, Some(5));
-        assert_eq!(dls_evidence_rows(&state_db), 0, "the evidence row goes with 5");
+        assert_eq!(
+            dls_evidence_rows(&state_db),
+            0,
+            "the evidence row goes with 5"
+        );
         drop(app);
     }
 
@@ -31892,7 +32009,7 @@ mod crash_recovery_tests {
         );
         for b in &blocks {
             let h = b.header.height;
-            let rows = writer.submit(b.clone()).wait();
+            let rows = writer.submit(b.clone(), None).wait();
             assert_eq!(
                 rows,
                 DurableRows {
