@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""ckpt_wait.py + run-cell.sh digest_ckpt_wait: the state digest waits for a
+checkpoint submitted after the drain to be durable on every live node.
+
+Item 6 Phase 3 coalesced checkpoints (TORUS_CHECKPOINT_INTERVAL_MS, 15 s on the
+standard load): validator RPC reads RocksDB only and lags up to one checkpoint
+window by design (docs/plans/item6-phase3-design.md). The drain's quiet window
+is 10 s, so without the wait the digest can read a durable state from before
+the last state change (ozarchy-9k-smokek-smoke-s0: books flipped stale ->
+correct mid-digest, a false DISAGREE).
+
+Offline: fake /metrics endpoints on 127.0.0.1 whose counters advance on a
+timer. No node, no cargo.
+
+    python3 -m pytest -q tools/matched-bench/test_ckpt_wait.py
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CKPT_WAIT = HERE / "ckpt_wait.py"
+RUN_CELL = HERE / "run-cell.sh"
+SUBMITS = "torus_exec_checkpoints_total"
+WRITES = "torus_exec_checkpoint_db_write_seconds_count"
+ON = json.dumps({"TORUS_EXEC_PIPELINE": "1", "TORUS_CHECKPOINT_INTERVAL_MS": "15000"})
+
+
+class FakeNode:
+    """A /metrics endpoint. `schedule`: [(seconds after start, submits, writes)],
+    the last entry whose time has passed wins. submits/writes None = metric
+    absent from the body; `fail` = HTTP 503."""
+
+    def __init__(self, schedule, fail=False):
+        self.schedule = sorted(schedule, key=lambda e: e[0])
+        self.fail = fail
+        self.t0 = time.monotonic()
+        self.hits = 0
+        node = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                node.hits += 1
+                if node.fail:
+                    self.send_response(503)
+                    self.end_headers()
+                    return
+                body = node.body().encode()
+                self.send_response(200)
+                self.send_header("content-type", "text/plain")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_port
+        self.url = "http://127.0.0.1:%d/metrics" % self.port
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def body(self):
+        now = time.monotonic() - self.t0
+        submits = writes = None
+        for at, s, w in self.schedule:
+            if at <= now:
+                submits, writes = s, w
+        lines = ["# HELP torus_block_height x", "torus_block_height 1600"]
+        if submits is not None:
+            lines.append("# TYPE torus_exec_checkpoints counter")
+            lines.append("%s %d" % (SUBMITS, submits))
+        if writes is not None:
+            lines.append('torus_exec_checkpoint_db_write_seconds_bucket{le="0.001"} 0')
+            lines.append("torus_exec_checkpoint_db_write_seconds_sum 1.5")
+            lines.append("%s %d" % (WRITES, writes))
+        return "\n".join(lines) + "\n# EOF\n"
+
+    def __enter__(self):
+        self.t0 = time.monotonic()
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+
+def run_wait(nodes, node_env=ON, extra=(), book_mode="classic", timeout=60):
+    """nodes: [(name, FakeNode)] -> (rc, stdout, stderr, json record, wall s)."""
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d, "digest-ckpt-wait.json")
+        cmd = [
+            sys.executable,
+            "-I",
+            str(CKPT_WAIT),
+            "--node-env",
+            node_env,
+            "--genesis-book-mode",
+            book_mode,
+            "--out",
+            str(out),
+            "--poll-s",
+            "0.05",
+        ]
+        for name, node in nodes:
+            cmd += ["--metrics", "%s=%s" % (name, node.url)]
+        cmd += list(extra)
+        t = time.monotonic()
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        wall = time.monotonic() - t
+        rec = json.loads(out.read_text()) if out.exists() else None
+        return r.returncode, r.stdout, r.stderr, rec, wall
+
+
+class WaitTests(unittest.TestCase):
+    def test_waits_for_a_checkpoint_submitted_after_t0_on_every_node(self):
+        # At T0 val0's last submit (21) is already durable, val1's is still in
+        # flight (writes 20). Neither counts: only write >= C0 + 1 is a
+        # checkpoint SUBMITTED after T0. val0 gets there at 0.6 s, val1 at 1.0 s.
+        n0 = FakeNode([(0, 21, 21), (0.6, 22, 22)])
+        n1 = FakeNode([(0, 21, 20), (0.3, 21, 21), (0.5, 22, 21), (1.0, 22, 22)])
+        with n0, n1:
+            rc, out, err, rec, wall = run_wait([("val0", n0), ("val1", n1)])
+        self.assertEqual(rc, 0, err)
+        self.assertGreaterEqual(wall, 1.0)
+        self.assertEqual(rec["outcome"], "durable")
+        self.assertEqual(rec["interval_ms"], 15000)
+        self.assertEqual(rec["timeout_s"], 60.0)
+        self.assertEqual(rec["nodes"]["val0"]["c0"], 21)
+        self.assertEqual(rec["nodes"]["val0"]["write_count"], 22)
+        self.assertEqual(rec["nodes"]["val1"]["c0"], 21)
+        self.assertEqual(rec["nodes"]["val1"]["write_count"], 22)
+        self.assertTrue(all(n["durable"] for n in rec["nodes"].values()))
+        # waited_s counts from the helper's own T0 (after interpreter start-up,
+        # later than the fakes' clock): ordered, and well past the first poll.
+        self.assertGreater(
+            rec["nodes"]["val1"]["waited_s"], rec["nodes"]["val0"]["waited_s"]
+        )
+        self.assertGreaterEqual(rec["waited_s"], 0.5)
+        lines = out.strip().splitlines()
+        self.assertEqual(len(lines), 1, out)
+        self.assertRegex(
+            lines[0],
+            r"^digest checkpoint wait: val0 ckpt 21->22 durable, "
+            r"val1 ckpt 21->22 durable, waited \d+\.\ds \(interval 15000 ms\)$",
+        )
+
+    def test_only_the_given_live_nodes_are_waited_on(self):
+        live = FakeNode([(0, 5, 5), (0.2, 6, 6)])
+        stuck = FakeNode([(0, 5, 5)])
+        with live, stuck:
+            rc, out, err, rec, _ = run_wait([("val0", live), ("val2", live)])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(sorted(rec["nodes"]), ["val0", "val2"])
+        self.assertEqual(stuck.hits, 0)
+        self.assertNotIn("val1", out)
+
+    def test_checkpoints_off_by_env_skip_with_one_line(self):
+        for env, why in (
+            ({"TORUS_CHECKPOINT_INTERVAL_MS": "0"}, "TORUS_CHECKPOINT_INTERVAL_MS"),
+            ({"TORUS_CHECKPOINT_INTERVAL_MS": "  "}, None),
+            ({"TORUS_CHECKPOINT_INTERVAL_MS": "-1"}, "TORUS_CHECKPOINT_INTERVAL_MS"),
+            (
+                {"TORUS_EXEC_PIPELINE": "0", "TORUS_CHECKPOINT_INTERVAL_MS": "15000"},
+                "TORUS_EXEC_PIPELINE",
+            ),
+        ):
+            with self.subTest(env=env):
+                # blank = unset = the validator default (15 s) on classic: a
+                # mode-3 genesis turns that default off.
+                mode = "level_authority_chunked" if why is None else "classic"
+                node = FakeNode([(0, 0, 0)])
+                with node:
+                    rc, out, err, rec, wall = run_wait(
+                        [("val0", node)], json.dumps(env), book_mode=mode
+                    )
+                self.assertEqual(rc, 0, err)
+                self.assertLess(wall, 5)
+                self.assertEqual(rec["outcome"], "skipped")
+                self.assertIsNone(rec["interval_ms"])
+                lines = out.strip().splitlines()
+                self.assertEqual(len(lines), 1, out)
+                self.assertTrue(
+                    lines[0].startswith("digest checkpoint wait: skipped"), lines[0]
+                )
+                self.assertIn("checkpoints off", lines[0])
+
+    def test_unset_interval_is_the_15s_validator_default_on_classic(self):
+        node = FakeNode([(0, 3, 3), (0.2, 4, 4)])
+        with node:
+            rc, out, err, rec, _ = run_wait([("val0", node)], json.dumps({}))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(rec["outcome"], "durable")
+        self.assertEqual(rec["interval_ms"], 15000)
+
+    def test_env_on_but_no_checkpoint_ever_ran_skips(self):
+        node = FakeNode([(0, 0, 0)])
+        with node:
+            rc, out, err, rec, wall = run_wait([("val0", node), ("val1", node)])
+        self.assertEqual(rc, 0, err)
+        self.assertLess(wall, 5)
+        self.assertEqual(rec["outcome"], "skipped")
+        self.assertIn("no checkpoint", out)
+
+    def test_env_off_but_node_checkpoints_waits_anyway(self):
+        """The node is the truth: a resolution that disagrees with it must not
+        skip the wait silently."""
+        node = FakeNode([(0, 7, 7), (0.3, 8, 8)])
+        with node:
+            rc, out, err, rec, wall = run_wait(
+                [("val0", node)], json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "0"})
+            )
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(rec["outcome"], "durable")
+        self.assertGreaterEqual(wall, 0.3)
+        self.assertIn("WARNING", rec["note"])
+
+    def test_metric_absent_falls_back_to_sleeping_interval_plus_margin(self):
+        old = FakeNode([(0, None, None)])
+        half = FakeNode([(0, 4, None)])
+        for node in (old, half):
+            with self.subTest(node=node.schedule), node:
+                rc, out, err, rec, wall = run_wait(
+                    [("val0", node)],
+                    json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "300"}),
+                    extra=["--fallback-margin-s", "0.4"],
+                )
+                self.assertEqual(rc, 0, err)
+                self.assertEqual(rec["outcome"], "fallback_sleep")
+                self.assertGreaterEqual(wall, 0.7)
+                self.assertAlmostEqual(rec["waited_s"], 0.7, delta=0.3)
+                self.assertIn("absent", out)
+                self.assertIn("slept", out)
+
+    def test_metric_absent_with_checkpoints_off_skips_without_sleeping(self):
+        old = FakeNode([(0, None, None)])
+        with old:
+            rc, out, err, rec, wall = run_wait(
+                [("val0", old)], json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "0"})
+            )
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(rec["outcome"], "skipped")
+        self.assertLess(wall, 5)
+
+    def test_checkpoints_off_and_unreadable_metrics_skip_without_retrying(self):
+        dead = FakeNode([(0, 0, 0)], fail=True)
+        with dead:
+            rc, out, err, rec, wall = run_wait(
+                [("val0", dead)], json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "0"})
+            )
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(rec["outcome"], "skipped")
+        self.assertEqual(dead.hits, 1)
+        self.assertLess(wall, 5)
+
+    def test_default_timeout_is_two_intervals_plus_30s(self):
+        node = FakeNode([(0, 1, 1), (0.1, 2, 2)])
+        with node:
+            _, _, err, rec, _ = run_wait(
+                [("val0", node)], json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "2000"})
+            )
+        self.assertEqual(rec["timeout_s"], 34.0, err)
+
+    def test_timeout_is_a_recorded_failure_not_a_pass(self):
+        node = FakeNode([(0, 9, 9)])
+        good = FakeNode([(0, 9, 9), (0.1, 10, 10)])
+        with node, good:
+            rc, out, err, rec, wall = run_wait(
+                [("val0", good), ("val1", node)], extra=["--timeout-s", "0.8"]
+            )
+        self.assertEqual(rc, 3, err)
+        self.assertEqual(rec["outcome"], "timeout")
+        self.assertFalse(rec["nodes"]["val1"]["durable"])
+        self.assertTrue(rec["nodes"]["val0"]["durable"])
+        self.assertEqual(rec["nodes"]["val1"]["write_count"], 9)
+        self.assertGreaterEqual(wall, 0.8)
+        self.assertIn("TIMEOUT", out)
+        self.assertIn("val1 ckpt 9->9 NOT durable", out)
+
+    def test_unreadable_metrics_until_the_deadline_is_a_timeout(self):
+        dead = FakeNode([(0, 1, 1)], fail=True)
+        with dead:
+            rc, out, err, rec, _ = run_wait(
+                [("val0", dead)], extra=["--timeout-s", "0.5"]
+            )
+        self.assertEqual(rc, 3, err)
+        self.assertEqual(rec["outcome"], "timeout")
+        self.assertIsNone(rec["nodes"]["val0"]["c0"])
+
+    def test_resolution_mirrors_the_node(self):
+        sys.path.insert(0, str(HERE))
+        try:
+            import ckpt_wait
+        finally:
+            sys.path.pop(0)
+        r = ckpt_wait.resolve_interval_ms
+        self.assertEqual(r({}, "classic"), 15000)
+        self.assertEqual(r({}, ""), 15000)
+        self.assertIsNone(r({}, "level_authority"))
+        self.assertIsNone(r({}, "level_authority_chunked"))
+        self.assertEqual(r({}, "order_rows"), 15000)
+        self.assertIsNone(r({"TORUS_BOOK_ROWS": " 3 "}, ""))
+        self.assertEqual(r({"TORUS_BOOK_ROWS": "3"}, "classic"), 15000)
+        self.assertEqual(
+            r({"TORUS_CHECKPOINT_INTERVAL_MS": "  9000\t"}, "classic"), 9000
+        )
+        self.assertEqual(r({"TORUS_CHECKPOINT_INTERVAL_MS": "+500"}, "classic"), 500)
+        self.assertEqual(
+            r({"TORUS_CHECKPOINT_INTERVAL_MS": "20000"}, "level_authority"), 20000
+        )
+        for off in ("0", "-5", "abc", "1.5", "99999999999999999999"):
+            self.assertIsNone(r({"TORUS_CHECKPOINT_INTERVAL_MS": off}, "classic"), off)
+        self.assertIsNone(r({"TORUS_EXEC_PIPELINE": " 0 "}, "classic"))
+
+
+# ------------------------------------------------------------- run-cell.sh
+def run_cell_function(live, mets, node_env=ON, extra_env=None):
+    """Execute run-cell.sh's real digest_ckpt_wait() with LIVE_IDX / METS."""
+    script = RUN_CELL.read_text()
+    start = script.index("digest_ckpt_wait() {\n")
+    end = script.index("\n}\n", start) + 3
+    with tempfile.TemporaryDirectory() as d:
+        command = """set -uo pipefail
+OUT=%s
+SELF_DIR=%s
+LIVE_IDX=(%s)
+METS=(%s)
+NODE_ENV_JSON=%s
+GEN_BOOK_MODE_GOT=classic
+log() { printf '[t] %%s\\n' "$*" | tee -a "$OUT/run.log"; }
+%s
+digest_ckpt_wait
+printf 'OUTCOME=%%s\\n' "$DIGEST_CKPT_WAIT"
+""" % (
+            d,
+            HERE,
+            " ".join(map(str, live)),
+            " ".join(map(str, mets)),
+            "'" + node_env + "'",
+            script[start:end],
+        )
+        env = dict(os.environ, **(extra_env or {}))
+        r = subprocess.run(
+            ["bash", "-c", command], capture_output=True, text=True, timeout=60, env=env
+        )
+        rec_path = Path(d, "digest-ckpt-wait.json")
+        rec = json.loads(rec_path.read_text()) if rec_path.exists() else None
+        return r, rec
+
+
+class RunCellTests(unittest.TestCase):
+    def test_dead_node_is_not_waited_on(self):
+        live = FakeNode([(0, 5, 5), (0.2, 6, 6)])
+        stuck = FakeNode([(0, 5, 5)])
+        with live, stuck:
+            r, rec = run_cell_function(
+                [0, 2],
+                [live.port, stuck.port, live.port],
+                extra_env={"DIGEST_CKPT_POLL_S": "0.05"},
+            )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("OUTCOME=durable", r.stdout)
+        self.assertEqual(sorted(rec["nodes"]), ["val0", "val2"])
+        self.assertEqual(stuck.hits, 0)
+        self.assertRegex(
+            r.stdout,
+            r"digest checkpoint wait: val0 ckpt 5->6 durable, val2 ckpt 5->6 durable",
+        )
+
+    def test_timeout_logs_loudly_and_sets_the_outcome(self):
+        stuck = FakeNode([(0, 5, 5)])
+        with stuck:
+            r, rec = run_cell_function(
+                [0],
+                [stuck.port, stuck.port, stuck.port],
+                extra_env={
+                    "DIGEST_CKPT_TIMEOUT_S": "0.5",
+                    "DIGEST_CKPT_POLL_S": "0.05",
+                },
+            )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("OUTCOME=timeout", r.stdout)
+        self.assertIn("WARNING", r.stdout)
+        self.assertEqual(rec["outcome"], "timeout")
+
+    def test_helper_failure_is_recorded_as_error(self):
+        node = FakeNode([(0, 5, 5)])
+        with node:
+            r, rec = run_cell_function(
+                [0], [node.port, node.port, node.port], node_env="not json"
+            )
+        self.assertIn("OUTCOME=error", r.stdout)
+        self.assertIn("WARNING", r.stdout)
+        self.assertEqual(rec["outcome"], "error")
+
+    def test_checkpoints_off_is_one_line_and_no_wait(self):
+        node = FakeNode([(0, 0, 0)])
+        with node:
+            t = time.monotonic()
+            r, rec = run_cell_function(
+                [0, 1, 2],
+                [node.port] * 3,
+                node_env=json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "0"}),
+            )
+            wall = time.monotonic() - t
+        self.assertIn("OUTCOME=skipped", r.stdout)
+        self.assertLess(wall, 5)
+        self.assertEqual(r.stdout.count("digest checkpoint wait"), 1, r.stdout)
+        self.assertNotIn("WARNING", r.stdout)
+
+    def test_wait_sits_after_the_drain_and_settle_and_before_the_digest(self):
+        script = RUN_CELL.read_text()
+        call = script.index("\ndigest_ckpt_wait\n")
+        self.assertLess(script.index('log "drained=$DRAINED'), call)
+        self.assertLess(
+            script.index('log "oracle feed paused (SIGSTOP) for the digest; settle'),
+            call,
+        )
+        self.assertLess(call, script.index("if Q_BEFORE=$(funnel_snapshot)"))
+        self.assertLess(call, script.index('"$TOOLS_DIR/digest-node.sh" "${RPCS[$i]}"'))
+        self.assertLess(
+            call, script.index('rpc "${RPCS[$i]}" torus_getLiquidatorVault')
+        )
+        self.assertLess(call, script.index('agree_cmp_height "$HCMP"'))
+
+
+# ------------------------------------------------------------- summarize.py
+sys.path.insert(0, str(HERE))
+from test_harness import run_summarize, write_agreement, write_cell  # noqa: E402
+
+sys.path.pop(0)
+
+
+class SummarizeTests(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="ckpt-wait-sum-")
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def write_wait(self, outcome):
+        with open(os.path.join(self.d, "digest-ckpt-wait.json"), "w") as f:
+            json.dump(
+                {
+                    "outcome": outcome,
+                    "interval_ms": 15000,
+                    "timeout_s": 60.0,
+                    "waited_s": 60.1 if outcome == "timeout" else 3.4,
+                    "nodes": {"val0": {"c0": 21, "write_count": 21, "durable": False}},
+                },
+                f,
+            )
+
+    def summarize(self, digests):
+        write_cell(self.d, 1_000, 1_000)
+        write_agreement(self.d, digests)
+        r = run_summarize(self.d, extra=["--digest-quiescent", "1"])
+        return r
+
+    def test_timeout_with_unequal_digests_is_unverified_not_a_fork(self):
+        self.write_wait("timeout")
+        s, out = self.summarize(["a", "b", "b"])
+        self.assertEqual(s["agreement"]["agreement_verdict"], "DIGEST_UNVERIFIED")
+        self.assertIsNone(s["headline"]["validators_agree"])
+        self.assertEqual(s["agreement"]["state_digest_ckpt_wait"]["outcome"], "timeout")
+        self.assertEqual(s["headline"]["digest_ckpt_wait"], "timeout")
+        self.assertIn("digest_ckpt=timeout", out)
+
+    def test_timeout_with_equal_digests_is_not_accepted(self):
+        self.write_wait("error")
+        s, _ = self.summarize(["same"] * 3)
+        self.assertEqual(s["agreement"]["agreement_verdict"], "AGREE")
+        self.assertFalse(s["validity"]["accepted"])
+        self.assertTrue(
+            any("checkpoint wait" in x for x in s["validity"]["unverified_reasons"]),
+            s["validity"],
+        )
+
+    def test_durable_wait_keeps_the_verdicts(self):
+        for outcome in ("durable", "skipped", "fallback_sleep"):
+            with self.subTest(outcome=outcome):
+                self.write_wait(outcome)
+                s, out = self.summarize(["a", "b", "b"])
+                self.assertEqual(s["agreement"]["agreement_verdict"], "DISAGREE")
+                s, out = self.summarize(["same"] * 3)
+                self.assertEqual(s["agreement"]["agreement_verdict"], "AGREE")
+                self.assertFalse(
+                    any(
+                        "checkpoint wait" in x
+                        for x in s["validity"]["unverified_reasons"]
+                        + s["validity"]["fail_reasons"]
+                    ),
+                    s["validity"],
+                )
+                self.assertIn("digest_ckpt=%s" % outcome, out)
+
+    def test_cell_without_the_record_is_unchanged(self):
+        s, out = self.summarize(["same"] * 3)
+        self.assertEqual(s["agreement"]["agreement_verdict"], "AGREE")
+        self.assertIsNone(s["agreement"]["state_digest_ckpt_wait"])
+        self.assertIsNone(s["headline"]["digest_ckpt_wait"])
+        self.assertIn("digest_ckpt=None", out)
+
+
+if __name__ == "__main__":
+    unittest.main()
