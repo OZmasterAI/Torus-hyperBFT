@@ -2811,7 +2811,7 @@ class OracleFeedHarnessTest(unittest.TestCase):
         self.assertNotIn("consensus", cmd)
 
     def test_every_oracle_step_is_gated_and_defaults_off(self):
-        self.assertIn("ORACLE_FEED=${ORACLE_FEED:-0}", self.src)
+        self.assertIn("ORACLE_FEED=${ORACLE_FEED:-seed}", self.src)
         self.assertIn(
             'ORACLE_KEYS="$MAINREPO/devnet/wsl/bench-validator-keys.json"', self.src
         )
@@ -2865,6 +2865,67 @@ class OracleFeedHarnessTest(unittest.TestCase):
                     os.path.exists(os.path.join(tmp, "oracle-pre-x")),
                     "must fail before any launch",
                 )
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_seed_is_the_default_and_stops_the_feed_before_the_load(self):
+        """Owner s138: orders need a market's first mark. ORACLE_FEED=seed
+        (default) runs the feed until every mark is fresh, stops it, waits
+        until no mark is usable, all before the load; the later feed steps
+        (pause, bench-end marks, summary) stay ORACLE_FEED=1 only."""
+        self.assertIn("ORACLE_FEED=${ORACLE_FEED:-seed}", self.src)
+        self.assertIn("ORACLE_STALE_TIMEOUT=${ORACLE_STALE_TIMEOUT:-150}", self.src)
+        seed = self.src.index('    if [ "$ORACLE_FEED" = seed ]; then\n        # Owner s138')
+        fresh = self.src.index('log "oracle marks fresh on all')
+        stop = self.src.index("        stop_oracle_feed\n", seed)
+        stale = self.src.index('[ "$(jq -r .usable <<<"$ORACLE_M")" = 0 ]', seed)
+        load = self.src.index('"${BENCH_CMD[@]}" >')
+        self.assertLess(fresh, seed)
+        self.assertLess(seed, stop)
+        self.assertLess(stop, stale)
+        self.assertLess(stale, load)
+        gate = self.src.rindex('if [ "$ORACLE_FEED" = 1 ] || [ "$ORACLE_FEED" = seed ]; then', 0, seed)
+        self.assertNotIn("\nfi\n", self.src[gate:seed])
+        self.assertIn("if [ \"$ORACLE_FEED\" = 1 ] || [ \"$ORACLE_FEED\" = seed ]; then trap 'stop_oracle_feed' EXIT", self.src)
+        for marker in ('kill -STOP "$ORACLE_PID"', "d['oracle_feed'] = o"):
+            i = self.src.index(marker)
+            g = self.src.rindex('if [ "$ORACLE_FEED" = 1 ]', 0, i)
+            self.assertNotIn("seed", self.src[g : self.src.index("\n", g)], marker)
+
+    def test_bad_seed_env_fails_preflight(self):
+        tmp = tempfile.mkdtemp(prefix="oracle-seed-")
+        try:
+            tgt = os.path.join(tmp, "release")
+            os.makedirs(tgt)
+            for b in ("torus-node", "bench-throughput"):
+                p = os.path.join(tgt, b)
+                with open(p, "w") as f:
+                    f.write("#!/bin/sh\nexit 0\n")
+                os.chmod(p, 0o755)
+            script, wt = sandbox_repo(tmp)
+            for env, msg in (
+                (dict(ORACLE_WALK_BP="10"), "ORACLE_WALK_BP=10 needs ORACLE_FEED=1"),
+                (dict(ORACLE_FEED="seed", ORACLE_SHOCK_BP="50"), "ORACLE_SHOCK_BP=50 needs ORACLE_FEED=1"),
+                (dict(ORACLE_STALE_TIMEOUT="x"), "ORACLE_STALE_TIMEOUT must be"),
+                (dict(ORACLE_FEED_DRAIN="1"), "ORACLE_FEED_DRAIN=1 needs ORACLE_FEED=1"),
+            ):
+                r = subprocess.run(
+                    [script, wt, "oracle-seed-x"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=dict(
+                        os.environ,
+                        TARGET_DIR=tmp,
+                        RESULTS_ROOT=tmp,
+                        DATA_ROOT=tmp,
+                        BENCH_ALLOW_UNDETACHED="1",
+                        **env,
+                    ),
+                )
+                self.assertEqual(r.returncode, 2, (env, r.stderr))
+                self.assertIn(msg, r.stderr)
+                self.assertFalse(os.path.exists(os.path.join(tmp, "oracle-seed-x")))
         finally:
             shutil.rmtree(tmp)
 
