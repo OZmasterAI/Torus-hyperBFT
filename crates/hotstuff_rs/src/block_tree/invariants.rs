@@ -197,11 +197,15 @@
 //! 1. **Safety clause**: `pc.block` extends from `locked_pc.block`, *or*
 //! 2. **Liveness clause**: `pc.view` is greater than `locked_pc.view`.
 //!
-//! For a *proposed block* (not a PC on its own), the predicate has a third, reflexive arm:
-//! 3. **Reflexive clause** (s138): the proposed block *is* `locked_pc.block`, not yet committed
-//!    ([`safe_proposal_lock`]).
+//! For a *proposed block* (not a PC on its own), the predicate has two more arms
+//! ([`safe_proposal_lock`]):
+//! 3. **Reflexive clause** (s138): the proposed block *is* `locked_pc.block`, committed or not.
+//! 4. **Certified clause** (s138): a PC on the proposed block itself has a view greater than
+//!    `locked_pc.view` (the attached TC's high QC, or the replica's highest PC). It is the
+//!    liveness clause with the block's own certificate in place of its justify's: a block that a
+//!    newer PC certifies extends (is) that PC's block.
 //!
-//! The lock is checked on the block's justify, i.e. on its parent, so without this arm a
+//! The lock is checked on the block's justify, i.e. on its parent, so without arm 3 a
 //! re-proposal of the locked block itself fails: its own justify is older than the lock and does
 //! not extend the locked block. PODC '19 HotStuff's `safeNode` checks the *node* ("node extends
 //! lockedQC.node", reflexive), which accepts it. HotStuff-rs re-proposes the highest Prepare or
@@ -210,8 +214,16 @@
 //! window livelocks. Safe: a vote is for one `(view, block, phase)`, so a vote for the locked
 //! block can only ever count toward a PC for the locked block, which never conflicts with the
 //! lock; the block hash binds its justify, so the arm cannot be used with any other justify, and
-//! a sibling carrying the same stale justify still fails (docs/plans/disjoint-vset-livelock.md,
+//! a sibling carrying the same stale justify still fails arm 3 (docs/plans/disjoint-vset-livelock.md,
 //! "Reflexive lock rule").
+//!
+//! Arm 4 lets that sibling pass once a PC newer than the lock certifies it: a replica locked on U
+//! (Precommit PC, view 3) whose highest PC is Prepare(U', 4) must vote for U''s re-proposal, or one
+//! withholding Byzantine validator leaves the honest replicas without a quorum for good (the
+//! sibling livelock, docs/plans/disjoint-vset-livelock.md section 9). Safe for the reason the
+//! liveness clause is: if a block C was committed with its Commit PC in view c, every PC with a
+//! view of at least c - 1 certifies C or a descendant, so a PC newer than a lock taken at or after
+//! c - 1 certifies a block that extends C, and the proposed block is that block.
 //!
 //! In stable cases--i.e., where in every view, either 1/3rd of replicas lock on the same `locked_pc`,
 //! or none lock--the safety clause will always be satisfied. This ensures that the `pc` extends the
@@ -361,21 +373,24 @@ fn note_pending_justify_deferral(block: &CryptoHash) -> Option<u64> {
 /// # Conditional checks
 ///
 /// `safe_block` returns `true` in case all of the following predicates are `true`:
-/// 1. `safe_proposal_pc(&block.hash, &block.justify, block_tree, chain_id)`: `safe_pc` on the
-///    justify, whose lock clause also accepts a proposal of the locked block itself.
+/// 1. `safe_proposal_pc(&block.hash, &block.justify, tc_high_qc, block_tree, chain_id)`:
+///    `safe_pc` on the justify, whose lock clause also accepts a proposal of the locked block
+///    itself, or of a block that a PC newer than the lock certifies.
 /// 2. `block.pc.phase` is either `Generic` or `Decide`.
 ///
 /// # Precondition
 ///
-/// [`is_correct`](Block::is_correct) is `true` for `block`.
+/// [`is_correct`](Block::is_correct) is `true` for `block`; `tc_high_qc` is the high QC of the
+/// verified TC the proposal carries ([`safe_proposal_lock`]).
 pub(crate) fn safe_block<K: KVStore>(
     block: &Block,
+    tc_high_qc: Option<&PhaseCertificate>,
     block_tree: &BlockTreeSingleton<K>,
     chain_id: ChainID,
 ) -> Result<bool, BlockTreeError> {
     Ok(
         /* 1 */
-        safe_proposal_pc(&block.hash, &block.justify, block_tree, chain_id)? &&
+        safe_proposal_pc(&block.hash, &block.justify, tc_high_qc, block_tree, chain_id)? &&
         /* 2 */ block.justify.is_block_justify(),
     )
 }
@@ -383,27 +398,32 @@ pub(crate) fn safe_block<K: KVStore>(
 /// [`safe_pc`] for the justify of a proposed block `block_hash` (a full proposal or a proposal
 /// header, whose `block_hash` the caller has checked to be `Block::hash(height, justify,
 /// data_hash)`): the same predicates, with the lock clause (3) replaced by
-/// [`safe_proposal_lock`], which also accepts a proposal of the locked block itself.
+/// [`safe_proposal_lock`], which also accepts a proposal of the locked block itself, or of a block
+/// that a PC newer than the lock certifies.
 ///
 /// # Precondition
 ///
-/// [`is_correct`](crate::types::signed_messages::Certificate::is_correct) is `true` for `justify`.
+/// [`is_correct`](crate::types::signed_messages::Certificate::is_correct) is `true` for `justify`
+/// and for `tc_high_qc` ([`safe_proposal_lock`]).
 pub(crate) fn safe_proposal_pc<K: KVStore>(
     block_hash: &CryptoHash,
     justify: &PhaseCertificate,
+    tc_high_qc: Option<&PhaseCertificate>,
     block_tree: &BlockTreeSingleton<K>,
     chain_id: ChainID,
 ) -> Result<bool, BlockTreeError> {
-    safe_pc_with_lock(justify, block_tree, chain_id, || safe_proposal_lock(block_hash, justify, block_tree))
+    safe_pc_with_lock(justify, block_tree, chain_id, || {
+        safe_proposal_lock(block_hash, justify, tc_high_qc, block_tree)
+    })
 }
 
 /// s138: the lock rule for a proposed block `block_hash` justified by `justify` (reflexive, as
 /// PODC '19 HotStuff's `safeNode`): either `justify` satisfies [`safe_pc_lock_clause`], or the
-/// block IS the locked block.
+/// block IS the locked block, or a PC newer than the lock certifies the block (below).
 ///
 /// The block hash binds the justify (`Block::hash(height, justify, data_hash)`, checked by the
 /// caller), so the reflexive arm only ever admits the locked block with its own justify; any other
-/// block carrying that (stale) justify is a sibling and still fails. Like `safe_pc_lock_clause` it
+/// block carrying that (stale) justify is a sibling and fails it. Like `safe_pc_lock_clause` it
 /// needs no tree membership (the locked block's body may be in flight), so the header fast path
 /// can enforce it unconditionally.
 ///
@@ -415,14 +435,47 @@ pub(crate) fn safe_proposal_pc<K: KVStore>(
 /// ([`is_committed_block`]): its justify was applied when it was first processed, and a stale
 /// Decide justify would mark the replica's undecided update as decided.
 ///
+/// s138 (Codex torus-adversarial P1 on 8af2b949, the sibling livelock): the lock is also satisfied
+/// when a PC NEWER than the lock certifies the block itself ([`certified_above_lock`]): the
+/// attached TC's high QC (`tc_high_qc`) or this replica's highest PC. That is the liveness clause
+/// ("a PC newer than the lock that the block extends") with the block's own certificate in place
+/// of its justify: a replica locked on U whose highest PC is Prepare(U', 4) above its lock
+/// Precommit(U, 3) must vote for U''s re-proposal (`repropose_block`), whose justify is U''s stale
+/// one, or with one Byzantine validator withholding the honest replicas are no quorum.
+///
 /// See the module docs ("Checking against the Lock") and docs/plans/disjoint-vset-livelock.md
-/// ("Reflexive lock rule") for the safety argument.
+/// (sections 8 and 9) for the safety argument.
+///
+/// # Precondition
+///
+/// `tc_high_qc` is the high QC of a TC the caller verified
+/// ([`valid_proposal_certificates`](crate::hotstuff::types::valid_proposal_certificates):
+/// `TimeoutCertificate::is_correct` checks the high QC itself), or `None`.
 pub(crate) fn safe_proposal_lock<K: KVStore>(
     block_hash: &CryptoHash,
     justify: &PhaseCertificate,
+    tc_high_qc: Option<&PhaseCertificate>,
     block_tree: &BlockTreeSingleton<K>,
 ) -> Result<bool, BlockTreeError> {
-    Ok(is_locked_block(block_hash, block_tree)? || safe_pc_lock_clause(justify, block_tree)?)
+    Ok(is_locked_block(block_hash, block_tree)?
+        || safe_pc_lock_clause(justify, block_tree)?
+        || certified_above_lock(block_hash, tc_high_qc, block_tree)?)
+}
+
+/// Whether a correct PC on `block_hash` with a view strictly greater than the lock's is known:
+/// `tc_high_qc` (verified by the caller) or this replica's highest PC (verified when accepted).
+///
+/// Strictly greater, as `pc_to_lock` and the liveness clause: a PC at the lock's view on another
+/// block can only come from an equivocating quorum (one honest vote per view).
+fn certified_above_lock<K: KVStore>(
+    block_hash: &CryptoHash,
+    tc_high_qc: Option<&PhaseCertificate>,
+    block_tree: &BlockTreeSingleton<K>,
+) -> Result<bool, BlockTreeError> {
+    let locked_view = block_tree.locked_pc()?.view;
+    let certifies = |pc: &PhaseCertificate| !pc.is_genesis_pc() && pc.block == *block_hash && pc.view > locked_view;
+    let highest_pc = block_tree.highest_pc()?;
+    Ok(certifies(&highest_pc) || tc_high_qc.is_some_and(certifies))
 }
 
 /// Whether `block_hash` is `block_tree`'s `locked_pc.block` (never the genesis PC's).

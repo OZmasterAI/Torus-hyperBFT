@@ -1470,7 +1470,12 @@ impl<N: Network> HotStuff<N> {
         // 1. Check if block is correct and safe.
         let is_correct = proposal.block.is_correct(self.config.chain_id, block_tree)?;
         let is_safe = if is_correct {
-            safe_block(&proposal.block, block_tree, self.config.chain_id)?
+            safe_block(
+                &proposal.block,
+                proposal.tc.as_ref().and_then(|tc| tc.high_qc.as_ref()),
+                block_tree,
+                self.config.chain_id,
+            )?
         } else {
             false
         };
@@ -1591,13 +1596,16 @@ impl<N: Network> HotStuff<N> {
                 // For fresh proposals: tip is the proposal itself (its signed header, F2).
                 // For reproposals: tip is the verified tc.high_tip (paper Alg 6, line 15).
                 // The header path does the same (`cast_header_vote`, F5).
-                if proposal.is_reproposal() {
-                    if let Some(tip) = proposal.tc.as_ref().and_then(|tc| tc.high_tip.as_ref()) {
-                        block_tree.set_local_tip(tip)?;
+                // s138: only a Generic vote takes a tip ([`Self::vote_takes_tip`]).
+                if Self::vote_takes_tip(vote_phase, &proposal.block.hash, block_tree)? {
+                    if proposal.is_reproposal() {
+                        if let Some(tip) = proposal.tc.as_ref().and_then(|tc| tc.high_tip.as_ref()) {
+                            block_tree.set_local_tip(tip)?;
+                        }
+                    } else {
+                        let tip = crate::pacemaker::types::TipInfo::from_proposal(&proposal);
+                        block_tree.set_local_tip(&tip)?;
                     }
-                } else if vote_phase == Phase::Generic {
-                    let tip = crate::pacemaker::types::TipInfo::from_proposal(&proposal);
-                    block_tree.set_local_tip(&tip)?;
                 }
 
                 Event::PhaseVote(PhaseVoteEvent {
@@ -2070,7 +2078,13 @@ impl<N: Network> HotStuff<N> {
         if !resp.block.is_correct(self.config.chain_id, block_tree)? {
             return Ok(());
         }
-        if !safe_block(&resp.block, block_tree, self.config.chain_id)? {
+        // The recovery's TC (this leader's TC(v-1)); its high QC may certify the tip above this
+        // leader's lock (`safe_proposal_lock`).
+        let tc_high_qc = match &self.recovery_state {
+            RecoveryState::Recovering { tc, .. } => tc.high_qc.clone(),
+            _ => None,
+        };
+        if !safe_block(&resp.block, tc_high_qc.as_ref(), block_tree, self.config.chain_id)? {
             return Ok(());
         }
 
@@ -2520,6 +2534,9 @@ impl<N: Network> HotStuff<N> {
         // (body still in flight) but we already validated and voted for it. Tracked
         // entries in pending_headers/pending_bodies are proof of prior validation.
         let justify_correct = header.justify.is_correct(self.config.chain_id, block_tree)?;
+        // s138: the high QC of the TC checked above (`valid_proposal_certificates`, which also
+        // binds it to our chain), for the lock's certified arm (`safe_proposal_lock`).
+        let tc_high_qc = header.tc.as_ref().and_then(|tc| tc.high_qc.as_ref());
         let justify_previously_validated = self.pending_headers.contains_key(&header.justify.block)
             || self.pending_bodies.contains_key(&header.justify.block);
         let is_safe = if justify_correct {
@@ -2547,9 +2564,9 @@ impl<N: Network> HotStuff<N> {
                 header.justify.is_block_justify()
                     && (header.justify.chain_id == self.config.chain_id
                         || header.justify.is_genesis_pc())
-                    && safe_proposal_lock(&header.block_hash, &header.justify, block_tree)?
+                    && safe_proposal_lock(&header.block_hash, &header.justify, tc_high_qc, block_tree)?
             } else {
-                safe_proposal_pc(&header.block_hash, &header.justify, block_tree, self.config.chain_id)?
+                safe_proposal_pc(&header.block_hash, &header.justify, tc_high_qc, block_tree, self.config.chain_id)?
                     && header.justify.is_block_justify()
             }
         } else {
@@ -3162,6 +3179,26 @@ impl<N: Network> HotStuff<N> {
         Ok(fresh_proposer(view, &validator_set_state, reputation.as_ref()).as_ref() == Some(proposer))
     }
 
+    /// s138 (the copied-tip livelock, docs/plans/disjoint-vset-livelock.md section 9): whether a
+    /// proposal vote of `vote_phase` sets this replica's local tip, to the voted header (a fresh
+    /// proposal) or to the TC's high tip (a TC re-proposal). Only a Generic vote does. A Prepare
+    /// vote (a validator-set-updating block) never did for a fresh proposal, so no honest vote
+    /// makes such a block a tip and the tail-fork argument (a re-proposal keeps a block 2f+1
+    /// voted for as the tip) has nothing to keep; copying the TC's tip on it let one Byzantine
+    /// tip of a sibling, signed in a view above every honest QC, win every later honest TC
+    /// against a replica locked on the other block, which refuses that sibling forever.
+    ///
+    /// The header path takes `vote_phase` from the leader's `has_validator_set_updates` flag, so a
+    /// block this replica holds as validator-set-updating never takes a tip either, whatever the
+    /// flag says (a Byzantine leader's mislabeled re-proposal).
+    fn vote_takes_tip<K: KVStore>(
+        vote_phase: Phase,
+        block_hash: &CryptoHash,
+        block_tree: &BlockTreeSingleton<K>,
+    ) -> Result<bool, HotStuffError> {
+        Ok(vote_phase == Phase::Generic && !block_tree.validator_set_updates_status(block_hash)?.contains_updates())
+    }
+
     /// Phase-vote for `header`, the current view's checked proposal header
     /// (leader, integrity, safe justify; lock already updated), whose body this
     /// replica holds. Re-checks that it may still vote in this view, and the
@@ -3175,7 +3212,12 @@ impl<N: Network> HotStuff<N> {
         if header.view != self.view_info.view
             || !is_phase_voter(&self.config.keypair.public(), &validator_set_state, &header.justify)
             || block_tree.highest_view_voted()?.is_some_and(|voted| voted >= header.view)
-            || !safe_proposal_lock(&header.block_hash, &header.justify, block_tree)?
+            || !safe_proposal_lock(
+                &header.block_hash,
+                &header.justify,
+                header.tc.as_ref().and_then(|tc| tc.high_qc.as_ref()),
+                block_tree,
+            )?
         {
             return Ok(());
         }
@@ -3200,12 +3242,15 @@ impl<N: Network> HotStuff<N> {
         // full-proposal path does: a re-proposal keeps the TC's verified high tip (its original
         // view and leader signature), a fresh Generic vote takes this signed header. Before, only
         // the full path did, so the tail-fork block B was never a tip and TC(v) could not carry it.
-        if header.is_reproposal() {
-            if let Some(tip) = header.tc.as_ref().and_then(|tc| tc.high_tip.as_ref()) {
-                block_tree.set_local_tip(tip)?;
+        // s138: only a Generic vote takes a tip ([`Self::vote_takes_tip`]).
+        if Self::vote_takes_tip(vote_phase, &header.block_hash, block_tree)? {
+            if header.is_reproposal() {
+                if let Some(tip) = header.tc.as_ref().and_then(|tc| tc.high_tip.as_ref()) {
+                    block_tree.set_local_tip(tip)?;
+                }
+            } else {
+                block_tree.set_local_tip(&crate::pacemaker::types::TipInfo::from_header(header))?;
             }
-        } else if vote_phase == Phase::Generic {
-            block_tree.set_local_tip(&crate::pacemaker::types::TipInfo::from_header(header))?;
         }
         // T1.3 observability: this vote was cast before `app.validate_block` ran on the body
         // (unless the block is already in the tree, in which case it was validated on
