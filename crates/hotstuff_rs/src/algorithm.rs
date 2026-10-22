@@ -438,6 +438,10 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
     /// senders entered `view`, which this replica leads but is behind on
     /// (restarted below the survivors). Entering it proposes (`enter_view`).
     fn skip_to_leader_view(&mut self, view: ViewNumber) {
+        // s138: from the view right before it, time that view out first (its TC can need our vote).
+        if let Err(e) = self.pacemaker.time_out_before_leader_skip(view, &self.block_tree) {
+            log::error!("leader-skip to view {}: timeout vote error: {:?}", view.int(), e);
+        }
         self.enter_skipped_view(view, "NewViews (leader-skip)");
         if self.hotstuff.take_sync_needed() {
             if let Err(e) = self.block_sync_client.trigger_sync(&mut self.block_tree) {
