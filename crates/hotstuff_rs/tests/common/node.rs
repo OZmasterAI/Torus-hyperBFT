@@ -12,7 +12,7 @@ use borsh::BorshDeserialize;
 use ed25519_dalek::SigningKey;
 use hotstuff_rs::{
     events::{
-        CommitBlockEvent, InsertBlockEvent, PhaseVoteEvent, ReceiveProposalEvent,
+        CommitBlockEvent, InsertBlockEvent, PhaseVoteEvent, ProposeEvent, ReceiveProposalEvent,
         UpdateHighestPCEvent,
     },
     replica::{Configuration, Replica, ReplicaSpec},
@@ -67,6 +67,10 @@ pub(crate) struct Node {
     tx_queue: Arc<Mutex<Vec<QueuedTransaction>>>,
     replica: Replica<MemDB>,
     kv_store: MemDB,
+    /// Proposals this node made that break VALIDPROPOSAL V1: the block does
+    /// not justify on the previous view (nor on the genesis PC) and no TC for
+    /// the previous view is attached. Always 0 for an honest leader.
+    tc_less_proposals: Arc<AtomicU64>,
 }
 
 impl Node {
@@ -231,6 +235,7 @@ impl Node {
 
         let verifying_key = keypair.verifying_key().to_bytes();
         let tx_queue = Arc::new(Mutex::new(Vec::new()));
+        let tc_less_proposals = Arc::new(AtomicU64::new(0));
 
         // Sync trigger knobs: enabled uses the historical aggressive defaults; disabled pushes the
         // trigger far past any test window so height-range sync never fires.
@@ -273,6 +278,7 @@ impl Node {
             .on_commit_block(commit_block_handler(verifying_key))
             .on_update_highest_pc(update_highest_pc_handler(verifying_key))
             .on_phase_vote(phase_vote_handler(verifying_key))
+            .on_propose(propose_handler(tc_less_proposals.clone()))
             .build()
             .start();
 
@@ -281,6 +287,7 @@ impl Node {
             replica,
             tx_queue,
             kv_store,
+            tc_less_proposals,
         }
     }
 
@@ -389,9 +396,31 @@ impl Node {
             .expect("should have been able to get the highest view entered from the block tree")
     }
 
+    /// Test hook (TC-required phase A): how many of this node's proposals lacked the
+    /// certificate VALIDPROPOSAL V1 asks for (see [`Node::tc_less_proposals`]).
+    #[allow(dead_code)]
+    pub(crate) fn tc_less_proposals(&self) -> u64 {
+        self.tc_less_proposals.load(Ordering::Relaxed)
+    }
+
     /// Query the verifying key of the node.
     pub(crate) fn verifying_key(&self) -> VerifyingKeyBytes {
         self.verifying_key
+    }
+}
+
+/// Test hook (TC-required phase A): count proposals for view v whose block neither
+/// justifies on v - 1 (or the genesis PC) nor carries a TC for v - 1. Restated
+/// here independently of the library's own predicate.
+fn propose_handler(tc_less: Arc<AtomicU64>) -> impl Fn(&ProposeEvent) + Send + 'static {
+    move |event| {
+        let p = &event.proposal;
+        let previous = |view: ViewNumber| view.int() + 1 == p.view.int();
+        let justified = previous(p.block.justify.view) || p.block.justify.is_genesis_pc();
+        let has_tc = p.tc.as_ref().is_some_and(|tc| previous(tc.view));
+        if !justified && !has_tc {
+            tc_less.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 

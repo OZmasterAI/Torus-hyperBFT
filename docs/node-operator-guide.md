@@ -148,6 +148,24 @@ first start with this build stores the digest of the file it is given (logged
 as a warning, since it cannot be checked against the original). A bound data
 directory started without `--genesis` refuses to start.
 
+### Consensus DB format (no migration)
+
+The consensus DB (`<data dir>/consensus-db`) records the format of its
+consensus data. A build reads only its own format and does not migrate an
+older one. The TC-required consensus (format 1: domain-tagged consensus
+signatures, leader-signed proposals and tips) cannot read a data dir written
+by an earlier build: its stored certificates would fail every signature
+check. Such a data dir refuses to start and is left as it was:
+
+```
+refusing to start: the consensus DB /data/consensus-db is written before TC-required phase C (no format key), and this build reads consensus DB format 1 only ...
+```
+
+Upgrade every node of the chain together, and start each one from a fresh
+data dir. The genesis file can stay the same. A node on an old build cannot
+take part in a chain run by the new build either: their signatures do not
+verify against each other.
+
 ## Running state hash: a hash-unverified node
 
 With the running state hash on (genesis `consensus.activations.running_state_hash`;

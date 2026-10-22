@@ -171,6 +171,23 @@ pub const BLOCK_TREE_PRUNED_HEIGHT: [u8; 1] = [22];
 /// before), so a crash between the two re-delivers instead of losing heights —
 /// the `on_committed_block` contract is at-least-once, strictly ascending.
 pub const APP_FED_BLOCK_HEIGHT: [u8; 1] = [23];
+/// TC phase C review (docs/plans/tc-required-and-tip-signing.md §4): the view at which the most
+/// recently committed validator-set update took over as the source of fresh proposals (the view of
+/// the Commit or Decide PC on the updating block that committed it). Tips of views up to it were
+/// proposed under the previous set, later ones under the committed set.
+pub const VALIDATOR_SET_UPDATE_VIEW: [u8; 1] = [24];
+/// The format of the consensus data in this store, a borsh `u32`
+/// ([`CONSENSUS_DB_FORMAT_VERSION`]), written once by
+/// [`BlockTreeSingleton::initialize`](super::accessors::internal::BlockTreeSingleton::initialize)
+/// in the same batch as the committed validator set. Absent: written by a build before TC-required
+/// phase C (untagged signatures, unsigned tips), which this build cannot read or verify.
+pub const CONSENSUS_DB_FORMAT: [u8; 1] = [25];
+
+/// The [`CONSENSUS_DB_FORMAT`] this build writes and the only one it reads. 1: TC-required phase C
+/// (docs/plans/tc-required-and-tip-signing.md): domain-tagged signatures, leader-signed proposals
+/// and headers, signed local tips. Stores have no in-place migration: a store of another format is
+/// refused at boot (torus-node `open_node_dbs`), and the data dir must be started fresh.
+pub const CONSENSUS_DB_FORMAT_VERSION: u32 = 1;
 
 // Fields of Block
 pub const BLOCK_HEIGHT: [u8; 1] = [0];

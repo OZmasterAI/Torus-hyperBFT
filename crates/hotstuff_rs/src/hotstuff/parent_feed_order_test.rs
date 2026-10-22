@@ -23,7 +23,7 @@ use crate::app::{
 use crate::block_tree::accessors::internal::{BlockTreeSingleton, BlockTreeWriteBatch};
 use crate::hotstuff::header_fast_path_regression_test::{generic_pc, proposer_for};
 use crate::hotstuff::implementation::HotStuff;
-use crate::hotstuff::messages::{BlockDataResponse, HotStuffMessage, ProposalHeader};
+use crate::hotstuff::messages::{BlockDataResponse, HotStuffMessage};
 use crate::hotstuff::types::PhaseCertificate;
 use crate::hotstuff::vote_persist_order_test::{
     base_tree, replica, OrderKV, OrderLog, OrderNetwork, BROADCAST_HEADER, CHAIN_ID,
@@ -290,17 +290,10 @@ fn follower_body_insert_still_feeds_inline_with_flag_on() {
     let q = chain.q.clone();
     follower
         .on_receive_msg(
-            HotStuffMessage::ProposalHeader(ProposalHeader {
-                chain_id: CHAIN_ID,
-                view: ViewNumber::new(3),
-                block_hash: q.hash,
-                height: q.height,
-                data_hash: q.data_hash,
-                justify: q.justify.clone(),
-                tc: None,
-                nec: None,
-                has_validator_set_updates: false,
-            }),
+            HotStuffMessage::ProposalHeader(crate::test_keys::signed_by(
+                crate::test_keys::unsigned_header(CHAIN_ID, &q, ViewNumber::new(3)),
+                &leader3,
+            )),
             &leader3,
             &mut chain.block_tree,
             &mut app,

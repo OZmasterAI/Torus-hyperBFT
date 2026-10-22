@@ -31,7 +31,6 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use borsh::BorshSerialize;
 
 use crate::app::{
     App, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest, ValidateBlockResponse,
@@ -190,9 +189,7 @@ fn generic_pc(
     signers: &[SigningKey],
     set: &ValidatorSet,
 ) -> PhaseCertificate {
-    let message = (CHAIN_ID, view, block, Phase::Generic)
-        .try_to_vec()
-        .unwrap();
+    let message = crate::types::signing::phase_vote_bytes(CHAIN_ID, view, &block, Phase::Generic);
     let mut signatures = SignatureSet::new(set.len());
     for sk in signers {
         let vk = sk.verifying_key();
@@ -211,17 +208,7 @@ fn generic_pc(
 }
 
 fn header_for(block: &Block, view: ViewNumber) -> ProposalHeader {
-    ProposalHeader {
-        chain_id: CHAIN_ID,
-        view,
-        block_hash: block.hash,
-        height: block.height,
-        data_hash: block.data_hash,
-        justify: block.justify.clone(),
-        tc: None,
-        nec: None,
-        has_validator_set_updates: false,
-    }
+    crate::test_keys::seed_leader_header(CHAIN_ID, block, view)
 }
 
 fn proposer_for<K: KVStore>(

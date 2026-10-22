@@ -40,7 +40,7 @@ use crate::block_tree::{
 };
 
 use super::{
-    crypto_primitives::{Signature, Verifier, VerifyingKey},
+    crypto_primitives::{Signature, VerifyingKey},
     data_types::{ChainID, SignatureBytes, TotalPower, ViewNumber},
     validator_set::{ValidatorSet, ValidatorSetState},
 };
@@ -58,9 +58,7 @@ pub(crate) trait SignedMessage: Clone {
     /// Verify that `signature_bytes` is a signature created by `verifying_key` over `message_bytes`.
     fn is_correct(&self, verifying_key: &VerifyingKey) -> bool {
         let signature = Signature::from_bytes(&self.signature_bytes().bytes());
-        verifying_key
-            .verify(&self.message_bytes(), &signature)
-            .is_ok()
+        crate::types::crypto_primitives::verify_signature(verifying_key, &self.message_bytes(), &signature)
     }
 }
 

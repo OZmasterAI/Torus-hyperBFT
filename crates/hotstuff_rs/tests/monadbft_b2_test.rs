@@ -3,7 +3,6 @@
     Tests for tasks 3.3.3 (NEC) and 3.3.4 (2-chain commit + speculative finality).
 */
 
-use borsh::BorshSerialize;
 use rand_core::OsRng;
 
 use hotstuff_rs::hotstuff::messages::Proposal;
@@ -20,6 +19,8 @@ use hotstuff_rs::types::validator_set::ValidatorSet;
 // ============================================================================
 // Helper functions
 // ============================================================================
+
+const CHAIN: ChainID = ChainID::new(0);
 
 fn make_validator_set(n: usize) -> (Vec<SigningKey>, ValidatorSet) {
     let mut csprg = OsRng {};
@@ -48,7 +49,7 @@ fn make_block(height: u64, justify: PhaseCertificate) -> Block {
 }
 
 fn sign_ne(keypair: &SigningKey, view: ViewNumber, high_tip_qc_view: ViewNumber) -> SignatureBytes {
-    let msg = (view, high_tip_qc_view).try_to_vec().unwrap();
+    let msg = hotstuff_rs::types::signing::no_endorsement_bytes(CHAIN, view, high_tip_qc_view);
     let sig = keypair.sign(&msg);
     SignatureBytes::new(sig.to_bytes())
 }
@@ -68,7 +69,7 @@ fn nec_and_qc_cannot_coexist_4_validators() {
     let nec_view = ViewNumber::new(5);
     let high_tip_qc_view = ViewNumber::new(2);
 
-    let mut collector = NECollector::new(nec_view, high_tip_qc_view, vs.clone());
+    let mut collector = NECollector::new(CHAIN, nec_view, high_tip_qc_view, vs.clone());
 
     // Collect 3 NE signatures (2f+1 = 3)
     for i in 0..3 {
@@ -116,7 +117,7 @@ fn ne_collector_rejects_bad_signature() {
     let nec_view = ViewNumber::new(5);
     let high_tip_qc_view = ViewNumber::new(2);
 
-    let mut collector = NECollector::new(nec_view, high_tip_qc_view, vs);
+    let mut collector = NECollector::new(CHAIN, nec_view, high_tip_qc_view, vs);
 
     // Sign with wrong view
     let bad_sig = sign_ne(&keypairs[0], ViewNumber::new(99), high_tip_qc_view);
@@ -136,7 +137,7 @@ fn ne_collector_no_double_count() {
     let nec_view = ViewNumber::new(5);
     let high_tip_qc_view = ViewNumber::new(2);
 
-    let mut collector = NECollector::new(nec_view, high_tip_qc_view, vs);
+    let mut collector = NECollector::new(CHAIN, nec_view, high_tip_qc_view, vs);
 
     let sig = sign_ne(&keypairs[0], nec_view, high_tip_qc_view);
     let result1 = collector.collect(
@@ -165,7 +166,7 @@ fn ne_collector_rejects_wrong_view() {
     let nec_view = ViewNumber::new(5);
     let high_tip_qc_view = ViewNumber::new(2);
 
-    let mut collector = NECollector::new(nec_view, high_tip_qc_view, vs);
+    let mut collector = NECollector::new(CHAIN, nec_view, high_tip_qc_view, vs);
 
     let sig = sign_ne(&keypairs[0], nec_view, high_tip_qc_view);
     // Pass wrong view to collect
@@ -199,6 +200,7 @@ fn is_fresh_proposal_happy_path() {
         block,
         tc: None,
         nec: None,
+        leader_signature: SignatureBytes::new([0; 64]),
     };
     assert!(is_fresh_proposal(&proposal), "Should be fresh (happy path)");
 }
@@ -225,6 +227,7 @@ fn is_fresh_proposal_with_nec() {
         block,
         tc: None,
         nec: Some(nec),
+        leader_signature: SignatureBytes::new([0; 64]),
     };
     assert!(is_fresh_proposal(&proposal), "Should be fresh (NEC)");
 }
@@ -261,6 +264,7 @@ fn is_fresh_proposal_with_tc_high_qc() {
         block,
         tc: Some(tc),
         nec: None,
+        leader_signature: SignatureBytes::new([0; 64]),
     };
     assert!(is_fresh_proposal(&proposal), "Should be fresh (TC high_qc)");
 }
@@ -291,6 +295,7 @@ fn is_not_fresh_for_reproposal() {
         block,
         tc: Some(tc),
         nec: None,
+        leader_signature: SignatureBytes::new([0; 64]),
     };
     assert!(
         !is_fresh_proposal(&proposal),
@@ -315,6 +320,7 @@ fn is_not_fresh_for_non_consecutive() {
         block,
         tc: None,
         nec: None,
+        leader_signature: SignatureBytes::new([0; 64]),
     };
     assert!(
         !is_fresh_proposal(&proposal),
@@ -334,7 +340,7 @@ fn nec_formation_with_quorum() {
     let nec_view = ViewNumber::new(10);
     let high_tip_qc_view = ViewNumber::new(5);
 
-    let mut collector = NECollector::new(nec_view, high_tip_qc_view, vs);
+    let mut collector = NECollector::new(CHAIN, nec_view, high_tip_qc_view, vs);
 
     // Collect from first 3 validators (indices 0, 1, 2)
     for i in 0..3 {
@@ -365,7 +371,7 @@ fn nec_cannot_form_insufficient_non_voters() {
     let nec_view = ViewNumber::new(10);
     let high_tip_qc_view = ViewNumber::new(5);
 
-    let mut collector = NECollector::new(nec_view, high_tip_qc_view, vs);
+    let mut collector = NECollector::new(CHAIN, nec_view, high_tip_qc_view, vs);
 
     // Only 2 non-voters send NE
     for i in 0..2 {

@@ -17,7 +17,9 @@ use crate::{
         block::*,
         crypto_primitives::Keypair,
         data_types::*,
+        crypto_primitives::{Signature, SigningKey, VerifyingKey},
         signed_messages::{SignedMessage, Vote},
+        signing::{phase_vote_bytes, proposal_header_bytes, sign_proposal_header},
     },
 };
 
@@ -187,12 +189,35 @@ pub struct Proposal {
     pub tc: Option<TimeoutCertificate>,
     // MonadBFT B2: NEC proving the skipped block is safe to abandon
     pub nec: Option<NoEndorsementCertificate>,
+    /// The proposer's signature over [`proposal_header_bytes`]`(chain_id, view, block.hash)`
+    /// (docs/plans/tc-required-and-tip-signing.md §3 F1). It makes the proposal's view provable, so a
+    /// voter's tip ([`TipInfo`](crate::pacemaker::types::TipInfo)) carries it.
+    pub leader_signature: SignatureBytes,
 }
 
 impl Proposal {
-    /// Returns true if this proposal is a reproposal (MonadBFT Case 4).
+    /// A proposal of `block` in `view`, signed by the proposer `key`.
+    pub fn signed(
+        key: &SigningKey,
+        chain_id: ChainID,
+        view: ViewNumber,
+        block: Block,
+        tc: Option<TimeoutCertificate>,
+        nec: Option<NoEndorsementCertificate>,
+    ) -> Proposal {
+        let leader_signature = sign_proposal_header(key, chain_id, view, &block.hash);
+        Proposal { chain_id, view, block, tc, nec, leader_signature }
+    }
+
+    /// Whether `leader_signature` is `leader`'s signature over this proposal's view and block.
+    pub fn is_signed_by(&self, leader: &VerifyingKey) -> bool {
+        is_header_signed_by(self.chain_id, self.view, &self.block.hash, &self.leader_signature, leader)
+    }
+
+    /// Returns true if this proposal is a reproposal (MonadBFT Case 4): its TC's high tip wins
+    /// and no NEC excuses skipping it (an NEC proposal carries a fresh block).
     pub fn is_reproposal(&self) -> bool {
-        self.tc.as_ref().is_some_and(|tc| tc.high_tip_is_winner)
+        is_reproposal(self.tc.as_ref(), self.nec.as_ref())
     }
 }
 
@@ -270,8 +295,7 @@ impl PhaseVote {
         block: CryptoHash,
         phase: Phase,
     ) -> Self {
-        let message_bytes = &(chain_id, view, block, phase).try_to_vec().unwrap();
-        let signature = keypair.sign(message_bytes);
+        let signature = keypair.sign(&phase_vote_bytes(chain_id, view, &block, phase));
 
         Self {
             chain_id,
@@ -285,9 +309,7 @@ impl PhaseVote {
 
 impl SignedMessage for PhaseVote {
     fn message_bytes(&self) -> Vec<u8> {
-        (self.chain_id, self.view, self.block, self.phase)
-            .try_to_vec()
-            .unwrap()
+        phase_vote_bytes(self.chain_id, self.view, &self.block, self.phase)
     }
 
     fn signature_bytes(&self) -> SignatureBytes {
@@ -352,7 +374,9 @@ pub struct ProposalResponse {
     pub chain_id: ChainID,
     /// The view this response is for (tc.view + 1).
     pub view: ViewNumber,
-    pub proposal: Proposal,
+    /// The requested block (the TC's high tip). The recovering leader re-proposes it under its own
+    /// signature, so the response carries the block alone.
+    pub block: Block,
 }
 
 /// Request for No-Endorsement attestations during RECOVER.
@@ -419,6 +443,9 @@ pub struct ProposalHeader {
     pub tc: Option<TimeoutCertificate>,
     pub nec: Option<NoEndorsementCertificate>,
     pub has_validator_set_updates: bool,
+    /// The proposer's signature over [`proposal_header_bytes`]`(chain_id, view, block_hash)` (F1),
+    /// copied from its [`Proposal`].
+    pub leader_signature: SignatureBytes,
 }
 
 impl ProposalHeader {
@@ -433,8 +460,48 @@ impl ProposalHeader {
             tc: p.tc.clone(),
             nec: p.nec.clone(),
             has_validator_set_updates,
+            leader_signature: p.leader_signature,
         }
     }
+
+    /// Replace `leader_signature` with `key`'s signature over this header's view and block.
+    pub fn sign(&mut self, key: &SigningKey) {
+        self.leader_signature = sign_proposal_header(key, self.chain_id, self.view, &self.block_hash);
+    }
+
+    /// This header signed by `key` (see [`sign`](Self::sign)).
+    pub fn signed(mut self, key: &SigningKey) -> Self {
+        self.sign(key);
+        self
+    }
+
+    /// Whether `leader_signature` is `leader`'s signature over this header's view and block.
+    pub fn is_signed_by(&self, leader: &VerifyingKey) -> bool {
+        is_header_signed_by(self.chain_id, self.view, &self.block_hash, &self.leader_signature, leader)
+    }
+
+    /// See [`Proposal::is_reproposal`].
+    pub fn is_reproposal(&self) -> bool {
+        is_reproposal(self.tc.as_ref(), self.nec.as_ref())
+    }
+}
+
+/// A proposal carrying `tc` and `nec` re-proposes the TC's high tip: the tip wins and no NEC.
+fn is_reproposal(tc: Option<&TimeoutCertificate>, nec: Option<&NoEndorsementCertificate>) -> bool {
+    nec.is_none() && tc.is_some_and(|tc| tc.high_tip_is_winner)
+}
+
+/// Whether `signature` is `leader`'s signature over [`proposal_header_bytes`]`(chain_id, view,
+/// block_hash)`.
+pub(crate) fn is_header_signed_by(
+    chain_id: ChainID,
+    view: ViewNumber,
+    block_hash: &CryptoHash,
+    signature: &SignatureBytes,
+    leader: &VerifyingKey,
+) -> bool {
+    let signature = Signature::from_bytes(&signature.bytes());
+    crate::types::crypto_primitives::verify_signature(leader, &proposal_header_bytes(chain_id, view, block_hash), &signature)
 }
 
 impl From<ProposalHeader> for HotStuffMessage {
@@ -498,6 +565,7 @@ mod tests {
             tc: None,
             nec: None,
             has_validator_set_updates: false,
+            leader_signature: SignatureBytes::new([0; 64]),
         };
         let bytes = header.try_to_vec().unwrap();
         assert!(
@@ -524,6 +592,7 @@ mod tests {
             block: block.clone(),
             tc: None,
             nec: None,
+            leader_signature: SignatureBytes::new([0; 64]),
         };
         let header = ProposalHeader::from_proposal(&proposal, false);
         assert!(header.chain_id == proposal.chain_id);
@@ -591,6 +660,7 @@ mod tests {
             block,
             tc: None,
             nec: None,
+            leader_signature: SignatureBytes::new([0; 64]),
         };
         let proposal_bytes = proposal.try_to_vec().unwrap();
         let header = ProposalHeader::from_proposal(&proposal, false);
@@ -615,6 +685,7 @@ mod tests {
             tc: None,
             nec: None,
             has_validator_set_updates: false,
+            leader_signature: SignatureBytes::new([0; 64]),
         };
         let msg: HotStuffMessage = header.into();
         assert!(msg.chain_id() == ChainID::new(1));

@@ -99,4 +99,13 @@ fn two_of_three_at_2_2_1_stakes_keep_committing_with_the_minority_down() {
         },
         || describe(&nodes),
     );
+
+    // docs/plans/tc-required-and-tip-signing.md: every leader backs a
+    // timeout-view proposal with the TC of the previous view (validators
+    // enforce it from phase B, VALIDPROPOSAL V1).
+    let tc_less: Vec<u64> = nodes.iter().map(|n| n.tc_less_proposals()).collect();
+    assert!(
+        tc_less.iter().all(|&count| count == 0),
+        "proposals without QC(v-1) or TC(v-1) per node: {tc_less:?}"
+    );
 }

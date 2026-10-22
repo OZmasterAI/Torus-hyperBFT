@@ -1,6 +1,8 @@
 # TC required (option B) and tip signing: design
 
-Status: design only (owner decision s134: option B). Pre-genesis. Base: main 28ba931e.
+Status: owner decision s134: option B. Pre-genesis. Base: main 28ba931e. Phase A built (feat/tc-required-phase-a);
+phase B built (feat/tc-required-phase-b: V1 and V3 always on, high-QC verification, §2 amendments below); phase C
+built (feat/tc-required-phase-c: F1-F5 and domain tags, §3 "As built").
 Paths (under `crates/hotstuff_rs/src/`): **PM** = pacemaker/implementation.rs, **PT** = pacemaker/types.rs,
 **PMsg** = pacemaker/messages.rs, **HS** = hotstuff/implementation.rs, **HT** = hotstuff/types.rs,
 **HM** = hotstuff/messages.rs, **RX** = networking/receiving.rs.
@@ -34,14 +36,32 @@ Paths (under `crates/hotstuff_rs/src/`): **PM** = pacemaker/implementation.rs, *
 
 ### Validator rule (VALIDPROPOSAL)
 
-All of this lives in `valid_proposal_certificates`, which gains a `justify` argument. A proposal or header for view
-v with block B is valid only if:
+All of this lives in `valid_proposal_certificates`, which gains a `justify` argument. Phase B enforces it on every
+replica (the phase-A test-only switch `tc_required` is gone). A proposal or header for view v with block B is valid
+only if:
 
 - **V1.** `B.justify.view == v-1`, or B.justify is the genesis PC, or a TC with `tc.view == v-1` is attached
   (existing check HT:476).
 - **V2.** TC attached, no NEC, `high_tip_is_winner` => B is `tc.high_tip` (existing check HT:479-484).
-- **V3 (new).** TC attached, no NEC, high_qc wins with `tc.high_qc = q` => `B.justify.view >= q.view`. Without V3,
-  a valid TC still lets a leader drop the high_qc block.
+- **V3 (new).** TC attached, no NEC, high_qc wins with `tc.high_qc = q` => `B.justify.view >= q.view` **or B is
+  q's block** (`extends_tc_high_qc`). Without V3, a valid TC still lets a leader drop the high_qc block.
+  - *Amendment (phase B).* A validator-set-update re-proposal (invariants.rs:686-697) re-proposes the block that
+    `highest_pc` certifies, and that block justifies below `q.view` when `q` is that very PC. The rule as first
+    written rejected it, so the update could never finish through a timeout view.
+- **High QC verified (phase B).** A timeout vote signs only its highest QC's `(view, block)` summary (PMsg:140-157),
+  so one byzantine voter could make a forged high-view QC the TC's `high_qc`, and under V3 no honest leader could
+  then propose. Two checks, both consistent with `summaries_are_signed` (which requires `high_qc` to be the highest
+  signed summary):
+  - the pacemaker drops a timeout vote whose `highest_qc` is not a correct QC (`is_correct` under the committed or
+    previous set, as for any PC) before echoing or collecting it, so an honest collector forms the TC from honest
+    votes only;
+  - `TimeoutCertificate::is_correct` requires `high_qc` to be a correct QC, so a TC built by anyone else around a
+    forged vote is rejected everywhere (proposals, AdvanceView, a vote's `highest_tc`).
+  - Cost: n signature checks per check; a QC equal to the replica's own highest PC (already verified, the common
+    case) is not re-verified.
+  - Rejected alternative: the TC builder taking the highest *verified* QC. A verifier only sees the signed summaries,
+    so it cannot tell a skipped forged QC from a skipped real one; allowing a non-highest `high_qc` would let a
+    byzantine builder pick a lower QC and evade V3.
 - **V4.** NEC rules are unchanged (HT:465-472).
 
 Nudges are exempt: they carry no new block, and `safe_nudge` already requires `justify.view == v-1` unless the phase
@@ -49,10 +69,13 @@ is Commit (block_tree/invariants.rs:439).
 
 ### Leader rule (on entering v as leader)
 
-- **L1.** If `highest_pc.view == v-1`, propose as today. Happy path, no wait.
+- **L1.** If `highest_pc.view == v-1`, propose as today. Happy path, no wait. The genesis PC also counts, but only
+  without TC(v-1): a held TC goes through L2 so its winning tip or high QC is kept (phase-A review P2).
 - **L2.** Else, if `highest_tc.view == v-1`, propose via `create_proposal_based_on_tc` and attach the TC in every case
   (`finish_leader_proposal` takes `tc: Option`). In case 3, first apply `tc.high_qc` (as PM:487-489 does); if its
-  block is missing, defer and fetch it (HS:806-815).
+  block is missing, defer and fetch it (HS:806-815). A re-proposed tip (case 4, or case 5 after a ProposalResponse,
+  which the leader validates and inserts first) keeps its own `has_validator_set_updates` flag, so validators vote
+  Prepare on a validator-set update (phase-A review P1).
 - **L3.** Otherwise enter a new `awaiting_tc` state, a sibling of `proposal_deferred`, retried every loop pass via
   `has_deferred_proposal` (algorithm.rs:208-211), which re-checks L1 and L2.
 - **L4.** Case 5 never falls through. It waits for a ProposalResponse (reproposal with TC, HS:1938-1957) or an NEC
@@ -71,7 +94,9 @@ is Commit (block_tree/invariants.rs:439).
 - **C3.** `on_receive_timeout_vote` routes `view == cur-1` to `prev_collector`. Bracha echo stays restricted to
   `view >= cur` (PM:275).
 - **C4.** A TC formed this way uses the existing highest_tc and AdvanceView path (PM:381-416), which also pulls
-  stragglers into v (PM:529-537).
+  stragglers into v (PM:529-537). It must not count as v's own AdvanceView (`last_advance_view`): otherwise the
+  AdvanceView carrying TC(v) is skipped and, in an epoch-change view (extends on timeout), every replica stays in v
+  holding TC(v) (found in phase B; fixed there).
 
 ### Liveness
 
@@ -96,6 +121,33 @@ within about two one-way delays of the first f+1.
   unchanged.
 - **Headroom.** The wait fits inside view v's timer: 1200 ms base (torus-types/src/lib.rs:1755-1757), stretched x2
   per stalled view up to cap 8 (PM:625-635, lib.rs:1767-1773).
+
+**As fixed (tc-liveness, s136).** Batch 9 (A+B+C on main) stalled the torus-consensus p00 cluster tests under
+`cargo test` (5-6 of 9 failed in one process; main 9/9). Not lost votes: CPU. A node-tagged trace of the CPU-busy
+crossing test (debug build, ubuntoz with 24 busy loops) showed one ed25519 check at ~36 ms and the same signatures
+checked again on every message (per header 7.5 checks, per timeout vote 6.2; main 3.0 / 2.7): the TC each timeout vote
+carries (its signatures, high QC, high tip), the tip and QC every honest vote reports, the header a leader re-sends
+every ~270 ms, each AdvanceView copy. Each replica's algorithm thread fell 4-5 s behind its queue (one replica
+processed its own TV(7) 4.6 s after sending it), so timeout votes for v-1 reached leader(v) after it had left v, QCs
+formed only in 8-16 s backed-off views and never in two consecutive views, and nothing committed.
+- **Fix.** All consensus checks go through `crypto_primitives::verify_signature`, which keeps the last 1024 checks that
+  passed on its thread, keyed by the exact `key ‖ signature ‖ message` bytes, and skips a check it has seen pass. A
+  failed or new check always runs, so every verdict is the one a fresh check gives: what a replica accepts (V1-V4,
+  F1-F5, the high-QC checks, the one-fresh-proposer rule) and the §4 argument are unchanged, and a leader still
+  proposes in v only with QC(v-1) or TC(v-1). The CPU-busy crossing test then passes in 9 s (main: 37-59 s), with at
+  most 1.4 checks per message.
+- **Test.** `tests/slow_signature_check_liveness_test.rs` adds 40 ms to every check (test hook): 4 validators all up
+  and 3 of 4 must commit height 6 in 90 s (56923063: no commit / height 2 in 60 s; main with the same hook: 15 s /
+  27 s; fixed: 9 s / 15 s). Unit: `signature_check_tests`, `timeout_votes_carrying_a_checked_tc_cost_one_signature_check_each`.
+- **Not changed (owner, pre-existing on main).** After a backed-off view, the next view entered at multiplier 1 has its
+  scheduled deadline in the past (the per-epoch schedule is absolute and only too-far-future deadlines are rebased,
+  PM 2b), so it times out at once (`deadline_in_ms=0` in the trace, on main and batch 9 alike). Main recovers its
+  consecutive QCs by chance (the leader enters that view by its own timeout and proposes in the same loop pass while
+  the others sit in a backed-off view); a slow cluster can lose every such view. Rebasing a past deadline too would
+  close it; it changes the view schedule for every chain, so it is left for a separate decision.
+- **Rejected.** Re-broadcasting own timeout votes on every timeout (adds messages to queues already seconds behind);
+  collecting votes for views further back (leader(v) has left v by the time a late TC(v-1) forms); certificate-driven
+  view advance (the votes were not lost, they were late).
 
 ## 3. Change 2: tip signing
 
@@ -131,9 +183,53 @@ within about two one-way delays of the first f+1.
 - **F5.** `cast_header_vote` sets local_tip from the header; reproposals copy the verified `tc.high_tip`. Remove the
   nudge write (HS:1573-1585).
 
+### As built (phase C)
+
+Owner answers s134: option (3); domain tags on every consensus signature now; drop nudge tips. Open question 4
+follows F2 (a tip signed under a set older than the previous one is dropped); 5: reputation stays off, and since the
+review (P2) it is refused: `check_leader_selection_mode` makes `ReplicaSpec::start` panic and the node refuse to start
+when `reputation_leader_selection` is on, because F2 would pick a tip's leader from today's reputation, not the tip
+view's.
+
+- **Signed bytes** (`types/signing.rs`): `DOMAIN_* || borsh(fields)`, tags `torus-hotstuff/v1/{proposal-header,
+  phase-vote, timeout-vote, no-endorsement}` (prefix-free). Timeout vote: `(chain_id, view, Option<(tip_hash,
+  tip_view)>, Option<(qc_view, qc_block)>)`; the presence bytes keep tip-only and QC-only votes apart. NE now binds
+  `chain_id` too (`valid_nec`, `NECollector::new` take it). Block-sync `AdvertiseBlock` stays untagged (not a
+  consensus signature; no tagged layout can equal its 16 bytes).
+- **F1.** `Proposal::signed`, `ProposalHeader.leader_signature`. A header or proposal not signed by its origin (the
+  proposer) is dropped before equivocation detection, so a forged header cannot frame a leader; a full proposal must
+  also be for the current view. `ProposalResponse` carries the block only (the recovering leader re-signs).
+- **F2.** `TipInfo::is_correct`: `Block::hash` recompute, then the signature of the view's one fresh proposer
+  (`fresh_proposer`, §4 "Validator-set update window"): leader(view) of the previous set if `view <= update_view`,
+  else of the committed set, decided or not. (First built as "committed or previous set", which let one view have two
+  valid tips; review fix s134. The s134 rule also switched to the committed set once the update was decided; s136
+  dropped that, see §4.)
+- **F3.** `summaries_are_signed`: the high tip is a signed `(hash, view)` at the highest signed tip view, and no
+  signed tip is newer than the TC's view. `is_correct` runs F2 on the high tip. `voter_metadata` must cover every
+  validator position (the unsigned-base fallback is gone).
+- **F4.** The pacemaker drops a timeout vote whose tip fails F2 or is newer than the vote, before echo or collection
+  (replaces the CONS-FIND-26 view check).
+- **F5.** `cast_header_vote` sets the tip as the full path does: re-proposal (TC high tip wins, no NEC) copies the
+  verified `tc.high_tip`; a fresh Generic vote takes the header. The nudge write is gone. VSU (Prepare) votes set no
+  tip, as before on the full path.
+- **Cost** (18c release, load ~30, `tip_signing_cost_report`): header sign 36 us per proposal (leader), header
+  verify 54 us per header or proposal received, `Block::hash` 0.3 us; F2 one verify per tip in a timeout vote (the
+  pacemaker and the TC check reuse the validator-set state they already read; a lone F2 with its own state read is
+  ~180 us); `TimeoutCertificate::is_correct` with 3 signers 312 us without a tip, 353 us with a high tip. Wire: +64
+  bytes per header and per tip, +9 bytes per signer in `voter_metadata` (tip view + option byte).
+
 If this lands after genesis: the P0.0 feature bits (feat/p00-activation-gating) are per-height bits on the app block
 header, not a consensus wire version. Borsh messages would need new variants plus a height-gated switch. Not
 recommended.
+
+**Stored data (batch 9 merge).** Phase C changes what the consensus DB holds: `LOCAL_TIP` gains the leader signature
+(an old record no longer decodes), and every stored PC / TC / NEC was signed over the untagged layout (each fails
+`is_correct` under the tagged one). Without a check an old data dir would boot and stall: every proposal on an old
+justify and every TC over an old high QC fails verification, and the algorithm thread only logs it. So the block
+tree records `CONSENSUS_DB_FORMAT` (variable 25, `CONSENSUS_DB_FORMAT_VERSION` = 1) at `initialize`, and torus-node's
+`open_node_dbs` refuses an initialized consensus DB of any other format (absent = pre-phase-C) before writing
+anything: start from a fresh data dir (docs/node-operator-guide.md, "Consensus DB format"). There is no migration;
+only local devnets exist.
 
 ## 4. Safety
 
@@ -147,14 +243,64 @@ recommended.
   - Unsigned views let the TC builder rank B below high_qc: F3 closes that. Optional TCs let the builder skip the TC
     entirely: V1 closes that. V3 closes the QC-winner variant.
   - The argument carries across consecutive timeout views, because a reproposal keeps B as the tip.
+- **Validator-set update window (review fix s134).** While an update is committed but not decided, `is_proposer`
+  accepts leader(v) of the committed set (CVS) and of the previous set (PVS), for nudges and re-proposals. If F2 also
+  accepted both (as first built, even after the decision), view v could have two valid tips: B from one leader with
+  2f+1 votes and X from the other (signed by a byzantine leader, reported by a byzantine voter). The collector keeps the
+  first tip at the highest view and `summaries_are_signed` accepts any signed tip there, so TC(v) could name X; X's
+  re-proposal fails, an NEC then lets a fresh block drop B, and no rollback fires (equivocation is keyed by
+  (view, leader)). Committed blocks stay safe (the lock).
+  - *Rule: one fresh proposer per view* (`ValidatorSetState::fresh_proposer_set`, `pacemaker::types::fresh_proposer`).
+    The PVS leader for `v <= update_view`, the CVS leader for `v > update_view` (or with no `update_view`: no update
+    committed yet). Whether the update is decided does not matter (owner s136). `update_view` (block-tree variable
+    24) is recorded when the updating block U is committed: the view of the Commit or Decide PC on U the commit rests
+    on (a commit through a descendant uses U's child's justify, U's Decide PC). Honest fresh proposals before it were
+    made under the PVS; between U's Commit PC and Decide PC honest leaders only nudge; every block after U justifies
+    on U's Decide PC or later.
+  - *Why decided-ness dropped out (s136, [claude-review] P3).* The s134 rule switched every view to the CVS leader
+    once the update was decided. VSU proposals and nudges set no tip, so every honest tip in the window is a
+    pre-update one, signed by the PVS leader at a view `<= update_view`. A replica that had applied the Decide PC
+    judged it against the CVS leader: it dropped undecided replicas' timeout votes, rejected every TC whose high tip
+    was such a tip (also as the losing tip of a case-3 TC) and every proposal carrying one. A case-3 leader became
+    decided by applying the TC's high QC (the Decide PC) and then rejected its own header. Cost: about 1-3 lost views
+    per update, more once dead-leader exclusion makes updates frequent. The rule now depends only on the view and
+    the committed `update_view`, so it is still exactly one leader per view, and replicas that differ only in
+    whether they saw the Decide PC agree on it.
+  - *When the PVS is dropped.* The rule reads the PVS for views `<= update_view` after the decision too. Nothing
+    changes in storage: the decision only sets `VALIDATOR_SET_UPDATE_DECIDED`; `PREVIOUS_VALIDATOR_SET` and
+    `update_view` stay until the next updating block U' is committed, which overwrites the committed set, the
+    previous set (with the old committed set), `update_view` and the decided flag in one write batch. From then on
+    a tip at a view `<=` the old `update_view` is judged against U''s previous set (the old CVS) and fails unless
+    that leader matches: open question 4 (drop, not archive). Such a tip can no longer matter: an honest replica
+    holding one omits it from its timeout votes (`own_timeout_summaries`), and the TC argument above needs only the
+    tips of blocks still uncertified, which are newer than U''s commit.
+  - Applied everywhere `fresh_proposer` is used: F2 (one signature check; the pacemaker's timeout-vote check F4 and
+    `TimeoutCertificate::is_correct`); a vote that sets the voter's tip (fresh Generic proposal, NEC proposals
+    included, both paths) only for that proposer, judged under the state after the justify (a Decide PC on an update
+    this replica has not committed yet is read as if committed; that rebuilt state has no `update_view`, which is
+    right because the proposal's view exceeds the justify's, which is at least `update_view`); a leader proposes a
+    fresh block (or an NEC block) only if it is that proposer; the timeout blame. Nudges, VSU re-proposals and TC
+    re-proposals (which copy the TC's high tip) keep the two-leader `is_proposer` rule.
+  - Options rejected: "PVS only while undecided" alone still has two leaders per view in the window. Ranking tied tips
+    by signer count fails (X can have up to 2f reporters, B only f+1). Treating both leaders' proposals in one view as
+    equivocation would make the undo detectable but TC(v) could still drop B. A single leader per view keeps the
+    argument above unconditional, and with dead-leader exclusion (the CVS drops a dead leader) it is the CVS leader
+    that proposes once the update takes over.
+  - Also from the review: the NE reply goes to the requesting proposer (either leader while undecided, as
+    `is_proposer`), not the CVS leader; the timeout blame (reputation bookkeeping) names the view's fresh proposer. The
+    justify-block fetch target (`request_missing_parent`) still asks the CVS leader of the justify's view first: a
+    hint, with rotation over the committed validators and height-range sync as fallbacks.
+  - Residual: a replica that applied U's Decide PC without committing U, and then a Generic PC on U's child before
+    the body arrives, judges later proposers under the old set until it commits; this is a liveness lag of that
+    replica, and its fresh votes for the old set's leader need 2f+1 such replicas to matter.
 - **Speculative-commit undo closed.** A speculatively committed block can then only be undone by leader
   equivocation, the existing rollback trigger (HS:1270-1285). `speculative_commits` has no RPC or exec consumer yet.
 - **Commit safety unchanged.** It still comes from the HotStuff lock (`safe_block` / `safe_pc`).
 
-## 5. Performance (derived, not measured)
+## 5. Performance (derived, not measured; phase C sign/verify measured in §3 "As built")
 
 - **Happy path: no added delay.** leader(v) aggregates the v-1 votes itself (HS:1201-1220), so L1 applies. The header
-  grows by 64 bytes and costs one sign and one verify (tens of us).
+  grows by 64 bytes and costs one sign and one verify (measured: 36 us and 54 us on a loaded 18c).
 - **Timeout view: about +0.5 to 1 RTT** (~13 ms LAN, 227-502 ms WAN). Part of it overlaps, because followers already
   wait for their own timeouts before voting.
 - **s134 estimates (one of 4 down):** LAN 1.51 -> 1.50 blocks/s; WAN -8% to -13%. A dead-leader view already costs
@@ -182,6 +328,33 @@ recommended.
 - `multiple_validator_set_updates_test` and `epoch_boundary_rejoin_test` with timeouts.
 - Update the stateright models (`stateright_lockstep_backoff.rs`, `stateright_rejoin_leader_sync.rs`).
 
+Phase B built the V1/V3 unit cases, the forged-high-QC cases (TC and collector), and in
+`tests/tc_required_byzantine_test.rs`: the byzantine leader that drops the TC, the tail-fork attempt, a byzantine
+voter with a forged high QC, a leader restart while awaiting TC(v-1), and a validator-set update through timeout views
+(5 validators, one down); `tests/tc_required_strict_test.rs` runs 4 nodes with each key down in turn. The
+multi-node tail-fork case checks that the fresh block without TC is rejected, and from phase C (F5) that B is
+re-proposed and voted in a later view.
+
+Phase C built the F1-F5 and domain-tag unit cases (`tc_validation_test.rs` "Phase C", `prev_view_collector_test.rs`
+F4, `types/signing.rs`) and, in `tests/tc_required_byzantine_test.rs`, a byzantine voter whose forged tips (fields not
+hashing to the signed block) must not make any honest leader run a recovery. The VSU case forces the V3-amendment
+re-proposal by dropping the first Prepare nudge and asserts it happened.
+
+The review fix (s134) adds `hotstuff/window_tip_leader_test.rs` (F2 per update view and decision, the B-vs-X tie at
+TC(v) resolving to B, fresh votes only for the view's fresh proposer incl. a Decide-PC justify on an uncommitted update,
+`update_view` recorded at commit, NE reply to the requesting proposer, the full path's drop of a proposal for another
+view), two window cases in `prev_view_collector_test.rs` (F4 drops the vote reporting X; timeout blame), the
+reputation-mode refusal, and `torus-consensus` slashing: a real phase-vote signature verifies through
+`build_vote_message`, which now builds hotstuff_rs's tagged phase-vote bytes.
+
+The s136 window rule (decided-ness dropped) adds, RED on c300a015: in `window_tip_leader_test.rs` F2 per view the same
+decided or not (and the committed set without an update view), a TC naming a pre-update tip correct and its
+re-proposal voted on both paths by decided and undecided replicas, a case-3 leader decided by the TC's high QC (the
+Decide PC) voting for its own header; in `prev_view_collector_test.rs` a decided replica collecting timeout votes
+with a pre-update tip and blaming the view's fresh proposer; in `tests/tc_required_byzantine_test.rs`
+`validator_set_update_window_timeout_loses_no_further_view` (4 validators, power update, the first fresh proposal
+after the update and one validator's timeout votes lost: view w+1 must still get a QC).
+
 **Mutation checks** (each must fail at least one test): revert V1 to `Ok(true)`; drop V3; unsign `tip.view`; skip
 the F2 hash recompute; skip the leader-signature check; drop the domain tag; drop `prev_collector` (expect the
 one-down wedge); restore the case-5 fall-through.
@@ -203,8 +376,8 @@ matched-bench (`tools/matched-bench`), main vs branch, same genesis, 3 runs each
 | Phase | Work | Estimate |
 |---|---|---|
 | A | `prev_collector`, filter and buffer changes (C1-C4); `awaiting_tc`; attach TC in every case; no case-5 fall-through; apply high_qc. Validator rule stays lax; assert every timeout-view proposal carries a TC. | 2-3 d |
-| B | Turn on V1 and V3; liveness and byzantine tests; mutation set. | 1-1.5 d |
-| C | F1-F5, domain tags, tests. | 2-2.5 d |
+| B | Turn on V1 and V3 (V3 amended, high QC verified); liveness and byzantine tests; mutation set. Built. | 1-1.5 d |
+| C | F1-F5, domain tags, tests. Built. | 2-2.5 d |
 | D | Bench cells and report. | 1 d |
 
 A Codex torus review runs after each phase. Total about 6-8 working days.

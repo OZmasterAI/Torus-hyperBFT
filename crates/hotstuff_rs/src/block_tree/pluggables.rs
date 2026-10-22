@@ -401,6 +401,30 @@ pub trait KVGet {
         }
     }
 
+    /* ↓↓↓ Validator Set Update View ↓↓↓ */
+
+    fn validator_set_update_view(&self) -> Result<Option<ViewNumber>, KVGetError> {
+        match self.get(&variables::VALIDATOR_SET_UPDATE_VIEW) {
+            Some(bytes) => ViewNumber::deserialize(&mut &*bytes)
+                .map(Some)
+                .map_err(|err| KVGetError::DeserializeValueError { key: Key::ValidatorSetUpdateView, source: err }),
+            None => Ok(None),
+        }
+    }
+
+    /* ↓↓↓ Consensus DB Format ↓↓↓ */
+
+    /// The [`CONSENSUS_DB_FORMAT`](variables::CONSENSUS_DB_FORMAT) of this store; `None` for a store
+    /// written before the key existed (or an empty one).
+    fn consensus_db_format(&self) -> Result<Option<u32>, KVGetError> {
+        match self.get(&variables::CONSENSUS_DB_FORMAT) {
+            Some(bytes) => u32::deserialize(&mut &*bytes)
+                .map(Some)
+                .map_err(|err| KVGetError::DeserializeValueError { key: Key::ConsensusDbFormat, source: err }),
+            None => Ok(None),
+        }
+    }
+
     /* ↓↓↓ Validator Set Update Complete ↓↓↓ */
     fn validator_set_update_complete(&self) -> Result<bool, KVGetError> {
         bool::deserialize(
@@ -424,7 +448,8 @@ pub trait KVGet {
             self.previous_validator_set()?,
             self.validator_set_update_block_height()?,
             self.validator_set_update_complete()?,
-        ))
+        )
+        .with_update_view(self.validator_set_update_view()?))
     }
 
     /* ↓↓↓ Highest View Phase-Voted ↓↓↓ */
@@ -487,6 +512,8 @@ pub enum Key {
     ValidatorSetUpdateHeight,
     ValidatorSetUpdateDecided,
     HighestViewPhaseVoted,
+    ValidatorSetUpdateView,
+    ConsensusDbFormat,
 }
 
 impl Display for Key {
@@ -517,6 +544,8 @@ impl Display for Key {
             Key::ValidatorSetUpdateHeight => write!(f, "Validator Set Update Block Height"),
             Key::ValidatorSetUpdateDecided => write!(f, "Validator Set Update Decided"),
             Key::HighestViewPhaseVoted => write!(f, "Highest View Phase-Voted"),
+            Key::ValidatorSetUpdateView => write!(f, "Validator Set Update View"),
+            Key::ConsensusDbFormat => write!(f, "Consensus DB Format"),
         }
     }
 }

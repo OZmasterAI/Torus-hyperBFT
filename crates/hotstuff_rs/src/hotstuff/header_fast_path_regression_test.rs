@@ -35,8 +35,6 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use borsh::BorshSerialize;
-
 use crate::app::{
     App, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest, ValidateBlockResponse,
 };
@@ -60,8 +58,10 @@ use crate::pacemaker::implementation::ViewInfo;
 use crate::types::block::Block;
 use crate::types::crypto_primitives::{Keypair, SigningKey, VerifyingKey};
 use crate::types::data_types::{
-    BlockHeight, ChainID, CryptoHash, Data, Datum, Power, SignatureSet, ViewNumber,
+    BlockHeight, ChainID, CryptoHash, Data, Datum, Power, SignatureBytes, SignatureSet, ViewNumber,
 };
+use crate::test_keys::signed_by;
+use crate::types::signing::phase_vote_bytes;
 use crate::types::update_sets::{AppStateUpdates, ValidatorSetUpdates};
 use crate::types::validator_set::{ValidatorSet, ValidatorSetState};
 
@@ -235,6 +235,29 @@ pub(crate) fn steady_block_tree(set: &ValidatorSet) -> (BlockTreeSingleton<MemKV
     (block_tree, vss)
 }
 
+/// A TC for `view` (no tips, no QCs) formed from `signers`' timeout votes,
+/// exactly as the `TimeoutVoteCollector` forms it.
+pub(crate) fn bare_tc(
+    view: ViewNumber,
+    signers: &[SigningKey],
+    set: &ValidatorSet,
+) -> crate::pacemaker::types::TimeoutCertificate {
+    use crate::pacemaker::messages::PacemakerMessage;
+    use crate::pacemaker::types::TimeoutVoteCollector;
+    use crate::types::signed_messages::Collector;
+    let mut collector = TimeoutVoteCollector::new(CHAIN_ID, view, set.clone());
+    let mut tc = None;
+    for key in signers {
+        let PacemakerMessage::TimeoutVote(vote) =
+            PacemakerMessage::timeout_vote(&Keypair::new(key.clone()), CHAIN_ID, view, None, None, None)
+        else {
+            unreachable!()
+        };
+        tc = collector.collect(&key.verifying_key(), vote).or(tc);
+    }
+    tc.expect("signers form a quorum")
+}
+
 /// Manually assemble a quorum-signed Generic `PhaseCertificate` for
 /// `block`/`view` (exactly as the `PhaseVoteCollector` would).
 pub(crate) fn generic_pc(
@@ -243,9 +266,7 @@ pub(crate) fn generic_pc(
     signers: &[SigningKey],
     set: &ValidatorSet,
 ) -> PhaseCertificate {
-    let message = (CHAIN_ID, view, block, Phase::Generic)
-        .try_to_vec()
-        .unwrap();
+    let message = phase_vote_bytes(CHAIN_ID, view, &block, Phase::Generic);
     let mut signatures = SignatureSet::new(set.len());
     for sk in signers {
         let vk = sk.verifying_key();
@@ -275,6 +296,7 @@ fn header_for(block: &Block, view: ViewNumber) -> ProposalHeader {
         tc: None,
         nec: None,
         has_validator_set_updates: false,
+        leader_signature: SignatureBytes::new([0; 64]),
     }
 }
 
@@ -379,7 +401,7 @@ fn pending_justify_bypass_enforces_lock_clause() {
     let h1 = header_for(&b1, view1);
     let p1 = proposer_for(view1, &keys, &vss, &block_tree);
     hotstuff
-        .on_receive_msg(HotStuffMessage::ProposalHeader(h1), &p1, &mut block_tree, &mut app)
+        .on_receive_msg(HotStuffMessage::ProposalHeader(signed_by(h1, &p1)), &p1, &mut block_tree, &mut app)
         .expect("processing a safe header must not error");
     deliver_body(&mut hotstuff, &mut block_tree, &mut app, &b1, view1, &p1);
     assert_eq!(
@@ -406,10 +428,13 @@ fn pending_justify_bypass_enforces_lock_clause() {
         Data::new(vec![]),
     );
     let view2 = ViewNumber::new(2);
-    let h2 = header_for(&b2, view2);
+    let mut h2 = header_for(&b2, view2);
+    // VALIDPROPOSAL V1 (TC-required phase B): the stale justify needs TC(1)
+    // to reach the safety checks under test.
+    h2.tc = Some(bare_tc(ViewNumber::new(1), &keys[..3], &set));
     let p2 = proposer_for(view2, &keys, &vss, &block_tree);
     hotstuff
-        .on_receive_msg(HotStuffMessage::ProposalHeader(h2), &p2, &mut block_tree, &mut app)
+        .on_receive_msg(HotStuffMessage::ProposalHeader(signed_by(h2, &p2)), &p2, &mut block_tree, &mut app)
         .expect("processing an unsafe header must not error");
 
     assert!(
@@ -452,7 +477,7 @@ fn header_vote_on_app_invalid_body_increments_metric() {
     let h1 = header_for(&b1, view1);
     let p1 = proposer_for(view1, &keys, &vss, &block_tree);
     hotstuff
-        .on_receive_msg(HotStuffMessage::ProposalHeader(h1), &p1, &mut block_tree, &mut app)
+        .on_receive_msg(HotStuffMessage::ProposalHeader(signed_by(h1, &p1)), &p1, &mut block_tree, &mut app)
         .expect("processing a safe header must not error");
     assert_eq!(
         block_tree
@@ -607,7 +632,7 @@ fn header_vote_locks_before_vote() {
     let p2 = proposer_for(view2, &keys, &vss, &block_tree);
     hotstuff
         .on_receive_msg(
-            HotStuffMessage::ProposalHeader(h2),
+            HotStuffMessage::ProposalHeader(signed_by(h2, &p2)),
             &p2,
             &mut block_tree,
             &mut app,
@@ -698,7 +723,7 @@ fn header_double_vote_window_refused() {
     let mut app = ParkingApp;
     let prop_c = proposer_for(view_c, &keys, &vss, &block_tree);
     hs1.on_receive_msg(
-        HotStuffMessage::ProposalHeader(hc),
+        HotStuffMessage::ProposalHeader(signed_by(hc, &prop_c)),
         &prop_c,
         &mut block_tree,
         &mut app,
@@ -736,7 +761,7 @@ fn header_double_vote_window_refused() {
     let mut hs2 = hotstuff_at(view_bp, keys[0].clone(), vss.clone());
     let prop_bp = proposer_for(view_bp, &keys, &vss, &block_tree);
     hs2.on_receive_msg(
-        HotStuffMessage::ProposalHeader(hbp),
+        HotStuffMessage::ProposalHeader(signed_by(hbp, &prop_bp)),
         &prop_bp,
         &mut block_tree,
         &mut app,

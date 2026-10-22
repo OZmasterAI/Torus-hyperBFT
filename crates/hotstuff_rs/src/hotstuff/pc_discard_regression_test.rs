@@ -52,7 +52,6 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use borsh::BorshSerialize;
 
 use crate::app::{
     App, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest, ValidateBlockResponse,
@@ -204,7 +203,7 @@ fn decide_pc(
     signers: &[SigningKey],
     set: &ValidatorSet,
 ) -> PhaseCertificate {
-    let message = (CHAIN_ID, view, block, Phase::Decide).try_to_vec().unwrap();
+    let message = crate::types::signing::phase_vote_bytes(CHAIN_ID, view, &block, Phase::Decide);
     let mut signatures = SignatureSet::new(set.len());
     for sk in signers {
         let vk = sk.verifying_key();

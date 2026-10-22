@@ -196,7 +196,9 @@ fn loopback_copy_of_inline_header_is_dropped() {
         tc: None,
         nec: None,
         has_validator_set_updates: false,
+        leader_signature: crate::types::data_types::SignatureBytes::new([0; 64]),
     };
+    let header = crate::test_keys::signed_by(header, &led.leader_vk);
     led.log.lock().unwrap().clear();
     let mut app = LeaderApp {
         log: led.log.clone(),

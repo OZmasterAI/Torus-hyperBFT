@@ -2,7 +2,7 @@
 //!
 //! # Initializing the Block Tree
 //!
-//! All variables in the Block Tree start out empty except eight. These eight variables, which must be
+//! All variables in the Block Tree start out empty except nine. These nine variables, which must be
 //! initialized using the [`initialize`](BlockTree::initialize) function before doing anything else with
 //! the Block Tree, are:
 //!
@@ -16,6 +16,7 @@
 //! |Locked PC|The [Genesis PC](crate::hotstuff::types::PhaseCertificate::genesis_pc)|
 //! |Highest View Entered|0|
 //! |Highest Phase Certificate|The [Genesis PC](crate::hotstuff::types::PhaseCertificate::genesis_pc)|
+//! |Consensus DB Format|[`CONSENSUS_DB_FORMAT_VERSION`](crate::block_tree::variables::CONSENSUS_DB_FORMAT_VERSION)|
 //!
 //! # Mutating the Block Tree directly from user code
 //!
@@ -180,6 +181,9 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         if let Some(height) = *update_height {
             wb.set_validator_set_update_block_height(height)?
         }
+        if let Some(view) = initial_validator_set_state.update_view() {
+            wb.set_validator_set_update_view(view)?
+        }
         wb.set_validator_set_update_decided(update_decided)?;
 
         wb.set_locked_pc(&PhaseCertificate::genesis_pc())?;
@@ -187,6 +191,8 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         wb.set_highest_view_entered(ViewNumber::init())?;
 
         wb.set_highest_pc(&PhaseCertificate::genesis_pc())?;
+
+        wb.set_consensus_db_format(variables::CONSENSUS_DB_FORMAT_VERSION)?;
 
         self.write(wb);
 
@@ -353,6 +359,10 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         // 3. Commit block(s) if needed (MonadBFT 2-chain irrevocable commit).
         if let Some(block) = invariants::block_to_commit(justify, self)? {
             committed_blocks = self.commit(&mut wb, &block)?;
+            // TC phase C review: record where the committed update took over fresh proposals.
+            if let Some(view) = self.update_view_of(&committed_blocks, justify)? {
+                wb.set_validator_set_update_view(view)?;
+            }
         }
 
         // 4. Set validator set updates as decided if needed.
@@ -552,6 +562,32 @@ impl<K: KVStore> BlockTreeSingleton<K> {
         );
 
         Ok(())
+    }
+
+    /// The [`update_view`](ValidatorSetState::update_view) of the latest validator-set update among
+    /// `committed_blocks` (committed by `update(justify)`), if any: the view of the PC on the updating
+    /// block U that the commit rests on. That is `justify` itself when it certifies U (a Commit or
+    /// Decide PC), else the justify of U's child on the committed chain, which can only be U's Decide
+    /// PC ([`safe_pc`](invariants::safe_pc) rejects a Generic PC on an updating block).
+    ///
+    /// Fresh proposals of views up to this one were made under the previous set: no honest leader
+    /// proposes a fresh block between U's Commit PC and its Decide PC (it nudges), and every block
+    /// after U justifies on U's Decide PC or later.
+    fn update_view_of(
+        &self,
+        committed_blocks: &[(CryptoHash, Option<ValidatorSetUpdates>)],
+        justify: &PhaseCertificate,
+    ) -> Result<Option<ViewNumber>, BlockTreeError> {
+        let Some(pos) = committed_blocks.iter().rposition(|(_, updates)| updates.is_some()) else {
+            return Ok(None);
+        };
+        let updating_block = committed_blocks[pos].0;
+        let view = match committed_blocks.get(pos + 1) {
+            Some((child, _)) => self.block_justify(child)?.view,
+            None if justify.block == updating_block => justify.view,
+            None => self.block_justify(&justify.block)?.view,
+        };
+        Ok(Some(view))
     }
 
     /// Set the highest `TimeoutCertificate` to be `tc`.
@@ -1544,6 +1580,30 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
                     key: Key::ValidatorSetUpdateHeight,
                     source: err,
                 })?,
+        );
+        Ok(())
+    }
+
+    /* ↓↓↓ Consensus DB Format ↓↓↓ */
+    pub fn set_consensus_db_format(&mut self, format: u32) -> Result<(), BlockTreeError> {
+        let _: () = self.0.set(
+            &variables::CONSENSUS_DB_FORMAT,
+            &format.try_to_vec().map_err(|err| KVSetError::SerializeValueError {
+                key: Key::ConsensusDbFormat,
+                source: err,
+            })?,
+        );
+        Ok(())
+    }
+
+    /* ↓↓↓ Validator Set Update View ↓↓↓ */
+    pub fn set_validator_set_update_view(&mut self, view: ViewNumber) -> Result<(), BlockTreeError> {
+        let _: () = self.0.set(
+            &variables::VALIDATOR_SET_UPDATE_VIEW,
+            &view.try_to_vec().map_err(|err| KVSetError::SerializeValueError {
+                key: Key::ValidatorSetUpdateView,
+                source: err,
+            })?,
         );
         Ok(())
     }

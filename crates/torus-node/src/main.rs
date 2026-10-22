@@ -1101,6 +1101,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // 6. Consensus configuration
     // Leader-selection mode is consensus-critical: every validator must run the
     // same setting or replicas disagree on leaders and finalization halts.
+    // Reputation-weighted selection is refused: the TC tip checks (F2) would pick a
+    // tip's leader from today's reputation, not the tip view's (TC phase C review P2).
+    hotstuff_rs::pacemaker::check_leader_selection_mode(chain_config.reputation_leader_selection)
+        .map_err(|refused| format!("genesis consensus.reputation_leader_selection: {refused}"))?;
     hotstuff_rs::pacemaker::set_reputation_leader_selection(
         chain_config.reputation_leader_selection,
     );
