@@ -1055,12 +1055,18 @@ impl<N: Network> HotStuff<N> {
         &mut self,
         tc: &crate::pacemaker::types::TimeoutCertificate,
         block_tree: &mut BlockTreeSingleton<K>,
-        _app: &mut impl App<K>,
+        app: &mut impl App<K>,
     ) -> Result<TcProposal, HotStuffError> {
         if tc.high_tip_is_winner {
             if let Some(ref tip) = tc.high_tip {
                 // Case 4: leader has the block — repropose.
                 if let Some(block) = block_tree.block(&tip.block_hash)? {
+                    // Review M2 (s138): unless honest replicas would refuse it as stale; then
+                    // drop it through an NEC (RECOVER without the block request).
+                    if Self::refused_as_stale(&block, tc, block_tree, app)? {
+                        self.begin_recovery(tc, block_tree, false)?;
+                        return Ok(TcProposal::Recovering);
+                    }
                     return Ok(TcProposal::Repropose(Box::new(Proposal::signed(
                         &self.config.keypair.0,
                         self.config.chain_id,
@@ -1074,74 +1080,91 @@ impl<N: Network> HotStuff<N> {
                 // Case 5: leader lacks the block — initiate RECOVER (Algorithm 7).
                 // This is async: we send requests and return None. The event loop
                 // handles responses to complete the proposal.
-                let validator_set_state = block_tree.validator_set_state()?;
-                let validator_set = validator_set_state.committed_validator_set().clone();
-                let total_power = validator_set.total_power().int() as u64;
-                let f = if total_power > 0 {
-                    (total_power - 1) / 3
-                } else {
-                    0
-                };
-                let kappa = (f + 1) as usize; // κ = f+1 guarantees at least one honest responder
-
-                // Step 1: Send ProposalRequest to κ validators (prefer those from TC's tips_views).
-                let req = ProposalRequest {
-                    chain_id: self.config.chain_id,
-                    view: self.view_info.view,
-                    tc: tc.clone(),
-                };
-                // FIX CONS-FIND-28: Shuffle recipients to prevent deterministic withholding.
-                let mut recipients: Vec<_> = validator_set
-                    .validators_and_powers()
-                    .into_iter()
-                    .map(|(vk, _)| vk)
-                    .filter(|vk| *vk != self.config.keypair.public())
-                    .collect();
-
-                // Deterministic shuffle seeded by view number.
-                let seed = self.view_info.view.int();
-                let len = recipients.len();
-                if len > 1 {
-                    for i in (1..len).rev() {
-                        let j = (seed
-                            .wrapping_mul(6364136223846793005)
-                            .wrapping_add(i as u64)
-                            % (i as u64 + 1)) as usize;
-                        recipients.swap(i, j);
-                    }
-                }
-
-                for vk in recipients.into_iter().take(kappa) {
-                    self.sender_handle
-                        .send::<HotStuffMessage>(vk, req.clone().into());
-                }
-
-                // Step 2: Broadcast NERequest to ALL validators.
-                let ne_req = NERequest {
-                    chain_id: self.config.chain_id,
-                    view: self.view_info.view,
-                    tc: tc.clone(),
-                };
-                self.sender_handle
-                    .broadcast::<HotStuffMessage>(ne_req.into());
-
-                // Step 3: Store recovery state for async completion.
-                let high_tip_qc_view = tip.block_justify.view;
-                self.recovery_state = RecoveryState::Recovering {
-                    recovered: None,
-                    tc: tc.clone(),
-                    ne_collector: NECollector::new(
-                        self.config.chain_id,
-                        self.view_info.view,
-                        high_tip_qc_view,
-                        validator_set,
-                    ),
-                };
+                self.begin_recovery(tc, block_tree, true)?;
                 return Ok(TcProposal::Recovering);
             }
         }
         // Case 3: the caller extends the high QC and attaches the TC.
         Ok(TcProposal::HighQcWins)
+    }
+
+    /// RECOVER (MonadBFT Algorithm 7) for `tc`'s winning high tip: with `request_block`, ask
+    /// f + 1 validators for the block (case 5: this leader lacks it); always ask every validator
+    /// for a No-Endorsement, and wait for a ProposalResponse or an NEC. Review M2 (s138): without
+    /// `request_block` for a held tip this leader must not re-propose (`refused_as_stale`).
+    fn begin_recovery<K: KVStore>(
+        &mut self,
+        tc: &crate::pacemaker::types::TimeoutCertificate,
+        block_tree: &BlockTreeSingleton<K>,
+        request_block: bool,
+    ) -> Result<(), HotStuffError> {
+        let Some(tip) = tc.high_tip.as_ref() else {
+            return Ok(());
+        };
+        let validator_set_state = block_tree.validator_set_state()?;
+        let validator_set = validator_set_state.committed_validator_set().clone();
+        let total_power = validator_set.total_power().int() as u64;
+        let f = if total_power > 0 {
+            (total_power - 1) / 3
+        } else {
+            0
+        };
+        let kappa = (f + 1) as usize; // κ = f+1 guarantees at least one honest responder
+
+        // Step 1: Send ProposalRequest to κ validators (prefer those from TC's tips_views).
+        let req = ProposalRequest {
+            chain_id: self.config.chain_id,
+            view: self.view_info.view,
+            tc: tc.clone(),
+        };
+        // FIX CONS-FIND-28: Shuffle recipients to prevent deterministic withholding.
+        let mut recipients: Vec<_> = validator_set
+            .validators_and_powers()
+            .into_iter()
+            .map(|(vk, _)| vk)
+            .filter(|vk| *vk != self.config.keypair.public())
+            .collect();
+
+        // Deterministic shuffle seeded by view number.
+        let seed = self.view_info.view.int();
+        let len = recipients.len();
+        if len > 1 {
+            for i in (1..len).rev() {
+                let j = (seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(i as u64)
+                    % (i as u64 + 1)) as usize;
+                recipients.swap(i, j);
+            }
+        }
+
+        for vk in recipients.into_iter().take(if request_block { kappa } else { 0 }) {
+            self.sender_handle
+                .send::<HotStuffMessage>(vk, req.clone().into());
+        }
+
+        // Step 2: Broadcast NERequest to ALL validators.
+        let ne_req = NERequest {
+            chain_id: self.config.chain_id,
+            view: self.view_info.view,
+            tc: tc.clone(),
+        };
+        self.sender_handle
+            .broadcast::<HotStuffMessage>(ne_req.into());
+
+        // Step 3: Store recovery state for async completion.
+        let high_tip_qc_view = tip.block_justify.view;
+        self.recovery_state = RecoveryState::Recovering {
+            recovered: None,
+            tc: tc.clone(),
+            ne_collector: NECollector::new(
+                self.config.chain_id,
+                self.view_info.view,
+                high_tip_qc_view,
+                validator_set,
+            ),
+        };
+        Ok(())
     }
 
     /// Process a newly received message for the current view according to the HotStuff subprotocol.
@@ -1514,7 +1537,12 @@ impl<N: Network> HotStuff<N> {
                 || block_tree.highest_view_voted()?.unwrap() < self.view_info.view)
                 && (!sets_tip_from_proposal
                     || Self::is_fresh_proposer(origin, proposal.view, &proposal.block.justify, block_tree)?)
-                && Self::vote_check(&proposal.block, block_tree, app)? == BlockDataCheck::Held
+                && Self::vote_check(
+                    &proposal.block,
+                    block_tree,
+                    app,
+                    Self::freshness_exempt(&proposal.block.hash, proposal.tc.as_ref(), proposal.is_reproposal(), block_tree)?,
+                )? == BlockDataCheck::Held
             {
                 let vote_phase = if validator_set_updates.is_some() {
                     Phase::Prepare
@@ -2052,6 +2080,11 @@ impl<N: Network> HotStuff<N> {
         } else {
             return Ok(());
         };
+        // Review M2 (s138): not a tip honest replicas would refuse as stale; keep waiting for
+        // the NEC (the NE request went out with the block request).
+        if Self::refused_as_stale(&block, &tc, block_tree, app)? {
+            return Ok(());
+        }
         self.recovery_state = RecoveryState::None;
 
         let proposal = Proposal::signed(
@@ -2834,13 +2867,17 @@ impl<N: Network> HotStuff<N> {
             return Ok(());
         }
         let hash = header.block_hash;
+        // Review M2 (s138): a re-proposal skips the app's freshness rules (`freshness_exempt`).
+        let exempt = |block_tree: &BlockTreeSingleton<K>| {
+            Self::freshness_exempt(&hash, header.tc.as_ref(), header.is_reproposal(), block_tree)
+        };
         let held = if self.pending_bodies.contains_key(&hash) {
             true
         } else if block_tree.contains(&hash) {
             // Rebase s87 (T0b): validated on insertion, but vote-time-only rules
             // (the local-clock bound) are in the data check alone.
             let check = match block_tree.block(&hash)? {
-                Some(block) => Self::vote_check(&block, block_tree, app)?,
+                Some(block) => Self::vote_check(&block, block_tree, app, exempt(block_tree)?)?,
                 None => BlockDataCheck::Missing,
             };
             match check {
@@ -2859,7 +2896,12 @@ impl<N: Network> HotStuff<N> {
                 }
             }
         } else if let Some(block) = body.filter(|block| block.hash == hash) {
-            let check = app.check_block_data(block, &block_tree.app_view(None)?);
+            let view = block_tree.app_view(None)?;
+            let check = if exempt(block_tree)? {
+                app.check_reproposal_data(block, &view)
+            } else {
+                app.check_block_data(block, &view)
+            };
             match check {
                 BlockDataCheck::Held => true,
                 BlockDataCheck::Missing => {
@@ -2890,12 +2932,17 @@ impl<N: Network> HotStuff<N> {
     /// inserted): it may vote only on `Held`. Vote-time-only rules (the
     /// local-clock bound on the block timestamp) live there, never in
     /// `validate_block`, so insertion of a certified block never applies them.
+    ///
+    /// Review M2 (s138): `exempt` ([`Self::freshness_exempt`]) asks
+    /// [`App::check_reproposal_data`] instead.
     fn vote_check<K: KVStore>(
         block: &Block,
         block_tree: &BlockTreeSingleton<K>,
         app: &mut impl App<K>,
+        exempt: bool,
     ) -> Result<BlockDataCheck, HotStuffError> {
-        let check = app.check_block_data(block, &block_tree.app_view(None)?);
+        let view = block_tree.app_view(None)?;
+        let check = if exempt { app.check_reproposal_data(block, &view) } else { app.check_block_data(block, &view) };
         if check != BlockDataCheck::Held {
             log::warn!(
                 "not voting (yet): {} fails the pre-vote data check ({check:?})",
@@ -2905,14 +2952,76 @@ impl<N: Network> HotStuff<N> {
         Ok(check)
     }
 
-    /// Review M2 (RED stub): whether a vote for `block_hash` may skip the app's freshness rules.
+    /// Review M2 (owner s138): whether the vote for `block_hash` asks
+    /// [`App::check_reproposal_data`] (which may skip vote-time freshness rules: Torus's 30 s
+    /// block timestamp lower bound) instead of [`App::check_block_data`]. True for a block
+    /// consensus may force a leader to propose again unchanged, whose freshness an honest replica
+    /// already judged while it was new:
+    ///
+    /// 1. **certified**: this replica's highest PC or locked PC is on it, or so is the attached
+    ///    TC's high QC (`tc`: verified by the caller): the validator-set-update re-proposal
+    ///    (`repropose_block`), including the re-proposal of the locked block itself (reflexive
+    ///    lock, s138);
+    /// 2. **voted**: it is the block this replica last voted for (a Prepare vote sets no tip);
+    /// 3. **authenticated TC re-proposal** (`is_reproposal`: correct TC(v-1), its high tip wins,
+    ///    no NEC; VALIDPROPOSAL V2 made the block that tip): the tip is this replica's own local
+    ///    tip, or the TC's signed tips for it hold more than the faulty power
+    ///    ([`TimeoutCertificate::tip_vouched`]).
+    ///
+    /// Anything else is fresh: a block one byzantine leader proposed stale and reports as its own
+    /// tip (tip power 1 <= f) is refused, and the next leader drops it through an NEC
+    /// ([`Self::refused_as_stale`]).
     pub(crate) fn freshness_exempt<K: KVStore>(
-        _block_hash: &CryptoHash,
-        _tc: Option<&TimeoutCertificate>,
-        _is_reproposal: bool,
-        _block_tree: &BlockTreeSingleton<K>,
+        block_hash: &CryptoHash,
+        tc: Option<&TimeoutCertificate>,
+        is_reproposal: bool,
+        block_tree: &BlockTreeSingleton<K>,
     ) -> Result<bool, HotStuffError> {
-        Ok(false)
+        let certified = |pc: &PhaseCertificate| !pc.is_genesis_pc() && pc.block == *block_hash;
+        if certified(&block_tree.highest_pc()?)
+            || certified(&block_tree.locked_pc()?)
+            || tc.and_then(|tc| tc.high_qc.as_ref()).is_some_and(certified)
+            || block_tree.last_voted_proposal()?.is_some_and(|(_, voted)| voted == *block_hash)
+        {
+            return Ok(true);
+        }
+        let Some(tc) = tc.filter(|tc| is_reproposal && tc.high_tip.as_ref().is_some_and(|tip| tip.block_hash == *block_hash))
+        else {
+            return Ok(false);
+        };
+        if block_tree.local_tip()?.is_some_and(|tip| tip.block_hash == *block_hash) {
+            return Ok(true);
+        }
+        Ok(tc.tip_vouched(block_tree)?)
+    }
+
+    /// Review M2 (s138, the leader side of [`Self::freshness_exempt`]; claude-review s131 round
+    /// 2): whether this leader must NOT re-propose `block`, the winning high tip of `tc`: it is
+    /// not freshness-exempt for this replica, and the app refuses it on a freshness rule alone
+    /// (`check_block_data` refuses, `check_reproposal_data` holds). Honest replicas would refuse
+    /// it the same way, so re-proposing it would only lose the view, in every view while the tip
+    /// keeps winning the TCs (one byzantine timeout vote suffices). The leader seeks an NEC
+    /// instead (`create_proposal_based_on_tc`, `complete_recovery`): honest replicas never voted
+    /// for such a block, so they sign No-Endorsements and a fresh block replaces it.
+    fn refused_as_stale<K: KVStore>(
+        block: &Block,
+        tc: &TimeoutCertificate,
+        block_tree: &BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<bool, HotStuffError> {
+        if Self::freshness_exempt(&block.hash, Some(tc), true, block_tree)? {
+            return Ok(false);
+        }
+        let view = block_tree.app_view(None)?;
+        let stale = app.check_block_data(block, &view) == BlockDataCheck::Invalid
+            && app.check_reproposal_data(block, &view) == BlockDataCheck::Held;
+        if stale {
+            log::warn!(
+                "not re-proposing the TC's high tip {}: stale and vouched for by at most f; seeking an NEC",
+                crate::logging::block_prefix(&block.hash)
+            );
+        }
+        Ok(stale)
     }
 
     /// TC phase C review (docs/plans/tc-required-and-tip-signing.md §4): whether `proposer` is the

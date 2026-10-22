@@ -374,7 +374,7 @@ fn locked_block_is_freshness_exempt() {
     wb.set_locked_pc(&pc(3, &b(), Phase::Precommit)).unwrap();
     r.tree.write(wb);
     assert!(HotStuff::<RecordingNetwork>::freshness_exempt(&b().hash, None, false, &r.tree).unwrap());
-    assert!(!HotStuff::<RecordingNetwork>::freshness_exempt(&a().hash, None, false, &r.tree).unwrap(), "control");
+    assert!(!HotStuff::<RecordingNetwork>::freshness_exempt(&fresh().hash, None, false, &r.tree).unwrap(), "control: not certified, not voted");
 }
 
 /// A replica over a tree in which `b` is a validator-set-updating block (`a` <- `b`).

@@ -3518,6 +3518,14 @@ fn check_timestamp_drift(ts: u64, local_now: u64) -> Result<(), String> {
 /// only, see [`check_timestamp_lag`]).
 pub(crate) const MAX_BLOCK_TIMESTAMP_LAG_SECS: u64 = 30;
 
+/// Whether [`check_timestamp_lag`] applies to a pre-vote check: always,
+/// except for a block hotstuff asks about through `check_reproposal_data`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LagBound {
+    Apply,
+    Exempt,
+}
+
 /// Pre-testnet P0 (review M2, `docs/plans/oracle-aggregation.md` decision
 /// 5): the lower half of the local-clock timestamp rule. A replica refuses
 /// to vote for a proposal whose timestamp is more than
@@ -3531,8 +3539,13 @@ pub(crate) const MAX_BLOCK_TIMESTAMP_LAG_SECS: u64 = 30;
 /// cannot wedge the chain. An honest proposer passes: it uses `max(now,
 /// parent.ts)`, and a proposal delivered later than the bound gets no vote,
 /// the view times out and the next leader proposes with a fresh clock.
+/// Review M2 (s138): except a block consensus may force a leader to propose
+/// again unchanged (hotstuff's `check_reproposal_data`: certified, last
+/// voted by this replica, or an authenticated TC re-proposal), whose
+/// timestamp is fixed by its hash: exempt ([`LagBound::Exempt`]), else a
+/// stall longer than the bound would make it unvotable forever.
 fn check_timestamp_lag(ts: u64, local_now: u64) -> Result<(), String> {
-    if false && ts.saturating_add(MAX_BLOCK_TIMESTAMP_LAG_SECS) < local_now {
+    if ts.saturating_add(MAX_BLOCK_TIMESTAMP_LAG_SECS) < local_now {
         return Err(format!(
             "timestamp {ts} + {MAX_BLOCK_TIMESTAMP_LAG_SECS}s < local clock {local_now}"
         ));
@@ -10342,18 +10355,35 @@ impl TorusApp {
     /// presence-only DA read. No wait and no network pull here:
     /// `validate_block` (run right after on the same body) and its retries
     /// hand misses to the recovery worker.
+    /// Review M2 (s138): [`Self::check_proposal_data`] for a block hotstuff
+    /// may force a leader to propose again unchanged (its
+    /// `check_reproposal_data`: certified, last voted by this replica, or an
+    /// authenticated TC re-proposal). Every rule but the timestamp LOWER
+    /// bound applies: the block's timestamp is fixed by its hash and an
+    /// honest replica judged it within the bound when it was new, so after a
+    /// stall longer than [`MAX_BLOCK_TIMESTAMP_LAG_SECS`] the bound would
+    /// refuse it forever. The ahead bound stays (time only helps it).
     fn check_reproposal_proposal_data(
         &mut self,
         block: &Block,
         parent: impl FnOnce(&CryptoHash) -> ParentHeader,
     ) -> BlockDataCheck {
-        self.check_proposal_data(block, parent)
+        self.check_proposal_data_with(block, parent, LagBound::Exempt)
     }
 
     fn check_proposal_data(
         &mut self,
         block: &Block,
         parent: impl FnOnce(&CryptoHash) -> ParentHeader,
+    ) -> BlockDataCheck {
+        self.check_proposal_data_with(block, parent, LagBound::Apply)
+    }
+
+    fn check_proposal_data_with(
+        &mut self,
+        block: &Block,
+        parent: impl FnOnce(&CryptoHash) -> ParentHeader,
+        lag: LagBound,
     ) -> BlockDataCheck {
         // T1.5 FAIL-STOP: refuse to vote for blocks this node will never execute.
         if self.is_exec_failed() {
@@ -10420,9 +10450,11 @@ impl TorusApp {
         // node's clock; pre-testnet P0 (review M2): or too far behind it.
         // Vote-time only: `validate_block` never applies either.
         let now = self.local_now_secs();
-        if let Err(reason) = check_timestamp_drift(header.timestamp, now)
-            .and_then(|()| check_timestamp_lag(header.timestamp, now))
-        {
+        // Review M2 (s138): a re-proposal hotstuff vouches for skips the lower bound.
+        if let Err(reason) = check_timestamp_drift(header.timestamp, now).and_then(|()| match lag {
+            LagBound::Apply => check_timestamp_lag(header.timestamp, now),
+            LagBound::Exempt => Ok(()),
+        }) {
             tracing::warn!(height = header.height, %reason, "not voting -- block timestamp");
             return BlockDataCheck::Invalid;
         }
@@ -10849,6 +10881,17 @@ impl App<RocksKVStore> for TorusApp {
         block_tree: &AppBlockTreeView<'_, RocksKVStore>,
     ) -> BlockDataCheck {
         self.check_proposal_data(block, |hash| tree_parent_header(block_tree, hash))
+    }
+
+    /// Review M2 (s138): the pre-vote check of a block hotstuff may force a
+    /// leader to propose again unchanged. See
+    /// [`TorusApp::check_reproposal_proposal_data`].
+    fn check_reproposal_data(
+        &mut self,
+        block: &Block,
+        block_tree: &AppBlockTreeView<'_, RocksKVStore>,
+    ) -> BlockDataCheck {
+        self.check_reproposal_proposal_data(block, |hash| tree_parent_header(block_tree, hash))
     }
 
     /// Send committed block to the execution pipeline thread.
@@ -27041,11 +27084,14 @@ mod crash_recovery_tests {
                 resp.data.clone(),
             )
         };
-        // The voters' clock runs an hour ahead: the proposals carry the real
+        // The voters' clock runs 25 s ahead: the proposals carry the real
         // clock, and under a loaded parallel run building an app took > 5 s,
         // so a clock pinned before it tripped the 5 s drift check (Invalid
-        // for the wrong reason). This test is about bits, not drift.
-        let clock = || unix_now_secs() + 3_600;
+        // for the wrong reason). This test is about bits, not drift. Not more
+        // than 30 s ahead (review M2: the 30 s lower bound would refuse a
+        // proposal stamped before the pinned clock), and a proposal stamped
+        // after the pin trips the ahead bound only if it comes > 30 s later.
+        let clock = || unix_now_secs() + 25;
         let mut from_1 = gated_app(clock(), rsh_at(1));
         assert_eq!(from_1.genesis_header.features, rsh, "genesis parent header");
         assert_eq!(from_1.last_header.features, rsh);
