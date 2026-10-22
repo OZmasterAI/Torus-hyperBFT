@@ -37,6 +37,27 @@ Pull tools from main before the next campaign that has crash cells.
 explicitly for mode-3 arms. Each cell logs `cell=<label> book_mode=... <flag>='...'` and records `cell.book_mode` /
 `cell.node_flags` in summary.json. Pull tools from main before the next campaign.
 
+**Owner s136: new benches are PAUSED.** 9k-9p below are queued on HOLD; start none until the owner says go.
+
+**Defaults on main (s136, batch 10 `2d2f3ed9`; pull main before preparing any cell):**
+* **Running state hash + L6.1 ON** for genesis files made by `devnet/wsl/gen-3val-genesis.sh` (hash from block 1; L6.1
+  follows it for Classic) and for a node started without `--genesis`. A genesis file WITHOUT an `activations` field
+  means OFF: every checked-in genesis file and `gen-weighted-genesis.sh` output (needed for unequal stakes, e.g.
+  2/2/1) stay off, so set `STATE_HASH_ACTIVATION` explicitly ON there when an arm should run the testnet config.
+  Hash-off arms set `STATE_HASH_ACTIVATION=off` explicitly (the generator now drops inherited hash / L6.1 spellings).
+  `consensus.book_window_commit` means "L6.1 from the running hash's height", so `BOOK_WINDOW_COMMIT=1` works unchanged.
+* **L2.1 streamed settle ON** (`TORUS_SETTLE_STREAMED`, `0` turns it off) and **the hash fail-stop ON**
+  (`TORUS_STATE_HASH_FAILSTOP`, `0` turns it off). Arms meant to run without them set `0` explicitly.
+* Startup lines now read `on=true` for both; campaign specs that check the old `on=false` lines need updating (8p-style
+  "= off" checks fail unless the arm sets off explicitly).
+* P0.0 (batch 8): a data dir bound to a genesis file refuses to restart without `--genesis` or with a changed file;
+  every restart path (crash cells, kill knob) must pass the same `--genesis`.
+* Coming next (not on main yet): the TC-required set (consensus DB format v1: data dirs from older binaries are refused
+  at start, so every cell needs fresh data dirs after it lands; the bench genesis cache must not reuse old data dirs).
+  9k is meant to run BEFORE it lands, as the clean "before" for 9o / 9p.
+* Harness on main: digest checkpoint wait (`ckpt_wait.py`, `9ea22dbd` + counter validation `eb993e3f`), bench oracle
+  signers (feed defaults to `--signer separate`; signer file `devnet/wsl/bench-oracle-signer-keys.json`).
+
 **Defaults on main (s131, after the L3.1 merge):** L3.3, L2.2, item 7 option 0, T5.3 (manifest in the consensus DB) and
 L3.1 (`TORUS_BOOK_COALESCE`, active with 15 s checkpoints, Classic, hash off, no byte cap) are ON by default; prune-by-default
 (retention 100,000) lands with the RH4 merge. A per-block-save control arm needs `TORUS_BOOK_COALESCE=0`; the old manifest
