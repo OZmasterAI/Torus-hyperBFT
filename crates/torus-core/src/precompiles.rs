@@ -1325,6 +1325,10 @@ fn core_writer_staking(
 ///
 /// Both return `true` = "queued", not "executed". The queue write goes through the
 /// per-tx / per-frame native journal, so a reverted frame drops it.
+///
+/// Item 7 T (`Feature::SameBlockCoreWriter` in the block's header): "NEXT block" above
+/// becomes "this block", after its native batches ([`CoreWriterQueue::enqueue_with`]); the
+/// value is then burned and credited in the same block.
 fn lockbox_precompile(
     input: &[u8],
     caller: &Address,
@@ -1416,6 +1420,41 @@ pub const CORE_WRITER_FIRST_OPEN_TARGET_KEY: &[u8] = b"core_writer_first_open_ta
 /// when it grows or restarts.
 pub const CORE_WRITER_FULL_ORDER_RUN_KEY: &[u8] = b"core_writer_full_order_run";
 
+/// Item 7 T (`Feature::SameBlockCoreWriter`): the order range's first-open-target cursor
+/// (u64 BE), [`CORE_WRITER_FIRST_OPEN_TARGET_KEY`]'s meaning for the order range
+/// (seqs [`torus_types::CORE_WRITER_ORDER_SEQ_BASE`]`..`, the only range the order walk
+/// fills under T). A key of its own: the step 2 cursor speaks for the shared range of the
+/// blocks before the activation, and reading it here would make the order walk skip
+/// targets whose order range is still open. Hashed state, written only when it moves.
+pub const CORE_WRITER_T_FIRST_OPEN_ORDER_TARGET_KEY: &[u8] =
+    b"core_writer_t_first_open_order_target";
+
+/// Item 7 T: [`CORE_WRITER_FULL_ORDER_RUN_KEY`]'s meaning for the order range, under its
+/// own key (see [`CORE_WRITER_T_FIRST_OPEN_ORDER_TARGET_KEY`]).
+pub const CORE_WRITER_T_FULL_ORDER_RUN_KEY: &[u8] = b"core_writer_t_full_order_run";
+
+/// The seq range one enqueue walk fills and the cursor rows that speak for it.
+struct WalkRange {
+    /// The range's first seq; it holds [`torus_types::CORE_WRITER_DRAIN_CAP`] seqs.
+    base: u64,
+    cursor_key: &'static [u8],
+    run_key: &'static [u8],
+}
+
+/// Step 2 (and T off): one range per target, from seq 0, every kind.
+const SHARED_RANGE: WalkRange = WalkRange {
+    base: 0,
+    cursor_key: CORE_WRITER_FIRST_OPEN_TARGET_KEY,
+    run_key: CORE_WRITER_FULL_ORDER_RUN_KEY,
+};
+
+/// Item 7 T: the order kinds' range.
+const T_ORDER_RANGE: WalkRange = WalkRange {
+    base: torus_types::CORE_WRITER_ORDER_SEQ_BASE,
+    cursor_key: CORE_WRITER_T_FIRST_OPEN_ORDER_TARGET_KEY,
+    run_key: CORE_WRITER_T_FULL_ORDER_RUN_KEY,
+};
+
 /// A `CF_FEE_CONFIG` u64 BE row; absent or not 8 bytes = `None`.
 fn read_u64_row(state_db: &impl StateBackend, key: &[u8]) -> Result<Option<u64>, CoreError> {
     Ok(state_db
@@ -1425,9 +1464,12 @@ fn read_u64_row(state_db: &impl StateBackend, key: &[u8]) -> Result<Option<u64>,
 }
 
 /// [`CORE_WRITER_FULL_ORDER_RUN_KEY`]: `Some((start, end))`; absent or not 16 bytes = `None`.
-fn read_order_run(state_db: &impl StateBackend) -> Result<Option<(u64, u64)>, CoreError> {
+fn read_order_run(
+    state_db: &impl StateBackend,
+    run_key: &[u8],
+) -> Result<Option<(u64, u64)>, CoreError> {
     Ok(state_db
-        .get_cf_raw(CF_FEE_CONFIG, CORE_WRITER_FULL_ORDER_RUN_KEY)?
+        .get_cf_raw(CF_FEE_CONFIG, run_key)?
         .and_then(|v| <[u8; 16]>::try_from(v.as_slice()).ok())
         .map(|v| {
             let (start, end) = v.split_at(8);
@@ -1471,8 +1513,24 @@ impl CoreWriterQueue {
     ///
     /// T4.4: takes any [`StateBackend`] so EVM execution can enqueue into a per-tx
     /// journaled overlay (durable only if the calling tx succeeds).
+    ///
+    /// Item 7 T: these are the rules of a block without `Feature::SameBlockCoreWriter`;
+    /// the EVM provider calls [`Self::enqueue_with`] with the block's bit.
     pub fn enqueue(state_db: &impl StateBackend, action: &QueuedAction) -> Result<u64, CoreError> {
+        Self::enqueue_walk(state_db, action, &SHARED_RANGE)
+    }
+
+    /// [`Self::enqueue`]'s walk over the seq range `range` of each target: the target is
+    /// full iff the range's last seq is taken, the cursor rows are the range's own. Step 2
+    /// (and T off): [`SHARED_RANGE`], every kind. Item 7 T: [`T_ORDER_RANGE`], order kinds
+    /// only (so `candidate >= next_block` holds with K >= 1, as the cursor needs).
+    fn enqueue_walk(
+        state_db: &impl StateBackend,
+        action: &QueuedAction,
+        range: &WalkRange,
+    ) -> Result<u64, CoreError> {
         const CAP: u64 = torus_types::CORE_WRITER_DRAIN_CAP;
+        let last_seq = range.base + CAP - 1;
         let order = action.kind.is_order();
         let next_block = action.block_queued.saturating_add(1);
         let candidate = if order {
@@ -1493,7 +1551,7 @@ impl CoreWriterQueue {
         // Codex P2: the walk to the first target with room skips the targets the two
         // cursor rows know are full instead of reading each one. K >= 1, so
         // `candidate >= next_block` and every target in `next_block .. cursor` is full.
-        let cursor = read_u64_row(state_db, CORE_WRITER_FIRST_OPEN_TARGET_KEY)?.unwrap_or(0);
+        let cursor = read_u64_row(state_db, range.cursor_key)?.unwrap_or(0);
         let mut run: Option<Option<(u64, u64)>> = None; // read at the first full probe
         let mut target_block = candidate.max(cursor);
         loop {
@@ -1506,26 +1564,30 @@ impl CoreWriterQueue {
             // A target's seqs are dense from 0 (rows leave only when the whole target
             // drains), so it is full iff its last slot is taken.
             if state_db
-                .get_cf_len(CF_CORE_WRITER_QUEUE, &queue_key(target_block, CAP - 1))?
+                .get_cf_len(CF_CORE_WRITER_QUEUE, &queue_key(target_block, last_seq))?
                 .is_none()
             {
                 break;
             }
             if run.is_none() {
-                run = Some(read_order_run(state_db)?);
+                run = Some(read_order_run(state_db, range.run_key)?);
             }
             target_block = target_block
                 .checked_add(1)
                 .ok_or_else(|| CoreError::Overflow("CoreWriter target block".into()))?;
         }
 
-        let seq = Self::next_sequence(state_db, target_block)?;
+        let seq = if range.base == 0 {
+            Self::next_sequence(state_db, target_block)?
+        } else {
+            Self::next_sequence_in(state_db, target_block, range.base)?
+        };
         let data = borsh::to_vec(action).map_err(|e| CoreError::Borsh(e.to_string()))?;
         state_db.put_cf_raw(CF_CORE_WRITER_QUEUE, &queue_key(target_block, seq), &data)?;
 
         // Every target in `candidate .. full_end` is full now (the walk's, and this row's
         // target if the row took its last slot).
-        let full_end = if seq == CAP - 1 {
+        let full_end = if seq == last_seq {
             target_block.saturating_add(1)
         } else {
             target_block
@@ -1534,11 +1596,7 @@ impl CoreWriterQueue {
         if candidate <= known_from {
             // `next_block .. candidate` was known full too: the cursor may move.
             if full_end > known_from {
-                state_db.put_cf_raw(
-                    CF_FEE_CONFIG,
-                    CORE_WRITER_FIRST_OPEN_TARGET_KEY,
-                    &full_end.to_be_bytes(),
-                )?;
+                state_db.put_cf_raw(CF_FEE_CONFIG, range.cursor_key, &full_end.to_be_bytes())?;
             }
         } else if order && full_end > candidate {
             // An order kind beyond the cursor: the targets between are unknown, so keep
@@ -1546,7 +1604,7 @@ impl CoreWriterQueue {
             // run either continues (`candidate` inside it) or restarts at `candidate`.
             let old = match run {
                 Some(r) => r,
-                None => read_order_run(state_db)?,
+                None => read_order_run(state_db, range.run_key)?,
             };
             let new = match old {
                 Some((start, end)) if (start..=end).contains(&candidate) => {
@@ -1558,7 +1616,7 @@ impl CoreWriterQueue {
                 let mut row = [0u8; 16];
                 row[..8].copy_from_slice(&new.0.to_be_bytes());
                 row[8..].copy_from_slice(&new.1.to_be_bytes());
-                state_db.put_cf_raw(CF_FEE_CONFIG, CORE_WRITER_FULL_ORDER_RUN_KEY, &row)?;
+                state_db.put_cf_raw(CF_FEE_CONFIG, range.run_key, &row)?;
             }
         }
         if order {
@@ -1581,9 +1639,43 @@ impl CoreWriterQueue {
         action: &QueuedAction,
         same_block: bool,
     ) -> Result<u64, CoreError> {
-        // RED stub: the T rules are not built yet.
-        let _ = same_block;
-        Self::enqueue(state_db, action)
+        match (same_block, action.kind.is_order()) {
+            (false, _) => Self::enqueue(state_db, action),
+            // Order kinds: step 2's walk (K, the last order target, the cursor rows), in
+            // the order range.
+            (true, true) => Self::enqueue_walk(state_db, action, &T_ORDER_RANGE),
+            (true, false) => Self::enqueue_same_block(state_db, action),
+        }
+    }
+
+    /// Item 7 T: a non-order kind queued in block h targets h itself (drained after h's
+    /// native batches), in the target's same-block range (seqs `0 .. CAP`); a full range
+    /// sends it on to h + 1, h + 2, ..., in that range only, so order rows (the other
+    /// range) never push it out. No cursor row: only h's own EVM block and the spill of a
+    /// recent one fill these ranges, and EVM gas bounds both (~150 enqueues per 3M gas at
+    /// `GAS_PRECOMPILE_WRITE`, ~750 per 15M), so a walk probes a few targets at most. The
+    /// range is dense from seq 0: rows leave a target only when its block drains it, after
+    /// which no enqueue targets it (the queuing block is the earliest target); at the
+    /// activation height the rows queued by H - 1 under the step 2 rules (seqs from 0)
+    /// come first.
+    fn enqueue_same_block(
+        state_db: &impl StateBackend,
+        action: &QueuedAction,
+    ) -> Result<u64, CoreError> {
+        const CAP: u64 = torus_types::CORE_WRITER_DRAIN_CAP;
+        let mut target_block = action.block_queued;
+        while state_db
+            .get_cf_len(CF_CORE_WRITER_QUEUE, &queue_key(target_block, CAP - 1))?
+            .is_some()
+        {
+            target_block = target_block
+                .checked_add(1)
+                .ok_or_else(|| CoreError::Overflow("CoreWriter target block".into()))?;
+        }
+        let seq = Self::next_sequence_in(state_db, target_block, 0)?;
+        let data = borsh::to_vec(action).map_err(|e| CoreError::Borsh(e.to_string()))?;
+        state_db.put_cf_raw(CF_CORE_WRITER_QUEUE, &queue_key(target_block, seq), &data)?;
+        Ok(seq)
     }
 
     /// Drain all rows queued for the given block_number, in key (sequence)
@@ -1664,6 +1756,33 @@ impl CoreWriterQueue {
             }
         }
         Ok(0)
+    }
+}
+
+impl CoreWriterQueue {
+    /// Item 7 T: the next sequence of the seq range `base .. base + CAP` of
+    /// `target_block` (one past its highest taken seq, else `base`), reading at
+    /// most that range's rows. Read-your-writes through any backend, as
+    /// [`Self::next_sequence`].
+    fn next_sequence_in(
+        state_db: &impl StateBackend,
+        target_block: u64,
+        base: u64,
+    ) -> Result<u64, CoreError> {
+        const CAP: u64 = torus_types::CORE_WRITER_DRAIN_CAP;
+        let end = base + CAP;
+        let rows = state_db.iterate_cf_prefix_from(
+            CF_CORE_WRITER_QUEUE,
+            &target_block.to_be_bytes(),
+            &queue_key(target_block, base),
+            CAP as usize,
+        )?;
+        Ok(rows
+            .iter()
+            .map(|(key, _)| queue_seq(key))
+            .filter(|seq| (base..end).contains(seq))
+            .max()
+            .map_or(base, |seq| seq + 1))
     }
 }
 
