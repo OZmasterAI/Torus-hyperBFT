@@ -5336,6 +5336,109 @@ mod s63_body_fetch_tests {
         assert!(seen.iter().all(|t| *t == live));
     }
 
+    /// Short label of a fixture validator for assertion messages: `P` (proposer), `o0`, `o1`.
+    fn who(f: &FetchFixture, vk: &VerifyingKey) -> String {
+        if *vk == f.origin {
+            return "P".into();
+        }
+        f.others.iter().position(|o| o == vk).map_or("?".into(), |i| format!("o{i}"))
+    }
+
+    fn label<T: Copy>(f: &FetchFixture, asks: &[(T, VerifyingKey)]) -> Vec<(T, String)> {
+        asks.iter().map(|(at, t)| (*at, who(f, t))).collect()
+    }
+
+    /// Codex P1 probe (fix/body-fetch-dead-peer): drive one body fetch through its whole 4 s
+    /// budget with the `silent` validators never heard from and only `holder` able to serve (the
+    /// proposer cannot). Returns `(ms, target)` of every ask, and whether the body arrived and
+    /// whether the fetch fell back to sync.
+    fn run_body_fetch_with_quiet_holder(
+        silent: &[VerifyingKey],
+        holder: VerifyingKey,
+        f: &mut FetchFixture,
+        t0: Instant,
+    ) -> (Vec<(u64, VerifyingKey)>, bool, bool) {
+        let block = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(),
+            CryptoHash::new([71; 32]), Data::new(vec![]));
+        assert_eq!(block.hash, f.hash);
+        let schedule = (1..=MAX_BODY_RETRIES_TOTAL as u64).map(|k| 100 * k)
+            .chain([1400, 1900, 2400, 2900, 3400, 3900, 4000]);
+        let mut asks = Vec::new();
+        let mut arrived = false;
+        for at in schedule {
+            let targets = f.tick_with_silent(t0 + MS(at), silent);
+            asks.extend(targets.iter().map(|t| (at, *t)));
+            if targets.contains(&holder) {
+                // The holder serves: deliver its response through the normal path.
+                let mut app = ScriptedApp { calls: 0, missing_left: 0, invalid: false };
+                f.hotstuff.on_receive_msg(
+                    BlockDataResponse { view: ViewNumber::new(1), block: block.clone() }.into(),
+                    &holder, &mut f.tree, &mut app).unwrap();
+                arrived = f.tree.contains(&f.hash);
+                break;
+            }
+        }
+        let sync = f.hotstuff.take_sync_needed();
+        (asks, arrived, sync)
+    }
+
+    /// Codex P1 (fix/body-fetch-dead-peer): a validator that has been quiet > 2 s is not
+    /// necessarily dead (votes go to leaders, sync adverts run every 10 s). When the proposer
+    /// cannot serve and the only other holder is quiet but alive, the holder must still be asked
+    /// inside the budget and the body arrive without a sync fallback. A quiet validator is asked
+    /// only after the fast phase, so a truly dead one does not eat the early attempts.
+    #[test]
+    fn quiet_alive_holder_is_asked_within_the_body_fetch_budget() {
+        // (a) every other validator is quiet (the 3-validator shape); the holder is one of them.
+        let t0 = Instant::now();
+        let mut f = fetch_fixture(t0, 0, t0);
+        let silent = f.others.clone();
+        let holder = f.others[1];
+        let (asks, arrived, sync) = run_body_fetch_with_quiet_holder(&silent, holder, &mut f, t0);
+        assert!(asks.iter().any(|(_, t)| *t == holder), "quiet holder never asked: {:?}", label(&f, &asks));
+        assert!(arrived, "body did not arrive: {:?}", label(&f, &asks));
+        assert!(!sync, "fell back to sync although a live holder existed: {:?}", label(&f, &asks));
+        assert!(asks.iter().filter(|(_, t)| silent.contains(t)).all(|(at, _)| *at > 900),
+            "quiet validators were asked in the fast phase: {:?}", label(&f, &asks));
+
+        // (b) one other validator is heard from but does not hold the body; the holder is quiet.
+        let t0 = Instant::now();
+        let mut f = fetch_fixture(t0, 0, t0);
+        let holder = f.others[1];
+        let (asks, arrived, sync) = run_body_fetch_with_quiet_holder(&[holder], holder, &mut f, t0);
+        assert!(arrived && !sync, "quiet holder not reached in the budget: {:?}", label(&f, &asks));
+        assert!(asks.iter().filter(|(_, t)| *t == holder).all(|(at, _)| *at > 900),
+            "the quiet validator was asked in the fast phase: {:?}", label(&f, &asks));
+    }
+
+    /// Codex P1, justify side: the by-hash justify fetch (fast phase only) reserves its last
+    /// asks for quiet validators instead of excluding them, and asks the proposer before them.
+    #[test]
+    fn justify_fetch_reserves_late_asks_for_quiet_validators() {
+        let t0 = Instant::now();
+        let mut f = fetch_fixture(t0, 0, t0);
+        let hash = CryptoHash::new([98; 32]);
+        f.hotstuff.set_started_at_for_test(t0.checked_sub(Duration::from_secs(60)).unwrap());
+        let quiet = f.others.clone();
+        let mut seen = Vec::new();
+        for attempt in 0..MAX_BODY_RETRIES_TOTAL {
+            let now = Instant::now();
+            f.hotstuff.note_peer_heard(&f.origin, now);
+            let stale = now.checked_sub(BODY_RETRY_INTERVAL * 2).unwrap();
+            f.hotstuff.justify_fetch_tracker.insert(hash, (stale, attempt, f.origin, ViewNumber::new(1)));
+            f.hotstuff.tick_justify_fetch_retries(&f.tree);
+            seen.extend(f.net.take().into_iter().map(|t| (attempt, t)));
+        }
+        assert_eq!(seen.len(), MAX_BODY_RETRIES_TOTAL as usize);
+        for q in &quiet {
+            assert!(seen.iter().any(|(_, t)| t == q), "quiet validator never asked: {:?}", label(&f, &seen));
+        }
+        let first_quiet = seen.iter().position(|(_, t)| quiet.contains(t)).expect("asked above");
+        assert!(first_quiet >= (MAX_BODY_RETRIES_TOTAL as usize) - quiet.len(),
+            "quiet validators asked before the late reserved slots: {:?}", label(&f, &seen));
+        assert!(seen[..first_quiet].iter().all(|(_, t)| *t == f.origin));
+    }
+
     /// Slow-phase retries stop quietly once the block reached the tree by
     /// another path (e.g. block sync) — no wasted requests, no sync fallback.
     #[test]
