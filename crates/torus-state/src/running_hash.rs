@@ -514,6 +514,14 @@ pub(crate) enum ChainStep {
     Unverified { first: bool },
 }
 
+/// Whether the stored chain start `start` is the configured `activation`:
+/// exactly it, or (s80 `TORUS_S80_EXEC_JOIN`, off = exactly it) the later
+/// height of the execution unit that covered `activation`.
+fn chain_started(start: Option<u64>, activation: u64) -> bool {
+    start == Some(activation)
+        || start.is_some_and(|s| s > activation && crate::exec_join::reaches(s, activation))
+}
+
 /// The chain step for flushing `height`. Never continues from anything but
 /// the stored hash of exactly `height - 1` of the configured chain.
 pub(crate) fn chain_step(db: &StateDb, height: u64) -> ChainStep {
@@ -523,15 +531,19 @@ pub(crate) fn chain_step(db: &StateDb, height: u64) -> ChainStep {
     if height < activation {
         return ChainStep::Off;
     }
-    if height == activation {
+    let start = read_activation_height(db);
+    if height == activation
+        || (crate::exec_join::reaches(height, activation) && !chain_started(start, activation))
+    {
         return ChainStep::Start;
     }
     if read_unverified_since(db).is_some() {
         return ChainStep::Unverified { first: false };
     }
-    let start = read_activation_height(db);
     match read_running_hash(db) {
-        Some((stored, hash)) if start == Some(activation) && stored + 1 == height => {
+        Some((stored, hash))
+            if chain_started(start, activation) && crate::exec_join::follows(stored, height) =>
+        {
             ChainStep::Continue(hash)
         }
         stored => {
@@ -595,14 +607,20 @@ impl ChainMemo {
         if height < activation {
             return ChainStep::Off;
         }
-        if height == activation {
+        if height == activation
+            || (crate::exec_join::reaches(height, activation)
+                && !chain_started(self.start, activation))
+        {
             return ChainStep::Start;
         }
         if self.unverified.is_some() {
             return ChainStep::Unverified { first: false };
         }
         match self.prev {
-            Some((stored, hash)) if self.start == Some(activation) && stored + 1 == height => {
+            Some((stored, hash))
+                if chain_started(self.start, activation)
+                    && crate::exec_join::follows(stored, height) =>
+            {
                 ChainStep::Continue(hash)
             }
             stored => {

@@ -1212,7 +1212,7 @@ fn run_job(
             // The window is contiguous: E checkpoints before any serial
             // block, so a gap here is a pipeline bug — never chain over it.
             if let Some(last) = window.last {
-                if last + 1 != *height {
+                if !torus_state::exec_join::follows(last, *height) {
                     return Err(JobError::Write(format!(
                         "digest {height} does not follow the digested window (last {last})"
                     )));

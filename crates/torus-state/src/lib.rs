@@ -11,6 +11,7 @@ pub mod da_gc_fence;
 pub mod db;
 pub mod erasure;
 pub mod error;
+pub mod exec_join;
 pub mod evm_block_state;
 pub mod incremental;
 pub mod native_da;

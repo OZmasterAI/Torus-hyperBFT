@@ -3454,7 +3454,10 @@ impl ExecutionContext {
         let block_ms = torus_types::eip712::block_timestamp_ms(block.header.timestamp);
         // A missing / undecodable parent header is an `Err` too: the caller
         // fail-stops (Codex r1: a scan from 0 is unbounded work).
-        let parent_ms = parent_block_ms(overlay, height)?;
+        // s80 exec join: a unit prunes from the header before its FIRST
+        // member, covering every member's range (0 = a single block).
+        let first = EXEC_JOIN_FIRST.with(|f| f.get());
+        let parent_ms = parent_block_ms(overlay, if first > 0 { first } else { height })?;
         #[cfg(not(test))]
         let expired = torus_state::nonce_window::expired_nonce_keys(overlay, parent_ms, block_ms)?;
         #[cfg(test)]
@@ -4616,7 +4619,7 @@ impl ExecutionContext {
             None
         };
         debug_assert!(
-            parent.as_ref().is_none_or(|p| p.height() + 1 == height),
+            parent.as_ref().is_none_or(|p| torus_state::exec_join::follows(p.height(), height)),
             "bl2: parent layer must be the immediate predecessor (parent={:?}, height={height})",
             parent.as_ref().map(|p| p.height())
         );
@@ -5642,18 +5645,30 @@ impl ExecutionContext {
             ctx.liq_value_sum = self.liq_value_sum;
             // 8u follow-up: the step's own exec-thread timer (inside the tail).
             let liq_timer = std::time::Instant::now();
-            #[cfg(test)]
-            let _ = match self.test_adl_work {
-                Some(w) => NativeExecutor::run_liquidations_with(
-                    &mut ctx,
-                    torus_core::liquidation::LIQ_SCAN_PER_BLOCK,
-                    torus_core::liquidation::LIQ_ACT_PER_BLOCK,
-                    w,
-                ),
-                None => NativeExecutor::run_liquidations(&mut ctx),
-            };
-            #[cfg(not(test))]
-            let _ = NativeExecutor::run_liquidations(&mut ctx);
+            // s80 exec join: a unit runs one pass per member block (the
+            // per-block scan / act / ADL budgets kept), or ONE pass with
+            // `TORUS_S80_EXEC_JOIN_LIQ=unit`. A single block: one pass.
+            let liq_passes = torus_state::exec_join::liq_passes(
+                EXEC_JOIN_FIRST.with(|f| f.get()),
+                height,
+            );
+            for _ in 0..liq_passes {
+                #[cfg(test)]
+                let _ = match self.test_adl_work {
+                    Some(w) => NativeExecutor::run_liquidations_with(
+                        &mut ctx,
+                        torus_core::liquidation::LIQ_SCAN_PER_BLOCK,
+                        torus_core::liquidation::LIQ_ACT_PER_BLOCK,
+                        w,
+                    ),
+                    None => NativeExecutor::run_liquidations(&mut ctx),
+                };
+                #[cfg(not(test))]
+                let _ = NativeExecutor::run_liquidations(&mut ctx);
+                if ctx.fatal_error.is_some() {
+                    break;
+                }
+            }
             if let Some(ref m) = self.metrics {
                 m.exec_liquidation_step_seconds
                     .observe(liq_timer.elapsed().as_secs_f64());
@@ -6604,85 +6619,337 @@ impl ExecutionContext {
 /// obvious call site to replace with the measured rendezvous wait.
 const SERIAL_HANDOFF_WAIT_SECS: f64 = 0.0;
 
+// ---- s80 PROTOTYPE exec-commit-units (`TORUS_S80_EXEC_JOIN=K`, default off) ----
+
+thread_local! {
+    /// s80: the FIRST height of the joined unit the exec thread is running
+    /// (0 = a single block). The nonce-window prune of the unit then covers
+    /// every member's range (from the header before the first member).
+    static EXEC_JOIN_FIRST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// s80: whether `block` may be joined into a unit with its neighbours: a
+/// trading-only block (orders, cancels, oracle prices, state-hash
+/// attestations, perp/spot transfers), no EVM transactions, no CoreWriter
+/// rows, no pending slashes, not an epoch boundary. A pure function of the
+/// committed content and height, so every node draws the same units.
+fn exec_join_safe(block: &TorusBlock, no_slashes: bool, epoch_length: u64) -> bool {
+    no_slashes
+        && block.evm_transactions.is_empty()
+        && block.core_writer_actions.is_empty()
+        && block.header.evm_tx_count == 0
+        && !EpochManager::is_epoch_boundary(block.header.height, epoch_length)
+        && block.native_actions.iter().all(|a| {
+            matches!(
+                a.action,
+                torus_types::NativeAction::PlaceOrder(_)
+                    | torus_types::NativeAction::PlaceOrderBatch(_)
+                    | torus_types::NativeAction::CancelOrder { .. }
+                    | torus_types::NativeAction::CancelAllOrders { .. }
+                    | torus_types::NativeAction::CancelByCloid { .. }
+                    | torus_types::NativeAction::ModifyOrder { .. }
+                    | torus_types::NativeAction::SubmitOraclePrices(_)
+                    | torus_types::NativeAction::AttestStateHash { .. }
+                    | torus_types::NativeAction::TransferToPerp { .. }
+                    | torus_types::NativeAction::TransferToSpot { .. }
+            )
+        })
+}
+
+/// s80: one execution unit from consecutive committed blocks: the LAST
+/// block's header (height, parent link, timestamp, flags) with the unit's
+/// action count, carrying every member's actions in height order. Only the
+/// exec thread sees it: it is never persisted (the members' own header and
+/// body rows are durable before the unit runs).
+fn exec_join_merge(blocks: &[TorusBlock]) -> TorusBlock {
+    let last = blocks.last().expect("a unit has a block");
+    let mut header = last.header.clone();
+    let native_actions: Vec<torus_types::SignedNativeAction> =
+        blocks.iter().flat_map(|b| b.native_actions.iter().cloned()).collect();
+    header.native_action_count = native_actions.len() as u32;
+    TorusBlock {
+        header,
+        native_actions,
+        evm_transactions: Vec::new(),
+        core_writer_actions: Vec::new(),
+    }
+}
+
+impl ExecutionContext {
+    /// s80: execute consecutive committed, join-safe `blocks` (header and
+    /// body rows durable) as ONE unit at the last height.
+    fn execute_joined(&self, blocks: &[TorusBlock]) {
+        let merged = exec_join_merge(blocks);
+        EXEC_JOIN_FIRST.with(|f| f.set(blocks[0].header.height));
+        let both = DurableRows {
+            header: true,
+            body: true,
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.execute_committed_block_with(&merged, Vec::new(), both)
+        }));
+        EXEC_JOIN_FIRST.with(|f| f.set(0));
+        if let Err(p) = result {
+            std::panic::resume_unwind(p);
+        }
+    }
+}
+
+/// One received block, its persist ticket waited.
+struct ExecReady {
+    torus_block: TorusBlock,
+    pending_slashes: Vec<PendingSlash>,
+    durable: DurableRows,
+    header_from_exec: bool,
+    committed_unexecuted: usize,
+}
+
+/// T5.3: wait for the block's header + body write (timed: how long exec waits).
+fn exec_wait_persist(ctx: &ExecutionContext, msg: CommittedBlockMsg) -> ExecReady {
+    let CommittedBlockMsg {
+        torus_block,
+        pending_slashes,
+        durable,
+        persist,
+        committed_unexecuted,
+    } = msg;
+    // T5.3: the writer's header write failed (or was dropped): execution
+    // writes the row, so the exec thread publishes the height after it.
+    let mut header_from_exec = false;
+    // T5.3: the header + body write runs on the commit-persist writer; the
+    // block executes only once it returned (timed: how long exec waits).
+    let durable = match persist {
+        Some(ticket) => {
+            let wait = std::time::Instant::now();
+            let rows = ticket.wait();
+            header_from_exec = !rows.header;
+            if let Some(ref m) = ctx.metrics {
+                m.exec_commit_persist_wait_seconds
+                    .observe(wait.elapsed().as_secs_f64());
+            }
+            if exec_rewrite_durable_rows() {
+                DurableRows::default()
+            } else {
+                rows
+            }
+        }
+        None => durable,
+    };
+    ExecReady {
+        torus_block,
+        pending_slashes,
+        durable,
+        header_from_exec,
+        committed_unexecuted,
+    }
+}
+
+/// The per-block bookkeeping after a block (or the unit holding it) ran.
+/// `false`: the fail-stop latched — the loop must halt.
+fn exec_after_block(
+    ctx: &ExecutionContext,
+    height: u64,
+    header_from_exec: bool,
+    committed_unexecuted: usize,
+) -> bool {
+    // The hook's receiver checks the row is readable before publishing.
+    if header_from_exec && !ctx.exec_failed.load(Ordering::SeqCst) {
+        if let Some(hook) = ctx.header_hook.get() {
+            hook(height);
+        }
+    }
+    // Paired with the inc() at the `exec_tx.send` site: dec AFTER execution
+    // so the gauge counts queued + in-flight blocks (pinned near the channel
+    // bound 64 = execution is the bottleneck).
+    if let Some(ref m) = ctx.metrics {
+        m.exec_queue_depth.dec();
+    }
+    // Rank 1: keep the metrics-free mirror in lockstep with the gauge.
+    ctx.exec_queue_len.fetch_sub(1, Ordering::Relaxed);
+    // Exec-aware admission: this block's count is no longer
+    // committed-but-unexecuted. Lock-free (one CAS), never waits on the
+    // consensus thread; with the knob off the count is 0 and nothing is
+    // touched.
+    if committed_unexecuted > 0 {
+        if let Some(ref mempool) = ctx.mempool {
+            mempool.note_exec_released(committed_unexecuted);
+        }
+    }
+    if ctx.exec_failed.load(Ordering::SeqCst) {
+        // Blocks still queued behind this one never execute here. The
+        // teardown is terminal: a dispatch racing in before `rx` drops
+        // can no longer count anything.
+        if let Some(ref mempool) = ctx.mempool {
+            mempool.close_exec_backlog();
+        }
+        // Dropping `rx` closes the channel: the consensus thread's next
+        // send fails and latches the same fail-stop on the TorusApp side.
+        tracing::error!(
+            height,
+            "execution pipeline halting (FAIL-STOP) — node must stop, not zombie-advance"
+        );
+        return false;
+    }
+    true
+}
+
+/// One block, executed alone (the per-block path). `false`: fail-stop.
+fn exec_one(ctx: &ExecutionContext, ready: ExecReady) -> bool {
+    let ExecReady {
+        torus_block,
+        pending_slashes,
+        durable,
+        header_from_exec,
+        committed_unexecuted,
+    } = ready;
+    let height = torus_block.header.height;
+    // T1.5: contain execution panics — a panic here must become a
+    // controlled fail-stop (latch + loop exit), not silent thread death
+    // with consensus zombie-advancing while state is frozen.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.execute_committed_block_with(&torus_block, pending_slashes, durable)
+    }));
+    if result.is_err() {
+        ctx.exec_failed.store(true, Ordering::SeqCst);
+        tracing::error!(height, "execution pipeline PANICKED executing committed block");
+    }
+    exec_after_block(ctx, height, header_from_exec, committed_unexecuted)
+}
+
+/// s80: run the blocks of one unit (consecutive heights, tickets waited):
+/// maximal runs of join-safe blocks execute as one unit each, every other
+/// block alone. `false`: fail-stop.
+fn exec_unit(ctx: &ExecutionContext, unit: Vec<ExecReady>) -> bool {
+    let mut run: Vec<ExecReady> = Vec::new();
+    let flush_run = |run: &mut Vec<ExecReady>| -> bool {
+        match run.len() {
+            0 => true,
+            1 => exec_one(ctx, run.pop().expect("one")),
+            _ => {
+                let members: Vec<ExecReady> = std::mem::take(run);
+                // Members whose rows the dispatch did not land get them now,
+                // as their own block (the unit itself is never persisted).
+                for m in &members {
+                    if !(m.durable.header && m.durable.body) {
+                        let rows = persist_committed_block_durably_timed(
+                            &ctx.state_db,
+                            &m.torus_block,
+                            None,
+                            false,
+                        );
+                        if !(rows.header && rows.body) {
+                            ctx.exec_failed.store(true, Ordering::SeqCst);
+                            tracing::error!(
+                                height = m.torus_block.header.height,
+                                "FATAL: s80 exec join: member rows did not persist (fail-stop)"
+                            );
+                        }
+                    }
+                }
+                let blocks: Vec<TorusBlock> =
+                    members.iter().map(|m| m.torus_block.clone()).collect();
+                let last = blocks.last().map(|b| b.header.height).unwrap_or(0);
+                if !ctx.exec_failed.load(Ordering::SeqCst) {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        ctx.execute_joined(&blocks)
+                    }));
+                    if result.is_err() {
+                        ctx.exec_failed.store(true, Ordering::SeqCst);
+                        tracing::error!(
+                            height = last,
+                            "execution pipeline PANICKED executing a joined unit"
+                        );
+                    }
+                    tracing::debug!(
+                        first = blocks[0].header.height,
+                        last,
+                        "s80 exec join: unit executed"
+                    );
+                }
+                let mut ok = true;
+                for m in members {
+                    ok &= exec_after_block(
+                        ctx,
+                        m.torus_block.header.height,
+                        m.header_from_exec,
+                        m.committed_unexecuted,
+                    );
+                }
+                ok
+            }
+        }
+    };
+    for ready in unit {
+        let safe = exec_join_safe(
+            &ready.torus_block,
+            ready.pending_slashes.is_empty(),
+            ctx.epoch_length,
+        );
+        if safe {
+            run.push(ready);
+            continue;
+        }
+        if !flush_run(&mut run) {
+            return false;
+        }
+        if !exec_one(ctx, ready) {
+            return false;
+        }
+    }
+    flush_run(&mut run)
+}
+
 fn execution_loop(rx: std::sync::mpsc::Receiver<CommittedBlockMsg>, ctx: ExecutionContext) {
     tracing::info!("execution pipeline thread started");
-    while let Ok(msg) = rx.recv() {
-        let CommittedBlockMsg {
-            torus_block,
-            pending_slashes,
-            durable,
-            persist,
-            committed_unexecuted,
-        } = msg;
-        let height = torus_block.header.height;
-        // T5.3: the writer's header write failed (or was dropped): execution
-        // writes the row, so the exec thread publishes the height after it.
-        let mut header_from_exec = false;
-        // T5.3: the header + body write runs on the commit-persist writer; the
-        // block executes only once it returned (timed: how long exec waits).
-        let durable = match persist {
-            Some(ticket) => {
-                let wait = std::time::Instant::now();
-                let rows = ticket.wait();
-                header_from_exec = !rows.header;
-                if let Some(ref m) = ctx.metrics {
-                    m.exec_commit_persist_wait_seconds
-                        .observe(wait.elapsed().as_secs_f64());
-                }
-                if exec_rewrite_durable_rows() {
-                    DurableRows::default()
-                } else {
-                    rows
-                }
-            }
-            None => durable,
+    let join_k = torus_state::exec_join::k();
+    // s80: a received block that does not continue the unit being collected.
+    let mut carry: Option<CommittedBlockMsg> = None;
+    let mut closed = false;
+    loop {
+        let msg = match carry.take() {
+            Some(m) => m,
+            None if closed => break,
+            None => match rx.recv() {
+                Ok(m) => m,
+                Err(_) => break,
+            },
         };
-        // T1.5: contain execution panics — a panic here must become a
-        // controlled fail-stop (latch + loop exit), not silent thread death
-        // with consensus zombie-advancing while state is frozen.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ctx.execute_committed_block_with(&torus_block, pending_slashes, durable)
-        }));
-        if result.is_err() {
-            ctx.exec_failed.store(true, Ordering::SeqCst);
-            tracing::error!(height, "execution pipeline PANICKED executing committed block");
+        if join_k <= 1 {
+            if !exec_one(&ctx, exec_wait_persist(&ctx, msg)) {
+                return;
+            }
+            continue;
         }
-        // The hook's receiver checks the row is readable before publishing.
-        if header_from_exec && !ctx.exec_failed.load(Ordering::SeqCst) {
-            if let Some(hook) = ctx.header_hook.get() {
-                hook(height);
+        // s80: collect the rest of this height's unit (blocking: the unit's
+        // head waits for its last member's commit), then run it. An unsafe
+        // block ends the collection (it runs alone anyway, so nothing waits
+        // behind it: an epoch boundary is applied as soon as it commits).
+        let first = msg.torus_block.header.height;
+        let (_, last) = torus_state::exec_join::unit_bounds(first, join_k);
+        let join_safe = |m: &CommittedBlockMsg| {
+            exec_join_safe(&m.torus_block, m.pending_slashes.is_empty(), ctx.epoch_length)
+        };
+        let mut collecting = join_safe(&msg);
+        let mut unit = vec![exec_wait_persist(&ctx, msg)];
+        let mut next = first + 1;
+        while collecting && next <= last {
+            match rx.recv() {
+                Ok(m) if m.torus_block.header.height == next => {
+                    collecting = join_safe(&m);
+                    unit.push(exec_wait_persist(&ctx, m));
+                    next += 1;
+                }
+                Ok(m) => {
+                    carry = Some(m);
+                    break;
+                }
+                Err(_) => {
+                    closed = true;
+                    break;
+                }
             }
         }
-        // Paired with the inc() at the `exec_tx.send` site: dec AFTER execution
-        // so the gauge counts queued + in-flight blocks (pinned near the channel
-        // bound 64 = execution is the bottleneck).
-        if let Some(ref m) = ctx.metrics {
-            m.exec_queue_depth.dec();
-        }
-        // Rank 1: keep the metrics-free mirror in lockstep with the gauge.
-        ctx.exec_queue_len.fetch_sub(1, Ordering::Relaxed);
-        // Exec-aware admission: this block's count is no longer
-        // committed-but-unexecuted. Lock-free (one CAS), never waits on the
-        // consensus thread; with the knob off the count is 0 and nothing is
-        // touched.
-        if committed_unexecuted > 0 {
-            if let Some(ref mempool) = ctx.mempool {
-                mempool.note_exec_released(committed_unexecuted);
-            }
-        }
-        if ctx.exec_failed.load(Ordering::SeqCst) {
-            // Blocks still queued behind this one never execute here. The
-            // teardown is terminal: a dispatch racing in before `rx` drops
-            // can no longer count anything.
-            if let Some(ref mempool) = ctx.mempool {
-                mempool.close_exec_backlog();
-            }
-            // Dropping `rx` closes the channel: the consensus thread's next
-            // send fails and latches the same fail-stop on the TorusApp side.
-            tracing::error!(
-                height,
-                "execution pipeline halting (FAIL-STOP) — node must stop, not zombie-advance"
-            );
+        if !exec_unit(&ctx, unit) {
             return;
         }
     }
@@ -8007,6 +8274,9 @@ impl TorusApp {
         // two cannot drift apart.
         let (exec_tx, exec_rx) =
             std::sync::mpsc::sync_channel(torus_mempool::rate_limit::EXEC_QUEUE_DEPTH);
+        // s80 PROTOTYPE exec-commit-units: read `TORUS_S80_EXEC_JOIN` once and
+        // log `TORUS_S80_EXEC_JOIN on=<bool> k=<K>` (default off).
+        torus_state::exec_join::init_from_env();
         let exec_handle = std::thread::Builder::new()
             .name("torus-execution".into())
             .spawn(move || execution_loop(exec_rx, exec_ctx))
@@ -22215,6 +22485,452 @@ mod crash_recovery_tests {
         );
         assert!(latch.load(Ordering::SeqCst));
         r01_assert_nothing_durable_from(&db, 3);
+    }
+
+    // ======================================================================
+    // s80 PROTOTYPE exec-commit-units (`TORUS_S80_EXEC_JOIN=K`)
+    // ======================================================================
+
+    /// What one s80 run of the pipeline fixture leaves behind.
+    struct S80Run {
+        dump: Vec<CfDump>,
+        hash: Option<(u64, [u8; 32])>,
+        unverified: bool,
+        native_blocks: u64,
+    }
+
+    fn s80_finish(db: &StateDb, metrics: &torus_telemetry::Metrics) -> S80Run {
+        S80Run {
+            dump: dump_all_cfs(db),
+            hash: torus_state::running_hash::read_running_hash(db),
+            unverified: torus_state::running_hash::read_unverified_since(db).is_some(),
+            native_blocks: metrics.exec_native_blocks.get(),
+        }
+    }
+
+    fn s80_fixture_db() -> StateDb {
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
+        let (_cfg, db) = make_test_config_and_db();
+        fund_pipeline_fixture(&db);
+        torus_state::running_hash::configure_activation(&db, Some(1))
+            .expect("configure running hash activation");
+        db
+    }
+
+    /// The pipeline fixture through `execution_loop` (the live path: rows
+    /// dispatch-durable, blocks queued ahead of the exec thread) with the
+    /// join at `k`.
+    fn s80_run_loop(k: u64, pipelined: bool) -> S80Run {
+        torus_state::exec_join::set_k(k);
+        let db = s80_fixture_db();
+        let mut ctx = pipeline_ctx(&db, pipelined, None);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        ctx.metrics = Some(metrics.clone());
+        ctx.exec_shutdown.store(true, Ordering::SeqCst);
+        let latch = ctx.exec_failed.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(32);
+        for b in &pipeline_fixture_blocks() {
+            let durable = persist_committed_block_durably(&db, b);
+            tx.send(CommittedBlockMsg {
+                torus_block: b.clone(),
+                pending_slashes: vec![],
+                durable,
+                persist: None,
+                committed_unexecuted: 0,
+            })
+            .unwrap();
+        }
+        drop(tx);
+        std::thread::spawn(move || execution_loop(rx, ctx)).join().unwrap();
+        assert!(!latch.load(Ordering::SeqCst), "k={k} pipelined={pipelined}: no fail-stop");
+        assert_eq!(read_native_applied_height(&db), Some(13), "k={k}");
+        let run = s80_finish(&db, &metrics);
+        torus_state::exec_join::set_k(1);
+        run
+    }
+
+    /// s80: the join helpers. A merged unit is the LAST block's header with the
+    /// unit's action count, carrying every member's actions in height order;
+    /// join-safe = trading / oracle / attest / transfer actions only, no EVM, no
+    /// CoreWriter rows, no slashes, not an epoch boundary.
+    #[test]
+    fn s80_exec_join_merge_and_safety() {
+        let blocks = pipeline_fixture_blocks();
+        let merged = exec_join_merge(&blocks[4..6]);
+        assert_eq!(merged.header.height, 6);
+        assert_eq!(merged.header.parent_hash, blocks[5].header.parent_hash);
+        assert_eq!(merged.header.timestamp, blocks[5].header.timestamp);
+        assert_eq!(merged.header.native_action_count, 3);
+        let want: Vec<_> = blocks[4]
+            .native_actions
+            .iter()
+            .chain(&blocks[5].native_actions)
+            .map(|a| a.nonce)
+            .collect();
+        assert_eq!(want.len(), 3);
+        assert_eq!(merged.native_actions.iter().map(|a| a.nonce).collect::<Vec<_>>(), want);
+        // epoch_length 4 in the fixture: 4 / 8 / 12 are boundaries; 4 also
+        // carries ClaimRewards, 9 CreateSession (not join-safe).
+        let safe: Vec<u64> = blocks
+            .iter()
+            .filter(|b| exec_join_safe(b, true, 4))
+            .map(|b| b.header.height)
+            .collect();
+        assert_eq!(safe, vec![1, 2, 3, 5, 6, 7, 10, 11, 13]);
+        assert!(!exec_join_safe(&blocks[0], false, 4), "pending slashes");
+        let mut evm = blocks[1].clone();
+        evm.evm_transactions.push(vec![1]);
+        assert!(!exec_join_safe(&evm, true, 4), "EVM content");
+    }
+
+    /// s80: with the join off (`K = 1`) the loop is the per-block path; at
+    /// `K = 2` it executes the fixture as the units [1,2], 3, 4, [5,6], 7..13
+    /// (3/4, 7/8, 9/10, 11/12 split by an unsafe block; 13 alone at the
+    /// channel close) — the same state as running those units directly — on the
+    /// serial and the pipelined path alike, twice over (deterministic), with
+    /// the running state hash still chained (not HASH-UNVERIFIED) to 13.
+    #[test]
+    fn s80_exec_join_loop_is_deterministic_and_runs_the_units() {
+        // K = 1 through the loop == the per-block reference.
+        let off = s80_run_loop(1, true);
+        assert!(!off.unverified);
+        assert_eq!(off.hash.map(|(h, _)| h), Some(13));
+        let off_serial = s80_run_loop(1, false);
+        assert_dumps_equal(&off.dump, &off_serial.dump, "k=1 serial vs pipelined");
+        assert_eq!(off.hash, off_serial.hash);
+
+        // K = 2: the unit reference, executed directly.
+        torus_state::exec_join::set_k(2);
+        let db = s80_fixture_db();
+        let mut ctx = pipeline_ctx(&db, true, None);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        ctx.metrics = Some(metrics.clone());
+        let blocks = pipeline_fixture_blocks();
+        for b in &blocks {
+            let durable = persist_committed_block_durably(&db, b);
+            assert!(durable.header && durable.body);
+        }
+        let units: [&[TorusBlock]; 11] = [
+            &blocks[0..2],
+            &blocks[2..3],
+            &blocks[3..4],
+            &blocks[4..6],
+            &blocks[6..7],
+            &blocks[7..8],
+            &blocks[8..9],
+            &blocks[9..10],
+            &blocks[10..11],
+            &blocks[11..12],
+            &blocks[12..13],
+        ];
+        let both = DurableRows { header: true, body: true };
+        for unit in units {
+            if unit.len() == 1 {
+                ctx.execute_committed_block_with(&unit[0], vec![], both);
+            } else {
+                ctx.execute_joined(unit);
+            }
+        }
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst), "reference: no fail-stop");
+        drop(ctx);
+        let reference = s80_finish(&db, &metrics);
+        torus_state::exec_join::set_k(1);
+        assert!(!reference.unverified, "reference: hash chained");
+        assert_eq!(reference.hash.map(|(h, _)| h), Some(13));
+
+        let on = s80_run_loop(2, true);
+        let on_again = s80_run_loop(2, true);
+        let on_serial = s80_run_loop(2, false);
+        for (run, what) in [(&on, "k=2 pipelined"), (&on_again, "k=2 again"), (&on_serial, "k=2 serial")] {
+            assert!(!run.unverified, "{what}: the running hash must stay chained");
+            assert_eq!(run.hash, reference.hash, "{what}: running state hash");
+            assert_dumps_equal(&reference.dump, &run.dump, what);
+            // [1,2] and [5,6] each ran ONE native phase (5 and 6 ran two at K = 1).
+            assert_eq!(run.native_blocks, reference.native_blocks, "{what}: native phases");
+            assert!(run.native_blocks < off.native_blocks, "{what}: fewer native phases than k=1");
+        }
+    }
+
+    /// s80 exec-commit-units node-level µbench: the econ load of
+    /// `torus-bridge/tests/ubench_econ.rs` (GTC limits around one mid, one side
+    /// per (sender, market), 400-order batches, cancel-all 5% + open-order
+    /// budget 900), SIGNED, plus three validators' oracle prices every block,
+    /// through the node's exec path (`execute_committed_block_with`: verify,
+    /// replay guard, sort, oracle, engine, tail, save_books, end_resident,
+    /// pipelined flush worker, running hash + L6.1 on as CL21) — per block
+    /// (`K = 1`) vs joined units of `K` (`execute_joined`, units drawn by
+    /// `exec_join::unit_bounds`). The same blocks for every arm; arms in
+    /// `S80_UB_ARMS` order on fresh DBs. Warm / measured block counts round
+    /// down to multiples of 12 (whole units for K = 1..4). Prints the exec
+    /// thread's wall ms per 1k fills over the measured blocks (the final
+    /// flush-worker drain included), and the `torus_exec_*_seconds_sum`
+    /// deltas per 1k fills.
+    ///   S80_UB_ARMS=1,2,2,1,1,2 cargo test --release -p torus-consensus --lib \
+    ///     s80_ubench_exec_join -- --ignored --nocapture
+    #[test]
+    #[ignore = "µbench, release: see the doc comment"]
+    fn s80_ubench_exec_join() {
+        use torus_types::{OrderType, PlaceOrderParams, TimeInForce};
+        let knob = |k: &str, d: u64| {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        let senders = knob("S80_UB_SENDERS", 600);
+        let markets = knob("S80_UB_MARKETS", 300);
+        let per_block = knob("S80_UB_ACTIONS", 60);
+        let warm = knob("S80_UB_WARM", 48) / 12 * 12;
+        let measure = (knob("S80_UB_MEASURE", 48) / 12 * 12).max(12);
+        let batch = knob("S80_UB_BATCH", 400);
+        let budget = knob("S80_UB_BUDGET", 900);
+        // S80_UB_LIQ_UNIT=1: one liquidation pass per unit (default: per member).
+        let liq_unit = knob("S80_UB_LIQ_UNIT", 0) == 1;
+        let arms: Vec<u64> = std::env::var("S80_UB_ARMS")
+            .unwrap_or_else(|_| "1,2".into())
+            .split(',')
+            .map(|s| s.trim().parse().expect("S80_UB_ARMS: k values"))
+            .collect();
+        let total = warm + measure;
+        let keys: Vec<k256::ecdsa::SigningKey> = (0..senders)
+            .map(|i| {
+                let mut b = [0x5Au8; 32];
+                b[24..].copy_from_slice(&(i + 1).to_be_bytes());
+                k256::ecdsa::SigningKey::from_slice(&b).unwrap()
+            })
+            .collect();
+        let addrs: Vec<Address> = keys.iter().map(crate::state_hash::account_address).collect();
+        // ubench_econ's generator (econ_load.rs `Gen::block` / `econ_order`).
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                self.0 >> 11
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+            fn chance(&mut self, p_milli: u64) -> bool {
+                self.below(1000) < p_milli
+            }
+        }
+        const TARGET: i128 = 1500;
+        const LEV: i128 = 20;
+        const BAND: u64 = 5;
+        let mid = FixedPoint::from_raw(TARGET * LEV * FixedPoint::SCALE);
+        let mut rng = Lcg(0x5EED_0087);
+        let mut open: std::collections::HashMap<u64, u64> = Default::default();
+        let t_gen = std::time::Instant::now();
+        let mut blocks: Vec<TorusBlock> = Vec::with_capacity(total as usize);
+        for h in 1..=total {
+            let block_ms = (1000 + h) * 1000;
+            let mut actions = Vec::with_capacity(per_block as usize + 3);
+            for i in 0..per_block {
+                let s = rng.below(senders);
+                let o = open.entry(s).or_insert(0);
+                let action = if *o + batch > budget || rng.chance(50) {
+                    *o = 0;
+                    NativeAction::CancelAllOrders { market_id: None }
+                } else {
+                    *o += batch;
+                    let orders = (0..batch)
+                        .map(|_| {
+                            let m = 1 + rng.below(markets);
+                            let is_buy = s.wrapping_add(m).is_multiple_of(2);
+                            let aggressive = rng.chance(500);
+                            let d = 1 + rng.below(BAND) as i128;
+                            let units =
+                                if is_buy == aggressive { TARGET * LEV + d } else { TARGET * LEV - d };
+                            let price = FixedPoint::from_raw(units * FixedPoint::SCALE);
+                            let notional = FixedPoint::from_raw(TARGET * FixedPoint::SCALE)
+                                * FixedPoint::from_raw(LEV * FixedPoint::SCALE);
+                            let mut quantity = notional / price;
+                            if quantity < FixedPoint::ONE {
+                                quantity = FixedPoint::ONE;
+                            }
+                            PlaceOrderParams {
+                                market_id: m,
+                                is_buy,
+                                price,
+                                quantity,
+                                order_type: OrderType::Limit,
+                                time_in_force: TimeInForce::GTC,
+                                reduce_only: false,
+                                client_order_id: None,
+                            }
+                        })
+                        .collect();
+                    NativeAction::PlaceOrderBatch(orders)
+                };
+                actions.push(torus_types::eip712::sign_native_action(
+                    action,
+                    block_ms + i,
+                    &keys[s as usize],
+                ));
+            }
+            for (seed, _) in ORACLE_VALIDATORS {
+                actions.push(torus_types::eip712::sign_native_action(
+                    NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
+                        prices: (1..=markets).map(|m| (m, mid)).collect(),
+                        timestamp: block_ms,
+                    }),
+                    block_ms + 500 + seed as u64,
+                    &oracle_key(seed),
+                ));
+            }
+            blocks.push(make_block(h, actions));
+        }
+        link_blocks(&mut blocks);
+        println!("S80UB generated {total} blocks in {:.1}s", t_gen.elapsed().as_secs_f64());
+
+        let sums = |m: &torus_telemetry::Metrics| -> std::collections::BTreeMap<String, f64> {
+            m.encode()
+                .lines()
+                .filter_map(|l| {
+                    let rest = l.strip_prefix("torus_exec_")?;
+                    let (name, v) = rest.split_once("_seconds_sum ")?;
+                    Some((name.to_string(), v.trim().parse().ok()?))
+                })
+                .collect()
+        };
+        let mut results: Vec<(u64, f64)> = Vec::new();
+        for (arm, &k) in arms.iter().enumerate() {
+            // Native trie maintenance stays at the node default
+            // (`TORUS_NATIVE_TRIE_MAINTENANCE`, off unless "1"): not forced on.
+            let (mut config, db) = make_test_config_and_db();
+            config.epoch_length = 1_000_000;
+            config.state_hash_activation_height = Some(1);
+            config.book_window_commit = true;
+            torus_state::running_hash::configure_activation(&db, Some(1)).unwrap();
+            torus_state::running_hash::configure_book_window(&db, Some(1)).unwrap();
+            {
+                let fund = torus_bridge::native_executor::NativeExecContext::new(
+                    db.clone(),
+                    1,
+                    1000,
+                    0,
+                    1_000_000,
+                    100,
+                    Address::new([99; 20]),
+                    Address::new([100; 20]),
+                    Address::new([101; 20]),
+                );
+                for a in &addrs {
+                    fund.positions
+                        .put_native_balance(
+                            a,
+                            &torus_core::position::NativeBalance {
+                                available: FixedPoint::from_raw(100_000_000 * FixedPoint::SCALE),
+                                order_margin: FixedPoint::ZERO,
+                            },
+                        )
+                        .unwrap();
+                }
+            }
+            for (seed, mult) in ORACLE_VALIDATORS {
+                oracle_put_validator(&db, seed, mult, torus_economics::ValidatorStatus::Active);
+            }
+            let one = FixedPoint::ONE.raw();
+            let row = borsh::to_vec(&("BASE".to_string(), "USDC".to_string(), one, one, 5 * one)).unwrap();
+            for m in 1..=markets {
+                db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), &row).unwrap();
+            }
+            torus_state::exec_join::set_k(k);
+            torus_state::exec_join::set_liq_per_unit(liq_unit);
+            let mut ctx = make_exec_ctx(&config, &db);
+            let metrics = Arc::new(torus_telemetry::Metrics::new());
+            ctx.metrics = Some(metrics.clone());
+            ctx.trade_writer = Some(torus_state::BackgroundCfWriter::spawn(
+                db.clone(),
+                "s80-ub-trade-writer",
+                64,
+            ));
+            ctx.attach_flush_worker(None);
+            let mut timed = std::time::Duration::ZERO;
+            let mut sums0 = Default::default();
+            let mut matched0 = 0;
+            let mut h = 1u64;
+            while h <= total {
+                if h == warm + 1 {
+                    sums0 = sums(&metrics);
+                    matched0 = metrics.orders_matched.get();
+                }
+                let (first, last) = torus_state::exec_join::unit_bounds(h, k);
+                assert_eq!(first, h, "arm {arm} k={k}: units start where the last one ended");
+                let unit = &blocks[h as usize - 1..last.min(total) as usize];
+                for b in unit {
+                    let durable = persist_committed_block_durably(&db, b);
+                    assert!(durable.header && durable.body);
+                }
+                let t = std::time::Instant::now();
+                if unit.len() == 1 {
+                    ctx.execute_committed_block_with(&unit[0], vec![], DurableRows { header: true, body: true });
+                } else {
+                    ctx.execute_joined(unit);
+                }
+                if h > warm {
+                    timed += t.elapsed();
+                }
+                h += unit.len() as u64;
+            }
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "arm {arm} k={k}: no fail-stop");
+            let sums1 = sums(&metrics);
+            // Drains W (the last unit's flush) and the trade writer: timed too.
+            let t = std::time::Instant::now();
+            drop(ctx);
+            let drain = t.elapsed();
+            timed += drain;
+            torus_state::exec_join::set_k(1);
+            torus_state::exec_join::set_liq_per_unit(false);
+            assert_eq!(read_native_applied_height(&db), Some(total));
+            assert!(
+                torus_state::running_hash::read_unverified_since(&db).is_none(),
+                "arm {arm} k={k}: hash chained"
+            );
+            // As summarize.py: fills = `orders_matched_total` over the window.
+            let fills = (metrics.orders_matched.get() - matched0) as f64;
+            assert!(fills > 0.0, "arm {arm} k={k}: the load must fill");
+            let kf = fills / 1e3;
+            let per1k = timed.as_secs_f64() * 1e3 / kf;
+            let parts: Vec<String> = sums1
+                .iter()
+                .filter_map(|(n, v)| {
+                    let d = v - sums0.get(n).copied().unwrap_or(0.0);
+                    (d > 0.0).then(|| format!("{n}={:.3}", d * 1e3 / kf))
+                })
+                .collect();
+            println!(
+                "S80UB arm={arm} k={k} liq_unit={liq_unit} measured_blocks={measure} fills/blk={:.0} exec_wall_ms/blk={:.2} \
+                 exec_wall_ms/1k_fills={per1k:.3} drain_ms={:.1} [ms/1k: {}]",
+                fills / measure as f64,
+                timed.as_secs_f64() * 1e3 / measure as f64,
+                drain.as_secs_f64() * 1e3,
+                parts.join(" "),
+            );
+            println!(
+                "S80UB arm={arm} k={k} (whole run) actions={} placed={} matched={} rej_margin={} \
+                 rej_open_limit={} rej_book={} rej_other={} rej_reasons={:?}",
+                metrics.native_actions_processed.get(),
+                metrics.orders_placed_accepted.get(),
+                metrics.orders_matched.get(),
+                metrics.orders_rejected_margin.get(),
+                metrics.orders_rejected_open_limit.get(),
+                metrics.orders_rejected_book.get(),
+                metrics.orders_rejected_other.get(),
+                metrics.orders_rejected_reason.iter().map(|c| c.get()).collect::<Vec<_>>(),
+            );
+            results.push((k, per1k));
+        }
+        for k in 1..=torus_state::exec_join::MAX_K {
+            let xs: Vec<f64> = results.iter().filter(|(kk, _)| *kk == k).map(|(_, v)| *v).collect();
+            if !xs.is_empty() {
+                println!(
+                    "S80UB SUMMARY k={k} n={} mean exec_wall_ms/1k_fills={:.3} all={xs:?}",
+                    xs.len(),
+                    xs.iter().sum::<f64>() / xs.len() as f64
+                );
+            }
+        }
     }
 
     /// R01b D: the exec channel closing while the node is NOT stopping (the

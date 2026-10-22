@@ -4843,7 +4843,9 @@ impl ResidentBooks {
         // Step 2: the previous block's slot first (its worker may still run).
         self.settle_rows();
         match self.rows.as_mut() {
-            Some(slot) if slot.height + 1 == block_height => slot.height = block_height,
+            Some(slot) if torus_state::exec_join::follows(slot.height, block_height) => {
+                slot.height = block_height
+            }
             Some(slot) => {
                 tracing::warn!(
                     rows_height = slot.height,
@@ -4859,7 +4861,7 @@ impl ResidentBooks {
             return false;
         }
         match self.inner.as_mut() {
-            Some(inner) if inner.height + 1 == block_height => {
+            Some(inner) if torus_state::exec_join::follows(inner.height, block_height) => {
                 inner.height = block_height;
                 true
             }
@@ -4926,7 +4928,7 @@ fn rows_slot_reusable<B: StateBackend>(
     parent_height: Option<u64>,
 ) -> Result<bool, torus_state::error::StateError> {
     let marker = applied_marker(state)?;
-    let height_ok = slot_height + 1 == height;
+    let height_ok = torus_state::exec_join::follows(slot_height, height);
     let marker_ok = resident_marker_ok(marker, slot_height);
     let parent_ok = parent_height.is_none_or(|p| p == slot_height);
     if height_ok && marker_ok && parent_ok {
@@ -6788,7 +6790,7 @@ impl<T: StateBackend> NativeExecContext<T> {
                 // No marker row (test envs / pre-marker DBs): the height
                 // sequence check below is the only guard available.
                 let marker_ok = applied_marker.is_some_and(|m| resident_marker_ok(m, inner.height));
-                let height_ok = inner.height + 1 == block_height;
+                let height_ok = torus_state::exec_join::follows(inner.height, block_height);
                 if height_ok && marker_ok {
                     reused_inner = Some(inner);
                 } else if marker_fault.is_none() {
