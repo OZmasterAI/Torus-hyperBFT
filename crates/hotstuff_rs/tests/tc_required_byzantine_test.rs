@@ -688,7 +688,9 @@ fn validator_set_update_window_timeout_loses_no_further_view() {
         // `is_proposer`). If TC(w - 1) brings it into w before the Decide PC reaches it, it nudges
         // the Commit PC, the Decide phase runs again in w and w ends with a QC, not a timeout (the
         // scenario is missed; a race of pacemaker deadlines across replicas, lost under CPU load).
-        // Its nudge for w is lost too.
+        // So every nudge for w is lost, whoever sends it: that nudger is the only one (the
+        // committed set's leader of w holds the Decide PC and proposes on it, and that proposal
+        // is dropped above).
         if let Message::ProgressMessage(ProgressMessage::HotStuffMessage(HotStuffMessage::Nudge(nudge))) = &message {
             if w.dropped == Some(nudge.view.int()) {
                 return None;
