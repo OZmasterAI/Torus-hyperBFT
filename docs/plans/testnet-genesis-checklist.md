@@ -21,7 +21,7 @@ waiting for a merge). "Blocks" names what cannot be finished until the item is s
 | Validator count (3 / 4 / 5) | Deferred: owner decides right before the testnet |
 | Liquidator-vault seed amount | Deferred: owner decides right before the testnet |
 | Item 7 T timing | Pending owner answer (s127 said before genesis; option: after genesis behind a P0.0 bit) |
-| Jailing / `JailVote` gate | Pending owner answer (recommended: skip the gate for the testnet if every validator is owner-run, fix before mainnet; jailing timing T2) |
+| Jailing / `JailVote` gate | **Leave as is for the testnet; fix before mainnet.** `JailVote` stays ungated (every testnet validator is owner-run), and jailing (J2 + E1/E2) plus the `JailVote` gate are pre-mainnet items. A testnet upgrade through P0.0 stays possible if live testing is wanted later. Dead-leader skip (b1) still handles dead leaders on the testnet |
 
 ## 1. Chain identity and validators
 
