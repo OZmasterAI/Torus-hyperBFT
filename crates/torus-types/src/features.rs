@@ -280,7 +280,7 @@ mod tests {
         assert_eq!(KNOWN_FEATURES, 0b111);
         assert_eq!(first_unknown_feature_in(0b11, 0b01), Some(1));
         assert_eq!(first_unknown_feature_in(0b01, 0b01), None);
-        assert_eq!(unknown_features(0b101), 0b100);
+        assert_eq!(unknown_features(0b1001), 0b1000);
         assert_eq!(first_unknown_feature(0b1), None);
         assert_eq!(first_unknown_feature(1 | (1 << 9) | (1 << 77)), Some(9));
         for f in Feature::ALL {
