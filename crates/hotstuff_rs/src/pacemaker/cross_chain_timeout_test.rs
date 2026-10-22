@@ -14,6 +14,7 @@ use super::*;
 use crate::hotstuff::cross_chain_certificate_test::{pc_on, tc_on};
 use crate::hotstuff::header_fast_path_regression_test::{generic_pc, signing_keys, steady_block_tree, validator_set, MemKV};
 use crate::networking::network::Network;
+use crate::pacemaker::types::TimeoutCertificate;
 use crate::types::crypto_primitives::SigningKey;
 use crate::types::data_types::CryptoHash;
 

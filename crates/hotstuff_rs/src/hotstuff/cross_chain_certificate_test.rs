@@ -119,7 +119,7 @@ fn tc_with_a_high_qc_of_another_chain_is_not_correct() {
     let foreign = pc_on(FOREIGN, 900, CryptoHash::new([10; 32]), &keys[..3], &set);
     assert!(foreign.is_correctly_signed(&set), "precondition: a real quorum, of chain 7");
     let tc = tc_on(CHAIN_ID, 4, &keys[..3], &set, &[Some(ours.clone()), Some(ours), Some(foreign)]);
-    assert_eq!(tc.high_qc.as_ref().unwrap().chain_id, FOREIGN, "precondition: chain 7's QC is the high QC");
+    assert!(tc.high_qc.as_ref().unwrap().chain_id == FOREIGN, "precondition: chain 7's QC is the high QC");
     assert!(!tc_correct(&tc, &tree), "a TC must not carry another chain's QC as its high QC");
 }
 
