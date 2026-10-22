@@ -428,6 +428,16 @@ impl Genesis {
                 "evm.block_interval must be >= 1".into(),
             ));
         }
+        // s138: the node runs on `chain_id`; EVM signers read `evm.chain_id`.
+        if genesis.evm.chain_id != genesis.chain_id {
+            return Err(GenesisError::InvalidEvm(format!(
+                "evm.chain_id {} differs from chain_id {} (absent chain_id = {}); \
+                 EVM transactions must be signed with chain_id, so the two must match",
+                genesis.evm.chain_id,
+                genesis.chain_id,
+                default_chain_id()
+            )));
+        }
         genesis.check_keys_and_hex()?;
         genesis.activation_schedule()?;
         Ok(genesis)
@@ -1583,8 +1593,8 @@ mod tests {
         let err = Genesis::from_json(&json.to_string()).unwrap_err();
         assert!(matches!(err, GenesisError::InvalidEvm(_)), "{err}");
         let msg = err.to_string();
-        assert!(msg.contains("evm.chain_id") && msg.contains("7778"), "{msg}");
-        assert!(msg.contains("7779"), "{msg}");
+        assert!(msg.contains("evm.chain_id 7778"), "{msg}");
+        assert!(msg.contains("chain_id 7779"), "{msg}");
         // A genesis without top-level chain_id means devnet 7778.
         json.as_object_mut().unwrap().remove("chain_id");
         json["evm"]["chain_id"] = 1.into();

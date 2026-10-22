@@ -1311,9 +1311,10 @@ mod tests {
             let t = v["consensus"]["timeout_base_ms"].as_u64().unwrap();
             v["consensus"]["timeout_base_ms"] = (t + 1).into();
             v["chain_id"] = 9999u64.into();
+            v["evm"]["chain_id"] = 9999u64.into();
         });
         let err = boot(dir.path(), &t).unwrap_err();
-        assert!(err.contains("changed: chain_id, consensus.timeout_base_ms."), "{err}");
+        assert!(err.contains("changed: chain_id, consensus.timeout_base_ms, evm.chain_id."), "{err}");
         assert_eq!(stored(dir.path()), before, "a refused boot rewrote the digest");
         // The original file still starts.
         assert_eq!(boot(dir.path(), DEVNET_GENESIS), Ok(GenesisBinding::Matched));
