@@ -296,6 +296,23 @@ that lost its chain rows keeps running, hash-unverified (see "Running state
 hash: a hash-unverified node", `torus_state_hash_unverified` = 1); recover by
 resyncing from a fresh data dir or restoring a data dir that has its rows.
 
+### Window-committed order books (L6.1) after an activation
+
+L6.1 is the feature `book_window_commit` (id 1,
+`docs/plans/l61-window-committed-books.md`). It needs `running_state_hash` in
+the same schedule (refused otherwise) and the Classic book mode. Genesis:
+`"activations": {"running_state_hash": 1, "book_window_commit": 1}`, or the
+bool `"book_window_commit": true`, which means "from the running hash's
+height" (an explicit `activations.book_window_commit` at another height next
+to it refuses to start). From the first block whose header carries bit 1, the
+running hash skips the order-book CF except at every 100th height, where the
+block always runs the native phase and saves (and hashes) every book.
+Execution runs this by the header's bit, so a node with another schedule
+replays the same transition. L3.1 coalesced book saves (`TORUS_BOOK_COALESCE`)
+run with the hash on only when the schedule starts L6.1 no later than the
+hash; a header that carries the hash bit without bit 1 on such a node
+fail-stops (fix the genesis activations).
+
 ### Order-book storage mode (`consensus.book_mode`)
 
 The order-book storage mode is a genesis field, fixed for the chain's life

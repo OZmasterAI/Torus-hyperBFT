@@ -142,7 +142,9 @@ pub struct ConsensusConfig {
     #[serde(default)]
     pub activations: std::collections::BTreeMap<torus_types::Feature, u64>,
     /// L6.1 window-committed Classic order books (CHAIN-WIDE, consensus-
-    /// changing; docs/plans/l61-window-committed-books.md). Absent = off.
+    /// changing; docs/plans/l61-window-committed-books.md). P0.0: the alias
+    /// of `activations.book_window_commit` at the running hash's height
+    /// (needs the hash; an explicit other height refuses). Absent = off.
     #[serde(default)]
     pub book_window_commit: bool,
 }
@@ -433,7 +435,7 @@ impl Genesis {
     /// Both alias spellings with different heights, or a built-in height that
     /// differs from the genesis one, refuse to start.
     pub fn activation_schedule(&self) -> Result<torus_types::ActivationSchedule, GenesisError> {
-        use torus_types::Feature::RunningStateHash;
+        use torus_types::Feature::{BookWindowCommit, RunningStateHash};
         let mut activations = self.consensus.activations.clone();
         if let Some(alias) = self.consensus.state_hash_activation_height {
             if alias == 0 {
@@ -454,6 +456,38 @@ impl Genesis {
                     activations.insert(RunningStateHash, alias);
                 }
             }
+        }
+        // L6.1: the bool is the alias of `book_window_commit` from the
+        // running hash's height (what CL21 measured and the bench harness's
+        // BOOK_WINDOW_COMMIT=1 writes).
+        if self.consensus.book_window_commit {
+            let Some(&hash) = activations.get(&RunningStateHash) else {
+                return Err(GenesisError::InvalidActivations(format!(
+                    "book_window_commit = true needs the running state hash \
+                     (activations.{} or state_hash_activation_height)",
+                    RunningStateHash.name()
+                )));
+            };
+            match activations.get(&BookWindowCommit) {
+                Some(&h) if h.max(1) != hash.max(1) => {
+                    return Err(GenesisError::InvalidActivations(format!(
+                        "book_window_commit = true (from the running hash's height {hash}) but \
+                         activations.{} = {h}",
+                        BookWindowCommit.name()
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    activations.insert(BookWindowCommit, hash);
+                }
+            }
+        }
+        if activations.contains_key(&BookWindowCommit) && !self.consensus.book_mode.is_classic() {
+            return Err(GenesisError::InvalidActivations(format!(
+                "{} (L6.1) needs book_mode classic, not {}",
+                BookWindowCommit.name(),
+                self.consensus.book_mode.name()
+            )));
         }
         torus_types::ActivationSchedule::for_chain(self.chain_id, &activations)
             .map_err(GenesisError::InvalidActivations)
@@ -809,7 +843,6 @@ impl Genesis {
             exec_trust_cache: false,
             activations,
             book_mode: self.consensus.book_mode,
-            book_window_commit: self.consensus.book_window_commit,
         }
     }
 
@@ -1360,18 +1393,25 @@ mod tests {
     fn genesis_book_window_commit_is_chain_config() {
         let genesis = Genesis::from_json(&sample_genesis_json()).unwrap();
         assert!(!genesis.consensus.book_window_commit);
-        assert!(!genesis.chain_config().book_window_commit, "off by default");
+        assert_eq!(genesis.chain_config().book_window_activation(), None, "off by default");
         let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
         json["consensus"]["book_window_commit"] = serde_json::json!(true);
         json["consensus"]["state_hash_activation_height"] = serde_json::json!(1);
         let mut config = Genesis::from_json(&json.to_string())
             .unwrap()
             .chain_config();
-        assert!(config.book_window_commit);
+        assert_eq!(config.book_window_activation(), Some(1));
         assert!(config.validate().is_ok());
         config.activations = Default::default();
+        assert!(config.validate().is_ok(), "nothing scheduled");
+        config.activations = torus_types::ActivationSchedule::merge(
+            &[(torus_types::Feature::BookWindowCommit, 1)].into_iter().collect(),
+            &[],
+        )
+        .unwrap();
         assert!(config.validate().is_err(), "L6.1 without the running hash");
     }
+
 
     /// Consensus bug (b): genesis records the hotstuff genesis set as the
     /// installed epoch set, ranked exactly like a computed plan, so the first

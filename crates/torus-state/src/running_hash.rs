@@ -349,17 +349,20 @@ fn discard_stored_chain(
 
 // ---------------------------------------------------------------------------
 // L6.1: window-committed Classic order books
-// (docs/plans/l61-window-committed-books.md). Consensus-changing, genesis-bound
-// (`consensus.book_window_commit`, default off = today's preimage).
+// (docs/plans/l61-window-committed-books.md). Consensus-changing: P0.0 feature
+// `book_window_commit` (genesis `consensus.activations.book_window_commit` or the
+// bool alias `consensus.book_window_commit`), default off = today's preimage.
 // ---------------------------------------------------------------------------
 
 /// Hash `cf_id` of `cf_native_order_books` (frozen, [`HASHED_CFS`]).
 pub const ID_NATIVE_ORDER_BOOKS: u8 = 3;
 
-/// L6.1: the node-local copy of the chain config's L6.1 activation height
-/// (`ChainConfig::book_window_activation`; `META_STATE_HASH_BOOK_WINDOW`,
-/// written at boot by [`configure_book_window`]), `None` = off. Read by the
-/// digest only; the execution rule takes the chain config itself.
+/// L6.1: the node-local copy of the L6.1 activation height the committed
+/// headers define (the first header carrying the `BookWindowCommit` bit;
+/// `META_STATE_HASH_BOOK_WINDOW`, written by execution through
+/// [`configure_book_window`] before the block that changes it), `None` = off.
+/// Read by the digest only; the execution rule reads the executed header's
+/// bit itself.
 pub fn read_book_window(db: &StateDb) -> Option<u64> {
     db.get_cf_raw(CF_CONSENSUS_META, META_STATE_HASH_BOOK_WINDOW)
         .ok()
@@ -368,12 +371,15 @@ pub fn read_book_window(db: &StateDb) -> Option<u64> {
         .map(u64::from_be_bytes)
 }
 
-/// L6.1: apply the chain config's L6.1 activation
-/// (`ChainConfig::book_window_activation`) at boot, after
-/// [`configure_activation`] and before any block is flushed. It is part of
-/// the chain's definition (it changes the hash preimage), so a change with a
-/// stored chain discards that chain, as an activation change does. Returns
-/// whether a stored chain was discarded.
+/// L6.1: set the L6.1 activation the digest reads (P0.0: execution calls it
+/// with the headers' activation, after a pipeline barrier, before the first
+/// block it changes is flushed). It is part of the chain's definition (it
+/// changes the hash preimage from its height on), so a stored chain that
+/// reaches the first height whose rule changes (the lower of the old and the
+/// new activation) is discarded, as an activation change does. A chain whose
+/// head is below that height was hashed under both rules alike and is kept
+/// (the bit turning on at H, with the chain at H - 1). Returns whether a
+/// stored chain was discarded.
 pub fn configure_book_window(db: &StateDb, on: Option<u64>) -> Result<bool, crate::StateError> {
     let stored = db.get_cf_raw(CF_CONSENSUS_META, META_STATE_HASH_BOOK_WINDOW)?;
     let previous = stored
@@ -386,7 +392,11 @@ pub fn configure_book_window(db: &StateDb, on: Option<u64>) -> Result<bool, crat
         return Ok(false);
     }
     let checkpoints = checkpoint_heights(db);
-    let reset = has_stored_chain(db, &checkpoints);
+    // The first height whose digest rule differs between `previous` and `on`.
+    let changed_from = previous
+        .unwrap_or(u64::MAX)
+        .min(on.unwrap_or(u64::MAX));
+    let reset = stored_chain_head(db, &checkpoints).is_some_and(|head| head >= changed_from);
     let cf = db.cf_handle(CF_CONSENSUS_META)?;
     let mut batch = rocksdb::WriteBatch::default();
     if reset {
@@ -394,7 +404,8 @@ pub fn configure_book_window(db: &StateDb, on: Option<u64>) -> Result<bool, crat
         tracing::warn!(
             ?previous,
             ?on,
-            "running state hash: book_window_commit config changed, stored chain discarded"
+            "running state hash: book_window_commit activation changed below the stored chain's \
+             head, stored chain discarded"
         );
     }
     if let Some(a) = on {
@@ -405,9 +416,23 @@ pub fn configure_book_window(db: &StateDb, on: Option<u64>) -> Result<bool, crat
     db.write(batch)?;
     tracing::info!(
         ?on,
-        "running state hash: L6.1 window-committed books (chain config)"
+        "running state hash: L6.1 window-committed books (from the committed headers)"
     );
     Ok(reset)
+}
+
+/// The highest height any part of the stored chain covers (hash, activation
+/// record, unverified marker, checkpoints), `None` = no stored chain.
+fn stored_chain_head(db: &StateDb, checkpoints: &[u64]) -> Option<u64> {
+    [
+        read_running_hash(db).map(|(h, _)| h),
+        read_activation_height(db),
+        read_unverified_since(db),
+        checkpoints.iter().copied().max(),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
 }
 
 /// L6.1: whether window-committed books apply at `height`: `book_window`

@@ -79,6 +79,24 @@ the debt into the closing layer exactly as L3.1 does (those bytes are never hash
 
 ## 5. Switch (genesis-bound)
 
+**P0.0 wiring (s136, batch 10, `merge/s136-batch10`), supersedes the bullets below where they differ:** L6.1 is
+the P0.0 feature `book_window_commit` (id 1). Genesis `consensus.activations.book_window_commit` schedules it; the
+bool `consensus.book_window_commit` is its alias at the running hash's height (refused without the hash or next to
+another explicit height); `ActivationSchedule::for_chain` refuses it without `running_state_hash`; the genesis and
+`ChainConfig::validate` refuse it with a row book mode. `ChainConfig::book_window_activation()` is the schedule's
+height (the old `ChainConfig.book_window_commit` field is gone). Execution: the forced attest-height save reads the
+executed header's bit (`book_window_full_save_for`); the digest's META row `state_hash_book_window` follows the
+headers (`ExecutionContext::follow_book_window_bit`, barrier + `configure_book_window` before the first block that
+changes it; no boot-time write); `configure_book_window` keeps a stored chain whose head is below the changed rule
+(the bit turning on at H > the hash's start keeps the chain). L3.1: the boot gate takes the schedule's (or the
+replayed headers') hash and L6.1 activations through `l31_hash_blocker`; per block, a header with the hash bit and
+without the L6.1 bit fail-stops while L3.1 is on (`l31_allows_header`, replacing phase 3's activation-change check).
+Tests: `l61_follows_the_header_bit_from_its_activation`, `l31_fail_stops_on_a_hashed_header_without_the_window_bit`,
+`l61_meta_row_follows_the_headers_not_the_boot`, `running_hash_book_window_change_above_the_head_keeps_the_chain`,
+genesis / types schedule tests.
+
+Original (pre-P0.0) switch:
+
 * Genesis `consensus.book_window_commit: bool`, default false (absent = off = today's hash preimage). Copied into
   `ChainConfig.book_window_commit`. `validate`: requires `state_hash_activation_height` (inert otherwise).
 * Boot: `running_hash::configure_book_window(db, ChainConfig::book_window_activation())` right after

@@ -190,6 +190,17 @@ impl ActivationSchedule {
                 feature.name()
             ));
         }
+        // L6.1 only changes the running hash's book preimage and the attest
+        // heights' save: without the hash it has no purpose.
+        if schedule.height_of(Feature::BookWindowCommit).is_some()
+            && schedule.height_of(Feature::RunningStateHash).is_none()
+        {
+            return Err(format!(
+                "feature {} needs {} in the schedule",
+                Feature::BookWindowCommit.name(),
+                Feature::RunningStateHash.name()
+            ));
+        }
         Ok(schedule)
     }
 

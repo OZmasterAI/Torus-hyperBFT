@@ -193,7 +193,8 @@ Each phase lands on its own branch with RED-first tests and full gates; each one
    rule, which refuses such headers before the vote and at insertion). Test fixtures: `make_test_config_and_db`
    schedules the running hash at 1 and `make_block` / `default_genesis_header` carry the bit, so the module's
    running-hash coverage stays on.
-   **L6.1 switch (not done here):** `perf/l61-window-books` keys its L3.1 gate on
+   **L6.1 switch: done s136 on `merge/s136-batch10`** (feature `book_window_commit` id 1; see
+   `docs/plans/l61-window-committed-books.md` section 5). Original note: `perf/l61-window-books` keys its L3.1 gate on
    `ChainConfig::book_window_activation()` through `l31_hash_blocker`. Once it is a `Feature` (window books),
    `l31_hash_blocker` should take the header-derived running-hash activation (`read_configured_activation`
    after the replay, as `configure_book_coalesce` does here) plus the schedule, and the window-book rule itself

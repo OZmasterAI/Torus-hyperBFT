@@ -126,7 +126,6 @@ fn chain_config(schedule: ActivationSchedule) -> ChainConfig {
         exec_trust_cache: false,
         activations: schedule,
         book_mode: Default::default(),
-        book_window_commit: false,
     }
 }
 
