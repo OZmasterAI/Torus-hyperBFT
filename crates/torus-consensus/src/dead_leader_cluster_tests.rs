@@ -1033,6 +1033,50 @@ fn dl_cluster_power_loss_keeps_the_leader_evidence_in_the_manifests() {
     c.assert_agree(&live, top);
 }
 
+/// s138, found by the power-loss test (not dead-leader specific, run with K = 0): the same power
+/// loss (validator 3 never runs), but `y`
+/// stops only once the chain needs its plan for boundary 2L (committed 2L - 2, applied 5: the
+/// plan source, boundary L, is among the lost heights). Restarted, `y` parks 6..=committed on
+/// their manifests; they drain only when the next height commits, but that height is boundary 2L
+/// (or needs its QC), which `y` cannot validate before it executed boundary L
+/// (`EpochPlanNotReady` -> `MissingData`), and the dead validator is the fourth, so `y`'s vote is
+/// needed: nothing ever commits again. RED on 16acaa48: stuck at committed 18 for 240 s.
+#[test]
+fn dl_cluster_power_loss_parked_plan_source_drains_for_the_boundary() {
+    let mut c = Cluster::new(&[1, 1, 1, 1]);
+    let y = 1;
+    let live = [0, 1, 2];
+    let hold = ExecHold::new(6);
+    // Dead-leader skip off: no exclusion update to wait on at 2L, the bug is not dead-leader's.
+    let off = Run::on().k(0);
+    c.start(0, &off);
+    c.start(2, &off);
+    c.start(y, &off.clone().held(&hold).keep_manifests());
+    c.wait_until("y commits up to the boundary that needs its plan", |c| {
+        c.committed(y) >= 2 * L - 2
+    });
+    assert_eq!(c.applied(y), 5, "y executed up to the hold");
+    let committed = c.committed(y);
+    c.stop(y);
+    let dir = c.nodes[y].dir.path().to_path_buf();
+    {
+        let state = StateDb::open(&dir.join("state")).unwrap();
+        for h in 6..=committed {
+            let key = h.to_be_bytes();
+            state.delete_cf_raw(CF_BLOCK_HEADERS, &key).unwrap();
+            state.delete_cf_raw(CF_BLOCK_BODIES, &key).unwrap();
+            state
+                .delete_cf_raw(CF_CONSENSUS_META, &crate::leader_skip::leader_qc_key(h))
+                .unwrap();
+        }
+    }
+    c.start(y, &off.clone().keep_manifests());
+    c.wait_applied(&live, 2 * L + 1);
+    let top = c.min_applied(&live);
+    c.stop_all();
+    c.assert_agree(&live, top);
+}
+
 /// Mixed configurations: validator 3 runs K = 0 (dead-leader skip off), the others K = 3.
 /// All four live: consensus does not notice (every node commits the same headers), but the
 /// states differ from height 1 on (validator 3 writes no leader statistics), so the running
