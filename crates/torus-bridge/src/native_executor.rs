@@ -1124,6 +1124,149 @@ fn settle_streamed_enabled() -> bool {
     })
 }
 
+/// s80 liq-tail-offload (`TORUS_S80_LIQ_PREVALUE`, node-local, OFF by
+/// default = exactly today's step): the liquidation step's cost off the
+/// exec thread's serial path. `mask` bit 0: the scan window's valuations
+/// (`liq_view`, read-only) run on the exec pool before the serial loop,
+/// which consumes them in order until its first act (a non-healthy account
+/// writes positions / balances of others) and values every later account
+/// live; bit 1: the window's dirty traders come from
+/// [`StateBackend::layer_traders`] (no clone of every position key the
+/// block wrote). `workers`: pool jobs per window
+/// (`TORUS_S80_LIQ_PREVALUE_WORKERS`, default 8); `min`: smallest window
+/// pre-valued (`TORUS_S80_LIQ_PREVALUE_MIN`, default 64).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiqPrevalue {
+    pub mask: u8,
+    pub workers: usize,
+    pub min: usize,
+}
+
+impl LiqPrevalue {
+    pub const OFF: Self = Self { mask: 0, workers: 8, min: 64 };
+}
+
+/// s80: pure parse of `TORUS_S80_LIQ_PREVALUE`: unset / empty / `0` /
+/// `false` = off; `1` / `true` / `on` = mask 3 (both parts); `2`..`3` as a
+/// mask (`2` = the window part only); `pool` = mask 1 (the pool part
+/// only). Anything else is warned and off.
+#[doc(hidden)]
+pub fn parse_liq_prevalue_mask(v: Option<&str>) -> u8 {
+    let Some(v) = v else { return 0 };
+    match v.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "off" => 0,
+        "1" | "true" | "on" | "3" => 3,
+        "pool" => 1,
+        "2" => 2,
+        _ => {
+            tracing::warn!(value = v, "TORUS_S80_LIQ_PREVALUE: not 0, 1, 2, 3, pool, true or false; using off");
+            0
+        }
+    }
+}
+
+thread_local! {
+    /// s80: [`with_liq_prevalue`]'s per-thread pin; `None` = the env.
+    static LIQ_PREVALUE_PIN: std::cell::Cell<Option<LiqPrevalue>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static LIQ_PREVALUE_STATS: std::cell::Cell<LiqPrevalueStats> = const {
+        std::cell::Cell::new(LiqPrevalueStats { passes: 0, consumed: 0, dropped: 0, prefix_windows: 0 })
+    };
+}
+
+/// s80 (tests): this thread's counters of the step's pre-valued path.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LiqPrevalueStats {
+    /// Windows valued on the pool.
+    pub(crate) passes: u64,
+    /// Accounts the serial loop classified from a pre-value.
+    pub(crate) consumed: u64,
+    /// Pre-values dropped at an act (those accounts valued live).
+    pub(crate) dropped: u64,
+    /// Windows whose dirty traders came from `layer_traders`.
+    pub(crate) prefix_windows: u64,
+}
+
+#[cfg(test)]
+impl LiqPrevalueStats {
+    pub(crate) fn since(&self, b: &Self) -> Self {
+        Self {
+            passes: self.passes - b.passes,
+            consumed: self.consumed - b.consumed,
+            dropped: self.dropped - b.dropped,
+            prefix_windows: self.prefix_windows - b.prefix_windows,
+        }
+    }
+    pub(crate) fn add(&mut self, d: &Self) {
+        self.passes += d.passes;
+        self.consumed += d.consumed;
+        self.dropped += d.dropped;
+        self.prefix_windows += d.prefix_windows;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn liq_prevalue_stats() -> LiqPrevalueStats {
+    LIQ_PREVALUE_STATS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn liq_prevalue_bump(f: impl FnOnce(&mut LiqPrevalueStats)) {
+    LIQ_PREVALUE_STATS.with(|c| {
+        let mut s = c.get();
+        f(&mut s);
+        c.set(s);
+    });
+}
+
+/// s80: runs `f` with `TORUS_S80_LIQ_PREVALUE` pinned to `pin` on this
+/// thread (tests, differential runs); the previous pin comes back on return
+/// or unwind.
+#[doc(hidden)]
+pub fn with_liq_prevalue<R>(pin: LiqPrevalue, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<LiqPrevalue>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LIQ_PREVALUE_PIN.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(LIQ_PREVALUE_PIN.with(|c| c.replace(Some(pin))));
+    f()
+}
+
+/// s80: the thread's pin if set, else the env, read once per process (one
+/// INFO line `TORUS_S80_LIQ_PREVALUE on=<bool>`).
+pub(crate) fn liq_prevalue() -> LiqPrevalue {
+    if let Some(p) = LIQ_PREVALUE_PIN.with(std::cell::Cell::get) {
+        return p;
+    }
+    static CFG: std::sync::OnceLock<LiqPrevalue> = std::sync::OnceLock::new();
+    *CFG.get_or_init(|| {
+        let num = |k: &str, d: usize| {
+            std::env::var(k).ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| *n > 0).unwrap_or(d)
+        };
+        let cfg = LiqPrevalue {
+            mask: parse_liq_prevalue_mask(std::env::var("TORUS_S80_LIQ_PREVALUE").ok().as_deref()),
+            workers: num("TORUS_S80_LIQ_PREVALUE_WORKERS", LiqPrevalue::OFF.workers),
+            min: num("TORUS_S80_LIQ_PREVALUE_MIN", LiqPrevalue::OFF.min),
+        };
+        tracing::info!(
+            on = cfg.mask != 0,
+            mask = cfg.mask,
+            workers = cfg.workers,
+            min = cfg.min,
+            "TORUS_S80_LIQ_PREVALUE on={} (liquidation window valued on the exec pool / dirty traders without key clones)",
+            cfg.mask != 0
+        );
+        cfg
+    })
+}
+
 #[cfg(test)]
 mod settle_streamed_flag_tests {
     use super::{

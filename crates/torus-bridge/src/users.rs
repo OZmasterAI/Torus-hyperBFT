@@ -751,12 +751,29 @@ impl Users {
         after: Option<Address>,
         limit: usize,
     ) -> Result<Option<Vec<Address>>, StateError> {
-        let Some(pending) = state.layer_keys(CF_NATIVE_POSITIONS) else {
-            return Ok(None);
+        // s80 liq-tail-offload (mask bit 2): the same sorted distinct list
+        // without cloning every key the block wrote.
+        let listed = if super::liq_prevalue().mask & 2 != 0 {
+            state.layer_traders(CF_NATIVE_POSITIONS, KEY)
+        } else {
+            None
         };
-        let mut dirty: Vec<Address> =
-            pending.iter().filter(|k| k.len() == KEY).map(|k| Address::from_slice(&k[..TRADER])).collect();
-        dirty.dedup(); // key-sorted: a trader's keys are adjacent
+        let dirty = match listed {
+            Some(d) => {
+                #[cfg(test)]
+                super::liq_prevalue_bump(|s| s.prefix_windows += 1);
+                d
+            }
+            None => {
+                let Some(pending) = state.layer_keys(CF_NATIVE_POSITIONS) else {
+                    return Ok(None);
+                };
+                let mut dirty: Vec<Address> =
+                    pending.iter().filter(|k| k.len() == KEY).map(|k| Address::from_slice(&k[..TRADER])).collect();
+                dirty.dedup(); // key-sorted: a trader's keys are adjacent
+                dirty
+            }
+        };
         let lo = after.map_or(Bound::Unbounded, Bound::Excluded);
         let mut base = self.traders.range((lo, Bound::Unbounded)).peekable();
         let start = after.map_or(0, |a| dirty.partition_point(|t| *t <= a));

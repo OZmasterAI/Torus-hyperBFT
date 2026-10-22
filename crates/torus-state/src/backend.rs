@@ -137,6 +137,13 @@ pub trait StateBackend: Clone + Send + Sync {
         None
     }
 
+    /// s80 liq-tail-offload: the distinct 20-byte prefixes (traders) of the
+    /// `key_len`-byte keys [`Self::layer_keys`] lists, ascending, without
+    /// cloning a key. `None` exactly when `layer_keys` is `None`.
+    fn layer_traders(&self, _cf: &str, _key_len: usize) -> Option<Vec<Address>> {
+        None
+    }
+
     /// Item 6 Phase 4 step 4: with resident rows attached and `cf` one of
     /// their CFs, THIS block's own pending row of `key` ([`OwnPendingRow::Pending`])
     /// or, when it has none, [`OwnPendingRow::Resident`]. Default
@@ -3476,6 +3483,49 @@ impl StateBackend for NativeStateOverlay {
         let mut keys: Vec<Vec<u8>> = cfp.writes.keys().chain(cfp.deletes.iter()).cloned().collect();
         keys.sort_unstable();
         Some(keys)
+    }
+
+    fn layer_traders(&self, cf: &str, key_len: usize) -> Option<Vec<Address>> {
+        let id = intern_cf(cf)?;
+        self.resident(id)?;
+        if key_len < 20 {
+            return None;
+        }
+        let state = self.pending.read().unwrap();
+        let cfp = state.cf(id);
+        // Each set is key-sorted, so its prefixes come sorted: dedup on the
+        // fly, then merge the two lists (a trader in both is listed once).
+        let prefixes = |keys: &mut dyn Iterator<Item = &Vec<u8>>| {
+            let mut out: Vec<Address> = Vec::new();
+            for k in keys.filter(|k| k.len() == key_len) {
+                let t = &k[..20];
+                if out.last().is_none_or(|l| l.as_slice() != t) {
+                    out.push(Address::from_slice(t));
+                }
+            }
+            out
+        };
+        let w = prefixes(&mut cfp.writes.keys());
+        let d = prefixes(&mut cfp.deletes.iter());
+        drop(state);
+        if d.is_empty() {
+            return Some(w);
+        }
+        let mut out = Vec::with_capacity(w.len() + d.len());
+        let (mut a, mut b) = (w.into_iter().peekable(), d.into_iter().peekable());
+        loop {
+            let next = match (a.peek(), b.peek()) {
+                (None, None) => break,
+                (Some(x), Some(y)) if x <= y => a.next(),
+                (Some(_), None) => a.next(),
+                _ => b.next(),
+            };
+            let t = next.expect("peeked");
+            if out.last() != Some(&t) {
+                out.push(t);
+            }
+        }
+        Some(out)
     }
 
     /// The first step of `get_cf_raw` for R's CFs: own pending, then R.

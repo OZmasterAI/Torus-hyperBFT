@@ -452,6 +452,52 @@ fn liquidation_l1_equals_reference_walk_on_seeded_sequences() {
     assert!(s.persistent > 100 && s.memo > 100 && s.dirty > 100, "every cache path used by the walk: {s:?}");
 }
 
+/// s80 liq-tail-offload (`TORUS_S80_LIQ_PREVALUE`, node-local): every
+/// mask (1: the window's valuations on the exec pool before the serial loop,
+/// dropped at the first act; 2: the window's dirty traders without cloning
+/// the block's position keys; 3: both) gives the flag-off run's results,
+/// liquidation / position / balance rows, `liquidations_triggered` and ADL
+/// work block by block, over the node path (R, L1, shadow) and the reference
+/// walk. Non-vacuous: pre-values consumed, pre-values dropped after an act,
+/// windows from the prefix list.
+#[test]
+fn liq_prevalue_masks_equal_flag_off_on_seeded_sequences() {
+    let mut total = LiqPrevalueStats::default();
+    for seed in 1..=3u64 {
+        for l1 in [true, false] {
+            let off = with_liq_prevalue(LiqPrevalue::OFF, || run(seed * 0x517C_C1B7, l1, &mut Stats::default()));
+            for mask in [1u8, 2, 3] {
+                let pin = LiqPrevalue { mask, workers: 4, min: 1 };
+                let before = liq_prevalue_stats();
+                let on = with_liq_prevalue(pin, || run(seed * 0x517C_C1B7, l1, &mut Stats::default()));
+                let d = liq_prevalue_stats().since(&before);
+                assert_eq!(on.len(), off.len());
+                for (h, (a, b)) in on.iter().zip(off.iter()).enumerate() {
+                    let at = format!("seed {seed} l1 {l1} mask {mask} block {}", h + 1);
+                    assert_eq!(a.results, b.results, "{at}: results");
+                    assert_eq!(a.markets, b.markets, "{at}: margin configs / listed markets");
+                    assert!(a.rows == b.rows, "{at}: liquidation / position / balance rows");
+                    assert_eq!(a.triggered, b.triggered, "{at}: liquidations_triggered");
+                    assert_eq!(a.adl_work, b.adl_work, "{at}: ADL drain work units");
+                }
+                if mask & 1 != 0 {
+                    assert!(d.passes > 0 && d.consumed > 0, "seed {seed} l1 {l1} mask {mask}: pre-values used: {d:?}");
+                } else {
+                    assert_eq!(d.passes, 0, "mask {mask}: no pre-value pass");
+                }
+                if mask & 2 != 0 && l1 {
+                    assert!(d.prefix_windows > 0, "seed {seed} mask {mask}: windows from the prefix list: {d:?}");
+                } else {
+                    assert_eq!(d.prefix_windows, 0, "mask {mask} l1 {l1}: no prefix list");
+                }
+                total.add(&d);
+            }
+        }
+    }
+    println!("LIQ_PREVALUE {total:?}");
+    assert!(total.dropped > 0, "pre-values dropped after an act (the live path after it): {total:?}");
+}
+
 /// adl-budget Q2 (A6 #3): one ranking per (block, market, side). The P2
 /// fixture's shape over the node path (R and the slot attached): u1 and u2
 /// long 1 @ 1,000 in markets 1..=4 (collateral 100: AV -300 at 900) against

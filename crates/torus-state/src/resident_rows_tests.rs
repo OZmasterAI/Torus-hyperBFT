@@ -553,6 +553,58 @@ fn layer_keys_are_own_pending_keys_with_resident() {
     assert_eq!(overlay.layer_keys(CF_NATIVE_BALANCES), Some(vec![[4u8; 20].to_vec()]));
 }
 
+/// s80 liq-tail-offload: `layer_traders(cf, key_len)` = the distinct 20-byte
+/// prefixes of the `key_len`-byte keys `layer_keys` lists, ascending (no key
+/// cloned); `None` exactly when `layer_keys` is `None`. Random own writes /
+/// tombstones (other lengths mixed in) over R, checked against
+/// `layer_keys`.
+#[test]
+fn layer_traders_are_layer_keys_prefixes() {
+    let (db, _dir) = temp_db();
+    let p = CF_NATIVE_POSITIONS;
+    assert!(db.layer_traders(p, 28).is_none(), "StateDb: None like layer_keys");
+    let parent = NativeStateOverlay::new(db.clone());
+    parent.put_cf_raw(p, &pos_key(1, 1), b"parent").unwrap();
+    let mut overlay = NativeStateOverlay::with_parent(db.clone(), Some(parent.freeze(1)));
+    assert!(overlay.layer_traders(p, 28).is_none(), "no R");
+    overlay.attach_resident(Arc::new(ResidentRows::build(&overlay).unwrap()));
+    assert_eq!(overlay.layer_traders(p, 28), Some(vec![]), "the parent is in R");
+    assert!(overlay.layer_traders(CF_NATIVE_ORDERS, 28).is_none(), "not an R CF");
+    let want = |o: &NativeStateOverlay| -> Vec<alloy_primitives::Address> {
+        let mut v: Vec<alloy_primitives::Address> = o
+            .layer_keys(p)
+            .unwrap()
+            .iter()
+            .filter(|k| k.len() == 28)
+            .map(|k| alloy_primitives::Address::from_slice(&k[..20]))
+            .collect();
+        v.dedup();
+        v
+    };
+    let mut x = 0x5EEDu64;
+    let mut next = |n: u64| {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (x >> 33) % n
+    };
+    for step in 0..400 {
+        let (t, m) = (next(40) as u8, next(6));
+        match next(5) {
+            0 => overlay.delete_cf_raw(p, &pos_key(t, m)).unwrap(),
+            1 => overlay.put_cf_raw(p, &[t; 21], b"odd length").unwrap(),
+            _ => overlay.put_cf_raw(p, &pos_key(t, m), b"w").unwrap(),
+        }
+        if step % 37 == 0 || step == 399 {
+            assert_eq!(overlay.layer_traders(p, 28).unwrap(), want(&overlay), "step {step}");
+        }
+    }
+    assert!(want(&overlay).len() > 20, "non-vacuous");
+    // A trader only under a tombstone, and only under a write, both listed once.
+    let both = overlay.layer_traders(p, 28).unwrap();
+    assert!(both.windows(2).all(|w| w[0] < w[1]), "ascending, distinct");
+    overlay.put_cf_raw(CF_NATIVE_BALANCES, &[4u8; 20], b"b").unwrap();
+    assert_eq!(overlay.layer_traders(CF_NATIVE_BALANCES, 20), Some(vec![alloy_primitives::Address::new([4u8; 20])]));
+}
+
 /// Item 6 Phase 4 step 4: `own_pending_row` (the typed loads' first step).
 /// The default (`StateDb`) and an overlay without R: `Unknown` (read through
 /// `get_cf_raw`). With R: the overlay's OWN pending write / tombstone as

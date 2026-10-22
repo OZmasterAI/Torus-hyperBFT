@@ -430,6 +430,15 @@ impl NativeExecutor {
         // escrow). B itself is never cut by it.
         let mut b_work = 0u64;
         let not_protocol = |a: &&Address| **a != LIQUIDATOR_VAULT && !liq::is_adl_escrow(a);
+        // s80 liq-tail-offload (mask bit 0): the valuations of the accounts
+        // the loop will scan, in loop order, computed on the exec pool. Until
+        // the loop's first act the loop writes only liquidation rows (cooldown
+        // / pending), which `liq_view` never reads, so each pre-value is what
+        // the loop's own `liq_view` would return; from the first act on every
+        // account is valued live.
+        let mut pre = Self::liq_prevalue_pass(ctx, &marks, l1, || {
+            accounts.iter().filter(not_protocol).take(scan).copied().collect()
+        });
         for (i, &trader) in accounts.iter().enumerate().filter(|(_, a)| not_protocol(a)) {
             if scanned == scan || acted == act {
                 cut = true;
@@ -443,7 +452,15 @@ impl NativeExecutor {
             scanned += 1;
             stats.scanned += 1;
             last = Some(trader);
-            let h = match Self::liq_view(ctx, &marks, &trader, l1)?.map(|v| liq::classify(&v)) {
+            let view = match pre.as_mut().and_then(Iterator::next) {
+                Some(v) => {
+                    #[cfg(test)]
+                    super::liq_prevalue_bump(|s| s.consumed += 1);
+                    v?
+                }
+                None => Self::liq_view(ctx, &marks, &trader, l1)?,
+            };
+            let h = match view.map(|v| liq::classify(&v)) {
                 Some(Some(h)) => h,
                 _ => {
                     // M2: nothing the step can do until a mark returns (the
@@ -463,6 +480,12 @@ impl NativeExecutor {
             }
             acted += 1;
             stats.acted += 1;
+            // s80: the act writes other accounts' rows (book fills, vault /
+            // escrow transfers): every later account is valued live.
+            if let Some(_rest) = pre.take() {
+                #[cfg(test)]
+                super::liq_prevalue_bump(|s| s.dropped += _rest.len() as u64);
+            }
             match h {
                 Health::Stage1 => stats.stage1 += 1,
                 Health::Backstop => stats.backstop += 1,
@@ -537,6 +560,42 @@ impl NativeExecutor {
         }
         stats.marks = marks;
         Ok(results)
+    }
+
+    /// s80 liq-tail-offload (`TORUS_S80_LIQ_PREVALUE` mask bit 0): the
+    /// valuations ([`Self::liq_view`]) of `cands()` in order, computed
+    /// read-only on the exec pool in `workers` contiguous chunks. `None`
+    /// (the loop values live, today's path): the bit off, a window under
+    /// `min` accounts, or a job that panicked (the live valuation then
+    /// meets the same panic on the exec thread, as today). Read-only: the
+    /// sums memo and the reader-fault channel are the only shared state a
+    /// valuation touches (a memo entry is the same value whoever builds it).
+    fn liq_prevalue_pass<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        marks: &Marks,
+        l1: bool,
+        cands: impl FnOnce() -> Vec<Address>,
+    ) -> Option<std::vec::IntoIter<Result<Option<AccountView>, CoreError>>> {
+        let cfg = super::liq_prevalue();
+        if cfg.mask & 1 == 0 {
+            return None;
+        }
+        let cands = cands();
+        if cands.len() < cfg.min.max(1) {
+            return None;
+        }
+        let chunk = cands.len().div_ceil(cfg.workers.max(1));
+        let jobs: Vec<_> = cands
+            .chunks(chunk)
+            .map(|c| move || c.iter().map(|t| Self::liq_view(ctx, marks, t, l1)).collect::<Vec<_>>())
+            .collect();
+        let mut out = Vec::with_capacity(cands.len());
+        for joined in crate::exec_pool::run_jobs(jobs) {
+            out.extend(joined.ok()?);
+        }
+        #[cfg(test)]
+        super::liq_prevalue_bump(|s| s.passes += 1);
+        Some(out.into_iter())
     }
 
     /// Item 6 E2: the walk's candidates (`liq::traders_after(&ctx.state,
