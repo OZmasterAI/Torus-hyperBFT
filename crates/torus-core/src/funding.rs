@@ -36,7 +36,7 @@ pub const FUNDING_ROW_PREFIX: &[u8; 3] = b"fnd";
 const ROW_VERSION: u8 = 1;
 
 /// Encoded size of a [`FundingRow`].
-pub const FUNDING_ROW_LEN: usize = 1 + 16 + 8 + 16 + 4 + 8 + 16 + 16 + 8;
+pub const FUNDING_ROW_LEN: usize = 1 + 16 + 8 + 16 + 4 + 8 + 16 + 16 + 8 + 8;
 
 /// `fnd ‖ market(8 BE)`.
 pub fn funding_key(market_id: MarketId) -> [u8; 11] {
@@ -110,6 +110,12 @@ pub struct FundingRow {
     pub last_rate: i128,
     /// Block timestamp of the last settlement (0 = none yet).
     pub last_settle_ts: u64,
+    /// Owner s138 (option B): where the current interval starts accruing.
+    /// The activation's block time in the interval that contains it (the
+    /// row's creation), `interval_start` after every settlement. The
+    /// interval pays `rate × (interval end − accrual_start) / interval`:
+    /// the first one pro-rated, every later one whole.
+    pub accrual_start: u64,
 }
 
 impl FundingRow {
@@ -124,11 +130,13 @@ impl FundingRow {
             last_oracle: FixedPoint::ZERO,
             last_rate: 0,
             last_settle_ts: 0,
+            accrual_start: now,
         }
     }
 
     /// Version 1: `1 ‖ cum_index ‖ interval_start ‖ premium_sum ‖ samples ‖
-    /// last_sample_ts ‖ last_oracle ‖ last_rate ‖ last_settle_ts`, all BE.
+    /// last_sample_ts ‖ last_oracle ‖ last_rate ‖ last_settle_ts ‖
+    /// accrual_start`, all BE.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(FUNDING_ROW_LEN);
         out.push(ROW_VERSION);
@@ -140,6 +148,7 @@ impl FundingRow {
         out.extend_from_slice(&self.last_oracle.raw().to_be_bytes());
         out.extend_from_slice(&self.last_rate.to_be_bytes());
         out.extend_from_slice(&self.last_settle_ts.to_be_bytes());
+        out.extend_from_slice(&self.accrual_start.to_be_bytes());
         out
     }
 
@@ -169,6 +178,7 @@ impl FundingRow {
         let last_oracle = FixedPoint::from_raw(i128_of(take(16)));
         let last_rate = i128_of(take(16));
         let last_settle_ts = u64_of(take(8));
+        let accrual_start = u64_of(take(8));
         Ok(Self {
             cum_index,
             interval_start,
@@ -178,16 +188,28 @@ impl FundingRow {
             last_oracle,
             last_rate,
             last_settle_ts,
+            accrual_start,
         })
     }
 
     /// The rate the current interval would pay now (0 without samples):
-    /// [`rate_e18`] of the average premium (truncated toward zero).
+    /// [`rate_e18`] of the average premium (truncated toward zero), times
+    /// the interval's accruing share (owner s138: the interval containing
+    /// the activation is pro-rated, `(end − accrual_start) / interval`,
+    /// truncated toward zero; 1 for every later interval).
     pub fn predicted_rate(&self, params: &FundingParams) -> i128 {
         if self.samples == 0 {
             return 0;
         }
-        rate_e18(self.premium_sum / i128::from(self.samples), params)
+        let rate = rate_e18(self.premium_sum / i128::from(self.samples), params);
+        let interval = params.interval_secs.max(1);
+        let end = self.interval_start.saturating_add(interval);
+        let accrued = end.saturating_sub(self.accrual_start.max(self.interval_start)).min(interval);
+        if accrued == interval {
+            return rate;
+        }
+        // |rate| <= 1e18 and accrued < interval <= 86400: no overflow.
+        rate * i128::from(accrued) / i128::from(interval)
     }
 
     /// When the current interval settles (the first block at or after it).
@@ -342,6 +364,7 @@ pub fn step(
         r.last_rate = rate;
         r.last_settle_ts = now;
         r.interval_start = align(now, params.interval_secs);
+        r.accrual_start = r.interval_start;
         r.premium_sum = 0;
         r.samples = 0;
         settled = Some(rate);
@@ -433,6 +456,7 @@ mod tests {
             last_oracle: fp(61_234),
             last_rate: -E18 / 10_000,
             last_settle_ts: 7_201,
+            accrual_start: 7_250,
         };
         let bytes = row.encode();
         assert_eq!(bytes.len(), FUNDING_ROW_LEN);

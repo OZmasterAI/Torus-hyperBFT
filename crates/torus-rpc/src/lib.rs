@@ -6263,6 +6263,7 @@ mod tests {
         row.samples = 2;
         row.last_rate = -INDEX_SCALE / 80_000; // -0.0000125
         row.last_settle_ts = 7_200;
+        row.accrual_start = 7_200; // settled at 7200: a whole interval (not the activation's)
         write_row(&state, 1, &row).unwrap();
         let (handle, addr) = start_server(state, mempool, executor).await;
         use jsonrpsee::core::client::ClientT;

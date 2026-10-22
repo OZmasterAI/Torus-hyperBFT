@@ -36,6 +36,13 @@ Per interval: `rate = F8 × interval_secs / 28800`, capped at `±max_rate_bps` (
 hourly cap). No samples in the interval (oracle stale the whole time) gives rate 0. An interval spanning a chain
 halt is paid once.
 
+**First interval after activation (owner s138, option B: pro-rated).** The interval that contains the market's
+activation (its row's creation at block time `t_H`) pays `rate × (interval_end − t_H) / interval_secs`
+(truncated toward zero), so a market activated late in an interval does not pay a whole interval for a fraction of
+it. Every later interval is whole. The row keeps `accrual_start` (`t_H` until the first settlement, then the
+interval start); `predictedRate` is pro-rated the same way. A first settlement delayed by a halt still pays the
+activation's share of one interval.
+
 **Cumulative index per market** (`i128`, quote per 1 unit of base, scaled 1e18 for precision on low-priced assets):
 `cum_index += rate × price`. `price` is the mark at the settlement block, or the last sampled oracle price if the
 mark is stale. One rounding per settlement, truncated toward zero.
@@ -82,7 +89,8 @@ so it settles the funding in cash before the position moves.
 ## 2. State
 - `CF_NATIVE_ORACLE` row `"fnd" ‖ market(8 BE)` (hashed, in the native root): version byte, `cum_index` i128,
   `interval_start` u64, `premium_sum` i128 (e18), `samples` u32, `last_sample_ts` u64, `last_oracle` i128 raw,
-  `last_rate` i128 (e18), `last_settle_ts` u64. The row is created the first time a listed market is stepped with
+  `last_rate` i128 (e18), `last_settle_ts` u64, `accrual_start` u64 (first-interval pro-rating).
+  The row is created the first time a listed market is stepped with
   the bit on, with `cum_index = 0`. An index of 0 is also the implicit entry of every position opened before the
   row existed.
 - Position row **v3** = v2 + `entry_index` i128 + `funding_paid` FixedPoint (143 bytes). It is written only when
@@ -126,17 +134,22 @@ off, proposal outcomes are byte-identical too.
 - `torus_getPosition` gains `fundingSinceOpen` (`funding_paid` + pending; positive = paid). The field is omitted
   when the position has no funding state.
 
-## 6. Owner decisions needed
-1. **Cash on touch vs. folding into cost basis.** Recommended: cash (HL-like; entry price stays clean). Funding
-   received becomes withdrawable at the next touch of the position, not hourly.
-2. **Per-market cap.** `ListMarket` / `UpdateMarketParams.max_funding_rate_bps` still has no slot. Storing it means
-   a proposal payload format change. Recommended for testnet: the chain-wide `funding_max_rate_bps` key; add a
-   per-market slot later behind its own P0.0 bit.
-3. **Defaults.** HL's interest, clamp and cap, a 5 s sample and an impact notional of 10000 (HL uses 20000 for
-   BTC/ETH and 6000 otherwise).
-4. **First interval after activation** is partial (fewer samples, full-interval rate). Alternative: pro-rate it.
-5. **Feature id 3.** Id 2 is left for `TradingFees` (`feat/trading-fees`), if it takes a bit. Renumber at merge
-   if not.
+## 6. Owner decisions (decided s138)
+1. **Cash at the next fill (option A), decided.** Funding settles in cash when a fill touches the position
+   (HL-like cash, entry price stays clean); funding received becomes withdrawable at that touch, not hourly.
+   **Upgrade path:** a more Hyperliquid-like hourly settlement of every position is a possible later upgrade. It
+   needs a design that avoids an O(positions) spike at the settlement block (for example, spreading the walk
+   across blocks) and goes behind its own P0.0 bit.
+2. **Chain-wide cap key (option A), decided.** The cap is the chain-wide `funding_max_rate_bps` key.
+   `ListMarket` / `UpdateMarketParams.max_funding_rate_bps` still has no slot; a per-market slot (a proposal
+   payload format change) comes later behind its own P0.0 bit.
+3. **Defaults stay as built, decided.** HL's interest, clamp and cap, a 5 s sample, and an impact notional of 10000
+   for every market (HL uses 20000 for BTC/ETH and 6000 otherwise).
+4. **First interval after activation: pro-rated (option B), decided.** `rate × (interval_end − t_H) /
+   interval_secs` for the interval containing the activation (section 1).
+5. **Memory, accepted.** +32 MB per 1M resident positions (`Position` 112 -> 144 bytes, section 2).
+6. **Feature id 3** (open). Id 2 is left for `TradingFees` (`feat/trading-fees`), if it takes a bit. Renumber at
+   merge if not.
 
 ## 7. Tests (RED first)
 - Unit (`torus-core/src/funding.rs`): rate formula, clamp and cap, premium sides, impact walk and budget, index
