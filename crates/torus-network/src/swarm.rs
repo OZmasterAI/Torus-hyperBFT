@@ -1877,10 +1877,18 @@ fn handle_event(
         )) => {
             warn!(%peer, ?error, "direct inbound failure");
         }
+        SwarmEvent::Behaviour(TorusBehaviourEvent::Identify(identify::Event::Sent {
+            connection_id,
+            ..
+        })) => {
+            // A refused connection is closed only once our info went out on
+            // it, so the peer sees the mismatch too (genesis_id::GenesisGate).
+            swarm.behaviour_mut().genesis_gate.identify_sent(connection_id);
+        }
         SwarmEvent::Behaviour(TorusBehaviourEvent::Identify(identify::Event::Received {
             peer_id,
+            connection_id,
             info,
-            ..
         })) => {
             // Owner s138 (K question, option B): a peer of another genesis is
             // refused before it enters the address book or the peer map. Its
@@ -1890,7 +1898,13 @@ fn handle_event(
                 // Codex P2: the refused peer cools down (5 s doubling to 60 s)
                 // and the gate denies every dial path meanwhile, so consensus
                 // sends to a still-mapped validator do not redial it in a loop.
-                let (cooldown, strikes) = swarm.behaviour_mut().genesis_gate.refuse(peer_id);
+                // The gate closes the connection once our identify info went
+                // out on it (not here: the peer may not have read it yet and
+                // would then never see the mismatch itself).
+                let (cooldown, strikes) = swarm
+                    .behaviour_mut()
+                    .genesis_gate
+                    .refuse(peer_id, connection_id);
                 if crate::genesis_id::warn_on_strike(strikes) {
                     warn!(%peer_id, ?cooldown, strikes, "peer {peer_id} {mismatch}: refusing");
                 } else {
@@ -1900,7 +1914,6 @@ fn handle_event(
                     m.p2p_genesis_mismatch_refusals.inc();
                 }
                 swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
-                let _ = swarm.disconnect_peer_id(peer_id);
                 return;
             }
             // Validator-set peers exempt (s350 FIX B): identify keeps the peer
