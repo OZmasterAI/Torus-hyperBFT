@@ -1080,6 +1080,20 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
      first: executor unlisted-market reject `d78ea41b`; delist / UpdateMarketParams `6eba584a`, `23b0190e`;
      aliased-row refusals `73e8068d`, `d46234af`; L2.1 / b0 / b1 paths with flags off; RH4 DA GC `bbc38711` ff.
    * Report per step: the exec-path rule rows (section 91 rule) with CIs. Doc target: the next results-doc section.
+9m. **[HOLD, owner s136: queued, NOT ready; do not start until the owner says go] Item 6 Phase 5 revisit check: exec
+   profile on the batch-10 head.** Q8 recipe (perf record on the exec thread + the exec timers), standard (hsdb-300m)
+   and deep shapes, main after batch 10 (Classic, hash on + attestation, L6.1, L2.1 on, 15 s checkpoints), ~1-1.5 h.
+   Question: are `flush_all` (cache flush) + overlay writes still >= ~15% of exec-thread CPU (timers hint ~18%,
+   sections 113, 117; the last profile 8u, section 105, predates L3.1 / L6.1)? If yes, item 6 Phase 5 is revisited
+   (rebase step 2, move the drain to the flush worker, re-A/B under the exec-path rule); if no, it stays parked.
+   Report the top exec-thread functions with shares, per shape. Doc target: the next results-doc section.
+9n. **[HOLD, owner s136: queued, NOT ready; do not start until the owner says go] 8f re-run: deep-book capacity on
+   main after batch 10.** Section 93's stage b cell (3 nodes, 1M accounts, 1M pre-loaded resting orders, 600 s
+   standard load) on main after batch 10, plus the same binary's standard cell. Section 93 passed RAM (8.1-9.2 GB per
+   node) and restarts, but found matched/s -14.3%, native blocks/s 13.3 -> 3.0, p50 15 -> 240 ms, `save_books`
+   4.0 -> 76.7 ms per block. L3.1 / L3.3 / L6.1 target that save (sections 117, 120). Question: is the deep-book
+   slowdown gone on today's main? Report RSS (peak / mean), restarts (SIGTERM / SIGKILL), matched/s, blocks/s, p50 /
+   p99, `save_books` and checkpoint settle wait per block, vs the standard cell. Doc target: next results-doc section.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
