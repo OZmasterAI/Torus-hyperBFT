@@ -19684,23 +19684,42 @@ Drift:
   * section 123's `j9-logscan.sh` -> `9j2-logscan.txt`;
   * `9j2-streamed.txt`.
 
-## 125. Step 9k, one-validator-down baseline: one binary pre-TC main `896240d4` (node `4719fce1`), stakes 2 / 2 / 1, U = all up vs K = `KILL_NO_RESTART=val2` (the stake-1 node, SIGKILL at bench+120 s, never restarted), hash + attestation + L6.1 + L2.1 + fail-stop on, Classic, 15 s checkpoints, standard shape (deep pending), w1 (U) + U K K U K U U K + reruns r1-K / r3-K / r4-K, 600 s cells, n = 4 (U) and 7 (K) (campaign ozarchy-9k2, archy, 2026-10-22)
+## 125. Step 9k, one-validator-down baseline: one binary pre-TC main `896240d4` (node `4719fce1`), stakes 2 / 2 / 1, U = all up vs K = `KILL_NO_RESTART=val2` (the stake-1 node, SIGKILL at bench+120 s, never restarted), hash + attestation + L6.1 + L2.1 + fail-stop on, Classic, 15 s checkpoints, standard and deep (8i P1M) shapes, per shape w1 (U) + U K K U K U U K, 600 s cells; std + reruns r1-K / r3-K / r4-K, n = 4 (U) and 7 (K); deep + r4-U-rerun (r4-U halted), n = 4 and 4 (campaigns ozarchy-9k2 and ozarchy-9k2-deep2, archy, 2026-10-22)
 
-**With one of three validators down (stake 1 of 5, never restarted), standard-shape matched/s drops 47.5% over the
-whole cell and 58.0% after the kill. Blocks/s drops 91% after the kill.** K / U matched/s: whole cell 145,507 vs
-277,283 (-131,777 ± 1,784, 78 sd); post-kill 115,870 vs 275,743 (-58.0%). The post-kill block rate is 1.40 vs 15.86.
+**With one of three validators down (stake 1 of 5, never restarted), matched/s drops 47.5% (std) / 46.0% (deep)
+over the whole cell and 58.0% / 56.0% after the kill. Post-kill blocks/s drops 91% / 90%.** Values are K / U
+matched/s.
+* Std: whole cell 145,507 vs 277,283 (-131,777 ± 1,784, 78 sd); post-kill 115,870 vs 275,743.
+* Deep: whole cell 147,371 vs 273,049 (-125,678 ± 748); post-kill 119,303 vs 271,366.
+* Post-kill blocks/s: 1.40 vs 15.86 (std), 1.47 vs 15.32 (deep).
+* Deep / std: 0.985 all up (resolved, -10 sd); 1.013 with one down (not resolved).
+
 The whole-cell figure is the summary headline (`matched_s_avg` over the 600 s load, 120 s of it before the kill).
-Cause: every view that the dead val2 leads runs to its timeout (val1 42.3 timeout views per minute = one in three views).
-**Finding:** in 5 of 7 K cells, 5-11 s after the kill, a survivor could not fetch the body of a block that the OTHER
-survivor had just proposed. It gave up after the 4 s budget and fell back to block sync. The chain then froze for
-17-50 s (2-11 s in the cells without it). These are the "dissemination failures" that keep 5 K cells REJECT under
-the kill-cell health fix. The cause is open: 18c investigates (`fix/body-fetch-dead-peer`).
+Cause: every view that the dead val2 leads runs to its timeout (val1: 42.3 / 43.2 timeout views per minute = one in
+three views).
+
+**Finding 1 (std only):** in 5 of 7 std K cells, 5-11 s after the kill, a survivor could not fetch the body of a
+block that the OTHER survivor had just proposed. It gave up after the 4 s budget and fell back to block sync, and the
+chain froze for 17-50 s (2-11 s in the cells without it). These are the "dissemination failures" that keep 5 std K
+cells REJECT under the kill-cell health fix. Deep K: 0 of 4 cells, longest freeze 1-11 s (125.7). The cause is open:
+18c investigates (`fix/body-fetch-dead-peer`).
+
+**Finding 2 (deep r4-U, all up): chain halt at the epoch boundary h9500** (125.8).
+* Execution had not yet applied the h9400 boundary, so two leaders in a row (val1 view 9507, val0 view 9508)
+  proposed the app's datum-less "refused" block. The second refusal came 26 ms before val0's h9400 checkpoint landed.
+* The refused block got a phase certificate (val2's `locked_pc`). *Inference:* both refusals hash to the same block,
+  and each leader votes for its own block without the data check.
+* From then on, each survivor refuses every proposal of the other ("fails the data check"), and val2 cannot insert
+  the locked block (blacklisting peers). No node committed again.
+* Excluded (r4-U-rerun replaces it). Cause to 18c.
 
 Question (bench queue 9k, owner GO s138): the "before" numbers for 9o (TC phase D) and 9p (dead-leader phase 4).
 Per window (pre-kill / post-kill): blocks/s, matched/s, timeout views per minute, p50 / p99 commit latency, and the
 end-of-load cancel-all tail.
 
 ### 125.1 Setup
+
+Sections 125.1-125.4 are the standard shape (std). The deep shape is in 125.7, the deep r4-U halt in 125.8.
 
 * Binary: pre-TC main `896240d4`, node md5 `4719fce155ca0586037ce3da4f6ece0e`, bench md5
   `db1fd9d30c66edfe7af618fb24f23903`. Node md5 ok in all 12 std cells (`summary.json` binaries, `std/cells.tsv`
@@ -19821,6 +19840,17 @@ End-of-load cancel-all tail (`sampler.csv` `torus_exec_cancel_all_total`, per su
   kill. Post-kill blocks/s is -91% and commit p50 +44% (high confidence).** All steps are 16-78 sd with no drift.
   They match the s77 9k smoke (memory): 1.5 blocks/s post-kill, view gaps 1.21-1.32 s, ~4,475 cancel-alls drained
   after the load.
+* **Deep shape: the same picture (high confidence; n = 4 / 4).** K - U is -46.0% matched/s over the whole cell
+  (-290 sd), -56.0% after the kill (-175 sd), -90.4% blocks/s and +33% p50 after the kill. Deep / std: all up 0.985
+  (resolved); one down 1.013 whole and 1.030 post-kill (not resolved; the std post-kill mean carries the fallback
+  freezes). The K / U ratios are 0.540 / 0.440 (deep) vs 0.525 / 0.420 (std). For 9o / 9p, the deep "before" is
+  matched/s 147.4k whole and 119.3k post-kill, 1.47 blocks/s, val1 43.2 timeout views / min, and p50 3.13 s post-kill.
+* **Deep r4-U halt (facts high confidence; how the refused block was certified is an inference; cause 18c).** An
+  all-up chain halted for good at the h9500 epoch boundary. Two consecutive leaders proposed the datum-less refused
+  block, a certificate formed on it, and every later proposal extends a parent no replica can decode or insert
+  (125.8). This is a liveness bug on the U arm, independent of the kill. The TC set and dead-leader skip do not
+  obviously target it (inference). The 9o / 9p "after" arms may meet it at any boundary where execution lags the
+  chain by an epoch.
 * **Mechanism, sized (estimate).** 126.4 views per minute = 0.475 s per view. Assume the two live-leader views of each
   round take U's view time (61 ms, r1-U `view_duration_ms`). Then each val2-led view costs ~1.30 s, so ~55 of every
   60 s go to waiting out the dead leader's views. That alone accounts for 1.40 vs 15.86 blocks/s. The default view
@@ -19911,26 +19941,283 @@ End-of-load cancel-all tail (`sampler.csv` `torus_exec_cancel_all_total`, per su
   (`fix/body-fetch-dead-peer`). For a re-check, `TORUS_BODY_FETCH_TRACE=1` would log the fetch targets that are
   derived from code here.
 * The cancel-all tail is a 1 Hz counter. The tail duration resolves to ±1 s.
+* Deep: the watch-node confound is the same (deep K watches val1, U val2; 125.7). The deep / std comparison is across
+  sessions (std 12:10-14:25 UTC, deep 15:30-19:51 UTC), not interleaved.
+* Deep K p99 sits under the 40.96 s order-age bucket edge in every cell. A sharper p99 needs finer buckets above
+  20 s.
+* The r4-U halt is one event in 22 cells (10 deep, 12 std). Its rate is unknown. Refused boundary proposals are
+  routine (20 of 22 cells log the refusal warning), so the rare part is the certificate (125.8 step 5). To check
+  that step, 18c can (a) test whether two leaders refusing the same boundary with the same justify yield one block
+  hash and a quorum, and (b) re-run with `RUST_LOG` debug for `hotstuff_rs::hotstuff` on a deep U cell. The
+  vote/PC lines are not logged at INFO.
+* Next: 9o / 9p "before" = these cells. Run their U arms with the K watch node (val1), and report the r4-U-style halt
+  per cell (heights flat for 30 s while the views advance).
 
-### 125.7 Deep shape: pending (campaign ozarchy-9k2-deep2 running)
+### 125.7 Deep shape (8i P1M), campaign ozarchy-9k2-deep2
 
-Not analysed. The 1M-genesis + `PRELOAD=1000000` cells, U K K U K U U K, will be added here when the campaign
-finishes and its cells are re-checked.
+**Deep matches std. One validator down costs 46.0% of matched/s over the whole cell and 56.0% after the kill.
+Post-kill blocks/s drops 90%. No K cell had a survivor-to-survivor body-fetch fallback (0 of 4; std 5 of 7).**
 
-### 125.8 Data
+* Setup: as 125.1 except the shape. The genesis has 1,000,000 accounts (`summary.json` genesis bulk_count 1000000,
+  md5 `bb2fb744`), and `PRELOAD=1000000` resting orders are placed before the load (preload rc 0, 23-25 s). Harness
+  worktree `/home/oz/projects/wt/9k2-deep-896240d4` with health.py `c8fff67d` (the kill-cell fix of 125.2) installed
+  before the campaign. Drivers: `ozarchy-9k2-tools/drivers/9k2-deep-v2-campaign.sh`, tail `9k2-deep-v2-tail.sh`.
+* Order: w1 (U, 300 s, warm-up gate ACCEPT), r1-U, r1-K, r2-K, r2-U, r3-K, r3-U, r4-U. The campaign stopped at r4-U
+  (`deep2/campaign.done` `exit=1 2026-10-22T19:48:36`). Owner decision: run a tail of r4-U-rerun and r4-K
+  (`deep2/tail.done` `exit=0 2026-10-22T21:51:20`).
+* Validity:
+  * Node md5 `4719fce1` in all 10 cells.
+  * 9 cells are rc 0, ACCEPT, AGREE, liveness PASS, state attestation ok: 63 checkpoints in U, 39-42 in K. They
+    have 0 `panicked`, `STATE HASH MISMATCH`, `diverged`, ` ERROR ` or `FATAL` lines.
+  * The one CELL-FLAG is r4-U: rc 2, DISAGREE, "drain not established" + "liveness failed" (a chain halt, 125.8).
+    It is excluded; r4-U-rerun takes its place.
+  * All 4 K cells are ACCEPT under the kill-cell fix. The only post-kill dissemination failures are
+    `native-da OUTBOUND FAILURE` lines toward val2 at kill+10.0 s (exempt): r3-K 9 (val0 8, val1 1), r4-K 15 (val1).
+    `log-summary.json` peer ids name val2.
+* n = 4 per arm: U = r1-U, r2-U, r3-U, r4-U-rerun; K = r1-K..r4-K. Statistics as 125.1 (6 df for the step CI).
+* In-flight watch node: the same split as std (125.6). `run.log`: `--in-flight-watch-rpc` is `:8646` (val1) in every
+  deep K cell and `:8647` (val2) in every deep U cell.
 
-* Cells: `~/bench-results-matched/ozarchy-9k2-std-{w1,r1-U,r1-K,r2-K,r2-U,r3-K,r3-U,r4-U,r4-K,r1-K-rerun,r3-K-rerun,r4-K-rerun}`
+Per cell (run order; val0; survivors agree within 0.25%):
+
+| cell | arm | matched/s whole | pre-kill | post-kill | blk/s pre | blk/s post | timeouts / min val1 post | commit p50 / p99 ms post (mean of survivors) | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| w1 (300 s, unscored) | U | 277,813 | 275,469 | 279,350 | 14.89 | 15.38 | 0.98 | 2,306 / 9,654 | ACCEPT |
+| r1 | U | 273,810 | 279,243 | 272,460 | 15.76 | 15.61 | 0.62 | 2,265 / 9,667 | ACCEPT |
+| r1 | K | 147,536 | 263,389 | 118,693 | 17.25 | 1.432 | 43.20 | 3,150 / 40,350 | ACCEPT |
+| r2 | K | 147,198 | 256,168 | 120,069 | 19.28 | 1.533 | 43.44 | 3,109 / 40,334 | ACCEPT |
+| r2 | U | 273,030 | 283,442 | 270,443 | 14.99 | 15.32 | 1.24 | 2,392 / 9,763 | ACCEPT |
+| r3 | K | 147,698 | 265,732 | 118,373 | 16.94 | 1.445 | 43.11 | 3,143 / 40,354 | ACCEPT |
+| r3 | U | 272,717 | 279,134 | 271,120 | 14.24 | 15.12 | 0.87 | 2,437 / 9,726 | ACCEPT |
+| r4 (excluded) | U | 248,154 | 274,281 | 241,650 | 15.21 | 13.78 | 1.37 | 2,202 / 9,662 | REJECT (halt, 125.8) |
+| r4-rerun | U | 272,639 | 277,467 | 271,442 | 15.24 | 15.23 | 1.12 | 2,310 / 9,685 | ACCEPT |
+| r4 | K | 147,053 | 255,634 | 120,076 | 17.78 | 1.484 | 43.23 | 3,131 / 40,340 | ACCEPT |
+
+Drift: U whole-cell in run order is 273.8k / 273.0k / 272.7k / 272.6k (r4-U-rerun ran 2 h later). That is monotonic
+but only -0.4%, inside 2 sd. K: 147.5k / 147.2k / 147.7k / 147.1k, no trend. The script reproduces r2-K's and r4-K's
+`summary.json` per-window values exactly.
+
+Arm means and steps (U n = 4, K n = 4; ± = 95% CI):
+
+| metric | window | U | K | K - U [CI] | % | (sd) |
+|---|---|---|---|---|---|---|
+| matched/s | whole 600 s | 273,049 ± 851 | 147,371 ± 473 | **-125,678 ± 748** | -46.0% | -290 |
+| matched/s | pre-kill | 279,821 ± 4,052 | 260,231 ± 8,106 | -19,590 ± 6,969 | -7.0% | -4.9 (confounded) |
+| matched/s | post-kill | 271,366 ± 1,336 | 119,303 ± 1,429 | **-152,064 ± 1,505** | -56.0% | -175 |
+| blocks/s | whole | 15.27 ± 0.45 | 4.728 ± 0.388 | -10.54 ± 0.46 | -69.0% | -40 |
+| blocks/s | pre-kill | 15.06 ± 1.00 | 17.81 ± 1.65 | +2.75 ± 1.49 | +18.3% | +3.2 (confounded) |
+| blocks/s | post-kill | 15.32 ± 0.33 | 1.474 ± 0.073 | **-13.85 ± 0.26** | -90.4% | -91 |
+| timeout views / min, val0 | pre / post | 0.50 / 0.84 | 0.62 / 0.19 | not resolved / -0.65 ± 0.30 | | +0.3 / -3.8 |
+| timeout views / min, val1 | pre / post | 0.75 / 0.96 | 0.75 / **43.24 ± 0.23** | post +42.28 ± 0.38 | | +193 |
+| views / min (val0) | pre / post | 912 / 921 | 1,076 / 130.2 | post -791 ± 18 | -85.9% | -75 |
+| commit p50 ms (mean of survivors) | pre-kill | 2,303 ± 114 | 1,290 ± 817 | -1,013 ± 635 | -44% | -2.8 (confounded) |
+| commit p50 ms | post-kill | 2,351 ± 124 | 3,133 ± 29 | **+782 ± 98** | +33% | +14 |
+| commit p99 ms | pre-kill | 9,629 ± 110 | 8,772 ± 766 | -857 ± 595 | -8.9% | -2.5 (confounded) |
+| commit p99 ms | post-kill | 9,710 ± 69 | 40,345 ± 14 | **+30,634 ± 54** | +316% | (bucket, below) |
+
+* Post-kill p50 differs by survivor, as in std: val0 4,063 ± 50 ms, val1 2,203 ± 10 ms (U 2,378 / 2,324).
+* Deep K post-kill p99 is 40,334-40,354 ms in every cell. `buckets.csv` order-age buckets double (20.48, 40.96,
+  81.92 s), so this value only says that fewer than 1% of orders waited longer than 40.96 s. The tight CI comes
+  from the interpolation, not from a measured spread. The std K p99 (40.3-73.3 s) went into the next bucket in the
+  freeze cells.
+* Mechanism, sized as in 125.5 (estimate): 130.2 views per minute = 0.461 s per view. With two live-leader views
+  per round at U's view time (65 ms, 921 views per minute), each val2-led view costs ~1.25 s. That is ~54 of every
+  60 s. Matched per block: 80.9k post-kill vs 17.7k in U.
+* The pre-kill window carries the same confound as std (watch node val1 vs val2): -7.0% matched/s, +18.3% blocks/s,
+  -44% p50. It is less resolved here (2.8-4.9 sd), because K pre-kill is noisier (blocks/s 16.9-19.3).
+
+End-of-load cancel-all tail (`sampler.csv` `torus_exec_cancel_all_total`, per survivor, t_bench1 -> t_drain):
+
+| arm | cancel-alls executed during load (mean per node) | executed after the load ended | tail duration | native mempool at t_bench1 |
+|---|---|---|---|---|
+| U (n = 4) | 341,526 | 0 in r2 / r3; 3,243 in r1-U; 1,259-1,359 in r4-U-rerun | 0 s; 1-2 s in r1-U / r4-U-rerun | 0 |
+| K (n = 4) | 157,216 | **4,516 ± 115** (4,215-4,850 per node) | 7-9 s | 4,215-5,178 |
+
+**Deep vs std** (deep / std ratio of arm means; step = deep - std ± Welch 95% CI; (sd) = step / pooled sd):
+
+| metric | window | U std | U deep | deep / std U | K std | K deep | deep / std K |
+|---|---|---|---|---|---|---|---|
+| matched/s | whole | 277,283 | 273,049 | **0.985** (-4,234 ± 704, -10 sd) | 145,507 | 147,371 | 1.013 (+1,865 ± 1,800, +1.1 sd) |
+| matched/s | pre-kill | 283,485 | 279,821 | 0.987 (-1.4 sd) | 264,473 | 260,231 | 0.984 (-1.2 sd) |
+| matched/s | post-kill | 275,743 | 271,366 | **0.984** (-4,376 ± 1,159, -6.5 sd) | 115,870 | 119,303 | 1.030 (+3,433 ± 2,606, +1.5 sd) |
+| blocks/s | post-kill | 15.86 | 15.32 | 0.966 (-1.9 sd) | 1.398 | 1.474 | 1.054 (+2.1 sd) |
+| timeout views / min, val1 | post-kill | 0.43 | 0.96 | (+0.5 / min) | 42.32 | 43.24 | 1.022 (+1.5 sd) |
+| commit p50 ms | post-kill | 2,201 | 2,351 | 1.068 (+1.7 sd) | 3,166 | 3,133 | 0.990 (-1.5 sd) |
+| commit p99 ms | post-kill | 9,640 | 9,710 | 1.007 (+1.7 sd) | 50,196 | 40,345 | 0.804 (-1.0 sd) |
+| K / U matched/s | whole / post-kill | | | | 0.525 / 0.420 | 0.540 / 0.440 | |
+
+* All up, deep runs 1.5-1.6% below std (resolved). The two shapes ran in different hours (std 12:10-14:25 UTC,
+  deep 15:30-17:48 and 19:19-19:51 UTC), so this is not a same-session A/B.
+* With one validator down, deep and std agree within the noise. Deep K post-kill (119.3k) sits where the two std K
+  cells without a fallback freeze sit (r2-K 117.6k, r4-K-rerun 120.2k). The +3.0% vs the 7-cell std mean is the
+  freeze cost that deep did not have.
+
+**Body-fetch fallbacks: none in deep K.**
+* `body fetch exhausted`, `falling back to sync`: 0 lines in all 12 deep K node logs (and in `log-summary.json`).
+  The only failure lines are the val2-bound OUTBOUND FAILUREs above.
+* Longest post-kill height freeze, val0 / val1 (125.5 convention; the script reproduces the std values):
+  r1-K 8 / 3 s, r2-K 1 / 2, r3-K 7 / 11, r4-K 3 / 5. Std: 17-50 s with a fallback, 2-11 s without.
+* Blocks committed in kill..+30 s: 32-34 (r1-K), 80 (r2-K), 38-39 (r3-K), 56-59 (r4-K). Std: 2-23, and 38 in
+  r4-K-rerun.
+* 0 of 4 deep vs 5 of 7 std: one-sided Fisher p = 0.045. That is weak evidence that the shape matters.
+  * The fallback is not std-only. The superseded deep warm-up `ozarchy-9k2-deep-w1` (all up, no kill, not scored)
+    was REJECT with `sync_fallback` 1 on val0 and 1 on val1 (`summary.json` dissemination).
+  * In std, all 5 fallback cells had a 1.0-2.3 s silence on both survivors at kill+0..2.4 s (125.5). Deep r1-K had
+    such a silence too (val0 1.8 s at +2.9 s, val1 1.5 s at +2.7 s, `deep_event_table.txt` GAPS) and did not fall
+    back. The silence alone does not predict the fallback.
+
+### 125.8 Finding: deep r4-U chain halt at an epoch boundary (all up; cause to 18c)
+
+**r4-U (U, no node killed) halted at 17:29:08 UTC and never committed again. Heights stayed 9498 / 9498 / 9497
+until the cell ended. It started at the epoch boundary h9500. Execution had not yet applied the h9400 boundary, so
+two leaders in a row proposed the app's datum-less "refused" block there. Facts are from the logs (file:line
+below). The step marked inference is how the datum-less block got a certificate.** The root cause is 18c's
+(already posted). Raw lines: `ozarchy-9k2-tools/analyst/deep-halt-evidence.md`. Line numbers are decompressed
+`val<i>.log.gz` lines; times are UTC.
+
+1. **Lead-in: a burst of near-empty blocks.** In `sampler.csv` (val0) the native mempool fell from 4,759 to 116 at
+   17:29:04 while the exec queue rose to 42-66. The height went 9386 -> 9399 -> 9460 -> 9498 between 17:29:04 and
+   17:29:08 (61 blocks in one second), crossing the h9400 boundary about 1 s before h9500. The same pattern occurred
+   at 17:28:51-55 (9171 -> 9300).
+2. **17:29:06.79, last commits.** val2 led view 9506 and proposed `CZHMqaN` at h9499 (val2:2129199; val0:2146429
+   `round-skip ... on leader header CZHMqaN`; val0:2146444 `TorusBlock deserialized height=9499 ... native_count=0`).
+   * val0 and val1 executed through h9498 (`block done height=9498`, val0:2146615 at 17:29:07.790, val1:2141253).
+   * val2 executed through h9497 (val2:2129372).
+   * No node committed again. (`on_commit_block fired height=` in the log is one below the app height:
+     9497 / 9497 / 9496, val0:2146468, val1:2141099, val2:2129197.)
+3. **View 9507 (val1), the first block that fails the data check.**
+   * val1 built h9500 (`produce_block ... parent_height=9499`, val1:2141101). Its app logged `epoch boundary:
+     execution has not applied the previous boundary yet ... refusing this boundary block for now height=9500
+     applied=9300 needed=9400` (val1:2141102).
+   * A refused proposal is datum-less by design: `refused_proposal`, `crates/torus-consensus/src/app.rs:57-67`,
+     returned by `build_proposal_on` at :10462-10467 (`896240d4`). The block is `JYumZbv` (val1:2141139
+     `header re-send: view=9507 block=JYumZbv`).
+   * val0 and val2 refuse to vote: `not voting: body of JYumZbv fails the data check` from 17:29:07.050
+     (val0:2146491 7x, val2:2129243 9x).
+4. **View 9508 (val0), same refusal, 26 ms too early.**
+   * val0 logged the same `refusing this boundary block ... applied=9300 needed=9400` at 17:29:07.997
+     (val0:2146623-2146624).
+   * Its checkpoint at h9400 landed at 17:29:08.023 (val0:2146626 `checkpoint db write height=9400 ...
+     write_ms=926.8`). val1's landed at 08.176 (val1:2141257), val2's at 08.002 (val2:2129382).
+   * `applied` is read from the state DB (`native_applied_height`, app.rs:8783-8789). It still said 9300 at
+     17:29:07.997, after val0's execution had reached h9498 (val0:2146615, 17:29:07.790) and 26 ms before its h9400
+     checkpoint finished. *Inference:* the marker follows the checkpoint, not execution, and it reached the needed
+     9400 just after both leaders had refused.
+5. **The datum-less block got a certificate.** val2 later logs `synced block [JYumZbv] justify (block=[CZHMqaN],
+   view=9506) conflicts with local locked_pc (block=[JYumZbv], view=9508)` (val2:2129437, 73x). So a phase
+   certificate for `JYumZbv` was formed in view 9508. *Inference:* hotstuff_rs hashes a block as
+   `hash(height, justify, data_hash)` (`crates/hotstuff_rs/src/types/block.rs:73-82`; no view, no proposer). So
+   val0's view-9508 refusal on the same parent with the same justify is the same block `JYumZbv`. The leader votes
+   on its own block without the data check: `vote_if_body_held` treats a hash in `pending_bodies` as held
+   (`hotstuff/implementation.rs:2665`; inline self-vote from `finish_leader_proposal` :937). val1 holds the same
+   hash as its own view-9507 proposal. val0 2 + val1 2 = 4 of 5 stake, a quorum. The doc comment on
+   `refused_proposal` assumes that "every honest `validate_block` rejects" such a block; the leader's own vote never
+   reaches `validate_block`.
+6. **From view 9510 on, every proposal fails the data check at the other survivor.**
+   * Every later `produce_block` logs `parent_height=9498 local_height=9498` (val1:2141258 at 17:29:10.410,
+     val0:2146688, ...). `produce_block` falls back to `last_header` when the parent block has no datum (app.rs:
+     10668-10678). *Inference:* they extend `JYumZbv`.
+   * The other survivor refuses each one with no `REJECTED` line before the `not voting` line. *Inference:* this fits
+     `check_parent_link` seeing a parent in the tree whose datum cannot be decoded, which it treats as Invalid
+     (app.rs:3096-3110, :3314).
+   * Per block (deep_halt.txt):
+     * val0 refuses val1's `Qt5sNJn` (v9510) 19x, `xp0E6CA` (v9513) 153x, `8SGjOuv` (v9516) 1,227x
+       (17:31:41.6-17:34:15.0, val0:2147360) and `XsF7iOW` (v9519) 1,240x.
+     * val1 refuses val0's `05FUE65` (v9511) 37x, `/YLl7T3` (v9514) 307x and `gs31jIc` (v9517) 2,455x
+       (17:34:15.2-17:39:22.2, val1:2143060). val0 re-sent `gs31jIc` 1,227x (val0:2151070).
+     * val2's views (9509, 9512, 9515, 9518) carry no proposal.
+   * View entry times double, matching the pacemaker backoff: 9510 17:29:10.5, 9511 :12.9, 9513 :27.2, 9514
+     :46.4, 9516 17:31:41.6, 9517 17:34:15.2, 9519 17:44:29.6.
+7. **val2 cannot follow.**
+   * It drops every header with `dropping proposal header: ... is_safe=false, justify_block_known=false`:
+     2,724 lines over views 9510-9519, first at 17:29:10.480 (val2:2129384).
+   * Each drop starts a block sync. 2,643 sessions end `made no progress`. 73 end with `block_sync: block failed app
+     validation (invalid), blacklisting peer`, from 17:29:11.998 (val2:2129440) to 17:47:03 (val2:2197417).
+   * *Inference:* the block its lock names is the datum-less `JYumZbv`, which its `validate_block` rejects
+     (`datums.len() != 1`, app.rs:10719-10724). val2 can never insert it.
+8. **val0 and val1 do not recover either.**
+   * Their syncs (timeout trigger, `committed_height` 9497 in hotstuff numbering) return 3 blocks and make no
+     progress. They blacklist the peer: val1 at 17:30:06.978 (val1:2141971), 17:32:07 and 17:36:07.319
+     (val1:2145755); val0 at 17:36:07.327 (val0:2151522).
+   * `sampler.csv` keeps height 9498 / 9498 / 9497 from 17:29:08 to the last sample at 17:44:07. The h9498 / h9497
+     checkpoints were written at shutdown (17:47:05, val0:2156075).
+   * The summary's liveness "stalls" (val0 306 s, val1 153 s, val2 837 s) are not recoveries. `health.py`
+     `assess_liveness` (lines 102-154 in the harness worktree) counts a stall only while work is pending. The stall
+     "ends" when the native mempool empties: val1 at 17:31:42, val0 at 17:34:15. val2 keeps 13,907 to the end. Why
+     the mempools emptied was not checked.
+9. **Verdicts.**
+   * Drain timeout after 780 s (`drain.json`).
+   * State attestation ok: 64 checkpoints 3100..9400 compared, h_n equal. 9400 is pending with no quorum, because no
+     block followed to carry the attestations.
+   * DISAGREE only because val2 is one height behind. Block 9492 hash and state digest are equal; the counters
+     differ by val2's missing block (matched 149,388,304 vs 149,388,918).
+   * 0 `panicked`, `FAIL-STOP`, `STATE HASH MISMATCH`, `diverged` lines. No divergence.
+
+Background lines, both shapes (count per node val0 / val1 / val2; whole log; `deep_logcounts.py`,
+`deep_logcounts2.py`):
+
+| cell | `validate_block: REJECTED -- datums.len() != 1` | `not voting: ... fails the data check` | `active validator set below BFT minimum` | `refusing this boundary block` (sum) | `blacklisting peer` | `dropping proposal header ... justify_block_known=false` |
+|---|---|---|---|---|---|---|
+| std-w1 | 3936 / 6973 / 3041 | 28 / 47 / 19 | 61 / 61 / 61 | 5 | 0 / 0 / 0 | 0 / 0 / 0 |
+| std-r1-U | 10358 / 10358 / 0 | 28 / 28 / 0 | 110 / 110 / 110 | 25 | 0 / 0 / 0 | 0 / 0 / 0 |
+| std-r1-K | 571 / 572 / 0 | 9 / 9 / 0 | 32 / 32 / 24 | 1 | 0 / 0 / 0 | 0 / 0 / 1 |
+| std-r2-K | 0 / 0 / 0 | 0 / 0 / 0 | 32 / 32 / 24 | 0 | 0 / 0 / 0 | 0 / 0 / 1 |
+| std-r2-U | 3182 / 17524 / 14379 | 9 / 54 / 45 | 109 / 109 / 109 | 4 | 0 / 0 / 0 | 0 / 0 / 4 |
+| std-r3-K | 0 / 0 / 0 | 0 / 0 / 0 | 32 / 32 / 25 | 2 | 0 / 0 / 0 | 0 / 0 / 0 |
+| std-r3-U | 3781 / 14125 / 10372 | 9 / 66 / 56 | 108 / 108 / 108 | 17 | 0 / 0 / 0 | 0 / 0 / 5 |
+| std-r4-U | 4456 / 7417 / 2969 | 28 / 47 / 19 | 109 / 109 / 109 | 24 | 0 / 0 / 0 | 0 / 0 / 4 |
+| std-r4-K | 0 / 0 / 0 | 0 / 0 / 0 | 32 / 32 / 25 | 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| std-r1-K-rerun | 0 / 1373 / 994 | 0 / 17 / 17 | 32 / 32 / 24 | 3 | 0 / 0 / 0 | 0 / 0 / 0 |
+| std-r3-K-rerun | 599 / 2003 / 1024 | 9 / 28 / 19 | 32 / 32 / 25 | 17 | 0 / 0 / 0 | 0 / 0 / 0 |
+| std-r4-K-rerun | 0 / 1435 / 1054 | 0 / 19 / 19 | 33 / 33 / 25 | 1 | 0 / 0 / 0 | 0 / 0 / 1 |
+| deep2-w1 | 0 / 6688 / 6688 | 0 / 28 / 28 | 87 / 87 / 87 | 11 | 0 / 0 / 0 | 0 / 0 / 1 |
+| deep2-r1-U | 8600 / 3800 / 12405 | 45 / 9 / 54 | 131 / 131 / 131 | 38 | 0 / 0 / 0 | 0 / 0 / 2 |
+| deep2-r1-K | 0 / 427 / 5 | 0 / 19 / 9 | 39 / 39 / 30 | 29 | 0 / 0 / 0 | 0 / 0 / 0 |
+| deep2-r2-K | 0 / 3114 / 2256 | 0 / 28 / 28 | 42 / 42 / 33 | 4 | 0 / 0 / 0 | 0 / 0 / 0 |
+| deep2-r2-U | 38608 / 27278 / 17091 | 106 / 82 / 61 | 131 / 131 / 131 | 16 | 0 / 0 / 0 | 0 / 0 / 3 |
+| deep2-r3-K | 2306 / 620 / 1263 | 26 / 9 / 17 | 39 / 39 / 30 | 2 | 0 / 0 / 0 | 0 / 0 / 0 |
+| deep2-r3-U | 45370 / 19815 / 30940 | 130 / 54 / 94 | 127 / 127 / 127 | 13 | 0 / 0 / 0 | 0 / 0 / 6 |
+| deep2-r4-U | 16268 / 14588 / 26888 | 2721 / 2862 / 73 | 94 / 94 / 94 | 17 | 1 / 3 / 73 | 0 / 0 / 2726 |
+| deep2-r4-U-rerun | 15743 / 34954 / 35197 | 45 / 108 / 93 | 131 / 131 / 131 | 34 | 0 / 0 / 0 | 0 / 0 / 8 |
+| deep2-r4-K | 0 / 1153 / 727 | 0 / 9 / 9 | 40 / 40 / 31 | 14 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+* The datum-less rejection lines and the `fails the data check` refusals appear in 19 of 22 cells (9-130 refusals
+  per node). Only r4-U has 2,721 / 2,862 refusals, blacklisting, and thousands of `justify_block_known=false` drops.
+* The boundary refusal warning appears in 20 of 22 cells (94 boundaries). It is logged by `epoch_plan`, which the
+  proposer and validator paths both call, so the sums are not counts of refused blocks. Refused boundaries are
+  routine. What is unique to r4-U is the certificate on a refused block (step 5).
+* `active validator set below BFT minimum ... have=3 need=4` is in every cell on every node. It is not only a boot
+  line: it repeats about once per 100-block epoch (108-131 lines per node in the 600 s U cells; deep r1-U has 131
+  for height 11,118; in K, val2's count stops at the kill). In r4-U the last one is at 17:29:06.1.
+* Other lines seen in every cell, not specific to the halt: `skipping duplicate/replayed native action on live
+  commit path` (44-760 per node; r4-U 33 at h9403 / 9444 / 9460 just before the halt).
+* A `locked_pc` conflict also appears in deep r3-U (val2, 5x at 17:10-17:11 UTC); that chain recovered at once.
+
+### 125.9 Data
+
+* Std cells: `~/bench-results-matched/ozarchy-9k2-std-{w1,r1-U,r1-K,r2-K,r2-U,r3-K,r3-U,r4-U,r4-K,r1-K-rerun,r3-K-rerun,r4-K-rerun}`
   (`summary.json`, `sampler.csv`, `buckets.csv`, `kill-norestart.json`, `log-summary.json`, `drain.json`,
   `state-attest.json`, `run.log`, `val<i>.log.gz`) and their `.campaign.log` / `.cell.rc`. Not used: smokes
   `ozarchy-9k2-{smokeu,smokek,smokedeepk}-smoke-s0`.
-* Campaign: `ozarchy-9k2-run/` (`handoff.json`, `campaign.log`, `campaign.done`, `std/{cells.tsv,campaign.log,campaign.done,rerun-queue.tsv}`).
-* Re-score: `ozarchy-9k2-rescored/<cell>/{rescore.json,log-summary.json}` (tools `/home/oz/projects/wt/health-kill-exempt`).
+* Deep cells: `~/bench-results-matched/ozarchy-9k2-deep2-{w1,r1-U,r1-K,r2-K,r2-U,r3-K,r3-U,r4-U,r4-U-rerun,r4-K}`
+  (same files) and their `.campaign.log` / `.cell.rc`. Not scored: `ozarchy-9k2-deep2-smoke-s0`,
+  `ozarchy-9k2-deep-w1` (superseded run).
+* Campaign: `ozarchy-9k2-run/` (`handoff.json`, `campaign.log`, `campaign.done`,
+  `std/{cells.tsv,campaign.log,campaign.done,rerun-queue.tsv}`,
+  `deep2/{cells.tsv,campaign.log,campaign.done,tail.log,tail.done,rerun-queue.tsv}`).
+* Re-score (std): `ozarchy-9k2-rescored/<cell>/{rescore.json,log-summary.json}` (tools `/home/oz/projects/wt/health-kill-exempt`).
 * Analysis: `ozarchy-9k2-tools/analyst/`:
-  * `std_windows.py` -> `std_windows.{json,txt}` (per-window rates, order-age percentiles, cancel-all tail);
-  * `std_stats.py` -> `std_stats.txt`;
-  * `std_events.py` + `std_event_table.py` -> `std_events.json`, `std_event_rows.json`, `std_event_table.txt`;
-  * `std_evidence_md.py` -> `std-fallback-evidence.md` (raw log lines with file:line for every event, for 18c);
-  * `std-analysis.md` (notes).
+  * std: `std_windows.py` -> `std_windows.{json,txt}`; `std_stats.py` -> `std_stats.txt`; `std_events.py` +
+    `std_event_table.py` -> `std_events.json`, `std_event_rows.json`, `std_event_table.txt`; `std_evidence_md.py`
+    -> `std-fallback-evidence.md`; `std-analysis.md` (notes).
+  * deep: `deep_windows.py` -> `deep_windows.{json,txt}`; `deep_stats.py` -> `deep_stats.txt` (also deep vs std);
+    `deep_events.py` + `deep_event_table.py` -> `deep_events.json`, `deep_event_rows.json`, `deep_event_table.txt`;
+    `deep_freeze.py` -> `deep_freeze.txt` (post-kill freezes, both shapes).
+  * r4-U halt: `halt/r4U-val{0,1,2}.txt` (17:28:55-17:48 UTC extracts with line numbers); `deep_halt.py` ->
+    `deep_halt.txt`; `deep_evidence_md.py` -> `deep-halt-evidence.md`.
+  * Background lines, both shapes: `deep_logcounts.py` / `deep_logcounts2.py` -> `logcounts{,2}/<cell>__<node>.json`;
+    `deep_logcount_table.py`, `deep_logcount2_table.py`, `deep_noise_md.py` -> `deep_logcount_table.txt`,
+    `deep_logcount2_table.txt`, `deep_noise_rows.md`.
 
 ## Open
 

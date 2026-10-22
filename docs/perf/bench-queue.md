@@ -1101,12 +1101,19 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    views per minute, p50 / p99 commit latency, plus the end-of-load cancel-all tail (archy s136 open question).
    ~2-2.5 h (estimate). Doc target: the next results-doc section.
    **Config (s136, batch 10 on main `2d2f3ed9`):** run as the testnet will: hash + attestation + L6.1 + L2.1 + fail-stop on. `gen-weighted-genesis.sh` (needed for 2/2/1 stakes) still defaults the hash OFF, so set `STATE_HASH_ACTIVATION` explicitly ON (hash from block 1; L6.1 follows it for Classic); L2.1 and fail-stop are on by default. Check the startup lines read `on=true`.
-   **Status (s138): standard shape DONE, deep running (`ozarchy-9k2-deep2`). Results: section 125 of
-   `ozarchy-antispam-item6-pf1-2026-10-04.md`.** K / U matched/s: whole cell 145.5k vs 277.3k (-47.5%), post-kill
-   115.9k vs 275.7k (-58.0%). Post-kill blocks/s 1.40 vs 15.86. val1 times out once per val2-led view (42.3 / min).
-   Cancel-all tail: K 4.5k in 6-10 s. Finding: in 5 of 7 K cells a survivor fell back to sync for the other survivor's
-   block body (17-50 s freeze; cause open, 18c). Caveat: the in-flight watcher is val1 in K vs val2 in U, which
-   confounds the pre-kill window.
+   **Status (s138): DONE, standard + deep. Results: section 125 of `ozarchy-antispam-item6-pf1-2026-10-04.md`.**
+   n per arm: std U 4 / K 7 (`ozarchy-9k2`, K reruns included); deep U 4 / K 4 (`ozarchy-9k2-deep2`; r4-U halted and
+   is excluded, r4-U-rerun replaces it). K / U matched/s:
+   * whole cell: std 145.5k vs 277.3k (-47.5%), deep 147.4k vs 273.0k (-46.0%);
+   * post-kill: std 115.9k vs 275.7k (-58.0%), deep 119.3k vs 271.4k (-56.0%).
+   Post-kill blocks/s 1.40 / 1.47 vs 15.86 / 15.32. val1 times out once per val2-led view (42.3 / 43.2 per min).
+   Cancel-all tail: K ~4.5k in 6-10 s. Deep / std: 0.985 all up, 1.013 one down.
+   Finding 1: in 5 of 7 std K cells (0 of 4 deep) a survivor fell back to sync for the other survivor's block body,
+   with a 17-50 s freeze (cause open, 18c `fix/body-fetch-dead-peer`).
+   Finding 2: deep r4-U (all up) halted for good at the h9500 epoch boundary. Two leaders proposed the datum-less
+   refused boundary block (execution had not applied h9400), it got a certificate (inference: identical hash +
+   leader self-votes), and nothing could extend it (cause to 18c, 125.8).
+   Caveat: the in-flight watcher is val1 in K vs val2 in U, which confounds the pre-kill window.
 9o. **[GO s138: 'before' cells now; 'after' arm on main after batch 12] TC-required phase D: one-down bench, main vs main + TC set.** After the TC set lands (batch 9
    + `fix/tc-liveness`) and after 9k. Same cells as 9k on both binaries, 3 runs each (design
    `docs/plans/tc-required-and-tip-signing.md` section 7): all-up and one-down (stake 2/2/1, stake-1 node killed, no
