@@ -10525,11 +10525,28 @@ impl TorusApp {
             Ok(updates) => updates,
             // Bug (b): retry once execution applied the previous boundary
             // (never blacklists a sync peer, never votes on a guess).
-            Err(EpochPlanNotReady) => return ValidateBlockResponse::MissingData,
+            Err(EpochPlanNotReady) => {
+                self.drain_parked_for_the_plan();
+                return ValidateBlockResponse::MissingData;
+            }
         };
         ValidateBlockResponse::Valid {
             app_state_updates: None,
             validator_set_updates,
+        }
+    }
+
+    /// s138: a boundary block is neither validated nor built before this node's execution
+    /// applied the previous boundary (bug (b), [`Self::epoch_plan`]). After a power loss the
+    /// heights that get it there can be parked on their commit manifests (FIX 1b / FIX 6), which
+    /// drain only with the next commit (or the rank-2 reconcile tick, off by default); when that
+    /// commit needs this node's vote on this very boundary block, nothing ever drains them
+    /// (`dl_cluster_power_loss_parked_plan_source_drains_for_the_boundary`). Dispatch what is
+    /// parked now. Local dispatch state only, as the reconcile tick; a no-op when nothing is
+    /// parked, so the steady-state dispatch cadence is unchanged.
+    fn drain_parked_for_the_plan(&mut self) {
+        if !self.deferred_exec.is_empty() && !self.is_exec_failed() {
+            self.drain_exec_queue();
         }
     }
 }
@@ -10597,6 +10614,13 @@ impl TorusApp {
             |h| self.boundary_evm(h),
         );
         if link != BlockDataCheck::Held {
+            // A boundary block waits on this node's plan (`boundary_evm`): see
+            // `drain_parked_for_the_plan`.
+            if link == BlockDataCheck::Missing
+                && EpochManager::is_epoch_boundary(header.height, self.epoch_length)
+            {
+                self.drain_parked_for_the_plan();
+            }
             if torus_types::features::first_unknown_feature_in(header.features, self.known_features)
                 .is_some()
             {
@@ -10694,6 +10718,7 @@ impl TorusApp {
         if EpochManager::is_epoch_boundary(next_height, self.epoch_length)
             && self.epoch_validator_set_updates(next_height).is_err()
         {
+            self.drain_parked_for_the_plan();
             return refused_proposal();
         }
         // Exec-ceiling Option A: wire the (previously dead) block_build_seconds —
@@ -10854,6 +10879,7 @@ impl TorusApp {
         drop(encode_span);
 
         let Ok(validator_set_updates) = self.epoch_validator_set_updates(height) else {
+            self.drain_parked_for_the_plan();
             return refused_proposal();
         };
 
