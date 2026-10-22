@@ -46,9 +46,14 @@ class FakeNode:
     writes)]; the answered scrape with index i (0 = the first, the helper's T0
     baseline) serves the last step with n <= i. submits/writes None = metric
     absent from the body. `fail_first`: the first N requests get HTTP 503 (not
-    answered, so they do not advance the steps); `fail`: every request does."""
+    answered, so they do not advance the steps); `fail`: every request does.
+    `raw`: metric lines served verbatim instead of the steps on every answer
+    with index >= `raw_from` (malformed-counter tests: exact text such as
+    -1e-999 or duplicates)."""
 
-    def __init__(self, steps, fail=False, fail_first=0):
+    def __init__(self, steps, fail=False, fail_first=0, raw=None, raw_from=0):
+        self.raw = raw
+        self.raw_from = raw_from
         self.steps = sorted(steps, key=lambda e: e[0])
         self.fail = fail
         self.fail_first = fail_first
@@ -91,6 +96,8 @@ class FakeNode:
             if n <= i:
                 submits, writes = s, w
         lines = ["# HELP torus_block_height x", "torus_block_height 1600"]
+        if self.raw is not None and i >= self.raw_from:
+            return "\n".join(lines + list(self.raw)) + "\n# EOF\n"
         if submits is not None:
             lines.append("# TYPE torus_exec_checkpoints counter")
             lines.append("%s %d" % (SUBMITS, submits))
@@ -380,6 +387,215 @@ class WaitTests(unittest.TestCase):
             )
         self.assertNotEqual(rec["outcome"], "skipped", out)
         self.assertGreater(dead.hits, 1)
+
+    def test_counter_validation_invalid_sample_with_checkpoints_off_never_skips(self):
+        # 18c msg 121 negative-off: interval off, SUBMITS=-1, WRITES=0 was
+        # "skipped" (ACCEPT). An invalid sample makes the node's evidence
+        # invalid for the whole scrape: fallback_sleep (UNVERIFIED), no skip.
+        # The negative margin only shortens the 15 s default fallback sleep.
+        bad = FakeNode([], raw=["%s -1" % SUBMITS, "%s 0" % WRITES])
+        with bad:
+            rc, out, err, rec, _ = run_wait(
+                [("val0", bad)],
+                json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "0"}),
+                extra=["--fallback-margin-s", "-14.8"] + LONG,
+            )
+        self.assertEqual(rec["outcome"], "fallback_sleep", out + err)
+        self.assertFalse(rec["nodes"]["val0"]["durable"])
+        self.assertTrue(rec["nodes"]["val0"]["invalid"])
+
+    def test_counter_validation_tiny_negative_is_not_rounded_to_zero(self):
+        # 18c msg 121 underflow-on: float("-1e-999") == -0.0 passed as 0, so
+        # SUBMITS=0, WRITES=1 was durable. Exact decimal parsing rejects it.
+        bad = FakeNode([], raw=["%s -1e-999" % SUBMITS, "%s 1" % WRITES])
+        with bad:
+            rc, out, err, rec, _ = run_wait(
+                [("val0", bad)],
+                json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "300"}),
+                extra=["--fallback-margin-s", "0.1"] + LONG,
+            )
+        self.assertEqual(rec["outcome"], "fallback_sleep", out + err)
+        self.assertFalse(rec["nodes"]["val0"]["durable"])
+
+    def test_counter_validation_duplicate_samples_invalidate_the_scrape(self):
+        # 18c msg 121 duplicate-invalid-on: SUBMITS 0 then SUBMITS -1 kept the
+        # valid 0 (durable). Any duplicate, valid or not, invalidates the
+        # node's evidence for that scrape.
+        for second in ("-1", "0"):
+            with self.subTest(second=second):
+                bad = FakeNode([], raw=["%s 0" % SUBMITS, "%s %s" % (SUBMITS, second),
+                                        "%s 1" % WRITES])
+                with bad:
+                    rc, out, err, rec, _ = run_wait(
+                        [("val0", bad)],
+                        json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "300"}),
+                        extra=["--fallback-margin-s", "0.1"] + LONG,
+                    )
+                self.assertEqual(rec["outcome"], "fallback_sleep", out + err)
+                self.assertFalse(rec["nodes"]["val0"]["durable"])
+
+    def test_counter_validation_malformed_or_labelled_lines_count_as_samples(self):
+        # Codex stop review: a counter line without a value, or a labelled
+        # series of the same metric, was skipped before duplicate detection,
+        # so "SUBMITS 0" next to it stayed the single valid sample (durable).
+        # Every line of a counter is a sample; a malformed one is invalid.
+        for raw in (["%s 0" % SUBMITS, SUBMITS, "%s 1" % WRITES],
+                    ["%s 0" % SUBMITS, '%s{x="y"} 5' % SUBMITS, "%s 1" % WRITES],
+                    ["%s 0" % SUBMITS, "%s 1" % WRITES, WRITES],
+                    [SUBMITS, "%s 1" % WRITES],
+                    ['%s{x="y"} 0' % SUBMITS, "%s 1" % WRITES]):
+            with self.subTest(raw=raw):
+                bad = FakeNode([], raw=raw)
+                with bad:
+                    rc, out, err, rec, _ = run_wait(
+                        [("val0", bad)],
+                        json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "300"}),
+                        extra=["--fallback-margin-s", "0.1"] + LONG,
+                    )
+                self.assertEqual(rec["outcome"], "fallback_sleep", out + err)
+                self.assertFalse(rec["nodes"]["val0"]["durable"])
+                self.assertTrue(rec["nodes"]["val0"]["invalid"])
+
+    def test_counter_validation_rejects_fractions_nan_inf_and_out_of_range(self):
+        for value in ("0.5", "NaN", "+Inf", "inf", "18446744073709551616", "1e400", "0x10", ""):
+            with self.subTest(value=value):
+                bad = FakeNode([], raw=["%s %s" % (SUBMITS, value), "%s 1" % WRITES])
+                with bad:
+                    rc, out, err, rec, _ = run_wait(
+                        [("val0", bad)],
+                        json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "300"}),
+                        extra=["--fallback-margin-s", "0.1"] + LONG,
+                    )
+                self.assertNotEqual(rec["outcome"], "durable", out + err)
+                self.assertNotEqual(rec["outcome"], "skipped", out + err)
+
+    def test_counter_validation_invalid_rescrape_never_makes_a_node_durable(self):
+        # The poll path: a valid T0 (9, 9) then rescrapes whose WRITES would
+        # reach the target 10 but whose scrape holds an invalid sample. The
+        # whole scrape is void, so the node stays NOT durable (timeout).
+        for raw in (["%s 9" % SUBMITS, "%s 10" % WRITES, "%s 10" % WRITES],
+                    ["%s -1" % SUBMITS, "%s 10" % WRITES]):
+            with self.subTest(raw=raw):
+                node = FakeNode([(0, 9, 9)], raw=raw, raw_from=1)
+                with node:
+                    rc, out, err, rec, _ = run_wait(
+                        [("val0", node)],
+                        json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "300"}),
+                        extra=["--timeout-s", "3"],
+                    )
+                self.assertEqual(rec["outcome"], "timeout", out + err)
+                self.assertFalse(rec["nodes"]["val0"]["durable"])
+                self.assertEqual(rec["nodes"]["val0"]["write_count"], 9)
+                self.assertGreater(node.answered, 1)
+
+    def test_counter_validation_invalid_node_is_reported_as_invalid_not_absent(self):
+        # Both metrics were served, so "absent (older binary)" is wrong for
+        # this node: it is named as invalid, with the offending samples.
+        bad = FakeNode([], raw=["%s 0" % SUBMITS, "%s 0" % SUBMITS, "%s 1" % WRITES])
+        with bad:
+            rc, out, err, rec, _ = run_wait(
+                [("val0", bad)],
+                json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "300"}),
+                extra=["--fallback-margin-s", "0.1"] + LONG,
+            )
+        self.assertEqual(rec["outcome"], "fallback_sleep", out + err)
+        for text in (out, rec["note"]):
+            self.assertIn("invalid counter samples on val0 (%s: 2 samples)" % SUBMITS, text)
+            self.assertNotIn("older binary", text)
+            self.assertIn("no durable evidence on val0", text)
+
+    def test_counter_validation_invalid_and_unreadable_with_checkpoints_off(self):
+        # Checkpoints off, val0 invalid, val1 unreadable: no skip (timeout on
+        # the unreadable node), and the note names the invalid node instead of
+        # an empty "but  ran checkpoints" warning.
+        bad = FakeNode([], raw=["%s -1" % SUBMITS, "%s 0" % WRITES])
+        dead = FakeNode([], fail=True)
+        with bad, dead:
+            rc, out, err, rec, _ = run_wait(
+                [("val0", bad), ("val1", dead)],
+                json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "0"}),
+                extra=["--timeout-s", "1.5"],
+            )
+        self.assertEqual(rec["outcome"], "timeout", out + err)
+        self.assertNotIn("ran checkpoints", rec["note"])
+        self.assertIn("invalid counter samples on val0 (%s=-1)" % SUBMITS, rec["note"])
+        self.assertIn("metrics unreadable on val1", out)
+
+    def test_counter_validation_rejects_non_ascii_digits(self):
+        # Decimal() accepts any Unicode digit; a Prometheus counter is ASCII.
+        bad = FakeNode([], raw=["%s 0" % SUBMITS, "%s \u0661" % WRITES])
+        with bad:
+            rc, out, err, rec, _ = run_wait(
+                [("val0", bad)],
+                json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "300"}),
+                extra=["--fallback-margin-s", "0.1"] + LONG,
+            )
+        self.assertEqual(rec["outcome"], "fallback_sleep", out + err)
+        self.assertFalse(rec["nodes"]["val0"]["durable"])
+
+    def test_counter_validation_accepts_plain_and_exponent_integers(self):
+        # Valid encodings a Prometheus exporter may emit: integral decimals
+        # (including 1e1 and 21.0) still count.
+        for submits, writes in (("9", "10"), ("9.0", "1e1"), ("+9", "10")):
+            with self.subTest(submits=submits, writes=writes):
+                node = FakeNode([], raw=["%s %s" % (SUBMITS, submits), "%s %s" % (WRITES, writes)])
+                with node:
+                    rc, out, err, rec, _ = run_wait([("val0", node)], ON, extra=LONG)
+                self.assertEqual(rec["outcome"], "durable", out + err)
+
+    def test_counter_validation_trailing_tokens_void_the_scrape(self):
+        # 18c msg 126 (Codex P3): only the second token was read, so
+        # "SUBMITS 0 garbage" with WRITES=1 was durable. The whole sample line
+        # is validated: name, value, an optional int64 timestamp, nothing else.
+        for raw in (["%s 0 garbage" % SUBMITS, "%s 1" % WRITES],
+                    ["%s 0" % SUBMITS, "%s 1 garbage" % WRITES],
+                    ["%s 9 1.5" % SUBMITS, "%s 10" % WRITES],
+                    ["%s 9 1792635019000 x" % SUBMITS, "%s 10" % WRITES],
+                    ["%s 9" % SUBMITS, "%s 10 1792635019000 1792635019000" % WRITES],
+                    ["%s 9 1e3" % SUBMITS, "%s 10" % WRITES],
+                    ["%s 9 0x10" % SUBMITS, "%s 10" % WRITES],
+                    ["%s 9 9223372036854775808" % SUBMITS, "%s 10" % WRITES],
+                    ["%s 9 %s" % (SUBMITS, "9" * 5000), "%s 10" % WRITES],
+                    ["%s 9" % SUBMITS, "%s 10 -%s" % (WRITES, "9" * 5000)]):
+            with self.subTest(raw=raw):
+                bad = FakeNode([], raw=raw)
+                with bad:
+                    rc, out, err, rec, _ = run_wait(
+                        [("val0", bad)],
+                        json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "300"}),
+                        extra=["--fallback-margin-s", "0.1"] + LONG,
+                    )
+                self.assertEqual(rec["outcome"], "fallback_sleep", out + err)
+                self.assertFalse(rec["nodes"]["val0"]["durable"])
+                self.assertTrue(rec["nodes"]["val0"]["invalid"])
+
+    def test_counter_validation_trailing_tokens_with_checkpoints_off_never_skip(self):
+        # 18c msg 126: "SUBMITS 0 garbage", WRITES=0, checkpoints off was
+        # "skipped" (ACCEPT). The invalid line voids the scrape: no skip.
+        bad = FakeNode([], raw=["%s 0 garbage" % SUBMITS, "%s 0" % WRITES])
+        with bad:
+            rc, out, err, rec, _ = run_wait(
+                [("val0", bad)],
+                json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "0"}),
+                extra=["--fallback-margin-s", "-14.8"] + LONG,
+            )
+        self.assertEqual(rec["outcome"], "fallback_sleep", out + err)
+        self.assertFalse(rec["nodes"]["val0"]["durable"])
+        self.assertTrue(rec["nodes"]["val0"]["invalid"])
+
+    def test_counter_validation_accepts_an_integer_timestamp(self):
+        # Prometheus text format: an optional int64 millisecond timestamp
+        # (sign allowed) after the value; trailing whitespace is fine.
+        for raw in (["%s 9 1792635019000" % SUBMITS, "%s 10" % WRITES],
+                    ["%s 9 -1" % SUBMITS, "%s 10 +1792635019000" % WRITES],
+                    ["%s 9 1792635019000 \t" % SUBMITS, "%s 10\t" % WRITES],
+                    ["%s 9 %s1" % (SUBMITS, "0" * 5000), "%s 10" % WRITES]):
+            with self.subTest(raw=raw):
+                node = FakeNode([], raw=raw)
+                with node:
+                    rc, out, err, rec, _ = run_wait([("val0", node)], ON, extra=LONG)
+                self.assertEqual(rec["outcome"], "durable", out + err)
+                self.assertEqual(rec["nodes"]["val0"]["c0"], 9)
 
     def test_negative_counters_are_not_durable_proof(self):
         # s77 re-review (Codex P3): SUBMITS=-1, WRITES=0 gave target 0 and an

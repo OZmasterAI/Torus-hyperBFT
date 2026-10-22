@@ -45,8 +45,8 @@ Standard library only: run-cell.sh runs it with python3 -I.
 """
 
 import argparse
+import decimal
 import json
-import math
 import sys
 import time
 import urllib.request
@@ -121,29 +121,66 @@ def scrape(url, timeout=3.0):
             text = r.read().decode("utf-8", "replace")
     except (OSError, ValueError):
         return None
-    vals = {SUBMITS: None, WRITES: None, "invalid": []}
+    # Every line of either counter is a sample, malformed or not: a line
+    # without a value, a labelled series of the same metric, or anything
+    # after the value but an optional int64 timestamp is an invalid sample
+    # (None), never skipped (it would hide a duplicate).
+    samples = {SUBMITS: [], WRITES: []}
     for line in text.splitlines():
         f = line.split()
-        if len(f) >= 2 and f[0] in (SUBMITS, WRITES):
-            n = counter_value(f[1])
+        name = f[0].split("{", 1)[0] if f else None
+        if name in samples:
+            ok = f[0] == name and len(f) in (2, 3) and (len(f) == 2 or is_timestamp(f[2]))
+            samples[name].append(f[1] if ok else None)
+    vals = {SUBMITS: None, WRITES: None, "invalid": []}
+    for name, raws in samples.items():
+        if len(raws) > 1:
+            vals["invalid"].append("%s: %d samples" % (name, len(raws)))
+        elif raws and raws[0] is None:
+            vals["invalid"].append("%s: malformed or labelled sample" % name)
+        elif raws:
+            n = counter_value(raws[0])
             if n is None:
-                vals["invalid"].append(f[0])
+                vals["invalid"].append("%s=%s" % (name, raws[0]))
             else:
-                vals[f[0]] = n
+                vals[name] = n
+    # One invalid, duplicate or out-of-range sample voids the node's evidence
+    # for the whole scrape: neither counter is used (no skip, no durable).
+    if vals["invalid"]:
+        vals[SUBMITS] = vals[WRITES] = None
     return vals
 
 
+def is_timestamp(raw):
+    """A Prometheus text-format sample timestamp: an int64 (milliseconds),
+    ASCII digits with an optional sign, leading zeros allowed. More than 19
+    significant digits is out of range before int() sees it: CPython raises
+    ValueError above 4300 digits, which must not crash the scrape."""
+    sign = raw[:1] if raw[:1] in ("+", "-") else ""
+    body = raw[len(sign):]
+    if not body or not all("0" <= ch <= "9" for ch in body):
+        return False
+    digits = body.lstrip("0") or "0"
+    if len(digits) > 19:
+        return False
+    return -2**63 <= int(sign + digits) <= 2**63 - 1
+
+
 def counter_value(raw):
-    """A counter sample as a finite non-negative integer, None otherwise (a
-    negative, fractional, NaN or infinite value is no evidence of anything:
-    the node is treated as not reporting that metric)."""
+    """A counter sample as an integer in [0, u64::MAX], None otherwise. Exact
+    decimal parsing (no float: -1e-999 must not round to 0); a sign, a
+    fraction, NaN, inf, an underscore, a non-ASCII digit or a value above
+    u64::MAX is no evidence of anything. Integral forms such as 21.0 or 1e1
+    are accepted."""
+    if not raw.isascii() or "_" in raw or raw.startswith("-"):
+        return None
     try:
-        x = float(raw)
-    except ValueError:
+        d = decimal.Decimal(raw)
+    except decimal.InvalidOperation:
         return None
-    if not math.isfinite(x) or x < 0 or x != int(x):
+    if not d.is_finite() or d.is_signed() or d > U64_MAX or d != d.to_integral_value():
         return None
-    return int(x)
+    return int(d)
 
 
 def active(v):
@@ -257,17 +294,25 @@ def main(argv=None):
     # unless a node that answered did checkpoint: then they are on whatever
     # the env says, and an unreadable node must not let the wait be skipped.
     base = baseline(nodes, deadline, a.poll_s, retry=interval_ms is not None)
-    if interval_ms is None and len(base) < len(nodes) and any(active(v) for v in base.values()):
+    if interval_ms is None and len(base) < len(nodes) and any(
+            active(v) or v["invalid"] for v in base.values()):
         base = baseline(nodes, deadline, a.poll_s, retry=True, base=base)
     bad = [n for n, _ in nodes if n not in base]
     ran_any = any(active(v) for v in base.values())
-    if bad and interval_ms is None and not ran_any:
+    # A node with invalid evidence never lets the wait be skipped.
+    invalid_any = any(v["invalid"] for v in base.values())
+    if bad and interval_ms is None and not ran_any and not invalid_any:
         rec["note"] = "metrics unreadable on %s" % " ".join(bad)
         return finish("skipped", "skipped, %s; metrics unreadable on %s" % (off, " ".join(bad)))
     if bad:
-        if interval_ms is None:
-            rec["note"] = ("WARNING: the node env resolves %s but %s ran checkpoints"
-                           % (off, " ".join(n for n, v in base.items() if active(v))))
+        notes = []
+        if interval_ms is None and ran_any:
+            notes.append("WARNING: the node env resolves %s but %s ran checkpoints"
+                         % (off, " ".join(n for n, v in base.items() if active(v))))
+        if invalid_any:
+            notes.append("invalid counter samples on %s" % " ".join(
+                "%s (%s)" % (n, "/".join(v["invalid"])) for n, v in base.items() if v["invalid"]))
+        rec["note"] = "; ".join(notes) or None
         return finish("timeout", "TIMEOUT after {waited}s: metrics unreadable on %s (%s)%s"
                       % (" ".join(bad), iv, " (%s)" % rec["note"] if rec["note"] else ""), TIMEOUT_RC)
     for name, v in base.items():
@@ -285,7 +330,7 @@ def main(argv=None):
     fresh_note = ("%s=0 at T0 on %s: waiting for the first checkpoint" % (SUBMITS, " ".join(fresh))
                   if fresh else None)
 
-    if interval_ms is None and not ran:
+    if interval_ms is None and not ran and not invalid_any:
         return finish("skipped", "skipped, %s%s" % (
             off, "; checkpoint metrics absent on %s" % " ".join(missing) if missing else ""))
     if missing:
@@ -294,14 +339,20 @@ def main(argv=None):
         # one whose first checkpoint never landed); the others only get a
         # sleep of interval + margin, which proves nothing about them:
         # outcome fallback_sleep, and summarize.py leaves the digest unpinned.
-        names = "/".join(sorted({k for n in missing for k in rec["nodes"][n]["missing"]}))
-        rec["note"] = ("checkpoint metrics absent on %s (older binary): slept interval + %.1f s, "
-                       "no durable evidence on %s" % (" ".join(missing), a.fallback_margin_s,
-                                                      " ".join(missing)))
-        bad_vals = ["%s (%s)" % (n, "/".join(rec["nodes"][n]["invalid"]))
-                    for n in missing if rec["nodes"][n]["invalid"]]
-        if bad_vals:
-            rec["note"] += "; invalid (not a non-negative integer) counter on %s" % " ".join(bad_vals)
+        # A node in `missing` either lacks a metric (older binary) or served
+        # an invalid sample (the scrape is void: both counters unusable).
+        absent = [n for n in missing if not rec["nodes"][n]["invalid"]]
+        invalid = [n for n in missing if rec["nodes"][n]["invalid"]]
+        why = []
+        if absent:
+            names = "/".join(sorted({k for n in absent for k in rec["nodes"][n]["missing"]}))
+            why.append("%s absent on %s (older binary)" % (names, " ".join(absent)))
+        if invalid:
+            why.append("invalid counter samples on %s" % " ".join(
+                "%s (%s)" % (n, "/".join(rec["nodes"][n]["invalid"])) for n in invalid))
+        why = "; ".join(why)
+        rec["note"] = ("%s: slept interval + %.1f s, no durable evidence on %s"
+                       % (why, a.fallback_margin_s, " ".join(missing)))
         if fresh_note:
             rec["note"] += "; " + fresh_note
         capable = [(n, u) for n, u in nodes if n not in missing]
@@ -311,10 +362,10 @@ def main(argv=None):
             return finish("timeout", "TIMEOUT: %s, waited {waited}s of %.0fs (%s) (%s)"
                           % (per, timeout_s, iv, rec["note"]), TIMEOUT_RC)
         time.sleep(max(0.0, eff_ms / 1000.0 + a.fallback_margin_s - (time.monotonic() - t0)))
-        return finish("fallback_sleep", "%s%s absent on %s (older binary), slept {waited}s >= "
-                      "interval + %.1fs margin, no durable evidence on %s (%s)"
-                      % (per + ", " if per else "", names, " ".join(missing),
-                         a.fallback_margin_s, " ".join(missing), iv))
+        return finish("fallback_sleep", "%s%s, slept {waited}s >= interval + %.1fs margin, "
+                      "no durable evidence on %s (%s)"
+                      % (per + ", " if per else "", why, a.fallback_margin_s,
+                         " ".join(missing), iv))
     if interval_ms is None:
         rec["note"] = ("WARNING: the node env resolves %s but %s ran checkpoints: waiting anyway "
                        "(timeout from the 15 s default)" % (off, " ".join(ran)))
