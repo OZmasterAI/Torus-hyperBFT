@@ -435,6 +435,34 @@ impl<N: Network> BlockSyncClient<N> {
         // rule prevents conflicting votes in live consensus but must not reject
         // valid committed blocks during catch-up.
         if !block.is_correct(block_tree)? {
+            // s138 D2: the block's justify is a Decide PC on an updating block U whose updates are
+            // still Pending here, correctly signed by the post-update set, but signed by too little
+            // of our committed (old) set to show that the old set committed U. An honest server
+            // sends exactly this after a disjoint replacement or a large power shift: this replica
+            // cannot check it, which is no proof against the server. Cool the server down instead
+            // of blacklisting it (as for an unsupported upgrade).
+            if block.hash == Block::hash(block.height, &block.justify, &block.data_hash)
+                && block
+                    .justify
+                    .is_unprovable_decide_on_pending_update(block_tree)?
+            {
+                log::error!(
+                    "block_sync: CANNOT CROSS the validator-set update at {:?}: the Decide PC in the \
+                     block at height {} is signed by the new set but by no more of our committed \
+                     set than its fault bound, so this replica cannot verify that the old set \
+                     committed the update (it needs the update's Commit PC). NOT blacklisting the \
+                     peer (cooling it down for {:?})",
+                    block.justify.block,
+                    block.height.int(),
+                    self.config.blacklist_expiry_time,
+                );
+                self.block_sync_client_state
+                    .cool_down_sync_server(peer, self.config.blacklist_expiry_time);
+                self.finish_session(false);
+                self.block_sync_client_state.no_server_retry_at =
+                    Some(Instant::now() + NO_SERVER_RETRY_INTERVAL);
+                return Ok(true);
+            }
             log::warn!("block_sync: block failed is_correct, blacklisting peer");
             self.block_sync_client_state
                 .blacklist_sync_server(peer, self.config.blacklist_expiry_time);
@@ -2305,5 +2333,267 @@ mod fatal_violation_wiring_tests {
         cli.block_sync_client_state.upgrade_cooldown[0].1 = Instant::now();
         cli.block_sync_client_state.remove_expired_blacklisted_servers();
         assert!(!cli.block_sync_client_state.cooling_down(&a));
+    }
+}
+
+/// s138 D2 (docs/plans/disjoint-vset-livelock.md §3.3): block sync across a validator-set update U.
+/// The client committed h0 under `S_old` = {1..4} (power 1 each); the server sends U (h1, Pending
+/// updates), B1 (h2, justify = U's Decide PC) and B2 (h3, justify = a Generic PC on B1).
+#[cfg(test)]
+mod membership_change_sync_tests {
+    use std::collections::VecDeque;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    use super::{BlockSyncClient, BlockSyncClientConfiguration, PendingSyncSession};
+    use crate::app::{
+        App, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest, ValidateBlockResponse,
+    };
+    use crate::block_tree::accessors::internal::{BlockTreeSingleton, BlockTreeWriteBatch};
+    use crate::hotstuff::header_fast_path_regression_test::{MemKV, NullNetwork};
+    use crate::hotstuff::types::{Phase, PhaseCertificate};
+    use crate::networking::network::ValidatorSetUpdateHandle;
+    use crate::test_keys::key_of;
+    use crate::types::block::Block;
+    use crate::types::crypto_primitives::{Keypair, SigningKey, VerifyingKey};
+    use crate::types::data_types::{
+        BlockHeight, ChainID, CryptoHash, Data, Power, SignatureSet, ViewNumber,
+    };
+    use crate::types::signing::phase_vote_bytes;
+    use crate::types::update_sets::{AppStateUpdates, ValidatorSetUpdates};
+    use crate::types::validator_set::{ValidatorSet, ValidatorSetState, ValidatorSetUpdatesStatus};
+
+    const CHAIN_ID: ChainID = ChainID::new(0);
+
+    fn vk(seed: u8) -> VerifyingKey {
+        SigningKey::from_bytes(&[seed; 32]).verifying_key()
+    }
+
+    /// `phase` PC on `block` in `view`, laid out for `set`, signed by `signers`.
+    fn pc(
+        view: u64,
+        block: CryptoHash,
+        phase: Phase,
+        set: &ValidatorSet,
+        signers: &[u8],
+    ) -> PhaseCertificate {
+        let view = ViewNumber::new(view);
+        let message = phase_vote_bytes(CHAIN_ID, view, &block, phase);
+        let mut signatures = SignatureSet::new(set.len());
+        for (pos, member) in set.validators().enumerate() {
+            if signers.iter().any(|&seed| vk(seed) == *member) {
+                signatures.set(pos, Some(Keypair::new(key_of(member)).sign(&message)));
+            }
+        }
+        PhaseCertificate {
+            chain_id: CHAIN_ID,
+            view,
+            block,
+            phase,
+            signatures,
+        }
+    }
+
+    /// Validates every synced block; `updating_block` carries `updates`.
+    struct UpdateApp {
+        updating_block: CryptoHash,
+        updates: ValidatorSetUpdates,
+    }
+
+    impl App<MemKV> for UpdateApp {
+        fn produce_block(&mut self, _r: ProduceBlockRequest<MemKV>) -> ProduceBlockResponse {
+            unreachable!("sync only")
+        }
+        fn validate_block(&mut self, _r: ValidateBlockRequest<MemKV>) -> ValidateBlockResponse {
+            unreachable!("sync only")
+        }
+        fn validate_block_for_sync(
+            &mut self,
+            request: ValidateBlockRequest<MemKV>,
+        ) -> ValidateBlockResponse {
+            ValidateBlockResponse::Valid {
+                app_state_updates: None,
+                validator_set_updates: (request.proposed_block().hash == self.updating_block)
+                    .then(|| self.updates.clone()),
+            }
+        }
+    }
+
+    struct Fixture {
+        tree: BlockTreeSingleton<MemKV>,
+        client: BlockSyncClient<NullNetwork>,
+        app: UpdateApp,
+        peer: VerifyingKey,
+        u: CryptoHash,
+    }
+
+    /// The client's tree (h0 committed under `S_old`) and a session holding U, B1 and B2. U applies
+    /// `updates`; U's Decide PC is signed by `decide_signers`, B1's Generic PC by `generic_signers`
+    /// (both laid out for the post-update set).
+    fn fixture(
+        updates: ValidatorSetUpdates,
+        decide_signers: &[u8],
+        generic_signers: &[u8],
+    ) -> Fixture {
+        let mut s_old = ValidatorSet::new();
+        for seed in 1..=4 {
+            s_old.put(&vk(seed), Power::new(1));
+        }
+        let mut s_new = s_old.clone();
+        s_new.apply_updates(&updates);
+
+        let mut tree = BlockTreeSingleton::new(MemKV::default());
+        tree.initialize(
+            &AppStateUpdates::new(),
+            &ValidatorSetState::new(s_old.clone(), s_old.clone(), None, true),
+        )
+        .unwrap();
+        let h0 = Block::new(
+            BlockHeight::new(0),
+            PhaseCertificate::genesis_pc(),
+            CryptoHash::new([30; 32]),
+            Data::new(vec![]),
+        );
+        tree.insert(&h0, None, None).unwrap();
+        let mut wb = BlockTreeWriteBatch::new();
+        tree.commit(&mut wb, &h0.hash).unwrap();
+        tree.write(wb);
+
+        let u = Block::new(
+            BlockHeight::new(1),
+            pc(1, h0.hash, Phase::Generic, &s_old, &[1, 2, 3]),
+            CryptoHash::new([31; 32]),
+            Data::new(vec![]),
+        );
+        let b1 = Block::new(
+            BlockHeight::new(2),
+            pc(5, u.hash, Phase::Decide, &s_new, decide_signers),
+            CryptoHash::new([32; 32]),
+            Data::new(vec![]),
+        );
+        let b2 = Block::new(
+            BlockHeight::new(3),
+            pc(6, b1.hash, Phase::Generic, &s_new, generic_signers),
+            CryptoHash::new([33; 32]),
+            Data::new(vec![]),
+        );
+
+        let (commands, _) = mpsc::channel();
+        let (_, results) = mpsc::channel();
+        let mut client = BlockSyncClient::new(
+            BlockSyncClientConfiguration {
+                chain_id: CHAIN_ID,
+                request_limit: 32,
+                response_timeout: Duration::from_secs(1),
+                blacklist_expiry_time: Duration::from_secs(60),
+                block_sync_trigger_min_view_difference: 2,
+                block_sync_trigger_timeout: Duration::from_secs(60),
+            },
+            commands,
+            results,
+            ValidatorSetUpdateHandle::new(NullNetwork),
+            None,
+        );
+        let peer = vk(1);
+        client.pending_sync = Some(PendingSyncSession {
+            peer,
+            pending_blocks: VecDeque::from(vec![u.clone(), b1, b2]),
+            highest_pc: None,
+            blocks_synced: 0,
+            init_height: BlockHeight::new(1),
+            fetch_iterations: 1,
+            session_start: Instant::now(),
+            awaiting_fetch: false,
+            last_fetch_start_height: None,
+            is_backfill: false,
+        });
+        Fixture {
+            tree,
+            client,
+            app: UpdateApp {
+                updating_block: u.hash,
+                updates,
+            },
+            peer,
+            u: u.hash,
+        }
+    }
+
+    /// U adds n5. U's Decide PC is signed by n1, n2, n3, n5 (old power 3 of 4): the client commits
+    /// U on it, switches to the new set and checks B2's justify against it. RED before s138: B1
+    /// failed `is_correct` against the old set and the server was blacklisted.
+    #[test]
+    fn sync_crosses_a_membership_change() {
+        let mut updates = ValidatorSetUpdates::new();
+        updates.insert(vk(5), Power::new(1));
+        let Fixture {
+            mut tree,
+            mut client,
+            mut app,
+            peer,
+            u,
+        } = fixture(updates, &[1, 2, 3, 5], &[2, 3, 4, 5]);
+
+        for _ in 0..3 {
+            client.process_pending_block(&mut tree, &mut app).unwrap();
+        }
+
+        let state = &client.block_sync_client_state;
+        assert!(
+            !state.blacklist_contains_server_address(&peer),
+            "honest server blacklisted"
+        );
+        assert!(!state.cooling_down(&peer));
+        assert!(
+            tree.committed_validator_set().unwrap().contains(&vk(5)),
+            "U committed"
+        );
+        assert!(matches!(
+            tree.validator_set_updates_status(&u).unwrap(),
+            ValidatorSetUpdatesStatus::Committed
+        ));
+        assert!(tree.validator_set_state().unwrap().update_decided());
+        assert_eq!(
+            tree.highest_committed_block_height().unwrap(),
+            Some(BlockHeight::new(1))
+        );
+        assert_eq!(
+            tree.highest_pc().unwrap().view,
+            ViewNumber::new(6),
+            "B2 inserted: its justify passed against the new set"
+        );
+    }
+
+    /// U raises n4 from 1 to 10 (10 of 13: n4 alone is a new quorum). U's Decide PC is n4's alone:
+    /// old power 1, not above the old fault bound (4 - 3 = 1). The client cannot check it: it must
+    /// not commit U, and must cool the server down instead of blacklisting it.
+    #[test]
+    fn sync_cools_down_on_an_unprovable_decide_pc() {
+        let mut updates = ValidatorSetUpdates::new();
+        updates.insert(vk(4), Power::new(10));
+        let Fixture {
+            mut tree,
+            mut client,
+            mut app,
+            peer,
+            u,
+        } = fixture(updates, &[4], &[4]);
+
+        client.process_pending_block(&mut tree, &mut app).unwrap(); // U
+        client.process_pending_block(&mut tree, &mut app).unwrap(); // B1
+
+        let state = &client.block_sync_client_state;
+        assert!(client.pending_sync.is_none(), "the session ends");
+        assert!(
+            !state.blacklist_contains_server_address(&peer),
+            "not blacklisted"
+        );
+        assert!(state.cooling_down(&peer), "cooled down");
+        assert_eq!(state.consecutive_futile_sessions, 0, "no sync backoff");
+        assert!(tree.validator_set_updates_status(&u).unwrap().is_pending());
+        assert_eq!(
+            tree.highest_committed_block_height().unwrap(),
+            Some(BlockHeight::new(0))
+        );
     }
 }
