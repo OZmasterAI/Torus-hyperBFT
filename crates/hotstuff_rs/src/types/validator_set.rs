@@ -327,7 +327,7 @@ impl ValidatorSetState {
     /// while the update is undecided (for nudges and re-proposals), this names a single leader per
     /// view, so no view has two legitimate fresh proposals (two valid tips) during the update window.
     pub fn fresh_proposer_set(&self, view: ViewNumber) -> &ValidatorSet {
-        if self.update_view.is_some_and(|boundary| view <= boundary) {
+        if !self.update_decided && self.update_view.is_some_and(|boundary| view <= boundary) {
             &self.previous_validator_set
         } else {
             &self.committed_validator_set
