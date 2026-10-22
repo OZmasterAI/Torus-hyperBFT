@@ -6447,6 +6447,54 @@ mod tests {
         );
     }
 
+    /// L6.1 under P0.0: execution moves the L6.1 row when the headers' bit
+    /// turns on at H, after a barrier (everything below H durable). A stored
+    /// chain whose head is below both the old and the new activation was
+    /// hashed under the same rule, so it is kept and extended (no
+    /// hash-unverified node at H); a chain reaching the changed rule's first
+    /// height is still discarded.
+    /// RED before the wiring: every change discarded the chain.
+    #[test]
+    fn running_hash_book_window_change_above_the_head_keeps_the_chain() {
+        use crate::cf::CF_NATIVE_ORDER_BOOKS;
+        use crate::running_hash::{
+            configure_activation, configure_book_window, read_book_window, ID_NATIVE_ORDER_BOOKS,
+        };
+        let (db, _d) = temp_db();
+        configure_activation(&db, Some(1)).unwrap();
+        let mut expect = [0u8; 32];
+        for h in 1..=205u64 {
+            if h == 150 {
+                assert!(
+                    !configure_book_window(&db, Some(150)).unwrap(),
+                    "head 149 < 150: chain kept"
+                );
+                assert_eq!(read_book_window(&db), Some(150));
+            }
+            let w = vec![
+                (CF_NATIVE_BALANCES, vec![7], Some(h.to_be_bytes().to_vec())),
+                (
+                    CF_NATIVE_ORDER_BOOKS,
+                    2u64.to_be_bytes().to_vec(),
+                    Some(vec![h as u8; 40]),
+                ),
+            ];
+            rsh_overlay(&db, &w)
+                .flush_with_native_trie_stats(&db, Some(h), None, None)
+                .unwrap();
+            let mut hashed = rsh_expected(&w);
+            if h >= 150 && h % STATE_HASH_CHECKPOINT_INTERVAL != 0 {
+                hashed.retain(|e| e.0 != ID_NATIVE_ORDER_BOOKS);
+            }
+            expect = next_running_hash(&expect, h, &hashed);
+            assert_eq!(read_running_hash(&db), Some((h, expect)), "h_{h}");
+        }
+        assert_eq!(checkpoint_heights(&db), vec![100, 200]);
+        // Moving it to a height the chain already covers is another definition.
+        assert!(configure_book_window(&db, Some(180)).unwrap(), "head 205 >= 150");
+        assert_eq!(read_running_hash(&db), None);
+    }
+
     /// L6.1 digest on the serial flush: with the flag on, a block's book
     /// writes (hash id 3) are skipped off attest heights and hashed at them;
     /// every other entry is hashed as before. With the flag off, the same

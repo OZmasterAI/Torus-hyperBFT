@@ -43654,6 +43654,210 @@ mod crash_recovery_tests {
         }
     }
 
+    /// P0.0: the schedule of an L6.1 chain: the running hash from block 1,
+    /// window books (`Feature::BookWindowCommit`) from `window` (`None`: not
+    /// scheduled).
+    fn l61_schedule(window: Option<u64>) -> torus_types::ActivationSchedule {
+        use torus_types::Feature::{BookWindowCommit, RunningStateHash};
+        let mut pairs = vec![(RunningStateHash, 1)];
+        pairs.extend(window.map(|w| (BookWindowCommit, w)));
+        torus_types::ActivationSchedule::merge(&pairs.into_iter().collect(), &[]).unwrap()
+    }
+
+    /// [`l61_blocks`] whose headers carry the window-books bit from `window`
+    /// on (the bits [`l61_schedule`] gives), linked from that genesis.
+    fn l61_blocks_from(window: u64) -> Vec<TorusBlock> {
+        let schedule = l61_schedule(Some(window));
+        let mut blocks: Vec<TorusBlock> = l61_blocks()
+            .into_iter()
+            .map(|b| {
+                let bits = schedule.active_at(b.header.height);
+                with_features(b, bits)
+            })
+            .collect();
+        let (mut config, _) = make_test_config_and_db();
+        config.activations = schedule;
+        link_from_genesis(&config, &mut blocks);
+        blocks
+    }
+
+    /// One run of `blocks` on the deep seed with the running hash from 1 and
+    /// NO L6.1 row in META (execution must take it from the headers), the
+    /// node's chain config edited by `edit` (its own schedule).
+    fn l61_bit_run(
+        blocks: &[TorusBlock],
+        pipelined: bool,
+        mode: Option<torus_bridge::native_executor::BookMode>,
+        ckpt: Option<crate::exec_pipeline::CheckpointPolicy>,
+        fault: &P2Fault,
+        edit: fn(&mut ChainConfig),
+    ) -> P2Run {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                P2_DUMP_DURABLE.set(false);
+                P2_CONFIG_EDIT.set(None);
+            }
+        }
+        let _reset = Reset;
+        P2_DUMP_DURABLE.set(true);
+        P2_CONFIG_EDIT.set(Some(edit));
+        p2_run_full(
+            blocks,
+            pipelined,
+            mode,
+            false,
+            fault,
+            ckpt,
+            &|db| l61_seed(db, false),
+            false,
+            None,
+            None,
+        )
+    }
+
+    /// P0.0 wiring of L6.1: window books are `Feature::BookWindowCommit`, and
+    /// execution follows the committed headers' bit, never the node's own
+    /// schedule. Headers: the running hash from 1, the window bit from 150.
+    /// Below 150 every write set equals the L6.1-off run's (books hashed every
+    /// block, no forced full save at 100); from 150 books are hashed only at
+    /// 200, where every stored book is. The chain is never restarted (start
+    /// 1, checkpoints 100 and 200), and the META row the digest reads is 150.
+    /// Serial, checkpointed, crash-across-150, restart and a node whose own
+    /// schedule has no L6.1 all give the golden's write sets, hash and state.
+    /// RED before the wiring: the rule came from the chain config's bool, so
+    /// no node applied the window from 150.
+    #[test]
+    fn l61_follows_the_header_bit_from_its_activation() {
+        use torus_bridge::native_executor::BookMode;
+        const W: u64 = 150;
+        fn scheduled(c: &mut ChainConfig) {
+            c.activations = l61_schedule(Some(W));
+        }
+        fn unscheduled(c: &mut ChainConfig) {
+            c.activations = l61_schedule(None);
+        }
+        let classic = Some(BookMode::Classic);
+        let off = l61_run(
+            &l61_blocks(),
+            false,
+            true,
+            classic,
+            None,
+            false,
+            None,
+            &P2Fault::None,
+            None,
+            None,
+        );
+        let blocks = l61_blocks_from(W);
+        let golden = l61_bit_run(&blocks, true, classic, None, &P2Fault::None, scheduled);
+        assert_eq!(
+            golden.captured.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
+            (1..=L31_BLOCKS).collect::<Vec<_>>(),
+            "every height hashed, the chain never restarted"
+        );
+        let sorted = |mut v: Vec<torus_state::running_hash::WriteEntry>| {
+            v.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+            v
+        };
+        for ((h, w_off), (_, w_on)) in off.captured.iter().zip(&golden.captured) {
+            if *h < W {
+                assert_eq!(
+                    sorted(w_off.clone()),
+                    sorted(w_on.clone()),
+                    "height {h} < {W}: as without L6.1"
+                );
+            } else if h % 100 == 0 {
+                let stored = l61_books_at(&golden, *h).len();
+                assert!(stored >= 2, "books exist at {h}");
+                assert_eq!(l61_book_entries(w_on), stored, "attest {h}: every book");
+            } else {
+                assert_eq!(l61_book_entries(w_on), 0, "height {h}: no book bytes");
+            }
+        }
+        assert!(l61_book_entries(&off.captured[99].1) > 0, "100 hashes its dirty books");
+        assert_eq!(torus_state::running_hash::read_book_window(&golden.db), Some(W));
+        assert_eq!(
+            torus_state::running_hash::read_activation_height(&golden.db),
+            Some(1)
+        );
+        for h in [100u64, 200] {
+            assert!(
+                torus_state::running_hash::read_checkpoint(&golden.db, h).is_some(),
+                "checkpoint {h}"
+            );
+        }
+        let check = |run: &P2Run, what: &str| {
+            assert_write_sets_equal(&golden.captured, &run.captured, what);
+            assert_eq!(golden.hash, run.hash, "{what}: running hash");
+            assert_eq!(
+                torus_state::running_hash::read_book_window(&run.db),
+                Some(W),
+                "{what}: META follows the headers"
+            );
+            assert_eq!(l31_divergence(&golden, run), None, "{what}");
+        };
+        let none = P2Fault::None;
+        let crash = P2Fault::CkptCrash(vec![(148, false), (W, true), (198, true)]);
+        let restart = P2Fault::RestartEvery(37);
+        let runs: [(&str, bool, _, _, &P2Fault, fn(&mut ChainConfig)); 6] = [
+            ("serial", false, classic, None, &none, scheduled),
+            ("serial, no resident books", false, None, None, &none, scheduled),
+            ("checkpoint every 7", true, classic, Some(ckpt_every(7)), &none, scheduled),
+            ("crash across 150", true, classic, Some(ckpt_every(5)), &crash, scheduled),
+            ("restart every 37", true, classic, None, &restart, scheduled),
+            ("own schedule without L6.1", true, classic, Some(ckpt_every(7)), &none, unscheduled),
+        ];
+        for (what, pipelined, mode, ckpt, fault, edit) in runs {
+            let run = l61_bit_run(&blocks, pipelined, mode, ckpt, fault, edit);
+            check(&run, what);
+        }
+    }
+
+    /// P0.0 wiring of L6.1, the L3.1 guard: L3.1 runs with the hash on only
+    /// where the window bit is on too. A node whose schedule allowed L3.1
+    /// (hash and L6.1 from 1) meeting a header that carries the running-hash
+    /// bit without the window bit fail-stops before executing it (its h_n
+    /// would need that block's book bytes); headers with both bits run.
+    /// RED before the wiring: only a change of the hash activation was checked.
+    #[test]
+    fn l31_fail_stops_on_a_hashed_header_without_the_window_bit() {
+        for window_bit in [false, true] {
+            let (mut config, db) = make_test_config_and_db();
+            config.activations = l61_schedule(Some(1));
+            let mut ctx = make_exec_ctx(&config, &db);
+            ctx.checkpoint = Some(ckpt_every(5));
+            ctx.configure_book_coalesce_with(true, Some(1), Some(1), None);
+            assert!(ctx.book_coalesce, "L3.1 on");
+            ctx.attach_flush_worker(None);
+            let mut blocks: Vec<TorusBlock> = (1..=3)
+                .map(|h| {
+                    let b = make_block(h, vec![]);
+                    let bits = if window_bit {
+                        config.activations.active_at(h)
+                    } else {
+                        TEST_FEATURES
+                    };
+                    with_features(b, bits)
+                })
+                .collect();
+            // Block 1 links to this node's genesis parent header.
+            link_from_genesis(&config, &mut blocks);
+            for b in &blocks {
+                dispatch_and_execute(&ctx, &db, b);
+            }
+            let failed = ctx.exec_failed.load(Ordering::SeqCst);
+            assert_eq!(failed, !window_bit, "window bit {window_bit}");
+            if !window_bit {
+                assert!(
+                    read_native_applied_height(&db).unwrap_or(0) == 0,
+                    "nothing of block 1 applied"
+                );
+            }
+        }
+    }
+
     /// L6.1 switch: L3.1 may run with the running hash iff L6.1 is on, and
     /// L6.1 refuses the row book modes.
     #[test]

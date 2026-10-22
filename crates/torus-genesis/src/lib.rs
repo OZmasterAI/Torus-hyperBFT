@@ -1271,6 +1271,89 @@ mod tests {
         }
     }
 
+    /// L6.1 under P0.0: window books are the feature `book_window_commit`.
+    /// `consensus.activations.book_window_commit` schedules it at its own
+    /// height; the bool `consensus.book_window_commit` (what the bench
+    /// harness writes) is its alias: from the running hash's height. Refused:
+    /// L6.1 without the running hash, the alias next to an explicit height
+    /// other than the hash's, and a row book mode.
+    /// RED before the wiring: the bool stayed outside the schedule and the
+    /// refusals loaded.
+    #[test]
+    fn genesis_book_window_commit_is_the_book_window_feature() {
+        use torus_types::Feature::{BookWindowCommit, RunningStateHash};
+        let with = |f: &dyn Fn(&mut serde_json::Value)| {
+            let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+            f(&mut json);
+            Genesis::from_json(&json.to_string())
+        };
+        let alias = with(&|j| {
+            j["consensus"]["state_hash_activation_height"] = serde_json::json!(7);
+            j["consensus"]["book_window_commit"] = serde_json::json!(true);
+        })
+        .unwrap()
+        .chain_config();
+        assert_eq!(alias.activations.height_of(RunningStateHash), Some(7));
+        assert_eq!(alias.activations.height_of(BookWindowCommit), Some(7));
+        assert_eq!(alias.book_window_activation(), Some(7));
+        assert_eq!(
+            alias.activations.active_at(7),
+            RunningStateHash.bit() | BookWindowCommit.bit(),
+            "the header bits carry it"
+        );
+        let own = with(&|j| {
+            j["consensus"]["activations"] =
+                serde_json::json!({"running_state_hash": 1, "book_window_commit": 300});
+        })
+        .unwrap()
+        .chain_config();
+        assert_eq!(own.book_window_activation(), Some(300));
+        assert_eq!(own.activations.active_at(299) & BookWindowCommit.bit(), 0);
+        // The alias with the same explicit height is fine.
+        assert!(with(&|j| {
+            j["consensus"]["activations"] =
+                serde_json::json!({"running_state_hash": 5, "book_window_commit": 5});
+            j["consensus"]["book_window_commit"] = serde_json::json!(true);
+        })
+        .is_ok());
+        let refused = [
+            (
+                "alias without the running hash",
+                with(&|j| {
+                    j["consensus"]["activations"] = serde_json::json!({});
+                    j["consensus"]["book_window_commit"] = serde_json::json!(true);
+                }),
+            ),
+            (
+                "feature without the running hash",
+                with(&|j| {
+                    j["consensus"]["activations"] = serde_json::json!({"book_window_commit": 3});
+                }),
+            ),
+            (
+                "alias next to another height",
+                with(&|j| {
+                    j["consensus"]["activations"] =
+                        serde_json::json!({"running_state_hash": 1, "book_window_commit": 300});
+                    j["consensus"]["book_window_commit"] = serde_json::json!(true);
+                }),
+            ),
+            (
+                "row book mode",
+                with(&|j| {
+                    j["consensus"]["activations"] =
+                        serde_json::json!({"running_state_hash": 1, "book_window_commit": 1});
+                    j["consensus"]["book_mode"] = serde_json::json!("level_authority_chunked");
+                }),
+            ),
+        ];
+        for (what, got) in refused {
+            let err = got.expect_err(what);
+            assert!(matches!(err, GenesisError::InvalidActivations(_)), "{what}: {err}");
+            assert!(err.to_string().contains("book_window_commit"), "{what}: {err}");
+        }
+    }
+
     /// L6.1: `consensus.book_window_commit` is a CHAIN-WIDE genesis field,
     /// absent (every existing genesis) = off; on needs the running hash.
     #[test]
