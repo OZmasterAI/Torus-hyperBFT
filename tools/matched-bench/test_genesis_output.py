@@ -252,6 +252,39 @@ for i in $(seq "$3" $(( $3 + $5 - 1 ))); do printf '%s 0x%040x\\n' "$i" "$i"; do
         self.assertNotIn('activations', final['consensus'])
         self.assertIn('  state_hash_activation = 7\n', result.stdout)
 
+    def test_inherited_hash_spellings_never_survive_the_scripts_choice(self):
+        # Codex P2 (s136): a weighted base carrying the legacy alias
+        # state_hash_activation_height (or the L6.1 bool, or activations of
+        # its own) must not leak into the final genesis: with 'off' the hash
+        # was reported off while the parser merged the inherited alias back
+        # in. This script alone decides the hash and L6.1 spellings.
+        inherited = [
+            {'state_hash_activation_height': 7},
+            {'state_hash_activation_height': 7, 'book_window_commit': True},
+            {'activations': {'running_state_hash': 7, 'book_window_commit': 7}},
+        ]
+        cases = [
+            ('off', None, 'off', False),
+            ('unset', {'running_state_hash': 1, 'book_window_commit': 1}, '1', True),
+            ('5', None, '5', False),
+        ]
+        for extra in inherited:
+            consensus = {**self.base['consensus'], **extra}
+            (self.root / 'testnet/genesis-weighted-base.json').write_text(
+                json.dumps({**self.base, 'consensus': consensus}))
+            for value, activations, shown, window in cases:
+                with self.subTest(inherited=extra, STATE_HASH_ACTIVATION=value):
+                    env = {} if value == 'unset' else {'STATE_HASH_ACTIVATION': value}
+                    result = self.run_script(force=True, **env)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    final = json.loads(self.output.read_text())['consensus']
+                    self.assertEqual(final.get('activations'), activations, final)
+                    self.assertEqual(final.get('state_hash_activation_height'),
+                                     int(value) if value.isdigit() else None, final)
+                    self.assertNotIn('book_window_commit', final)
+                    self.assertIn('  state_hash_activation = %s\n' % shown, result.stdout)
+                    self.assertEqual('book_window_commit = on' in result.stdout, window, result.stdout)
+
     def test_default_classic_genesis_reports_window_books_on(self):
         # The default for a Classic genesis is the hash + L6.1 from block 1
         # (CL21), written as activations; the summary says both. A row book
