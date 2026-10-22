@@ -2905,6 +2905,16 @@ impl<N: Network> HotStuff<N> {
         Ok(check)
     }
 
+    /// Review M2 (RED stub): whether a vote for `block_hash` may skip the app's freshness rules.
+    pub(crate) fn freshness_exempt<K: KVStore>(
+        _block_hash: &CryptoHash,
+        _tc: Option<&TimeoutCertificate>,
+        _is_reproposal: bool,
+        _block_tree: &BlockTreeSingleton<K>,
+    ) -> Result<bool, HotStuffError> {
+        Ok(false)
+    }
+
     /// TC phase C review (docs/plans/tc-required-and-tip-signing.md §4): whether `proposer` is the
     /// one fresh proposer of `view` ([`fresh_proposer`]) for a block justified by `justify`.
     ///

@@ -220,6 +220,28 @@ pub trait App<K: KVStore>: Send {
         BlockDataCheck::Held
     }
 
+    /// [`Self::check_block_data`] for the vote on a block consensus may make a
+    /// leader propose again, whose contents (and so its timestamp) are fixed
+    /// by its hash, and whose vote-time FRESHNESS rules an honest replica
+    /// already checked when the block was new (review M2: Torus's 30 s block
+    /// timestamp lower bound). Asked instead of `check_block_data` when the
+    /// block is certified (this replica's highest or locked PC, or the attached
+    /// TC's high QC: the validator-set-update re-proposal), this replica voted
+    /// for it before, or it is an authenticated TC re-proposal (the TC's
+    /// winning high tip, which is this replica's own tip or is vouched for by
+    /// more than the faulty power of the TC's signed tips). The app may skip
+    /// rules that only time can break here; every other rule must still
+    /// apply, so a long stall cannot make such a block unvotable forever.
+    ///
+    /// The default is [`Self::check_block_data`].
+    fn check_reproposal_data(
+        &mut self,
+        block: &Block,
+        block_tree: &AppBlockTreeView<'_, K>,
+    ) -> BlockDataCheck {
+        self.check_block_data(block, block_tree)
+    }
+
     /// Called after a block is irrevocably committed by consensus (finalized via
     /// the commit rule -- 2-chain in MonadBFT pipelined mode).
     ///
