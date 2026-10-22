@@ -1812,6 +1812,7 @@ fn handle_event(
             } else {
                 None
             };
+            warn!(%peer, ?error, tracked = tracked.is_some(), "DIAG direct OutboundFailure");
             if let Some((target, message)) = tracked {
                 // Re-enqueue unconditionally (cheap; the queue is bounded) so the next
                 // reconnect flush re-delivers the message.
@@ -3410,6 +3411,17 @@ fn handle_consensus_direct_traced(
         t.decode_end_us = Some(ReceiveTrace::stamp());
         if let Some(meta) = body_fetch_trace_metadata(&msg) {
             t.kind = Some(meta.kind); t.hash = Some(meta.hash); t.view = Some(meta.view);
+        }
+    }
+    {
+        use hotstuff_rs::networking::messages::Message as M;
+        let kind = match &msg {
+            M::BlockSyncMessage(hotstuff_rs::block_sync::messages::BlockSyncMessage::BlockSyncRequest(_)) => "request".to_string(),
+            M::BlockSyncMessage(_) => "response".to_string(),
+            _ => String::new(),
+        };
+        if !kind.is_empty() {
+            info!(%peer, kind, bytes = payload.len(), "DIAG direct in: block sync message");
         }
     }
     if enqueue_consensus_inbound_traced(shared, sender_vk, msg, payload, trace) == ConsensusEnqueue::Duplicate {

@@ -119,6 +119,8 @@ impl<N: Network + 'static, K: KVStore> BlockSyncServer<N, K> {
                 })
                 .publish(&self.event_publisher);
 
+                let diag_t0 = std::time::Instant::now();
+                log::info!("DIAG syncsv: request start={} limit={}", start_height.int(), limit);
                 // Get, from the block tree, the blocks and the PC that will be used to form the Block Sync Response.
                 let bt_snapshot = self.block_tree_camera.snapshot();
                 let blocks_res = bt_snapshot.blocks_from_height_to_newest(
@@ -129,6 +131,7 @@ impl<N: Network + 'static, K: KVStore> BlockSyncServer<N, K> {
 
                 match (blocks_res, highest_pc_res) {
                     (Ok(blocks), Ok(highest_pc)) => {
+                        log::info!("DIAG syncsv: built {} blocks in {:?}", blocks.len(), diag_t0.elapsed());
                         // If there are blocks and a highest PC to return, send a Block Sync Response.
                         self.sender.send(
                             origin,
