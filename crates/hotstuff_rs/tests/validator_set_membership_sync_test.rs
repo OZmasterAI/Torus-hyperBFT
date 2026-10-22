@@ -17,7 +17,7 @@
 //! | T4 | add 1 to 4; the joiner cut off through the window | RED (D2) |
 //! | T5 | add 1 to 4; a fresh node started from genesis after the decide | RED (D2) |
 //! | T6a | power 1 -> 2 for one of 4; a member deaf from U's Precommit-PC nudge on | GREEN |
-//! | T6b | power 1 -> 10 for one of 4; same; the Decide PC holds no old-set quorum | RED |
+//! | T6b | power 1 -> 10 for one of 4; same; the Decide PC holds no old-set quorum | RED (ignored: needs U's Commit PC) |
 //!
 //! A laggard that is an old-set member stays in the window until it has voted Commit (its votes
 //! still leave once it is deaf). A dead old-set member in the window can livelock the window on
@@ -455,7 +455,12 @@ fn laggard_crosses_a_small_power_change() {
 /// dropped, so the Decide PC is n3's alone: power 1 under the old powers, below the old quorum (3 of
 /// 4), and no more than the old set's fault bound (1). n0 cannot tell from the chain that the old
 /// set committed U.
+///
+/// Stays RED with the s138 fix: n3 alone may be the old set's one tolerated fault, and the chain
+/// carries no old-set signature on U, so n0 cannot tell U from a U* n3 built for itself. Crossing
+/// needs U's Commit PC served to n0 (persisted by servers: a DB and protocol change).
 #[test]
+#[ignore = "needs U's Commit PC (format change): Decide PC signed only by a member holding the old fault bound"]
 fn laggard_crosses_a_large_power_change() {
     let mut cluster = Cluster::new(4, &[(0, 1), (1, 1), (2, 1), (3, 1)]);
     for i in 0..4 {

@@ -841,7 +841,9 @@ impl<K: KVStore> BlockTreeSingleton<K> {
                     wb.set_previous_validator_set(&previous_validator_set)?;
                     wb.set_validator_set_update_block_height(block_height)?;
                     wb.set_validator_set_update_decided(false)?;
-                    wb.set_committed_validator_set_updates(block)?;
+                    // s138 D3: mark the updating block `b`, not the commit target `block` (they
+                    // differ when `b` commits as an ancestor of the target).
+                    wb.set_committed_validator_set_updates(b)?;
 
                     committed_blocks.push((*b, Some(validator_set_updates.clone())));
                 } else {
