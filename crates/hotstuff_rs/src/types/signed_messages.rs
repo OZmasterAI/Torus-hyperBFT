@@ -82,7 +82,12 @@ pub(crate) trait Certificate {
 
     /// Check whether the certificate is "correct" ( i.e., whether it can serve as evidence that a particular
     /// decision has been approved by the quorum of validators assigned to collectively make the decision),
-    /// given the current `block_tree`.
+    /// given the current `block_tree`, for the chain `chain_id`.
+    ///
+    /// A certificate is bound to its chain: one of another chain is never correct, even when it is
+    /// correctly signed by our validators (the same keys may validate another chain, and every vote
+    /// signs its own `chain_id`), and neither is one that embeds a certificate of another chain. The
+    /// genesis PC (chain 0 by definition) is the one chain-neutral certificate.
     ///
     /// ## Guidelines for implementation
     ///
@@ -95,6 +100,7 @@ pub(crate) trait Certificate {
     ///    committed validator set, the previous validator set, or both (in separate calls).
     fn is_correct<K: KVStore>(
         &self,
+        chain_id: ChainID,
         block_tree: &BlockTreeSingleton<K>,
     ) -> Result<bool, BlockTreeError>;
 

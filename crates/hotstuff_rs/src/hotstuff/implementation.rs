@@ -779,7 +779,7 @@ impl<N: Network> HotStuff<N> {
                 // would (pacemaker `on_receive_advance_view`). The TC binds only
                 // the QC's view and block, so check the QC itself first.
                 if let Some(high_qc) = &tc.high_qc {
-                    if high_qc.view > highest_pc.view && high_qc.is_correct(block_tree)? {
+                    if high_qc.view > highest_pc.view && high_qc.is_correct(self.config.chain_id, block_tree)? {
                         block_tree.advance_highest_pc_from_remote(high_qc, &self.event_publisher)?;
                     }
                 }
@@ -1406,7 +1406,7 @@ impl<N: Network> HotStuff<N> {
         }
 
         // 1. Check if block is correct and safe.
-        let is_correct = proposal.block.is_correct(block_tree)?;
+        let is_correct = proposal.block.is_correct(self.config.chain_id, block_tree)?;
         let is_safe = if is_correct {
             safe_block(&proposal.block, block_tree, self.config.chain_id)?
         } else {
@@ -1621,7 +1621,7 @@ impl<N: Network> HotStuff<N> {
         .publish(&self.event_publisher);
 
         // 1. Check if the nudge is correct and safe.
-        if !nudge.justify.is_correct(block_tree)?
+        if !nudge.justify.is_correct(self.config.chain_id, block_tree)?
             || !safe_nudge(
                 &nudge,
                 self.view_info.view,
@@ -1763,10 +1763,10 @@ impl<N: Network> HotStuff<N> {
                 // collector's PCs remain correct by construction.
                 if block_tree.validator_set_state()?.update_decided() {
                     debug_assert!(
-                        new_pc.is_correct(block_tree)?,
+                        new_pc.is_correct(self.config.chain_id, block_tree)?,
                         "locally-collected steady-state PC must be correct by construction"
                     );
-                } else if !new_pc.is_correct(block_tree)? {
+                } else if !new_pc.is_correct(self.config.chain_id, block_tree)? {
                     return Ok(());
                 }
                 let pc_block_pending = self.pending_headers.contains_key(&new_pc.block)
@@ -1863,7 +1863,7 @@ impl<N: Network> HotStuff<N> {
         .publish(&self.event_publisher);
 
         // 1. Check if the highest_pc in the NewView message is correct and safe.
-        if new_view.highest_pc.is_correct(block_tree)?
+        if new_view.highest_pc.is_correct(self.config.chain_id, block_tree)?
             && safe_pc(&new_view.highest_pc, block_tree, self.config.chain_id)?
         {
             // 2. Trigger block tree updates: update highestPC, lock, commit (if new PC collected).
@@ -2000,7 +2000,7 @@ impl<N: Network> HotStuff<N> {
 
         // Validate the block before reproposing: check hash/justify correctness
         // and safety invariants (safe_pc, block justify type).
-        if !resp.block.is_correct(block_tree)? {
+        if !resp.block.is_correct(self.config.chain_id, block_tree)? {
             return Ok(());
         }
         if !safe_block(&resp.block, block_tree, self.config.chain_id)? {
@@ -2435,7 +2435,7 @@ impl<N: Network> HotStuff<N> {
         // In the header pipeline, the justify's block may not yet be in the tree
         // (body still in flight) but we already validated and voted for it. Tracked
         // entries in pending_headers/pending_bodies are proof of prior validation.
-        let justify_correct = header.justify.is_correct(block_tree)?;
+        let justify_correct = header.justify.is_correct(self.config.chain_id, block_tree)?;
         let justify_previously_validated = self.pending_headers.contains_key(&header.justify.block)
             || self.pending_bodies.contains_key(&header.justify.block);
         let is_safe = if justify_correct {
@@ -3099,7 +3099,7 @@ impl<N: Network> HotStuff<N> {
     ) -> Result<bool, HotStuffError> {
         Ok(self.body_metadata_is_bound(block)
             && (self.pending_headers.contains_key(&block.hash)
-                || block.justify.is_correct(block_tree)?))
+                || block.justify.is_correct(self.config.chain_id, block_tree)?))
     }
 
     /// Attempt to validate and insert a block body. See [`BodyInsert`] for the
@@ -4751,7 +4751,7 @@ mod sync_recovery_tests {
         let child = Block::new(BlockHeight::new(1),
             generic_pc(ViewNumber::new(1), parent.hash, &old_keys, &old_set),
             CryptoHash::new([10; 32]), Data::new(vec![]));
-        assert!(!child.justify.is_correct(&tree).unwrap(),
+        assert!(!child.justify.is_correct(hotstuff.config.chain_id, &tree).unwrap(),
             "missing parent makes certificate verification use the new set");
         hotstuff.justify_fetch_tracker.insert(child.hash, (Instant::now(), 0, origin, view));
         let mut app = RecoveryApp { calls: 0, valid: true, reject_below: 0 };
@@ -4765,7 +4765,7 @@ mod sync_recovery_tests {
         // Parent arrives through sync; its stored height now identifies the old
         // validator set. Only then may the child's QC and app data be accepted.
         tree.insert(&parent, None, None).unwrap();
-        assert!(child.justify.is_correct(&tree).unwrap());
+        assert!(child.justify.is_correct(hotstuff.config.chain_id, &tree).unwrap());
         hotstuff.poll_deferred_bodies_after_sync(true, &mut tree, &mut app).unwrap();
         assert!(tree.contains(&child.hash));
         assert_eq!(app.calls, 1);

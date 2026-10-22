@@ -149,7 +149,9 @@ pub fn apply<K: KVStore>(
     if !recovery_pc.is_block_justify() {
         return Err(RecoveryError::PcWrongPhase);
     }
-    if !recovery_pc.is_correct(&bt)? {
+    // The operator supplies the PC for this store's own chain; it is checked against the chain it
+    // claims (the replica re-checks every certificate it acts on against its configured chain).
+    if !recovery_pc.is_correct(recovery_pc.chain_id, &bt)? {
         return Err(RecoveryError::PcBadSignatures);
     }
 

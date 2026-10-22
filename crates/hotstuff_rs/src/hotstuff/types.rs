@@ -46,14 +46,19 @@ impl Certificate for PhaseCertificate {
     /// Determine the appropriate validator set that the PC should be checked against, and check if the
     /// signatures in the certificate are correct and form a quorum given this validator set.
     ///
-    /// A special case is if the PC is the Genesis PC, in which case it is automatically correct.
+    /// A special case is if the PC is the Genesis PC, in which case it is automatically correct. Any
+    /// other PC must be of chain `chain_id`.
     fn is_correct<K: KVStore>(
         &self,
+        chain_id: ChainID,
         block_tree: &BlockTreeSingleton<K>,
     ) -> Result<bool, BlockTreeError> {
         if self.is_genesis_pc() {
             return Ok(true);
         };
+        if self.chain_id != chain_id {
+            return Ok(false);
+        }
 
         let block_height = block_tree.block_height(&self.block)?;
 
@@ -243,12 +248,13 @@ impl PhaseCertificate {
     /// the post-update set, but without enough old-set signers to show that the old set committed
     /// the block (see [`is_correct_decide_on_pending_update`](Self::is_correct_decide_on_pending_update)).
     /// Block sync does not blacklist a server for such a PC: the server may be honest, this replica
-    /// just cannot check it.
+    /// just cannot check it. A PC of another chain than `chain_id` is never merely unprovable.
     pub(crate) fn is_unprovable_decide_on_pending_update<K: KVStore>(
         &self,
+        chain_id: ChainID,
         block_tree: &BlockTreeSingleton<K>,
     ) -> Result<bool, BlockTreeError> {
-        if !self.phase.is_decide() || block_tree.block_height(&self.block)?.is_none() {
+        if self.chain_id != chain_id || !self.phase.is_decide() || block_tree.block_height(&self.block)?.is_none() {
             return Ok(false);
         }
         let ValidatorSetUpdatesStatus::Pending(updates) =
@@ -649,7 +655,7 @@ pub(crate) fn valid_proposal_certificates<K: KVStore>(
     if !extends_tc_high_qc(block_hash, justify, tc, nec) {
         return Ok(false);
     }
-    tc.is_correct(block_tree)
+    tc.is_correct(chain_id, block_tree)
 }
 
 /// VALIDPROPOSAL rule V1 (docs/plans/tc-required-and-tip-signing.md §2): a
@@ -1105,12 +1111,12 @@ mod pending_update_decide_pc_tests {
 
         assert!(
             decide_pc(u, 5, &s_new, &[1, 2, 3, 5])
-                .is_correct(&bt)
+                .is_correct(CHAIN, &bt)
                 .unwrap(),
             "a Decide PC of the post-update set on a Pending U must pass"
         );
         assert!(
-            !decide_pc(u, 5, &s_old, &[1, 2, 3]).is_correct(&bt).unwrap(),
+            !decide_pc(u, 5, &s_old, &[1, 2, 3]).is_correct(CHAIN, &bt).unwrap(),
             "a Decide PC laid out for the pre-update set must fail"
         );
     }
@@ -1133,11 +1139,11 @@ mod pending_update_decide_pc_tests {
             "fixture: n9 alone is a quorum of the post-update set"
         );
         assert!(
-            !decide_pc(u, 5, &s_new, &[9]).is_correct(&bt).unwrap(),
+            !decide_pc(u, 5, &s_new, &[9]).is_correct(CHAIN, &bt).unwrap(),
             "a Decide PC no pre-update member signed must fail"
         );
         assert!(
-            !decide_pc(u, 5, &s_new, &[1, 9]).is_correct(&bt).unwrap(),
+            !decide_pc(u, 5, &s_new, &[1, 9]).is_correct(CHAIN, &bt).unwrap(),
             "old power 1 of 4 does not exceed the old set's fault bound (4 - 3 = 1): fail"
         );
     }

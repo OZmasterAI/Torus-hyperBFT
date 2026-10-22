@@ -200,6 +200,9 @@ mod parent_feed_order_test;
 mod tc_validation_test;
 
 #[cfg(test)]
+pub(crate) mod cross_chain_certificate_test;
+
+#[cfg(test)]
 mod tc_leader_test;
 
 #[cfg(test)]

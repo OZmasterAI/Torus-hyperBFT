@@ -376,11 +376,11 @@ fn tc_summary_rewritten_high_tip_is_not_correct() {
     let b = block(1);
     let c = block(2);
     let honest = reproposal_tc(&c);
-    assert!(honest.is_correct(&tree).unwrap(), "control: collector TC is correct");
+    assert!(honest.is_correct(CHAIN_ID, &tree).unwrap(), "control: collector TC is correct");
 
     let mut forged = honest.clone();
     forged.high_tip = Some(tip(&b, VIEW - 1));
-    assert!(!forged.is_correct(&tree).unwrap(), "high tip no signer reported");
+    assert!(!forged.is_correct(CHAIN_ID, &tree).unwrap(), "high tip no signer reported");
 }
 
 /// Dropping the signed winning tip turns a re-proposal view into a fresh one.
@@ -392,7 +392,7 @@ fn tc_summary_hidden_high_tip_is_not_correct() {
     let mut hidden = reproposal_tc(&block(2));
     hidden.high_tip = None;
     hidden.high_tip_is_winner = false;
-    assert!(!hidden.is_correct(&tree).unwrap(), "signed tips but no high tip");
+    assert!(!hidden.is_correct(CHAIN_ID, &tree).unwrap(), "signed tips but no high tip");
 }
 
 #[test]
@@ -402,7 +402,7 @@ fn tc_summary_flipped_winner_is_not_correct() {
     let (tree, _) = steady_block_tree(&set);
     let mut flipped = reproposal_tc(&block(2));
     flipped.high_tip_is_winner = false;
-    assert!(!flipped.is_correct(&tree).unwrap(), "tip with no QC must win");
+    assert!(!flipped.is_correct(CHAIN_ID, &tree).unwrap(), "tip with no QC must win");
 }
 
 #[test]
@@ -419,20 +419,20 @@ fn tc_summary_high_qc_must_be_the_highest_signed_qc() {
         &[None, None, None],
         &[Some(low.clone()), Some(high.clone()), Some(low.clone())],
     );
-    assert!(tc.is_correct(&tree).unwrap(), "control: collector TC is correct");
+    assert!(tc.is_correct(CHAIN_ID, &tree).unwrap(), "control: collector TC is correct");
     assert!(tc.high_qc.as_ref() == Some(&high), "control: collector keeps the highest QC");
 
     let mut lower = tc.clone();
     lower.high_qc = Some(low);
-    assert!(!lower.is_correct(&tree).unwrap(), "a lower signed QC is not the high QC");
+    assert!(!lower.is_correct(CHAIN_ID, &tree).unwrap(), "a lower signed QC is not the high QC");
 
     let mut unsigned = tc.clone();
     unsigned.high_qc = Some(generic_pc(ViewNumber::new(3), block(9).hash, &keys[..3], &set));
-    assert!(!unsigned.is_correct(&tree).unwrap(), "a QC no signer reported");
+    assert!(!unsigned.is_correct(CHAIN_ID, &tree).unwrap(), "a QC no signer reported");
 
     let mut dropped = tc.clone();
     dropped.high_qc = None;
-    assert!(!dropped.is_correct(&tree).unwrap(), "signed QCs but no high QC");
+    assert!(!dropped.is_correct(CHAIN_ID, &tree).unwrap(), "signed QCs but no high QC");
 }
 
 // ---------------------------------------------------------------------------
@@ -452,12 +452,12 @@ fn tc_summary_tip_tied_with_high_qc_does_not_win() {
     let tips = vec![Some(tip(&c, VIEW - 1)); 3];
     let qcs = vec![Some(qc); 3];
     let tc = collected_tc(&keys[..3], &set, VIEW - 1, &tips, &qcs);
-    assert!(tc.is_correct(&tree).unwrap(), "control: collector TC is correct");
+    assert!(tc.is_correct(CHAIN_ID, &tree).unwrap(), "control: collector TC is correct");
     assert!(!tc.high_tip_is_winner, "control: the collector gives a tie to the QC");
 
     let mut forged = tc.clone();
     forged.high_tip_is_winner = true;
-    assert!(!forged.is_correct(&tree).unwrap(), "a tip tied with the high QC must not win");
+    assert!(!forged.is_correct(CHAIN_ID, &tree).unwrap(), "a tip tied with the high QC must not win");
 }
 
 /// The header path checks a header's TC against the HEADER's view, not the
@@ -679,7 +679,7 @@ fn tc_with_a_forged_high_qc_is_not_correct() {
     let forged = forged_qc(VIEW - 2, block(44).hash);
     let tc = collected_tc(&keys[..3], &set, VIEW - 1, &[None, None, None], &[Some(forged.clone()), Some(honest), None]);
     assert!(tc.high_qc.as_ref() == Some(&forged), "fixture: the forged QC is the highest summary");
-    assert!(!tc.is_correct(&tree).unwrap(), "a TC whose high QC is not a correct QC");
+    assert!(!tc.is_correct(CHAIN_ID, &tree).unwrap(), "a TC whose high QC is not a correct QC");
 }
 
 /// With the forged-QC TC attached, neither the block above nor the block
@@ -805,7 +805,7 @@ fn f2_tc_carrying_a_tip_with_a_forged_view_is_rejected() {
     let tips = vec![Some(forged.clone()), Some(forged.clone()), Some(forged)];
     let tc = collected_tc(&keys[..3], &set, VIEW - 1, &tips, &[None, None, None]);
     let (tree, _) = steady_block_tree(&set);
-    assert!(!tc.is_correct(&tree).unwrap(), "high tip fails F2");
+    assert!(!tc.is_correct(CHAIN_ID, &tree).unwrap(), "high tip fails F2");
     assert_both_paths("re-proposal under a TC with a forged tip view", &b, (Some(tc), None), false);
 }
 
@@ -820,10 +820,10 @@ fn f3_tc_whose_high_tip_is_not_the_highest_signed_view_is_not_correct() {
     let high = tip(&block(1), VIEW - 1);
     let tc = collected_tc(&keys[..3], &set, VIEW - 1, &[Some(low.clone()), Some(high.clone()), None], &[None, None, None]);
     assert!(tc.high_tip.as_ref() == Some(&high), "fixture: the collector keeps the highest tip");
-    assert!(tc.is_correct(&tree).unwrap(), "control: collector TC is correct");
+    assert!(tc.is_correct(CHAIN_ID, &tree).unwrap(), "control: collector TC is correct");
     let mut lower = tc.clone();
     lower.high_tip = Some(low);
-    assert!(!lower.is_correct(&tree).unwrap(), "a lower signed tip is not the high tip");
+    assert!(!lower.is_correct(CHAIN_ID, &tree).unwrap(), "a lower signed tip is not the high tip");
     assert_both_paths("re-proposal of the lower tip", &block(2), (Some(lower), None), false);
 }
 
@@ -838,11 +838,11 @@ fn f3_tc_high_tip_view_must_be_the_signed_view() {
     let b = block(1);
     let tips = vec![Some(tip(&b, VIEW - 3)); 3];
     let tc = collected_tc(&keys[..3], &set, VIEW - 1, &tips, &[None, None, None]);
-    assert!(tc.is_correct(&tree).unwrap(), "control: collector TC is correct");
+    assert!(tc.is_correct(CHAIN_ID, &tree).unwrap(), "control: collector TC is correct");
     let mut raised = tc.clone();
     raised.high_tip = Some(tip(&b, VIEW - 1));
     assert!(tip_is_correct(raised.high_tip.as_ref().unwrap()), "fixture: the raised tip passes F2");
-    assert!(!raised.is_correct(&tree).unwrap(), "a tip view no signer signed");
+    assert!(!raised.is_correct(CHAIN_ID, &tree).unwrap(), "a tip view no signer signed");
 }
 
 /// F3: the tip view is bound by each signer's signature, not only by the
@@ -865,7 +865,7 @@ fn f3_tip_view_is_bound_by_the_signatures() {
             *summary = Some(raised.summary());
         }
     }
-    assert!(!rewritten.is_correct(&tree).unwrap(), "tip views the signers did not sign");
+    assert!(!rewritten.is_correct(CHAIN_ID, &tree).unwrap(), "tip views the signers did not sign");
 }
 
 /// F3: a signed tip can be no newer than the view the TC times out.
@@ -876,7 +876,7 @@ fn f3_tc_with_a_tip_from_a_later_view_is_not_correct() {
     let (tree, _) = steady_block_tree(&set);
     let future = tip(&block(1), VIEW + 1);
     let tc = collected_tc(&keys[..3], &set, VIEW - 1, &[Some(future), None, None], &[None, None, None]);
-    assert!(!tc.is_correct(&tree).unwrap(), "tip view VIEW + 1 in TC(VIEW - 1)");
+    assert!(!tc.is_correct(CHAIN_ID, &tree).unwrap(), "tip view VIEW + 1 in TC(VIEW - 1)");
 }
 
 /// F1: a header (or full proposal) must carry its proposer's signature over
@@ -1131,9 +1131,9 @@ fn tip_signing_cost_report() {
     let with_tip = reproposal_tc(&b);
     let without_tip = bare_tc(VIEW - 1);
     time("TimeoutCertificate::is_correct, 3 signers, no tip", &mut || {
-        assert!(without_tip.is_correct(&tree).unwrap());
+        assert!(without_tip.is_correct(CHAIN_ID, &tree).unwrap());
     });
     time("TimeoutCertificate::is_correct, 3 signers, high tip (F2 + F3)", &mut || {
-        assert!(with_tip.is_correct(&tree).unwrap());
+        assert!(with_tip.is_correct(CHAIN_ID, &tree).unwrap());
     });
 }

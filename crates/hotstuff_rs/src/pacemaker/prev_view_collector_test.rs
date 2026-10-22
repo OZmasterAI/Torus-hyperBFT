@@ -225,7 +225,7 @@ fn a_timeout_vote_with_a_forged_high_qc_is_not_collected() {
         f.timeout_vote_with_qc(3, 5, None);
         let tc = f.tree.highest_tc().unwrap().expect("three honest votes form TC(5)");
         assert!(tc.high_qc.as_ref() == Some(&honest), "at view {current}: the TC's high QC is the honest one");
-        assert!(tc.is_correct(&f.tree).unwrap(), "at view {current}: the TC is correct");
+        assert!(tc.is_correct(CHAIN, &f.tree).unwrap(), "at view {current}: the TC is correct");
     }
 }
 
@@ -373,7 +373,7 @@ fn a_timeout_vote_with_an_invalid_tip_is_not_collected() {
             f.timeout_vote_with_tip(3, 5, None);
             let tc = f.tree.highest_tc().unwrap().expect("three honest votes form TC(5)");
             assert!(tc.high_tip.as_ref() == Some(&honest), "{name}, at view {current}: the high tip is the honest one");
-            assert!(tc.is_correct(&f.tree).unwrap(), "{name}, at view {current}: the TC is correct");
+            assert!(tc.is_correct(CHAIN, &f.tree).unwrap(), "{name}, at view {current}: the TC is correct");
         }
     }
 }
@@ -388,7 +388,7 @@ fn a_timeout_vote_with_a_valid_tip_is_collected() {
     f.timeout_vote_with_tip(2, 5, None);
     let tc = f.tree.highest_tc().unwrap().expect("TC(5)");
     assert!(tc.high_tip.as_ref() == Some(&honest));
-    assert!(tc.is_correct(&f.tree).unwrap());
+    assert!(tc.is_correct(CHAIN, &f.tree).unwrap());
 }
 
 /// F4 makes every replica drop a vote whose tip fails F2, so an honest replica
@@ -512,7 +512,7 @@ fn window_timeout_vote_reporting_the_previous_sets_tip_after_the_update_view_is_
     f.timeout_vote_with_tip(3, v, None);
     let tc = f.tree.highest_tc().unwrap().expect("three votes without X form TC(v)");
     assert!(tc.high_tip.as_ref() == Some(&tip_b), "TC(v) names B");
-    assert!(tc.is_correct(&f.tree).unwrap());
+    assert!(tc.is_correct(CHAIN, &f.tree).unwrap());
 }
 
 /// The timeout of a view is recorded against that view's fresh proposer (reputation
@@ -556,7 +556,7 @@ fn window_decided_replica_collects_a_pre_update_tip() {
         }
         let tc = f.tree.highest_tc().unwrap().unwrap_or_else(|| panic!("decided={decided}: TC({v}) forms"));
         assert!(tc.high_tip.as_ref() == Some(&tip), "decided={decided}: TC({v}) names the pre-update tip");
-        assert!(tc.is_correct(&f.tree).unwrap(), "decided={decided}: and is correct");
+        assert!(tc.is_correct(CHAIN, &f.tree).unwrap(), "decided={decided}: and is correct");
     }
 }
 
@@ -629,6 +629,6 @@ fn timeout_votes_carrying_a_checked_tc_cost_one_signature_check_each() {
         "one check per vote (its own signature); TC(5)'s signatures were already checked"
     );
     let before = signature_checks_on_this_thread();
-    assert!(tc5.is_correct(&f.tree).unwrap());
+    assert!(tc5.is_correct(CHAIN, &f.tree).unwrap());
     assert_eq!(signature_checks_on_this_thread() - before, 0, "TC(5) again: no check");
 }
