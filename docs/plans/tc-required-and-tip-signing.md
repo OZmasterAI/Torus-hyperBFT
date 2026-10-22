@@ -122,6 +122,33 @@ within about two one-way delays of the first f+1.
 - **Headroom.** The wait fits inside view v's timer: 1200 ms base (torus-types/src/lib.rs:1755-1757), stretched x2
   per stalled view up to cap 8 (PM:625-635, lib.rs:1767-1773).
 
+**As fixed (tc-liveness, s136).** Batch 9 (A+B+C on main) stalled the torus-consensus p00 cluster tests under
+`cargo test` (5-6 of 9 failed in one process; main 9/9). Not lost votes: CPU. A node-tagged trace of the CPU-busy
+crossing test (debug build, ubuntoz with 24 busy loops) showed one ed25519 check at ~36 ms and the same signatures
+checked again on every message (per header 7.5 checks, per timeout vote 6.2; main 3.0 / 2.7): the TC each timeout vote
+carries (its signatures, high QC, high tip), the tip and QC every honest vote reports, the header a leader re-sends
+every ~270 ms, each AdvanceView copy. Each replica's algorithm thread fell 4-5 s behind its queue (one replica
+processed its own TV(7) 4.6 s after sending it), so timeout votes for v-1 reached leader(v) after it had left v, QCs
+formed only in 8-16 s backed-off views and never in two consecutive views, and nothing committed.
+- **Fix.** All consensus checks go through `crypto_primitives::verify_signature`, which keeps the last 1024 checks that
+  passed on its thread, keyed by the exact `key ‖ signature ‖ message` bytes, and skips a check it has seen pass. A
+  failed or new check always runs, so every verdict is the one a fresh check gives: what a replica accepts (V1-V4,
+  F1-F5, the high-QC checks, the one-fresh-proposer rule) and the §4 argument are unchanged, and a leader still
+  proposes in v only with QC(v-1) or TC(v-1). The CPU-busy crossing test then passes in 9 s (main: 37-59 s), with at
+  most 1.4 checks per message.
+- **Test.** `tests/slow_signature_check_liveness_test.rs` adds 40 ms to every check (test hook): 4 validators all up
+  and 3 of 4 must commit height 6 in 90 s (56923063: no commit / height 2 in 60 s; main with the same hook: 15 s /
+  27 s; fixed: 9 s / 15 s). Unit: `signature_check_tests`, `timeout_votes_carrying_a_checked_tc_cost_one_signature_check_each`.
+- **Not changed (owner, pre-existing on main).** After a backed-off view, the next view entered at multiplier 1 has its
+  scheduled deadline in the past (the per-epoch schedule is absolute and only too-far-future deadlines are rebased,
+  PM 2b), so it times out at once (`deadline_in_ms=0` in the trace, on main and batch 9 alike). Main recovers its
+  consecutive QCs by chance (the leader enters that view by its own timeout and proposes in the same loop pass while
+  the others sit in a backed-off view); a slow cluster can lose every such view. Rebasing a past deadline too would
+  close it; it changes the view schedule for every chain, so it is left for a separate decision.
+- **Rejected.** Re-broadcasting own timeout votes on every timeout (adds messages to queues already seconds behind);
+  collecting votes for views further back (leader(v) has left v by the time a late TC(v-1) forms); certificate-driven
+  view advance (the votes were not lost, they were late).
+
 ## 3. Change 2: tip signing
 
 ### Options compared
