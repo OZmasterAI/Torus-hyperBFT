@@ -297,6 +297,78 @@ only local devnets exist.
   equivocation, the existing rollback trigger (HS:1270-1285). `speculative_commits` has no RPC or exec consumer yet.
 - **Commit safety unchanged.** It still comes from the HotStuff lock (`safe_block` / `safe_pc`).
 
+### Incompatible tips (s138, Codex P1 on fix/vsu-sibling-unlock 138a9219)
+
+- **Stall (main 2da29bec and fix/vsu-sibling-unlock 138a9219, ordinary blocks only).** n = 4, one
+  Byzantine B leading view 4. Everyone votes U in view 2; only replica 0 learns QC(U, 2) and locks
+  on it. B signs a header of V (sibling of U, justify QC(A, 1)) for view 4, never sends it, and
+  reports it as its tip: TC(4) = {1, 2, B} has tip (V, 4) beating QC(U, 2) by view. Leader(5)
+  re-proposes V (V2); replicas 1 and 2 vote and copy the tip (V, 4) (F5); replica 0 refuses (V's
+  justify is older than its lock and V does not extend U); B withholds and goes silent. Every
+  honest TC after that has tip (V, 4) (replicas 1, 2) beating QC(U, 2) (replica 0): leaders
+  re-propose V forever, two honest votes, nothing committed above A. Test
+  `hotstuff::tc_tip_ordinary_stall_test` (RED f3de002e on main; same on the sibling branch, b3da11f2).
+  Excluding update tips (the sibling branch) does not help: V is an ordinary block.
+- **Root cause.** The TC's winner rule (`pacemaker/types.rs`, collector and `summaries_are_signed`)
+  ranked tip against high QC by view alone. A tip newer than the high QC whose block justifies
+  BELOW it is a sibling of the certified block (it cannot be its ancestor: the QC's block was
+  certified at a view below the tip's, through its own justify chain), and every replica locked on
+  that QC refuses it. A second hole the model found: `highest_qc_for_timeout` omitted the highest PC
+  when the tip was newer, so a replica locked on QC(W, 3) with tip (U, 4) on another branch hid its
+  lock, U won as "compatible" with a lower high QC, and that replica refused U forever.
+- **Fix (no wire or DB format change; pre-genesis consensus rule).**
+  - `high_tip_wins`: the tip wins iff `tip.view > high_qc.view` AND `tip.block_justify.view >=
+    high_qc.view` (no high QC: the tip wins, as before). Else the high QC wins: V3, the leader
+    extends it (`propose_from_highest_pc` after applying it).
+  - `highest_qc_for_timeout` always reports the highest PC (not the genesis PC).
+  - Old TCs: a stored `highest_tc` whose flag differs under the new rule fails `is_correct`; it only
+    costs the leader that view (local devnets only; start from a fresh data dir anyway).
+- **Liveness argument (all honest timeout votes in the TC).** Every signer's lock is at most its
+  highest PC, which it reports, so `lock.view <= q.view` for q the TC's high QC. If q wins, the
+  leader proposes on a QC of view `>= q.view`: every lock is older, or of the same view and then the
+  same block (one QC per view), so the lock clause holds. If the tip T wins, `T.justify.view >=
+  q.view >= lock.view`, same conclusion for T's re-proposal. So with honest leaders after GST every
+  view whose TC carries all honest summaries gets a QC; two consecutive honest views commit.
+- **Safety (no two conflicting commits).** Unchanged by construction: both edits change only which
+  TC certificate wins (V2 vs V3) and what a timeout vote reports. An honest vote still needs
+  `safe_proposal_lock` (lock clause, reflexive arm, the sibling branch's certified-above-lock arm).
+  The 2-chain lemma does not use V1-V4 or tips: if C commits through QC(C, c) and QC(C', c+1), the
+  f+1 honest voters of C' are locked on QC(C, c); any QC of a view > c+1 has an honest voter among
+  them, who voted only if the justify is newer than its lock (a QC of a view in (c, w), on C's
+  branch by induction), or extends its locked block, or is its locked block, or is certified above
+  its lock (again C's branch by induction).
+  - Signed tips: `block_justify` is bound by the tip's hash (F2) but not verified as a real QC. An
+    honest tip's justify was verified when its holder voted; a Byzantine tip with a forged high-view
+    justify still wins (as any newer tip did before the fix) and costs the views its vote is in.
+  - Reflexive lock / unlock rule (fix/vsu-sibling-unlock): untouched; a VSU re-proposal of the high
+    QC's block (V3 "is q's block") still passes through them.
+  - M2 freshness (fix/m2-timestamp-lower-bound): `is_reproposal` reads `high_tip_is_winner`, so a tip
+    that now loses is not a re-proposal and the leader's fresh block on the high QC is judged fresh,
+    as it should be (a new block). The certified exemption (`tc.high_qc` on the block) is unchanged.
+  - Tail-fork (this section above): a block B with 2f+1 votes in view v keeps winning unless some
+    TC carries a QC of a view in (B.justify.view, v) on another branch. The model reaches such
+    states (a Bracha echo sends TV(w) without leaving w, so a replica counted in TC(w) can still
+    vote in w), so "tail-fork closed" holds only where no such QC exists. Analysis (not tested): a
+    Byzantine leader(v+1) that signs a sibling header for v+1 and reports it already outranks B
+    before this fix, so the tail-fork property was not closed against a Byzantine next leader.
+    `speculative_commits` has no consumer.
+- **Model.** `tests/stateright_tc_tip_ordinary.rs`: A <- {U, V, fresh blocks}, the 2-chain commit and
+  lock, V1-V3, signed tips with copies, Byzantine signed headers and arbitrary timeout summaries,
+  Bracha-echo timeouts (a replica counted in TC(w) may still vote in w). Old rule: a stall needing
+  no Byzantine tip (a fresh sibling of view 3 outranks QC(U, 2)); each half of the fix alone
+  stalls; the fix commits in every honest synchronous suffix, and with the Byzantine timeout vote
+  in every TC next to the replica with the highest lock (prefixes of up to 12 events). Agreement
+  holds in all modes.
+- **Residual (not fixed).** An active Byzantine validator whose timeout vote is in every TC together
+  with the two honest replicas that do NOT hold the highest lock, reporting a low QC, keeps its tip
+  of V compatible with the TC's high QC: leaders re-propose V, the replica locked on U refuses, the
+  Byzantine one withholds (model: `compatible_tip_rule_residual_when_the_tc_omits_the_top_lock`).
+  A fix is a Jolteon-style lock escape: a proposal carrying a correct TC(v-1) with `justify.view >=
+  tc.high_qc.view` satisfies the lock. Safe only if a replica never votes in a view at or below one
+  it has sent a timeout vote for (the commit-quorum member's reported QC must cover its later
+  votes); the Bracha echo breaks that today (it sends TV(cur) and stays in cur), so the escape also
+  needs `highest_view_voted` raised on every timeout vote sent. Owner decision.
+
 ## 5. Performance (derived, not measured; phase C sign/verify measured in §3 "As built")
 
 - **Happy path: no added delay.** leader(v) aggregates the v-1 votes itself (HS:1201-1220), so L1 applies. The header
