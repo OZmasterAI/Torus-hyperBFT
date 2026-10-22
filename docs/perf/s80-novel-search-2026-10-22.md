@@ -5,7 +5,7 @@ binary). The bar is a 120 s CL21 cell on 29bfc705: **270.3k matched/s, 18.1 blk/
 and every branch is local. Status is as of 11:47-11:50. Several cells and review steps were still running at that
 time; they are listed in section 7.
 
-**Late cells (11:50-12:40, added by the main session at 12:38-12:41).** All ACCEPT / AGREE. The flag-on cells prove the
+**Late cells (11:50-12:47, added by the main session at 12:38-13:20).** All ACCEPT / AGREE. The flag-on cells prove the
 flag was active (startup line `on=true`). n = 1-2 per arm; the flag-off cells of this session span 252.7k-269.1k
 matched/s, so none of these rows resolves a matched/s difference.
 
@@ -21,13 +21,15 @@ matched/s, so none of these rows resolves a matched/s difference.
 | end-resident-gate off-1 | 252,991.3 | 258,401.1 | 21.2 | 32.51 | 2.49 | 6,827.3 | 9,687.2 |
 | close-merge-removal off-1 | 260,132.4 | 261,983.4 | 19.2 | 38.15 | 2.64 | 6,401.1 | 9,770.0 |
 | close-merge-removal **on-1** (12:40) | 259,415.8 | 260,988.0 | 21.0 | 34.69 | 2.59 | 7,376.0 | 9,668.1 |
+| close-merge-removal **on-2** (12:43) | 261,003.7 | 265,001.9 | 20.8 | 35.84 | 2.62 | 5,716.9 | 9,608.9 |
+| close-merge-removal off-2 (12:46) | 264,140.2 | 266,707.5 | 20.8 | 35.37 | 2.54 | 7,303.9 | 9,733.1 |
 
 Reading: liq-tail-offload's microbench cut shows up in the cell's own engine metric (eng/1k 2.64 -> 2.53, -4.2%;
 chain 34.83 -> 33.64 ms, -3.4%) but not in matched/s (-0.4%, n=1) or blk/s. That is the work-conservation pattern
 of earlier sections (s114, s124): on the standard 300-market shape a few % of exec time does not convert into
 matched/s; it may on shapes where E is saturated longer (deep, larger blocks). oracle-step-memo on vs off: 256.7k
 (mean of 2) vs 257.0k, no gain: park. The other candidates' flag-on cells did not run before the session end; their
-off-1 rows are kept as same-binary references for whoever finishes the ABBA. close-merge-removal on-1 vs off-1: matched/s -0.3%, blk/s 19.2 -> 21.0, chain 38.15 -> 34.69 ms (n=1 each; its target is the deep shape, which no cell here ran). All s80 workflows, cell drivers and units were stopped at 12:38-12:41; no node or bench process is left running.
+off-1 rows are kept as same-binary references for whoever finishes the ABBA. close-merge-removal has the full 2+2 ABBA: off 262.1k matched/s (260.1k, 264.1k), 20.0 blk/s, chain 36.8 ms vs on 260.2k (259.4k, 261.0k), 20.9 blk/s, chain 35.3 ms: matched/s -0.7%, inside the spread (its target is the deep shape, which no cell here ran). The s80 workflows were stopped at 12:38; the close-merge cell agent's own driver still ran on-2 and off-2 (12:41-12:47) before it ended. Nothing was running at 13:19.
 
 Terms used below:
 - **E** is the `torus-execution` thread, the serial exec thread.

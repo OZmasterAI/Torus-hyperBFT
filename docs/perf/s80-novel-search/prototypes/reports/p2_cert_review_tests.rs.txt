@@ -1,0 +1,86 @@
+//! Review probe (adversarial review of s80 phase2-sender-certificate, not part
+//! of the prototype): orders the exact path rejects in `validate_order_price`
+//! still enter the certificate's sums. A non-positive limit price makes the
+//! sender's Σ notional negative (margin bypass), and a price near i128::MIN
+//! in the anchor market overflows the unchecked `r - base` (panic).
+
+#[path = "common/econ_load.rs"]
+mod econ_load;
+
+use econ_load::{base_mark, feed_setup, sender, special, REPORTERS};
+use torus_bridge::native_executor::{with_p2_cert, NativeExecContext, NativeExecutor, P2CertMode};
+use torus_core::position::NativeBalance;
+use torus_state::StateDb;
+use torus_types::{FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
+
+fn units(v: i128) -> FixedPoint {
+    FixedPoint::from_raw(v * FixedPoint::SCALE)
+}
+
+fn limit(is_buy: bool, price: FixedPoint, qty: i128) -> PlaceOrderParams {
+    PlaceOrderParams {
+        market_id: 1,
+        is_buy,
+        price,
+        quantity: units(qty),
+        order_type: OrderType::Limit,
+        time_in_force: TimeInForce::GTC,
+        reduce_only: false,
+        client_order_id: None,
+    }
+}
+
+/// One block: sender 0 holds `avail` units, market 1 marked at the mid.
+fn run(mode: P2CertMode, avail: i128, orders: Vec<PlaceOrderParams>) -> String {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = StateDb::open(dir.path()).expect("open db");
+    {
+        let ctx = NativeExecContext::new(db.clone(), 1, 1000, 0, 1_000_000, 100, special(99), special(100), special(101));
+        ctx.positions
+            .put_native_balance(&sender(0), &NativeBalance { available: units(avail), order_margin: FixedPoint::ZERO })
+            .unwrap();
+    }
+    feed_setup(&db, 1, true);
+    let mut ctx = NativeExecContext::new(db.clone(), 2, 1001, 0, 1_000_000, 100, special(99), special(100), special(101));
+    for n in REPORTERS {
+        ctx.oracle.submit_price(&special(n), 1, base_mark(), ctx.block_height, ctx.timestamp).unwrap();
+    }
+    let block = vec![(sender(0), NativeAction::PlaceOrderBatch(orders))];
+    let r = with_p2_cert(mode, || {
+        let _ = NativeExecutor::begin_block_oracle(&mut ctx);
+        NativeExecutor::execute_batch(&mut ctx, &block)
+    });
+    format!("{:?}", r.results)
+}
+
+#[test]
+fn review_negative_price_bypasses_the_account_check() {
+    // 10 x 30000 at 20x = 15000 units of IM against 100 units: a margin reject.
+    let big = limit(true, base_mark(), 10);
+    let off_alone = run(P2CertMode::Off, 100, vec![big.clone()]);
+    let on_alone = run(P2CertMode::On, 100, vec![big.clone()]);
+    eprintln!("alone off: {off_alone}\nalone on : {on_alone}");
+    assert_eq!(off_alone, on_alone, "control: the certificate fails the bound");
+    // Plus a buy at -1e9 units (rejected by validate_order_price in both paths).
+    let neg = limit(true, units(-1_000_000_000), 1);
+    let off = run(P2CertMode::Off, 100, vec![big.clone(), neg.clone()]);
+    let on = run(P2CertMode::On, 100, vec![big, neg]);
+    eprintln!("with neg off: {off}\nwith neg on : {on}");
+    assert_eq!(off, on, "flag on must be byte-identical to flag off");
+}
+
+#[test]
+fn review_min_price_in_the_anchor_market_does_not_panic() {
+    let orders = vec![limit(false, base_mark(), 1), limit(false, FixedPoint::from_raw(i128::MIN + 1), 1)];
+    let off = run(P2CertMode::Off, 1_000_000, orders.clone());
+    eprintln!("off: {off}");
+    let on = std::panic::catch_unwind(|| run(P2CertMode::On, 1_000_000, orders.clone()));
+    match &on {
+        Ok(s) => eprintln!("on : {s}"),
+        Err(e) => eprintln!(
+            "on PANICKED: {:?}",
+            e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+        ),
+    }
+    assert_eq!(on.ok().as_deref(), Some(off.as_str()), "flag on must not panic and must match flag off");
+}
