@@ -2879,6 +2879,11 @@ class OracleFeedHarnessTest(unittest.TestCase):
         fresh = self.src.index('log "oracle marks fresh on all')
         stop = self.src.index("        stop_oracle_feed\n", seed)
         stale = self.src.index('[ "$(jq -r .usable <<<"$ORACLE_M")" = 0 ]', seed)
+        # the stale gate needs a COMPLETE scan (oracle_marks stops at its 30 s
+        # budget): every market checked, no error, none usable
+        gate_src = self.src[self.src.rindex("\n", 0, stale) : self.src.index("break; }", stale)]
+        self.assertIn('[ "$(jq -r .checked <<<"$ORACLE_M")" = "$MARKETS" ]', gate_src)
+        self.assertIn('[ "$(jq -r .errors <<<"$ORACLE_M")" = 0 ]', self.src[stale : self.src.index("break; }", stale)])
         load = self.src.index('"${BENCH_CMD[@]}" >')
         self.assertLess(fresh, seed)
         self.assertLess(seed, stop)
@@ -2891,6 +2896,30 @@ class OracleFeedHarnessTest(unittest.TestCase):
             i = self.src.index(marker)
             g = self.src.rindex('if [ "$ORACLE_FEED" = 1 ]', 0, i)
             self.assertNotIn("seed", self.src[g : self.src.index("\n", g)], marker)
+
+    def test_seed_stale_gate_waits_for_a_complete_scan(self):
+        """Codex stop review: a partial oracle_marks pass (its 30 s budget hit:
+        checked < markets) must not open the load, even with usable 0."""
+        start = self.src.index('    if [ "$ORACLE_FEED" = seed ]; then\n        # Owner s138')
+        end = self.src.index("\n    fi\n", start) + len("\n    fi\n")
+        block = self.src[start:end]
+        script = (
+            "MARKETS=2; ORACLE_STALE_TIMEOUT=20; OUT=$(mktemp -d)\n"
+            "stop_oracle_feed() { :; }; sleep() { :; }; log() { echo \"LOG $*\"; }\n"
+            "die() { echo \"DIE $*\"; exit 3; }\n"
+            "oracle_marks() { echo x >> \"$OUT/calls\"; N=$(wc -l < \"$OUT/calls\");\n"
+            "  case $N in 1) echo '{\"markets\":2,\"checked\":1,\"usable\":0,\"errors\":0}';;\n"
+            "    2) echo '{\"markets\":2,\"checked\":2,\"usable\":1,\"errors\":0}';;\n"
+            "    3) echo '{\"markets\":2,\"checked\":2,\"usable\":0,\"errors\":1}';;\n"
+            "    *) echo '{\"markets\":2,\"checked\":2,\"usable\":0,\"errors\":0}';; esac; }\n"
+            "ORACLE_FEED=seed\n"
+            + block
+            + 'echo "calls=$(wc -l < "$OUT/calls") stale=[$ORACLE_STALE_S]"\n'
+        )
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("calls=4 stale=[", r.stdout)
+        self.assertNotIn("stale=[]", r.stdout)
 
     def test_bad_seed_env_fails_preflight(self):
         tmp = tempfile.mkdtemp(prefix="oracle-seed-")

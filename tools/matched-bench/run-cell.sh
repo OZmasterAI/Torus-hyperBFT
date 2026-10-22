@@ -1759,7 +1759,9 @@ if [ "$ORACLE_FEED" = 1 ] || [ "$ORACLE_FEED" = seed ]; then
         while [ $(( $(date +%s) - T_STALE0 )) -lt "$ORACLE_STALE_TIMEOUT" ]; do
             sleep 5
             ORACLE_M=$(oracle_marks 0)
-            [ "$(jq -r .usable <<<"$ORACLE_M")" = 0 ] && [ "$(jq -r .errors <<<"$ORACLE_M")" = 0 ] \
+            # every market read (the probe stops at its 30 s budget), no error, none usable
+            [ "$(jq -r .checked <<<"$ORACLE_M")" = "$MARKETS" ] && [ "$(jq -r .usable <<<"$ORACLE_M")" = 0 ] \
+                && [ "$(jq -r .errors <<<"$ORACLE_M")" = 0 ] \
                 && { ORACLE_STALE_S=$(( $(date +%s) - T_STALE0 )); break; }
         done
         printf '%s\n' "$ORACLE_M" > "$OUT/oracle-marks-seeded.json"
