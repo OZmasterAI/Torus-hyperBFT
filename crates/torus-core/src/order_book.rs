@@ -428,9 +428,45 @@ pub struct ReduceOnlyPositions {
     positions: HashMap<Address, FixedPoint>,
 }
 
+/// s80 exec-block-arena: the batch path's reduce-only maps, cleared and
+/// kept between calls.
+static REDUCE_ONLY: crate::recycle::Recycler<HashMap<Address, FixedPoint>> =
+    crate::recycle::Recycler::new(1024);
+
+/// s80 exec-block-arena: the batch path's account-margin trader maps,
+/// cleared and kept between calls.
+static MARGIN_TRADERS: crate::recycle::Recycler<HashMap<Address, TraderMargins>> =
+    crate::recycle::Recycler::new(1024);
+
+/// s80: [`REDUCE_ONLY`]'s (hits, misses).
+pub fn reduce_only_recycler_stats() -> (u64, u64) {
+    REDUCE_ONLY.stats()
+}
+
+/// s80: [`MARGIN_TRADERS`]' (hits, misses).
+pub fn account_margins_recycler_stats() -> (u64, u64) {
+    MARGIN_TRADERS.stats()
+}
+
+/// s80: clear `map` and keep it in `pool` (a map over the kept capacity is
+/// dropped).
+fn recycle_map<K, V>(pool: &crate::recycle::Recycler<HashMap<K, V>>, mut map: HashMap<K, V>) {
+    if map.capacity() == 0 || map.capacity() > crate::recycle::MAX_KEPT_CAPACITY {
+        return;
+    }
+    map.clear();
+    pool.give(map);
+}
+
 impl ReduceOnlyPositions {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// s80 exec-block-arena: an empty map, from the free list when it holds
+    /// one (capacity kept), else [`Self::new`].
+    pub fn recycled() -> Self {
+        Self { positions: REDUCE_ONLY.take().unwrap_or_default() }
     }
 
     pub fn insert(&mut self, trader: Address, signed_size: FixedPoint) {
@@ -721,6 +757,12 @@ impl AccountMargins {
             pre_batch: false,
             charged_maker_fills: 0,
         }
+    }
+
+    /// s80 exec-block-arena: [`Self::new`] with the trader map from the
+    /// free list when it holds one (empty, capacity kept).
+    pub fn new_recycled(tiers: Option<std::sync::Arc<[crate::margin::MarginTier]>>) -> Self {
+        Self { traders: MARGIN_TRADERS.take().unwrap_or_default(), ..Self::new(tiers) }
     }
 
     /// Plan 9.11 (telemetry): maker fills committed with a mark charge
@@ -2055,6 +2097,20 @@ impl OrderBook {
 
     pub fn clear_reduce_only_positions(&mut self) {
         self.reduce_only_positions = ReduceOnlyPositions::default();
+    }
+
+    /// s80 exec-block-arena: [`Self::clear_reduce_only_positions`], the
+    /// map cleared and kept for [`ReduceOnlyPositions::recycled`].
+    pub fn recycle_reduce_only_positions(&mut self) {
+        let ro = std::mem::take(&mut self.reduce_only_positions);
+        recycle_map(&REDUCE_ONLY, ro.positions);
+    }
+
+    /// s80 exec-block-arena: [`Self::clear_account_margins`], the trader
+    /// map cleared and kept for [`AccountMargins::new_recycled`].
+    pub fn recycle_account_margins(&mut self) {
+        let am = std::mem::take(&mut self.account_margins);
+        recycle_map(&MARGIN_TRADERS, am.traders);
     }
 
     /// F1 (s517): install the account margins for the next placement(s);
@@ -7764,5 +7820,64 @@ mod taker_margin_limit_tests {
             assert_eq!(filled(&r), q, "sell {id}");
             assert_eq!(b.account_margins().get(&addr(2)).unwrap().free, FixedPoint::ZERO, "sell {id}");
         }
+    }
+}
+
+#[cfg(test)]
+mod recycle_tests {
+    use super::*;
+
+    fn a(n: u16) -> Address {
+        let mut b = [0u8; 20];
+        b[..2].copy_from_slice(&n.to_be_bytes());
+        Address::new(b)
+    }
+
+    /// s80 exec-block-arena: the book's recycled margins / reduce-only maps
+    /// leave the book exactly as `clear_*` does (defaults), and the next
+    /// recycled constructor hands out an EMPTY map (no entry of the last
+    /// batch survives) with its capacity kept.
+    #[test]
+    fn recycled_margins_and_reduce_only_maps_start_empty() {
+        let mut book = OrderBook::new(1, FixedPoint::ONE, FixedPoint::ONE);
+        let mut am = AccountMargins::new_recycled(None);
+        let mut ro = ReduceOnlyPositions::recycled();
+        assert!(am.traders.is_empty() && ro.is_empty());
+        for n in 0..300 {
+            am.insert(a(n), FixedPoint::ONE, FixedPoint::ONE);
+            ro.insert(a(n), FixedPoint::ONE);
+        }
+        am.set_mark(Some(FixedPoint::ONE));
+        am.set_pre_batch_snapshots(true);
+        let (am_cap, ro_cap) = (am.traders.capacity(), ro.positions.capacity());
+        book.set_account_margins(am);
+        book.set_reduce_only_positions(ro);
+        book.recycle_account_margins();
+        book.recycle_reduce_only_positions();
+        let fresh = AccountMargins::default();
+        let m = book.account_margins();
+        assert!(m.traders.is_empty() && m.mark.is_none() && !m.pre_batch && m.tiers.is_none());
+        assert_eq!((m.charged_maker_fills, fresh.charged_maker_fills), (0, 0));
+        assert!(book.reduce_only_positions.is_empty());
+        // Other tests may recycle concurrently: look for ours by capacity.
+        let mut seen = (false, false);
+        let mut back = Vec::new();
+        while let Some(t) = MARGIN_TRADERS.take() {
+            assert!(t.is_empty(), "a kept margins map is empty");
+            seen.0 |= t.capacity() == am_cap;
+            back.push(t);
+        }
+        let mut back_ro = Vec::new();
+        while let Some(t) = REDUCE_ONLY.take() {
+            assert!(t.is_empty(), "a kept reduce-only map is empty");
+            seen.1 |= t.capacity() == ro_cap;
+            back_ro.push(t);
+        }
+        assert_eq!(seen, (true, true));
+        back.into_iter().for_each(|t| MARGIN_TRADERS.give(t));
+        back_ro.into_iter().for_each(|t| REDUCE_ONLY.give(t));
+        let am = AccountMargins::new_recycled(None);
+        assert!(am.traders.is_empty() && am.traders.capacity() > 0);
+        assert!(ReduceOnlyPositions::recycled().is_empty());
     }
 }

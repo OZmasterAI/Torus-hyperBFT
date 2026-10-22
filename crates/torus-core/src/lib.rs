@@ -9,4 +9,5 @@ pub mod margin;
 pub mod oracle;
 pub mod order_book;
 pub mod position;
+pub mod recycle;
 pub mod precompiles;

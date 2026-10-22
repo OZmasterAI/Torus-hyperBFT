@@ -897,6 +897,46 @@ pub fn settle_no_merge_fallbacks_on_this_thread() -> u64 {
 /// sorted key order (`PositionCache::flush_with_runs`): the same writes in
 /// the same order, without moving every entry into one map. The thread's pin
 /// if set, else the env read once per process.
+/// s80 exec-block-arena (`TORUS_S80_EXEC_ARENA=1`, node-local, default
+/// off): the engine's per-market scratch maps (pass A's plan position
+/// caches, the books' batch reduce-only and account-margin maps) and each
+/// pool worker's maker cache are cleared and kept between calls instead of
+/// dropped and regrown (`torus_core::recycle`). Capacity only: what the
+/// engine computes, writes and returns is the same.
+pub fn parse_exec_arena(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "true" | "on"))
+}
+
+/// s80: 0 = the env, 1 = pinned off, 2 = pinned on ([`pin_exec_arena`]).
+/// Process-wide (not per thread): the pool workers read it too.
+static EXEC_ARENA_PIN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// s80 exec-block-arena: whether the flag is on (env read once, pin first).
+pub fn exec_arena_enabled() -> bool {
+    match EXEC_ARENA_PIN.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = parse_exec_arena(std::env::var("TORUS_S80_EXEC_ARENA").ok().as_deref());
+        tracing::info!("TORUS_S80_EXEC_ARENA on={on}");
+        on
+    })
+}
+
+/// s80 (tests / benches): pin the flag process-wide (`None`: the env).
+#[doc(hidden)]
+pub fn pin_exec_arena(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    EXEC_ARENA_PIN.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn settle_no_merge_enabled() -> bool {
     if let Some(on) = SETTLE_NO_MERGE_PIN.with(std::cell::Cell::get) {
         return on;
@@ -3065,7 +3105,13 @@ impl<T: StateBackend> AccountReader<'_, T> {
         MAKER_FREE.with(|c| {
             let mut c = c.borrow_mut();
             if c.0 != b.id {
-                *c = (b.id, HashMap::default());
+                if exec_arena_enabled() {
+                    // s80: keep the map's capacity for the new batch.
+                    c.0 = b.id;
+                    c.1.clear();
+                } else {
+                    *c = (b.id, HashMap::default());
+                }
             }
             c.1.insert(*maker, free);
         });
@@ -9910,6 +9956,13 @@ impl NativeExecutor {
         if let Err(e) = pos_flushed {
             ctx.fatal_error = Some(format!("position cache flush failed: {e}"));
         }
+        // s80 exec-block-arena: pass B's per-market caches (written above or
+        // abandoned with the fatal) go back to the free list.
+        if exec_arena_enabled() {
+            for run in pos_runs.drain(..) {
+                run.recycle();
+            }
+        }
         if let Err(e) = bal_cache.flush_all(&ctx.positions) {
             ctx.fatal_error = Some(format!("balance cache flush failed: {e}"));
         }
@@ -10433,13 +10486,22 @@ impl NativeExecutor {
             // s114 follow-up: and the cloid index (adds before any later check).
             CloidMarkets::absorb(cloid_markets, &mut mbr.book, mbr.market_id);
         }
-        mbr.book.clear_reduce_only_positions();
+        let arena = exec_arena_enabled();
+        if arena {
+            mbr.book.recycle_reduce_only_positions();
+        } else {
+            mbr.book.clear_reduce_only_positions();
+        }
         // Plan 9.11 (telemetry): this book's charged maker fills.
         if let Some(m) = metrics {
             m.maker_offmark_charged_fills
                 .inc_by(mbr.book.account_margins().charged_maker_fills());
         }
-        mbr.book.clear_account_margins();
+        if arena {
+            mbr.book.recycle_account_margins();
+        } else {
+            mbr.book.clear_account_margins();
+        }
         for r in &mbr.results {
             triggered.extend(r.result.triggered_stops.iter().cloned());
         }
@@ -11708,7 +11770,7 @@ impl NativeExecutor {
         record_fills: bool,
     ) -> MarketSettlePlan {
         let market_id = mbr.market_id;
-        let mut pos_cache = PositionCache::new();
+        let mut pos_cache = if exec_arena_enabled() { PositionCache::recycled() } else { PositionCache::new() };
         let mut orders = Vec::with_capacity(prepared.len());
         // At most two traders per fill: sized up front, the map never
         // regrows (s84: regrowth was a third of the cum_volume time).
@@ -13041,7 +13103,8 @@ impl NativeExecutor {
         // Item 6 M1: a sender whose position Phase 2 read (`pre_pos`,
         // same reader, nothing written in between) is not read again.
         if !prepared.is_empty() || book.has_reduce_only_orders() {
-            let mut known = ReduceOnlyPositions::new();
+            let mut known =
+                if exec_arena_enabled() { ReduceOnlyPositions::recycled() } else { ReduceOnlyPositions::new() };
             for p in prepared {
                 if let Some((signed, _)) = p.pre_pos {
                     known.insert(p.sender, signed);
@@ -13062,7 +13125,11 @@ impl NativeExecutor {
         let tiers = Self::margin_tiers(margin_configs.get(&market_id));
         // F1 (s517, D2): each checked sender's exclusive pool (0 outside
         // the market of its first checked taker) and valuation price.
-        let mut am = AccountMargins::new(tiers.clone());
+        let mut am = if exec_arena_enabled() {
+            AccountMargins::new_recycled(tiers.clone())
+        } else {
+            AccountMargins::new(tiers.clone())
+        };
         // s94 option 1: every fill's loss against the mark is charged.
         // An unchecked taker (GTC buy, reduce-only) pays a charge from
         // its pool here, else its snapshot — the pre-batch state, which

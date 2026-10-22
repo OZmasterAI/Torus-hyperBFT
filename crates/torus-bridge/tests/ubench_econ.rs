@@ -59,6 +59,42 @@ struct Sample {
     /// `end_resident` alone (item 6 step 1).
     end_ms: f64,
     fills: u64,
+    /// s80 exec-block-arena: minor page faults in the timed window (process, exec thread).
+    flt_proc: u64,
+    flt_thread: u64,
+}
+
+/// s80: `perf record|stat --control fifo:<ctl>,<ack> -D -1` hook: with
+/// `UB_PERF_CTL` / `UB_PERF_ACK` set, the measured blocks' timed window
+/// (oracle + execute_batch + liquidations) is the only profiled region.
+struct PerfCtl(Option<(std::fs::File, std::io::BufReader<std::fs::File>)>);
+
+impl PerfCtl {
+    fn from_env() -> Self {
+        let (Ok(c), Ok(a)) = (std::env::var("UB_PERF_CTL"), std::env::var("UB_PERF_ACK")) else {
+            return Self(None);
+        };
+        let ctl = std::fs::OpenOptions::new().write(true).open(c).expect("perf ctl fifo");
+        let ack = std::fs::File::open(a).expect("perf ack fifo");
+        Self(Some((ctl, std::io::BufReader::new(ack))))
+    }
+
+    fn cmd(&mut self, what: &str) {
+        use std::io::{BufRead, Write};
+        if let Some((ctl, ack)) = self.0.as_mut() {
+            ctl.write_all(format!("{what}\n").as_bytes()).unwrap();
+            ctl.flush().unwrap();
+            let mut l = String::new();
+            ack.read_line(&mut l).unwrap();
+        }
+    }
+}
+
+/// s80: minor faults (field 10 of `/proc/<self|thread-self>/stat`).
+fn minflt(path: &str) -> u64 {
+    let s = std::fs::read_to_string(path).unwrap_or_default();
+    // Fields after the `(comm)` close paren: state is field 3, minflt field 10.
+    s.rsplit_once(')').and_then(|(_, r)| r.split_whitespace().nth(7)).and_then(|v| v.parse().ok()).unwrap_or(0)
 }
 
 /// A cold R build over the final DB: rows, bytes, ms.
@@ -131,6 +167,7 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
     let mut rc_measured = 0u64;
     let mut placed_measured = 0u64;
     let mut subs0: Vec<Option<f64>> = vec![None; END_SUBS.len()];
+    let mut perf = PerfCtl::from_env();
     for h in 1..=(warm + measure) {
         let block = gen.block(actions);
         let mut overlay = NativeStateOverlay::with_parent(db.clone(), parent.clone());
@@ -166,6 +203,10 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
         }
         let rc0 = metrics.orders_rejected_cancelled.get();
         let pa0 = metrics.orders_placed_accepted.get();
+        if h > warm {
+            perf.cmd("enable");
+        }
+        let (fp0, ft0) = (minflt("/proc/self/stat"), minflt("/proc/thread-self/stat"));
         let t0 = std::time::Instant::now();
         let agg = NativeExecutor::begin_block_oracle(&mut ctx);
         assert!(!fed || agg.iter().all(|r| r.success), "mark aggregation: {agg:?}");
@@ -174,6 +215,10 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
         let t1 = std::time::Instant::now();
         let _ = NativeExecutor::run_liquidations(&mut ctx);
         let tail = t1.elapsed();
+        let (fp1, ft1) = (minflt("/proc/self/stat"), minflt("/proc/thread-self/stat"));
+        if h > warm {
+            perf.cmd("disable");
+        }
         assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
         let pa = ctx.phase_accum;
         let fills = ctx.trade_index as u64;
@@ -212,6 +257,8 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
                 r_end_ms: r_end.as_secs_f64() * 1e3,
                 end_ms: end.as_secs_f64() * 1e3,
                 fills,
+                flt_proc: fp1 - fp0,
+                flt_thread: ft1 - ft0,
             });
         }
         if let Some(p) = parent.take() {
@@ -270,6 +317,7 @@ fn median(mut v: Vec<f64>) -> f64 {
 fn ubench_econ() {
     let runs = env("UB_RUNS", 3);
     let mut per_run = Vec::new();
+    let mut per_flt = Vec::new();
     for r in 0..runs {
         let (s, rc, placed, resting, rb, subs) = run_once(r);
         let fills: u64 = s.iter().map(|x| x.fills).sum();
@@ -280,6 +328,8 @@ fn ubench_econ() {
         let settle: f64 = s.iter().map(|x| x.settle_ms).sum();
         let r_end: f64 = s.iter().map(|x| x.r_end_ms).sum();
         let end: f64 = s.iter().map(|x| x.end_ms).sum();
+        let flt_p: u64 = s.iter().map(|x| x.flt_proc).sum();
+        let flt_t: u64 = s.iter().map(|x| x.flt_thread).sum();
         let n = s.len() as f64;
         let sub = |i: usize| subs[i].map_or("-".to_string(), |v: f64| format!("{:.2}", v / n));
         let k = fills as f64 / 1e3;
@@ -313,7 +363,15 @@ fn ubench_econ() {
             rb.ms,
             rb.ms * 1e6 / rb.rows.max(1) as f64,
         );
+        println!(
+            "UB run={r} faults/1k_fills proc={:.1} exec_thread={:.1} faults/blk proc={:.0} exec_thread={:.0}",
+            flt_p as f64 / k,
+            flt_t as f64 / k,
+            flt_p as f64 / n,
+            flt_t as f64 / n,
+        );
         per_run.push(per1k);
+        per_flt.push(flt_p as f64 / k);
     }
     println!(
         "UB marks={} real_markets={} walk_bp={} resident_rows={} r_worker={} MEDIAN engine_ms/1k_fills={:.2} runs={:?}",
@@ -325,6 +383,9 @@ fn ubench_econ() {
         median(per_run.clone()),
         per_run
     );
+    println!("UB MEDIAN faults/1k_fills(proc)={:.1} runs={:?}", median(per_flt.clone()), per_flt);
+    // s80 exec-block-arena: proves the flag-on arm recycled (hits, misses).
+    println!("UB recycle(hits,misses)={:?}", torus_core::recycle::stats());
 }
 
 /// `UB_MARK_WALK`: 0 bp submits the mid every block (the bench as before);

@@ -798,9 +798,39 @@ fn cover_market(markets: &mut Option<(MarketId, MarketId)>, m: MarketId) {
     });
 }
 
+/// s80 exec-block-arena: pass A's per-market plan caches, cleared and kept
+/// between calls ([`PositionCache::recycled`] / [`PositionCache::recycle`]).
+static POSITION_CACHES: crate::recycle::Recycler<PositionCache> = crate::recycle::Recycler::new(1024);
+
+/// s80: [`POSITION_CACHES`]' (hits, misses).
+pub fn position_cache_recycler_stats() -> (u64, u64) {
+    POSITION_CACHES.stats()
+}
+
 impl PositionCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// s80 exec-block-arena: an empty cache, from the free list when it
+    /// holds one (its maps keep their capacity), else [`Self::new`].
+    pub fn recycled() -> Self {
+        POSITION_CACHES.take().unwrap_or_default()
+    }
+
+    /// s80 exec-block-arena: clear this cache (entries, dirty marks and the
+    /// key-market range: [`Self::new`]'s state) and keep it for
+    /// [`Self::recycled`]; a cache over the kept capacity is dropped.
+    pub fn recycle(mut self) {
+        if self.map.capacity() > crate::recycle::MAX_KEPT_CAPACITY
+            || self.dirty.capacity() > crate::recycle::MAX_KEPT_CAPACITY
+        {
+            return;
+        }
+        self.map.clear();
+        self.dirty.clear();
+        self.markets = None;
+        POSITION_CACHES.give(self);
     }
 
     /// Read-through load: cache hit, else fall through to the backend and
@@ -1426,5 +1456,58 @@ mod exec_hasher_tests {
         let b = HashMap::<(Address, MarketId), ()>::default();
         let key = (Address::ZERO, 1);
         assert_ne!(a.hasher().hash_one(key), b.hasher().hash_one(key));
+    }
+}
+
+#[cfg(test)]
+mod recycle_tests {
+    use super::*;
+
+    fn pos(t: u8, m: MarketId) -> Position {
+        Position {
+            trader: Address::new([t; 20]),
+            market_id: m,
+            is_long: true,
+            size: FixedPoint::ONE,
+            entry_price: FixedPoint::ONE,
+            cost_basis: FixedPoint::ONE,
+            realized_pnl: FixedPoint::ZERO,
+            isolated_margin: FixedPoint::ZERO,
+            margin_type: MarginType::Cross,
+        }
+    }
+
+    /// s80 exec-block-arena: a recycled cache is empty in every respect a
+    /// fresh one is (entries, dirty marks, key-market range) and keeps the
+    /// capacity it had; a cache over the kept limit is not kept.
+    #[test]
+    fn recycled_position_cache_is_empty_and_keeps_its_capacity() {
+        let mut c = PositionCache::recycled();
+        for t in 0..200u8 {
+            c.set(pos(t, 7));
+        }
+        c.remove(&Address::new([250; 20]), 9);
+        assert_eq!(c.market_range(), Some((7, 9)));
+        let cap = c.map.capacity();
+        assert!(cap >= 201);
+        c.recycle();
+        // Other tests of this binary may recycle too: take until ours.
+        let mut got = None;
+        while let Some(r) = POSITION_CACHES.take() {
+            if r.map.capacity() == cap {
+                got = Some(r);
+                break;
+            }
+        }
+        let r = got.expect("the recycled cache was kept");
+        assert!(r.is_empty() && r.dirty.is_empty());
+        assert_eq!(r.market_range(), None);
+        assert!(r.runs_disjoint(&[]));
+        // An outlier is dropped, not kept.
+        let mut big = PositionCache::new();
+        big.reserve(crate::recycle::MAX_KEPT_CAPACITY + 1);
+        let before = POSITION_CACHES.len();
+        big.recycle();
+        assert!(POSITION_CACHES.len() <= before);
     }
 }
