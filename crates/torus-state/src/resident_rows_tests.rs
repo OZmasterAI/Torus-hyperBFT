@@ -1040,3 +1040,85 @@ fn build_with_source_holds_three_cfs_raw_and_the_source() {
 fn resident_slot_is_source(cf: &str) -> bool {
     cf == CF_NATIVE_POSITIONS || cf == CF_NATIVE_BALANCES
 }
+
+// ======================================================================
+// s80 end-resident-gate (`TORUS_S80_ER_GATE`): the end_resident worker
+// follows the frozen set borrowed instead of a copied `ResidentDelta`.
+// ======================================================================
+
+use super::ResidentDeltaEntries;
+
+/// s80 end-resident-gate: the frozen set's borrowed view of R's CFs
+/// (`FrozenPending::resident_entries`) yields exactly the copied delta's
+/// entries (`FrozenPending::resident_delta`, = the overlay's own delta
+/// before `freeze`) per slot and per CF (none for a CF outside R), on random
+/// writes and tombstones over a parent layer with nested checkpoints; and R
+/// (raw, all five CFs) following the view equals R following the copy, rows
+/// and byte count, block after block.
+#[test]
+fn frozen_resident_entries_equal_the_copied_delta_and_apply_alike() {
+    let (db, _dir) = temp_db();
+    let mut seed = 0x5eed_80e2_1a7e_0001u64;
+    let mut rnd = move |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let cfs = [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_ORACLE, CF_NATIVE_MARKETS, CF_NATIVE_ORDERS];
+    let mut copied = ResidentRows::default();
+    let mut borrowed = ResidentRows::default();
+    let (mut nonempty, mut tombstones) = (0, 0);
+    let owned = |it: &mut dyn Iterator<Item = (&[u8], Option<&[u8]>)>| -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+        it.map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec))).collect()
+    };
+    for round in 0..200u64 {
+        let parent = (round % 3 != 0).then(|| {
+            let p = NativeStateOverlay::new(db.clone());
+            for _ in 0..rnd(20) {
+                let cf = cfs[rnd(cfs.len() as u64) as usize];
+                p.put_cf_raw(cf, &pos_key(rnd(5) as u8, rnd(4)), b"parent").unwrap();
+            }
+            p.freeze(round)
+        });
+        let overlay = NativeStateOverlay::with_parent(db.clone(), parent);
+        for step in 0..rnd(60) {
+            let cf = cfs[rnd(cfs.len() as u64) as usize];
+            let key = if rnd(8) == 0 { odd_keys()[rnd(5) as usize].clone() } else { pos_key(rnd(6) as u8, rnd(5)) };
+            match rnd(5) {
+                0 => overlay.delete_cf_raw(cf, &key).unwrap(),
+                1 => {
+                    overlay.checkpoint();
+                    overlay.put_cf_raw(cf, &key, b"rolled back").unwrap();
+                    overlay.revert_to_checkpoint();
+                }
+                2 => {
+                    overlay.checkpoint();
+                    overlay.put_cf_raw(cf, &key, b"committed").unwrap();
+                    overlay.commit_checkpoint();
+                }
+                _ => overlay.put_cf_raw(cf, &key, &step.to_be_bytes()).unwrap(),
+            }
+        }
+        let before = overlay.own_pending_delta();
+        nonempty += usize::from(!before.is_empty());
+        let frozen = overlay.freeze(round + 1);
+        let view = frozen.resident_entries();
+        for (slot, cf) in RESIDENT_CFS.iter().enumerate() {
+            assert_eq!(owned(&mut view.slot_entries(slot)), before.cfs[slot], "round {round} slot {slot}");
+            assert_eq!(
+                owned(&mut view.entries_of(cf)),
+                owned(&mut before.entries(cf)),
+                "round {round} {cf}"
+            );
+            tombstones += before.cfs[slot].iter().filter(|(_, v)| v.is_none()).count();
+        }
+        assert_eq!(view.entries_of(CF_NATIVE_ORDERS).count(), 0, "round {round}: not an R CF");
+        copied.apply(&before);
+        borrowed.apply_entries(&view);
+        assert_eq!(borrowed, copied, "round {round}: R after the view != R after the copy");
+        assert_eq!(borrowed.bytes(), copied.bytes(), "round {round}: byte count");
+        assert_eq!(borrowed.bytes(), bytes_of(&borrowed), "round {round}: byte count is the rows'");
+    }
+    assert!(nonempty > 100 && tombstones > 100, "non-vacuous: {nonempty} {tombstones}");
+}

@@ -4681,6 +4681,15 @@ impl ResidentBooks {
         self.rows = None;
     }
 
+    /// s80 end-resident-gate: drop the rows slot only (the books stay),
+    /// after waiting for an `end_resident` worker: a block whose worker was
+    /// started at its hand-off but which then failed (the checkpoint upkeep)
+    /// leaves the slot empty, as a block that never reached `end_resident`.
+    pub fn drop_rows(&mut self) {
+        self.settle_rows();
+        self.rows = None;
+    }
+
     /// Item 6 step 2: wait for the `end_resident` worker (if one runs) and
     /// put the slot it made into the holder; observes
     /// `exec_end_resident_wait_seconds` (the time this thread waited). A
@@ -5199,6 +5208,31 @@ pub fn end_resident(
     }
 }
 
+/// s80 end-resident-gate (`TORUS_S80_ER_GATE`, node-local, default off):
+/// shrink the gate the next block's `begin_resident` waits on. (A) the
+/// `end_resident` worker follows a pipelined block's frozen set borrowed
+/// ([`torus_state::FrozenPending::resident_entries`]) instead of copying
+/// every key and value of R's CFs into a [`torus_state::ResidentDelta`]
+/// first, and drops the block's leftovers (its `drop_later` values, the
+/// frozen set's handle) after the slot is ready, not before; (0) app.rs
+/// starts the worker right after the hand-off, before the checkpoint
+/// upkeep. Same slot, same rows, same state: only when the slot is ready
+/// changes.
+pub fn parse_er_gate(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "true" | "on"))
+}
+
+/// s80 end-resident-gate: `TORUS_S80_ER_GATE`, read (and logged) once per
+/// process.
+pub fn er_gate_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = parse_er_gate(std::env::var("TORUS_S80_ER_GATE").ok().as_deref());
+        tracing::info!("TORUS_S80_ER_GATE on={on}");
+        on
+    })
+}
+
 /// Item 6 step 2: [`end_resident`] with its work (R applying `delta`, the
 /// decoded positions and the sums carry) on a worker thread (P2-3: the
 /// holder's long-lived `torus-end-resident` thread, not one per block), so it
@@ -5220,31 +5254,53 @@ pub fn end_resident_on_worker(
     ok: bool,
     metrics: Option<Arc<torus_telemetry::Metrics>>,
 ) {
+    end_resident_on_worker_with(holder, block, overlay, delta, ok, metrics, er_gate_enabled());
+}
+
+/// [`end_resident_on_worker`] with the s80 end-resident-gate given
+/// (`er_gate`, app.rs: its context's `TORUS_S80_ER_GATE`): on, the worker
+/// follows a [`BlockDelta::Frozen`] borrowed and drops the block's
+/// leftovers after it sent the slot. The slot is the same either way.
+pub fn end_resident_on_worker_with(
+    holder: &mut ResidentBooks,
+    block: ResidentBlock,
+    overlay: &mut NativeStateOverlay,
+    delta: impl Into<BlockDelta>,
+    ok: bool,
+    metrics: Option<Arc<torus_telemetry::Metrics>>,
+    er_gate: bool,
+) {
     let delta = delta.into();
     holder.settle_rows();
     let timer = std::time::Instant::now();
-    let Some(job) = end_resident_take(holder, block, overlay, delta, ok) else {
+    let Some(mut job) = end_resident_take(holder, block, overlay, delta, ok) else {
         if let Some(m) = metrics.as_deref() {
             m.exec_end_resident_seconds.observe(timer.elapsed().as_secs_f64());
         }
         return;
     };
+    job.er_gate = er_gate;
     let height = job.height;
     let checks = timer.elapsed();
     let worker_metrics = metrics.clone();
     let (done, handle) = std::sync::mpsc::sync_channel(1);
     let task: EndResidentTask = Box::new(move || {
+        let mut leftovers = None;
         let slot = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let timer = std::time::Instant::now();
-            let slot = job.run(worker_metrics.as_deref());
+            let (slot, rest) = job.run_split(worker_metrics.as_deref());
             if let Some(m) = worker_metrics.as_deref() {
                 m.exec_end_resident_seconds
                     .observe((checks + timer.elapsed()).as_secs_f64());
             }
+            leftovers = Some(rest);
             slot
         }));
         // The holder may be gone (dropped mid-job): nothing to report to.
         let _ = done.send(slot);
+        // s80 end-resident-gate: the block's leftovers (empty with the gate
+        // off) are dropped once the slot is on its way.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(leftovers)));
     });
     // P2-3: the holder's long-lived thread, started at its first job.
     if holder.end_thread.is_none() {
@@ -5324,8 +5380,21 @@ struct EndResidentJob {
     delta: BlockDelta,
     /// Dropped by whichever thread runs the job.
     retired: Retired,
+    /// s80 end-resident-gate: follow a frozen delta borrowed and hand the
+    /// leftovers back ([`EndResidentJob::run_split`]). Off unless the
+    /// worker's caller turns it on.
+    er_gate: bool,
     #[cfg(test)]
     worker_hook: Option<WorkerHook>,
+}
+
+/// s80 end-resident-gate: what a gated job no longer needs once its slot is
+/// made (the block's `drop_later` values, the frozen set's handle), for the
+/// worker to drop after it sent the slot. Empty with the gate off.
+#[derive(Default)]
+struct Leftovers {
+    _retired: Option<Retired>,
+    _frozen: Option<Arc<torus_state::FrozenPending>>,
 }
 
 /// `end_resident`'s checks: detach R from `overlay`; `None` (slot stays
@@ -5377,6 +5446,7 @@ fn end_resident_take(
         sums,
         delta,
         retired,
+        er_gate: false,
         #[cfg(test)]
         worker_hook: block.worker_hook,
     })
@@ -5385,6 +5455,18 @@ fn end_resident_take(
 impl EndResidentJob {
     /// R takes the block's delta; the decoded positions and the sums follow.
     fn run(self, metrics: Option<&torus_telemetry::Metrics>) -> RowsSlot {
+        self.run_split(metrics).0
+    }
+
+    /// [`Self::run`], handing back what the slot no longer needs (s80
+    /// end-resident-gate on: the block's leftovers, dropped by the caller
+    /// after the slot is on its way; off: nothing, dropped here as before).
+    fn run_split(self, metrics: Option<&torus_telemetry::Metrics>) -> (RowsSlot, Leftovers) {
+        if self.er_gate {
+            if let BlockDelta::Frozen(_) = &self.delta {
+                return self.run_borrowed(metrics);
+            }
+        }
         let EndResidentJob {
             mut rows,
             mut users,
@@ -5393,10 +5475,18 @@ impl EndResidentJob {
             sums,
             delta,
             retired,
+            er_gate,
             #[cfg(test)]
             worker_hook,
         } = self;
-        drop(retired);
+        // s80 end-resident-gate on (a taken delta: nothing to borrow): the
+        // leftovers still go after the slot.
+        let mut leftovers = Leftovers::default();
+        if er_gate {
+            leftovers._retired = Some(retired);
+        } else {
+            drop(retired);
+        }
         #[cfg(test)]
         if let Some(hook) = worker_hook {
             (hook.0)();
@@ -5430,15 +5520,76 @@ impl EndResidentJob {
         let sums_version = carry.finish(u);
         r.set_source(users.clone());
         drop(delta);
-        RowsSlot {
-            rows,
-            marks,
-            sums_version,
-            #[cfg(test)]
-            sums_carried,
-            users,
+        (
+            RowsSlot {
+                rows,
+                marks,
+                sums_version,
+                #[cfg(test)]
+                sums_carried,
+                users,
+                height,
+            },
+            leftovers,
+        )
+    }
+
+    /// s80 end-resident-gate (A): [`Self::run`] following the block's frozen
+    /// set borrowed ([`torus_state::FrozenPending::resident_entries`]: the
+    /// entries the copied delta would hold, in the same order, no key or
+    /// value copied); the block's `drop_later` values and the frozen set's
+    /// handle come back as leftovers.
+    fn run_borrowed(self, metrics: Option<&torus_telemetry::Metrics>) -> (RowsSlot, Leftovers) {
+        let EndResidentJob {
+            mut rows,
+            mut users,
             height,
+            marks,
+            sums,
+            delta,
+            retired,
+            er_gate: _,
+            #[cfg(test)]
+            worker_hook,
+        } = self;
+        let BlockDelta::Frozen(frozen) = delta else {
+            unreachable!("run_split sends only a frozen delta here");
+        };
+        #[cfg(test)]
+        if let Some(hook) = worker_hook {
+            (hook.0)();
         }
+        let r = Arc::get_mut(&mut rows).expect("end_resident_take checked R is not shared");
+        let u = Arc::get_mut(&mut users).expect("end_resident_take checked the record set is not shared");
+        let mut carry = sums.map_or_else(SumsCarry::none, |s| s.into_carry(marks.as_ref()));
+        let view = frozen.resident_entries();
+        let timer = std::time::Instant::now();
+        r.apply_entries(&view);
+        if let Some(m) = metrics {
+            m.exec_end_resident_rows_seconds.observe(timer.elapsed().as_secs_f64());
+        }
+        let timer = std::time::Instant::now();
+        u.apply(&view, Some(&mut |t: &Address, report| carry.trader(t, report)));
+        if let Some(m) = metrics {
+            m.exec_end_resident_users_seconds.observe(timer.elapsed().as_secs_f64());
+            set_resident_gauges(m, r, Some(u));
+        }
+        #[cfg(test)]
+        let sums_carried = carry.carried;
+        let sums_version = carry.finish(u);
+        r.set_source(users.clone());
+        (
+            RowsSlot {
+                rows,
+                marks,
+                sums_version,
+                #[cfg(test)]
+                sums_carried,
+                users,
+                height,
+            },
+            Leftovers { _retired: Some(retired), _frozen: Some(frozen) },
+        )
     }
 }
 

@@ -302,6 +302,13 @@ fn run_with(seed: u64, cached: bool, calm: bool, stats: &mut Stats) -> Vec<Block
 /// `end_resident_on_worker`; the slot checks run on odd blocks (an explicit
 /// join first), even blocks leave the join to the next `begin_resident`.
 fn run_mode(seed: u64, cached: bool, calm: bool, worker: bool, stats: &mut Stats) -> Vec<BlockOut> {
+    run_mode_gated(seed, cached, calm, worker, false, stats)
+}
+
+/// [`run_mode`]; `er_gate` (s80 end-resident-gate, with `worker`): the
+/// worker follows the frozen set borrowed (`BlockDelta::Frozen` under the
+/// gate) and drops the block's leftovers after its slot is ready.
+fn run_mode_gated(seed: u64, cached: bool, calm: bool, worker: bool, er_gate: bool, stats: &mut Stats) -> Vec<BlockOut> {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     for m in 1..=5u64 {
@@ -406,7 +413,11 @@ fn run_mode(seed: u64, cached: bool, calm: bool, worker: bool, stats: &mut Stats
         overlay.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes()).unwrap();
         let delta = overlay.own_pending_delta();
         let frozen = overlay.freeze(h);
-        if worker {
+        if worker && er_gate {
+            let delta = if rb.attached() { BlockDelta::Frozen(frozen.clone()) } else { delta.into() };
+            end_resident_on_worker_with(&mut holder, rb, &mut overlay, delta, true, None, true);
+            assert_eq!(holder.rows_in_flight(), cached, "seed {seed} block {h}: deferred");
+        } else if worker {
             end_resident_on_worker(&mut holder, rb, &mut overlay, delta, true, None);
             assert_eq!(holder.rows_in_flight(), cached, "seed {seed} block {h}: deferred");
         } else {
@@ -507,6 +518,34 @@ fn end_resident_on_worker_equals_inline_and_reference() {
             }
         }
         println!("SUMS_CACHE worker calm={calm} carried={} slot_checked={} shadow={}", stats.carried, stats.slot_checked, stats.shadow);
+        assert!(stats.slot_checked > 200 && stats.shadow > 1_000, "calm={calm}: non-vacuous: {stats:?}");
+        if calm {
+            assert!(stats.carried > 50, "carried entries: {stats:?}");
+        }
+    }
+}
+
+/// s80 end-resident-gate (`TORUS_S80_ER_GATE`): the worker following the
+/// frozen set borrowed gives the same results and rows as the inline run and
+/// the reference run, block by block, with moving and calm marks (carried
+/// sums); the slot's sums and records equal a cold build after the checked
+/// blocks.
+#[test]
+fn er_gate_worker_on_the_frozen_view_equals_inline_and_reference() {
+    for calm in [false, true] {
+        let mut stats = Stats::default();
+        for seed in 1..=3u64 {
+            let s = seed * 0x57E9_2002;
+            let gated = run_mode_gated(s, true, calm, true, true, &mut stats);
+            let inline = run_mode(s, true, calm, false, &mut Stats::default());
+            let reference = run_mode(s, false, calm, false, &mut Stats::default());
+            for (h, ((g, i), r)) in gated.iter().zip(&inline).zip(&reference).enumerate() {
+                let h = h + 1;
+                assert_eq!(g.results, r.results, "calm={calm} seed {seed} block {h}: results vs reference");
+                assert_eq!(g.results, i.results, "calm={calm} seed {seed} block {h}: results vs inline");
+                assert!(g.rows == r.rows && g.rows == i.rows, "calm={calm} seed {seed} block {h}: rows");
+            }
+        }
         assert!(stats.slot_checked > 200 && stats.shadow > 1_000, "calm={calm}: non-vacuous: {stats:?}");
         if calm {
             assert!(stats.carried > 50, "carried entries: {stats:?}");

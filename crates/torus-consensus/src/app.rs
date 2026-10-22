@@ -1638,6 +1638,12 @@ struct ExecutionContext {
     /// flag off (`=0`) it stays empty forever and execution is byte-identical to
     /// the per-block reload path.
     resident_books: std::sync::Mutex<torus_bridge::native_executor::ResidentBooks>,
+    /// s80 end-resident-gate (`TORUS_S80_ER_GATE`, node-local, default off):
+    /// a pipelined block starts its `end_resident` worker right after the
+    /// hand-off (before the checkpoint upkeep), and the worker follows the
+    /// frozen set borrowed and drops the block's leftovers after its slot is
+    /// ready (`end_resident_on_worker_with`). Same slot, same state.
+    er_gate: bool,
     /// rank-root: cross-block in-RAM native-trie node cache
     /// (`TORUS_NATIVE_ROOT_CACHE`). Value-neutral and node-local: persisted
     /// trie bytes and the root are identical with or without it. Self-
@@ -1736,6 +1742,10 @@ struct ExecutionContext {
     /// runtime flag for R (D16).
     #[cfg(test)]
     test_no_resident_rows: bool,
+    /// s80 end-resident-gate (tests): the pipelined block at this height
+    /// fails its checkpoint upkeep (fail-stop latched, as a merge panic).
+    #[cfg(test)]
+    test_upkeep_fault: Option<u64>,
     /// Item 6 Phase 2 (plan 9.8): test-only reference switch — `true` runs
     /// every native block on torus-bridge's frozen reference paths (the
     /// full-scan cancel-all, the per-row position flush), reached through its
@@ -5961,6 +5971,9 @@ impl ExecutionContext {
             let test_delta_before_freeze =
                 (pipelined && resident_rows.attached()).then(|| overlay.own_pending_delta());
             let resident_ok;
+            // s80 end-resident-gate (0): the worker already started at the
+            // hand-off (pipelined, gate on): nothing left to end below.
+            let mut ended_early = false;
             if pipelined {
                 debug_assert!(
                     evm_batch.is_none(),
@@ -6055,6 +6068,39 @@ impl ExecutionContext {
                 }) {
                     return;
                 }
+                // s80 end-resident-gate (0): the worker needs only R and the
+                // frozen set, both final now; the upkeep below touches the
+                // overlay's layers and the checkpoint state, never R or the
+                // rows slot (its L3.1 close `try_lock`s the holder for the
+                // books, released here first). So the worker starts here and
+                // overlaps the upkeep too. A failed upkeep drops the slot
+                // (below): the same empty slot as without the gate.
+                if self.er_gate {
+                    #[cfg(test)]
+                    self.test_path("er_gate.end_resident_at_handoff");
+                    let rows = std::mem::replace(
+                        &mut resident_rows,
+                        torus_bridge::native_executor::begin_resident(None, &mut overlay, height, None),
+                    );
+                    let delta = std::mem::replace(
+                        &mut resident_delta,
+                        torus_state::ResidentDelta::default().into(),
+                    );
+                    let mut holder = self
+                        .resident_books
+                        .lock()
+                        .expect("resident-books mutex poisoned (exec thread panicked mid-block)");
+                    torus_bridge::native_executor::end_resident_on_worker_with(
+                        &mut holder,
+                        rows,
+                        &mut overlay,
+                        delta,
+                        true,
+                        self.metrics.clone(),
+                        true,
+                    );
+                    ended_early = true;
+                }
                 // 8k L3.1: this block's skipped books join the window's debt
                 // before the upkeep, which may close the window right here.
                 if !coalesced.is_empty() {
@@ -6066,7 +6112,20 @@ impl ExecutionContext {
                 if book_window_full {
                     self.ckpt.lock().unwrap().unsaved.clear();
                 }
-                if !self.checkpoint_upkeep(&mut overlay, height) {
+                #[cfg(test)]
+                let upkeep_fault = self.test_upkeep_fault == Some(height);
+                #[cfg(not(test))]
+                let upkeep_fault = false;
+                if upkeep_fault {
+                    self.exec_failed.store(true, Ordering::SeqCst);
+                }
+                if upkeep_fault || !self.checkpoint_upkeep(&mut overlay, height) {
+                    if ended_early {
+                        self.resident_books
+                            .lock()
+                            .expect("resident-books mutex poisoned (exec thread panicked mid-block)")
+                            .drop_rows();
+                    }
                     return;
                 }
                 resident_ok = true;
@@ -6221,18 +6280,19 @@ impl ExecutionContext {
             // is held only to hand the job over); the next access of the
             // rows slot — the next native block's `begin_resident` or an
             // untouched block's `advance_untouched` — joins it first.
-            {
+            if !ended_early {
                 let mut holder = self
                     .resident_books
                     .lock()
                     .expect("resident-books mutex poisoned (exec thread panicked mid-block)");
-                torus_bridge::native_executor::end_resident_on_worker(
+                torus_bridge::native_executor::end_resident_on_worker_with(
                     &mut holder,
                     resident_rows,
                     &mut overlay,
                     resident_delta,
                     resident_ok,
                     self.metrics.clone(),
+                    self.er_gate,
                 );
             }
 
@@ -7761,6 +7821,7 @@ impl TorusApp {
             exec_shutdown: exec_shutdown.clone(),
             exec_queue_len: exec_queue_len.clone(),
             resident_books: std::sync::Mutex::new(Default::default()),
+            er_gate: torus_bridge::native_executor::er_gate_enabled(),
             trie_cache: Arc::new(std::sync::Mutex::new(Default::default())),
             member_cache: Arc::new(std::sync::Mutex::new(
                 torus_state::native_trie::NativeMemberCache::with_budget(
@@ -7789,6 +7850,8 @@ impl TorusApp {
             test_no_resident: false,
             #[cfg(test)]
             test_no_resident_rows: false,
+            #[cfg(test)]
+            test_upkeep_fault: None,
             #[cfg(test)]
             test_reference_paths: false,
             #[cfg(test)]
@@ -17024,6 +17087,7 @@ mod crash_recovery_tests {
             exec_shutdown: Arc::new(AtomicBool::new(false)),
             exec_queue_len: Arc::new(AtomicU64::new(0)),
             resident_books: std::sync::Mutex::new(Default::default()),
+            er_gate: torus_bridge::native_executor::er_gate_enabled(),
             trie_cache: Arc::new(std::sync::Mutex::new(Default::default())),
             member_cache: Arc::new(std::sync::Mutex::new(
                 torus_state::native_trie::NativeMemberCache::with_budget(
@@ -17051,6 +17115,8 @@ mod crash_recovery_tests {
             test_no_resident: false,
             #[cfg(test)]
             test_no_resident_rows: false,
+            #[cfg(test)]
+            test_upkeep_fault: None,
             #[cfg(test)]
             test_reference_paths: false,
             #[cfg(test)]
@@ -28959,14 +29025,16 @@ mod crash_recovery_tests {
     /// boundaries), built once, never shared at the end of a block.
     #[test]
     fn resident_rows_equal_db_scan_after_every_block_serial_and_pipelined() {
-        for on in [false, true] {
+        // s80 end-resident-gate: and with the gate on.
+        for (on, er_gate) in [(false, false), (true, false), (false, true), (true, true)] {
             let (_cfg, state_db) = make_test_config_and_db();
             fund_pipeline_fixture(&state_db);
-            let ctx = pipeline_ctx(&state_db, on, None);
+            let mut ctx = pipeline_ctx(&state_db, on, None);
+            ctx.er_gate = er_gate;
             for b in &pipeline_fixture_blocks() {
                 dispatch_and_execute(&ctx, &state_db, b);
                 assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
-                assert_resident_rows_track_db(&ctx, &state_db, b.header.height, &format!("on={on}"));
+                assert_resident_rows_track_db(&ctx, &state_db, b.header.height, &format!("on={on} er_gate={er_gate}"));
             }
             let mut holder = ctx.resident_books.lock().unwrap();
             assert_eq!(holder.rows_builds(), 1, "on={on}: built once at block 1");
@@ -28985,20 +29053,32 @@ mod crash_recovery_tests {
     /// `advance_untouched`) joins it, so R still equals the DB after every
     /// block; the end timer and the join's wait timer count once per worker.
     /// Prints the worker's time vs the exposed wait (18c sanity, tiny blocks).
+    ///
+    /// s80 end-resident-gate: the same with `er_gate` on; pipelined, every
+    /// native block starts its worker at the hand-off (before the upkeep).
     #[test]
     fn end_resident_runs_on_a_worker_joined_by_the_next_block() {
-        for on in [false, true] {
+        for (on, er_gate) in [(false, false), (true, false), (false, true), (true, true)] {
             let (_cfg, state_db) = make_test_config_and_db();
             fund_pipeline_fixture(&state_db);
             let mut ctx = pipeline_ctx(&state_db, on, None);
+            ctx.er_gate = er_gate;
             let metrics = Arc::new(torus_telemetry::Metrics::new());
             ctx.metrics = Some(metrics.clone());
             let mut spawned = 0.0;
+            // s80 end-resident-gate: workers of pipelined blocks (an epoch
+            // boundary runs serially and ends late either way).
+            let mut spawned_pipelined = 0.0;
+            let pipelined_blocks =
+                |ctx: &ExecutionContext| ctx.test_paths.lock().unwrap().get("block.pipelined").copied().unwrap_or(0);
             for b in &pipeline_fixture_blocks() {
+                let before = pipelined_blocks(&ctx);
                 dispatch_and_execute(&ctx, &state_db, b);
+                let pipelined = pipelined_blocks(&ctx) > before;
                 assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
                 let in_flight = ctx.resident_books.lock().unwrap().rows_in_flight();
                 spawned += f64::from(u8::from(in_flight));
+                spawned_pipelined += f64::from(u8::from(in_flight && pipelined));
                 // Odd heights: the next block joins the worker itself.
                 if b.header.height.is_multiple_of(2) {
                     assert_resident_rows_track_db(&ctx, &state_db, b.header.height, &format!("worker on={on}"));
@@ -29010,12 +29090,68 @@ mod crash_recovery_tests {
             assert!(spawned >= 4.0, "on={on}: native blocks ran on the worker ({spawned})");
             assert_eq!(v("torus_exec_end_resident_seconds_count"), spawned, "on={on}");
             assert_eq!(v("torus_exec_end_resident_wait_seconds_count"), spawned, "on={on}: one join per worker");
+            let early = ctx.test_paths.lock().unwrap().get("er_gate.end_resident_at_handoff").copied().unwrap_or(0);
+            if on && er_gate {
+                assert!(spawned_pipelined >= 4.0 && spawned_pipelined < spawned, "non-vacuous: {spawned_pipelined} of {spawned}");
+                assert_eq!(early as f64, spawned_pipelined, "er_gate: every pipelined worker started at the hand-off");
+            } else {
+                assert_eq!(early, 0, "on={on} er_gate={er_gate}: no early start");
+            }
             println!(
-                "STEP2 on={on} workers={spawned} end_resident_ms_sum={:.3} wait_ms_sum={:.3}",
+                "STEP2 on={on} er_gate={er_gate} workers={spawned} end_resident_ms_sum={:.3} wait_ms_sum={:.3}",
                 v("torus_exec_end_resident_seconds_sum") * 1e3,
                 v("torus_exec_end_resident_wait_seconds_sum") * 1e3
             );
         }
+    }
+
+    /// s80 end-resident-gate: a pipelined block whose checkpoint upkeep fails
+    /// after its worker started at the hand-off leaves the rows slot empty
+    /// (no worker in flight), as with the gate off; the fail-stop is latched
+    /// either way and the state below is the same. W is parked at the
+    /// block's job until the block returned: W writes nothing once the
+    /// fail-stop is latched (R01b), so without the park the outcome would
+    /// race the latch (the gate's hand-over runs before it).
+    #[test]
+    fn er_gate_failed_upkeep_leaves_the_rows_slot_empty() {
+        let mut dumps = Vec::new();
+        for er_gate in [false, true] {
+            let (_cfg, state_db) = make_test_config_and_db();
+            fund_pipeline_fixture(&state_db);
+            let gate = crate::exec_pipeline::WorkerGate::new();
+            let mut ctx = pipeline_ctx(&state_db, true, Some(gate.clone()));
+            ctx.er_gate = er_gate;
+            let blocks = pipeline_fixture_blocks();
+            // Block 3: a pipelined native block on R reused (2 is empty).
+            let at = 3;
+            gate.hold_from(at);
+            ctx.test_upkeep_fault = Some(at);
+            for b in &blocks {
+                if b.header.height > at {
+                    break;
+                }
+                dispatch_and_execute(&ctx, &state_db, b);
+            }
+            assert!(ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst), "er_gate={er_gate}: fail-stop latched");
+            {
+                let mut holder = ctx.resident_books.lock().unwrap();
+                assert!(!holder.rows_in_flight(), "er_gate={er_gate}: no worker left in flight");
+                assert_eq!(holder.rows_height(), None, "er_gate={er_gate}: failed upkeep: R not stashed");
+                assert_eq!(holder.rows_shared_fallbacks(), 0, "er_gate={er_gate}");
+            }
+            let early = ctx.test_paths.lock().unwrap().get("er_gate.end_resident_at_handoff").copied().unwrap_or(0);
+            assert_eq!(early > 0, er_gate, "er_gate={er_gate}: early start at {at}");
+            gate.release();
+            drop(ctx);
+            let dump = dump_all_cfs(&state_db);
+            assert_eq!(
+                read_native_applied_height(&state_db),
+                Some(at - 1),
+                "er_gate={er_gate}: the failed block is not durable"
+            );
+            dumps.push(dump);
+        }
+        assert_dumps_equal(&dumps[0], &dumps[1], "failed upkeep: gate off vs on");
     }
 
     /// Item 6 C1: the same block sequence with and without R lands identical
@@ -36253,7 +36389,7 @@ mod crash_recovery_tests {
                 .total(|r, l, _| r == Reader::Test && !matches!(l, Layer::Parent | Layer::Db)),
             Count::default()
         );
-        let want: BTreeMap<&str, u64> = [
+        let mut want: BTreeMap<&str, u64> = [
             ("barrier", 2),
             ("block.evm", 1),
             ("block.pipelined", 10),
@@ -36269,6 +36405,11 @@ mod crash_recovery_tests {
         ]
         .into_iter()
         .collect();
+        // s80 end-resident-gate (`TORUS_S80_ER_GATE=1`): every Flush
+        // hand-off starts its end_resident worker right there.
+        if torus_bridge::native_executor::er_gate_enabled() {
+            want.insert("er_gate.end_resident_at_handoff", 8);
+        }
         assert_eq!(node.paths, want);
         assert_eq!(
             node.ledger().calls,

@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::*;
 use torus_core::position::{cum_volume_key, position_key, MarginType, NativeBalance, PositionManager, POSITION_V2_LEN};
 use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS};
-use torus_state::{NativeStateOverlay, StateBackend, StateDb};
+use torus_state::{NativeStateOverlay, ResidentDelta, StateBackend, StateDb};
 use torus_types::{FixedPoint, MarketId};
 
 struct Lcg(u64);
@@ -437,6 +437,60 @@ fn users_equal_decoded_rows_after_random_deltas() {
     assert!(stats.reported > 1_000 && stats.reported_none > 50 && stats.changes > 3_000, "reports: {stats:?}");
     assert!(stats.balances > 1_000 && stats.volumes > 1_000, "balance and cvlm rows: {stats:?}");
     assert!(stats.lenient > 50 && stats.other > 50, "lenient rows, rows under no trader: {stats:?}");
+}
+
+/// s80 end-resident-gate (`TORUS_S80_ER_GATE`): the record set following
+/// the block's frozen set borrowed (`FrozenPending::resident_entries`, the
+/// worker's view under the gate) reports the same traders, changes and
+/// positions in the same order, and ends equal to the record set following
+/// the copied delta, after every block of 8 seeds x 150 random blocks
+/// (irregular rows, `cvlm`, tombstones included); both equal a cold build.
+#[test]
+fn users_follow_the_frozen_view_like_the_copied_delta() {
+    let mut stats = Stats::default();
+    let mut reported = 0usize;
+    for seed in 1..=8u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let mut rng = Lcg(seed * 0x9E37_79B9);
+        for _ in 0..4 {
+            let o = NativeStateOverlay::new(db.clone());
+            random_block(&o, &mut rng);
+            random_balance_block(&o, &mut rng);
+            o.flush(&db).unwrap();
+        }
+        let mut rows = ResidentRows::build(&db).unwrap();
+        let mut copy = Users::build(&rows);
+        let mut view = Users::build(&rows);
+        for h in 1..=150 {
+            let o = NativeStateOverlay::new(db.clone());
+            random_block(&o, &mut rng);
+            random_balance_block(&o, &mut rng);
+            let delta = o.own_pending_delta();
+            o.flush(&db).unwrap();
+            let frozen = o.freeze(h);
+            let mut want: Vec<Report> = Vec::new();
+            copy.apply(
+                &delta,
+                Some(&mut |t: &Address, r: Option<(&[Change], &[Position], &mut Sums)>| {
+                    want.push((*t, r.map(|(c, n, _)| (c.to_vec(), n.to_vec()))));
+                }),
+            );
+            let mut got: Vec<Report> = Vec::new();
+            view.apply(
+                &frozen.resident_entries(),
+                Some(&mut |t: &Address, r: Option<(&[Change], &[Position], &mut Sums)>| {
+                    got.push((*t, r.map(|(c, n, _)| (c.to_vec(), n.to_vec()))));
+                }),
+            );
+            assert_eq!(format!("{got:?}"), format!("{want:?}"), "seed {seed} block {h}: reports");
+            reported += got.len();
+            assert!(view.same_as(&copy), "seed {seed} block {h}: view != copy");
+            rows.apply(&delta);
+            check(&view, &rows, &db, &mut stats, &format!("seed {seed} block {h}"));
+        }
+    }
+    assert!(reported > 1_000 && stats.opaque > 500, "non-vacuous: {reported} {stats:?}");
 }
 
 /// Plan Task 1.1: a regular user's fields re-encode to R's bytes (each

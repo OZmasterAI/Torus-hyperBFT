@@ -1,7 +1,7 @@
 //! Item 6 Phase 4 step 1 (`docs/plans/item6-phase4-impl.md` Task 1.1): the
 //! record set [`Users`] — one record per trader of R's `CF_NATIVE_POSITIONS`
 //! and `CF_NATIVE_BALANCES` rows — kept in the resident rows slot next to R
-//! and updated from each block's [`ResidentDelta`] at `end_resident` (built
+//! and updated from each block's [`torus_state::ResidentDelta`] at `end_resident` (built
 //! cold with R). It replaces C7's `TraderPositions` (decoded positions, E2's
 //! trader set, adl-budget C2's holder lists) and also follows the balance and
 //! `cvlm` rows. Node-local, never consensus-visible, no format change.
@@ -64,7 +64,7 @@ use torus_state::error::StateError;
 use torus_state::resident_rows::{ResidentRow, ResidentRowIter, ResidentSource};
 #[cfg(test)]
 use torus_state::ResidentRows;
-use torus_state::{FrozenPending, ResidentDelta, StateBackend};
+use torus_state::{FrozenPending, ResidentDeltaEntries, StateBackend};
 use torus_types::{FixedPoint, MarketId};
 
 use super::SumsResult;
@@ -484,11 +484,16 @@ impl Users {
     /// it on or clears it); `None` when its rows are re-decoded (opaque
     /// before, or an irregular write in either CF: a new record starts
     /// without sums).
-    pub(crate) fn apply(&mut self, delta: &ResidentDelta, mut seen: Option<&mut Seen<'_>>) {
+    ///
+    /// s80 end-resident-gate: `delta` is any [`ResidentDeltaEntries`] (the
+    /// copied [`torus_state::ResidentDelta`], or the block's frozen set borrowed under
+    /// `TORUS_S80_ER_GATE`): the same entries give the same records and
+    /// reports.
+    pub(crate) fn apply<D: ResidentDeltaEntries>(&mut self, delta: &D, mut seen: Option<&mut Seen<'_>>) {
         // A trader's balance and `cvlm` rows are not adjacent in key order:
         // gathered per trader first.
         let mut balances: HashMap<Address, BalanceDelta<'_>> = HashMap::default();
-        for (k, v) in delta.entries(CF_NATIVE_BALANCES) {
+        for (k, v) in delta.entries_of(CF_NATIVE_BALANCES) {
             match balance_owner(k) {
                 Some((t, BalanceRow::Balance)) => balances.entry(t).or_default().balance = Some(v),
                 Some((t, BalanceRow::Volume)) => balances.entry(t).or_default().volume = Some(v),
@@ -500,7 +505,7 @@ impl Users {
         let mut changes: Vec<Change> = Vec::new();
         // The delta is key-sorted: a trader's entries are adjacent (a key
         // shorter than a trader prefix sorts outside every trader's range).
-        let mut entries = delta.entries(CF_NATIVE_POSITIONS).peekable();
+        let mut entries = delta.entries_of(CF_NATIVE_POSITIONS).peekable();
         while let Some(first) = entries.next() {
             if first.0.len() < TRADER {
                 self.put_other(true, first.0, first.1);

@@ -209,6 +209,28 @@ impl ResidentDelta {
     }
 }
 
+/// s80 end-resident-gate (`TORUS_S80_ER_GATE`): a block's writes (`Some`)
+/// and tombstones (`None`) of R's CFs, key-sorted per CF: owned
+/// ([`ResidentDelta`]) or borrowed from the block's frozen set
+/// ([`crate::FrozenPending::resident_entries`], no copy). Both yield exactly
+/// the same entries for the same block.
+pub trait ResidentDeltaEntries {
+    /// The entries of R's slot `slot` ([`RESIDENT_CFS`] order), key-sorted.
+    fn slot_entries<'a>(&'a self, slot: usize) -> impl Iterator<Item = (&'a [u8], Option<&'a [u8]>)> + 'a;
+
+    /// The entries of `cf`, key-sorted (none for a CF outside R).
+    fn entries_of<'a>(&'a self, cf: &str) -> impl Iterator<Item = (&'a [u8], Option<&'a [u8]>)> + 'a {
+        resident_slot(cf).into_iter().flat_map(move |s| self.slot_entries(s))
+    }
+}
+
+impl ResidentDeltaEntries for ResidentDelta {
+    #[inline]
+    fn slot_entries<'a>(&'a self, slot: usize) -> impl Iterator<Item = (&'a [u8], Option<&'a [u8]>)> + 'a {
+        self.cfs[slot].iter().map(|(k, v)| (k.as_slice(), v.as_deref()))
+    }
+}
+
 /// Item 6 C6b: one key of an R CF that the block's own pending set writes
 /// (`current: Some`) or deletes (`current: None`), with R's row (the state
 /// at the start of the block, parent layer included).
@@ -351,6 +373,27 @@ impl ResidentRows {
                     Some(v) => {
                         self.bytes += key.len() + v.len();
                         map.insert(key.clone(), v.clone())
+                    }
+                    None => map.remove(key),
+                };
+                if let Some(old) = old {
+                    self.bytes -= key.len() + old.len();
+                }
+            }
+        }
+    }
+
+    /// s80 end-resident-gate: [`Self::apply`] from any
+    /// [`ResidentDeltaEntries`] (the frozen set borrowed): the same rows and
+    /// byte count as `apply` of the copied delta.
+    pub fn apply_entries<D: ResidentDeltaEntries>(&mut self, delta: &D) {
+        let from = if matches!(self.users, SourceSlots::Raw) { 0 } else { SOURCE_SLOTS };
+        for (slot, map) in self.cfs.iter_mut().enumerate().skip(from) {
+            for (key, value) in delta.slot_entries(slot) {
+                let old = match value {
+                    Some(v) => {
+                        self.bytes += key.len() + v.len();
+                        map.insert(key.to_vec(), v.to_vec())
                     }
                     None => map.remove(key),
                 };

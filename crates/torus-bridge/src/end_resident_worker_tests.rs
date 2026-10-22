@@ -516,3 +516,168 @@ fn slot_reads_positions_and_balances_from_users() {
         assert_eq!((slot.users.row_count() as i64, slot.users.row_bytes() as i64), (user_rows, user_bytes));
     }
 }
+
+// ======================================================================
+// s80 end-resident-gate (`TORUS_S80_ER_GATE`): the worker follows the
+// frozen set borrowed and drops the block's leftovers after its slot is
+// ready.
+// ======================================================================
+
+/// One pipelined-shape block at `h` (the delta from the frozen set) ended
+/// inline (`None`) or on the worker with the gate off / on; a value given
+/// to `drop_later` records the thread it is dropped on.
+fn frozen_block(
+    db: &StateDb,
+    holder: &mut ResidentBooks,
+    h: u64,
+    gate: Option<bool>,
+    dropped: &Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    struct OnDrop(Arc<std::sync::Mutex<Vec<String>>>);
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            let name = std::thread::current().name().unwrap_or("").to_string();
+            self.0.lock().unwrap().push(name);
+        }
+    }
+    let mut overlay = NativeStateOverlay::new(db.clone());
+    let mut rb = begin_resident(Some(holder), &mut overlay, h, None);
+    assert!(rb.attached(), "block {h}: R attached");
+    let t = (h % 9) as u8 + 1;
+    overlay.put_cf_raw(CF_NATIVE_BALANCES, &[t; 20], &[b'w', h as u8]).unwrap();
+    overlay.put_cf_raw(CF_NATIVE_BALANCES, &[0x40 + h as u8; 20], b"new").unwrap();
+    overlay.put_cf_raw(CF_NATIVE_POSITIONS, &pos_key(t, 2 + h % 3), &[b'q', h as u8]).unwrap();
+    overlay.delete_cf_raw(CF_NATIVE_POSITIONS, &pos_key(t, 1)).unwrap();
+    overlay.delete_cf_raw(CF_NATIVE_BALANCES, &[0x40 + h as u8 - 1; 20]).unwrap();
+    overlay
+        .put_cf_raw(torus_state::cf::CF_CONSENSUS_META, torus_state::cf::META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes())
+        .unwrap();
+    rb.drop_later(OnDrop(dropped.clone()));
+    match gate {
+        None => {
+            let delta = overlay.own_pending_delta();
+            let frozen = overlay.freeze(h);
+            end_resident(holder, rb, &mut overlay, delta, true, None);
+            frozen.flush_with_native_trie_stats(db, None, None, None).unwrap();
+        }
+        Some(gate) => {
+            let frozen = overlay.freeze(h);
+            end_resident_on_worker_with(holder, rb, &mut overlay, BlockDelta::Frozen(frozen.clone()), true, None, gate);
+            assert!(holder.rows_in_flight(), "block {h}: end_resident deferred to the worker");
+            frozen.flush_with_native_trie_stats(db, None, None, None).unwrap();
+        }
+    }
+}
+
+/// s80 end-resident-gate: the worker with the gate on (the frozen set
+/// borrowed) makes the slot the inline end and the gate-off worker (the
+/// copied delta) make, and R equals the DB, after every block; the block's
+/// leftovers are dropped on the worker thread in both worker modes.
+#[test]
+fn er_gate_worker_slot_equals_the_copied_delta_slot() {
+    let dropped = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dbs: Vec<_> = (0..3).map(|_| open_db()).collect();
+    for (_, db) in &dbs {
+        seed(db);
+    }
+    let mut holders: Vec<ResidentBooks> = (0..3).map(|_| ResidentBooks::default()).collect();
+    let gates = [None, Some(false), Some(true)];
+    for h in 1..=16u64 {
+        for ((holder, (_, db)), gate) in holders.iter_mut().zip(&dbs).zip(gates) {
+            frozen_block(db, holder, h, gate, &dropped);
+        }
+        let want = dump_rows(holders[0].rows().unwrap());
+        assert_eq!(want, dump_db(&dbs[0].1), "block {h}: inline R != DB");
+        for (i, holder) in holders.iter_mut().enumerate().skip(1) {
+            assert_eq!(dump_rows(holder.rows().unwrap()), want, "block {h}: worker {:?} slot != inline slot", gates[i]);
+            assert_eq!(dump_db(&dbs[i].1), dump_db(&dbs[0].1), "block {h}: state");
+            assert_eq!(holder.trader_positions_match_rows(), Some(true), "block {h}: {:?} decoded positions", gates[i]);
+        }
+    }
+    for holder in &holders {
+        assert_eq!(holder.rows_builds(), 1, "R built once");
+        assert_eq!(holder.rows_shared_fallbacks(), 0);
+    }
+    // Gate on: the last block's leftovers may still be dropping after its
+    // slot was joined.
+    let deadline = std::time::Instant::now() + DEADLINE;
+    while dropped.lock().unwrap().len() < 48 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let dropped = dropped.lock().unwrap();
+    assert_eq!(dropped.len(), 48);
+    assert_eq!(dropped.iter().filter(|n| *n == "torus-end-resident").count(), 32, "{dropped:?}");
+}
+
+/// s80 end-resident-gate: with the gate on, the next access of the rows
+/// slot returns while the block's leftovers (a `drop_later` value, the
+/// frozen set's handle) are still being dropped on the worker; with it off
+/// (today's order: the leftovers first) it waits for that drop. Either way
+/// the slot is the block's and the next block reuses it.
+#[test]
+fn er_gate_slot_is_ready_before_the_leftovers_drop() {
+    struct Blocker(mpsc::Sender<()>, mpsc::Receiver<()>);
+    impl Drop for Blocker {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+            let _ = self.1.recv_timeout(DEADLINE);
+        }
+    }
+    for gate in [false, true] {
+        let (_d, db) = open_db();
+        seed(&db);
+        let mut holder = ResidentBooks::default();
+        let none = Arc::new(std::sync::Mutex::new(Vec::new()));
+        frozen_block(&db, &mut holder, 1, Some(gate), &none);
+        let mut overlay = NativeStateOverlay::new(db.clone());
+        let mut rb = begin_resident(Some(&mut holder), &mut overlay, 2, None);
+        assert!(!rb.rebuilt(), "gate={gate}: block 2 reuses R");
+        overlay.put_cf_raw(CF_NATIVE_BALANCES, &[3u8; 20], b"two").unwrap();
+        overlay
+            .put_cf_raw(torus_state::cf::CF_CONSENSUS_META, torus_state::cf::META_NATIVE_APPLIED_HEIGHT, &2u64.to_be_bytes())
+            .unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        rb.drop_later(Blocker(started_tx, release_rx));
+        let frozen = overlay.freeze(2);
+        end_resident_on_worker_with(&mut holder, rb, &mut overlay, BlockDelta::Frozen(frozen.clone()), true, None, gate);
+        frozen.flush_with_native_trie_stats(&db, None, None, None).unwrap();
+        drop(frozen);
+        started_rx.recv_timeout(DEADLINE).expect("the leftovers' drop never started");
+        let (done_tx, done_rx) = mpsc::channel();
+        let t = std::thread::spawn(move || {
+            let h = holder.rows_height();
+            done_tx.send(()).unwrap();
+            (holder, h)
+        });
+        if gate {
+            done_rx
+                .recv_timeout(DEADLINE / 2)
+                .expect("gate on: the slot access waited for the leftovers' drop");
+            release_tx.send(()).unwrap();
+        } else {
+            assert!(done_rx.recv_timeout(HOLD).is_err(), "gate off: the slot came before the leftovers' drop");
+            release_tx.send(()).unwrap();
+            done_rx.recv_timeout(DEADLINE).expect("gate off: never returned after the release");
+        }
+        let (mut holder, h) = t.join().unwrap();
+        assert_eq!(h, Some(2), "gate={gate}: the slot is block 2's");
+        assert_eq!(dump_rows(holder.rows().unwrap()), dump_db(&db), "gate={gate}: R == DB");
+        assert_eq!(holder.trader_positions_match_rows(), Some(true), "gate={gate}");
+        frozen_block(&db, &mut holder, 3, Some(gate), &none);
+        assert_eq!(dump_rows(holder.rows().unwrap()), dump_db(&db), "gate={gate}: R == DB after 3");
+        assert_eq!(holder.rows_builds(), 1, "gate={gate}: R built once");
+    }
+}
+
+/// s80 end-resident-gate: `TORUS_S80_ER_GATE` parses `1` / `true` / `on` as
+/// on, anything else (unset included) as off.
+#[test]
+fn er_gate_flag_parse() {
+    for v in ["1", " 1 ", "true", "on"] {
+        assert!(parse_er_gate(Some(v)), "{v}");
+    }
+    for v in [None, Some(""), Some("0"), Some("false"), Some("off"), Some("2"), Some("yes")] {
+        assert!(!parse_er_gate(v), "{v:?}");
+    }
+}

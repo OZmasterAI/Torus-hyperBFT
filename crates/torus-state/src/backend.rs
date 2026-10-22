@@ -1033,6 +1033,21 @@ fn resident_delta_of(state: &PendingState) -> ResidentDelta {
     delta
 }
 
+/// s80 end-resident-gate (`TORUS_S80_ER_GATE`): the frozen set's writes and
+/// tombstones of R's CFs, borrowed ([`FrozenPending::resident_entries`]):
+/// the entries of [`FrozenPending::resident_delta`] without copying them.
+pub struct FrozenResidentDelta<'a> {
+    state: &'a PendingState,
+    ids: [CfId; RESIDENT_CFS.len()],
+}
+
+impl crate::resident_rows::ResidentDeltaEntries for FrozenResidentDelta<'_> {
+    #[inline]
+    fn slot_entries<'a>(&'a self, slot: usize) -> impl Iterator<Item = (&'a [u8], Option<&'a [u8]>)> + 'a {
+        cf_stream(self.state.cf(self.ids[slot]))
+    }
+}
+
 impl FrozenPending {
     /// The frozen pending set (crate-internal: the checkpoint layer merges it).
     pub(crate) fn pending_state(&self) -> &PendingState {
@@ -1138,6 +1153,16 @@ impl FrozenPending {
     /// the end-of-block upkeep take it off the execution thread.
     pub fn resident_delta(&self) -> ResidentDelta {
         resident_delta_of(&self.state)
+    }
+
+    /// s80 end-resident-gate (`TORUS_S80_ER_GATE`): [`Self::resident_delta`]
+    /// borrowed from this set (no copy of any key or value): the same entries
+    /// per CF, in the same order.
+    pub fn resident_entries(&self) -> FrozenResidentDelta<'_> {
+        FrozenResidentDelta {
+            state: &self.state,
+            ids: RESIDENT_CFS.map(|cf| intern_cf(cf).expect("resident CF is registered")),
+        }
     }
 
     /// A 1-key frozen set holding only the native applied-height marker
