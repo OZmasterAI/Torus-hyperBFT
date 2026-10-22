@@ -11,6 +11,7 @@ tools:
   - NotebookEdit
   - mcp__toolshed__run_tool
   - mcp__toolshed__list_tools
+  - SendMessage
 permissionMode: acceptEdits
 ---
 
