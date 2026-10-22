@@ -121,6 +121,41 @@ fn list_failures(
     Some(out)
 }
 
+/// s139: append to `out` the `orderUpdates` events of the placements in
+/// `list` refused before any book saw them (the book logs its own refusals,
+/// with the order id; `NativeActionResult::is_book_reject`). `result` is
+/// `execute_batch(list)`'s; one entry per order of a PlaceOrderBatch within
+/// the cap, as [`list_failures`] reads it. A count mismatch (never expected)
+/// adds nothing. Node-local stream output only.
+pub fn order_rejections(
+    list: &[(Address, NativeAction)],
+    result: &NativeBatchResult,
+    out: &mut Vec<torus_state::order_events::OrderEvent>,
+) {
+    let total: usize = list.iter().map(|(_, a)| flat_len(a)).sum();
+    if result.results.len() != total {
+        return;
+    }
+    let mut flat = 0;
+    for (sender, action) in list {
+        let len = flat_len(action);
+        let entries = &result.results[flat..flat + len];
+        flat += len;
+        let orders: &[torus_types::PlaceOrderParams] = match action {
+            NativeAction::PlaceOrder(p) => std::slice::from_ref(p),
+            NativeAction::PlaceOrderBatch(orders) => orders,
+            _ => continue,
+        };
+        for (params, r) in orders.iter().zip(entries) {
+            if !r.success && !r.is_book_reject() {
+                out.push(torus_bridge::native_executor::pre_book_reject_event(
+                    sender, params, None, r.reason,
+                ));
+            }
+        }
+    }
+}
+
 /// The block's native execution failures and order rejections, ascending
 /// body index.
 ///
@@ -338,6 +373,55 @@ mod tests {
             gas_used: 0,
             reason,
         }
+    }
+
+    /// s139: the pre-book rejections of a list map to their sender and
+    /// order (a batch's orders one by one); the book's own refusals
+    /// (borrowed canonical message) and successes are not taken; a count
+    /// mismatch adds nothing.
+    #[test]
+    fn order_rejections_take_only_pre_book_refusals() {
+        use torus_state::order_events::{OrderEventReason, OrderEventStatus};
+        let a = Address::repeat_byte(1);
+        let b = Address::repeat_byte(2);
+        let book_reject = NativeActionResult {
+            action_type: "place_order",
+            success: false,
+            error: Some(std::borrow::Cow::Borrowed(FailureReason::IocCancel.book_reject_message())),
+            gas_used: 1000,
+            reason: FailureReason::IocCancel,
+        };
+        assert!(book_reject.is_book_reject());
+        let mut cloid_order = order(7);
+        cloid_order.client_order_id = Some(0xabc);
+        let list = vec![
+            (a, NativeAction::PlaceOrder(cloid_order)),
+            (b, NativeAction::PlaceOrderBatch(vec![order(1), order(2), order(3)])),
+            (a, NativeAction::CancelAllOrders { market_id: None }),
+        ];
+        let result = batch(vec![
+            err(FailureReason::Tick, "off tick"),
+            ok(),
+            book_reject.clone(),
+            err(FailureReason::Margin, "insufficient margin"),
+            err(FailureReason::Other, "cancel failed"),
+        ]);
+        let mut out = Vec::new();
+        order_rejections(&list, &result, &mut out);
+        let got: Vec<_> = out
+            .iter()
+            .map(|e| (e.trader, e.price.raw(), e.order_id, e.cloid, e.status, e.reason))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (a, 7, None, Some(0xabc), OrderEventStatus::Rejected, OrderEventReason::Reject(FailureReason::Tick)),
+                (b, 3, None, None, OrderEventStatus::Rejected, OrderEventReason::Reject(FailureReason::Margin)),
+            ]
+        );
+        let mut none = Vec::new();
+        order_rejections(&list, &batch(vec![ok()]), &mut none);
+        assert!(none.is_empty());
     }
 
     fn batch(results: Vec<NativeActionResult>) -> NativeBatchResult {

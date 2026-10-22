@@ -5977,6 +5977,14 @@ impl ExecutionContext {
             // With no subscriber, exec records only what history needs (s78).
             // Checked once per block, before execution.
             ctx.record_fills = self.fill_sink.get().is_some_and(|s| s.wants_fills());
+            // s139: while an `orderUpdates` subscriber exists, the books log
+            // this block's order events and the executor records pre-book
+            // rejections (output-only). Checked once per block.
+            ctx.set_order_events(
+                self.fill_sink
+                    .get()
+                    .is_some_and(|s| s.wants_order_events()),
+            );
 
             let engine_timer = std::time::Instant::now();
             // Item 2: aggregate every listed market BEFORE any action, at the block
@@ -6194,6 +6202,16 @@ impl ExecutionContext {
             // index (timed: `exec_action_status_seconds`).
             #[cfg(test)]
             let oracle_results = (pre_results.clone(), post_results.clone());
+            // s139: the block's order events (every book's log, the triggered
+            // stops' pre-book rejections, then the action results' pre-book
+            // rejections), taken before `native_failures` moves the results'
+            // messages. Sent after the flush / hand-off, with the fills.
+            let order_events = ctx.order_events_on().then(|| {
+                let mut events = ctx.take_order_events();
+                crate::action_results::order_rejections(&pre_evm, &pre_results, &mut events);
+                crate::action_results::order_rejections(&post_evm, &post_results, &mut events);
+                events
+            });
             let action_status_timer = std::time::Instant::now();
             let core_writer = crate::action_results::core_writer_results(core_writer_drained);
             // s112: a block that drained CoreWriter rows has a record even
@@ -6658,6 +6676,16 @@ impl ExecutionContext {
             // A hard crash can lose the last few queued batches,
             // which is a cosmetic RPC trade-history gap, never consensus state.
             //
+            // s139: the order events go out the same way (only blocks with any).
+            if let (Some(events), Some(sink)) = (order_events, self.fill_sink.get()) {
+                if !events.is_empty() {
+                    sink.send_order_events(Arc::new(torus_state::order_events::BlockOrderEvents {
+                        height: fills_block,
+                        timestamp: fills_ts,
+                        events,
+                    }));
+                }
+            }
             // s80: the fills are wrapped once; the stream sink (if installed)
             // and the trade writer share the same Arc. Emitted here, after the
             // flush / hand-off, so a block whose hand-off failed (shutdown)
@@ -22549,6 +22577,82 @@ mod crash_recovery_tests {
             }
             assert_dumps_equal(&plain, &idle, &format!("idle sink vs none (on={on})"));
             assert_eq!(root_plain, root_idle, "native root (on={on})");
+        }
+    }
+
+    /// s139: a sink with an `orderUpdates` subscriber (order events wanted,
+    /// fills not).
+    struct OrderEventSink {
+        seen: Arc<std::sync::Mutex<Vec<Arc<torus_state::order_events::BlockOrderEvents>>>>,
+    }
+
+    impl torus_state::trade_rows::FillSink for OrderEventSink {
+        fn wants_fills(&self) -> bool {
+            false
+        }
+        fn send_fills(&self, _block: Arc<torus_state::trade_rows::BlockFills>) {}
+        fn wants_order_events(&self) -> bool {
+            true
+        }
+        fn send_order_events(&self, block: Arc<torus_state::order_events::BlockOrderEvents>) {
+            self.seen.lock().unwrap().push(block);
+        }
+    }
+
+    /// s139: with an order-event subscriber, every executed block with order
+    /// events reaches the sink once, in height order, serial and pipelined
+    /// alike, with the events of its placements and fills; and every CF and
+    /// the native root equal a run without a sink (the events never touch
+    /// state).
+    #[test]
+    fn order_event_sink_receives_each_block_and_state_is_unchanged() {
+        use torus_state::order_events::OrderEventStatus as S;
+        for on in [false, true] {
+            let (plain, root_plain, _) = run_fill_fixture(on, true, None);
+            torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
+            let (_cfg, state_db) = make_test_config_and_db();
+            fund_pipeline_fixture(&state_db);
+            let mut ctx = pipeline_ctx(&state_db, on, None);
+            ctx.trade_history = true;
+            let seen: Arc<std::sync::Mutex<Vec<_>>> = Default::default();
+            let sink: Arc<dyn torus_state::trade_rows::FillSink> =
+                Arc::new(OrderEventSink { seen: seen.clone() });
+            assert!(ctx.fill_sink.set(sink).is_ok());
+            for b in &pipeline_fixture_blocks() {
+                dispatch_and_execute(&ctx, &state_db, b);
+            }
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fixture must not fail-stop");
+            drop(ctx);
+            let root = torus_state::native_trie::persisted_native_root(&state_db).unwrap();
+            assert_dumps_equal(&plain, &dump_all_cfs(&state_db), &format!("order sink vs none (on={on})"));
+            assert_eq!(root_plain, root, "native root (on={on})");
+
+            let seen = seen.lock().unwrap().clone();
+            let got: Vec<(u64, Vec<S>)> = seen
+                .iter()
+                .map(|b| {
+                    let mut st: Vec<S> = b.events.iter().map(|e| e.status).collect();
+                    st.sort_by_key(|s| format!("{s:?}"));
+                    (b.height, st)
+                })
+                .collect();
+            assert_eq!(
+                got,
+                vec![
+                    // A rests, B crosses it: the maker and the taker fill.
+                    (3, vec![S::Filled, S::Filled, S::Open]),
+                    (5, vec![S::Open]),
+                    (6, vec![S::Filled, S::Filled]),
+                    (10, vec![S::Open]),
+                    (11, vec![S::Filled, S::Filled]),
+                    (13, vec![S::Open]),
+                ],
+                "pipeline on={on}"
+            );
+            for b in &seen {
+                assert!(b.timestamp > 0, "on={on}");
+                assert!(b.events.iter().all(|e| e.order_id.is_some() && e.market == 1), "on={on}");
+            }
         }
     }
 

@@ -16,6 +16,7 @@ pub mod incremental;
 pub mod native_da;
 pub mod native_trie;
 pub mod nonce_window;
+pub mod order_events;
 pub mod overlay;
 /// Item 7 option 0 step 0: test-only overlay read probes (`test-probes`).
 #[cfg(feature = "test-probes")]

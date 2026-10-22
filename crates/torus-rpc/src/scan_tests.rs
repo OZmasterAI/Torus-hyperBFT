@@ -803,6 +803,7 @@ fn level_book_sides_are_read_from_one_snapshot() {
     for _ in 0..3_000 {
         let d = row_book_depth(
             &state,
+            None,
             1,
             BookLayout::LevelAuthority,
             1,

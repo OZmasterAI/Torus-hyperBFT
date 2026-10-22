@@ -51,6 +51,7 @@ impl OrderBook {
                         None,
                         self.market_id,
                         &mut Vec::new(),
+                        None,
                     );
                     if self.asks.get(&best_ask).is_none_or(|q| q.is_empty()) {
                         self.asks.remove(&best_ask);
@@ -92,6 +93,7 @@ impl OrderBook {
                         None,
                         self.market_id,
                         &mut Vec::new(),
+                        None,
                     );
                     if self.bids.get(&best_bid).is_none_or(|q| q.is_empty()) {
                         self.bids.remove(&best_bid);

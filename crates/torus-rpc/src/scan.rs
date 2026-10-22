@@ -172,7 +172,21 @@ fn done(walk: Result<Flow, RpcError>) -> Result<(), RpcError> {
 
 /// One RocksDB snapshot shared by the reads of one answer (`None` = each
 /// read sees the latest commit).
-type Snap<'a, 's> = Option<&'a rocksdb::Snapshot<'s>>;
+pub(crate) type Snap<'a, 's> = Option<&'a rocksdb::Snapshot<'s>>;
+
+/// s139: the native applied height (`META_NATIVE_APPLIED_HEIGHT`, the eth
+/// head's source) as of `snap`; 0 when absent.
+pub(crate) fn applied_height_at(state: &StateDb, snap: &rocksdb::Snapshot<'_>) -> Result<u64, RpcError> {
+    let Ok(handle) = state.cf_handle(torus_state::cf::CF_CONSENSUS_META) else {
+        return Ok(0);
+    };
+    let row = snap
+        .get_cf(handle, torus_state::cf::META_NATIVE_APPLIED_HEIGHT)
+        .map_err(rocks)?;
+    Ok(row
+        .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+        .map_or(0, u64::from_be_bytes))
+}
 
 /// The rows of `cf` under `prefix` (empty = the whole CF), in key order, each
 /// charged to `b` BEFORE `visit` sees it; `visit` may stop early. A missing
@@ -742,18 +756,29 @@ pub(crate) fn find_by_cloid(
 /// main's; `depth` bounds the reply. The rows come from ONE snapshot, so a
 /// commit that moves both sides is seen whole or not at all (never a
 /// crossed book).
+///
+/// s139: `snap` = read as of that snapshot (the `l2Book` stream reads the
+/// applied height and the book under one); `None` = a fresh one.
 pub(crate) fn row_book_depth(
     state: &StateDb,
+    snap: Snap<'_, '_>,
     mid: MarketId,
     layout: BookLayout,
     depth: usize,
     b: &mut ScanBudget,
 ) -> Result<BookDepth, RpcError> {
-    let snapshot = state.inner().snapshot();
+    let own;
+    let snapshot = match snap {
+        Some(s) => s,
+        None => {
+            own = state.inner().snapshot();
+            &own
+        }
+    };
     let mut rows: Vec<KeyValue> = Vec::new();
     done(for_each_prefixed(
         state,
-        Some(&snapshot),
+        Some(snapshot),
         CF_NATIVE_ORDER_BOOKS,
         &mid.to_be_bytes(),
         b,
@@ -770,13 +795,21 @@ pub(crate) fn row_book_depth(
 
 /// A classic whole-book blob for `torus_getOrderBook`, charged by size
 /// before the caller decodes it.
+/// s139: `snap` = read as of that snapshot.
 pub(crate) fn classic_blob(
     state: &StateDb,
+    snap: Snap<'_, '_>,
     mid: MarketId,
     b: &mut ScanBudget,
 ) -> Result<Option<Vec<u8>>, RpcError> {
     b.step()?;
-    let blob = state.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &mid.to_be_bytes())?;
+    let blob = match snap {
+        None => state.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &mid.to_be_bytes())?,
+        Some(snap) => match state.cf_handle(CF_NATIVE_ORDER_BOOKS) {
+            Ok(handle) => snap.get_cf(handle, mid.to_be_bytes()).map_err(rocks)?,
+            Err(_) => None,
+        },
+    };
     if let Some(blob) = &blob {
         b.step_n(packed_rows(blob.len()))?;
     }

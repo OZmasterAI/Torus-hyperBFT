@@ -94,6 +94,15 @@ pub trait FillSink: Send + Sync {
     fn wants_fills(&self) -> bool;
     /// One executed block's fills (only blocks with fills), in height order.
     fn send_fills(&self, block: std::sync::Arc<BlockFills>);
+    /// s139: whether anyone currently wants order events (`orderUpdates`),
+    /// checked once per block before execution. False = the books log no
+    /// events and the executor records no rejections.
+    fn wants_order_events(&self) -> bool {
+        false
+    }
+    /// s139: one executed block's order events (only blocks with events,
+    /// recorded while `wants_order_events` was true), in height order.
+    fn send_order_events(&self, _block: std::sync::Arc<crate::order_events::BlockOrderEvents>) {}
 }
 
 /// One entry of a `CF_NATIVE_TRADES` row.
