@@ -2007,11 +2007,13 @@ sleep 2
 # books stale -> correct mid-digest, a false DISAGREE). Now that the chain is
 # quiet, wait until every LIVE node has made durable a checkpoint submitted
 # after this point: ckpt_wait.py (torus_exec_checkpoints_total at T0 = C0, then
-# torus_exec_checkpoint_db_write_seconds_count >= C0 + 1). Checkpoints off ->
-# one skip line, no wait; metrics absent (older binary) -> sleep interval + 5 s;
-# timeout (2 x interval + 30 s) -> WARNING here, digest-ckpt-wait.json
-# outcome=timeout, and summarize.py marks the digest unpinned (DIGEST_UNVERIFIED
-# instead of DISAGREE) and the cell unverified. The 1 Hz sampler still runs, so
+# torus_exec_checkpoint_db_write_seconds_count >= C0 + 1; a node with both
+# counters 0 waits for its first checkpoint). Checkpoints off -> one skip line,
+# no wait; metrics absent (older binary) -> sleep interval + 5 s
+# (fallback_sleep: no durable evidence for that node); fallback_sleep or a
+# timeout (2 x interval + 30 s) -> WARNING here, and summarize.py marks the
+# digest unpinned (DIGEST_UNVERIFIED instead of DISAGREE) and the cell
+# unverified (digest-ckpt-wait.json has the outcome). The 1 Hz sampler still runs, so
 # metrics-1hz shows the checkpoint landing. DIGEST_CKPT_TIMEOUT_S /
 # DIGEST_CKPT_POLL_S override the timeout and the 0.5 s poll.
 digest_ckpt_wait() {
@@ -2031,7 +2033,7 @@ digest_ckpt_wait() {
     fi
     log "$line"
     case "$DIGEST_CKPT_WAIT" in
-        durable|skipped|fallback_sleep) ;;
+        durable|skipped) ;;
         *) log "WARNING: digest checkpoint wait outcome=$DIGEST_CKPT_WAIT (rc=$rc): the state digest may read a durable state from before the last state change; summarize.py marks the digest unpinned and the cell unverified (digest-ckpt-wait.json)" ;;
     esac
     return 0

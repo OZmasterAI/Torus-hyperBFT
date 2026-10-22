@@ -21,20 +21,26 @@ The proof, per live node (the caller passes only the live ones):
   after T0 is on disk, and it covers every state change before T0.
 
 Checkpoints off (the node's own resolution, resolve_interval_ms) and no node
-reporting a checkpoint -> skipped, one line, no wait. The env says off but a
-node did checkpoint -> the node is the truth: wait, with a WARNING note. A node
+reporting a checkpoint -> skipped, one line, no wait. Checkpoints on and both
+counters 0 at T0 is NOT a skip: the first window has not flushed yet (blocks
+stay memory-only until the first checkpoint), so the node waits for its first
+durable checkpoint (C0 + 1 = 1) like any other. The env says off but a node
+did checkpoint -> the node is the truth: wait, with a WARNING note. A node
 without either metric (older binary) with checkpoints on -> sleep interval +
-margin for it (the nodes that do report them are still held to
-W >= C0 + 1). No W >= C0 + 1 on every node within the timeout (default
-2 x interval + 30 s) -> outcome "timeout", exit 3: the digest may predate the
-final state (run-cell.sh logs it, summarize.py marks the cell).
+margin for it (the nodes that do report them are still held to W >= C0 + 1),
+outcome "fallback_sleep": exit 0, but no durable evidence for that node, so
+summarize.py does not count the digest as pinned. No W >= C0 + 1 on every node
+within the timeout (default 2 x interval + 30 s) -> outcome "timeout", exit 3:
+the digest may predate the final state (run-cell.sh logs it, summarize.py
+marks the cell).
 
   ckpt_wait.py --metrics val0=URL [--metrics val2=URL ...] --node-env JSON
                [--genesis-book-mode MODE] --out FILE [--timeout-s S]
                [--poll-s S] [--fallback-margin-s S]
 
 Prints one line ("digest checkpoint wait: ..."); FILE gets the evidence.
-Exit 0 durable / skipped / fallback_sleep, 3 timeout, 2 bad arguments.
+Exit 0 durable / skipped / fallback_sleep (no evidence, not a pass), 3
+timeout, 2 bad arguments.
 Standard library only: run-cell.sh runs it with python3 -I.
 """
 
@@ -167,7 +173,14 @@ def baseline(nodes, deadline, poll_s, retry, base=None):
 
 def poll_durable(rec, nodes, t0, deadline, poll_s):
     """Poll WRITES until every node reached its target (C0 + 1) or the
-    deadline; marks rec nodes durable. Returns the names still pending."""
+    deadline; marks rec nodes durable. Returns the names still pending.
+
+    The pairing: SUBMITS (C0) goes up when checkpoint_submit hands a job to
+    the flush worker (app.rs), WRITES when the worker finished WRITING one
+    (exec_pipeline.rs). Submits are serialized (each waits for the previous
+    job in flight), so WRITES >= C0 + 1 means every job submitted before T0
+    plus one more, submitted after T0, is durable: the on-disk state covers
+    every state change before T0."""
     pending = dict(nodes)
     while True:
         for name in list(pending):
@@ -244,20 +257,29 @@ def main(argv=None):
         node["target"] = None if v[SUBMITS] is None else v[SUBMITS] + 1
     missing = [n for n, _ in nodes if rec["nodes"][n]["missing"]]
     ran = [n for n, _ in nodes if (base[n][SUBMITS] or 0) > 0]
+    # Checkpoints on (by the env, or by a node that ran one) and a counter at
+    # 0 = the first window has not flushed yet, NOT "no checkpoints": the
+    # node is held to its first durable checkpoint (target 1) like any other.
+    fresh = [n for n, _ in nodes if n not in missing and not base[n][SUBMITS]]
+    fresh_note = ("%s=0 at T0 on %s: waiting for the first checkpoint" % (SUBMITS, " ".join(fresh))
+                  if fresh else None)
 
     if interval_ms is None and not ran:
         return finish("skipped", "skipped, %s%s" % (
             off, "; checkpoint metrics absent on %s" % " ".join(missing) if missing else ""))
     if missing:
         # Mixed fleet: the nodes that report both metrics are still held to
-        # W >= C0 + 1 (an older binary elsewhere excuses no stalled node);
-        # only the others are covered by sleeping interval + margin.
+        # W >= C0 + 1 (an older binary elsewhere excuses no stalled node, nor
+        # one whose first checkpoint never landed); the others only get a
+        # sleep of interval + margin, which proves nothing about them:
+        # outcome fallback_sleep, and summarize.py leaves the digest unpinned.
         names = "/".join(sorted({k for n in missing for k in rec["nodes"][n]["missing"]}))
-        rec["note"] = "checkpoint metrics absent on %s (older binary): slept interval + %.1f s" % (
-            " ".join(missing), a.fallback_margin_s)
+        rec["note"] = ("checkpoint metrics absent on %s (older binary): slept interval + %.1f s, "
+                       "no durable evidence on %s" % (" ".join(missing), a.fallback_margin_s,
+                                                      " ".join(missing)))
+        if fresh_note:
+            rec["note"] += "; " + fresh_note
         capable = [(n, u) for n, u in nodes if n not in missing]
-        if not any((base[n][SUBMITS] or 0) > 0 for n, _ in capable):
-            capable = []
         pending = poll_durable(rec, capable, t0, deadline, a.poll_s) if capable else []
         per = per_node_line(rec, capable)
         if pending:
@@ -265,15 +287,18 @@ def main(argv=None):
                           % (per, timeout_s, iv, rec["note"]), TIMEOUT_RC)
         time.sleep(max(0.0, eff_ms / 1000.0 + a.fallback_margin_s - (time.monotonic() - t0)))
         return finish("fallback_sleep", "%s%s absent on %s (older binary), slept {waited}s >= "
-                      "interval + %.1fs margin (%s)" % (per + ", " if per else "", names,
-                                                         " ".join(missing), a.fallback_margin_s, iv))
-    if not ran:
-        rec["note"] = "%s=0 on every live node: no checkpoint ran (per-block flush)" % SUBMITS
-        return finish("skipped", "skipped, no checkpoint ran on any live node (%s=0; %s)" % (SUBMITS, iv))
+                      "interval + %.1fs margin, no durable evidence on %s (%s)"
+                      % (per + ", " if per else "", names, " ".join(missing),
+                         a.fallback_margin_s, " ".join(missing), iv))
     if interval_ms is None:
         rec["note"] = ("WARNING: the node env resolves %s but %s ran checkpoints: waiting anyway "
                        "(timeout from the 15 s default)" % (off, " ".join(ran)))
+    if fresh_note:
+        rec["note"] = "; ".join(x for x in (rec["note"], fresh_note) if x)
 
+    # The wait. C0 counted submits (at submit), WRITES counts jobs the flush
+    # worker finished writing; submits are serialized, so WRITES >= C0 + 1 =
+    # every job submitted before T0 plus one more is durable (poll_durable).
     pending = poll_durable(rec, nodes, t0, deadline, a.poll_s)
     per = per_node_line(rec, nodes)
     warn = " (%s)" % rec["note"] if rec["note"] else ""

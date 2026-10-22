@@ -282,13 +282,17 @@ python3 tools/matched-bench/test_harness.py
    every live node (submits are serialized, so a checkpoint submitted after
    the quiet point is on disk). One `digest checkpoint wait:` line per cell;
    `digest-ckpt-wait.json` holds C0, the final write count and the wait per
-   node. Checkpoints off (and no node checkpointing) -> `skipped`, no wait;
-   metrics absent (older binary) -> sleep interval + 5 s (`fallback_sleep`;
-   the nodes that report them are still held to C0 + 1);
-   no checkpoint within 2 x interval + 30 s -> `timeout` (WARNING in run.log;
-   summarize.py treats the digest as unpinned, so unequal digests read
-   `DIGEST_UNVERIFIED` instead of `DISAGREE`, and adds an unverified reason, so
-   the cell is not accepted; the crash gate fails). `summary.json`:
+   node. Checkpoints off (and no node checkpointing) -> `skipped`, no wait.
+   Checkpoints on with both counters 0 (the first window not flushed yet) is
+   not a skip: the node waits for its first checkpoint (C0 + 1 = 1).
+   Metrics absent (older binary) -> sleep interval + 5 s (`fallback_sleep`;
+   the nodes that report them are still held to C0 + 1), but the sleep is no
+   durable evidence for the node without them: like a `timeout` (no checkpoint
+   within 2 x interval + 30 s) or `error` (no / unknown outcome in the record)
+   it gets a WARNING in run.log, and summarize.py treats the digest as
+   unpinned, so unequal digests read `DIGEST_UNVERIFIED` instead of
+   `DISAGREE`, and adds an unverified reason, so the cell is not accepted; the
+   crash gate fails. Only `durable` and `skipped` pin the digest. `summary.json`:
    `agreement.state_digest_ckpt_wait`, `headline.digest_ckpt_wait`, and
    `digest_ckpt=` on the SUMMARY line.
 

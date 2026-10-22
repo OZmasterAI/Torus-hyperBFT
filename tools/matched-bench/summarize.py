@@ -1021,8 +1021,9 @@ def digest_ckpt_wait_record(path):
     Under coalesced checkpoints validator RPC reads RocksDB only, so without it
     the digest can read a state from before the last state change. None = no
     record (older cell): nothing changes. outcome durable / skipped (checkpoints
-    off) / fallback_sleep (older binary) pin the digest; timeout / error (or an
-    unreadable record) do not."""
+    off) pin the digest; fallback_sleep (a node without the metrics, older
+    binary, was only slept on: no durable evidence for it), timeout, error, and
+    a record that is unreadable or has no / an unknown outcome do not."""
     try:
         with open(path) as f:
             rec = json.load(f)
@@ -1034,10 +1035,29 @@ def digest_ckpt_wait_record(path):
 
 
 DIGEST_CKPT_WAIT = digest_ckpt_wait_record(os.path.join(OUT, "digest-ckpt-wait.json"))
-DIGEST_CKPT_WAIT_OUTCOME = DIGEST_CKPT_WAIT.get("outcome") if DIGEST_CKPT_WAIT else None
-# A failed wait leaves the digest unpinned, like a non-quiescent one.
-digest_ckpt_failed = bool(DIGEST_CKPT_WAIT) and DIGEST_CKPT_WAIT_OUTCOME not in (
-    "durable", "skipped", "fallback_sleep")
+# A record that exists is judged on its outcome, even {}: no / an unknown
+# outcome is a failed wait ("error"), never "no record".
+DIGEST_CKPT_WAIT_OUTCOME = None
+if DIGEST_CKPT_WAIT is not None:
+    DIGEST_CKPT_WAIT_OUTCOME = DIGEST_CKPT_WAIT.get("outcome")
+    if DIGEST_CKPT_WAIT_OUTCOME not in ("durable", "skipped", "fallback_sleep", "timeout", "error"):
+        DIGEST_CKPT_WAIT_OUTCOME = "error"
+# Anything but durable / skipped leaves the digest unpinned, like a
+# non-quiescent one. fallback_sleep too: the nodes without the metrics (older
+# binary) were only slept on, their checkpoints may never have advanced.
+digest_ckpt_failed = DIGEST_CKPT_WAIT is not None and DIGEST_CKPT_WAIT_OUTCOME not in (
+    "durable", "skipped")
+
+
+def digest_ckpt_reason():
+    """The unverified / crash-gate reason for a failed wait."""
+    if DIGEST_CKPT_WAIT_OUTCOME == "fallback_sleep":
+        nodes = DIGEST_CKPT_WAIT.get("nodes")
+        nodes = nodes if isinstance(nodes, dict) else {}
+        absent = sorted(n for n, v in nodes.items() if isinstance(v, dict) and v.get("missing"))
+        return ("state digest checkpoint wait fallback_sleep: no durable evidence on %s (older binary)"
+                % (" ".join(absent) or "the nodes without the metrics"))
+    return "state digest checkpoint wait %s (digest-ckpt-wait.json)" % DIGEST_CKPT_WAIT_OUTCOME
 
 
 def crash_record(path):
@@ -1372,8 +1392,7 @@ def crash_gate(raw, agreement, node_env):
     if not agreement.get("state_digest_quiescent"):
         fail.append("state digest was not taken at a quiescent chain")
     if digest_ckpt_failed:
-        fail.append("state digest checkpoint wait %s (digest may predate the final state)"
-                    % DIGEST_CKPT_WAIT_OUTCOME)
+        fail.append("%s: digest may predate the final state" % digest_ckpt_reason())
     if int(agreement.get("panic_or_failstop_lines") or 0) > 0:
         fail.append("panic/fail-stop somewhere in the 3-node run")
     # The survivors must still agree with each other on the funnel; only the
@@ -1672,12 +1691,12 @@ validity = acceptance(liveness, drained, int(A.bench_rc or -1),
 if NORESTART_CHECK and NORESTART_CHECK["action"] == "rejected":
     validity["fail_reasons"].append(NORESTART_CHECK["reason"])
     validity["verdict"], validity["accepted"] = "REJECT", False
-# s137: a failed pre-digest checkpoint wait is a harness problem, never a
-# silent pass: the cell is at best UNVERIFIED, even with equal digests (they
-# may both describe a state from before the last state change).
+# s137: a failed pre-digest checkpoint wait (timeout / error / fallback_sleep
+# = no durable evidence) is a harness problem, never a silent pass: the cell
+# is at best UNVERIFIED, even with equal digests (they may both describe a
+# state from before the last state change).
 if digest_ckpt_failed:
-    validity["unverified_reasons"].append(
-        "state digest checkpoint wait %s (digest-ckpt-wait.json)" % DIGEST_CKPT_WAIT_OUTCOME)
+    validity["unverified_reasons"].append(digest_ckpt_reason())
     if validity["verdict"] == "ACCEPT":
         validity["verdict"], validity["accepted"] = "UNVERIFIED", False
 summary = {
