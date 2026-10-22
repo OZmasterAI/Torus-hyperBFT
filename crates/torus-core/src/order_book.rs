@@ -2452,6 +2452,16 @@ impl OrderBook {
         }
     }
 
+    /// s80 ro-basis-walk-memo: [`Self::orders_for_trader`] without the
+    /// `Vec` — the same orders in the same (`trader_orders`) order.
+    pub fn trader_orders_iter(&self, trader: &Address) -> impl Iterator<Item = &Order> + '_ {
+        self.trader_orders
+            .get(trader)
+            .into_iter()
+            .flat_map(TraderOrders::iter)
+            .filter_map(move |id| self.get_order(*id))
+    }
+
     /// Orders of `trader` that hold an open-order slot: resting orders plus
     /// pending stops (stops are rare, so a scan is fine).
     pub fn open_order_count(&self, trader: &Address) -> usize {
@@ -5460,6 +5470,35 @@ mod tests {
         assert_eq!(ob.pending_stop_count(), 1);
         assert_eq!(ob.orders_for_trader(&a).len(), 2);
         assert_eq!(ob.open_order_count(&a), 3);
+    }
+
+    /// s80 ro-basis-walk-memo: `trader_orders_iter` yields exactly
+    /// `orders_for_trader` (same orders, same order), small lists and large
+    /// ones with holes (cancels, maker fills), and nothing for an unknown
+    /// trader.
+    #[test]
+    fn trader_orders_iter_is_orders_for_trader() {
+        let a = addr(1);
+        let ids_of = |v: Vec<&Order>| v.iter().map(|o| (o.id, o.remaining_qty)).collect::<Vec<_>>();
+        let mut ob = book();
+        let mut ids = Vec::new();
+        for k in 0..100 {
+            ids.push(ob.place_order(limit_sell(fp(200 + k % 7), fp(1 + k % 3)), a, 0).order_id);
+            if k == 20 {
+                // small list (<= 32 slots)
+                assert_eq!(ids_of(ob.trader_orders_iter(&a).collect()), ids_of(ob.orders_for_trader(&a)));
+            }
+        }
+        for (k, id) in ids.iter().enumerate() {
+            if k % 3 == 0 {
+                ob.cancel_order(*id).unwrap();
+            }
+        }
+        ob.place_order(market_buy(fp(5)), addr(2), 0); // a maker fill and a partial
+        let want = ids_of(ob.orders_for_trader(&a));
+        assert!(want.len() > 50);
+        assert_eq!(ids_of(ob.trader_orders_iter(&a).collect()), want);
+        assert_eq!(ob.trader_orders_iter(&addr(9)).count(), 0);
     }
 
     /// `cancel_all` returns a trader's orders in its `trader_orders` order:

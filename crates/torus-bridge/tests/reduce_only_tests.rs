@@ -776,3 +776,167 @@ fn reduce_only_modify_that_changes_nothing_still_sweeps() {
         }
     }
 }
+
+// ============================================================================
+// s80 ro-basis-walk-memo (`TORUS_S80_RO_BASIS_MEMO`): the Phase-2 reduce-only
+// reservation basis walks a sender's resting orders once per (sender,
+// market) per call instead of once per reduce-only order. End to end: one
+// `execute_batch` with a 1,024-order reduce-only batch (plus single RO
+// orders and a taker) leaves the same results, ids and state either way.
+// ============================================================================
+
+use torus_bridge::native_executor::{ro_basis_walks_on_this_thread, with_ro_basis_memo};
+use torus_state::running_hash::HASHED_CFS;
+use torus_state::StateBackend as _;
+
+/// One attack call's outputs.
+#[derive(Debug, PartialEq)]
+struct RoBatchOut {
+    results: Vec<(bool, Option<String>, torus_state::action_status::FailureReason)>,
+    /// Every resting order of market 1: (id, trader, side, price, remaining, original, RO).
+    book: Vec<(u128, Address, bool, FixedPoint, FixedPoint, FixedPoint, bool)>,
+    next_order_id: u128,
+    /// `t`'s signed position in market 1 after the call.
+    t_pos: FixedPoint,
+    /// Every hashed CF row after `save_order_books`.
+    rows: Vec<(u8, Vec<u8>, Vec<u8>)>,
+}
+
+/// `t` rests `r` dust (1-lot) non-reduce-only bids over `levels` price levels
+/// (after going long `long` against maker `m`), then ONE `execute_batch`:
+/// a 1,024-order reduce-only `PlaceOrderBatch` of `t`, 64 single reduce-only
+/// sells of `t`, and a taker buy of `m` that crosses some of them. Returns
+/// the outputs, the call's `phase_accum.margin_ns` and the basis walks.
+fn ro_batch_run(r: usize, levels: usize, long: i64, memo: bool, threads: usize) -> (RoBatchOut, u128, u64) {
+    let (t, m) = (addr(1), addr(2));
+    let (_d, mut ctx) = fresh(Path::Batch, &[m]);
+    fund_native(&ctx, &t, fp(100_000_000));
+    fund_native(&ctx, &m, fp(100_000_000));
+    fund_native(&ctx, &filler(), fp(FUNDING));
+    let exec = |ctx: &mut NativeExecContext, actions: &[(Address, NativeAction)]| {
+        let out = NativeExecutor::execute_batch_engine_mode(ctx, actions, threads).results;
+        assert!(ctx.fatal_error.is_none(), "fatal {:?}", ctx.fatal_error);
+        out
+    };
+    if long > 0 {
+        exec(&mut ctx, &[place(m, limit(1, false, 100, long))]);
+        exec(&mut ctx, &[place(t, limit(1, true, 100, long))]);
+        assert_eq!(pos(&ctx, &t), fp(long));
+    }
+    let bids: Vec<PlaceOrderParams> = (0..r).map(|k| limit(1, true, 10 + (k % levels) as i64, 1)).collect();
+    for chunk in bids.chunks(1_000) {
+        let res = exec(&mut ctx, &[(t, NativeAction::PlaceOrderBatch(chunk.to_vec()))]);
+        assert!(res[0].success, "{:?}", res[0].error);
+    }
+    assert_eq!(resting(&ctx, &t).len(), r);
+
+    let mut actions: Vec<(Address, NativeAction)> = Vec::new();
+    let batch: Vec<PlaceOrderParams> = (0..1_024)
+        .map(|k| ro(limit(1, false, 100 + (k % 9) as i64, 1 + (k % 5) as i64)))
+        .collect();
+    actions.push((t, NativeAction::PlaceOrderBatch(batch)));
+    for k in 0..64 {
+        actions.push(place(t, ro(limit(1, false, 101 + (k % 3), 2 * r as i64))));
+    }
+    actions.push(place(m, limit(1, true, 103, 7)));
+    if threads >= 2 {
+        actions.push(place(filler(), limit(9, true, 1, 1)));
+    }
+    let (ns0, w0) = (ctx.phase_accum.margin_ns, ro_basis_walks_on_this_thread());
+    let results = with_ro_basis_memo(memo, || exec(&mut ctx, &actions));
+    let margin_ns = ctx.phase_accum.margin_ns - ns0;
+    let walks = ro_basis_walks_on_this_thread() - w0;
+
+    let mut book: Vec<_> = ctx.order_books()[&1]
+        .orders_for_trader(&t)
+        .into_iter()
+        .chain(ctx.order_books()[&1].orders_for_trader(&m))
+        .map(|o| {
+            (
+                o.id,
+                o.trader,
+                matches!(o.side, torus_types::Side::Buy),
+                o.price,
+                o.remaining_qty,
+                o.original_qty,
+                o.reduce_only,
+            )
+        })
+        .collect();
+    book.sort();
+    let next_order_id = ctx.next_global_order_id;
+    let t_pos = pos(&ctx, &t);
+    ctx.save_order_books();
+    let mut rows = Vec::new();
+    for (id, cf) in HASHED_CFS {
+        for (k, v) in ctx.state.iterate_cf(cf, None).unwrap() {
+            rows.push((*id, k, v));
+        }
+    }
+    let results = results
+        .iter()
+        .map(|x| (x.success, x.error.as_ref().map(|e| e.to_string()), x.reason))
+        .collect();
+    (RoBatchOut { results, book, next_order_id, t_pos, rows }, margin_ns, walks)
+}
+
+/// Flag off vs on, serial and sharded Phase 2, flat and long, one level and
+/// 50: identical results, order ids, book and state rows; the memo walks
+/// once (one pair), the flag-off walk once per reduce-only order.
+#[test]
+fn ro_basis_memo_one_call_same_results_ids_and_state() {
+    for threads in [1usize, 4] {
+        for (r, levels, long) in [(200usize, 1usize, 0i64), (200, 50, 40), (120, 7, 3)] {
+            let (off, _, walks_off) = ro_batch_run(r, levels, long, false, threads);
+            let (on, _, walks_on) = ro_batch_run(r, levels, long, true, threads);
+            let what = format!("threads={threads} r={r} levels={levels} long={long}");
+            assert_eq!(on.results, off.results, "{what}: results");
+            assert_eq!(on.book, off.book, "{what}: book");
+            assert_eq!(on.next_order_id, off.next_order_id, "{what}: next order id");
+            assert!(on.rows == off.rows, "{what}: state rows differ");
+            assert_eq!(walks_off, 1_024 + 64, "{what}: base walks per RO order");
+            assert_eq!(walks_on, 1, "{what}: memo walks once");
+            // The batch did something: with a long of 40 (> the taker's 7)
+            // RO sells rest; a long of 3 is closed (in part) by the taker
+            // filling RO sells of the batch.
+            match long {
+                40 => assert!(on.book.iter().any(|o| o.6), "{what}: no RO order rests"),
+                3 => assert!(on.t_pos < fp(3), "{what}: the taker filled no RO sell"),
+                _ => assert_eq!(on.t_pos, FixedPoint::ZERO, "{what}: flat stays flat"),
+            }
+        }
+    }
+}
+
+/// Release timing (`cargo test -p torus-bridge --release --test reduce_only_tests
+/// ro_basis_memo_e2e_timing -- --ignored --nocapture`): the call's
+/// `phase_accum.margin_ns`, off vs on, median of 7 fresh runs per arm (arms
+/// alternate), R in {100, 1,000} (1,000 = the base open limit: every RO order
+/// is then rejected at its slot, after the walk).
+#[test]
+#[ignore]
+fn ro_basis_memo_e2e_timing() {
+    println!("R\tlevels\tlong\toff_margin_ms\ton_margin_ms\tdelta_ms\toff_raw\ton_raw");
+    for (r, levels, long) in [(100usize, 1usize, 0i64), (1_000, 1, 0), (1_000, 50, 0), (900, 50, 40)] {
+        let (mut off, mut on) = (Vec::new(), Vec::new());
+        let mut first: Option<RoBatchOut> = None;
+        for _ in 0..7 {
+            let (a, ns_a, _) = ro_batch_run(r, levels, long, false, 1);
+            let (b, ns_b, _) = ro_batch_run(r, levels, long, true, 1);
+            assert!(a == b, "R={r}: outputs differ");
+            if let Some(f) = &first {
+                assert!(*f == a, "R={r}: run-to-run outputs differ");
+            }
+            first = Some(a);
+            off.push(ns_a as f64 / 1e6);
+            on.push(ns_b as f64 / 1e6);
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let (raw_off, raw_on) = (format!("{off:.2?}"), format!("{on:.2?}"));
+        let (mo, mn) = (med(&mut off), med(&mut on));
+        println!("{r}\t{levels}\t{long}\t{mo:.3}\t{mn:.3}\t{:.3}\t{raw_off}\t{raw_on}", mo - mn);
+    }
+}

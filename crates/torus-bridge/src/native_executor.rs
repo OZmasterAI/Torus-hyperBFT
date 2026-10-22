@@ -912,6 +912,90 @@ fn settle_no_merge_enabled() -> bool {
     })
 }
 
+thread_local! {
+    /// s80 ro-basis-walk-memo: [`with_ro_basis_memo`]'s per-thread pin;
+    /// `None` = the env.
+    static RO_BASIS_MEMO_PIN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// s80 ro-basis-walk-memo: resting-order walks the Phase-2 reduce-only
+    /// reservation basis ran on this thread (tests: proves which arm ran).
+    static RO_BASIS_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// s80 ro-basis-walk-memo (`TORUS_S80_RO_BASIS_MEMO`, node-local, OFF by
+/// default): `1` or `true` (trimmed, any case) = on; anything else off.
+#[doc(hidden)]
+pub fn parse_ro_basis_memo(v: Option<&str>) -> bool {
+    v.map(str::trim)
+        .is_some_and(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+}
+
+/// s80 ro-basis-walk-memo: runs `f` with `TORUS_S80_RO_BASIS_MEMO` pinned to
+/// `on` on this thread (the reservation basis runs on the calling thread of
+/// `execute_batch`). The previous pin comes back when `f` returns or unwinds.
+#[doc(hidden)]
+pub fn with_ro_basis_memo<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RO_BASIS_MEMO_PIN.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(RO_BASIS_MEMO_PIN.with(|c| c.replace(Some(on))));
+    f()
+}
+
+/// s80 ro-basis-walk-memo: resting-order walks of the Phase-2 reduce-only
+/// reservation basis on this thread so far.
+#[doc(hidden)]
+pub fn ro_basis_walks_on_this_thread() -> u64 {
+    RO_BASIS_WALKS.with(std::cell::Cell::get)
+}
+
+fn note_ro_basis_walk() {
+    RO_BASIS_WALKS.with(|c| c.set(c.get() + 1));
+}
+
+/// s80 ro-basis-walk-memo: the pin, else the env read once (one INFO line).
+fn ro_basis_memo_enabled() -> bool {
+    if let Some(on) = RO_BASIS_MEMO_PIN.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = parse_ro_basis_memo(std::env::var("TORUS_S80_RO_BASIS_MEMO").ok().as_deref());
+        tracing::info!("TORUS_S80_RO_BASIS_MEMO on={on}");
+        on
+    })
+}
+
+#[cfg(test)]
+mod ro_basis_memo_flag_tests {
+    use super::{parse_ro_basis_memo, ro_basis_memo_enabled, with_ro_basis_memo};
+
+    /// Off by default: only `1` / `true` (trimmed, any case) turn it on.
+    #[test]
+    fn parse_off_by_default() {
+        for v in [None, Some(""), Some("0"), Some("false"), Some("yes"), Some("2")] {
+            assert!(!parse_ro_basis_memo(v), "{v:?}");
+        }
+        for v in ["1", " 1 ", "true", "TRUE", " True\n"] {
+            assert!(parse_ro_basis_memo(Some(v)), "{v:?}");
+        }
+    }
+
+    /// The pin wins over the env and is restored after `f`.
+    #[test]
+    fn pin_overrides_and_restores() {
+        let env = ro_basis_memo_enabled();
+        with_ro_basis_memo(true, || {
+            assert!(ro_basis_memo_enabled());
+            with_ro_basis_memo(false, || assert!(!ro_basis_memo_enabled()));
+            assert!(ro_basis_memo_enabled());
+        });
+        assert_eq!(ro_basis_memo_enabled(), env);
+    }
+}
+
 #[cfg(test)]
 mod settle_no_merge_flag_tests {
     use super::{
@@ -1778,6 +1862,10 @@ impl TopUpCand {
 #[cfg(test)]
 #[path = "sell_top_up_stitch_tests.rs"]
 mod sell_top_up_stitch_tests;
+
+#[cfg(test)]
+#[path = "ro_basis_memo_tests.rs"]
+mod ro_basis_memo_tests;
 
 /// Open-order count work (trader probes + stops) per worker thread: below
 /// 2x this the count stays on the exec thread. Every count a 300-market block
@@ -12381,12 +12469,36 @@ impl NativeExecutor {
     ///   the position advanced through the batch's earlier fills; if those
     ///   shrank it, the extra opening part is charged against the order's
     ///   budget there (the reservation itself is released whole anyway).
+    ///
+    /// s80 ro-basis-walk-memo (`TORUS_S80_RO_BASIS_MEMO=1`): see
+    /// [`Self::phase2_reservation_basis_with`].
     fn phase2_reservation_basis<T: StateBackend>(
         ctx: &NativeExecContext<T>,
         orders: &[(usize, Address, &PlaceOrderParams)],
     ) -> HashMap<usize, (FixedPoint, FixedPoint)> {
+        Self::phase2_reservation_basis_with(ctx, orders, ro_basis_memo_enabled())
+    }
+
+    /// [`Self::phase2_reservation_basis`] with the s80 ro-basis-walk-memo
+    /// choice explicit. `memo = false` (the default) walks the sender's
+    /// resting orders in the market once per reduce-only non-stop order
+    /// (O(R) `get_order`s each, R up to the open-order limit: 1,024 such
+    /// orders against R = 1,000 is ~1M lookups per call). `memo = true` sums
+    /// them once per (sender, market) per call: Phase 2 touches no book (the
+    /// books are behind `&ctx`), so the sum is a pure function of the pair
+    /// within the call; the walk is the same orders in the same
+    /// (`trader_orders`) order folded with the same `sat_add`, so the map is
+    /// byte-identical (`ro_basis_memo_tests`).
+    fn phase2_reservation_basis_with<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        orders: &[(usize, Address, &PlaceOrderParams)],
+        memo: bool,
+    ) -> HashMap<usize, (FixedPoint, FixedPoint)> {
         let sat_add =
             |a: FixedPoint, b: FixedPoint| FixedPoint::from_raw(a.raw().saturating_add(b.raw()));
+        // s80 ro-basis-walk-memo: (sender, market) -> resting non-reduce-only
+        // remaining (empty, no allocation, with the flag off).
+        let mut resting_memo: HashMap<(Address, MarketId), FixedPoint> = HashMap::default();
         let track_growth = orders.iter().any(|(_, _, p)| p.reduce_only && !Self::is_stop(p));
         // Item 6 M1: the closing allowances are only read by orders that
         // never rest; without one in the batch they are not tracked (the
@@ -12417,12 +12529,24 @@ impl NativeExecutor {
                 let pos = Self::signed_position(&ctx.positions, &sender, params.market_id)
                     .inspect_err(|e| note_reader_fault(&ctx.reader_fault, "reduce-only reservation position read", e));
                 if let Ok(pos) = pos {
-                    let resting = ctx.order_books.get(&params.market_id).map_or(FixedPoint::ZERO, |b| {
-                        b.orders_for_trader(&sender)
-                            .iter()
-                            .filter(|o| !o.reduce_only)
-                            .fold(FixedPoint::ZERO, |acc, o| sat_add(acc, o.remaining_qty))
-                    });
+                    let resting = if memo {
+                        *resting_memo.entry((sender, params.market_id)).or_insert_with(|| {
+                            note_ro_basis_walk();
+                            ctx.order_books.get(&params.market_id).map_or(FixedPoint::ZERO, |b| {
+                                b.trader_orders_iter(&sender)
+                                    .filter(|o| !o.reduce_only)
+                                    .fold(FixedPoint::ZERO, |acc, o| sat_add(acc, o.remaining_qty))
+                            })
+                        })
+                    } else {
+                        note_ro_basis_walk();
+                        ctx.order_books.get(&params.market_id).map_or(FixedPoint::ZERO, |b| {
+                            b.orders_for_trader(&sender)
+                                .iter()
+                                .filter(|o| !o.reduce_only)
+                                .fold(FixedPoint::ZERO, |acc, o| sat_add(acc, o.remaining_qty))
+                        })
+                    };
                     let grown = growth
                         .get(&(sender, params.market_id))
                         .copied()
