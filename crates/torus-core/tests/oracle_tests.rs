@@ -589,3 +589,56 @@ fn quorum_survives_one_cut_outlier_with_enough_stake_left() {
     assert_eq!(mgr.aggregate_price(1, 2, 1_000, &equal_stakes(10)).unwrap(), fp(100));
     assert_eq!(mgr.get_price(1, 1_000).unwrap().num_reporters, 7);
 }
+
+// ============================================================================
+// s80 oracle-step-memo: memo_expiry bounds
+// ============================================================================
+
+/// No rows: nothing expires.
+#[test]
+fn memo_expiry_empty_is_max() {
+    let (_dir, mgr) = setup_with_config(OracleConfig::default());
+    assert_eq!(mgr.memo_expiry(1_000).unwrap(), Some(u64::MAX));
+}
+
+/// The earliest submission leaves the window at `ts + window + 1`; a fresh
+/// aggregate turns stale at `ts + max_age + 1`; a stale one never bounds.
+#[test]
+fn memo_expiry_is_the_first_window_or_staleness_change() {
+    let (_dir, db) = setup();
+    let mgr = OracleManager::new(db.clone(), OracleConfig::default());
+    let stakes: Vec<(Address, FixedPoint)> = (1..=3).map(|n| (addr(n), fp(100))).collect();
+    // Market 1: three reporters at ts 1000 -> fresh aggregate at 1000.
+    for n in 1..=3 {
+        mgr.submit_price(&addr(n), 1, fp(50), 10, 1_000).unwrap();
+    }
+    mgr.aggregate_price(1, 11, 1_000, &stakes).unwrap();
+    // Window 10: the rows count while now <= 1010; first change at 1011.
+    assert_eq!(mgr.memo_expiry(1_000).unwrap(), Some(1_011));
+    // A later row of another market does not move the minimum.
+    mgr.submit_price(&addr(1), 2, fp(60), 12, 1_004).unwrap();
+    assert_eq!(mgr.memo_expiry(1_004).unwrap(), Some(1_011));
+    // Rows pruned: only the aggregate (ts 1000, max age 60) bounds: 1061.
+    assert_eq!(mgr.prune_submissions(1_020).unwrap(), 4);
+    assert_eq!(mgr.memo_expiry(1_020).unwrap(), Some(1_061));
+    // Stale at 1061: it stays stale, nothing bounds any more.
+    assert_eq!(mgr.memo_expiry(1_061).unwrap(), Some(u64::MAX));
+    // A future-dated submission bounds at its own ts + window + 1.
+    mgr.submit_price(&addr(2), 3, fp(70), 13, 2_000).unwrap();
+    assert_eq!(mgr.memo_expiry(1_061).unwrap(), Some(2_011));
+}
+
+/// A row that does not decode: no memo.
+#[test]
+fn memo_expiry_undecodable_row_is_none() {
+    let (_dir, db) = setup();
+    let mgr = OracleManager::new(db.clone(), OracleConfig::default());
+    db.put_cf_raw(CF_NATIVE_ORACLE, b"agg\0\0\0\0\0\0\0\x01", b"short").unwrap();
+    assert_eq!(mgr.memo_expiry(1_000).unwrap(), None);
+    db.delete_cf_raw(CF_NATIVE_ORACLE, b"agg\0\0\0\0\0\0\0\x01").unwrap();
+    let mut key = b"sub".to_vec();
+    key.extend_from_slice(&1u64.to_be_bytes());
+    key.extend_from_slice(addr(1).as_slice());
+    db.put_cf_raw(CF_NATIVE_ORACLE, &key, b"junk").unwrap();
+    assert_eq!(mgr.memo_expiry(1_000).unwrap(), None);
+}

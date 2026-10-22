@@ -2695,6 +2695,142 @@ struct BlockMarksState {
     configs: HashMap<MarketId, MarketMarginConfig>,
 }
 
+/// s80 oracle-step-memo (`TORUS_S80_ORACLE_MEMO=1`, default off): what the
+/// block-start oracle step ([`NativeExecutor::begin_block_oracle`]) decided
+/// at header second `t0`, reused by later blocks while its inputs are
+/// unchanged. Node-local, never consensus-visible: a hit writes the same
+/// bytes and returns the same results and mark table as the full step.
+///
+/// Kept in the resident rows slot next to the mark state (built empty with
+/// R, dropped with it: a rebuild, restart or failed block starts without
+/// one). Valid while:
+/// * the submission and aggregate rows are as the step left them: every
+///   block's delta of those rows must equal what the step itself wrote
+///   ([`Self::expect`], checked by `end_resident` against the delta R
+///   takes), and the next block's own layer must not touch them before its
+///   step (`layer_touches`);
+/// * `t0 <= now < expiry` ([`OracleManager::memo_expiry`]: no submission
+///   leaves the window, no fresh aggregate turns stale);
+/// * the listed markets and the Active stakes read this block are equal;
+/// * the mark table's market set is equal (listed, aggregated, margin
+///   config and book markets).
+#[derive(Debug)]
+struct OracleMemo {
+    t0: u64,
+    expiry: u64,
+    markets: Vec<MarketId>,
+    stakes: Vec<(Address, FixedPoint)>,
+    /// The aggregate rows the step writes fresh each block (key-sorted),
+    /// with block (bytes 16..24) and timestamp (28..36) re-stamped per block.
+    fresh: Vec<(Vec<u8>, [u8; 36])>,
+    results: Vec<NativeActionResult>,
+    marks: HashMap<MarketId, Option<FixedPoint>>,
+    /// The table's markets beyond `listed ∪ aggregated`: margin-config and
+    /// book markets (sorted).
+    extra: Vec<MarketId>,
+    /// `listed ∪ aggregated` as a dense membership map (index = market id;
+    /// empty when an id is >= `DENSE_MARKETS`: `extra` is then recomputed
+    /// through `base_set`).
+    base_dense: Vec<bool>,
+    base_set: BTreeSet<MarketId>,
+    /// What the block's delta of the oracle CF `agg` + `sub` rows must be
+    /// exactly for the memo to carry to the next block.
+    expect: OracleExpect,
+}
+
+/// [`OracleMemo::expect`].
+#[derive(Debug)]
+enum OracleExpect {
+    /// After a full step: the rows the block's own layer held after it
+    /// (key-sorted; tombstones `None`).
+    Rows(Vec<(Vec<u8>, Option<Vec<u8>>)>),
+    /// After a hit: [`OracleMemo::fresh`] stamped with (block, timestamp).
+    Stamped(u64, u64),
+}
+
+impl OracleMemo {
+    /// The memo survives the block iff `delta`'s `agg` / `sub` oracle rows
+    /// are exactly [`Self::expect`] (nothing after the step wrote them).
+    fn matches(&self, delta: &torus_state::ResidentDelta) -> bool {
+        let rows = delta.entries(torus_state::cf::CF_NATIVE_ORACLE).filter(|(key, _)| {
+            key.starts_with(b"agg") || key.starts_with(torus_state::cf::ORACLE_SUBMISSION_PREFIX)
+        });
+        match &self.expect {
+            OracleExpect::Rows(want) => {
+                let mut want = want.iter();
+                for (key, value) in rows {
+                    match want.next() {
+                        Some((k, v)) if k.as_slice() == key && v.as_deref() == value => {}
+                        _ => return false,
+                    }
+                }
+                want.next().is_none()
+            }
+            OracleExpect::Stamped(height, ts) => {
+                let (h, t) = (height.to_be_bytes(), ts.to_be_bytes());
+                let mut want = self.fresh.iter();
+                for (key, value) in rows {
+                    let Some((k, row)) = want.next() else { return false };
+                    let ok = k.as_slice() == key
+                        && value.is_some_and(|v| {
+                            v.len() == 36
+                                && v[..16] == row[..16]
+                                && v[16..24] == h
+                                && v[24..28] == row[24..28]
+                                && v[28..36] == t
+                        });
+                    if !ok {
+                        return false;
+                    }
+                }
+                want.next().is_none()
+            }
+        }
+    }
+
+    /// The table's markets beyond `listed ∪ aggregated` for this block.
+    fn extra_of<'a>(&self, keys: impl Iterator<Item = &'a MarketId>) -> Vec<MarketId> {
+        let mut extra: Vec<MarketId> = if self.base_dense.is_empty() {
+            keys.filter(|m| !self.base_set.contains(*m)).copied().collect()
+        } else {
+            keys.filter(|&&m| !self.base_dense.get(m as usize).copied().unwrap_or(false)).copied().collect()
+        };
+        extra.sort_unstable();
+        extra.dedup();
+        extra
+    }
+}
+
+/// s80 oracle-step-memo: `TORUS_S80_ORACLE_MEMO=1` turns the memo on
+/// (default off = the full step every block). Read once per process.
+pub fn oracle_memo_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("TORUS_S80_ORACLE_MEMO").is_ok_and(|v| v.trim() == "1");
+        tracing::info!("TORUS_S80_ORACLE_MEMO on={on}");
+        on
+    })
+}
+
+/// s80 oracle-step-memo: process-wide counts of memo hits and full steps
+/// taken with the memo on (tests / µbench introspection).
+pub static ORACLE_MEMO_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ORACLE_MEMO_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// s80 oracle-step-memo: count one step (hit or full) and log the running
+/// totals every 2048 steps (a cell's proof of the hit rate).
+fn oracle_memo_count(hit: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (hits, misses) = if hit {
+        (ORACLE_MEMO_HITS.fetch_add(1, Relaxed) + 1, ORACLE_MEMO_MISSES.load(Relaxed))
+    } else {
+        (ORACLE_MEMO_HITS.load(Relaxed), ORACLE_MEMO_MISSES.fetch_add(1, Relaxed) + 1)
+    };
+    if (hits + misses) % 2048 == 0 {
+        tracing::info!(hits, misses, "TORUS_S80_ORACLE_MEMO steps");
+    }
+}
+
 impl<'a, T: StateBackend> AccountReader<'a, T> {
     fn of(ctx: &'a NativeExecContext<T>) -> Self {
         Self {
@@ -4290,6 +4426,9 @@ struct RowsSlot {
     /// C2: the mark table / configs of block `height` (None: that block had
     /// no table — the next one takes a new version).
     marks: Option<BlockMarksState>,
+    /// s80 oracle-step-memo: the memo after block `height` (checked against
+    /// its delta).
+    oracle_memo: Option<OracleMemo>,
     /// C3 / Phase 4 step 3: the version the users' sums entries were last
     /// joined at ([`BlockSums::slot_version`]; the entries themselves live on
     /// `users`' records, built empty with R, dropped with it).
@@ -4955,6 +5094,8 @@ pub struct ResidentBlock {
     /// [`NativeExecContext::detach_resident_block`], this block's (stashed
     /// by `end_resident`).
     marks: Option<BlockMarksState>,
+    /// s80 oracle-step-memo: as `marks` (the slot's memo in, this block's out).
+    oracle_memo: Option<OracleMemo>,
     /// C3: the slot's sums cache (empty when R was built) and, after
     /// [`NativeExecContext::detach_resident_block`], this block's memo;
     /// `end_resident` merges them. `None`: R not attached (no cache).
@@ -5055,6 +5196,7 @@ pub fn begin_resident(
         attached: false,
         rebuilt: false,
         marks: None,
+        oracle_memo: None,
         sums: None,
         users: None,
         retired: Retired::default(),
@@ -5073,6 +5215,7 @@ pub fn begin_resident(
         match rows_slot_reusable(&*overlay, slot.height, height, overlay.parent_height()) {
             Ok(true) => {
                 block.marks = slot.marks;
+                block.oracle_memo = slot.oracle_memo;
                 block.sums = Some(BlockSums {
                     records: Some(slot.users.clone()),
                     ..BlockSums::new(slot.sums_version)
@@ -5320,6 +5463,7 @@ struct EndResidentJob {
     users: Arc<Users>,
     height: u64,
     marks: Option<BlockMarksState>,
+    oracle_memo: Option<OracleMemo>,
     sums: Option<BlockSums>,
     delta: BlockDelta,
     /// Dropped by whichever thread runs the job.
@@ -5352,7 +5496,7 @@ fn end_resident_take(
         return None;
     };
     drop(r.take_source());
-    let ResidentBlock { height, marks, mut sums, users, retired, .. } = block;
+    let ResidentBlock { height, marks, oracle_memo, mut sums, users, retired, .. } = block;
     if let Some(s) = sums.as_mut() {
         drop(s.records.take());
     }
@@ -5374,6 +5518,7 @@ fn end_resident_take(
         users,
         height,
         marks,
+        oracle_memo,
         sums,
         delta,
         retired,
@@ -5390,6 +5535,7 @@ impl EndResidentJob {
             mut users,
             height,
             marks,
+            oracle_memo,
             sums,
             delta,
             retired,
@@ -5411,6 +5557,9 @@ impl EndResidentJob {
         let mut carry = sums.map_or_else(SumsCarry::none, |s| s.into_carry(marks.as_ref()));
         // Item 6 cut 5: from the frozen set (pipelined), here on the worker.
         let delta = delta.into_delta();
+        // s80 oracle-step-memo: carried only if nothing but the step wrote
+        // the submission / aggregate rows this block.
+        let oracle_memo = oracle_memo.filter(|m| m.matches(&delta));
         // Phase 4 step 2: R's raw CFs (liquidation, oracle, markets) only.
         let timer = std::time::Instant::now();
         r.apply(&delta);
@@ -5433,6 +5582,7 @@ impl EndResidentJob {
         RowsSlot {
             rows,
             marks,
+            oracle_memo,
             sums_version,
             #[cfg(test)]
             sums_carried,
@@ -6265,6 +6415,17 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// Item 6 C2: the previous block's mark state from the resident rows slot
     /// ([`Self::attach_resident_block`]), consumed by `begin_block_oracle`.
     prev_marks: Option<BlockMarksState>,
+    /// s80 oracle-step-memo: the slot's memo ([`Self::attach_resident_block`]
+    /// to [`Self::detach_resident_block`]).
+    oracle_memo: Option<OracleMemo>,
+    /// s80 oracle-step-memo: R is attached (a memo can be carried).
+    oracle_memo_slot: bool,
+    /// s80 oracle-step-memo: the block's step was a memo hit (`Some(true)`)
+    /// or a full step with the memo on (`Some(false)`); `None`: memo off.
+    oracle_memo_hit: Option<bool>,
+    /// s80 oracle-step-memo: use the memo ([`oracle_memo_enabled`] at
+    /// construction; tests set it per context).
+    pub oracle_memo_on: bool,
     /// Item 6 C3: the block's margin sums cache ([`Self::attach_resident_block`]
     /// to [`Self::detach_resident_block`]; `None`: every valuation builds).
     sums: Option<BlockSums>,
@@ -6933,6 +7094,10 @@ impl<T: StateBackend> NativeExecContext<T> {
             delisted_markets,
             block_marks: None,
             prev_marks: None,
+            oracle_memo: None,
+            oracle_memo_slot: false,
+            oracle_memo_hit: None,
+            oracle_memo_on: oracle_memo_enabled(),
             sums: None,
             trader_markets,
             cloid_markets,
@@ -7008,6 +7173,8 @@ impl<T: StateBackend> NativeExecContext<T> {
 
     pub fn attach_resident_block(&mut self, block: &mut ResidentBlock) {
         self.prev_marks = block.marks.take();
+        self.oracle_memo = block.oracle_memo.take();
+        self.oracle_memo_slot = block.attached;
         // C3: the slot's sums cache (used once the table is filled).
         self.sums = block.sums.take();
     }
@@ -7021,10 +7188,26 @@ impl<T: StateBackend> NativeExecContext<T> {
             .block_marks
             .take()
             .map(|marks| BlockMarksState { marks, configs: self.margin_configs.clone() });
+        block.oracle_memo = self.oracle_memo.take();
         // C3: the sums cache and this block's memo, merged by `end_resident`.
         if let Some(sums) = self.sums.take() {
             block.sums = Some(sums);
         }
+    }
+
+    /// s80 oracle-step-memo: whether this block's oracle step was a memo hit
+    /// (`None`: the memo is off or the step did not run). Tests / µbench.
+    pub fn oracle_memo_hit(&self) -> Option<bool> {
+        self.oracle_memo_hit
+    }
+
+    /// s80 oracle-step-memo (tests): the block's mark table, market-sorted
+    /// (`None`: no table).
+    #[doc(hidden)]
+    pub fn block_mark_table(&self) -> Option<Vec<(MarketId, Option<FixedPoint>)>> {
+        let mut v: Vec<_> = self.block_marks.as_ref()?.marks.iter().map(|(m, p)| (*m, *p)).collect();
+        v.sort_unstable_by_key(|(m, _)| *m);
+        Some(v)
     }
 
     /// Item 6 C2: the version of the block's mark table (`None`: no table).
@@ -15813,6 +15996,9 @@ impl NativeExecutor {
     pub fn begin_block_oracle<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
     ) -> Vec<NativeActionResult> {
+        if ctx.oracle_memo_on {
+            return Self::begin_block_oracle_memo(ctx);
+        }
         match Self::oracle_inputs(ctx) {
             Ok((markets, stakes)) => {
                 let results = Self::aggregate_oracle_prices(ctx, &markets, &stakes);
@@ -15832,6 +16018,15 @@ impl NativeExecutor {
         ctx: &NativeExecContext<T>,
     ) -> Result<(Vec<MarketId>, Vec<(Address, FixedPoint)>), String> {
         ctx.oracle.prune_submissions(ctx.timestamp).map_err(|e| e.to_string())?;
+        Self::oracle_listed_stakes(ctx)
+    }
+
+    /// [`Self::oracle_inputs`] without the prune: listed markets (ascending),
+    /// Active stakes.
+    #[allow(clippy::type_complexity)]
+    fn oracle_listed_stakes<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+    ) -> Result<(Vec<MarketId>, Vec<(Address, FixedPoint)>), String> {
         let markets = ctx.governance.listed_market_ids().map_err(|e| e.to_string())?;
         let stakes = ctx
             .staking
@@ -15845,6 +16040,143 @@ impl NativeExecutor {
             })
             .collect();
         Ok((markets, stakes))
+    }
+
+    /// s80 oracle-step-memo: [`Self::begin_block_oracle`] with the slot's
+    /// [`OracleMemo`]. Reads the listed markets and Active stakes; on a hit
+    /// (see [`OracleMemo`]) re-puts the fresh aggregate rows re-stamped with
+    /// this block, reuses the mark table (version by the same rule as
+    /// [`Self::fill_block_marks`]) and returns the memo's results — no
+    /// prune, collect, median or mark reads. Otherwise the full step (prune,
+    /// aggregate, fill), then records a new memo when R is attached, nothing
+    /// faulted and the block's own layer did not write an aggregate row
+    /// before the step.
+    fn begin_block_oracle_memo<T: StateBackend>(ctx: &mut NativeExecContext<T>) -> Vec<NativeActionResult> {
+        use torus_state::cf::{CF_NATIVE_ORACLE, ORACLE_SUBMISSION_PREFIX};
+        let memo = ctx.oracle_memo.take();
+        let (markets, stakes) = match Self::oracle_listed_stakes(ctx) {
+            Ok(v) => v,
+            Err(e) => {
+                ctx.fatal_error = Some(format!("oracle block-start step: {e}"));
+                return Vec::new();
+            }
+        };
+        let now = ctx.timestamp;
+        let hit = memo.filter(|m| {
+            m.t0 <= now
+                && now < m.expiry
+                && m.markets == markets
+                && m.stakes == stakes
+                && !ctx.state.layer_touches(CF_NATIVE_ORACLE, ORACLE_SUBMISSION_PREFIX)
+                && !ctx.state.layer_touches(CF_NATIVE_ORACLE, b"agg")
+                && m.extra == m.extra_of(ctx.margin_configs.keys().chain(ctx.order_books.keys()))
+        });
+        ctx.oracle_memo_hit = Some(hit.is_some());
+        oracle_memo_count(hit.is_some());
+        if let Some(mut m) = hit {
+            let (h, t) = (ctx.block_height.to_be_bytes(), now.to_be_bytes());
+            for (key, row) in &m.fresh {
+                let mut buf = *row;
+                buf[16..24].copy_from_slice(&h);
+                buf[28..36].copy_from_slice(&t);
+                if let Err(e) = ctx.state.put_cf_raw(CF_NATIVE_ORACLE, key, &buf) {
+                    // As the full step: a failed aggregate write is a local fault.
+                    Self::latch_core_fault(ctx, "oracle aggregate", &CoreError::from(e));
+                    return m.results;
+                }
+            }
+            m.expect = OracleExpect::Stamped(ctx.block_height, now);
+            let prev = ctx.prev_marks.take();
+            ctx.block_marks = None;
+            if let Some(sums) = ctx.sums.as_mut() {
+                sums.start(None);
+            }
+            let table = match prev {
+                Some(p) if p.marks.marks == m.marks && p.configs == ctx.margin_configs => p.marks,
+                _ => BlockMarks::new(
+                    m.marks.clone(),
+                    MARK_VERSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+                ),
+            };
+            let version = table.version;
+            ctx.block_marks = Some(table);
+            if let Some(sums) = ctx.sums.as_mut() {
+                sums.start(Some(version));
+            }
+            let results = m.results.clone();
+            ctx.oracle_memo = Some(m);
+            return results;
+        }
+        let agg_pre_touched = ctx.state.layer_touches(CF_NATIVE_ORACLE, b"agg");
+        if let Err(e) = ctx.oracle.prune_submissions(now) {
+            ctx.fatal_error = Some(format!("oracle block-start step: {e}"));
+            return Vec::new();
+        }
+        let results = Self::aggregate_oracle_prices(ctx, &markets, &stakes);
+        Self::fill_block_marks(ctx, &markets);
+        if ctx.oracle_memo_slot && !agg_pre_touched && ctx.fatal_error.is_none() {
+            ctx.oracle_memo = Self::record_oracle_memo(ctx, markets, stakes, &results);
+        }
+        results
+    }
+
+    /// s80 oracle-step-memo: the memo of the full step that just ran (`None`:
+    /// no mark table, a row that does not decode, R's change view missing, or
+    /// an aggregate write that is not this block's fresh row).
+    fn record_oracle_memo<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        markets: Vec<MarketId>,
+        stakes: Vec<(Address, FixedPoint)>,
+        results: &[NativeActionResult],
+    ) -> Option<OracleMemo> {
+        use torus_state::cf::{CF_NATIVE_ORACLE, ORACLE_SUBMISSION_PREFIX};
+        let now = ctx.timestamp;
+        let table = ctx.block_marks.as_ref()?;
+        let expiry = ctx.oracle.memo_expiry(now).ok()??;
+        if expiry <= now {
+            return None;
+        }
+        let mut agg = ctx.state.resident_changes(CF_NATIVE_ORACLE, b"agg")?;
+        let mut sub = ctx.state.resident_changes(CF_NATIVE_ORACLE, ORACLE_SUBMISSION_PREFIX)?;
+        agg.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+        sub.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+        let (h, t) = (ctx.block_height.to_be_bytes(), now.to_be_bytes());
+        let mut fresh = Vec::with_capacity(agg.len());
+        for c in &agg {
+            let row: [u8; 36] = c.current.as_deref()?.try_into().ok()?;
+            if row[16..24] != h || row[28..36] != t {
+                return None;
+            }
+            fresh.push((c.key.clone(), row));
+        }
+        let expect = agg.into_iter().chain(sub).map(|c| (c.key, c.current)).collect();
+        let aggregated = ctx.oracle.aggregated_market_ids().ok()?;
+        let base_set: BTreeSet<MarketId> = markets.iter().copied().chain(aggregated).collect();
+        let base_dense = match base_set.last() {
+            Some(&max) if max < DENSE_MARKETS => {
+                let mut v = vec![false; max as usize + 1];
+                for &m in &base_set {
+                    v[m as usize] = true;
+                }
+                v
+            }
+            _ => Vec::new(),
+        };
+        let mut memo = OracleMemo {
+            t0: now,
+            expiry,
+            markets,
+            stakes,
+            fresh,
+            results: results.to_vec(),
+            marks: table.marks.clone(),
+            extra: Vec::new(),
+            base_dense,
+            base_set,
+            expect: OracleExpect::Rows(expect),
+        };
+        memo.extra = memo.extra_of(ctx.margin_configs.keys().chain(ctx.order_books.keys()));
+        Some(memo)
     }
 
     /// Item 6 C2: the end of [`Self::begin_block_oracle`] (after the
@@ -15888,6 +16220,42 @@ impl NativeExecutor {
             _ => MARK_VERSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
         };
         ctx.block_marks = Some(BlockMarks::new(marks, version));
+        if let Some(sums) = ctx.sums.as_mut() {
+            sums.start(Some(version));
+        }
+    }
+
+    /// s80 oracle-step-memo step 1 (µbench only): the cost floor of a memo
+    /// hit — re-put `rows` (36-byte aggregate rows, `(key, value)`) with
+    /// block (bytes 16..24) and timestamp (bytes 28..36) patched to this
+    /// block, then reuse the previous block's mark table and version (no
+    /// prune, no collect, no median, no mark reads). NOT exact in general:
+    /// the µbench arm `UB_ORACLE_STUB=1` uses it on a feed whose marks and
+    /// reporters never change.
+    #[doc(hidden)]
+    pub fn oracle_step_stub_for_bench<T: StateBackend>(ctx: &mut NativeExecContext<T>, rows: &[(Vec<u8>, Vec<u8>)]) {
+        let mut buf = [0u8; 36];
+        for (key, value) in rows {
+            buf.copy_from_slice(&value[..36]);
+            buf[16..24].copy_from_slice(&ctx.block_height.to_be_bytes());
+            buf[28..36].copy_from_slice(&ctx.timestamp.to_be_bytes());
+            if let Err(e) = ctx.state.put_cf_raw(torus_state::cf::CF_NATIVE_ORACLE, key, &buf) {
+                ctx.fatal_error = Some(format!("oracle stub put: {e}"));
+                return;
+            }
+        }
+        let prev = ctx.prev_marks.take();
+        ctx.block_marks = None;
+        if let Some(sums) = ctx.sums.as_mut() {
+            sums.start(None);
+        }
+        let Some(p) = prev else { return };
+        let version = if p.configs == ctx.margin_configs {
+            p.marks.version
+        } else {
+            MARK_VERSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+        };
+        ctx.block_marks = Some(BlockMarks::new(p.marks.marks, version));
         if let Some(sums) = ctx.sums.as_mut() {
             sums.start(Some(version));
         }

@@ -50,6 +50,10 @@ use torus_types::FixedPoint;
 
 struct Sample {
     exec_ms: f64,
+    /// s80 oracle-step-memo step 1: `begin_block_oracle` alone (inside `exec_ms`).
+    oracle_ms: f64,
+    /// s80 oracle-step-memo: the step was a memo hit (`None`: memo off).
+    memo_hit: Option<bool>,
     tail_ms: f64,
     margin_ms: f64,
     match_ms: f64,
@@ -92,6 +96,17 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
     let mut walk = MarkWalk::new(markets, env("UB_MARK_WALK", 0));
     let resident = env("UB_NO_R", 0) != 1;
     let worker = env("UB_R_WORKER", 0) == 1;
+    // s80 oracle-step-memo step 1: after block 1's real step, every block runs
+    // the memo-hit cost floor (re-put the aggregate rows, reuse the marks).
+    let stub = env("UB_ORACLE_STUB", 0) == 1;
+    // s80 oracle-step-memo step 2: feed cadence. `UB_FEED_EVERY=n` (> 0):
+    // the reporters submit on block 1 before the step and then on every
+    // n-th block AFTER the step (as feed actions, counted from the next
+    // block); `UB_SECOND_EVERY=k`: the header second advances every k
+    // blocks (default 1 = every block, as before).
+    let feed_every = env("UB_FEED_EVERY", 0);
+    let second_every = env("UB_SECOND_EVERY", 1).max(1);
+    let mut agg_rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut holder = ResidentBooks::default();
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -142,7 +157,7 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
         let mut ctx = NativeExecContext::new(
             overlay.clone(),
             h + 1,
-            1000 + h,
+            1000 + h / second_every,
             0,
             1_000_000,
             100,
@@ -154,7 +169,9 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
         ctx.set_order_books(std::mem::take(&mut books));
         ctx.next_global_order_id = next_id;
         ctx.metrics = Some(metrics.clone());
-        if fed {
+        let feed_now = fed && (feed_every == 0 || h == 1);
+        let feed_after = fed && feed_every > 0 && h > 1 && h % feed_every == 0;
+        if feed_now {
             // Before the timed block start, stamped with this block (s85 feeder M1b).
             walk.step();
             for m in 1..=markets {
@@ -167,13 +184,32 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
         let rc0 = metrics.orders_rejected_cancelled.get();
         let pa0 = metrics.orders_placed_accepted.get();
         let t0 = std::time::Instant::now();
-        let agg = NativeExecutor::begin_block_oracle(&mut ctx);
-        assert!(!fed || agg.iter().all(|r| r.success), "mark aggregation: {agg:?}");
+        if stub && h > 1 {
+            NativeExecutor::oracle_step_stub_for_bench(&mut ctx, &agg_rows);
+        } else {
+            let agg = NativeExecutor::begin_block_oracle(&mut ctx);
+            assert!(!fed || agg.iter().all(|r| r.success), "mark aggregation: {agg:?}");
+        }
+        let oracle = t0.elapsed();
+        if stub && h == 1 {
+            agg_rows = ctx.state.iterate_cf(torus_state::cf::CF_NATIVE_ORACLE, Some(b"agg")).unwrap();
+            assert!(agg_rows.iter().all(|(_, v)| v.len() == 36));
+        }
         NativeExecutor::execute_batch(&mut ctx, &block);
         let exec = t0.elapsed();
         let t1 = std::time::Instant::now();
         let _ = NativeExecutor::run_liquidations(&mut ctx);
         let tail = t1.elapsed();
+        if feed_after {
+            walk.step();
+            for m in 1..=markets {
+                let mark = walk.mark(base_mark(), m);
+                for n in REPORTERS {
+                    ctx.oracle.submit_price(&special(n), m, mark, ctx.block_height, ctx.timestamp).unwrap();
+                }
+            }
+        }
+        let memo_hit = ctx.oracle_memo_hit();
         assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
         let pa = ctx.phase_accum;
         let fills = ctx.trade_index as u64;
@@ -205,6 +241,8 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
             placed_measured += metrics.orders_placed_accepted.get() - pa0;
             samples.push(Sample {
                 exec_ms: exec.as_secs_f64() * 1e3,
+                oracle_ms: oracle.as_secs_f64() * 1e3,
+                memo_hit,
                 tail_ms: tail.as_secs_f64() * 1e3,
                 margin_ms: pa.margin_ns as f64 / 1e6,
                 match_ms: pa.match_ns as f64 / 1e6,
@@ -270,10 +308,24 @@ fn median(mut v: Vec<f64>) -> f64 {
 fn ubench_econ() {
     let runs = env("UB_RUNS", 3);
     let mut per_run = Vec::new();
+    let mut oracle_per_run = Vec::new();
     for r in 0..runs {
         let (s, rc, placed, resting, rb, subs) = run_once(r);
         let fills: u64 = s.iter().map(|x| x.fills).sum();
         let exec: f64 = s.iter().map(|x| x.exec_ms).sum();
+        let oracle: f64 = s.iter().map(|x| x.oracle_ms).sum();
+        let hits = s.iter().filter(|x| x.memo_hit == Some(true)).count();
+        let memo_blocks = s.iter().filter(|x| x.memo_hit.is_some()).count();
+        // Hit / miss split of the oracle step (memo on).
+        let split = |want: bool| {
+            let v: Vec<f64> = s.iter().filter(|x| x.memo_hit == Some(want)).map(|x| x.oracle_ms).collect();
+            if v.is_empty() { f64::NAN } else { v.iter().sum::<f64>() / v.len() as f64 }
+        };
+        println!(
+            "UB run={r} oracle memo_blocks={memo_blocks} hits={hits} hit_ms={:.3} miss_ms={:.3}",
+            split(true),
+            split(false)
+        );
         let tail: f64 = s.iter().map(|x| x.tail_ms).sum();
         let margin: f64 = s.iter().map(|x| x.margin_ms).sum();
         let mtch: f64 = s.iter().map(|x| x.match_ms).sum();
@@ -284,8 +336,9 @@ fn ubench_econ() {
         let sub = |i: usize| subs[i].map_or("-".to_string(), |v: f64| format!("{:.2}", v / n));
         let k = fills as f64 / 1e3;
         let per1k = (exec + tail) / k;
+        oracle_per_run.push(oracle / n);
         println!(
-            "UB run={r} blocks={} fills/blk={:.0} engine_ms/blk={:.1} engine_ms/1k_fills={:.2} \
+            "UB run={r} blocks={} fills/blk={:.0} engine_ms/blk={:.1} engine_ms/1k_fills={:.2} oracle_ms/blk={:.3} \
              [exec/1k={:.2} margin/1k={:.2} match/1k={:.2} settle/1k={:.2} tail(liq)/1k={:.2}] \
              rejected_cancelled={} accepted={} resting_end={} r_end/blk={:.2}ms \
              [end_resident/blk={:.2}ms rows/blk={}ms users/blk={}ms timer/blk={}ms wait/blk={}ms] \
@@ -294,6 +347,7 @@ fn ubench_econ() {
             fills as f64 / n,
             (exec + tail) / n,
             per1k,
+            oracle / n,
             exec / k,
             margin / k,
             mtch / k,
@@ -324,6 +378,15 @@ fn ubench_econ() {
         env("UB_R_WORKER", 0) == 1,
         median(per_run.clone()),
         per_run
+    );
+    println!(
+        "UB oracle_stub={} feed_every={} second_every={} memo={} MEDIAN oracle_ms/blk={:.3} runs={:?}",
+        env("UB_ORACLE_STUB", 0) == 1,
+        env("UB_FEED_EVERY", 0),
+        env("UB_SECOND_EVERY", 1),
+        torus_bridge::native_executor::oracle_memo_enabled(),
+        median(oracle_per_run.clone()),
+        oracle_per_run.iter().map(|v| (v * 1e3).round() / 1e3).collect::<Vec<_>>()
     );
 }
 

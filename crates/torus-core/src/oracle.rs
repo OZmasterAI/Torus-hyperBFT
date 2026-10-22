@@ -431,6 +431,32 @@ impl<T: StateBackend> OracleManager<T> {
             .collect())
     }
 
+    /// s80 oracle-step-memo: the first header second `t > now` at which the
+    /// block-start step (prune, aggregate, mark read) may decide differently
+    /// than at `now` over UNCHANGED rows: the earliest second a submission
+    /// row leaves the window (`ts + window + 1`) or an aggregate row that is
+    /// fresh at `now` turns stale (`ts + max_age + 1`; a stale row stays
+    /// stale). Call right after the step at `now` (prune done). `None` (no
+    /// memo): a row that does not decode. `u64::MAX`: no row expires.
+    pub fn memo_expiry(&self, now: u64) -> Result<Option<u64>, CoreError> {
+        let mut expiry = u64::MAX;
+        for (_, value) in self.state.iterate_cf(CF_NATIVE_ORACLE, Some(ORACLE_SUBMISSION_PREFIX))? {
+            let Ok(sub) = OracleSubmission::try_from_slice(&value) else {
+                return Ok(None);
+            };
+            expiry = expiry.min(sub.timestamp.saturating_add(self.config.window_secs).saturating_add(1));
+        }
+        for (_, value) in self.state.iterate_cf(CF_NATIVE_ORACLE, Some(b"agg"))? {
+            let Ok(stored) = StoredAggregatedPrice::try_from_slice(&value) else {
+                return Ok(None);
+            };
+            if !self.is_stale(&stored, now) {
+                expiry = expiry.min(stored.timestamp.saturating_add(self.config.max_age_secs).saturating_add(1));
+            }
+        }
+        Ok(Some(expiry))
+    }
+
     /// Whether any submission row exists (the block's oracle step is due).
     /// Stops at the first row.
     pub fn has_submissions(&self) -> Result<bool, CoreError> {
