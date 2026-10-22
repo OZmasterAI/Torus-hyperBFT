@@ -1,6 +1,6 @@
 # Perp funding engine (P0.0 feature `funding_engine`)
 
-Status (s138): design + implementation on `feat/funding-engine` (from main `e60c326c`). Owner-approved as a
+Status (s138): built on `feat/funding-engine` (from main `e60c326c`): design `d1c64031`, RED `18ca517a`, GREEN `188fc1e8` + `a3a8b450`. Owner-approved as a
 testnet MUST (s138 product-scope audit: "no funding engine yet", `native_executor.rs:15502`; `max_funding_rate_bps`
 has no state slot). Paths are relative to the repo root.
 
@@ -72,6 +72,11 @@ so it settles the funding in cash before the position moves.
   the market has a funding row. With the bit off, every row stays v2 (111 bytes, byte-identical). v2 and v3 rows
   both decode, and v3 rows are regular rows for the resident records (item 6 C7).
 - No new CF and no per-position rows.
+- Memory: `Position` gains a packed `Option<PositionFunding>`, 112 -> 144 bytes per resident position record
+  (about +32 MB per 1M positions), bit on or off (`users_size_of_pins`). Unpacked it would have been 160.
+- Not covered: mempool admission (`torus-mempool`, node-local, best effort) values accounts without pending
+  funding, so it can admit an order the executor then refuses. That is a node-local admission gap, not a
+  consensus effect.
 
 ## 3. Execution
 - Block-start step `begin_block_funding`, inside `begin_block_oracle`: after aggregation and before the mark table
