@@ -773,6 +773,27 @@ class SummarizeKillTest(unittest.TestCase):
         self.assertIn("no run-id.json", s["kill_record_check"]["reason"])
         self.assert_not_excluded(s)
 
+    def test_resummarize_does_not_restore_a_kill_record_summarize_now_rejects(self):
+        """Codex P2 (s138): the old summary has .kill_no_restart; once run-id.json is gone summarize.py omits it,
+        and resummarize.sh's keep-old-keys merge must not put the obsolete kill windows back."""
+        write_kill_cell(self.d)
+        s, _ = self.summ()
+        self.assertIn("kill_no_restart", s)
+        os.remove(os.path.join(self.d, "run-id.json"))
+        r = subprocess.run(
+            ["bash", os.path.join(HERE, "resummarize.sh"), self.d],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(self.d, "summary.json")) as f:
+            s = json.load(f)
+        self.assertNotIn("kill_no_restart", sorted(s))
+        self.assertNotIn("killed_node", s["headline"])
+        self.assertEqual(s["kill_record_check"]["action"], "rejected")
+        self.assertEqual(s["validity"]["verdict"], "REJECT")
+
     # ---- Codex P2b: one shared boundary sample between 'before' and 'after'
     def test_boundary_increment_between_the_last_pre_and_first_post_kill_scrape_counts_in_after(self):
         """the probe: one timeout and the kill's order-age observations land between the scrape at kill-0.5 s and

@@ -19,7 +19,9 @@ restores the old behaviour, `TOOLS_DIR=<dir>` pins it, and
 devnet. `resummarize.sh <cell-dir>` re-scores an existing cell in place from its
 own `summary.json` provenance; every top-level key it does not regenerate
 (`.oracle_feed` and the other records run-cell.sh adds after summarize.py) is kept
-from the old summary.
+from the old summary, except the keys listed in `summary-owned-keys.txt` (written by
+summarize.py or a re-deriving script, even conditionally: a rejected kill record's
+`.kill_no_restart` stays dropped).
 
 **Start every cell detached:** `run-cell.sh` refuses to run outside a
 `bench-*.service` unit. Start it, or the script that drives several cells,

@@ -8,7 +8,8 @@ j() { jq -r "$@" "$D/summary.json"; }
 # (summarize.py rewrites summary.json from scratch) is put back from it. That keeps every
 # record run-cell.sh adds after summarize.py and nothing here re-derives (.oracle_feed for
 # ORACLE_FEED=1|seed, and any later one) without a hand list; keys present in the new
-# summary (validity, headline, the re-derived records below) always win.
+# summary (validity, headline, the re-derived records below) always win, and a key summarize.py or a
+# re-deriving script owns (summary-owned-keys.txt) is never put back.
 OLD_SUMMARY=$(mktemp "${TMPDIR:-/tmp}/resummarize-old.XXXXXX")
 trap 'rm -f "${OLD_SUMMARY:?}"' EXIT
 cp "$D/summary.json" "$OLD_SUMMARY"
@@ -96,6 +97,12 @@ fi
 if [ -f "$D/state-attest.json" ] || [ -n "$STATE_ATTEST" ]; then
     python3 -I "$T/state_attest.py" summary --dir "$D" >/dev/null
 fi
-# Top-level keys of the old summary nothing above regenerated (see OLD_SUMMARY).
+# Top-level keys of the old summary nothing above regenerated (see OLD_SUMMARY), except the keys
+# summarize.py and the re-deriving scripts own (summary-owned-keys.txt): one of those missing from
+# the new summary was omitted on purpose (kill_no_restart after its kill record is rejected, ...).
+OWNED=$(grep -v '^#' "$T/summary-owned-keys.txt" | grep . | jq -R . | jq -sc .)
+[ "$OWNED" != "[]" ] || { echo "resummarize.sh: empty $T/summary-owned-keys.txt" >&2; exit 1; }
 tmp="$D/summary.json.keep.tmp"
-jq --slurpfile old "$OLD_SUMMARY" '$old[0] + .' "$D/summary.json" > "$tmp" && mv -f "$tmp" "$D/summary.json"
+jq --slurpfile old "$OLD_SUMMARY" --argjson owned "$OWNED" \
+    '($old[0] | with_entries(select(.key as $k | $owned | any(. == $k) | not))) + .' \
+    "$D/summary.json" > "$tmp" && mv -f "$tmp" "$D/summary.json"
