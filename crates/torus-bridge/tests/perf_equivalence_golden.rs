@@ -832,6 +832,22 @@ const REDUCED_B: [&str; 18] = [
     "0x11947a7ad2fa6f14ab404890c39c03bf20cab72ac911852fd60b7723d0cabc16",
 ];
 
+/// s80 liq-tail-offload: with `TORUS_S80_LIQ_PREVALUE` on and
+/// `TORUS_S80_LIQ_PREVALUE_MIN=1` every liquidation window is valued on the
+/// exec pool: show the run took that path (pre-values consumed), so the
+/// digests above checked it. Flag off: no pass ran. The counters are
+/// per process (nextest: per test).
+fn prevalue_path(name: &str) {
+    let cfg = torus_bridge::native_executor::liq_prevalue();
+    let [passes, consumed, fallbacks] = torus_bridge::native_executor::liq_prevalue_counts();
+    eprintln!("{name}: TORUS_S80_LIQ_PREVALUE {cfg:?}: passes {passes}, consumed {consumed}, fault fallbacks {fallbacks}");
+    if cfg.mask & 1 == 0 {
+        assert_eq!(passes, 0, "{name}: flag off, no pre-value pass");
+    } else if cfg.min <= 1 {
+        assert!(passes > 0 && consumed > 0, "{name}: flag on with MIN=1, the pre-valued path ran");
+    }
+}
+
 fn check(name: &str, got: &[String], want: &[&str]) {
     if std::env::var("GOLDEN_PRINT").is_ok() {
         println!("const {name}: [&str; {}] = {got:#?};", got.len());
@@ -854,6 +870,7 @@ fn scenario_a_serial_digests_golden() {
         check("ROW50_OUT_A", &row50_out, &ROW50_OUT_A);
         check("GOLDEN_A", &digests, &GOLDEN_A);
     }
+    prevalue_path("scenario_a_serial");
 }
 
 #[test]
@@ -867,6 +884,7 @@ fn scenario_a_engine_digests_golden() {
         check("ROW50_OUT_A", &row50_out, &ROW50_OUT_A);
         check("GOLDEN_A", &digests, &GOLDEN_A);
     }
+    prevalue_path("scenario_a_engine");
 }
 
 #[test]
@@ -878,6 +896,7 @@ fn scenario_b_liquidation_digests_equal_c93c579() {
         check("GOLDEN_B", &digests, &GOLDEN_B);
         check("GOLDEN_B", &pre_row50, &GOLDEN_B);
     }
+    prevalue_path("scenario_b");
 }
 
 /// 18c review (adl-budget A3 nit c; A5/A6): the GOLDEN_A / GOLDEN_B re-pins

@@ -7847,6 +7847,9 @@ impl TorusApp {
         // `TORUS_NATIVE_TRIE_MAINTENANCE=1` it builds a missing trie and rebuilds one left stale by
         // an earlier maintenance-off run, once, before replay.
         let maintain_trie = torus_state::native_trie::native_trie_maintenance_enabled();
+        // s80 liq-tail-offload: read TORUS_S80_LIQ_PREVALUE once at startup
+        // (logs its `on=<bool>` INFO line before the first block).
+        let _ = torus_bridge::native_executor::liq_prevalue();
         if !maintain_trie {
             tracing::info!("native trie maintenance off (default; TORUS_NATIVE_TRIE_MAINTENANCE=1 enables): CF_NATIVE_TRIE/CF_NATIVE_HASHED not maintained, trie marked stale; native root falls back to full scan");
         }

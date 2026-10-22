@@ -498,6 +498,240 @@ fn liq_prevalue_masks_equal_flag_off_on_seeded_sequences() {
     assert!(total.dropped > 0, "pre-values dropped after an act (the live path after it): {total:?}");
 }
 
+/// s80 review P2: the block's overlay with reads of one key failing (a
+/// local storage fault), counted. Everything else is forwarded, except
+/// `own_pending_row` (a wrapper that changes `get_cf_raw` must not forward
+/// it: typed loads then read `get_cf_raw`).
+#[derive(Clone)]
+struct FailRead {
+    inner: NativeStateOverlay,
+    fail: Option<(&'static str, Vec<u8>)>,
+    hits: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FailRead {
+    fn check(&self, cf: &str, key: &[u8]) -> Result<(), torus_state::StateError> {
+        if self.fail.as_ref().is_some_and(|(c, k)| *c == cf && k.as_slice() == key) {
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(torus_state::StateError::Io(std::io::Error::other("injected read failure")));
+        }
+        Ok(())
+    }
+}
+
+impl StateBackend for FailRead {
+    fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, torus_state::StateError> {
+        self.check(cf, key)?;
+        self.inner.get_cf_raw(cf, key)
+    }
+    fn get_cf_len(&self, cf: &str, key: &[u8]) -> Result<Option<usize>, torus_state::StateError> {
+        self.check(cf, key)?;
+        self.inner.get_cf_len(cf, key)
+    }
+    fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), torus_state::StateError> {
+        self.inner.put_cf_raw(cf, key, value)
+    }
+    fn put_cf_raw_owned(&self, cf: &str, key: &[u8], value: Vec<u8>) -> Result<(), torus_state::StateError> {
+        self.inner.put_cf_raw_owned(cf, key, value)
+    }
+    fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), torus_state::StateError> {
+        self.inner.delete_cf_raw(cf, key)
+    }
+    fn iterate_cf(&self, cf: &str, prefix: Option<&[u8]>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, torus_state::StateError> {
+        self.inner.iterate_cf(cf, prefix)
+    }
+    fn iterate_cf_from(
+        &self,
+        cf: &str,
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, torus_state::StateError> {
+        self.inner.iterate_cf_from(cf, start, limit)
+    }
+    fn iterate_cf_prefix_from(
+        &self,
+        cf: &str,
+        prefix: &[u8],
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, torus_state::StateError> {
+        self.inner.iterate_cf_prefix_from(cf, prefix, start, limit)
+    }
+    fn prefix_exists(&self, cf: &str, prefix: &[u8]) -> Result<bool, torus_state::StateError> {
+        self.inner.prefix_exists(cf, prefix)
+    }
+    fn layer_touches(&self, cf: &str, prefix: &[u8]) -> bool {
+        self.inner.layer_touches(cf, prefix)
+    }
+    fn resident_changes(&self, cf: &str, prefix: &[u8]) -> Option<Vec<torus_state::ResidentChange>> {
+        self.inner.resident_changes(cf, prefix)
+    }
+    fn layer_keys(&self, cf: &str) -> Option<Vec<Vec<u8>>> {
+        self.inner.layer_keys(cf)
+    }
+    fn layer_traders(&self, cf: &str, key_len: usize) -> Option<Vec<Address>> {
+        self.inner.layer_traders(cf, key_len)
+    }
+    fn atomic_write(&self, ops: &[torus_state::AtomicWriteOp<'_>]) -> Result<(), torus_state::StateError> {
+        self.inner.atomic_write(ops)
+    }
+}
+
+/// An account of [`fault_block`]: long in market 1 at 1,000.
+#[derive(Clone, Copy, Debug)]
+enum Acct {
+    /// Long 1, collateral 1,000,000: healthy.
+    Healthy,
+    /// [`Acct::Healthy`] plus long 1 @ 1,000 in [`UNLISTED`] (no market
+    /// row, aggregate or book: outside the block's mark table, so its
+    /// valuation reads the oracle through `AccountReader::mark`).
+    Unlisted,
+    /// Long 10 against collateral 100 (MM 250): backstop, an act.
+    Backstop,
+}
+
+const UNLISTED: MarketId = 77;
+
+/// The failing read of [`fault_block`].
+#[derive(Clone, Copy, Debug)]
+enum Fail {
+    /// The oracle aggregate of [`UNLISTED`]: a reader fault
+    /// (`AccountReader::mark` latches `reader_fault`, reads "no mark").
+    Mark,
+    /// This trader's balance: `liq_view`'s `Err`.
+    Balance(u64),
+}
+
+/// What [`fault_block`]'s step produced.
+#[derive(Debug, PartialEq, Eq)]
+struct FaultOut {
+    results: String,
+    /// `take_fatal_error()` after the step: `fatal_error`, else the reader
+    /// fault (what the committer checks).
+    fatal: Option<String>,
+}
+
+/// One block: `accts` (`trader(i)`, ascending) and their counterparty
+/// `maker(0)` in the DB; R and the slot attached when `l1`; the step with
+/// scan 2,048 and act budget `act` under `pin`, reads of `fail` failing.
+/// Returns the step's output and the failing read's hits during the step.
+fn fault_block(l1: bool, act: usize, accts: &[(u64, Acct)], fail: Fail, pin: LiqPrevalue) -> (FaultOut, usize) {
+    let now = 10_000;
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    db.put_cf_raw(CF_NATIVE_MARKETS, &1u64.to_be_bytes(), &market_row(5)).unwrap();
+    db.put_cf_raw(CF_NATIVE_ORACLE, &agg_key(1), &agg_row(fp(MID), now - 1)).unwrap();
+    {
+        let ctx = NativeExecContext::new(db.clone(), 1, now, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+        let p = &ctx.positions;
+        let bal = |t: &Address, v: i64| {
+            p.put_native_balance(t, &NativeBalance { available: fp(v), order_margin: FixedPoint::ZERO }).unwrap();
+        };
+        for &(i, kind) in accts {
+            let t = trader(i);
+            let (qty, collateral) = match kind {
+                Acct::Healthy | Acct::Unlisted => (1, 1_000_000),
+                Acct::Backstop => (10, 100),
+            };
+            p.apply_fill(&t, 1, true, fp(qty), fp(MID), MarginType::Cross).unwrap();
+            p.apply_fill(&maker(0), 1, false, fp(qty), fp(MID), MarginType::Cross).unwrap();
+            if matches!(kind, Acct::Unlisted) {
+                p.apply_fill(&t, UNLISTED, true, fp(1), fp(MID), MarginType::Cross).unwrap();
+            }
+            bal(&t, collateral);
+        }
+        bal(&maker(0), 1_000_000_000);
+    }
+    let mut holder = ResidentBooks::default();
+    let mut overlay = NativeStateOverlay::with_parent(db.clone(), None);
+    let mut rb = begin_resident(l1.then_some(&mut holder), &mut overlay, 1, None);
+    assert_eq!(rb.attached(), l1);
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fail = match fail {
+        Fail::Mark => (CF_NATIVE_ORACLE, agg_key(UNLISTED)),
+        Fail::Balance(i) => (CF_NATIVE_BALANCES, trader(i).as_slice().to_vec()),
+    };
+    let backend = FailRead { inner: overlay.clone(), fail: Some(fail), hits: hits.clone() };
+    let mut ctx = NativeExecContext::new(backend, 1, now, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+    ctx.attach_resident_block(&mut rb);
+    let _ = NativeExecutor::begin_block_oracle(&mut ctx);
+    assert!(ctx.fatal_error.is_none() && ctx.reader_fault.get().is_none(), "{:?} {:?}", ctx.fatal_error, ctx.reader_fault);
+    let table = ctx.block_marks.as_ref().expect("mark table");
+    assert!(table.get(1).is_some() && table.get(UNLISTED).is_none(), "market 1 in the table, {UNLISTED} outside it");
+    assert_eq!(ctx.sums.is_some(), l1, "L1 iff R attached");
+    hits.store(0, std::sync::atomic::Ordering::Relaxed);
+    let liq = with_liq_prevalue(pin, || {
+        NativeExecutor::run_liquidations_with(&mut ctx, liq::LIQ_SCAN_PER_BLOCK, act, liq::ADL_WORK_PER_BLOCK)
+    });
+    let hits = hits.load(std::sync::atomic::Ordering::Relaxed);
+    let results = format!("{:?}", liq.iter().map(|x| (&x.error, x.success, x.gas_used)).collect::<Vec<_>>());
+    (FaultOut { results, fatal: ctx.take_fatal_error() }, hits)
+}
+
+/// s80 review P2 + test gaps: the pre-value pass values the whole scan
+/// window, also accounts the serial loop never reaches (act budget, an
+/// earlier `Err`). With the flag on, the block's fail-stop outcome (and
+/// reason) and the step's results equal the flag-off run's when a read
+/// fails: (a) a reader fault (an oracle read of a market outside the mark
+/// table latches `reader_fault`) past the act cap: no fail-stop, as off —
+/// the pass latched it, the step discards the pass and values live (RED
+/// before: the block failed); (b) the same account reached: the same
+/// fail-stop; (c) a balance read `Err` past the act cap: never consumed
+/// (dropped at the act), no fail-stop; (d) that `Err` consumed from a
+/// pre-value at its account: the same `liquidation step:` fail-stop.
+/// Non-vacuous: off never reads a key past the cut, on does (the pass);
+/// the fallback and the consumed `Err` are counted.
+#[test]
+fn liq_prevalue_fault_outcomes_equal_flag_off() {
+    use Acct::*;
+    let on = LiqPrevalue { mask: 3, workers: 4, min: 1 };
+    let cut = [(0, Backstop), (1, Unlisted)];
+    let cut_bal = [(0, Backstop), (1, Healthy)];
+    let err_first = [(0, Healthy), (1, Healthy), (2, Backstop)];
+    // (name, L1, act budget, accounts, failing read, fail-stop expected)
+    type Case<'a> = (&'a str, bool, usize, &'a [(u64, Acct)], Fail, bool);
+    #[rustfmt::skip]
+    let cases: [Case; 7] = [
+        ("a: reader fault past the act cap", true, 1, &cut, Fail::Mark, false),
+        ("b: reader fault reached", true, 64, &cut, Fail::Mark, true),
+        ("c: balance Err past the act cap, L1", true, 1, &cut_bal, Fail::Balance(1), false),
+        ("c: balance Err past the act cap, walk", false, 1, &cut_bal, Fail::Balance(1), false),
+        ("d: balance Err consumed, L1", true, 64, &err_first, Fail::Balance(1), true),
+        ("d: balance Err consumed, walk", false, 64, &err_first, Fail::Balance(1), true),
+        ("b': reader fault reached, no act", true, 64, &[(0, Healthy), (1, Unlisted)], Fail::Mark, true),
+    ];
+    for (name, l1, act, accts, fail, fatal) in cases {
+        let (off, off_hits) = fault_block(l1, act, accts, fail, LiqPrevalue::OFF);
+        let before = liq_prevalue_stats();
+        let (got, on_hits) = fault_block(l1, act, accts, fail, on);
+        let d = liq_prevalue_stats().since(&before);
+        println!("{name}: off {off:?} hits {off_hits}; on hits {on_hits} {d:?}");
+        assert_eq!(got, off, "{name}: flag on == flag off (results, fail-stop and its reason)");
+        assert_eq!(off.fatal.is_some(), fatal, "{name}: fail-stop expected {fatal}: {:?}", off.fatal);
+        assert_eq!(d.passes, 1, "{name}: the window was pre-valued");
+        if !fatal {
+            assert_eq!(off_hits, 0, "{name}: off never reads past the cut");
+            assert!(on_hits > 0, "{name}: on read the failing key in the pass");
+        }
+        match fail {
+            Fail::Mark => {
+                assert!(off.fatal.as_deref().is_none_or(|f| f.contains("oracle mark read")), "{name}: {off:?}");
+                assert_eq!(d.fault_fallbacks, 1, "{name}: the pass latched the fault and was discarded");
+                assert_eq!(d.consumed, 0, "{name}: the window valued live");
+            }
+            Fail::Balance(_) => {
+                assert_eq!(d.fault_fallbacks, 0, "{name}: an Err is no reader fault");
+                if fatal {
+                    assert!(off.fatal.as_deref().is_some_and(|f| f.starts_with("liquidation step:")), "{name}: {off:?}");
+                    assert_eq!(d.consumed, 2, "{name}: trader 0's pre-value, then the Err at trader 1");
+                } else {
+                    assert!(d.dropped > 0, "{name}: the Err was dropped at the act, never consumed");
+                }
+            }
+        }
+    }
+}
+
 /// adl-budget Q2 (A6 #3): one ranking per (block, market, side). The P2
 /// fixture's shape over the node path (R and the slot attached): u1 and u2
 /// long 1 @ 1,000 in markets 1..=4 (collateral 100: AV -300 at 900) against

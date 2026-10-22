@@ -751,8 +751,8 @@ impl Users {
         after: Option<Address>,
         limit: usize,
     ) -> Result<Option<Vec<Address>>, StateError> {
-        // s80 liq-tail-offload (mask bit 2): the same sorted distinct list
-        // without cloning every key the block wrote.
+        // s80 liq-tail-offload (mask bit 1, value 2): the same sorted
+        // distinct list without cloning every key the block wrote.
         let listed = if super::liq_prevalue().mask & 2 != 0 {
             state.layer_traders(CF_NATIVE_POSITIONS, KEY)
         } else {

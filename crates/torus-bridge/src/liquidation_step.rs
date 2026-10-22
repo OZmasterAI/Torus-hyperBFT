@@ -436,9 +436,27 @@ impl NativeExecutor {
         // / pending), which `liq_view` never reads, so each pre-value is what
         // the loop's own `liq_view` would return; from the first act on every
         // account is valued live.
+        let had_fault = ctx.reader_fault.get().is_some();
         let mut pre = Self::liq_prevalue_pass(ctx, &marks, l1, || {
             accounts.iter().filter(not_protocol).take(scan).copied().collect()
         });
+        // s80 review P2: the pass values the whole window, also accounts
+        // the loop never reaches (act budget, an earlier `Err`). A reader
+        // fault it latched (`AccountReader::mark` of a market outside the
+        // table) may belong to one of those: with the flag off that block
+        // commits. Discard the fault and the pass; the loop then values
+        // every account live (the 29bfc705 path) and latches the same fault
+        // again iff it reaches that account. Also when the pass returned
+        // `None` (a panicking job): another job may have latched one. Only
+        // the pass runs between the two reads of the channel.
+        if !had_fault && ctx.reader_fault.get().is_some() {
+            ctx.reader_fault.take();
+            pre = None;
+            super::LIQ_PREVALUE_FAULT_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(test)]
+            super::liq_prevalue_bump(|s| s.fault_fallbacks += 1);
+        }
+        let mut consumed = 0u64;
         for (i, &trader) in accounts.iter().enumerate().filter(|(_, a)| not_protocol(a)) {
             if scanned == scan || acted == act {
                 cut = true;
@@ -454,6 +472,7 @@ impl NativeExecutor {
             last = Some(trader);
             let view = match pre.as_mut().and_then(Iterator::next) {
                 Some(v) => {
+                    consumed += 1;
                     #[cfg(test)]
                     super::liq_prevalue_bump(|s| s.consumed += 1);
                     v?
@@ -520,6 +539,9 @@ impl NativeExecutor {
             stats.pending_changed |= Self::mark_pending(ctx, &marks, l1, &trader)?;
             results.push(NativeActionResult::ok("liquidation", 3000));
         }
+        if consumed > 0 {
+            super::LIQ_PREVALUE_CONSUMED.fetch_add(consumed, std::sync::atomic::Ordering::Relaxed);
+        }
         // D8: the vault is exempt from stage 1 / backstop; ADL when its AV < 0.
         // (`classify` is Adl exactly when AV < 0, overflow-checked.)
         if let Some(v) = Self::liq_view(ctx, &marks, &LIQUIDATOR_VAULT, l1)? {
@@ -569,7 +591,15 @@ impl NativeExecutor {
     /// `min` accounts, or a job that panicked (the live valuation then
     /// meets the same panic on the exec thread, as today). Read-only: the
     /// sums memo and the reader-fault channel are the only shared state a
-    /// valuation touches (a memo entry is the same value whoever builds it).
+    /// valuation touches (a memo entry is the same value whoever builds it;
+    /// one valued with a mark from outside the table is not cached). A
+    /// reader fault the pass latched is discarded by the caller together
+    /// with the pass (s80 review P2, see [`Self::liquidation_pass`]).
+    ///
+    /// Latency (s80 review): `run_jobs` holds the exec thread for the whole
+    /// pass. When an account early in the window acts, the pre-values after
+    /// it are dropped and valued again live, so the pass's wall time (about
+    /// 1 ms per block at ubench scale) is added to that block's step.
     fn liq_prevalue_pass<T: StateBackend>(
         ctx: &NativeExecContext<T>,
         marks: &Marks,
@@ -593,6 +623,7 @@ impl NativeExecutor {
         for joined in crate::exec_pool::run_jobs(jobs) {
             out.extend(joined.ok()?);
         }
+        super::LIQ_PREVALUE_PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(test)]
         super::liq_prevalue_bump(|s| s.passes += 1);
         Some(out.into_iter())

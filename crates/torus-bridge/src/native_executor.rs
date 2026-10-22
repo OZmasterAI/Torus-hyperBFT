@@ -1174,7 +1174,7 @@ thread_local! {
 #[cfg(test)]
 thread_local! {
     static LIQ_PREVALUE_STATS: std::cell::Cell<LiqPrevalueStats> = const {
-        std::cell::Cell::new(LiqPrevalueStats { passes: 0, consumed: 0, dropped: 0, prefix_windows: 0 })
+        std::cell::Cell::new(LiqPrevalueStats { passes: 0, consumed: 0, dropped: 0, prefix_windows: 0, fault_fallbacks: 0 })
     };
 }
 
@@ -1190,6 +1190,9 @@ pub(crate) struct LiqPrevalueStats {
     pub(crate) dropped: u64,
     /// Windows whose dirty traders came from `layer_traders`.
     pub(crate) prefix_windows: u64,
+    /// Passes discarded because they latched a reader fault (the window
+    /// then valued live, the 29bfc705 path).
+    pub(crate) fault_fallbacks: u64,
 }
 
 #[cfg(test)]
@@ -1200,6 +1203,7 @@ impl LiqPrevalueStats {
             consumed: self.consumed - b.consumed,
             dropped: self.dropped - b.dropped,
             prefix_windows: self.prefix_windows - b.prefix_windows,
+            fault_fallbacks: self.fault_fallbacks - b.fault_fallbacks,
         }
     }
     pub(crate) fn add(&mut self, d: &Self) {
@@ -1207,6 +1211,7 @@ impl LiqPrevalueStats {
         self.consumed += d.consumed;
         self.dropped += d.dropped;
         self.prefix_windows += d.prefix_windows;
+        self.fault_fallbacks += d.fault_fallbacks;
     }
 }
 
@@ -1239,9 +1244,28 @@ pub fn with_liq_prevalue<R>(pin: LiqPrevalue, f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// s80: process-wide counters of the pre-valued path (relaxed, one add per
+/// step each): windows valued on the pool, accounts the serial loop
+/// classified from a pre-value (steps whose loop ran to its end), passes
+/// discarded for a reader fault they latched. Read by
+/// [`liq_prevalue_counts`] (`perf_equivalence_golden` shows the path ran).
+pub(crate) static LIQ_PREVALUE_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static LIQ_PREVALUE_CONSUMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static LIQ_PREVALUE_FAULT_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// s80: `[passes, consumed, fault fallbacks]` of this process (see
+/// [`LIQ_PREVALUE_PASSES`]).
+#[doc(hidden)]
+pub fn liq_prevalue_counts() -> [u64; 3] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [LIQ_PREVALUE_PASSES.load(Relaxed), LIQ_PREVALUE_CONSUMED.load(Relaxed), LIQ_PREVALUE_FAULT_FALLBACKS.load(Relaxed)]
+}
+
 /// s80: the thread's pin if set, else the env, read once per process (one
-/// INFO line `TORUS_S80_LIQ_PREVALUE on=<bool>`).
-pub(crate) fn liq_prevalue() -> LiqPrevalue {
+/// INFO line `TORUS_S80_LIQ_PREVALUE on=<bool>`; the node calls this at
+/// startup, `App::new`, so the line is logged before the first block).
+#[doc(hidden)]
+pub fn liq_prevalue() -> LiqPrevalue {
     if let Some(p) = LIQ_PREVALUE_PIN.with(std::cell::Cell::get) {
         return p;
     }
