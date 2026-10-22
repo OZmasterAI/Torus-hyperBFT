@@ -1,5 +1,5 @@
-//! 8k L2.1 streamed in-order settle (`TORUS_SETTLE_STREAMED=1`, node-local,
-//! off by default): each market's pool job matches the market AND computes
+//! 8k L2.1 streamed in-order settle (`TORUS_SETTLE_STREAMED`, node-local,
+//! on by default since s136, `0` turns it off): each market's pool job matches the market AND computes
 //! its settle plan (pass A), and the exec thread runs settle pass B market by
 //! market, in market-id order, while the pool still works on later markets,
 //! instead of waiting for every match, then every plan, then running pass B.

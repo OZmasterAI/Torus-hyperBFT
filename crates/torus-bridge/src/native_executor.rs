@@ -961,25 +961,13 @@ mod settle_no_merge_flag_tests {
     }
 }
 
-/// 8k L2.1 (`TORUS_SETTLE_STREAMED`, node-local, OFF by default): pure
-/// parse. `1` or `true` (trimmed, any case) = on; unset, empty, `0` or
-/// `false` = off; anything else is warned and off.
+/// 8k L2.1 (`TORUS_SETTLE_STREAMED`, node-local, ON by default since s136,
+/// owner decision after the 9j winner CL21): pure parse
+/// (`on_by_default_flag`). `0` or `false` (trimmed, any case) = off; unset,
+/// empty, `1` or `true` = on; anything else is warned and on.
 #[doc(hidden)]
 pub fn parse_settle_streamed(v: Option<&str>) -> bool {
-    let Some(v) = v else {
-        return false;
-    };
-    match v.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" => true,
-        "" | "0" | "false" => false,
-        _ => {
-            tracing::warn!(
-                value = v,
-                "TORUS_SETTLE_STREAMED: not empty, 1, true, 0 or false (any case); using the default (off)"
-            );
-            false
-        }
-    }
+    on_by_default_flag("TORUS_SETTLE_STREAMED", v)
 }
 
 /// 8k L2.1 test seam (no effect unless pinned by
@@ -1102,7 +1090,7 @@ pub fn in_maker_snapshot_read_on_this_thread() -> bool {
     MAKER_SNAPSHOT_READ.with(std::cell::Cell::get)
 }
 
-/// 8k L2.1 (`TORUS_SETTLE_STREAMED=1`, node-local, off by default): with
+/// 8k L2.1 (`TORUS_SETTLE_STREAMED`, node-local, on by default; `0` turns it off): with
 /// the per-market match setup in the pool jobs and a parallel settle
 /// possible, each market's pool job matches the market and then computes its
 /// settle plan (pass A), and the exec thread runs pass B market by market,
