@@ -5931,6 +5931,8 @@ impl TradeSink<'_> {
             taker_start_raw: taker.start_size.raw(),
             maker_pnl_raw: maker.closed_pnl.map_or(0, |p| p.raw()),
             taker_pnl_raw: taker.closed_pnl.map_or(0, |p| p.raw()),
+            maker_fee_raw: 0,
+            taker_fee_raw: 0,
         });
         debug_assert_eq!(self.pending_extras.len(), self.pending_fills.len());
     }

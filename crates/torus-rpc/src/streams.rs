@@ -326,6 +326,8 @@ mod tests {
                     taker_start_raw: 0,
                     maker_pnl_raw: -825 * S / 10,
                     taker_pnl_raw: 0,
+                    maker_fee_raw: 0,
+                    taker_fee_raw: 0,
                 },
                 FillExtras {
                     maker_order_id: 33,
@@ -334,6 +336,8 @@ mod tests {
                     taker_start_raw: S / 2,
                     maker_pnl_raw: 0,
                     taker_pnl_raw: 125 * S / 100,
+                    maker_fee_raw: 0,
+                    taker_fee_raw: 0,
                 },
                 FillExtras {
                     maker_order_id: 55,
@@ -342,6 +346,8 @@ mod tests {
                     taker_start_raw: 15 * S / 10,
                     maker_pnl_raw: 0,
                     taker_pnl_raw: 0,
+                    maker_fee_raw: 0,
+                    taker_fee_raw: 0,
                 },
             ],
         }

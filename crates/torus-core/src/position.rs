@@ -476,6 +476,33 @@ impl<T: StateBackend> PositionManager<T> {
         Ok(row.unwrap_or(FixedPoint::ZERO))
     }
 
+    /// Trading fees (`trading_fees` feature): `trader`'s lifetime net fees
+    /// (rebates negative), the `cfee` row
+    /// ([`torus_types::trading_fees::cum_fee_key`]); zero if absent.
+    pub fn get_cum_fee(&self, trader: &Address) -> Result<FixedPoint, CoreError> {
+        let key = torus_types::trading_fees::cum_fee_key(trader);
+        match self.state.get_cf_raw(CF_NATIVE_BALANCES, &key)? {
+            Some(data) => {
+                let raw: [u8; 16] = data.as_slice().try_into().map_err(|_| {
+                    CoreError::Borsh(format!("cum_fee row has {} bytes, expected 16", data.len()))
+                })?;
+                Ok(FixedPoint::from_raw(i128::from_be_bytes(raw)))
+            }
+            None => Ok(FixedPoint::ZERO),
+        }
+    }
+
+    /// Add `fee` to `trader`'s `cfee` row ([`Self::get_cum_fee`]).
+    pub fn add_cum_fee(&self, trader: &Address, fee: FixedPoint) -> Result<(), CoreError> {
+        let total = self.get_cum_fee(trader)? + fee;
+        self.state.put_cf_raw(
+            CF_NATIVE_BALANCES,
+            &torus_types::trading_fees::cum_fee_key(trader),
+            &total.raw().to_be_bytes(),
+        )?;
+        Ok(())
+    }
+
     pub fn put_cum_volume(&self, trader: &Address, volume: FixedPoint) -> Result<(), CoreError> {
         self.state.put_cf_raw(
             CF_NATIVE_BALANCES,
@@ -518,7 +545,7 @@ impl<T: StateBackend> PositionManager<T> {
         if let Some(pnl) = pnl {
             self.credit_realized_pnl(trader, pnl)?;
         }
-        Ok(FillEffect { start_size, closed_pnl: pnl })
+        Ok(FillEffect { start_size, closed_pnl: pnl, fee: FixedPoint::ZERO })
     }
 
     /// C1: `apply_fill`, but the position read-modify-write goes through a
@@ -599,6 +626,7 @@ impl<T: StateBackend> PositionManager<T> {
                 FillEffect {
                     start_size,
                     closed_pnl: pnl,
+                    fee: FixedPoint::ZERO,
                 },
             )
         })
@@ -624,12 +652,16 @@ pub struct FillEffect {
     pub start_size: FixedPoint,
     /// Realized PnL of the fill's close component (None = no close part).
     pub closed_pnl: Option<FixedPoint>,
+    /// Trading fee this side paid on the fill (negative = rebate). Set by the
+    /// executor's settlement (`trading_fees` feature); the position
+    /// transition itself leaves it zero.
+    pub fee: FixedPoint,
 }
 
 // Hand-written: `FixedPoint` has no `Default`.
 impl Default for FillEffect {
     fn default() -> Self {
-        Self { start_size: FixedPoint::ZERO, closed_pnl: None }
+        Self { start_size: FixedPoint::ZERO, closed_pnl: None, fee: FixedPoint::ZERO }
     }
 }
 

@@ -184,7 +184,7 @@ fn apply_fill_cached_effect_reports_start_and_pnl() {
             .unwrap();
         assert_eq!(
             effect,
-            FillEffect { start_size: start, closed_pnl: pnl },
+            FillEffect { start_size: start, closed_pnl: pnl, fee: FixedPoint::ZERO },
             "cached step {i}"
         );
         if i == 3 {
@@ -205,7 +205,7 @@ fn apply_fill_cached_effect_reports_start_and_pnl() {
             .unwrap();
         assert_eq!(
             effect,
-            FillEffect { start_size: start, closed_pnl: pnl },
+            FillEffect { start_size: start, closed_pnl: pnl, fee: FixedPoint::ZERO },
             "uncached step {i}"
         );
     }

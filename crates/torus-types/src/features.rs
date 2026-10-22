@@ -28,6 +28,13 @@ pub enum Feature {
     /// bool `consensus.book_window_commit` is its alias (from the running
     /// hash's height).
     BookWindowCommit = 1,
+    /// Maker / taker trading fees (docs/plans/trading-fees.md): from its
+    /// height every book fill charges each side its fee (governance keys
+    /// `trading_taker_fee_ppm` / `trading_maker_fee_ppm`, built-in defaults)
+    /// from the side's quote balance and credits the sum to the treasury's
+    /// native balance. Not in any built-in table and not in
+    /// [`DEFAULT_GENESIS_ACTIVATIONS`]: off until a release schedules it.
+    TradingFees = 2,
     /// TEST-ONLY (cargo feature `test-features`, enabled from
     /// torus-consensus's dev-dependencies; no node build reaches it): the P0.0
     /// integration tests' feature with a state-visible rule (the block pipeline
@@ -41,12 +48,14 @@ impl Feature {
     /// Every feature compiled in, in id order (test-only ones included in a
     /// `test-features` build; [`KNOWN_FEATURES`] is what the node can run).
     #[cfg(not(feature = "test-features"))]
-    pub const ALL: &'static [Feature] = &[Feature::RunningStateHash, Feature::BookWindowCommit];
+    pub const ALL: &'static [Feature] =
+        &[Feature::RunningStateHash, Feature::BookWindowCommit, Feature::TradingFees];
     /// Every feature compiled in, in id order (see above).
     #[cfg(feature = "test-features")]
     pub const ALL: &'static [Feature] = &[
         Feature::RunningStateHash,
         Feature::BookWindowCommit,
+        Feature::TradingFees,
         Feature::TestStateRule,
     ];
 
@@ -65,7 +74,7 @@ impl Feature {
     /// ([`ActivationSchedule::for_chain`]).
     pub const fn is_test_only(self) -> bool {
         match self {
-            Feature::RunningStateHash | Feature::BookWindowCommit => false,
+            Feature::RunningStateHash | Feature::BookWindowCommit | Feature::TradingFees => false,
             #[cfg(feature = "test-features")]
             Feature::TestStateRule => true,
         }
@@ -76,6 +85,7 @@ impl Feature {
         match self {
             Feature::RunningStateHash => "running_state_hash",
             Feature::BookWindowCommit => "book_window_commit",
+            Feature::TradingFees => "trading_fees",
             #[cfg(feature = "test-features")]
             Feature::TestStateRule => "test_state_rule",
         }
@@ -265,7 +275,9 @@ mod tests {
         // of phase 5, P2): see `known_features_never_hold_a_test_feature`.
         assert_eq!(Feature::BookWindowCommit.id(), 1);
         assert_eq!(Feature::BookWindowCommit.name(), "book_window_commit");
-        assert_eq!(KNOWN_FEATURES, 0b11);
+        assert_eq!(Feature::TradingFees.id(), 2);
+        assert_eq!(Feature::TradingFees.name(), "trading_fees");
+        assert_eq!(KNOWN_FEATURES, 0b111);
         assert_eq!(first_unknown_feature_in(0b11, 0b01), Some(1));
         assert_eq!(first_unknown_feature_in(0b01, 0b01), None);
         assert_eq!(unknown_features(0b101), 0b100);
@@ -390,6 +402,31 @@ mod tests {
                 Feature::BookWindowCommit.bit()
             );
         }
+    }
+
+    /// Trading fees (s138): a known feature that no built-in table and no
+    /// default genesis schedules (off until a release names a height), and a
+    /// genesis `consensus.activations.trading_fees` switches it on at H.
+    #[test]
+    fn trading_fees_is_known_unscheduled_and_genesis_schedulable() {
+        assert_ne!(KNOWN_FEATURES & Feature::TradingFees.bit(), 0);
+        assert!(!Feature::TradingFees.is_test_only());
+        for chain_id in [crate::eip712::TORUS_CHAIN_ID, 7779, 1] {
+            assert!(builtin_activations(chain_id)
+                .iter()
+                .all(|(f, _)| *f != Feature::TradingFees));
+        }
+        assert!(DEFAULT_GENESIS_ACTIVATIONS
+            .iter()
+            .all(|(f, _)| *f != Feature::TradingFees));
+        let id = crate::eip712::TORUS_CHAIN_ID;
+        let g: BTreeMap<_, _> = [(Feature::TradingFees, 100)].into_iter().collect();
+        let s = ActivationSchedule::for_chain(id, &g).unwrap();
+        assert_eq!(s.active_at(99) & Feature::TradingFees.bit(), 0);
+        assert_eq!(s.active_at(100), Feature::TradingFees.bit());
+        let json: serde_json::Value = serde_json::json!({"heights": {"trading_fees": 7}});
+        let back: ActivationSchedule = serde_json::from_value(json).unwrap();
+        assert_eq!(back.height_of(Feature::TradingFees), Some(7));
     }
 
     #[test]

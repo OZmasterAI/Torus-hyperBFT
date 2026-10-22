@@ -64,6 +64,10 @@ pub struct FillExtras {
     /// Realized PnL of the fill's close part (0 = no close part).
     pub maker_pnl_raw: i128,
     pub taker_pnl_raw: i128,
+    /// Trading fee each side paid on the fill (negative = rebate; 0 while
+    /// the `trading_fees` feature is off).
+    pub maker_fee_raw: i128,
+    pub taker_fee_raw: i128,
 }
 
 /// One executed block's fills, shared by the trade writer and the stream sink

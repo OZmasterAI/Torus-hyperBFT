@@ -781,6 +781,44 @@ fn delist_grace_param_change_is_range_checked_and_executes_into_fee_config() {
     assert_eq!(torus_types::delist_grace_blocks(Some(b"302401")), 43_200);
 }
 
+/// Trading fees (s138): the taker rate (0..=10,000 ppm) and the maker rate
+/// (-1,000..=10,000 ppm, negative = rebate) are ParameterChange keys executed
+/// into their own CF_FEE_CONFIG rows; out of range or not a number is refused
+/// at submission. RED before: the keys were not modifiable.
+#[test]
+fn trading_fee_param_changes_are_range_checked_and_execute_into_fee_config() {
+    use torus_types::trading_fees::{MAKER_FEE_PARAM, TAKER_FEE_PARAM};
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    let refused: [(&str, &[&str]); 2] = [
+        (TAKER_FEE_PARAM, &["-1", "10001", "x", "1.5"]),
+        (MAKER_FEE_PARAM, &["-1001", "10001", "x"]),
+    ];
+    for (key, bads) in refused {
+        for bad in bads {
+            let payload = ExecutionPayload::ParameterChange {
+                param_key: key.into(),
+                new_value: (*bad).into(),
+            };
+            let r = gov.submit_proposal(addr(2), "P".into(), "D".into(), Some(payload), 0);
+            assert!(
+                matches!(&r, Err(EconomicsError::InvalidParameterValue { key: kk, .. }) if kk == key),
+                "{key} = {bad}: {r:?}"
+            );
+        }
+    }
+    for (block, key, value) in [
+        (0, TAKER_FEE_PARAM, "300"),
+        (200, MAKER_FEE_PARAM, "-100"),
+        (400, MAKER_FEE_PARAM, "0"),
+    ] {
+        pass_param(&gov, key, value, &[2], block);
+        let data = gov.state().get_cf_raw(CF_FEE_CONFIG, key.as_bytes()).unwrap().unwrap();
+        assert_eq!(data, value.as_bytes(), "{key}");
+    }
+}
+
 #[test]
 fn execute_treasury_spend() {
     let (_dir, gov, staking) = setup();
