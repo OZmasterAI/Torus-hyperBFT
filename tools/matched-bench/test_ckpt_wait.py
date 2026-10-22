@@ -263,6 +263,39 @@ class WaitTests(unittest.TestCase):
         self.assertEqual(dead.hits, 1)
         self.assertLess(wall, 5)
 
+    def test_env_off_but_a_readable_node_checkpoints_does_not_skip_an_unreadable_one(
+        self,
+    ):
+        """Codex stop review: env off, val1 unreadable, val0 ran checkpoints.
+        The node is the truth (checkpoints are on): val1 must be retried and,
+        unreadable until the deadline, the wait is a timeout, never skipped."""
+        good = FakeNode([(0, 7, 7), (0.1, 8, 8)])
+        dead = FakeNode([(0, 7, 7)], fail=True)
+        with good, dead:
+            rc, out, err, rec, _ = run_wait(
+                [("val0", good), ("val1", dead)],
+                json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "0"}),
+                extra=["--timeout-s", "0.6"],
+            )
+        self.assertEqual(rc, 3, out + err)
+        self.assertEqual(rec["outcome"], "timeout")
+        self.assertGreater(dead.hits, 1)
+
+    def test_env_off_unreadable_node_that_recovers_is_waited_on(self):
+        good = FakeNode([(0, 7, 7), (0.1, 8, 8)])
+        flaky = FakeNode([(0, 4, 4), (0.5, 5, 5)], fail=True)
+        with good, flaky:
+            threading.Timer(0.3, lambda: setattr(flaky, "fail", False)).start()
+            rc, out, err, rec, _ = run_wait(
+                [("val0", good), ("val1", flaky)],
+                json.dumps({"TORUS_CHECKPOINT_INTERVAL_MS": "0"}),
+                extra=["--timeout-s", "5"],
+            )
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(rec["outcome"], "durable")
+        self.assertTrue(rec["nodes"]["val1"]["durable"])
+        self.assertIn("WARNING", rec["note"])
+
     def test_default_timeout_is_two_intervals_plus_30s(self):
         node = FakeNode([(0, 1, 1), (0.1, 2, 2)])
         with node:

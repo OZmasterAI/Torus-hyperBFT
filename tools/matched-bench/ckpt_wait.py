@@ -149,10 +149,10 @@ def parse_args(argv):
     return a
 
 
-def baseline(nodes, deadline, poll_s, retry):
+def baseline(nodes, deadline, poll_s, retry, base=None):
     """name -> scrape() for every node that answered; with `retry`, keep
-    asking the others until the deadline."""
-    base = {}
+    asking the others until the deadline. `base`: answers already in."""
+    base = dict(base or {})
     while True:
         for name, url in nodes:
             if name not in base:
@@ -212,15 +212,24 @@ def main(argv=None):
         print("digest checkpoint wait: " + line.replace("{waited}", "%.1f" % rec["waited_s"]))
         return rc
 
-    # T0 baseline. Checkpoints off: one pass, no retry (no wait when off).
+    # T0 baseline. Checkpoints off: one pass, no retry (no wait when off),
+    # unless a node that answered did checkpoint: then they are on whatever
+    # the env says, and an unreadable node must not let the wait be skipped.
     base = baseline(nodes, deadline, a.poll_s, retry=interval_ms is not None)
+    if interval_ms is None and len(base) < len(nodes) and any(
+            (v[SUBMITS] or 0) > 0 for v in base.values()):
+        base = baseline(nodes, deadline, a.poll_s, retry=True, base=base)
     bad = [n for n, _ in nodes if n not in base]
-    if bad and interval_ms is None:
+    ran_any = any((v[SUBMITS] or 0) > 0 for v in base.values())
+    if bad and interval_ms is None and not ran_any:
         rec["note"] = "metrics unreadable on %s" % " ".join(bad)
         return finish("skipped", "skipped, %s; metrics unreadable on %s" % (off, " ".join(bad)))
     if bad:
-        return finish("timeout", "TIMEOUT after {waited}s: metrics unreadable on %s (%s)"
-                      % (" ".join(bad), iv), TIMEOUT_RC)
+        if interval_ms is None:
+            rec["note"] = ("WARNING: the node env resolves %s but %s ran checkpoints"
+                           % (off, " ".join(n for n, v in base.items() if (v[SUBMITS] or 0) > 0)))
+        return finish("timeout", "TIMEOUT after {waited}s: metrics unreadable on %s (%s)%s"
+                      % (" ".join(bad), iv, " (%s)" % rec["note"] if rec["note"] else ""), TIMEOUT_RC)
     for name, v in base.items():
         node = rec["nodes"][name]
         node["c0"], node["write_count"] = v[SUBMITS], v[WRITES]
