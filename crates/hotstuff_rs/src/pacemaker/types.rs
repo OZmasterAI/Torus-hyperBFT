@@ -146,6 +146,33 @@ pub(crate) fn tip_leader_reputation<K: KVStore>(block_tree: &BlockTreeSingleton<
     }
 }
 
+/// The TC's winner rule (MonadBFT Algorithm 4, as amended s138): whether the high tip wins over
+/// the high QC, so the next leader must re-propose the tip's block (VALIDPROPOSAL V2) rather than
+/// extend the high QC (V3). The collector sets [`TimeoutCertificate::high_tip_is_winner`] by it and
+/// `summaries_are_signed` checks the flag against it.
+///
+/// The tip wins if it is newer than the high QC AND its block justifies on a view at least the
+/// high QC's (`block_justify` is bound by the tip's block hash, F2). A tip whose block justifies
+/// below the high QC is a sibling of the certified block (not its ancestor: a block certified
+/// after the tip's view cannot have been certified before it): replicas locked on that QC never
+/// vote for it, and before s138 such a tip won every TC by view (Codex P1 on 138a9219: a
+/// Byzantine leader's unsent header of a sibling, copied into honest tips by a re-proposal vote,
+/// stalled ordinary blocks forever). The high QC wins then: the next leader extends it, and every
+/// signer's lock is at most its reported highest PC ([`BlockTreeSingleton::highest_qc_for_timeout`]
+/// always reports it), so at most the high QC.
+///
+/// Only liveness and the tail-fork property depend on this rule; commit safety is the lock's
+/// (docs/plans/tc-required-and-tip-signing.md §4).
+///
+/// [`BlockTreeSingleton::highest_qc_for_timeout`]: crate::block_tree::accessors::internal::BlockTreeSingleton::highest_qc_for_timeout
+pub(crate) fn high_tip_wins(tip: Option<&TipInfo>, qc: Option<&PhaseCertificate>) -> bool {
+    match (tip, qc) {
+        (Some(tip), Some(qc)) => tip.view > qc.view && tip.block_justify.view >= qc.view,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
 /// What one signer of a [`TimeoutCertificate`] signed besides `(chain_id, view)`: its tip's
 /// `(hash, view)` and its highest QC's `(view, block)` ([`timeout_vote_bytes`]).
 pub type VoterMetadata = (Option<TipSummary>, Option<QcSummary>);
@@ -209,12 +236,7 @@ impl TimeoutCertificate {
             }
             None => max_qc.is_none(),
         };
-        let winner = match (&self.high_tip, &self.high_qc) {
-            (Some(tip), Some(qc)) => tip.view > qc.view,
-            (Some(_), None) => true,
-            _ => false,
-        };
-        tip_ok && qc_ok && winner == self.high_tip_is_winner
+        tip_ok && qc_ok && high_tip_wins(self.high_tip.as_ref(), self.high_qc.as_ref()) == self.high_tip_is_winner
     }
 }
 
@@ -404,13 +426,7 @@ impl Collector for TimeoutVoteCollector {
                 }
 
                 if self.signature_set_power >= self.validator_set.quorum() {
-                    let max_tip_view = self.high_tip.as_ref().map(|t| t.view);
-                    let max_qc_view = self.high_qc.as_ref().map(|q| q.view);
-                    let high_tip_is_winner = match (max_tip_view, max_qc_view) {
-                        (Some(tv), Some(qv)) => tv > qv,
-                        (Some(_), None) => true,
-                        _ => false,
-                    };
+                    let high_tip_is_winner = high_tip_wins(self.high_tip.as_ref(), self.high_qc.as_ref());
                     let collected_tc = TimeoutCertificate {
                         chain_id: self.chain_id,
                         view: self.view,
