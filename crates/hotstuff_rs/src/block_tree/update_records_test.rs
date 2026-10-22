@@ -154,7 +154,7 @@ fn block(height: u64, justify: PhaseCertificate, tag: u8) -> Block {
     Block::new(BlockHeight::new(height), justify, CryptoHash::new([tag; 32]), Data::new(vec![]))
 }
 
-fn tree() -> (BlockTreeSingleton<RecKV>, RecKV) {
+fn new_tree() -> (BlockTreeSingleton<RecKV>, RecKV) {
     let kv = RecKV::default();
     let mut tree = BlockTreeSingleton::new(kv.clone());
     let old = old_set();
@@ -217,7 +217,7 @@ fn updates_bytes(updates: &ValidatorSetUpdates) -> Vec<u8> {
 /// U committed (a crash cannot leave U committed without its record).
 #[test]
 fn a_commit_pc_on_an_update_is_recorded_in_the_commit_batch() {
-    let (mut tree, kv) = tree();
+    let (mut tree, kv) = new_tree();
     let [_, _, u] = chain_to_update(&mut tree);
     kv.reset_log();
 
@@ -245,7 +245,7 @@ fn a_commit_pc_on_an_update_is_recorded_in_the_commit_batch() {
 /// writes no record key.
 #[test]
 fn an_ordinary_commit_neither_reads_nor_writes_records() {
-    let (mut tree, kv) = tree();
+    let (mut tree, kv) = new_tree();
     let b0 = block(0, PhaseCertificate::genesis_pc(), 10);
     tree.insert(&b0, None, None).unwrap();
     kv.reset_log();
@@ -263,14 +263,14 @@ fn an_ordinary_commit_neither_reads_nor_writes_records() {
 #[test]
 fn an_update_committed_without_its_commit_pc_has_no_record() {
     // By its Decide PC.
-    let (mut tree, _) = tree();
+    let (mut tree, _) = new_tree();
     let [_, _, u] = chain_to_update(&mut tree);
     let result = tree.update(&pc(7, &u.hash, Phase::Decide), &None).unwrap();
     assert!(result.validator_set_updates.is_some(), "fixture: U committed");
     assert!(tree.validator_set_update_record(u.height).unwrap().is_none(), "Decide PC: no record");
 
     // As the grandparent of a Generic PC (2-chain on U's child).
-    let (mut tree, _) = tree();
+    let (mut tree, _) = new_tree();
     let [_, _, u] = chain_to_update(&mut tree);
     let child = block(3, pc(7, &u.hash, Phase::Decide), 13);
     tree.insert(&child, None, None).unwrap();
@@ -283,7 +283,7 @@ fn an_update_committed_without_its_commit_pc_has_no_record() {
 /// record: a node syncing from genesis needs every record.
 #[test]
 fn records_survive_block_tree_pruning() {
-    let (mut tree, _) = tree();
+    let (mut tree, _) = new_tree();
     let [_, _, u] = chain_to_update(&mut tree);
     tree.update(&commit_pc(&u), &None).unwrap();
     extend_and_commit(&mut tree, &u, pc(7, &u.hash, Phase::Decide), 12, 30);
@@ -304,7 +304,7 @@ fn records_survive_block_tree_pruning() {
 
 /// A committed chain B0, B1, U (recorded), C (U's child, Decide PC), and four ordinary blocks.
 fn served_tree(record: bool) -> (BlockTreeSingleton<RecKV>, [Block; 3]) {
-    let (mut tree, _) = tree();
+    let (mut tree, _) = new_tree();
     let chain = chain_to_update(&mut tree);
     let u = &chain[2];
     if record {
