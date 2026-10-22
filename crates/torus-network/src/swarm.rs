@@ -5127,6 +5127,90 @@ mod tests {
         }
     }
 
+    /// rpc-only sync fix: a node behind a fast chain sends one by-hash
+    /// `BlockDataRequest` per dropped proposal header, plus 100 ms retries, to
+    /// the header's origin. On slow hosts these passed request-response's
+    /// 100-stream per-connection cap, so the serving peer dropped the node's
+    /// `BlockSyncRequest` ("at capacity") and the node never synced. By-hash
+    /// fetches to one peer are now bounded; block sync and other peers are not.
+    #[tokio::test]
+    async fn block_data_requests_to_one_peer_are_bounded_in_flight() {
+        use hotstuff_rs::block_sync::messages::BlockSyncRequest;
+        use hotstuff_rs::hotstuff::messages::{BlockDataRequest, HotStuffMessage};
+        use hotstuff_rs::networking::messages::{Message, ProgressMessage};
+        use hotstuff_rs::types::data_types::{BlockHeight, ChainID, CryptoHash, ViewNumber};
+        let shared = test_shared();
+        let mut swarm = test_swarm();
+        let local = test_vk(80);
+        let (server, server_pid) = (test_vk(81), test_peer(81));
+        let (other, other_pid) = (test_vk(82), test_peer(82));
+        let fetch = |i: u8| -> Message {
+            HotStuffMessage::BlockDataRequest(BlockDataRequest {
+                chain_id: ChainID::new(0),
+                view: ViewNumber::new(i as u64),
+                block_hash: CryptoHash::new([i; 32]),
+            })
+            .into()
+        };
+        let is_fetch = |m: &Message| {
+            matches!(
+                m,
+                Message::ProgressMessage(ProgressMessage::HotStuffMessage(
+                    HotStuffMessage::BlockDataRequest(_)
+                ))
+            )
+        };
+        let mut send = |target: &VerifyingKey, pid: PeerId, message: Message| {
+            send_direct_connected(&mut swarm, &shared, &local, target, pid, message, None)
+        };
+
+        for i in 0..BLOCK_DATA_MAX_INFLIGHT_PER_PEER {
+            assert!(matches!(send(&server, server_pid, fetch(i as u8)), DirectSendOutcome::Sent));
+        }
+        // At the cap, more by-hash fetches to that peer are shed: not sent,
+        // not buffered for a reconnect flush.
+        for i in 0..10u8 {
+            assert!(matches!(send(&server, server_pid, fetch(200 + i)), DirectSendOutcome::Shed));
+        }
+        assert_eq!(shared.outbound_direct.lock().unwrap().len(), BLOCK_DATA_MAX_INFLIGHT_PER_PEER);
+        assert!(shared.pending_sends.lock().unwrap().flush(&server).is_empty());
+
+        // Block sync to the same peer is never shed.
+        let sync: Message = BlockSyncRequest {
+            chain_id: ChainID::new(0),
+            start_height: BlockHeight::new(0),
+            limit: 128,
+        }
+        .into();
+        assert!(matches!(send(&server, server_pid, sync), DirectSendOutcome::Sent));
+        // Another peer has its own budget.
+        assert!(matches!(send(&other, other_pid, fetch(1)), DirectSendOutcome::Sent));
+
+        // A finished fetch (response or failure) frees one slot.
+        let done = shared
+            .outbound_direct
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, (t, m))| *t == server && is_fetch(m))
+            .map(|(id, _)| *id)
+            .unwrap();
+        finish_direct_request(&shared, &done);
+        assert!(matches!(send(&server, server_pid, fetch(100)), DirectSendOutcome::Sent));
+        assert!(matches!(send(&server, server_pid, fetch(101)), DirectSendOutcome::Shed));
+        // Finishing a request that is not a by-hash fetch frees no fetch slot.
+        let sync_id = shared
+            .outbound_direct
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, (_, m))| matches!(m, Message::BlockSyncMessage(_)))
+            .map(|(id, _)| *id)
+            .unwrap();
+        finish_direct_request(&shared, &sync_id);
+        assert!(matches!(send(&server, server_pid, fetch(102)), DirectSendOutcome::Shed));
+    }
+
     #[tokio::test]
     async fn body_send_trace_actual_encode_initiation_and_tracking_preserve_message() {
         use crate::body_send_trace::{tests::messages, BodySendTrace};

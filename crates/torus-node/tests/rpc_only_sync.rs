@@ -82,7 +82,8 @@ impl Node {
                 "--metrics-addr",
                 "127.0.0.1:0",
                 "--log-level",
-                "info",
+                // Diagnostics: e.g. `info,libp2p_request_response=debug`.
+                &std::env::var("TORUS_TEST_LOG_LEVEL").unwrap_or_else(|_| "info".into()),
             ])
             .args(extra)
             .env_remove("RUST_LOG")
@@ -145,6 +146,11 @@ impl Drop for Node {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // Diagnostics: keep every log, pass or fail.
+        if let Ok(dir) = std::env::var("TORUS_TEST_KEEP_LOGS") {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::copy(&self.log, Path::new(&dir).join(self.log.file_name().unwrap()));
+        }
     }
 }
 
