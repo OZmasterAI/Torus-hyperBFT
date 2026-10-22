@@ -289,6 +289,22 @@ def test_artifact_crash_gate_info_line_ok(e):
     assert "crash-gate-info-failstop-line" in r.stdout, r.stdout
 
 
+@with_env(TS2)
+def test_artifact_crash_gate_info_line_on_true_ok(e):
+    """s136: fail-stop is on by default, so the INFO config echo reads on=true -> still the artifact"""
+    p = e.path(TS2, "crash-restart-tail.log")
+    with open(p) as fh:
+        tail = fh.read()
+    assert "(TORUS_STATE_HASH_FAILSTOP) on=false" in tail
+    with open(p, "w") as fh:
+        fh.write(tail.replace("(TORUS_STATE_HASH_FAILSTOP) on=false", "(TORUS_STATE_HASH_FAILSTOP) on=true"))
+    r = e.step(TS2, "s2", "t1")
+    assert r.returncode == 0, r.stdout + r.stderr
+    (row,) = e.table()
+    assert row["rc"] == "2" and row["flag"] == "ok", row
+    assert "crash-gate-info-failstop-line" in r.stdout, r.stdout
+
+
 @with_env(TM)
 def test_artifact_mark_only_digest_ok(e):
     """rc 2, REJECT DISAGREE where val0 differs in mark fields only (block hash equal) + the INFO line -> ok"""

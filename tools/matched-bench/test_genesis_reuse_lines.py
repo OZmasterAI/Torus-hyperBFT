@@ -5,7 +5,7 @@
 
 Before genesis reuse (0f2ca85b) every cell ran devnet/wsl/gen-3val-genesis.sh, and campaign checks and spec
 expectations read its run.log output: the "generating N-market 3-val genesis -> G" line, the generator's
-"reusing existing ..." / "wrote G" lines and its summary ("  state_hash_activation = off", "  markets    = N", ...).
+"reusing existing ..." / "wrote G" lines and its summary ("  state_hash_activation = 1", "  markets    = N", ...).
 A reused cell must print the same lines in the same form (ozarchy 8p: a spec expectation on the
 state_hash_activation line stopped the campaign at its first reused cell).
 
@@ -70,6 +70,8 @@ CONFIGS = (
     ("state-hash", {"STATE_HASH_ACTIVATION": "1"}),
     ("extra-env", {"EXTRA_ENV": "TIMEOUT_BASE_MS=700 EVM_BLOCK_INTERVAL=5"}),
     ("liq-thin", {"LIQ_THIN": "2"}),
+    # owner s136: unset = the hash on (written explicitly); 'off' = the pre-s136 genesis
+    ("hash-off", {"STATE_HASH_ACTIVATION": "off"}),
     ("force", {"FORCE": "1"}),
 )
 TS = re.compile(r"^\[\d\d:\d\d:\d\d\] ")
@@ -234,7 +236,7 @@ class GenesisSectionTest(unittest.TestCase):
                     "generating 3-market 3-val genesis -> " + g,
                     "wrote " + g,
                     "  state_hash_activation = %s"
-                    % ("1" if name == "state-hash" else "off"),
+                    % ("off" if name == "hash-off" else "1"),
                     "  markets    = 3",
                     "  bulk_count = %d" % BULK,
                 }
@@ -383,9 +385,14 @@ class ArchivedExpectationsTest(unittest.TestCase):
                 with self.subTest(config=name, regex=e["regex"], src=e["src"]):
                     n = {k: grep_count(e["regex"], c[k]["path"]) for k in self.kinds(c)}
                     self.assertEqual(len(set(n.values())), 1, n)
+        # owner s136: an unset STATE_HASH_ACTIVATION now prints "= 1", so 8p's expectation
+        # holds only for an explicit 'off' arm (archy's specs must set it)
+        self.assertGreaterEqual(
+            grep_count(ARCHY_8P["regex"], SB.logs["hash-off"]["reuse"]["path"]), 1
+        )
         for name in ("default", "extra-env", "liq-thin", "force"):
-            self.assertGreaterEqual(
-                grep_count(ARCHY_8P["regex"], SB.logs[name]["reuse"]["path"]), 1, name
+            self.assertEqual(
+                grep_count(ARCHY_8P["regex"], SB.logs[name]["reuse"]["path"]), 0, name
             )
 
     def test_archived_script_genesis_checks_pass_on_a_reused_cell(self):
@@ -404,7 +411,7 @@ class ArchivedExpectationsTest(unittest.TestCase):
                             self.assertEqual(rc, 0, src)
                             if MUST_PASS[src]:
                                 self.assertEqual(out.strip(), c["md5"], src)
-            state = "1" if name == "state-hash" else "off"
+            state = "off" if name == "hash-off" else "1"
             self.assertEqual(
                 script_check(SCRIPT_CHECKS[0][1], c["reuse"], state)[0], 0, name
             )

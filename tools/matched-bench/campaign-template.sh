@@ -11,7 +11,7 @@
 # What the template adds to the p3gate driver:
 #   * after EVERY cell, in the foreground and before the next cell starts, run_spec calls cell_step (cell-step.sh +
 #     cell_step.py): validate the cell (rc, ACCEPT/AGREE, node md5 vs the arm's staged md5; known artifacts — the crash
-#     gate's INFO 'state hash fail-stop ... on=false' line and the mark-only digest — stay ok), run the campaign's
+#     gate's INFO 'state hash fail-stop ... on=false/true' line and the mark-only digest — stay ok), run the campaign's
 #     archived analysis on it (CELL_STEP_ANALYSIS_CMD) and append one row to $RUN/cells.tsv
 #     (label arm rep rc agree md5_ok metric flag). Bounded by CELL_STEP_TIMEOUT (default 900 s; on timeout a
 #     bad:step-timeout row is written and the campaign continues).

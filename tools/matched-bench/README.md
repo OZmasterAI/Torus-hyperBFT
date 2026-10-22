@@ -1390,7 +1390,8 @@ Self-tests: `test_preload.py`, `test_harness.py` (`BulkCountAndPreloadHarnessTes
 With `STATE_HASH_ACTIVATION` alone every node computes the running state hash h_n, but no node
 attests (the node attests only with `--state-hash-attest-key`): 0 attestations, no on-chain
 votes or quorum, so the quorum check never runs and the fail-stop has nothing to act on (the
-node logs `running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false`). A cell could
+node logs `running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=...`; on=true by default
+since s136, on=false with `TORUS_STATE_HASH_FAILSTOP=0`). A cell could
 only show equal hash entry counts and heights (perf section 120, bench 9g).
 
 `STATE_HASH_ATTEST=1` (harness env, default 0 = off: no key, flag, env, step or file) makes the
@@ -1415,7 +1416,8 @@ check live and proves agreement value for value:
   `--signer` and no signer key file is FATAL.
 - **Nodes.** `STATE_HASH_ATTEST_KEY_DIR` makes `start-node.sh` append
   `--state-hash-attest-key=<dir>/val<i>.key` (launch and crash restart alike); after launch every
-  node's argv must carry it. `TORUS_STATE_HASH_FAILSTOP=1` is exported before `EXTRA_ENV` (an
+  node's argv must carry it. `TORUS_STATE_HASH_FAILSTOP=1` is exported before `EXTRA_ENV` (the node
+  default since s136; exported explicitly so older binaries run the same; an
   `EXTRA_ENV` override is allowed, and the scan then fails the cell): a node whose h_n differs
   from the on-chain > 2/3 quorum hash latches its fail-stop and exits. Each node submits one
   `AttestStateHash` per durable checkpoint (every 100 blocks).

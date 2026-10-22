@@ -130,6 +130,10 @@ Steps 1-6: ~8-9 days. Step 2 changes the block hash, so it must land before the 
 
 ## 6. Open questions for the owner
 1. Running hash in the testnet genesis? Without it nothing detects divergent execution; only header bits are cross-checked.
+   **Answered (owner s136): ON at genesis.** Every newly generated genesis names `running_state_hash` (and, Classic,
+   `book_window_commit`) from block 1 explicitly (`DEFAULT_GENESIS_ACTIVATIONS`, `gen-3val-genesis.sh`, batch 10). A
+   genesis file naming no activation still means none (Codex review P1: its digest binds the data dir, so the parser
+   never reinterprets an existing file).
 2. Built-in schedule now, governance later — or governance from day one (voting period / timelock for activations)?
 3. With 3 validators (f = 0) every upgrade needs all of them; is a stall at H acceptable on the trial testnet?
 4. Old binaries keep voting past H (liveness) or stop as proposed (safe when vote rules change)?
@@ -193,7 +197,8 @@ Each phase lands on its own branch with RED-first tests and full gates; each one
    rule, which refuses such headers before the vote and at insertion). Test fixtures: `make_test_config_and_db`
    schedules the running hash at 1 and `make_block` / `default_genesis_header` carry the bit, so the module's
    running-hash coverage stays on.
-   **L6.1 switch (not done here):** `perf/l61-window-books` keys its L3.1 gate on
+   **L6.1 switch: done s136 on `merge/s136-batch10`** (feature `book_window_commit` id 1; see
+   `docs/plans/l61-window-committed-books.md` section 5). Original note: `perf/l61-window-books` keys its L3.1 gate on
    `ChainConfig::book_window_activation()` through `l31_hash_blocker`. Once it is a `Feature` (window books),
    `l31_hash_blocker` should take the header-derived running-hash activation (`read_configured_activation`
    after the replay, as `configure_book_coalesce` does here) plus the schedule, and the window-book rule itself

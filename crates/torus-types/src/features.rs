@@ -20,6 +20,14 @@ pub enum Feature {
     /// The running state hash (docs/plans/running-state-hash-impl.md); the old
     /// genesis field `consensus.state_hash_activation_height` is its alias.
     RunningStateHash = 0,
+    /// L6.1 window-committed Classic order books
+    /// (docs/plans/l61-window-committed-books.md): from its height the running
+    /// hash skips `cf_native_order_books` except at attest heights, where the
+    /// block runs the native phase and saves (and hashes) every book. Needs
+    /// [`Feature::RunningStateHash`] and the Classic book mode. The genesis
+    /// bool `consensus.book_window_commit` is its alias (from the running
+    /// hash's height).
+    BookWindowCommit = 1,
     /// TEST-ONLY (cargo feature `test-features`, enabled from
     /// torus-consensus's dev-dependencies; no node build reaches it): the P0.0
     /// integration tests' feature with a state-visible rule (the block pipeline
@@ -33,10 +41,14 @@ impl Feature {
     /// Every feature compiled in, in id order (test-only ones included in a
     /// `test-features` build; [`KNOWN_FEATURES`] is what the node can run).
     #[cfg(not(feature = "test-features"))]
-    pub const ALL: &'static [Feature] = &[Feature::RunningStateHash];
+    pub const ALL: &'static [Feature] = &[Feature::RunningStateHash, Feature::BookWindowCommit];
     /// Every feature compiled in, in id order (see above).
     #[cfg(feature = "test-features")]
-    pub const ALL: &'static [Feature] = &[Feature::RunningStateHash, Feature::TestStateRule];
+    pub const ALL: &'static [Feature] = &[
+        Feature::RunningStateHash,
+        Feature::BookWindowCommit,
+        Feature::TestStateRule,
+    ];
 
     /// The fixed id (the bit position).
     pub const fn id(self) -> u8 {
@@ -53,7 +65,7 @@ impl Feature {
     /// ([`ActivationSchedule::for_chain`]).
     pub const fn is_test_only(self) -> bool {
         match self {
-            Feature::RunningStateHash => false,
+            Feature::RunningStateHash | Feature::BookWindowCommit => false,
             #[cfg(feature = "test-features")]
             Feature::TestStateRule => true,
         }
@@ -63,6 +75,7 @@ impl Feature {
     pub const fn name(self) -> &'static str {
         match self {
             Feature::RunningStateHash => "running_state_hash",
+            Feature::BookWindowCommit => "book_window_commit",
             #[cfg(feature = "test-features")]
             Feature::TestStateRule => "test_state_rule",
         }
@@ -118,6 +131,17 @@ pub fn builtin_activations(chain_id: u64) -> &'static [(Feature, u64)] {
         .find(|(id, _)| *id == chain_id)
         .map_or(&[], |(_, activations)| activations)
 }
+
+/// Owner s136: the activations every NEWLY generated genesis names
+/// explicitly (`devnet/wsl/gen-3val-genesis.sh` with STATE_HASH_ACTIVATION
+/// unset writes them as `consensus.activations`), and the schedule of a node
+/// started without `--genesis`: the running state hash from block 1, and
+/// with it L6.1 window-committed books (what the 9j head-to-head measured,
+/// CL21; a row book mode gets the hash only: L6.1 is Classic-only). A genesis
+/// FILE naming no activation still means none (Codex P1: its digest binds
+/// the data dir, so the parser never reinterprets it).
+pub const DEFAULT_GENESIS_ACTIVATIONS: &[(Feature, u64)] =
+    &[(Feature::RunningStateHash, 1), (Feature::BookWindowCommit, 1)];
 
 /// Heights 0 and 1 are both block 1 (the genesis parent header at 0 carries
 /// block 1's bits).
@@ -177,6 +201,17 @@ impl ActivationSchedule {
                 feature.name()
             ));
         }
+        // L6.1 only changes the running hash's book preimage and the attest
+        // heights' save: without the hash it has no purpose.
+        if schedule.height_of(Feature::BookWindowCommit).is_some()
+            && schedule.height_of(Feature::RunningStateHash).is_none()
+        {
+            return Err(format!(
+                "feature {} needs {} in the schedule",
+                Feature::BookWindowCommit.name(),
+                Feature::RunningStateHash.name()
+            ));
+        }
         Ok(schedule)
     }
 
@@ -228,7 +263,9 @@ mod tests {
         assert_eq!(Feature::RunningStateHash.bit(), 1);
         // Test-only features are never in this binary's set (Codex review
         // of phase 5, P2): see `known_features_never_hold_a_test_feature`.
-        assert_eq!(KNOWN_FEATURES, 1);
+        assert_eq!(Feature::BookWindowCommit.id(), 1);
+        assert_eq!(Feature::BookWindowCommit.name(), "book_window_commit");
+        assert_eq!(KNOWN_FEATURES, 0b11);
         assert_eq!(first_unknown_feature_in(0b11, 0b01), Some(1));
         assert_eq!(first_unknown_feature_in(0b01, 0b01), None);
         assert_eq!(unknown_features(0b101), 0b100);
@@ -328,6 +365,31 @@ mod tests {
             assert_eq!(s.next_activation_after(0), None, "{at}: block 1 bits at 0");
         }
         assert_eq!(ActivationSchedule::default().next_activation_after(0), None);
+    }
+
+    /// L6.1 (`book_window_commit`) only changes the running hash and the
+    /// attest-height save, so a schedule naming it without
+    /// `running_state_hash` refuses to start (genesis and built-in alike).
+    /// RED before the L6.1 P0.0 wiring: accepted.
+    #[test]
+    fn book_window_commit_needs_the_running_hash_in_the_schedule() {
+        let id = crate::eip712::TORUS_CHAIN_ID;
+        let only: BTreeMap<_, _> = [(Feature::BookWindowCommit, 5)].into_iter().collect();
+        let err = ActivationSchedule::for_chain(id, &only)
+            .expect_err("book_window_commit without running_state_hash");
+        assert!(err.contains("book_window_commit") && err.contains("running_state_hash"), "{err}");
+        for (hash, window) in [(1, 1), (1, 150), (0, 1), (40, 40), (40, 300)] {
+            let both: BTreeMap<_, _> =
+                [(Feature::RunningStateHash, hash), (Feature::BookWindowCommit, window)]
+                    .into_iter()
+                    .collect();
+            let s = ActivationSchedule::for_chain(id, &both).unwrap();
+            assert_eq!(s.height_of(Feature::BookWindowCommit), Some(window));
+            assert_eq!(
+                s.active_at(window.max(1)) & Feature::BookWindowCommit.bit(),
+                Feature::BookWindowCommit.bit()
+            );
+        }
     }
 
     #[test]

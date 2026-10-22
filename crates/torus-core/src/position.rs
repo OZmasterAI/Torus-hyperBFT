@@ -949,6 +949,13 @@ impl PositionCache {
         true
     }
 
+    /// 8k L2.1: lowest and highest market id of any key ever put in this
+    /// cache (clean entries included); `None` while it is empty. A plan cache
+    /// whose range is exactly `(m, m)` holds only market `m`'s keys.
+    pub fn market_range(&self) -> Option<(MarketId, MarketId)> {
+        self.markets
+    }
+
     /// Number of cached entries (live rows, misses and tombstones).
     pub fn len(&self) -> usize {
         self.map.len()

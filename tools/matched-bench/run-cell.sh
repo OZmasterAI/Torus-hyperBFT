@@ -1563,8 +1563,9 @@ if [ -n "$MAX_IN_FLIGHT" ]; then
     export TORUS_RPC_MAX_RESPONSE_MB=64
     log "MAX_IN_FLIGHT=$MAX_IN_FLIGHT: TORUS_RPC_MAX_RESPONSE_MB=64 on the nodes (loaded torus_getBlockBody replies pass the 10 MiB default)"
 fi
-# STATE_HASH_ATTEST=1: fail-stop live (before EXTRA_ENV, which may override it:
-# the scan then fails the cell) and each node's attest key (start-node.sh reads
+# STATE_HASH_ATTEST=1: fail-stop live (the node default since s136, exported so
+# older binaries run the same; before EXTRA_ENV, which may override it: the
+# scan then fails the cell) and each node's attest key (start-node.sh reads
 # STATE_HASH_ATTEST_KEY_DIR; not a TORUS_* var, so it is logged on its own).
 unset STATE_HASH_ATTEST_KEY_DIR
 if state_attest_on; then

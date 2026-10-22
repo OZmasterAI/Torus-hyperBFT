@@ -175,8 +175,8 @@ stake is the quorum hash, and every node compares it with its own checkpoint.
 
 **Without the flag** the node never attests. It still hashes, still checks every vote and the
 quorum hash against its own checkpoints (metrics `torus_state_hash_mismatch_total`,
-`torus_state_hash_no_quorum_total`), and can still fail-stop with
-`TORUS_STATE_HASH_FAILSTOP=1`. But its stake does not count toward any quorum. On a small
+`torus_state_hash_no_quorum_total`), and still fail-stops on a quorum mismatch
+(`TORUS_STATE_HASH_FAILSTOP`, on by default since s136; `0` turns it off). But its stake does not count toward any quorum. On a small
 validator set (3 validators need all 3) a missing attester means no quorum hash at all.
 
 **Resubmit after 65 s.** The node signs each attestation with nonce = now (ms; strictly

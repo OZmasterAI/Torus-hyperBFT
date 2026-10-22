@@ -953,6 +953,8 @@ class CrashKillGuardTest(unittest.TestCase):
                 [
                     f"{esc}[2m2026-10-01T22:25:23Z{esc}[0m {esc}[32m INFO{esc}[0m state_hash: running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false",
                     "2026-10-01T22:25:23Z  INFO state_hash: running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false",
+                    # s136: fail-stop on by default, the echo reads on=true
+                    "2026-10-01T22:25:23Z  INFO state_hash: running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=true",
                     "2026-10-01T22:26:00Z  WARN state_hash: running state hash: this node diverged from the on-chain quorum hash at this checkpoint (recorded); fail-stop is off, so it keeps running",
                     f"{esc}[2m2026-10-01T22:27:00Z{esc}[0m {esc}[33m WARN{esc}[0m state_hash: node is hash-unverified: no fail-stop decision on the quorum mismatch",
                     f"{esc}[2m2026-10-01T22:30:00Z{esc}[0m {esc}[31mERROR{esc}[0m state_hash: FAIL-STOP (TORUS_STATE_HASH_FAILSTOP=1): latching exec_failed, node stops voting",
@@ -2616,6 +2618,12 @@ class CrashScanTest(unittest.TestCase):
             "(recorded); fail-stop is off, so it keeps running\n"
             + '{"timestamp":"x","level":"INFO","fields":{"message":"running state hash '
             'fail-stop (TORUS_STATE_HASH_FAILSTOP)","on":false}}\n'
+            # s136: fail-stop on by default, the echo reads on=true
+            + "2026-10-20T06:31:02.1Z  INFO torus_consensus::state_hash: running state "
+            "hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=true\n"
+            + f"{e}[2m2026-10-20T06:31:02.1Z{e}[0m {e}[32m INFO{e}[0m "
+            f"{e}[2mtorus_consensus::state_hash{e}[0m{e}[2m:{e}[0m running state hash "
+            f"fail-stop (TORUS_STATE_HASH_FAILSTOP) {e}[3mon{e}[0m{e}[2m={e}[0mtrue\n"
         )
         self.assertEqual(j["panic_or_failstop_lines"], 0)
         self.assertEqual(j["gap"], 11)

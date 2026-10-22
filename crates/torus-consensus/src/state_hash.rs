@@ -24,14 +24,32 @@ use torus_state::running_hash::{
 use torus_state::StateDb;
 use torus_types::{Address, NativeAction, TorusBlock, B256};
 
-/// Pure parse of `TORUS_STATE_HASH_FAILSTOP`: ON only for exactly `1`.
+/// Pure parse of `TORUS_STATE_HASH_FAILSTOP`. ON by default (owner s136):
+/// only `0` or `false` (trimmed, any case) turn it off; unset, empty, `1`,
+/// `true` = on; anything else is warned and on (a typo never disarms it).
 pub fn parse_failstop(v: Option<String>) -> bool {
-    matches!(v.as_deref().map(str::trim), Some("1"))
+    let Some(v) = v else {
+        return true;
+    };
+    match v.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" => false,
+        "" | "1" | "true" => true,
+        _ => {
+            tracing::warn!(
+                value = v.as_str(),
+                "TORUS_STATE_HASH_FAILSTOP: not empty, 1, true, 0 or false (any case); using the default (on)"
+            );
+            true
+        }
+    }
 }
 
-/// `TORUS_STATE_HASH_FAILSTOP=1`, read once per process. Default OFF: on a
-/// 3-validator net one diverged node that stops voting halts the chain
-/// (> 2/3 needs all 3), trading a silent fork for a halt.
+/// `TORUS_STATE_HASH_FAILSTOP`, read once per process; the INFO line logs the
+/// effective value. ON by default since s136 (owner decision; the 9j winner
+/// CL21 ran it on): a node whose checkpoint differs from the on-chain quorum
+/// hash latches `exec_failed` and stops voting. Note: on a 3-validator net
+/// one diverged node that stops voting halts the chain (> 2/3 needs all 3),
+/// trading a silent fork for a halt. `0` turns it off.
 pub fn failstop_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -160,7 +178,7 @@ pub struct StateHashMonitor {
     /// signer of its `AttestStateHash` actions. `None`: never submits.
     attest_key: OnceLock<k256::ecdsa::SigningKey>,
     /// Latch `exec_failed` when the on-chain quorum hash differs from the
-    /// local checkpoint (`TORUS_STATE_HASH_FAILSTOP=1`).
+    /// local checkpoint (`TORUS_STATE_HASH_FAILSTOP`, on unless `0`).
     failstop: bool,
     /// See [`DEFAULT_RESUBMIT_AFTER_MS`].
     resubmit_after_ms: u64,
@@ -184,7 +202,7 @@ impl Default for StateHashMonitor {
 }
 
 impl StateHashMonitor {
-    /// Fail-stop from `TORUS_STATE_HASH_FAILSTOP` (default off).
+    /// Fail-stop from `TORUS_STATE_HASH_FAILSTOP` (default on since s136).
     pub fn new() -> Self {
         Self::with_failstop(failstop_enabled())
     }

@@ -115,7 +115,8 @@ blocks (`periodic_abci_states`).
   `torus_state_hash_mismatch_total{validator}` metric and an ERROR log with the
   hashes. A checkpoint whose votes are all in but has no quorum → its own
   metric (`torus_state_hash_no_quorum_total`).
-- **Fail-stop, gated OFF by default (`TORUS_STATE_HASH_FAILSTOP=1`):** if a
+- **Fail-stop, gated OFF by default (`TORUS_STATE_HASH_FAILSTOP=1`; ON by default since
+  s136, owner decision, `TORUS_STATE_HASH_FAILSTOP=0` turns it off):** if a
   quorum hash exists and differs from the local checkpoint, set the
   `exec_failed` latch so the node stops voting. Turn on only after testnet runs
   clean. On a 3-validator net this halts the chain instead of continuing on a

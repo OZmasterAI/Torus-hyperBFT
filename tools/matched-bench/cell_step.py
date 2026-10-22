@@ -91,10 +91,10 @@ TSV = "cells.tsv"
 V = ("val0", "val1", "val2")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 # Pre-s131 crash-kill.sh crash_scan_restart_tail pattern (no level filter; it counted the INFO
-# `on=false` line). Kept to classify cells summarized before the ERROR-level rule.
+# `on=false` line; `on=true` since fail-stop is on by default, s136). Kept to classify cells summarized before the ERROR-level rule.
 PANIC_RE = re.compile(r"panicked|FAIL-STOP|fail-stop|conflicting blocks")
 BENIGN_FAILSTOP_RE = re.compile(
-    r" INFO \S+: running state hash fail-stop \(TORUS_STATE_HASH_FAILSTOP\) on=false\s*$"
+    r" INFO \S+: running state hash fail-stop \(TORUS_STATE_HASH_FAILSTOP\) on=(?:false|true)\s*$"
 )
 MARK = {
     "accountValue",
@@ -231,7 +231,7 @@ def restart_tail_benign(cell):
         )
     return (
         True,
-        "%d INFO 'state hash fail-stop ... on=false' line(s), nothing else" % benign,
+        "%d INFO 'state hash fail-stop ... on=false/true' line(s), nothing else" % benign,
     )
 
 

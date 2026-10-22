@@ -11,7 +11,7 @@ pub mod eip1559;
 pub mod eip712;
 pub mod features;
 
-pub use features::{ActivationSchedule, Feature, KNOWN_FEATURES};
+pub use features::{ActivationSchedule, Feature, DEFAULT_GENESIS_ACTIVATIONS, KNOWN_FEATURES};
 
 // ============================================================================
 // Identifiers
@@ -1866,6 +1866,20 @@ fn default_backoff_cap() -> u32 {
 }
 
 impl ChainConfig {
+    /// L6.1: the first height of window-committed books
+    /// (docs/plans/l61-window-committed-books.md), `None` = not scheduled:
+    /// the schedule's [`Feature::BookWindowCommit`] height, 0 read as 1
+    /// (genesis `consensus.activations.book_window_commit`, or the bool
+    /// `consensus.book_window_commit`: from the running hash's height). Only
+    /// an expectation, as [`Self::state_hash_activation_height`]: execution
+    /// runs the window rule where the committed headers carry the bit. The
+    /// boot-time L3.1 gate reads it.
+    pub fn book_window_activation(&self) -> Option<u64> {
+        self.activations
+            .height_of(Feature::BookWindowCommit)
+            .map(|h| h.max(1))
+    }
+
     /// FIX CONS-PF-04: Validate chain configuration parameters.
     pub fn validate(&self) -> Result<(), String> {
         if self.epoch_length == 0 {
@@ -1873,6 +1887,20 @@ impl ChainConfig {
         }
         if self.max_validators == 0 {
             return Err("max_validators must be >= 1".to_string());
+        }
+        let book_window = self.book_window_activation().is_some();
+        if book_window && self.state_hash_activation_height().is_none() {
+            return Err(
+                "book_window_commit needs the running state hash (activations.running_state_hash): \
+                 it only changes the running hash"
+                    .to_string(),
+            );
+        }
+        if book_window && !self.book_mode.is_classic() {
+            return Err(format!(
+                "book_window_commit (L6.1) needs book_mode classic, not {}",
+                self.book_mode.name()
+            ));
         }
         Ok(())
     }
@@ -1946,6 +1974,49 @@ pub struct ValidatorSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L6.1 under P0.0: `ChainConfig::book_window_activation` is the
+    /// schedule's `book_window_commit` height (0 read as 1), whatever else is
+    /// scheduled; `validate` refuses it without the running hash or with a
+    /// row book mode. RED before the wiring: it read the old bool.
+    #[test]
+    fn book_window_activation_is_the_schedule_height() {
+        let sched = |pairs: &[(Feature, u64)]| {
+            ActivationSchedule::merge(&pairs.iter().copied().collect(), &[]).unwrap()
+        };
+        // Built from JSON so the test names no field beyond the schedule.
+        let base: ChainConfig = serde_json::from_value(serde_json::json!({
+            "chain_id": 1, "chain_name": "t", "evm_gas_limit": 1, "evm_block_interval": 1,
+            "evm_big_block_interval": 0, "evm_big_gas_limit": 1, "base_fee_per_gas": 1,
+            "epoch_length": 10, "max_validators": 4, "min_stake": "0x0",
+            "fee_burn_bps": 10000, "fee_validator_bps": 0, "fee_treasury_bps": 0,
+            "fee_dev_pool_bps": 0,
+        }))
+        .unwrap();
+        let with = |pairs: &[(Feature, u64)]| ChainConfig {
+            activations: sched(pairs),
+            ..base.clone()
+        };
+        let rsh = Feature::RunningStateHash;
+        let win = Feature::BookWindowCommit;
+        assert_eq!(base.book_window_activation(), None);
+        assert_eq!(with(&[(rsh, 1)]).book_window_activation(), None);
+        assert_eq!(with(&[(rsh, 1), (win, 1)]).book_window_activation(), Some(1));
+        assert_eq!(with(&[(rsh, 0), (win, 0)]).book_window_activation(), Some(1));
+        assert_eq!(with(&[(rsh, 1), (win, 250)]).book_window_activation(), Some(250));
+        assert!(with(&[(rsh, 1), (win, 250)]).validate().is_ok());
+        assert!(with(&[(win, 5)]).validate().is_err(), "L6.1 without the running hash");
+        let rows = ChainConfig {
+            book_mode: book_mode::BookMode::LevelAuthorityChunked,
+            ..with(&[(rsh, 1), (win, 1)])
+        };
+        assert!(rows.validate().is_err(), "L6.1 needs Classic");
+        let rows_off = ChainConfig {
+            book_mode: book_mode::BookMode::LevelAuthorityChunked,
+            ..with(&[(rsh, 1)])
+        };
+        assert!(rows_off.validate().is_ok());
+    }
 
     /// Item 7 step 2: EVM txs ride the small cadence (`h % N == 0`) or a big height
     /// (M > 0, `h % M == 0`); M = 0 switches big heights off.

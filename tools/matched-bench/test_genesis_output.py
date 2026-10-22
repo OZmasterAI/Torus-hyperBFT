@@ -224,6 +224,86 @@ for i in $(seq "$3" $(( $3 + $5 - 1 ))); do printf '%s 0x%040x\\n' "$i" "$i"; do
     # EVM cadence N, `.evm.block_interval` (EvmConfig.block_interval; absent =
     # torus_types::DEFAULT_EVM_BLOCK_INTERVAL = 11).
 
+    def test_running_state_hash_defaults_on_and_off_is_explicit(self):
+        # Owner s136: the running state hash is on in every newly generated
+        # genesis, WRITTEN EXPLICITLY (Codex P1: the node reads a genesis
+        # naming no activation as off, its legacy meaning). Unset
+        # STATE_HASH_ACTIVATION writes consensus.activations (hash + L6.1 from
+        # block 1, Classic); 'off' writes no activation at all (the pre-s136
+        # bytes); H writes the alias as before.
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        final = json.loads(self.output.read_text())
+        self.assertEqual(final['consensus']['activations'],
+                         {'running_state_hash': 1, 'book_window_commit': 1})
+        self.assertNotIn('state_hash_activation_height', final['consensus'])
+        self.assertNotIn('book_window_commit', final['consensus'])
+        self.assertIn('  state_hash_activation = 1\n', result.stdout)
+        result = self.run_script(STATE_HASH_ACTIVATION='off')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        final = json.loads(self.output.read_text())
+        for field in ('activations', 'state_hash_activation_height', 'book_window_commit'):
+            self.assertNotIn(field, final['consensus'])
+        self.assertIn('  state_hash_activation = off\n', result.stdout)
+        result = self.run_script(STATE_HASH_ACTIVATION='7')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        final = json.loads(self.output.read_text())
+        self.assertEqual(final['consensus']['state_hash_activation_height'], 7)
+        self.assertNotIn('activations', final['consensus'])
+        self.assertIn('  state_hash_activation = 7\n', result.stdout)
+
+    def test_inherited_hash_spellings_never_survive_the_scripts_choice(self):
+        # Codex P2 (s136): a weighted base carrying the legacy alias
+        # state_hash_activation_height (or the L6.1 bool, or activations of
+        # its own) must not leak into the final genesis: with 'off' the hash
+        # was reported off while the parser merged the inherited alias back
+        # in. This script alone decides the hash and L6.1 spellings.
+        inherited = [
+            {'state_hash_activation_height': 7},
+            {'state_hash_activation_height': 7, 'book_window_commit': True},
+            {'activations': {'running_state_hash': 7, 'book_window_commit': 7}},
+        ]
+        cases = [
+            ('off', None, 'off', False),
+            ('unset', {'running_state_hash': 1, 'book_window_commit': 1}, '1', True),
+            ('5', None, '5', False),
+        ]
+        for extra in inherited:
+            consensus = {**self.base['consensus'], **extra}
+            (self.root / 'testnet/genesis-weighted-base.json').write_text(
+                json.dumps({**self.base, 'consensus': consensus}))
+            for value, activations, shown, window in cases:
+                with self.subTest(inherited=extra, STATE_HASH_ACTIVATION=value):
+                    env = {} if value == 'unset' else {'STATE_HASH_ACTIVATION': value}
+                    result = self.run_script(force=True, **env)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    final = json.loads(self.output.read_text())['consensus']
+                    self.assertEqual(final.get('activations'), activations, final)
+                    self.assertEqual(final.get('state_hash_activation_height'),
+                                     int(value) if value.isdigit() else None, final)
+                    self.assertNotIn('book_window_commit', final)
+                    self.assertIn('  state_hash_activation = %s\n' % shown, result.stdout)
+                    self.assertEqual('book_window_commit = on' in result.stdout, window, result.stdout)
+
+    def test_default_classic_genesis_reports_window_books_on(self):
+        # The default for a Classic genesis is the hash + L6.1 from block 1
+        # (CL21), written as activations; the summary says both. A row book
+        # mode, BOOK_WINDOW_COMMIT=0, an explicit hash height or 'off' get no
+        # L6.1.
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('  book_window_commit = on (L6.1)\n', result.stdout)
+        for extra, activations in (({'BOOK_MODE': '3'}, {'running_state_hash': 1}),
+                                   ({'BOOK_WINDOW_COMMIT': '0'}, {'running_state_hash': 1}),
+                                   ({'STATE_HASH_ACTIVATION': '1'}, None),
+                                   ({'STATE_HASH_ACTIVATION': 'off'}, None)):
+            with self.subTest(**extra):
+                result = self.run_script(**extra)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn('book_window_commit = on', result.stdout)
+                final = json.loads(self.output.read_text())
+                self.assertEqual(final['consensus'].get('activations'), activations)
+
     def test_book_window_commit_needs_the_state_hash_and_sets_the_consensus_flag(self):
         # L6.1 (ported from perf/l61-window-books 9930fc60): chain-wide genesis field
         final = self.generate(STATE_HASH_ACTIVATION='1', BOOK_WINDOW_COMMIT='1')[1]
@@ -233,9 +313,12 @@ for i in $(seq "$3" $(( $3 + $5 - 1 ))); do printf '%s 0x%040x\\n' "$i" "$i"; do
             with self.subTest(value=value):
                 final = self.generate(STATE_HASH_ACTIVATION='1', BOOK_WINDOW_COMMIT=value)[1]
                 self.assertNotIn('book_window_commit', final.get('consensus', {}))
-        result = self.run_script(BOOK_WINDOW_COMMIT='1')
+        # Owner s136: unset = the node default (hash on), so only 'off' refuses.
+        final = self.generate(BOOK_WINDOW_COMMIT='1')[1]
+        self.assertIs(final['consensus']['book_window_commit'], True)
+        result = self.run_script(STATE_HASH_ACTIVATION='off', BOOK_WINDOW_COMMIT='1')
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('BOOK_WINDOW_COMMIT=1 needs STATE_HASH_ACTIVATION', result.stderr)
+        self.assertIn('BOOK_WINDOW_COMMIT=1 needs the running state hash', result.stderr)
 
     def test_evm_block_interval_sets_the_final_genesis_only(self):
         # MARKETS=3 > the base's 2: the synthesis branch, which is the one the
@@ -298,7 +381,9 @@ for i in $(seq "$3" $(( $3 + $5 - 1 ))); do printf '%s 0x%040x\\n' "$i" "$i"; do
                 self.assertEqual(result.returncode, 0, result.stderr)
                 full = json.loads(self.full.read_text())
                 final = json.loads(self.output.read_text())
-                self.assertEqual(final['consensus'], {**self.base['consensus'], 'book_mode': name})
+                # owner s136: the hash is written explicitly; a row mode gets no L6.1
+                self.assertEqual(final['consensus'], {**self.base['consensus'], 'book_mode': name,
+                                                      'activations': {'running_state_hash': 1}})
                 self.assertNotIn('book_mode', full['consensus'], 'the reused weighted base is never patched')
                 self.assertIn('book_mode  = %s' % name, result.stdout)
 

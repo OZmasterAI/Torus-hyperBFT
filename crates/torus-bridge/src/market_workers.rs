@@ -426,7 +426,8 @@ impl MarketWorkerPool {
     ///
     /// Orders are processed in submission order (preserving within-market
     /// determinism). Each order's global ID is pre-assigned by the caller.
-    fn match_market(
+    /// 8k L2.1: also the streamed settle's per-market match step.
+    pub(crate) fn match_market(
         market_id: MarketId,
         mut book: OrderBook,
         requests: Vec<MatchRequest<'_>>,

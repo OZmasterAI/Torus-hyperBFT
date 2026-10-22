@@ -2318,7 +2318,7 @@ class SamplerCheckTest(Base):
         logs = {
             0: "2026 ERROR torus: thread 'exec' panicked at x.rs:1\n"
             "2026  INFO torus: running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false\n",
-            1: "2026  INFO torus: running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false\n",
+            1: "2026  INFO torus: running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=true\n",
             2: "2026  WARN torus: \x1b[31mSTATE HASH MISMATCH\x1b[0m at 7\n",
         }
         for v, txt in logs.items():
