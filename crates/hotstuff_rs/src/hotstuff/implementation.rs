@@ -867,12 +867,22 @@ impl<N: Network> HotStuff<N> {
                     block_tree.app_view(parent_block.as_ref())?,
                 );
 
+                let response = app.produce_block(produce_block_request);
+                // s138 (9k2 deep r4-U halt): a refusal is never proposed, inserted
+                // or self-voted; the view times out (`App::refuses_proposal`).
+                if app.refuses_proposal(&response) {
+                    log::warn!(
+                        "leader of view {}: the app refused to build a block -- no proposal this view",
+                        self.view_info.view.int()
+                    );
+                    return Ok(());
+                }
                 let ProduceBlockResponse {
                     data,
                     data_hash,
                     app_state_updates,
                     validator_set_updates,
-                } = app.produce_block(produce_block_request);
+                } = response;
 
                 let block = Block::new(child_height, highest_pc, data_hash, data);
 
@@ -2265,12 +2275,24 @@ impl<N: Network> HotStuff<N> {
                 parent_block,
                 block_tree.app_view(parent_block.as_ref())?,
             );
+            let response = app.produce_block(produce_block_request);
+            // s138 (9k2 deep r4-U halt): a refusal is never proposed. Here it
+            // built the same placeholder as the refusing leader of the tip
+            // (same height, justify, data hash), which voted for it through
+            // `pending_bodies`: the two certified it.
+            if app.refuses_proposal(&response) {
+                log::warn!(
+                    "leader of view {}: the app refused the NEC proposal -- no proposal this view",
+                    self.view_info.view.int()
+                );
+                return Ok(());
+            }
             let ProduceBlockResponse {
                 data,
                 data_hash,
                 app_state_updates: _,
                 validator_set_updates: _,
-            } = app.produce_block(produce_block_request);
+            } = response;
 
             let block = Block::new(child_height, high_tip_qc, data_hash, data);
 
