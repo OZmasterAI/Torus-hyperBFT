@@ -841,7 +841,9 @@ impl<K: KVStore> BlockTreeSingleton<K> {
                     wb.set_previous_validator_set(&previous_validator_set)?;
                     wb.set_validator_set_update_block_height(block_height)?;
                     wb.set_validator_set_update_decided(false)?;
-                    wb.set_committed_validator_set_updates(block)?;
+                    // s138 D3: mark the updating block `b`, not the commit target `block` (they
+                    // differ when `b` commits as an ancestor of the target).
+                    wb.set_committed_validator_set_updates(b)?;
 
                     committed_blocks.push((*b, Some(validator_set_updates.clone())));
                 } else {
@@ -2815,5 +2817,99 @@ mod block_tree_pruner_tests {
         let mut wb = BlockTreeWriteBatch::new();
         wb.set_highest_pc(&pc).unwrap();
         bt.write(wb);
+    }
+}
+
+/// s138 D3 (docs/plans/disjoint-vset-livelock.md §3.4, §6 T8): `commit` marks the updating block's
+/// validator-set updates Committed, not the commit target's.
+#[cfg(test)]
+mod commit_marks_updating_block_tests {
+    use super::*;
+    use crate::hotstuff::header_fast_path_regression_test::MemKV;
+    use crate::hotstuff::types::Phase;
+    use crate::types::{
+        block::Block,
+        crypto_primitives::SigningKey,
+        data_types::{BlockHeight, ChainID, CryptoHash, Data, Power, SignatureSet, ViewNumber},
+    };
+
+    fn pc(view: u64, block: CryptoHash, phase: Phase) -> PhaseCertificate {
+        PhaseCertificate {
+            chain_id: ChainID::new(0),
+            view: ViewNumber::new(view),
+            block,
+            phase,
+            signatures: SignatureSet::new(0),
+        }
+    }
+
+    /// T8 `commit_marks_the_updating_block`: h0 committed; U at h1 adds a validator (Pending); the
+    /// commit target B at h2 is U's child. Committing B commits U too: U's status must end
+    /// Committed, B's must stay None (B updates nothing), and the committed set must include the
+    /// new validator.
+    #[test]
+    fn commit_marks_the_updating_block() {
+        let key = |seed: u8| SigningKey::from_bytes(&[seed; 32]).verifying_key();
+        let mut genesis_set = ValidatorSet::new();
+        genesis_set.put(&key(1), Power::new(1));
+        let mut bt = BlockTreeSingleton::new(MemKV::default());
+        bt.initialize(
+            &AppStateUpdates::new(),
+            &ValidatorSetState::new(genesis_set.clone(), genesis_set, None, true),
+        )
+        .unwrap();
+
+        let b0 = Block::new(
+            BlockHeight::new(0),
+            PhaseCertificate::genesis_pc(),
+            CryptoHash::new([20; 32]),
+            Data::new(vec![]),
+        );
+        bt.insert(&b0, None, None).unwrap();
+        let mut wb = BlockTreeWriteBatch::new();
+        bt.commit(&mut wb, &b0.hash).unwrap();
+        bt.write(wb);
+
+        let mut updates = ValidatorSetUpdates::new();
+        updates.insert(key(2), Power::new(1));
+        let u = Block::new(
+            BlockHeight::new(1),
+            pc(1, b0.hash, Phase::Generic),
+            CryptoHash::new([21; 32]),
+            Data::new(vec![]),
+        );
+        bt.insert(&u, None, Some(&updates)).unwrap();
+        let b = Block::new(
+            BlockHeight::new(2),
+            pc(4, u.hash, Phase::Decide),
+            CryptoHash::new([22; 32]),
+            Data::new(vec![]),
+        );
+        bt.insert(&b, None, None).unwrap();
+
+        let mut wb = BlockTreeWriteBatch::new();
+        let committed = bt.commit(&mut wb, &b.hash).unwrap();
+        bt.write(wb);
+        assert_eq!(committed.len(), 2, "U and B commit in one walk");
+
+        assert!(
+            matches!(
+                bt.validator_set_updates_status(&u.hash).unwrap(),
+                ValidatorSetUpdatesStatus::Committed
+            ),
+            "the updating block U must end Committed"
+        );
+        assert!(
+            matches!(
+                bt.validator_set_updates_status(&b.hash).unwrap(),
+                ValidatorSetUpdatesStatus::None
+            ),
+            "the commit target B updates nothing and must stay unmarked"
+        );
+        assert!(bt.committed_validator_set().unwrap().contains(&key(2)));
+        assert_eq!(
+            *bt.validator_set_state().unwrap().update_height(),
+            Some(BlockHeight::new(1))
+        );
     }
 }

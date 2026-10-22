@@ -128,52 +128,14 @@ impl<N: Network> Pacemaker<N> {
 
             // 1.1. If the current view is an Epoch-Change view, broadcast a `TimeoutVote`, then extend the view.
             if is_epoch_change_view(&cur_view, self.config.epoch_length) {
-                if is_validator(&self.config.keypair.public(), &validator_set_state) {
-                    let (tip, highest_qc) = self.own_timeout_summaries(block_tree)?;
-                    let pacemaker_message = PacemakerMessage::timeout_vote(
-                        &self.config.keypair,
-                        self.config.chain_id,
-                        cur_view,
-                        block_tree.highest_tc()?,
-                        tip,
-                        highest_qc,
-                    );
-                    self.sender
-                        .broadcast(Message::from(pacemaker_message.clone()));
-                    if let PacemakerMessage::TimeoutVote(timeout_vote) = pacemaker_message {
-                        Event::TimeoutVote(TimeoutVoteEvent {
-                            timestamp: SystemTime::now(),
-                            timeout_vote,
-                        })
-                        .publish(&self.event_publisher)
-                    }
-                }
+                self.broadcast_timeout_vote(cur_view, &validator_set_state, block_tree)?;
 
                 // We extend the view timeout so that we will broadcast a `TimeoutVote` when this view times out again.
                 self.extend_view(block_tree.highest_pc()?.view, block_tree.committed_qc_view()?)?
 
             // 1.2. MonadBFT: broadcast TimeoutVote before advancing on normal view timeout.
             } else {
-                if is_validator(&self.config.keypair.public(), &validator_set_state) {
-                    let (tip, highest_qc) = self.own_timeout_summaries(block_tree)?;
-                    let pacemaker_message = PacemakerMessage::timeout_vote(
-                        &self.config.keypair,
-                        self.config.chain_id,
-                        cur_view,
-                        block_tree.highest_tc()?,
-                        tip,
-                        highest_qc,
-                    );
-                    self.sender
-                        .broadcast(Message::from(pacemaker_message.clone()));
-                    if let PacemakerMessage::TimeoutVote(timeout_vote) = pacemaker_message {
-                        Event::TimeoutVote(TimeoutVoteEvent {
-                            timestamp: SystemTime::now(),
-                            timeout_vote,
-                        })
-                        .publish(&self.event_publisher)
-                    }
-                }
+                self.broadcast_timeout_vote(cur_view, &validator_set_state, block_tree)?;
                 self.update_view(
                     cur_view + 1,
                     &validator_set_state,
@@ -509,6 +471,38 @@ impl<N: Network> Pacemaker<N> {
         Ok((None, (!highest_pc.is_genesis_pc()).then_some(highest_pc)))
     }
 
+    /// Broadcast this replica's `TimeoutVote` for `view` (if it is a validator), as a view's
+    /// timeout does.
+    fn broadcast_timeout_vote<K: KVStore>(
+        &mut self,
+        view: ViewNumber,
+        validator_set_state: &ValidatorSetState,
+        block_tree: &BlockTreeSingleton<K>,
+    ) -> Result<(), PacemakerError> {
+        if !is_validator(&self.config.keypair.public(), validator_set_state) {
+            return Ok(());
+        }
+        let (tip, highest_qc) = self.own_timeout_summaries(block_tree)?;
+        let pacemaker_message = PacemakerMessage::timeout_vote(
+            &self.config.keypair,
+            self.config.chain_id,
+            view,
+            block_tree.highest_tc()?,
+            tip,
+            highest_qc,
+        );
+        self.sender
+            .broadcast(Message::from(pacemaker_message.clone()));
+        if let PacemakerMessage::TimeoutVote(timeout_vote) = pacemaker_message {
+            Event::TimeoutVote(TimeoutVoteEvent {
+                timestamp: SystemTime::now(),
+                timeout_vote,
+            })
+            .publish(&self.event_publisher)
+        }
+        Ok(())
+    }
+
     /// Execute the required steps in the Pacemaker protocol upon receiving an `AdvanceView` message.
     ///
     /// ## Preconditions
@@ -766,15 +760,41 @@ impl<N: Network> Pacemaker<N> {
         highest_qc_view: ViewNumber,
         committed_view: ViewNumber,
     ) -> Result<bool, PacemakerError> {
-        let cur_view = self.view_info.view;
-        if view <= cur_view
-            || view.int() - cur_view.int() > MAX_ROUND_SKIP_VIEWS
-            || epoch(cur_view, self.config.epoch_length) != epoch(view, self.config.epoch_length)
-        {
+        if !self.can_skip_to(view) {
             return Ok(false);
         }
         self.update_view(view, validator_set_state, highest_qc_view, committed_view)?;
         Ok(true)
+    }
+
+    /// Whether [`skip_to_view`](Self::skip_to_view) enters `view`: ahead of the current view, at
+    /// most [`MAX_ROUND_SKIP_VIEWS`] ahead, and in the same epoch.
+    fn can_skip_to(&self, view: ViewNumber) -> bool {
+        let cur_view = self.view_info.view;
+        view > cur_view
+            && view.int() - cur_view.int() <= MAX_ROUND_SKIP_VIEWS
+            && epoch(cur_view, self.config.epoch_length) == epoch(view, self.config.epoch_length)
+    }
+
+    /// s138: time out the current view before a leader-skip (s75 fix A, NewViews from more than f
+    /// power) into the next one. The replica leads that view and, under TC-required, proposes there
+    /// only with a QC or a TC for the current view. A skip leaves the current view before its
+    /// deadline, and a view is timed out only while it is the current one, so without this the
+    /// replica's timeout vote for it is never sent: TC(current) then forms only if the other
+    /// validators' votes reach a quorum on their own, which one lost vote (or the skipping leader's
+    /// own power) prevents, and the next view is lost too. Nothing is sent unless `view` is the
+    /// next view and [`skip_to_view`](Self::skip_to_view) will enter it.
+    pub(crate) fn time_out_before_leader_skip<K: KVStore>(
+        &mut self,
+        view: ViewNumber,
+        block_tree: &BlockTreeSingleton<K>,
+    ) -> Result<(), PacemakerError> {
+        let cur_view = self.view_info.view;
+        if cur_view.int().checked_add(1) != Some(view.int()) || !self.can_skip_to(view) {
+            return Ok(());
+        }
+        let validator_set_state = block_tree.validator_set_state()?;
+        self.broadcast_timeout_vote(cur_view, &validator_set_state, block_tree)
     }
 
     /// Extend the timeout of the current view, which must be an Epoch-Change View.
