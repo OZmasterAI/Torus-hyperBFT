@@ -186,7 +186,7 @@ fn survivors_fetch_each_others_bodies_without_asking_the_dead_validator() {
     }));
     let observer = probe.clone();
     filter.rewrite(Arc::new(move |sender, recipient, message| {
-        observer.lock().unwrap().observe(sender, recipient, message)
+        observer.lock().unwrap_or_else(|e| e.into_inner()).observe(sender, recipient, message)
     }));
 
     let check = |p: &Probe| -> Result<bool, String> {
@@ -210,19 +210,26 @@ fn survivors_fetch_each_others_bodies_without_asking_the_dead_validator() {
     };
 
     let deadline = Instant::now() + Duration::from_secs(90);
-    loop {
+    let failure = loop {
         let p = probe.lock().unwrap();
         match check(&p) {
-            Ok(true) => break,
+            Ok(true) => break None,
             Ok(false) if Instant::now() < deadline => {}
-            Ok(false) => panic!(
-                "fewer than {FETCHES_TO_OBSERVE} measured fetches completed in 90 s\n  {}",
-                p.describe(&keys)
-            ),
-            Err(why) => panic!("one-down body fetch failed: {why}\n  {}", p.describe(&keys)),
+            Ok(false) => {
+                break Some(format!(
+                    "fewer than {FETCHES_TO_OBSERVE} measured fetches completed in 90 s\n  {}",
+                    p.describe(&keys)
+                ))
+            }
+            Err(why) => break Some(format!("one-down body fetch failed: {why}\n  {}", p.describe(&keys))),
         }
         drop(p);
         std::thread::sleep(POLL_INTERVAL);
-    }
+    };
+    // Release the probe and stop the survivors before failing, so a failure reports cleanly.
     filter.heal();
+    drop(nodes);
+    if let Some(failure) = failure {
+        panic!("{failure}");
+    }
 }

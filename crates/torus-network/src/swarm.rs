@@ -714,6 +714,40 @@ pub(crate) const DEPOSED_GRACE: Duration = Duration::from_secs(60);
 const REDIAL_BACKOFF_MIN: Duration = Duration::from_millis(500);
 const REDIAL_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// 9k one-down: at most one compact gossipsub slow-peer WARN per interval
+/// (process-wide; the per-message libp2p WARN is filtered, see
+/// `torus_telemetry::GOSSIPSUB_PAYLOAD_WARN_DIRECTIVE`).
+const SLOW_PEER_WARN_INTERVAL: Duration = Duration::from_secs(1);
+
+static SLOW_PEER_LAST_WARN: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// Whether a compact slow-peer WARN may be logged at `now` (and if so, stamp it).
+fn slow_peer_warn_due(last: &std::sync::Mutex<Option<Instant>>, now: Instant) -> bool {
+    let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
+    match *last {
+        Some(at) if now.saturating_duration_since(at) < SLOW_PEER_WARN_INTERVAL => false,
+        _ => {
+            *last = Some(now);
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+mod slow_peer_warn_tests {
+    use super::*;
+
+    #[test]
+    fn compact_slow_peer_warn_is_throttled_to_one_per_interval() {
+        let last = std::sync::Mutex::new(None);
+        let t0 = Instant::now();
+        assert!(slow_peer_warn_due(&last, t0));
+        assert!(!slow_peer_warn_due(&last, t0 + Duration::from_millis(100)));
+        assert!(!slow_peer_warn_due(&last, t0 + SLOW_PEER_WARN_INTERVAL - Duration::from_millis(1)));
+        assert!(slow_peer_warn_due(&last, t0 + SLOW_PEER_WARN_INTERVAL));
+    }
+}
+
 /// Whether `peer` may be redialed now, advancing its exponential backoff. A
 /// persistently-unreachable peer is dialed at most once per (growing) interval, so
 /// the failure-driven dial + WARN storm is throttled to O(log) per outage instead
@@ -1629,6 +1663,23 @@ fn handle_event(
                 timeout = failed_messages.timeout,
                 "gossipsub slow peer"
             );
+            // 9k one-down: libp2p's own per-message "Send Queue full" WARN
+            // (whole payload Debug-formatted on this task, ~400 KB a line) is
+            // filtered by torus_telemetry::build_env_filter. This compact,
+            // throttled line keeps the drop visible in the logs (and to the
+            // bench's `Send Queue full` counters) at no formatting cost.
+            if slow_peer_warn_due(&SLOW_PEER_LAST_WARN, Instant::now()) {
+                warn!(
+                    %peer_id,
+                    publish = failed_messages.publish,
+                    forward = failed_messages.forward,
+                    priority = failed_messages.priority,
+                    non_priority = failed_messages.non_priority,
+                    timeout = failed_messages.timeout,
+                    "gossipsub Send Queue full (slow peer; payloads not logged, at most one line per {:?})",
+                    SLOW_PEER_WARN_INTERVAL
+                );
+            }
             if let Some(ref m) = shared.metrics {
                 m.gossipsub_slow_peer_events.inc();
                 for (kind, n) in [
