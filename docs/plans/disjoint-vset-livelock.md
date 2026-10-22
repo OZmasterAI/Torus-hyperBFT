@@ -396,6 +396,14 @@ The tail-fork argument keeps a block 2f+1 replicas voted for as the tip across t
 validator-set-updating blocks never set a tip for a fresh proposal, so no honest vote ever made such a block a tip,
 and the copy only spread a Byzantine one. NE signing (`last_voted_proposal`) is unchanged.
 
+**Update (s138, fix/tc-tip-ordinary-stall merged here).** The same stall exists for ordinary (Generic) blocks, on
+main too (Codex P1 on 138a9219). Fixed for both by the TC's winner rule: a tip wins only if its block also justifies
+on a view >= the TC's high QC (`pacemaker::types::high_tip_wins`), and timeout votes always report the highest PC.
+U' justifies on QC(A, 1), so whenever the TC carries the locked replica's Precommit(U, 3) the high QC wins and the
+leader acts on it; `an_active_byzantine_tip_does_not_strand_the_update` passes and is no longer ignored. Still open:
+a TC with the Byzantine vote that omits every replica with the highest lock (docs/plans/tc-required-and-tip-signing.md
+§4, "Incompatible tips", residual). The text below is the state before that fix.
+
 **Residual, not fixed (needs a decision): an active Byzantine tip.** With fixes 1 and 2 every model state decides in
 the synchronous suffix where the Byzantine validator is silent. If it stays active it can put its own tip of a
 sibling, signed in a view it led and above every honest QC, into every TC (its timeout vote arrives first); the tip
