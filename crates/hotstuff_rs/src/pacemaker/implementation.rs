@@ -2070,6 +2070,75 @@ fn update_view_on_schedule_keeps_cumulative_deadline() {
     );
 }
 
+/// Past deadline after a backed-off view (s137): Task A stretches a stalled
+/// view in place (2c) without moving the views after it, so the absolute
+/// schedule of the next views can lie in the past by the time that view ends.
+/// The QC for the backed-off view then puts every replica into the next view
+/// at multiplier 1 with its scheduled deadline already gone, and the view
+/// times out on the next tick (`deadline_in_ms=0` in the s136 trace): the
+/// consecutive QC the 2-chain commit rule needs never forms.
+///
+/// Rule: an entered view gets at least one base view time from entry.
+#[test]
+fn update_view_after_backed_off_view_gets_a_full_view_time() {
+    let mvt = Duration::from_millis(500);
+    // Schedule base T0: view 10 at T0 + 1 slot, 11 at T0 + 2, 12 at T0 + 3.
+    let (mut pacemaker, vss) = test_pacemaker(10);
+
+    // Enter 11 with the QC frontier at 8 (stall depth 2 => x4): stretched in
+    // place to entry + 4 slots, past the scheduled deadline of view 12.
+    pacemaker
+        .update_view(ViewNumber::new(11), &vss, ViewNumber::new(8), ViewNumber::new(8))
+        .unwrap();
+    // QC(11) forms late in the backed-off view, after view 12's scheduled
+    // deadline (T0 + 3 slots) but before view 11's own (entry + 4 slots).
+    std::thread::sleep(mvt * 3 + Duration::from_millis(100));
+
+    let before = Instant::now();
+    pacemaker
+        .update_view(ViewNumber::new(12), &vss, ViewNumber::new(11), ViewNumber::new(11))
+        .unwrap();
+    let after = Instant::now();
+    let deadline = pacemaker.query().deadline;
+    assert!(
+        deadline >= before + mvt,
+        "a view entered on QC(v-1) after a backed-off view must get a full view time, \
+         not a deadline {:?} in the past",
+        before.saturating_duration_since(deadline),
+    );
+    assert!(deadline <= after + mvt * 2, "and no more than the 2b bound");
+
+    // The next healthy entry right after it keeps a live deadline too.
+    let before = Instant::now();
+    pacemaker
+        .update_view(ViewNumber::new(13), &vss, ViewNumber::new(12), ViewNumber::new(12))
+        .unwrap();
+    assert!(pacemaker.query().deadline >= before + mvt);
+}
+
+/// The lower bound holds on every entry path: a TC/timeout jump at
+/// multiplier 1 (frontier QC(v-1) held) into a view whose scheduled deadline
+/// is gone, and a round-skip (`skip_to_view`) likewise.
+#[test]
+fn every_entry_gets_at_least_one_view_time() {
+    let mvt = Duration::from_millis(500);
+    let (mut pacemaker, vss) = test_pacemaker(1);
+    // Real time consumes the schedule: views 1..=4 are all in the past.
+    std::thread::sleep(mvt * 4 + Duration::from_millis(100));
+    let before = Instant::now();
+    pacemaker
+        .update_view(ViewNumber::new(3), &vss, ViewNumber::new(2), ViewNumber::new(2))
+        .unwrap();
+    assert!(pacemaker.query().deadline >= before + mvt, "update_view");
+
+    std::thread::sleep(mvt * 2 + Duration::from_millis(100));
+    let before = Instant::now();
+    assert!(pacemaker
+        .skip_to_view(ViewNumber::new(5), &vss, ViewNumber::new(4), ViewNumber::new(4))
+        .unwrap());
+    assert!(pacemaker.query().deadline >= before + mvt, "skip_to_view");
+}
+
 /// S470 (commit-lag backoff): the commit-lag exponent is a pure function of
 /// `(highest_qc_view, committed_view, cap)` — no node-local timing state — so
 /// every honest replica derives the identical schedule (lockstep-exact), and
