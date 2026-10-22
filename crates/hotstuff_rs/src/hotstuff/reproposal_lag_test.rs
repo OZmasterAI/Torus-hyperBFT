@@ -13,11 +13,15 @@
 //! So a replica asks [`App::check_reproposal_data`] (which may skip freshness rules) instead of
 //! [`App::check_block_data`] when the block
 //! - is certified: this replica's highest PC or locked PC, or the attached TC's high QC, is on it;
-//! - is the block this replica last voted for (it judged it fresh then); or
-//! - is a TC re-proposal (correct TC(v-1), high tip wins, no NEC) whose tip is this replica's own
-//!   local tip, or which the TC's signed tips vouch for with more than the faulty power (at least
-//!   one honest replica voted for it while it was fresh), counted under a set that authenticates
-//!   the TC.
+//! - is a TC re-proposal (correct TC(v-1), high tip wins, no NEC) which the TC's signed tips vouch
+//!   for with more than the faulty power (at least one honest replica voted for it while it was
+//!   fresh), counted under a set that authenticates the TC; or
+//! - outside a TC re-proposal, is the block this replica last voted for (a validator-set update's
+//!   Prepare vote, which sets no tip).
+//!
+//! A TC re-proposal is judged by its TC alone, never by the replica's own tip or vote (Codex P1-a,
+//! s138): every honest replica then decides alike, so a stale tip voted by a minority cannot split
+//! them into re-voters (who withhold No-Endorsements) and refusers forever.
 //!
 //! A TC re-proposal nobody honest vouches for is still judged fresh: a byzantine leader that
 //! proposes ts = parent.ts after a stall (the M2 hole) and reports that block as its own tip in

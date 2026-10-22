@@ -2871,7 +2871,12 @@ impl<N: Network> HotStuff<N> {
         let exempt = |block_tree: &BlockTreeSingleton<K>| {
             Self::freshness_exempt(&hash, header.tc.as_ref(), header.is_reproposal(), block_tree)
         };
-        let held = if self.pending_bodies.contains_key(&hash) {
+        // Codex P1-b (M2 review, s138): `pending_bodies` holds this leader's own proposals, voted
+        // without a data check. Only a block it just produced may skip it: a TC re-proposal (case
+        // 4, or case 5 after a ProposalResponse; both in the tree) is checked like any voter's,
+        // or a leader that cannot judge a stale tip (data `Missing`) would vote for it and make it
+        // an honest signed tip, vouching for it in the next TC with one byzantine tip.
+        let held = if self.pending_bodies.contains_key(&hash) && !header.is_reproposal() {
             true
         } else if block_tree.contains(&hash) {
             // Rebase s87 (T0b): validated on insertion, but vote-time-only rules
@@ -2955,18 +2960,26 @@ impl<N: Network> HotStuff<N> {
     /// Review M2 (owner s138): whether the vote for `block_hash` asks
     /// [`App::check_reproposal_data`] (which may skip vote-time freshness rules: Torus's 30 s
     /// block timestamp lower bound) instead of [`App::check_block_data`]. True for a block
-    /// consensus may force a leader to propose again unchanged, whose freshness an honest replica
+    /// consensus may force a leader to propose again unchanged, whose freshness honest replicas
     /// already judged while it was new:
     ///
     /// 1. **certified**: this replica's highest PC or locked PC is on it, or so is the attached
     ///    TC's high QC (`tc`: verified by the caller): the validator-set-update re-proposal
     ///    (`repropose_block`), including the re-proposal of the locked block itself (reflexive
     ///    lock, s138);
-    /// 2. **voted**: it is the block this replica last voted for (a Prepare vote sets no tip);
-    /// 3. **authenticated TC re-proposal** (`is_reproposal`: correct TC(v-1), its high tip wins,
-    ///    no NEC; VALIDPROPOSAL V2 made the block that tip): the tip is this replica's own local
-    ///    tip, or the TC's signed tips for it hold more than the faulty power
-    ///    ([`TimeoutCertificate::tip_vouched`]).
+    /// 2. **authenticated TC re-proposal** (`is_reproposal`: correct TC(v-1), its high tip wins,
+    ///    no NEC; VALIDPROPOSAL V2 made the block that tip): the TC's signed tips for it hold more
+    ///    than the faulty power ([`TimeoutCertificate::tip_vouched`]);
+    /// 3. **voted, outside a TC re-proposal**: it is the block this replica last voted for (a
+    ///    validator-set update's Prepare vote, which sets no tip: no TC can vouch for it, and no
+    ///    No-Endorsement is withheld for it).
+    ///
+    /// A TC re-proposal is judged by the TC alone, never by this replica's own tip or vote (Codex
+    /// P1-a, s138): every honest replica receiving it then decides alike. A local exemption split
+    /// them on a stale tip voted by a minority: its voters re-voted it whenever they or a byzantine
+    /// leader re-proposed it (so withheld their NEs), the rest refused it, and neither a QC nor an
+    /// NEC could form, in any view. Judged by the TC, nobody re-votes it unless it is vouched (then
+    /// all do), and its voters sign NEs once their vote is older than the TC's view.
     ///
     /// Anything else is fresh: a block one byzantine leader proposed stale and reports as its own
     /// tip (tip power 1 <= f) is refused, and the next leader drops it through an NEC
@@ -2981,28 +2994,30 @@ impl<N: Network> HotStuff<N> {
         if certified(&block_tree.highest_pc()?)
             || certified(&block_tree.locked_pc()?)
             || tc.and_then(|tc| tc.high_qc.as_ref()).is_some_and(certified)
-            || block_tree.last_voted_proposal()?.is_some_and(|(_, voted)| voted == *block_hash)
         {
             return Ok(true);
         }
-        let Some(tc) = tc.filter(|tc| is_reproposal && tc.high_tip.as_ref().is_some_and(|tip| tip.block_hash == *block_hash))
-        else {
-            return Ok(false);
-        };
-        if block_tree.local_tip()?.is_some_and(|tip| tip.block_hash == *block_hash) {
-            return Ok(true);
+        if is_reproposal {
+            let Some(tc) = tc.filter(|tc| tc.high_tip.as_ref().is_some_and(|tip| tip.block_hash == *block_hash)) else {
+                return Ok(false);
+            };
+            return Ok(tc.tip_vouched(block_tree)?);
         }
-        Ok(tc.tip_vouched(block_tree)?)
+        Ok(block_tree.last_voted_proposal()?.is_some_and(|(_, voted)| voted == *block_hash))
     }
 
     /// Review M2 (s138, the leader side of [`Self::freshness_exempt`]; claude-review s131 round
     /// 2): whether this leader must NOT re-propose `block`, the winning high tip of `tc`: it is
-    /// not freshness-exempt for this replica, and the app refuses it on a freshness rule alone
-    /// (`check_block_data` refuses, `check_reproposal_data` holds). Honest replicas would refuse
-    /// it the same way, so re-proposing it would only lose the view, in every view while the tip
-    /// keeps winning the TCs (one byzantine timeout vote suffices). The leader seeks an NEC
-    /// instead (`create_proposal_based_on_tc`, `complete_recovery`): honest replicas never voted
-    /// for such a block, so they sign No-Endorsements and a fresh block replaces it.
+    /// not freshness-exempt (judged by `tc`, as every honest replica judges it), and the app
+    /// refuses it fresh (`check_block_data` is `Invalid`) but not otherwise
+    /// (`check_reproposal_data` is `Held`, or `Missing`: Codex P1-b, the data not local yet
+    /// cannot make a block fresh). Honest replicas would refuse it the same way, so re-proposing
+    /// it would only lose the view, in every view while the tip keeps winning the TCs (one
+    /// byzantine timeout vote suffices). The leader seeks an NEC instead
+    /// (`create_proposal_based_on_tc`, `complete_recovery`): honest replicas sign
+    /// No-Endorsements unless they voted for it in the TC's view, and a fresh block replaces it.
+    /// A tip whose fresh check is `Missing` is re-proposed: every voter, this leader included
+    /// (no `pending_bodies` shortcut for a re-proposal), votes only once it holds.
     fn refused_as_stale<K: KVStore>(
         block: &Block,
         tc: &TimeoutCertificate,
@@ -3014,7 +3029,7 @@ impl<N: Network> HotStuff<N> {
         }
         let view = block_tree.app_view(None)?;
         let stale = app.check_block_data(block, &view) == BlockDataCheck::Invalid
-            && app.check_reproposal_data(block, &view) == BlockDataCheck::Held;
+            && app.check_reproposal_data(block, &view) != BlockDataCheck::Invalid;
         if stale {
             log::warn!(
                 "not re-proposing the TC's high tip {}: stale and vouched for by at most f; seeking an NEC",
