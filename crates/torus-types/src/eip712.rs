@@ -1403,6 +1403,73 @@ pub fn batch_verify_native_actions_cached_with_sort_hashes(
     )
 }
 
+/// s80 keyed-local-trust-key (prototype; no node caller yet): the exec verify
+/// pass keyed by the SHA-256 local trust key
+/// ([`crate::local_trust_key`]) with the sort hash memoized in the cache
+/// value. `memo_lookup(key)` returns `(sender, keccak256(C))` that THIS node
+/// seeded after verifying the byte-identical `(C, nonce, sig)`
+/// ([`crate::sort_hash_and_local_trust_key_with_scratch`]). On a hit both are
+/// reused (no Keccak); on a miss or for a session action `keccak256(C)` is
+/// computed here and the sender resolves exactly as in
+/// [`batch_verify_native_actions_cached_with_sort_hashes`] (phase 1 recover,
+/// phase 2 sessions). Same outputs as that function when the memo was seeded
+/// from verified actions. The pre-pass is always sequential (it ignores
+/// `TORUS_EXEC_PARALLEL_KEYS`); the lookup sees one key per EIP-712 action,
+/// in input order.
+pub fn batch_verify_native_actions_local_key_memo(
+    actions: &[SignedNativeAction],
+    timestamp: u64,
+    session_lookup: impl Fn(&[u8; 32]) -> Option<crate::SessionData>,
+    memo_lookup: impl Fn(&B256) -> Option<(Address, B256)>,
+) -> (Vec<Option<Address>>, Vec<B256>) {
+    let mode = verify_mode();
+    let pool = if matches!(mode, VerifyMode::Pool(_)) {
+        live_verify_pool()
+    } else {
+        None
+    };
+    local_key_memo_impl(actions, timestamp, session_lookup, memo_lookup, mode, pool)
+}
+
+/// [`batch_verify_native_actions_local_key_memo`] with an explicit
+/// [`VerifyMode`] (an ephemeral pool for `Pool(n)`; tests and benches).
+pub fn batch_verify_native_actions_local_key_memo_with_mode(
+    actions: &[SignedNativeAction],
+    timestamp: u64,
+    session_lookup: impl Fn(&[u8; 32]) -> Option<crate::SessionData>,
+    memo_lookup: impl Fn(&B256) -> Option<(Address, B256)>,
+    mode: VerifyMode,
+) -> (Vec<Option<Address>>, Vec<B256>) {
+    let pool = match mode {
+        VerifyMode::Pool(n) => rayon::ThreadPoolBuilder::new().num_threads(n).build().ok(),
+        _ => None,
+    };
+    local_key_memo_impl(actions, timestamp, session_lookup, memo_lookup, mode, pool.as_ref())
+}
+
+fn local_key_memo_impl(
+    actions: &[SignedNativeAction],
+    timestamp: u64,
+    session_lookup: impl Fn(&[u8; 32]) -> Option<crate::SessionData>,
+    memo_lookup: impl Fn(&B256) -> Option<(Address, B256)>,
+    mode: VerifyMode,
+    dedicated: Option<&rayon::ThreadPool>,
+) -> (Vec<Option<Address>>, Vec<B256>) {
+    let mut scratch = Vec::new();
+    let mut sort_hashes = Vec::with_capacity(actions.len());
+    let cache_hits: Vec<Option<Address>> = actions
+        .iter()
+        .map(|action| {
+            let (hit, sort) =
+                crate::local_trust_lookup_with_scratch(action, &mut scratch, &memo_lookup);
+            sort_hashes.push(sort);
+            hit
+        })
+        .collect();
+    let senders = verify_phases(actions, timestamp, session_lookup, &cache_hits, mode, dedicated);
+    (senders, sort_hashes)
+}
+
 /// One action's `(sort hash if wanted, trust-cache key)`. Without
 /// `want_sort_hash` this is exactly today's `verified_cache_key_with_scratch`.
 fn action_keys(

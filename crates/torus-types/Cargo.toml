@@ -14,6 +14,8 @@ ethnum = { workspace = true }
 k256 = { workspace = true }
 ed25519-dalek = { workspace = true }
 rayon = "1"
+# s80 keyed-local-trust-key: SHA-256 (SHA-NI via runtime cpufeatures) node-local trust key.
+sha2 = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -1485,6 +1485,109 @@ pub fn sort_hash_and_verified_cache_key_with_scratch(
     (sort_hash, Some(hasher.finalize()))
 }
 
+// ---- s80 keyed-local-trust-key (prototype, not wired into the node) ----
+//
+// The trust-cache key is node-local (never on the wire or in state), so its
+// hash function is free. These are the SHA-256 forms of the trust key: the
+// same preimage and eligibility as [`verified_cache_key`], hashed with
+// SHA-256 (SHA-NI where the CPU has it, about 4x keccak-asm per byte). Paired
+// with a cache value that memoizes the anti-MEV sort hash `keccak256(C)`, an
+// all-hit exec block needs no Keccak at all
+// (`eip712::batch_verify_native_actions_local_key_memo`).
+
+/// Encodes the trust-key preimage `C || nonce || v || r || s` into `data` and
+/// returns `(C's length, eligible)`. For a session action (not eligible)
+/// `data` holds only `C`.
+fn trust_key_preimage(action: &SignedNativeAction, data: &mut Vec<u8>) -> (usize, bool) {
+    data.clear();
+    action.action.append_canonical_bytes(data);
+    let c_len = data.len();
+    let ActionSignature::Eip712(sig) = &action.signature else {
+        return (c_len, false);
+    };
+    data.extend_from_slice(&action.nonce.to_be_bytes());
+    data.push(sig.v);
+    data.extend_from_slice(&sig.r);
+    data.extend_from_slice(&sig.s);
+    (c_len, true)
+}
+
+fn sha256_b256(data: &[u8]) -> B256 {
+    use sha2::Digest;
+    B256::from_slice(&sha2::Sha256::digest(data))
+}
+
+/// SHA-256 node-local trust key: `sha256(C || nonce || v || r || s)` for an
+/// EIP-712 action, `None` for a session action (same eligibility and
+/// preimage as [`verified_cache_key`], a different hash function).
+pub fn local_trust_key(action: &SignedNativeAction) -> Option<B256> {
+    if !matches!(&action.signature, ActionSignature::Eip712(_)) {
+        return None;
+    }
+    local_trust_key_with_scratch(action, &mut Vec::with_capacity(64))
+}
+
+/// [`local_trust_key`] with a caller-owned preimage buffer (contents
+/// afterwards unspecified).
+pub fn local_trust_key_with_scratch(
+    action: &SignedNativeAction,
+    data: &mut Vec<u8>,
+) -> Option<B256> {
+    if !matches!(&action.signature, ActionSignature::Eip712(_)) {
+        data.clear();
+        return None;
+    }
+    trust_key_preimage(action, data);
+    Some(sha256_b256(data))
+}
+
+/// What a verifying ingress path stores for the memo: `(keccak256(C),
+/// local key)`; the key is `None` for a session action. In the node the sort
+/// hash would come from forking the content-hash sponge after `C`.
+pub fn sort_hash_and_local_trust_key_with_scratch(
+    action: &SignedNativeAction,
+    data: &mut Vec<u8>,
+) -> (B256, Option<B256>) {
+    let (c_len, eligible) = trust_key_preimage(action, data);
+    let sort_hash = alloy_primitives::keccak256(&data[..c_len]);
+    (sort_hash, eligible.then(|| sha256_b256(data)))
+}
+
+/// The exec pre-pass of the memo path for one action: the local key (an
+/// EIP-712 action) and, if `lookup` misses or the action is not eligible,
+/// `keccak256(C)` computed here. Returns `(cached sender, sort hash)`.
+pub fn local_trust_lookup_with_scratch(
+    action: &SignedNativeAction,
+    data: &mut Vec<u8>,
+    lookup: impl FnOnce(&B256) -> Option<(Address, B256)>,
+) -> (Option<Address>, B256) {
+    let (c_len, eligible) = trust_key_preimage(action, data);
+    if eligible {
+        if let Some((sender, sort_hash)) = lookup(&sha256_b256(data)) {
+            return (Some(sender), sort_hash);
+        }
+    }
+    (None, alloy_primitives::keccak256(&data[..c_len]))
+}
+
+/// Whether `sha2` takes its SHA-NI path on this CPU (the same CPUID test as
+/// sha2 0.10's `cpufeatures::new!(shani_cpuid, "sha", "sse2", "ssse3",
+/// "sse4.1")`). Without it SHA-256 is slower than keccak-asm, so a node
+/// would keep the keccak key.
+pub fn sha256_hw_accelerated() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        std::arch::is_x86_feature_detected!("sha")
+            && std::arch::is_x86_feature_detected!("sse2")
+            && std::arch::is_x86_feature_detected!("ssse3")
+            && std::arch::is_x86_feature_detected!("sse4.1")
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
 // ============================================================================
 // Order Types
 // ============================================================================

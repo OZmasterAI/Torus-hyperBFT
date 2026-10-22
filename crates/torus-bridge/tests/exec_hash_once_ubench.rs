@@ -164,10 +164,14 @@ fn exec_hash_once_ubench_new_path() {
 // Block shape (bench CL21): 60 actions = 37 PlaceOrderBatch x 400 + 23
 // CancelAllOrders. `tie_pct` = share of the places whose (category, sender)
 // sort key ties with another place (pairs of places from one sender).
+//
+// Arm `sha256-tieonly` (the no-memo alternative): SHA-256 key -> sender only;
+// keccak(C) is computed on E for the actions whose (category, sender) ties
+// with another action (only there can the hash change the order).
 // ============================================================================
 
 use std::sync::RwLock;
-use torus_bridge::native_executor::IndexedActions;
+use torus_bridge::native_executor::{classify_action, IndexedActions};
 use torus_types::eip712::batch_verify_native_actions_local_key_memo;
 
 const BENCH_PLACES: usize = 37;
@@ -176,6 +180,16 @@ const BENCH_ORDERS: usize = 400;
 
 type KeccakCache = RwLock<HashMap<B256, Address>>;
 type MemoCache = RwLock<HashMap<B256, (Address, B256)>>;
+
+/// The three trust-caches, seeded like ingress would.
+struct Caches {
+    /// keccak key -> sender (today).
+    keccak: KeccakCache,
+    /// SHA-256 key -> (sender, keccak(C)).
+    memo: MemoCache,
+    /// SHA-256 key -> sender (the tie-only arm).
+    local: KeccakCache,
+}
 
 /// Number of same-sender place pairs for a tie share (participants = 2 x pairs).
 fn tie_pairs(tie_pct: usize) -> usize {
@@ -207,9 +221,10 @@ fn bench_block(tie_pct: usize, salt: u64) -> Vec<SignedNativeAction> {
                 ),
                 quantity: FixedPoint::from_raw(10_000_000 + j as i128),
                 order_type: OrderType::Limit,
-                time_in_force: if j % 5 == 0 { TimeInForce::IOC } else { TimeInForce::GTC },
+                time_in_force: TimeInForce::GTC,
                 reduce_only: false,
-                client_order_id: Some((salt as u128) << 64 | (i * 100_000 + j) as u128),
+                // The 300-market cells run with cloid share 0: 45 B per order.
+                client_order_id: None,
             })
             .collect();
         actions.push(sign_native_action(
@@ -238,13 +253,15 @@ fn bench_block(tie_pct: usize, salt: u64) -> Vec<SignedNativeAction> {
 
 /// Both trust-caches seeded like ingress would (outside any timed region),
 /// plus `filler` unrelated entries so the maps have a live-like size.
-fn seed_caches(actions: &[SignedNativeAction], filler: usize) -> (KeccakCache, MemoCache) {
+fn seed_caches(actions: &[SignedNativeAction], filler: usize) -> Caches {
     let mut kc = HashMap::with_capacity(filler + actions.len());
     let mut memo = HashMap::with_capacity(filler + actions.len());
+    let mut local = HashMap::with_capacity(filler + actions.len());
     for i in 0..filler {
         let k = alloy_primitives::keccak256((i as u64).to_be_bytes());
         kc.insert(k, Address::from_word(k));
         memo.insert(k, (Address::from_word(k), k));
+        local.insert(k, Address::from_word(k));
     }
     let mut scratch = Vec::new();
     for a in actions {
@@ -252,14 +269,26 @@ fn seed_caches(actions: &[SignedNativeAction], filler: usize) -> (KeccakCache, M
         kc.insert(torus_types::verified_cache_key(a).unwrap(), sender);
         let (sort, key) = torus_types::sort_hash_and_local_trust_key_with_scratch(a, &mut scratch);
         memo.insert(key.unwrap(), (sender, sort));
+        local.insert(key.unwrap(), sender);
     }
-    (RwLock::new(kc), RwLock::new(memo))
+    Caches { keccak: RwLock::new(kc), memo: RwLock::new(memo), local: RwLock::new(local) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum TrustKeyArm {
     Keccak,
     Sha256,
+    Sha256TieOnly,
+}
+
+impl TrustKeyArm {
+    fn name(self) -> &'static str {
+        match self {
+            TrustKeyArm::Keccak => "keccak",
+            TrustKeyArm::Sha256 => "sha256",
+            TrustKeyArm::Sha256TieOnly => "sha256-tieonly",
+        }
+    }
 }
 
 /// One E-path pass: (senders, sort hashes, sorted lists, verify ms, sort ms).
@@ -267,8 +296,7 @@ enum TrustKeyArm {
 fn e_path(
     arm: TrustKeyArm,
     actions: &[SignedNativeAction],
-    kc: &KeccakCache,
-    memo: &MemoCache,
+    caches: &Caches,
 ) -> (Vec<Option<Address>>, Vec<B256>, (IndexedActions, IndexedActions), f64, f64) {
     let t = Instant::now();
     let (senders, hashes) = match arm {
@@ -276,14 +304,40 @@ fn e_path(
             actions,
             NOW,
             |_| None,
-            |k| kc.read().unwrap().get(k).copied(),
+            |k| caches.keccak.read().unwrap().get(k).copied(),
         ),
         TrustKeyArm::Sha256 => batch_verify_native_actions_local_key_memo(
             actions,
             NOW,
             |_| None,
-            |k| memo.read().unwrap().get(k).copied(),
+            |k| caches.memo.read().unwrap().get(k).copied(),
         ),
+        TrustKeyArm::Sha256TieOnly => {
+            // A hit carries no sort hash (ZERO placeholder); a miss hashes C.
+            let (senders, mut hashes) = batch_verify_native_actions_local_key_memo(
+                actions,
+                NOW,
+                |_| None,
+                |k| caches.local.read().unwrap().get(k).map(|s| (*s, B256::ZERO)),
+            );
+            // keccak(C) only where (category, sender) ties: elsewhere the
+            // hash cannot change the order.
+            let mut groups: HashMap<(u8, Address), u32> = HashMap::with_capacity(actions.len());
+            let keyed: Vec<Option<(u8, Address)>> = actions
+                .iter()
+                .zip(&senders)
+                .map(|(a, s)| s.map(|s| (classify_action(&a.action) as u8, s)))
+                .collect();
+            for k in keyed.iter().flatten() {
+                *groups.entry(*k).or_default() += 1;
+            }
+            for (i, k) in keyed.iter().enumerate() {
+                if k.is_some_and(|k| groups[&k] > 1) && hashes[i] == B256::ZERO {
+                    hashes[i] = alloy_primitives::keccak256(actions[i].action.canonical_bytes());
+                }
+            }
+            (senders, hashes)
+        }
     };
     let tv = t.elapsed().as_secs_f64() * 1e3;
     // The replay guard's clone (untimed: identical in both arms).
@@ -312,13 +366,19 @@ fn trust_key_memo_arm_matches_keccak_arm_on_bench_blocks() {
     for tie_pct in [0usize, 20, 50] {
         let actions = bench_block(tie_pct, tie_pct as u64);
         assert_eq!(actions.len(), BENCH_PLACES + BENCH_CANCELS);
-        let (kc, memo) = seed_caches(&actions, 1_000);
-        let (s_k, h_k, sorted_k, _, _) = e_path(TrustKeyArm::Keccak, &actions, &kc, &memo);
-        let (s_s, h_s, sorted_s, _, _) = e_path(TrustKeyArm::Sha256, &actions, &kc, &memo);
+        let caches = seed_caches(&actions, 1_000);
+        let (s_k, h_k, sorted_k, _, _) = e_path(TrustKeyArm::Keccak, &actions, &caches);
+        let (s_s, h_s, sorted_s, _, _) = e_path(TrustKeyArm::Sha256, &actions, &caches);
         assert_eq!(s_s, s_k, "tie {tie_pct}%: senders");
         assert_eq!(h_s, h_k, "tie {tie_pct}%: sort hashes");
         assert_eq!(order_of(&sorted_s.0), order_of(&sorted_k.0), "tie {tie_pct}%: pre-EVM");
         assert_eq!(order_of(&sorted_s.1), order_of(&sorted_k.1), "tie {tie_pct}%: post-EVM");
+        // The tie-only arm: same senders and lists (its non-tie hashes are
+        // placeholders by design).
+        let (s_t, _, sorted_t, _, _) = e_path(TrustKeyArm::Sha256TieOnly, &actions, &caches);
+        assert_eq!(s_t, s_k, "tie {tie_pct}%: tie-only senders");
+        assert_eq!(order_of(&sorted_t.0), order_of(&sorted_k.0), "tie {tie_pct}%: tie-only pre");
+        assert_eq!(order_of(&sorted_t.1), order_of(&sorted_k.1), "tie {tie_pct}%: tie-only post");
         // Uncached ground truth.
         let fresh: Vec<(Address, NativeAction)> = actions
             .iter()
@@ -364,8 +424,9 @@ fn hash_throughput() -> (f64, f64) {
 }
 
 /// Decisive µbench: verify + sort ms per bench-shaped block, keccak vs
-/// sha256, ABBA rounds (K S S K K S), median of `UB_REPS` (200) reps each.
-/// `UB_TRUST_KEY=keccak|sha256` runs one arm only; `UB_TIES` (default
+/// sha256, ABBA rounds (K S S K K S), median of `UB_REPS` (200) reps each;
+/// then the tie-only arm against keccak (K T T K K T).
+/// `UB_TRUST_KEY=keccak|sha256|tieonly` runs one arm only; `UB_TIES` (default
 /// `0,20,50`) picks the tie shares; `UB_FILLER` (65536) the cache size.
 #[test]
 #[ignore]
@@ -382,9 +443,13 @@ fn trust_key_ubench_bench_block() {
     let order: Vec<TrustKeyArm> = match only.as_deref() {
         Some("keccak") => vec![TrustKeyArm::Keccak; 3],
         Some("sha256") => vec![TrustKeyArm::Sha256; 3],
+        Some("tieonly") => vec![TrustKeyArm::Sha256TieOnly; 3],
         _ => {
             use TrustKeyArm::*;
-            vec![Keccak, Sha256, Sha256, Keccak, Keccak, Sha256]
+            vec![
+                Keccak, Sha256, Sha256, Keccak, Keccak, Sha256, // ABBA memo
+                Keccak, Sha256TieOnly, Sha256TieOnly, Keccak, Keccak, Sha256TieOnly, // ABBA tie-only
+            ]
         }
     };
     let (k_mbs, s_mbs) = hash_throughput();
@@ -395,14 +460,14 @@ fn trust_key_ubench_bench_block() {
     for tie_pct in ties {
         let actions = bench_block(tie_pct, 1_000 + tie_pct as u64);
         let c_bytes: usize = actions.iter().map(|a| a.action.canonical_bytes().len()).sum();
-        let (kc, memo) = seed_caches(&actions, filler);
+        let caches = seed_caches(&actions, filler);
         let mut per_arm: HashMap<&'static str, Vec<(f64, f64, f64)>> = HashMap::new();
         for (round, &arm) in order.iter().enumerate() {
             let mut v = Vec::with_capacity(reps);
             let mut s = Vec::with_capacity(reps);
             let mut tot = Vec::with_capacity(reps);
             for rep in 0..reps + 5 {
-                let (_, _, sorted, tv, ts) = e_path(arm, &actions, &kc, &memo);
+                let (_, _, sorted, tv, ts) = e_path(arm, &actions, &caches);
                 std::hint::black_box(&sorted);
                 drop(sorted);
                 if rep >= 5 {
@@ -412,7 +477,7 @@ fn trust_key_ubench_bench_block() {
                 }
             }
             let (mv, ms, mt) = (median(v), median(s), median(tot));
-            let name = if arm == TrustKeyArm::Keccak { "keccak" } else { "sha256" };
+            let name = arm.name();
             println!(
                 "tie={tie_pct}% round={round} arm={name}: verify {mv:.4} ms  sort {ms:.4} ms  verify+sort {mt:.4} ms (median of {reps})"
             );
@@ -426,18 +491,20 @@ fn trust_key_ubench_bench_block() {
                 mean(&r.iter().map(|x| x.2).collect::<Vec<_>>()),
             ))
         };
-        if let (Some(k), Some(s)) = (summary("keccak"), summary("sha256")) {
-            println!(
-                "SUMMARY tie={tie_pct}% C={c_bytes} B/blk: keccak verify+sort {:.4} ms (verify {:.4} sort {:.4}) | sha256 {:.4} ms (verify {:.4} sort {:.4}) | saved {:.4} ms/blk ({:+.1}%)",
-                k.2,
-                k.0,
-                k.1,
-                s.2,
-                s.0,
-                s.1,
-                k.2 - s.2,
-                (s.2 / k.2 - 1.0) * 100.0
-            );
+        for other in ["sha256", "sha256-tieonly"] {
+            if let (Some(k), Some(s)) = (summary("keccak"), summary(other)) {
+                println!(
+                    "SUMMARY tie={tie_pct}% C={c_bytes} B/blk: keccak verify+sort {:.4} ms (verify {:.4} sort {:.4}) | {other} {:.4} ms (verify {:.4} sort {:.4}) | saved {:.4} ms/blk ({:+.1}%)",
+                    k.2,
+                    k.0,
+                    k.1,
+                    s.2,
+                    s.0,
+                    s.1,
+                    k.2 - s.2,
+                    (s.2 / k.2 - 1.0) * 100.0
+                );
+            }
         }
     }
 }
