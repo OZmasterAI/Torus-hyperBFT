@@ -32,8 +32,8 @@
 #               FORCE=1. Never rebuilt implicitly (1M accounts take minutes and
 #               ~290 MB). Cost at N = 1M: each jq pass over the genesis parses
 #               ~240-290 MB (~3 s, a rewrite ~7 s and ~1.4 GB RSS with jq 1.8);
-#               this script does one rewrite (step 3, more with the optional
-#               steps 4-5) and one summary pass.
+#               this script does two rewrites (steps 3 and 5, more with the optional
+#               steps 4 and 6) and one summary pass.
 #   EVM_BLOCK_INTERVAL=N  genesis EVM cadence N (.evm.block_interval: EVM txs
 #               only at heights with height % N == 0; bench Q12). Integer in
 #               2..=100 (torus_types::EVM_BLOCK_INTERVAL_RANGE, what governance
@@ -212,20 +212,27 @@ fi
 #            only for a Classic book mode and unless BOOK_WINDOW_COMMIT=0);
 #    H     = from H (the alias field state_hash_activation_height, as before);
 #    off   = no activation written (the pre-s136 bytes).
-if [ "${STATE_HASH_ACTIVATION:-}" = off ]; then
-    :
-elif [ -n "${STATE_HASH_ACTIVATION:-}" ]; then
+#    Whatever the base carries for these (the alias, the L6.1 bool,
+#    activations.running_state_hash / book_window_commit) is dropped first, so
+#    this script alone decides (Codex P2: an inherited alias survived 'off' while
+#    the summary said off). One jq pass for all three.
+if [ -n "${STATE_HASH_ACTIVATION:-}" ] && [ "$STATE_HASH_ACTIVATION" != off ]; then
     [[ "$STATE_HASH_ACTIVATION" =~ ^[0-9]+$ ]] && [ "$STATE_HASH_ACTIVATION" -ge 1 ] \
         || { echo "FATAL: STATE_HASH_ACTIVATION must be an integer >= 1 or 'off' (got '$STATE_HASH_ACTIVATION')" >&2; exit 1; }
-    tmp=$(mktemp) && jq --argjson h "$STATE_HASH_ACTIVATION" '.consensus.state_hash_activation_height = $h' "$OUT" > "$tmp" && mv "$tmp" "$OUT"
-else
-    win=true; [ "${BOOK_WINDOW_COMMIT:-}" = 0 ] && win=false
-    tmp=$(mktemp) && jq --argjson win "$win" '
-        ((.consensus.book_mode // "classic") | tostring | ascii_downcase) as $m
-        | .consensus.activations = ({running_state_hash: 1}
-            + (if $win and ($m == "classic" or $m == "0") then {book_window_commit: 1} else {} end))' \
-        "$OUT" > "$tmp" && mv "$tmp" "$OUT"
 fi
+win=true; [ "${BOOK_WINDOW_COMMIT:-}" = 0 ] && win=false
+tmp=$(mktemp) && jq --arg sha "${STATE_HASH_ACTIVATION:-}" --argjson win "$win" '
+    .consensus |= (del(.state_hash_activation_height, .book_window_commit)
+        | if has("activations") then
+              .activations |= del(.running_state_hash, .book_window_commit)
+              | if .activations == {} then del(.activations) else . end
+          else . end)
+    | ((.consensus.book_mode // "classic") | tostring | ascii_downcase) as $m
+    | if $sha == "off" then .
+      elif $sha != "" then .consensus.state_hash_activation_height = ($sha | tonumber)
+      else .consensus.activations = ((.consensus.activations // {}) + {running_state_hash: 1}
+          + (if $win and ($m == "classic" or $m == "0") then {book_window_commit: 1} else {} end))
+      end' "$OUT" > "$tmp" && mv "$tmp" "$OUT"
 
 # 6. Optional L6.1 window-committed Classic books (docs/plans/l61-window-committed-books.md).
 #    CHAIN-WIDE genesis field (alias of activations.book_window_commit at the running
