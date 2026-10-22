@@ -326,3 +326,26 @@ fn order_events_cost_ubench() {
         off[3], on[3]
     );
 }
+
+/// Codex P2 (s139): an accepted reduce-only placement clamped to the position
+/// reports the clamped `originalQty` (the stored order's), not the request.
+#[test]
+fn order_events_reduce_only_clamp_reports_clamped_orig_qty() {
+    let mut b = book();
+    let mut ro = ReduceOnlyPositions::new();
+    // A long 2: a reduce-only sell of 5 rests as 2.
+    ro.insert(addr(A), fp(2));
+    b.set_reduce_only_positions(ro);
+    let mut p = gtc(false, 100, 5);
+    p.reduce_only = true;
+    let r = b.place_order(p, addr(A), 1);
+    assert!(r.reject.is_none());
+    let o = b.get_order(r.order_id).expect("rests");
+    assert_eq!(o.original_qty, fp(2));
+    let ev = b.take_order_events();
+    assert_eq!(summary(&ev), vec![(Some(r.order_id), A, S::Open, R::None, 0, 2)]);
+    assert_eq!(ev[0].orig_qty, fp(2), "event originalQty == book originalQty");
+    // A later cancel reports the same originalQty.
+    b.cancel_order(r.order_id).unwrap();
+    assert_eq!(b.take_order_events()[0].orig_qty, fp(2));
+}

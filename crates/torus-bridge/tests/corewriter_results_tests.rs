@@ -307,3 +307,45 @@ fn drain_entries_report_the_order_id_each_placement_got() {
         "the IOC filled against the native sell and rests nowhere"
     );
 }
+
+/// Codex P2 (s139): a CoreWriter placement refused before the book (off
+/// tick) records its `orderUpdates` rejection with the row's parameters, as
+/// a native placement does; nothing while recording is off.
+#[test]
+fn drained_pre_book_rejection_records_an_order_event() {
+    use torus_state::order_events::{OrderEventReason, OrderEventStatus};
+    for record in [true, false] {
+        let (_dir, db) = open_test_db();
+        fund(&db, 21);
+        let mut off_tick = cw_order(0, 100, 0);
+        if let QueuedActionKind::PlaceOrder { price, cloid, .. } = &mut off_tick {
+            *price = FixedPoint::from_raw(100 * FixedPoint::SCALE + FixedPoint::SCALE / 2);
+            *cloid = Some(0x77);
+        }
+        enqueue(&db, 21, off_tick, 1);
+        let mut ctx = ctx(&db);
+        ctx.set_order_events(record);
+        let entries = NativeExecutor::drain_core_writer_entries(&mut ctx).expect("queue reads");
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].result.success);
+        assert_eq!(
+            entries[0].result.reason,
+            torus_state::action_status::FailureReason::Tick
+        );
+        let events = ctx.take_order_events();
+        if !record {
+            assert!(events.is_empty(), "{events:?}");
+            continue;
+        }
+        assert_eq!(events.len(), 1, "{events:?}");
+        let e = &events[0];
+        assert_eq!(e.status, OrderEventStatus::Rejected);
+        assert_eq!(
+            e.reason,
+            OrderEventReason::Reject(torus_state::action_status::FailureReason::Tick)
+        );
+        assert_eq!((e.trader, e.market, e.order_id, e.cloid), (addr(21), 1, None, Some(0x77)));
+        assert_eq!(e.price, FixedPoint::from_raw(100 * FixedPoint::SCALE + FixedPoint::SCALE / 2));
+        assert_eq!(e.orig_qty, fp(1));
+    }
+}

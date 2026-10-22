@@ -1478,6 +1478,39 @@ mod subscribe_ws_tests {
         panic!("the publisher did not stop");
     }
 
+    /// Codex P2 (s139): a tick for another market does not advance the
+    /// subscription's height, so a forced refresh of the subscribed market at
+    /// that same height (a subscription joining during a publisher read) is
+    /// still delivered.
+    #[tokio::test]
+    async fn l2book_other_market_tick_does_not_swallow_refresh() {
+        // The publisher never polls in this test; the ticks are injected.
+        let node = start_l2(16, Duration::from_secs(3600)).await;
+        let mut ws = connect(node.addr).await;
+        let sub = ws.subscribe(json!(["l2Book", {"marketId": "0x1"}])).await;
+        let first = ws.recv().await;
+        assert_eq!(first["params"]["result"]["blockNumber"], "0x0", "{first}");
+        wait_subs(&node.subs, 1).await;
+        let tick = |market: u64, price: &str| {
+            let level = crate::types::RpcPriceLevel {
+                price: price.to_string(),
+                quantity: "0x1".to_string(),
+                order_count: 1,
+            };
+            let snap = crate::book_stream::BookSnap::new(vec![level], Vec::new());
+            let mut books = std::collections::BTreeMap::new();
+            books.insert(market, Ok(Arc::new(snap)));
+            Arc::new(crate::book_stream::BookTick { height: 1, books })
+        };
+        let _ = node.feed.tx.send(tick(2, "0x2"));
+        let _ = node.feed.tx.send(tick(1, "0x64"));
+        let n = ws.recv().await;
+        assert_eq!(n["params"]["subscription"], sub, "{n}");
+        assert_eq!(n["params"]["result"]["blockNumber"], "0x1", "{n}");
+        assert_eq!(n["params"]["result"]["seq"], "0x1", "{n}");
+        assert_eq!(n["params"]["result"]["levels"][0][0]["px"], "0x64", "{n}");
+    }
+
     /// A subscriber more than the feed's capacity behind is closed with a
     /// lag error.
     #[tokio::test]
