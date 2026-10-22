@@ -194,10 +194,13 @@ table built into the binary for the chain id:
   unknown feature name refuses to start (`invalid activations: ...`). The old
   field `consensus.state_hash_activation_height` is an alias of
   `activations.running_state_hash`; both set and different refuses to start.
-  **Default (owner s136):** a genesis naming no activation (no
-  `activations`, no alias) runs the running state hash from block 1, and
-  with a Classic book mode L6.1 `book_window_commit` from block 1 too;
-  `"activations": {}` turns every feature off.
+  **Default (owner s136):** every newly generated genesis
+  (`devnet/wsl/gen-3val-genesis.sh`) names
+  `"activations": {"running_state_hash": 1, "book_window_commit": 1}`
+  explicitly (L6.1 only with a Classic book mode). A genesis file naming no
+  activation (no `activations`, no alias) keeps its meaning: no feature, the
+  same as `"activations": {}` (its digest binds the data dir, so the node
+  never reinterprets an existing file).
 - **Running chain (a release):** the genesis file of a running chain cannot
   change (see "Genesis": the data dir refuses a changed file). A release
   carries the height in its built-in table (`builtin_activations`,

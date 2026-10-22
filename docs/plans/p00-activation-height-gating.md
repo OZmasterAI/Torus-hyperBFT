@@ -130,8 +130,10 @@ Steps 1-6: ~8-9 days. Step 2 changes the block hash, so it must land before the 
 
 ## 6. Open questions for the owner
 1. Running hash in the testnet genesis? Without it nothing detects divergent execution; only header bits are cross-checked.
-   **Answered (owner s136): ON at genesis.** A genesis naming no activation schedules `running_state_hash` from block 1
-   (`DEFAULT_GENESIS_ACTIVATIONS`, batch 10); `"activations": {}` opts out.
+   **Answered (owner s136): ON at genesis.** Every newly generated genesis names `running_state_hash` (and, Classic,
+   `book_window_commit`) from block 1 explicitly (`DEFAULT_GENESIS_ACTIVATIONS`, `gen-3val-genesis.sh`, batch 10). A
+   genesis file naming no activation still means none (Codex review P1: its digest binds the data dir, so the parser
+   never reinterprets an existing file).
 2. Built-in schedule now, governance later — or governance from day one (voting period / timelock for activations)?
 3. With 3 validators (f = 0) every upgrade needs all of them; is a stall at H acceptable on the trial testnet?
 4. Old binaries keep voting past H (liveness) or stop as proposed (safe when vote rules change)?

@@ -132,12 +132,14 @@ pub fn builtin_activations(chain_id: u64) -> &'static [(Feature, u64)] {
         .map_or(&[], |(_, activations)| activations)
 }
 
-/// Owner s136: the activations of a genesis that names none (no
-/// `consensus.activations`, no `state_hash_activation_height`): the running
-/// state hash from block 1, and with it L6.1 window-committed books (what the
-/// 9j head-to-head measured, CL21; the genesis drops
-/// [`Feature::BookWindowCommit`] for a row book mode: it is Classic-only). An
-/// explicit `"activations": {}` opts out.
+/// Owner s136: the activations every NEWLY generated genesis names
+/// explicitly (`devnet/wsl/gen-3val-genesis.sh` with STATE_HASH_ACTIVATION
+/// unset writes them as `consensus.activations`), and the schedule of a node
+/// started without `--genesis`: the running state hash from block 1, and
+/// with it L6.1 window-committed books (what the 9j head-to-head measured,
+/// CL21; a row book mode gets the hash only: L6.1 is Classic-only). A genesis
+/// FILE naming no activation still means none (Codex P1: its digest binds
+/// the data dir, so the parser never reinterprets it).
 pub const DEFAULT_GENESIS_ACTIVATIONS: &[(Feature, u64)] =
     &[(Feature::RunningStateHash, 1), (Feature::BookWindowCommit, 1)];
 

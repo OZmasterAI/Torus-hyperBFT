@@ -348,7 +348,9 @@ for i in $(seq "$3" $(( $3 + $5 - 1 ))); do printf '%s 0x%040x\\n' "$i" "$i"; do
                 self.assertEqual(result.returncode, 0, result.stderr)
                 full = json.loads(self.full.read_text())
                 final = json.loads(self.output.read_text())
-                self.assertEqual(final['consensus'], {**self.base['consensus'], 'book_mode': name})
+                # owner s136: the hash is written explicitly; a row mode gets no L6.1
+                self.assertEqual(final['consensus'], {**self.base['consensus'], 'book_mode': name,
+                                                      'activations': {'running_state_hash': 1}})
                 self.assertNotIn('book_mode', full['consensus'], 'the reused weighted base is never patched')
                 self.assertIn('book_mode  = %s' % name, result.stdout)
 

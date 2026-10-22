@@ -139,8 +139,10 @@ pub struct ConsensusConfig {
     /// P0.0: `{ "<feature_name>": height }`, when each gated feature switches
     /// on (0 or 1 = from block 1). An unknown name refuses to start;
     /// `state_hash_activation_height` is the alias of `running_state_hash`.
-    /// Absent (and no alias): [`torus_types::DEFAULT_GENESIS_ACTIVATIONS`]
-    /// (owner s136: the running state hash from block 1); `{}` = none.
+    /// Absent = none, the same as `{}` (Codex P1, s136: an existing genesis
+    /// file keeps its meaning, its digest binds the data dir). Owner s136's
+    /// "hash on at genesis" is written explicitly by the generators
+    /// ([`torus_types::DEFAULT_GENESIS_ACTIVATIONS`], `gen-3val-genesis.sh`).
     #[serde(default)]
     pub activations: Option<std::collections::BTreeMap<torus_types::Feature, u64>>,
     /// L6.1 window-committed Classic order books (CHAIN-WIDE, consensus-
@@ -438,22 +440,10 @@ impl Genesis {
     /// differs from the genesis one, refuse to start.
     pub fn activation_schedule(&self) -> Result<torus_types::ActivationSchedule, GenesisError> {
         use torus_types::Feature::{BookWindowCommit, RunningStateHash};
-        // Owner s136: a genesis naming no activation runs the defaults (the
-        // running state hash and, Classic only, L6.1 from block 1);
-        // `"activations": {}` opts out.
-        let mut activations = match (
-            &self.consensus.activations,
-            self.consensus.state_hash_activation_height,
-        ) {
-            (Some(named), _) => named.clone(),
-            (None, Some(_)) => Default::default(),
-            // L6.1 is Classic-only: a row book mode gets the hash alone.
-            (None, None) => torus_types::DEFAULT_GENESIS_ACTIVATIONS
-                .iter()
-                .copied()
-                .filter(|(f, _)| *f != BookWindowCommit || self.consensus.book_mode.is_classic())
-                .collect(),
-        };
+        // Codex P1 (s136): absent = none (an existing genesis file keeps its
+        // meaning: the same digest must mean the same chain). The default
+        // (hash + L6.1 from block 1) is written by the generators.
+        let mut activations = self.consensus.activations.clone().unwrap_or_default();
         if let Some(alias) = self.consensus.state_hash_activation_height {
             if alias == 0 {
                 return Err(GenesisError::InvalidActivations(

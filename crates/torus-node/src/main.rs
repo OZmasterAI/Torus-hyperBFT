@@ -467,9 +467,9 @@ fn default_chain_config() -> ChainConfig {
         commit_lag_backoff_cap: 0,
         reputation_leader_selection: false,
         exec_trust_cache: false,
-        // P0.0: no genesis, so the defaults of a genesis naming no activation
-        // (owner s136: the running state hash from block 1) and the built-in
-        // table.
+        // P0.0: no genesis file, so the defaults a generated genesis names
+        // (owner s136: the running state hash + L6.1 from block 1, Classic)
+        // and the built-in table.
         activations: torus_types::ActivationSchedule::for_chain(
             torus_evm::TORUS_CHAIN_ID,
             &torus_types::DEFAULT_GENESIS_ACTIVATIONS.iter().copied().collect(),

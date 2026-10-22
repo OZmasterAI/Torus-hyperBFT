@@ -203,16 +203,28 @@ if [ -n "$BOOK_MODE_NAME" ]; then
 fi
 
 # 5. Running state hash activation (docs/plans/running-state-hash-impl.md).
-#    CHAIN-WIDE: every node hashes from this height. Owner s136: ON at genesis:
-#    unset = the genesis names no activation, so the node default applies
-#    (running_state_hash from block 1); an integer H = from H (the alias
-#    field); 'off' = the explicit opt-out `.consensus.activations = {}`.
+#    CHAIN-WIDE: every node hashes from this height. Owner s136: ON in every
+#    genesis this script writes, named EXPLICITLY: the node reads a genesis
+#    naming no activation as off (its legacy meaning; Codex P1: an existing
+#    file's digest binds data dirs, so the parser never reinterprets it).
+#    unset = consensus.activations = {running_state_hash: 1, book_window_commit: 1}
+#            (torus_types::DEFAULT_GENESIS_ACTIVATIONS; book_window_commit, L6.1,
+#            only for a Classic book mode and unless BOOK_WINDOW_COMMIT=0);
+#    H     = from H (the alias field state_hash_activation_height, as before);
+#    off   = no activation written (the pre-s136 bytes).
 if [ "${STATE_HASH_ACTIVATION:-}" = off ]; then
-    tmp=$(mktemp) && jq '.consensus.activations = {}' "$OUT" > "$tmp" && mv "$tmp" "$OUT"
+    :
 elif [ -n "${STATE_HASH_ACTIVATION:-}" ]; then
     [[ "$STATE_HASH_ACTIVATION" =~ ^[0-9]+$ ]] && [ "$STATE_HASH_ACTIVATION" -ge 1 ] \
         || { echo "FATAL: STATE_HASH_ACTIVATION must be an integer >= 1 or 'off' (got '$STATE_HASH_ACTIVATION')" >&2; exit 1; }
     tmp=$(mktemp) && jq --argjson h "$STATE_HASH_ACTIVATION" '.consensus.state_hash_activation_height = $h' "$OUT" > "$tmp" && mv "$tmp" "$OUT"
+else
+    win=true; [ "${BOOK_WINDOW_COMMIT:-}" = 0 ] && win=false
+    tmp=$(mktemp) && jq --argjson win "$win" '
+        ((.consensus.book_mode // "classic") | tostring | ascii_downcase) as $m
+        | .consensus.activations = ({running_state_hash: 1}
+            + (if $win and ($m == "classic" or $m == "0") then {book_window_commit: 1} else {} end))' \
+        "$OUT" > "$tmp" && mv "$tmp" "$OUT"
 fi
 
 # 6. Optional L6.1 window-committed Classic books (docs/plans/l61-window-committed-books.md).
@@ -222,13 +234,6 @@ if [ "${BOOK_WINDOW_COMMIT:-0}" = 1 ]; then
     [ "${STATE_HASH_ACTIVATION:-}" != off ] \
         || { echo "FATAL: BOOK_WINDOW_COMMIT=1 needs the running state hash (STATE_HASH_ACTIVATION=off)" >&2; exit 1; }
     tmp=$(mktemp) && jq '.consensus.book_window_commit = true' "$OUT" > "$tmp" && mv "$tmp" "$OUT"
-    echo "  book_window_commit = on (L6.1)"
-fi
-
-# 6b. The node default of a Classic genesis naming no activation (unset
-#     STATE_HASH_ACTIVATION, no BOOK_MODE row mode) includes L6.1 from block 1.
-if [ -z "${STATE_HASH_ACTIVATION:-}" ] && [ -z "$BOOK_MODE_NAME" ] && [ "${BOOK_WINDOW_COMMIT:-0}" != 1 ]; then
-    echo "  book_window_commit = on (L6.1)"
 fi
 
 echo "wrote $OUT"
@@ -236,7 +241,9 @@ echo "wrote $OUT"
 jq -r '
     "  timeout_ms = \(.consensus.timeout_base_ms)",
     "  evm_block_interval = \(.evm.block_interval // "absent (node default 11)")",
-    "  state_hash_activation = \(if (.consensus | has("activations")) then (.consensus.activations.running_state_hash // "off") else (.consensus.state_hash_activation_height // 1) end)",
+    "  state_hash_activation = \(.consensus.activations.running_state_hash // .consensus.state_hash_activation_height // "off")",
+    (if (.consensus.activations.book_window_commit // null) != null or .consensus.book_window_commit == true
+     then "  book_window_commit = on (L6.1)" else empty end),
     "  book_mode  = \(.consensus.book_mode // "absent (classic)")",
     "  chain_id   = \(.chain_id)",
     "  validators = \(.validators|length)  (\([.validators[].address] | join(" ")) )",
