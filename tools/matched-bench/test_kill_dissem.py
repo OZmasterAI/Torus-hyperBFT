@@ -3,16 +3,18 @@
 
 A validator SIGKILLed without restart makes the survivors' sends to it fail (native-da / block-data OUTBOUND
 FAILURE peer=<its id>, once its QUIC connection times out). Those failures are expected and must not REJECT the
-cell. Everything else stays strict: a failure toward the OTHER survivor, a failure toward the killed node before
-its kill, a failure whose target the logs cannot name (no peer id, no proposer evidence for a fetched block) and
-any cell without the per-line evidence all still count. A cell without a kill is judged exactly as before.
+cell. Only a line that itself names the killed node as its peer, dated at or after the kill, is exempt.
+Everything else stays strict: a failure toward the OTHER survivor, a failure toward the killed node before its
+kill, a failure whose line names no peer, every body / justify fetch fallback (the fetch rotates across all other
+validators before it falls back to sync, so the surviving peer failed too, whoever proposed the block) and any
+cell without the per-line evidence all still count. A cell without a kill is judged exactly as before.
 
 Per-peer evidence (collect_logs.py, from the node logs run-cell.sh keeps as val<i>.log.gz):
   * each node's own `local_peer_id=` startup line maps peer ids to val0/val1/val2;
   * OUTBOUND FAILURE lines name the peer they failed toward (`peer=<id>`);
-  * body / justify fetch fallbacks name only the block hash: its proposer is the node whose log re-sent that
-    block's header ("header re-send: view=V block=<7-char base64 prefix> ... (still in own view)"); without such a
-    line the block's proposer is unknown and the fallback is not attributed.
+  * body / justify fetch fallbacks name only the block hash; its proposer (the node whose log re-sent that
+    block's header, "header re-send: view=V block=<7-char base64 prefix> ...") is recorded for the report
+    only and never exempts the line.
 """
 
 import base64
@@ -227,17 +229,21 @@ class KillDisseminationTest(unittest.TestCase):
         self.assertIs(r["clean"], False)
         self.assertEqual(r["live_by_node"]["val0"]["toward"], {"val1": 1})
 
-    def test_a_fallback_for_a_block_only_the_killed_node_proposed_is_exempt_after_the_kill(
-        self,
-    ):
-        r = self.judge(
-            {
-                "val0": [body_fallback(AFTER, HASH_V2)],
-                "val2": [resend(KILL_TS - 1, HASH_V2)],
-            }
-        )
-        self.assertIs(r["clean"], True, r)
-        self.assertEqual(r["exempt_toward_killed"], 1)
+    def test_a_fallback_for_a_block_only_the_killed_node_proposed_still_rejects(self):
+        # Codex review: a body fetch rotates across every other validator before it
+        # falls back to sync, so the fallback means the surviving peer failed too.
+        # Only a line that itself names the killed node as its peer is exempt.
+        for fallback in (body_fallback, justify_fallback):
+            r = self.judge(
+                {
+                    "val0": [fallback(AFTER, HASH_V2)],
+                    "val2": [resend(KILL_TS - 1, HASH_V2)],
+                }
+            )
+            self.assertIs(r["clean"], False, r)
+            self.assertEqual(r["exempt_toward_killed"], 0)
+            self.assertEqual(r["live_by_node"]["val0"]["lines"], 1)
+
 
     def test_failures_toward_the_killed_node_before_its_kill_still_reject(self):
         r = self.judge({"val0": [outbound(KILL_TS - 1, "val2")]})
@@ -355,6 +361,18 @@ class SummarizeKillDissemTest(unittest.TestCase):
         self.assertEqual(s["validity"]["verdict"], "REJECT")
         self.assertIn("dissemination failures", s["validity"]["fail_reasons"])
         self.assertFalse(s["dissemination"]["dissemination_clean"])
+        self.assertEqual(s["dissemination"]["kill_exemption"]["live_failures"], 1)
+
+    def test_kill_cell_with_a_fallback_on_a_block_the_killed_node_proposed_rejects(self):
+        s = self.summ(
+            {
+                "val0": [outbound(AFTER, "val2")] * 8 + [body_fallback(AFTER, HASH_V2)],
+                "val2": [resend(KILL_TS - 1, HASH_V2)],
+            }
+        )
+        self.assertEqual(s["validity"]["verdict"], "REJECT")
+        self.assertIn("dissemination failures", s["validity"]["fail_reasons"])
+        self.assertEqual(s["dissemination"]["kill_exemption"]["exempt_toward_killed"], 8)
         self.assertEqual(s["dissemination"]["kill_exemption"]["live_failures"], 1)
 
     def test_kill_cell_without_a_log_summary_stays_strict(self):
