@@ -129,7 +129,10 @@ impl OrderBook {
             ..base.clone()
         };
         let unfilled = p.qty - filled.min(p.qty);
-        let mut out = Vec::with_capacity(2);
+        // Pushed at the end, then rotated in front of the fired stops' events
+        // (no allocation per placement).
+        let start = log.len();
+        let out = &mut *log;
         match (result.reject, &result.status) {
             (Some(reason), _) => out.push(ev(
                 S::Rejected,
@@ -165,8 +168,11 @@ impl OrderBook {
                 FixedPoint::ZERO,
             )),
         }
-        let at = log.len() - result.triggered_stops.len().min(log.len());
-        log.splice(at..at, out);
+        let added = log.len() - start;
+        let fired = result.triggered_stops.len().min(start);
+        if fired > 0 {
+            log[start - fired..].rotate_right(added);
+        }
     }
 }
 

@@ -89,7 +89,10 @@ fn actions() -> Vec<(Address, NativeAction)> {
     ]
 }
 
-fn run(record: bool, threads: Option<usize>) -> (Vec<OrderEvent>, Vec<(Vec<u8>, Vec<u8>)>) {
+/// The book CF's rows.
+type BookRows = Vec<(Vec<u8>, Vec<u8>)>;
+
+fn run(record: bool, threads: Option<usize>) -> (Vec<OrderEvent>, BookRows) {
     let (_dir, db) = open_test_db();
     let mut ctx = make_ctx(db.clone(), 1);
     for t in 1..=4u8 {
@@ -199,4 +202,148 @@ fn exec_order_events_off_drops_the_logs() {
     assert!(ctx.take_order_events().is_empty());
     ctx.set_order_events(true);
     assert!(ctx.take_order_events().is_empty());
+}
+
+/// The open orders and pending stops rebuilt from the events alone, as a
+/// stream client applies them: `id -> (market, remaining, price)`.
+#[derive(Default, Debug, PartialEq)]
+struct Mirror {
+    open: std::collections::BTreeMap<u128, (u64, i128, i128)>,
+    stops: std::collections::BTreeSet<u128>,
+}
+
+impl Mirror {
+    fn apply(&mut self, e: &OrderEvent) {
+        let Some(id) = e.order_id else { return };
+        match e.status {
+            S::Open | S::Modified | S::PartiallyFilled => {
+                if e.remaining > FixedPoint::ZERO {
+                    self.open.insert(id, (e.market, e.remaining.raw(), e.price.raw()));
+                } else {
+                    self.open.remove(&id);
+                }
+            }
+            S::Filled | S::Canceled | S::Rejected => {
+                self.open.remove(&id);
+                self.stops.remove(&id);
+            }
+            S::TriggerPending => {
+                self.stops.insert(id);
+            }
+            S::Triggered => {
+                self.stops.remove(&id);
+            }
+        }
+    }
+
+    /// What the books hold (what `torus_getOpenOrders` returns once saved).
+    fn of_books(ctx: &NativeExecContext) -> Self {
+        let mut m = Mirror::default();
+        for (&mid, book) in ctx.order_books() {
+            for (_, q) in book.bid_queues().chain(book.ask_queues()) {
+                for o in q {
+                    m.open.insert(o.id, (mid, o.remaining_qty.raw(), o.price.raw()));
+                }
+            }
+            for s in book.pending_stops() {
+                m.stops.insert(s.id);
+            }
+        }
+        m
+    }
+}
+
+/// Consistency with the open-orders snapshot: a client that applies every
+/// event ends with exactly the books' open orders and pending stops, after
+/// every block of a pseudo-random flow (rests, crosses, IOC, post-only,
+/// stops, cancels, cancel-alls, modifies, self-trades, off-tick rejects), on
+/// the sequential and the parallel engine alike.
+#[test]
+fn exec_order_events_rebuild_the_open_orders() {
+    for threads in [None, Some(4)] {
+        let (_dir, db) = open_test_db();
+        let mut ctx = make_ctx(db, 1);
+        for t in 1..=3u8 {
+            fund(&ctx, &addr(t));
+        }
+        ctx.set_order_events(true);
+        let mut mirror = Mirror::default();
+        let mut seen: std::collections::BTreeSet<String> = Default::default();
+        let mut seed: u64 = 0x5eed;
+        let mut rnd = |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for block in 0..40 {
+            let mut list = Vec::new();
+            for _ in 0..12 {
+                let t = addr(1 + rnd(3) as u8);
+                let m = 1 + rnd(2);
+                let is_buy = rnd(2) == 0;
+                let px = 98 + rnd(5) as i64;
+                let qty = 1 + rnd(4) as i64;
+                let known: Vec<u128> = mirror.open.keys().copied().collect();
+                let action = match rnd(20) {
+                    0..=8 => NativeAction::PlaceOrder(gtc(m, is_buy, px, qty)),
+                    9 | 10 => NativeAction::PlaceOrder(order(m, is_buy, px, qty, TimeInForce::IOC, None)),
+                    11 => NativeAction::PlaceOrder(order(m, is_buy, px, qty, TimeInForce::PostOnly, None)),
+                    12 => NativeAction::PlaceOrder(PlaceOrderParams {
+                        order_type: OrderType::StopMarket {
+                            trigger: fp(if is_buy { 101 } else { 99 }),
+                        },
+                        price: fp(if is_buy { 110 } else { 90 }),
+                        ..gtc(m, is_buy, px, qty)
+                    }),
+                    13 => NativeAction::PlaceOrder(PlaceOrderParams {
+                        // Off tick: refused before the book.
+                        price: FixedPoint::from_raw(fp(px).raw() + 1),
+                        ..gtc(m, is_buy, px, qty)
+                    }),
+                    14 | 15 if !known.is_empty() => NativeAction::CancelOrder {
+                        order_id: known[rnd(known.len() as u64) as usize],
+                    },
+                    16 if !known.is_empty() => NativeAction::ModifyOrder {
+                        order_id: known[rnd(known.len() as u64) as usize],
+                        new_price: (rnd(2) == 0).then(|| fp(px)),
+                        new_qty: Some(fp(qty)),
+                    },
+                    17 => NativeAction::CancelAllOrders {
+                        market_id: (rnd(2) == 0).then_some(m),
+                    },
+                    _ => NativeAction::PlaceOrder(gtc(m, is_buy, px, qty)),
+                };
+                list.push((t, action));
+            }
+            match threads {
+                Some(n) => NativeExecutor::execute_batch_engine_mode(&mut ctx, &list, n),
+                None => NativeExecutor::execute_batch(&mut ctx, &list),
+            };
+            let events = ctx.take_order_events();
+            for e in &events {
+                mirror.apply(e);
+                seen.insert(format!("{:?}/{:?}", e.status, e.reason));
+            }
+            assert_eq!(mirror, Mirror::of_books(&ctx), "block {block}, threads {threads:?}");
+        }
+        assert!(!mirror.open.is_empty(), "the flow leaves resting orders");
+        // The flow is not vacuous: every kind of transition happened.
+        for want in [
+            "Open/None",
+            "PartiallyFilled/None",
+            "Filled/None",
+            "TriggerPending/None",
+            "Triggered/None",
+            "Modified/User",
+            "Canceled/User",
+            "Canceled/SelfTrade",
+            "Canceled/Unfilled",
+            // (The off-tick placements are refused before the book: the
+            // committer maps those from the results, `order_rejections`.)
+            "Rejected/Reject(BadTriggerPx)",
+            "Rejected/Reject(IocCancel)",
+            "Rejected/Reject(BadAloPx)",
+        ] {
+            assert!(seen.contains(want), "{want} never happened: {seen:?}");
+        }
+    }
 }

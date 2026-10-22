@@ -271,6 +271,8 @@ pub trait TorusApi {
     async fn using_big_blocks(&self, address: String) -> RpcResult<bool>;
 
     // --- Phase 7B: Trade streaming subscription ---
+    /// `torus_subscribe(kind, params)`: `newTrades`, `userFills` (s80),
+    /// `l2Book`, `orderUpdates` (s139). See `docs/api/streams.md`.
     #[subscription(name = "subscribe" => "subscription", unsubscribe = "unsubscribe", item = serde_json::Value)]
     async fn subscribe(
         &self,
