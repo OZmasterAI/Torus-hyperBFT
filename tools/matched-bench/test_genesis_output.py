@@ -224,6 +224,26 @@ for i in $(seq "$3" $(( $3 + $5 - 1 ))); do printf '%s 0x%040x\\n' "$i" "$i"; do
     # EVM cadence N, `.evm.block_interval` (EvmConfig.block_interval; absent =
     # torus_types::DEFAULT_EVM_BLOCK_INTERVAL = 11).
 
+    def test_running_state_hash_defaults_on_and_off_is_explicit(self):
+        # Owner s136: the running state hash is on at genesis. Unset
+        # STATE_HASH_ACTIVATION leaves the genesis without activations (the
+        # node default: from block 1) and the summary says so; 'off' writes
+        # the explicit opt-out `consensus.activations = {}`.
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        final = json.loads(self.output.read_text())
+        self.assertNotIn('activations', final.get('consensus', {}))
+        self.assertNotIn('state_hash_activation_height', final.get('consensus', {}))
+        self.assertIn('  state_hash_activation = 1\n', result.stdout)
+        result = self.run_script(STATE_HASH_ACTIVATION='off')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        final = json.loads(self.output.read_text())
+        self.assertEqual(final['consensus']['activations'], {})
+        self.assertIn('  state_hash_activation = off\n', result.stdout)
+        result = self.run_script(STATE_HASH_ACTIVATION='7')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('  state_hash_activation = 7\n', result.stdout)
+
     def test_book_window_commit_needs_the_state_hash_and_sets_the_consensus_flag(self):
         # L6.1 (ported from perf/l61-window-books 9930fc60): chain-wide genesis field
         final = self.generate(STATE_HASH_ACTIVATION='1', BOOK_WINDOW_COMMIT='1')[1]

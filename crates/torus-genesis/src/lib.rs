@@ -1304,6 +1304,53 @@ mod tests {
         }
     }
 
+    /// Owner s136: the running state hash is ON at genesis. A genesis that
+    /// names no activation (no `consensus.activations`, no
+    /// `state_hash_activation_height`: every fresh genesis the repo's
+    /// generators and checked-in files produce) schedules `running_state_hash`
+    /// from block 1 (P0.0: height 1, so the genesis parent header carries the
+    /// bit). `"activations": {}` is the explicit opt-out; the alias alone keeps
+    /// its own height.
+    /// RED before the change: absent meant off.
+    #[test]
+    fn a_genesis_without_activations_runs_the_running_hash_from_block_1() {
+        use torus_types::Feature::RunningStateHash;
+        let with = |f: &dyn Fn(&mut serde_json::Value)| {
+            let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+            f(&mut json);
+            Genesis::from_json(&json.to_string()).unwrap().chain_config()
+        };
+        let fresh = with(&|_| {});
+        assert_eq!(fresh.state_hash_activation_height(), Some(1));
+        assert_eq!(fresh.activations.height_of(RunningStateHash), Some(1));
+        assert_eq!(
+            fresh.activations.active_at(0) & RunningStateHash.bit(),
+            RunningStateHash.bit(),
+            "the genesis parent header carries block 1's bit"
+        );
+        let off = with(&|j| j["consensus"]["activations"] = serde_json::json!({}));
+        assert_eq!(off.state_hash_activation_height(), None, "explicit opt-out");
+        assert_eq!(off.activations.active_at(1), 0);
+        let alias = with(&|j| j["consensus"]["state_hash_activation_height"] = serde_json::json!(40));
+        assert_eq!(alias.state_hash_activation_height(), Some(40));
+        // The checked-in genesis files (devnet, ab-harness, devnet ladder)
+        // name no activation: they run it from block 1 too.
+        for (name, text) in [
+            ("devnet/genesis.json", include_str!("../../../devnet/genesis.json")),
+            (
+                "devnet/ab-harness/devnet-genesis.json",
+                include_str!("../../../devnet/ab-harness/devnet-genesis.json"),
+            ),
+            (
+                "testnet/p3-testnet/devnet-ladder/genesis-10mkt.json",
+                include_str!("../../../testnet/p3-testnet/devnet-ladder/genesis-10mkt.json"),
+            ),
+        ] {
+            let g = Genesis::from_json(text).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(g.chain_config().state_hash_activation_height(), Some(1), "{name}");
+        }
+    }
+
     /// L6.1 under P0.0: window books are the feature `book_window_commit`.
     /// `consensus.activations.book_window_commit` schedules it at its own
     /// height; the bool `consensus.book_window_commit` (what the bench
