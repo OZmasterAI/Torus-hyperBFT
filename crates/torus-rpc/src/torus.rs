@@ -422,22 +422,38 @@ pub(crate) fn validate_known_markets<S: StateBackend>(
             Ok(())
         }
     };
+    // Owner s138 (the executor's consensus rule, same predicate and text):
+    // no order on a market that has never had an oracle mark (no aggregate
+    // row with a price > 0). The row is never deleted, so a node whose view
+    // lags can only refuse early, never accept what consensus refuses.
+    let marked = |mid: u64| -> Result<bool, String> {
+        torus_core::oracle::ever_marked(state_db, mid).map_err(|e| format!("oracle lookup failed: {e}"))
+    };
+    let first_mark_rule = |mid: u64, is_marked: bool| {
+        if is_marked {
+            Ok(())
+        } else {
+            Err(torus_types::market_never_marked_reason(mid))
+        }
+    };
     match action {
         torus_types::NativeAction::PlaceOrder(p) => {
             let s = spec(p.market_id)?;
             reduce_only_rule(p, delisted(p.market_id)?)?;
+            first_mark_rule(p.market_id, marked(p.market_id)?)?;
             check_tick_lot(p, s)
         }
         torus_types::NativeAction::PlaceOrderBatch(orders) => {
             let mut specs = std::collections::BTreeMap::new();
             for p in orders {
-                let (s, d) = match specs.entry(p.market_id) {
+                let (s, d, mk) = match specs.entry(p.market_id) {
                     std::collections::btree_map::Entry::Occupied(e) => *e.get(),
                     std::collections::btree_map::Entry::Vacant(e) => {
-                        *e.insert((spec(p.market_id)?, delisted(p.market_id)?))
+                        *e.insert((spec(p.market_id)?, delisted(p.market_id)?, marked(p.market_id)?))
                     }
                 };
                 reduce_only_rule(p, d)?;
+                first_mark_rule(p.market_id, mk)?;
                 check_tick_lot(p, s)?;
             }
             Ok(())

@@ -216,6 +216,23 @@ fn aggregated_price_key(market_id: MarketId) -> Vec<u8> {
     key
 }
 
+/// Owner s138: whether `market_id` has EVER had an oracle mark — its
+/// aggregate row exists with a price > 0 (fresh or stale: a stale one keeps
+/// the band's stale fallback). No row (never aggregated) is `Ok(false)`: the
+/// market has no price band, so the executor refuses orders there
+/// (`FailureReason::MarketNeverMarked`) and the RPC intake answers the same.
+/// Only aggregation writes the row and nothing deletes it, so once `true`
+/// it stays `true`. `Err` is a local fault (read failed, row undecodable).
+pub fn ever_marked<S: StateBackend>(state: &S, market_id: MarketId) -> Result<bool, CoreError> {
+    match state.get_cf_raw(CF_NATIVE_ORACLE, &aggregated_price_key(market_id))? {
+        None => Ok(false),
+        Some(data) => Ok(StoredAggregatedPrice::try_from_slice(&data)
+            .map_err(|e| CoreError::Borsh(e.to_string()))?
+            .price
+            > FixedPoint::ZERO),
+    }
+}
+
 // ============================================================================
 // OracleManager
 // ============================================================================
@@ -399,6 +416,11 @@ impl<T: StateBackend> OracleManager<T> {
             Err(CoreError::NoOraclePrice(_)) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Owner s138: [`ever_marked`] on this manager's state.
+    pub fn ever_marked(&self, market_id: MarketId) -> Result<bool, CoreError> {
+        ever_marked(&self.state, market_id)
     }
 
     /// Block-start step: delete every submission row (all markets) whose block

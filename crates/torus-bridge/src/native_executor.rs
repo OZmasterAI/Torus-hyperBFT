@@ -2743,6 +2743,26 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
         }
     }
 
+    /// Owner s138 (consensus rule, genesis-bound): whether `market_id` has
+    /// ever had an oracle mark — a usable mark ([`Self::mark`]: the block
+    /// table, no extra read on a marked market), else an aggregate row with
+    /// a price > 0 (a stale mark: the band's stale fallback applies,
+    /// unchanged). No such row: never marked (no band), orders refused
+    /// (`FailureReason::MarketNeverMarked`). Only the block's oracle step
+    /// writes that row, before any action, and nothing deletes it, so every
+    /// read of a block answers the same on every path. R02: a local fault is
+    /// recorded on the reader fault channel (the block fail-stops) and reads
+    /// `false` meanwhile.
+    fn ever_marked(&self, market_id: MarketId) -> bool {
+        if self.mark(market_id).is_some() {
+            return true;
+        }
+        self.oracle.ever_marked(market_id).unwrap_or_else(|e| {
+            self.note_fault("first mark oracle read", &e);
+            false
+        })
+    }
+
     fn tiers(&self, market_id: MarketId) -> Option<&'a [MarginTier]> {
         match self.dense_tiers.filter(|d| !d.tiers.is_empty()) {
             Some(d) => d.tiers.get(market_id as usize).copied().flatten(),
@@ -9199,13 +9219,17 @@ impl NativeExecutor {
         ctx.phase_accum.phase1_actions_ns += phase1_timer.elapsed().as_nanos();
 
         // Pre-testnet P0 (consensus rule): a placement on a market that is not
-        // listed (P1: or a non-reduce-only one on a delisted market) is
+        // listed (P1: or a non-reduce-only one on a delisted market; owner
+        // s138: or any one on a market that has never had an oracle mark) is
         // rejected first, before the cloid pass and Phase 2, so it
         // claims no cloid, slot, margin or order id and Phase 3 never creates
         // its book. One registry read per market of the call (none for a
-        // market with a book).
+        // market with a book), one mark answer per market (no read for a
+        // market with a usable mark in the block table).
         {
             let mut listed: HashMap<MarketId, Result<bool, CoreError>> = HashMap::default();
+            let mut marked: HashMap<MarketId, bool> = HashMap::default();
+            let reader = AccountReader::of(ctx);
             let (books, state, metrics) = (&ctx.order_books, &ctx.state, &ctx.metrics);
             let delisted = &ctx.delisted_markets;
             let mut fault: Option<String> = None;
@@ -9216,9 +9240,11 @@ impl NativeExecutor {
                 let m = p.market_id;
                 let rejection = match listed.entry(m).or_insert_with(|| Self::market_listed(books, state, m)) {
                     // Pre-testnet P1: a delisted market takes reduce-only
-                    // orders only.
-                    Ok(true) if p.reduce_only || !delisted.contains(&m) => return true,
-                    Ok(true) => Self::delisted_rejection(m),
+                    // orders only. Owner s138: no market takes orders
+                    // before its first oracle mark.
+                    Ok(true) if !p.reduce_only && delisted.contains(&m) => Self::delisted_rejection(m),
+                    Ok(true) if *marked.entry(m).or_insert_with(|| reader.ever_marked(m)) => return true,
+                    Ok(true) => Self::never_marked_rejection(m),
                     Ok(false) => Self::unknown_market_rejection(m),
                     Err(e) => {
                         if e.is_local_fault() && fault.is_none() {
@@ -12981,6 +13007,25 @@ impl NativeExecutor {
             .then(|| NativeActionResult::rejected("place_order", Self::delisted_rejection(params.market_id)))
     }
 
+    /// Owner s138: the rejection of a placement or a modify on a market that
+    /// has never had an oracle mark (the RPC intake's text).
+    fn never_marked_rejection(market_id: MarketId) -> Rejection {
+        (FailureReason::MarketNeverMarked, torus_types::market_never_marked_reason(market_id))
+    }
+
+    /// Owner s138: `Some(rejection)` for `action` (a placement, any order
+    /// type, reduce-only included; a modify; a triggered stop) on a market
+    /// that has never had an oracle mark ([`AccountReader::ever_marked`]).
+    /// Nothing written, nothing charged. A stale mark is not refused here.
+    fn reject_never_marked<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        action: &'static str,
+        market_id: MarketId,
+    ) -> Option<NativeActionResult> {
+        (!AccountReader::of(ctx).ever_marked(market_id))
+            .then(|| NativeActionResult::rejected(action, Self::never_marked_rejection(market_id)))
+    }
+
     /// Pre-testnet P0: `None` when `market_id` is listed, else the action's
     /// rejection (nothing written, nothing charged). A failed registry read
     /// fail-stops (R02) and rejects the action meanwhile.
@@ -13222,8 +13267,10 @@ impl NativeExecutor {
         // Pre-testnet P0: a market that is not listed first (the batch path's
         // order: before the cloid and open-order checks claim anything).
         // Pre-testnet P1: then a delisted market (reduce-only orders only).
+        // Owner s138: then a market that has never had an oracle mark.
         if let Some(r) = Self::reject_unlisted(ctx, "place_order", params.market_id)
             .or_else(|| Self::reject_delisted(ctx, params))
+            .or_else(|| Self::reject_never_marked(ctx, "place_order", params.market_id))
         {
             if let Some(ref m) = ctx.metrics {
                 RejectReason::Other.count(m, r.reason);
@@ -13320,8 +13367,11 @@ impl NativeExecutor {
         // Pre-testnet P0: never a book for a market that is not listed (a
         // triggered stop or a liquidation order names a market that has a
         // book or a position, so this only guards the invariant).
+        // Owner s138: nor an order on a market never marked (a triggered
+        // stop fires through here; liquidation orders need a mark anyway).
         if let Some(r) = Self::reject_unlisted(ctx, "place_order", market_id)
             .or_else(|| Self::reject_delisted(ctx, params))
+            .or_else(|| Self::reject_never_marked(ctx, "place_order", market_id))
         {
             return r;
         }
@@ -14567,6 +14617,11 @@ impl NativeExecutor {
                 "order {order_id} belongs to {}, not sender {sender}",
                 old.trader
             ));
+        }
+        // Owner s138: no modify on a market that has never had an oracle
+        // mark (an order can only rest there from state older than the rule).
+        if let Some(r) = Self::reject_never_marked(ctx, "modify_order", market_id) {
+            return r;
         }
         let book = &ctx.order_books[&market_id];
         let is_buy = old.side == Side::Buy;
