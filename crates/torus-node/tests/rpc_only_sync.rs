@@ -262,9 +262,22 @@ fn rpc_only_node_catches_up_and_follows_through_one_bootstrap_peer() {
         |n| n[2].executed_height().is_some_and(|h| h >= target),
     );
 
-    // ...and follows: R reaches V0's then-current height, twice.
+    // ...and follows, twice: V0 executes blocks beyond both nodes' previous
+    // heights (so a stalled chain fails here), then R reaches that new height.
+    let mut prev = target;
     for round in 0..2 {
+        prev = prev
+            .max(v0.executed_height().unwrap_or(0))
+            .max(r.executed_height().unwrap_or(0));
+        wait_until(
+            work.path(),
+            &mut [&mut v0, &mut v1, &mut r],
+            &format!("the chain executes new blocks (round {round}, above {prev})"),
+            |n| n[0].executed_height().is_some_and(|h| h > prev),
+        );
         let target = v0.executed_height().unwrap();
+        assert!(target > prev);
+        prev = target;
         wait_until(
             work.path(),
             &mut [&mut v0, &mut v1, &mut r],
