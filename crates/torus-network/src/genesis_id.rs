@@ -30,6 +30,7 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::fmt;
+use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
