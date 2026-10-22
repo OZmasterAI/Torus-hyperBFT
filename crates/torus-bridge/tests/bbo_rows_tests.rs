@@ -76,6 +76,8 @@ struct Chain {
 
 impl Chain {
     fn new(mode: BookMode, deferred: bool) -> Self {
+        // Owner s138: a fixture from before the never-marked rule (test-only seam).
+        torus_core::oracle::test_treat_unmarked_as_marked();
         torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         let dir = tempfile::tempdir().expect("tempdir");
         let db = StateDb::open(dir.path()).expect("open db");

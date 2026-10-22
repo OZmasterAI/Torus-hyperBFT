@@ -56,6 +56,8 @@ fn order(market_id: MarketId, price: i64, ot: OrderType, cloid: Option<u128>) ->
 /// Trader 1: a resting bid with C (market 1), a stop with C + 1 (market 2),
 /// a bid without a cloid (market 1). Persisted by the real save path.
 fn seed(dir: &TempDir, mode: BookMode) -> StateDb {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let db = StateDb::open(dir.path()).unwrap();
     // Pre-testnet P0: orders need a listed market (a placeholder row
     // where the test has none).

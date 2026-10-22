@@ -13905,6 +13905,8 @@ mod crash_recovery_tests {
     /// module lists markets 1..=8 with placeholder rows (tick / lot 1, no
     /// margin config: the book an unlisted market used to get).
     fn list_test_markets(state_db: &StateDb) {
+        // Owner s138: a fixture from before the never-marked rule (test-only seam).
+        torus_core::oracle::test_treat_unmarked_as_marked();
         for m in 1..=8u64 {
             state_db
                 .put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed")
@@ -29310,6 +29312,8 @@ mod crash_recovery_tests {
 
     /// 3 Active validators, market 1 listed, epoch length 1000 (no boundary).
     fn oracle_fixture_db() -> (ChainConfig, StateDb) {
+        // Owner s138: a fixture from before the never-marked rule (test-only seam).
+        torus_core::oracle::test_treat_unmarked_as_marked();
         let (mut config, db) = make_test_config_and_db();
         config.epoch_length = 1_000;
         for (seed, mult) in ORACLE_VALIDATORS {
@@ -33458,6 +33462,8 @@ mod crash_recovery_tests {
     /// (lot 0.001, tick 0.01, initial margin 5% / 10%); traders, makers and
     /// the seeded thin positions funded; 81 / 82 hold EVM balance.
     fn c5_fixture() -> (ChainConfig, StateDb) {
+        // Owner s138: a fixture from before the never-marked rule (test-only seam).
+        torus_core::oracle::test_treat_unmarked_as_marked();
         use torus_core::position::{MarginType, NativeBalance, PositionManager};
         let (mut config, db) = make_test_config_and_db();
         config.epoch_length = C5_EPOCH;

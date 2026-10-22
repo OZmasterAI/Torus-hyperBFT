@@ -71,6 +71,8 @@ fn key() -> Vec<u8> {
 
 /// `layer` written to its own empty DB (as a checkpoint writes L).
 fn apply(layer: &CheckpointLayer) -> (StateDb, tempfile::TempDir) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().expect("tempdir");
     let db = StateDb::open(dir.path()).expect("open db");
     // Pre-testnet P0: orders need a listed market (placeholder rows,
@@ -109,6 +111,8 @@ struct Split {
 
 impl Chain {
     fn new() -> Self {
+        // Owner s138: a fixture from before the never-marked rule (test-only seam).
+        torus_core::oracle::test_treat_unmarked_as_marked();
         defer_books_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let db = StateDb::open(dir.path()).expect("open db");

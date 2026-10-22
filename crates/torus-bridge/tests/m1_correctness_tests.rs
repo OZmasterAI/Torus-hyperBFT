@@ -145,6 +145,8 @@ fn world(ctx: &mut NativeExecContext) -> World {
 
 /// Book m1 (tick 2, lot 2) with maker addr(2)'s ask 5 @60; then `block`.
 fn run_m1(mode: Mode, block: &[(Address, NativeAction)]) -> Run {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     // Pre-testnet P0: orders need a listed market (placeholder rows,
@@ -251,6 +253,8 @@ fn row41_limit_price_not_positive_rejected_before_the_book() {
 /// next order hit the limit. Now it takes none.
 #[test]
 fn row41_rejected_limit_takes_no_open_order_slot() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     use torus_core::position::OPEN_ORDER_BASE_LIMIT;
     let a = addr(1);
     for mode in MODES {
@@ -283,6 +287,8 @@ fn row41_rejected_limit_takes_no_open_order_slot() {
 /// rejected (`unknown market_id`) and creates no book.
 #[test]
 fn row42_books_created_from_the_market_row() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let (a, c) = (addr(1), addr(3));
     let block = vec![
         place(a, order(5, true, fpr(100 * S + S / 2), fpr(S / 5))), // 0: rests (tick 0.5, lot 0.1)
@@ -334,6 +340,8 @@ fn row42_books_created_from_the_market_row() {
 /// market row says otherwise (existing persisted books are not rewritten).
 #[test]
 fn row42_existing_book_keeps_its_meta() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let a = addr(1);
     for mode in MODES {
         let dir = tempfile::tempdir().unwrap();

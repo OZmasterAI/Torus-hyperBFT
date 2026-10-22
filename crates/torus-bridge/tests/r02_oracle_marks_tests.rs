@@ -79,6 +79,8 @@ type Ctx = NativeExecContext<FailingAggRead>;
 /// Market 1 listed (test row), trader 1 rich, `agg` the aggregate row of
 /// market 1 (None: no row). Block 2 at `NOW`, fault switch off.
 fn setup(agg: Option<Vec<u8>>) -> (tempfile::TempDir, StateDb, Arc<AtomicBool>, Ctx) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     db.put_cf_raw(CF_NATIVE_MARKETS, &M.to_be_bytes(), b"listed").unwrap();

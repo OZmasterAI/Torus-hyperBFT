@@ -2760,6 +2760,8 @@ mod ack_scratch_tests {
     }
 
     fn fixtures(state: &torus_state::StateDb) -> Vec<SignedNativeAction> {
+        // Owner s138: a fixture from before the never-marked rule (test-only seam).
+        torus_core::oracle::test_treat_unmarked_as_marked_on_this_thread();
         use torus_types::{FixedPoint, OrderType, PlaceOrderParams, TimeInForce};
         state
             .put_cf_raw(CF_NATIVE_MARKETS, &1u64.to_be_bytes(), b"market")
@@ -3051,6 +3053,8 @@ mod tick_lot_ingress_tests {
     }
 
     fn db() -> (tempfile::TempDir, torus_state::StateDb) {
+        // Owner s138: a fixture from before the never-marked rule (test-only seam).
+        torus_core::oracle::test_treat_unmarked_as_marked_on_this_thread();
         let dir = tempfile::TempDir::new().unwrap();
         let state = torus_state::StateDb::open(dir.path()).unwrap();
         (dir, state)
@@ -3379,6 +3383,8 @@ mod delist_ingress_tests {
     const S: i128 = FixedPoint::SCALE;
 
     fn db() -> (tempfile::TempDir, torus_state::StateDb) {
+        // Owner s138: a fixture from before the never-marked rule (test-only seam).
+        torus_core::oracle::test_treat_unmarked_as_marked_on_this_thread();
         let dir = tempfile::TempDir::new().unwrap();
         let state = torus_state::StateDb::open(dir.path()).unwrap();
         (dir, state)

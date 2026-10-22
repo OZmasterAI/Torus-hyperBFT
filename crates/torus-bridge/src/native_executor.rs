@@ -1580,6 +1580,8 @@ mod parallel_match_setup_flag_tests {
     fn in_jobs_calls(pin: bool, block: &[(Address, NativeAction)]) -> u64 {
         let dir = tempfile::tempdir().unwrap();
         let db = torus_state::StateDb::open(dir.path()).unwrap();
+        // Owner s138: a fixture from before the never-marked rule (test-only seam).
+        torus_core::oracle::test_treat_unmarked_as_marked();
         // Pre-testnet P0: orders need a listed market.
         for m in [1u64, 2] {
             db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();

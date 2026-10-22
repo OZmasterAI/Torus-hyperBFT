@@ -120,6 +120,8 @@ type Ctx = NativeExecContext<Failing>;
 
 /// Traders 1..=4 rich. Block 2 at `NOW`, nothing armed.
 fn setup() -> (tempfile::TempDir, StateDb, Failing, Ctx) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     // Pre-testnet P0: orders need a listed market (placeholder rows,

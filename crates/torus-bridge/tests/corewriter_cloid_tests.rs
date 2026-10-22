@@ -16,6 +16,8 @@ use torus_types::{FixedPoint, MarketId};
 const C: u128 = 0xc10d_0000_0000_0000_0000_0000_0000_0001;
 
 fn open_test_db() -> (tempfile::TempDir, StateDb) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().expect("create temp dir");
     let db = StateDb::open(dir.path()).expect("open db");
     // Pre-testnet P0: orders need a listed market (no implicit books).

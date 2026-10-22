@@ -80,6 +80,8 @@ type Ctx = NativeExecContext<FailingRead>;
 /// Market 1's row (`market_row`; None: no row), traders 1..=4 rich. Block 2
 /// at `NOW`, nothing armed.
 fn setup(market_row: Option<&[u8]>) -> (tempfile::TempDir, StateDb, FailingRead, Ctx) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     // Pre-testnet P0: orders need a listed market (placeholder rows,
@@ -322,6 +324,8 @@ fn r02_position_reads_without_fault_unchanged() {
 /// which fail-stops the same way.
 #[test]
 fn r02_market_shape_read_fault_fail_stops() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     for mode in MODES {
         let (_d, _db, backend, mut ctx) = setup(Some(b"listed"));
         backend.arm(CF_NATIVE_MARKETS, &M.to_be_bytes());
@@ -339,6 +343,8 @@ fn r02_market_shape_read_fault_fail_stops() {
 /// `unknown_market_tests`.)
 #[test]
 fn r02_market_shape_absent_or_undecodable_unchanged() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     for mode in MODES {
         for row in [None, Some(b"listed".as_slice())] {
             let what = format!("mode {mode:?} row {row:?}");
