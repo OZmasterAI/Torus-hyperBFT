@@ -316,6 +316,89 @@ impl<Id: std::hash::Hash + Eq + Copy> PushScheduler<Id> {
     }
 }
 
+/// Max by-hash `BlockDataRequest`s in flight to one peer over `/torus/direct`.
+///
+/// A node behind a fast chain sends one by-hash fetch per dropped proposal
+/// header (the justify block it lacks), its 100 ms retries, and a walk back
+/// through missing parents, all to the header's origin. None of these can be
+/// inserted while the node lacks the chain below them; height-range block sync
+/// is what catches it up. Unbounded, they took request-response's 100-stream
+/// per-connection cap (inbound and outbound share it) on slow hosts, the
+/// serving peer then dropped the node's `BlockSyncRequest` at capacity, and the
+/// node never synced (rpc-only node vs one fast validator, ubuntoz/cachyoz).
+/// The cap leaves at least a third of the window for block sync and consensus
+/// even with each served fetch's response (a direct send the other way) also
+/// in flight. A shed fetch is not buffered: the hotstuff trackers retry or fall
+/// back to block sync.
+pub(crate) const BLOCK_DATA_MAX_INFLIGHT_PER_PEER: usize = 32;
+
+/// Per-peer in-flight count of by-hash block-data fetches (see
+/// [`BLOCK_DATA_MAX_INFLIGHT_PER_PEER`]). Generic over the request-id type so
+/// the policy is unit-testable without a live swarm.
+pub struct BlockDataInflight<Id: std::hash::Hash + Eq + Copy> {
+    ids: HashMap<Id, PeerId>,
+    per_peer: HashMap<PeerId, usize>,
+    max_per_peer: usize,
+}
+
+impl<Id: std::hash::Hash + Eq + Copy> BlockDataInflight<Id> {
+    pub(crate) fn new(max_per_peer: usize) -> Self {
+        Self {
+            ids: HashMap::new(),
+            per_peer: HashMap::new(),
+            max_per_peer,
+        }
+    }
+
+    /// Whether one more fetch to `peer` fits under the cap.
+    fn has_capacity(&self, peer: &PeerId) -> bool {
+        self.per_peer.get(peer).copied().unwrap_or(0) < self.max_per_peer
+    }
+
+    fn record(&mut self, id: Id, peer: PeerId) {
+        if self.ids.insert(id, peer).is_none() {
+            *self.per_peer.entry(peer).or_insert(0) += 1;
+        }
+    }
+
+    /// The request finished (response or failure); a no-op for any other id.
+    pub(crate) fn complete(&mut self, id: &Id) {
+        let Some(peer) = self.ids.remove(id) else {
+            return;
+        };
+        if let Some(n) = self.per_peer.get_mut(&peer) {
+            *n -= 1;
+            if *n == 0 {
+                self.per_peer.remove(&peer);
+            }
+        }
+    }
+}
+
+impl BlockDataInflight<request_response::OutboundRequestId> {
+    pub(crate) fn for_block_data() -> Self {
+        Self::new(BLOCK_DATA_MAX_INFLIGHT_PER_PEER)
+    }
+}
+
+/// A `/torus/direct` request finished (response or outbound failure): free its
+/// by-hash fetch slot, if it held one.
+fn finish_direct_request(shared: &SharedState, id: &request_response::OutboundRequestId) {
+    shared.block_data_inflight.lock().unwrap().complete(id);
+}
+
+/// A by-hash body / justify fetch (the requests [`BlockDataInflight`] bounds).
+fn is_block_data_request(message: &hotstuff_rs::networking::messages::Message) -> bool {
+    use hotstuff_rs::hotstuff::messages::HotStuffMessage;
+    use hotstuff_rs::networking::messages::{Message, ProgressMessage};
+    matches!(
+        message,
+        Message::ProgressMessage(ProgressMessage::HotStuffMessage(
+            HotStuffMessage::BlockDataRequest(_)
+        ))
+    )
+}
+
 /// Serve native-action bodies for the requested hashes from the durable DA store
 /// (Task 5). Returns one entry per requested hash, **in request order**; an empty
 /// `Vec` means the body was not found (or no store is attached). The stored
@@ -457,6 +540,10 @@ pub struct SharedState {
     /// (bounded) and dispatched as in-flight pushes complete (Direct `Response` /
     /// `OutboundFailure`).
     pub push_scheduler: Mutex<PushScheduler<request_response::OutboundRequestId>>,
+    /// In-flight by-hash `BlockDataRequest`s per peer, capped at
+    /// [`BLOCK_DATA_MAX_INFLIGHT_PER_PEER`] so a lagging node's fetches cannot
+    /// take the `/torus/direct` stream window its block sync needs.
+    pub block_data_inflight: Mutex<BlockDataInflight<request_response::OutboundRequestId>>,
     /// Mirror of [`NetworkConfig::allow_private_addrs`]: when false (public
     /// networks), loopback/private/link-local addresses are kept out of the
     /// kademlia address book — both identify-advertised and DHT-learned.
@@ -1837,6 +1924,7 @@ fn handle_event(
             ..
         })) => {
             shared.outbound_direct.lock().unwrap().remove(&request_id);
+            finish_direct_request(shared, &request_id);
             // B1: a forward envelope acked by the leader is done — clear its
             // retry entry.
             shared
@@ -1866,6 +1954,7 @@ fn handle_event(
             // The failed push body is recoverable via T4 re-push + the hot-path
             // pull (#4 Task 1).
             dispatch_next_push(swarm, shared, local_key, request_id);
+            finish_direct_request(shared, &request_id);
             let tracked = shared.outbound_direct.lock().unwrap().remove(&request_id);
             let tracked_forward = if tracked.is_none() {
                 shared
@@ -2544,7 +2633,10 @@ fn handle_command(
                         // encode failure is skipped exactly as the pre-B2
                         // send path did (borsh on a hotstuff message does not
                         // fail in practice).
-                        DirectSendOutcome::SelfDelivered | DirectSendOutcome::EncodeFailed => {}
+                        // A broadcast is never a block-data fetch, so never shed.
+                        DirectSendOutcome::SelfDelivered
+                        | DirectSendOutcome::EncodeFailed
+                        | DirectSendOutcome::Shed => {}
                     }
                 }
                 if let Some(ref m) = shared.metrics {
@@ -3044,6 +3136,9 @@ enum DirectSendOutcome {
     Buffered,
     /// borsh encoding failed (not expected for hotstuff messages).
     EncodeFailed,
+    /// A by-hash block-data fetch dropped because the target already has
+    /// [`BLOCK_DATA_MAX_INFLIGHT_PER_PEER`] in flight (not buffered).
+    Shed,
 }
 
 /// Send a consensus message directly to `target`, buffering instead of dropping
@@ -3145,6 +3240,14 @@ fn send_direct_connected(
     message: hotstuff_rs::networking::messages::Message,
     mut trace: Option<&mut crate::body_send_trace::BodySendTrace>,
 ) -> DirectSendOutcome {
+    let block_data = is_block_data_request(&message);
+    if block_data && !shared.block_data_inflight.lock().unwrap().has_capacity(&pid) {
+        debug!(%pid, "block-data fetch shed: peer at the in-flight cap");
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.finish("shed");
+        }
+        return DirectSendOutcome::Shed;
+    }
     if let Some(trace) = trace.as_deref_mut() {
         trace.encode_begin = Some(hotstuff_rs::logging::BodyFetchTraceStamp::capture());
     }
@@ -3169,6 +3272,9 @@ fn send_direct_connected(
         trace.send_begin = Some(hotstuff_rs::logging::BodyFetchTraceStamp::capture());
     }
     let req_id = swarm.behaviour_mut().direct.send_request(&pid, req);
+    if block_data {
+        shared.block_data_inflight.lock().unwrap().record(req_id, pid);
+    }
     if let Some(trace) = trace.as_deref_mut() {
         trace.send_end = Some(hotstuff_rs::logging::BodyFetchTraceStamp::capture());
         trace.tracking_begin = Some(hotstuff_rs::logging::BodyFetchTraceStamp::capture());
@@ -3954,6 +4060,7 @@ mod tests {
             native_da_shards_inbound: Mutex::new(VecDeque::new()),
             pending_native_pushes: Mutex::new(PendingSendQueue::new(8)),
             push_scheduler: Mutex::new(PushScheduler::for_pushes()),
+            block_data_inflight: Mutex::new(BlockDataInflight::for_block_data()),
             recently_deposed: RwLock::new(HashMap::new()),
             redial_backoff: Mutex::new(HashMap::new()),
             allow_private_addrs: false,
@@ -5294,6 +5401,90 @@ mod tests {
             assert_eq!(delivered.try_to_vec().unwrap(), expected);
             assert_eq!(trace.snapshot()["outcome"], "self_delivered");
         }
+    }
+
+    /// rpc-only sync fix: a node behind a fast chain sends one by-hash
+    /// `BlockDataRequest` per dropped proposal header, plus 100 ms retries, to
+    /// the header's origin. On slow hosts these passed request-response's
+    /// 100-stream per-connection cap, so the serving peer dropped the node's
+    /// `BlockSyncRequest` ("at capacity") and the node never synced. By-hash
+    /// fetches to one peer are now bounded; block sync and other peers are not.
+    #[tokio::test]
+    async fn block_data_requests_to_one_peer_are_bounded_in_flight() {
+        use hotstuff_rs::block_sync::messages::BlockSyncRequest;
+        use hotstuff_rs::hotstuff::messages::{BlockDataRequest, HotStuffMessage};
+        use hotstuff_rs::networking::messages::{Message, ProgressMessage};
+        use hotstuff_rs::types::data_types::{BlockHeight, ChainID, CryptoHash, ViewNumber};
+        let shared = test_shared();
+        let mut swarm = test_swarm();
+        let local = test_vk(80);
+        let (server, server_pid) = (test_vk(81), test_peer(81));
+        let (other, other_pid) = (test_vk(82), test_peer(82));
+        let fetch = |i: u8| -> Message {
+            HotStuffMessage::BlockDataRequest(BlockDataRequest {
+                chain_id: ChainID::new(0),
+                view: ViewNumber::new(i as u64),
+                block_hash: CryptoHash::new([i; 32]),
+            })
+            .into()
+        };
+        let is_fetch = |m: &Message| {
+            matches!(
+                m,
+                Message::ProgressMessage(ProgressMessage::HotStuffMessage(
+                    HotStuffMessage::BlockDataRequest(_)
+                ))
+            )
+        };
+        let mut send = |target: &VerifyingKey, pid: PeerId, message: Message| {
+            send_direct_connected(&mut swarm, &shared, &local, target, pid, message, None)
+        };
+
+        for i in 0..BLOCK_DATA_MAX_INFLIGHT_PER_PEER {
+            assert!(matches!(send(&server, server_pid, fetch(i as u8)), DirectSendOutcome::Sent));
+        }
+        // At the cap, more by-hash fetches to that peer are shed: not sent,
+        // not buffered for a reconnect flush.
+        for i in 0..10u8 {
+            assert!(matches!(send(&server, server_pid, fetch(200 + i)), DirectSendOutcome::Shed));
+        }
+        assert_eq!(shared.outbound_direct.lock().unwrap().len(), BLOCK_DATA_MAX_INFLIGHT_PER_PEER);
+        assert!(shared.pending_sends.lock().unwrap().flush(&server).is_empty());
+
+        // Block sync to the same peer is never shed.
+        let sync: Message = BlockSyncRequest {
+            chain_id: ChainID::new(0),
+            start_height: BlockHeight::new(0),
+            limit: 128,
+        }
+        .into();
+        assert!(matches!(send(&server, server_pid, sync), DirectSendOutcome::Sent));
+        // Another peer has its own budget.
+        assert!(matches!(send(&other, other_pid, fetch(1)), DirectSendOutcome::Sent));
+
+        // A finished fetch (response or failure) frees one slot.
+        let done = shared
+            .outbound_direct
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, (t, m))| *t == server && is_fetch(m))
+            .map(|(id, _)| *id)
+            .unwrap();
+        finish_direct_request(&shared, &done);
+        assert!(matches!(send(&server, server_pid, fetch(100)), DirectSendOutcome::Sent));
+        assert!(matches!(send(&server, server_pid, fetch(101)), DirectSendOutcome::Shed));
+        // Finishing a request that is not a by-hash fetch frees no fetch slot.
+        let sync_id = shared
+            .outbound_direct
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, (_, m))| matches!(m, Message::BlockSyncMessage(_)))
+            .map(|(id, _)| *id)
+            .unwrap();
+        finish_direct_request(&shared, &sync_id);
+        assert!(matches!(send(&server, server_pid, fetch(102)), DirectSendOutcome::Shed));
     }
 
     #[tokio::test]
