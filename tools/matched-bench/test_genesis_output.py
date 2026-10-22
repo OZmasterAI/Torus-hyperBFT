@@ -244,6 +244,20 @@ for i in $(seq "$3" $(( $3 + $5 - 1 ))); do printf '%s 0x%040x\\n' "$i" "$i"; do
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('  state_hash_activation = 7\n', result.stdout)
 
+    def test_default_classic_genesis_reports_window_books_on(self):
+        # The node default for a Classic genesis naming no activation is the
+        # hash + L6.1 from block 1 (CL21); the summary says both. A row book
+        # mode or an explicit hash height gets no L6.1 line.
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('  book_window_commit = on (L6.1)\n', result.stdout)
+        for extra in ({'BOOK_MODE': '3'}, {'STATE_HASH_ACTIVATION': '1'},
+                      {'STATE_HASH_ACTIVATION': 'off'}):
+            with self.subTest(**extra):
+                result = self.run_script(**extra)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn('book_window_commit = on', result.stdout)
+
     def test_book_window_commit_needs_the_state_hash_and_sets_the_consensus_flag(self):
         # L6.1 (ported from perf/l61-window-books 9930fc60): chain-wide genesis field
         final = self.generate(STATE_HASH_ACTIVATION='1', BOOK_WINDOW_COMMIT='1')[1]

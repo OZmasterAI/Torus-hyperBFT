@@ -1365,6 +1365,39 @@ mod tests {
         }
     }
 
+    /// The genesis default runs what the 9j head-to-head measured (CL21:
+    /// Classic + L6.1 + hash on, section 124): a Classic genesis naming no
+    /// activation also schedules `book_window_commit` from block 1, so L3.1
+    /// (coalesced book saves) keeps running with the hash on. A row book mode
+    /// gets the hash only (L6.1 is Classic-only); `"activations": {}` and the
+    /// hash alias alone (an explicit, hash-only config) do not get it.
+    /// RED before the change: the default had no L6.1.
+    #[test]
+    fn a_classic_genesis_without_activations_also_runs_window_books() {
+        use torus_types::Feature::{BookWindowCommit, RunningStateHash};
+        let with = |f: &dyn Fn(&mut serde_json::Value)| {
+            let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+            f(&mut json);
+            Genesis::from_json(&json.to_string()).unwrap().chain_config()
+        };
+        let fresh = with(&|_| {});
+        assert_eq!(fresh.state_hash_activation_height(), Some(1));
+        assert_eq!(fresh.book_window_activation(), Some(1));
+        assert_eq!(
+            fresh.activations.active_at(0),
+            RunningStateHash.bit() | BookWindowCommit.bit(),
+            "the genesis parent header carries both"
+        );
+        assert!(fresh.validate().is_ok());
+        let rows = with(&|j| j["consensus"]["book_mode"] = serde_json::json!("level_authority_chunked"));
+        assert_eq!(rows.state_hash_activation_height(), Some(1));
+        assert_eq!(rows.book_window_activation(), None, "L6.1 is Classic-only");
+        let off = with(&|j| j["consensus"]["activations"] = serde_json::json!({}));
+        assert_eq!(off.book_window_activation(), None);
+        let alias = with(&|j| j["consensus"]["state_hash_activation_height"] = serde_json::json!(1));
+        assert_eq!(alias.book_window_activation(), None, "explicit hash-only config");
+    }
+
     /// L6.1 under P0.0: window books are the feature `book_window_commit`.
     /// `consensus.activations.book_window_commit` schedules it at its own
     /// height; the bool `consensus.book_window_commit` (what the bench
