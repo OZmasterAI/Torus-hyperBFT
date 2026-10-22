@@ -2523,7 +2523,11 @@ fn handle_command(
             }
         }
         NetworkCommand::Send { target, message } => {
-            send_direct(swarm, shared, local_key, &target, message);
+            let diag_sync = matches!(message, hotstuff_rs::networking::messages::Message::BlockSyncMessage(_));
+            let out = send_direct(swarm, shared, local_key, &target, message);
+            if diag_sync {
+                info!(outcome = ?std::mem::discriminant(&out), queued_cmds = 0, "DIAG send block sync message");
+            }
         }
         NetworkCommand::SendTraced { target, message, mut trace } => {
             send_direct_observed(swarm, shared, local_key, &target, message, Some(&mut trace));
@@ -3527,7 +3531,7 @@ fn handle_consensus_direct_traced(
             _ => String::new(),
         };
         if !kind.is_empty() {
-            info!(%peer, kind, bytes = payload.len(), "DIAG direct in: block sync message");
+            info!(%peer, kind, bytes = payload.len(), inbound_len = shared.inbound.lock().unwrap().len(), "DIAG direct in: block sync message");
         }
     }
     if enqueue_consensus_inbound_traced(shared, sender_vk, msg, payload, trace) == ConsensusEnqueue::Duplicate {
