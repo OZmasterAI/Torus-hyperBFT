@@ -188,10 +188,10 @@ pub fn quorum_power(total: u128) -> u128 {
 }
 
 /// A1: the rows the execution of block `height` writes for `attr`, read against `state` (the
-/// block's pre-state). Misses add to the missed-slot run of their leader, then the success
-/// resets its leader's run and j; a signer in the exclusion lifecycle records `seen_at` (at most
-/// once per epoch window `(H - L, H]`); the cursor is written. Rows that would not change are not
-/// returned.
+/// block's pre-state). Misses add to the missed-slot run of their leader (not for a validator in
+/// the exclusion lifecycle), then the success resets its leader's run and j; a signer in the
+/// exclusion lifecycle records `seen_at` (at most once per epoch window `(H - L, H]`); the cursor
+/// is written. Rows that would not change are not returned.
 pub fn attribution_rows<T: StateBackend>(
     state: &T,
     height: u64,
@@ -211,8 +211,21 @@ pub fn attribution_rows<T: StateBackend>(
         }
         Ok(&mut touched.get_mut(address).expect("inserted").1)
     }
-    // The gap's views come before the certified one: misses first, then the success.
+    // The exclusion lifecycle (planned or installed, not re-admitted), read only when needed.
+    let index = if attr.misses.is_empty() && attr.signers.is_empty() {
+        Vec::new()
+    } else {
+        leader_excluded_index(state)?
+    };
+    // The gap's views come before the certified one: misses first, then the success. A
+    // validator in the exclusion lifecycle collects no misses: from its plan boundary to its
+    // install boundary it still leads (and, dead, misses), but the exclusion already accounts
+    // for that; counted, they would survive into its re-admission (A3 keeps the run) and
+    // exclude it again at the next plan before it ever led again.
     for address in &attr.misses {
+        if index.binary_search(address).is_ok() {
+            continue;
+        }
         let st = entry(&mut touched, state, address)?;
         st.miss_run = st.miss_run.saturating_add(1);
     }
@@ -221,23 +234,20 @@ pub fn attribution_rows<T: StateBackend>(
         st.miss_run = 0;
         st.j = 0;
     }
-    if !attr.signers.is_empty() {
-        let index = leader_excluded_index(state)?;
-        if !index.is_empty() {
-            // A3 reads "seen in (H - L, H]" at boundary H: one record per such window.
-            let window_start = match epoch_length {
-                0 => 0,
-                l => (height.saturating_sub(1) / l) * l,
-            };
-            for address in attr
-                .signers
-                .iter()
-                .filter(|a| index.binary_search(a).is_ok())
-            {
-                let st = entry(&mut touched, state, address)?;
-                if st.seen_at.is_none_or(|seen| seen <= window_start) {
-                    st.seen_at = Some(height);
-                }
+    if !attr.signers.is_empty() && !index.is_empty() {
+        // A3 reads "seen in (H - L, H]" at boundary H: one record per such window.
+        let window_start = match epoch_length {
+            0 => 0,
+            l => (height.saturating_sub(1) / l) * l,
+        };
+        for address in attr
+            .signers
+            .iter()
+            .filter(|a| index.binary_search(a).is_ok())
+        {
+            let st = entry(&mut touched, state, address)?;
+            if st.seen_at.is_none_or(|seen| seen <= window_start) {
+                st.seen_at = Some(height);
             }
         }
     }
