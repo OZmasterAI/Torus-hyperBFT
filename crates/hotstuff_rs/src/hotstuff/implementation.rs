@@ -24,7 +24,8 @@ use crate::{
     block_tree::{
         accessors::internal::{BlockTreeError, BlockTreeSingleton, UpdateResult},
         invariants::{
-            repropose_block, safe_block, safe_nudge, safe_pc, safe_pc_lock_clause, safe_proposal_lock,
+            is_committed_block, repropose_block, safe_block, safe_nudge, safe_pc, safe_pc_lock_clause,
+            safe_proposal_lock,
             safe_proposal_pc,
         },
         pluggables::KVStore,
@@ -1462,39 +1463,19 @@ impl<N: Network> HotStuff<N> {
         }
 
         // 2. Validate the block using the app, and insert it into the block tree if it is valid.
-        let parent_block = if proposal.block.justify.is_genesis_pc() {
-            None
+        //
+        // Codex P1 (mixed commit): a committed block passes the checks above only as this
+        // replica's locked block (`safe_proposal_lock`). It was validated, inserted and its justify
+        // applied when it was first processed: vote on it (step 5) without doing any of that again.
+        // Re-inserting would bring back its pending validator-set updates and list it twice under
+        // its parent; a stale Decide justify would mark this replica's undecided update decided.
+        let has_validator_set_updates = if is_committed_block(&proposal.block.hash, block_tree)? {
+            Some(block_tree.validator_set_updates_status(&proposal.block.hash)?.contains_updates())
         } else {
-            Some(&proposal.block.justify.block)
+            self.validate_insert_and_update(&proposal.block, block_tree, app)?
         };
-        let validate_block_request =
-            ValidateBlockRequest::new(&proposal.block, block_tree.app_view(parent_block)?);
 
-        if let ValidateBlockResponse::Valid {
-            app_state_updates,
-            validator_set_updates,
-        } = app.validate_block(validate_block_request)
-        {
-            block_tree.insert(
-                &proposal.block,
-                app_state_updates.as_ref(),
-                validator_set_updates.as_ref(),
-            )?;
-            Event::InsertBlock(InsertBlockEvent {
-                timestamp: SystemTime::now(),
-                block: proposal.block.clone(),
-            })
-            .publish(&self.event_publisher);
-
-            // 3. Trigger block tree updates: update highestPC, lock, commit.
-            let update_result = block_tree
-                .update(&proposal.block.justify, &self.event_publisher)
-                .unwrap_or(UpdateResult {
-                    validator_set_updates: None,
-                    committed_block_hashes: vec![],
-                });
-            self.process_update_result(update_result, block_tree, app);
-
+        if let Some(has_validator_set_updates) = has_validator_set_updates {
             // 4. Access the possibly updated validator set state, and update the vote collectors if needed.
             let validator_set_state = block_tree.validator_set_state()?;
 
@@ -1508,7 +1489,7 @@ impl<N: Network> HotStuff<N> {
             // them, so a block others certify is still accepted here).
             // TC phase C review (§4): a vote that makes this proposal the voter's tip (a fresh
             // Generic proposal, NEC ones included) is cast only for the view's one fresh proposer.
-            let sets_tip_from_proposal = validator_set_updates.is_none() && !proposal.is_reproposal();
+            let sets_tip_from_proposal = !has_validator_set_updates && !proposal.is_reproposal();
             if is_phase_voter(
                 &self.config.keypair.public(),
                 &validator_set_state,
@@ -1519,7 +1500,7 @@ impl<N: Network> HotStuff<N> {
                     || Self::is_fresh_proposer(origin, proposal.view, &proposal.block.justify, block_tree)?)
                 && Self::vote_check(&proposal.block, block_tree, app)? == BlockDataCheck::Held
             {
-                let vote_phase = if validator_set_updates.is_some() {
+                let vote_phase = if has_validator_set_updates {
                     Phase::Prepare
                 } else {
                     Phase::Generic
@@ -1572,6 +1553,48 @@ impl<N: Network> HotStuff<N> {
         }
 
         Ok(())
+    }
+
+    /// Steps 2 and 3 of [`on_receive_proposal`](Self::on_receive_proposal) for a block that is not
+    /// committed: validate `block` with the app, and if it is valid insert it and apply its justify
+    /// (highest PC, lock, commit). Returns whether the block updates the validator set, or `None`
+    /// if the app did not accept it.
+    fn validate_insert_and_update<K: KVStore>(
+        &mut self,
+        block: &Block,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<Option<bool>, HotStuffError> {
+        let parent_block = if block.justify.is_genesis_pc() {
+            None
+        } else {
+            Some(&block.justify.block)
+        };
+        let validate_block_request = ValidateBlockRequest::new(block, block_tree.app_view(parent_block)?);
+
+        let ValidateBlockResponse::Valid {
+            app_state_updates,
+            validator_set_updates,
+        } = app.validate_block(validate_block_request)
+        else {
+            return Ok(None);
+        };
+        block_tree.insert(block, app_state_updates.as_ref(), validator_set_updates.as_ref())?;
+        Event::InsertBlock(InsertBlockEvent {
+            timestamp: SystemTime::now(),
+            block: block.clone(),
+        })
+        .publish(&self.event_publisher);
+
+        // 3. Trigger block tree updates: update highestPC, lock, commit.
+        let update_result = block_tree
+            .update(&block.justify, &self.event_publisher)
+            .unwrap_or(UpdateResult {
+                validator_set_updates: None,
+                committed_block_hashes: vec![],
+            });
+        self.process_update_result(update_result, block_tree, app);
+        Ok(Some(validator_set_updates.is_some()))
     }
 
     /// Process the received nudge.
@@ -2528,7 +2551,14 @@ impl<N: Network> HotStuff<N> {
         // deferred to the idempotent body-arrival `update` in `try_insert_body`.
         // This runs unconditionally (like the full path's update), even for a
         // non-voting replica, so every replica advances its lock from the header.
-        block_tree.update_locks_only(&header.justify, &self.event_publisher)?;
+        //
+        // Codex P1 (mixed commit): a committed block passes the checks above only as this
+        // replica's locked block (`safe_proposal_lock`); its justify was applied when it was
+        // first processed, and re-applying it is not a no-op when it is a Decide PC (the decided
+        // flag would cover this replica's undecided update). Vote on it without applying it.
+        if !block_already_in_tree || !is_committed_block(&header.block_hash, block_tree)? {
+            block_tree.update_locks_only(&header.justify, &self.event_publisher)?;
+        }
 
         // Vote on the header (same voting logic as on_receive_proposal).
         let validator_set_state = block_tree.validator_set_state()?;

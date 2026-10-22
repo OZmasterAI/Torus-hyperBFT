@@ -362,7 +362,7 @@ fn note_pending_justify_deferral(block: &CryptoHash) -> Option<u64> {
 ///
 /// `safe_block` returns `true` in case all of the following predicates are `true`:
 /// 1. `safe_proposal_pc(&block.hash, &block.justify, block_tree, chain_id)`: `safe_pc` on the
-///    justify, whose lock clause also accepts a proposal of the (uncommitted) locked block itself.
+///    justify, whose lock clause also accepts a proposal of the locked block itself.
 /// 2. `block.pc.phase` is either `Generic` or `Decide`.
 ///
 /// # Precondition
@@ -383,7 +383,7 @@ pub(crate) fn safe_block<K: KVStore>(
 /// [`safe_pc`] for the justify of a proposed block `block_hash` (a full proposal or a proposal
 /// header, whose `block_hash` the caller has checked to be `Block::hash(height, justify,
 /// data_hash)`): the same predicates, with the lock clause (3) replaced by
-/// [`safe_proposal_lock`], which also accepts a proposal of the uncommitted locked block itself.
+/// [`safe_proposal_lock`], which also accepts a proposal of the locked block itself.
 ///
 /// # Precondition
 ///
@@ -399,15 +399,21 @@ pub(crate) fn safe_proposal_pc<K: KVStore>(
 
 /// s138: the lock rule for a proposed block `block_hash` justified by `justify` (reflexive, as
 /// PODC '19 HotStuff's `safeNode`): either `justify` satisfies [`safe_pc_lock_clause`], or the
-/// block IS the locked block and that block is not committed yet.
+/// block IS the locked block.
 ///
 /// The block hash binds the justify (`Block::hash(height, justify, data_hash)`, checked by the
 /// caller), so the reflexive arm only ever admits the locked block with its own justify; any other
-/// block carrying that (stale) justify is a sibling and still fails. A committed locked block is
-/// excluded: no honest leader re-proposes it (its Commit PC can be nudged in any view), and
-/// re-inserting it / re-applying its stale justify is not wanted. Like `safe_pc_lock_clause` it
-/// needs no tree membership (the locked block's body may be in flight; a block not in the tree
-/// is not committed), so the header fast path can enforce it unconditionally.
+/// block carrying that (stale) justify is a sibling and still fails. Like `safe_pc_lock_clause` it
+/// needs no tree membership (the locked block's body may be in flight), so the header fast path
+/// can enforce it unconditionally.
+///
+/// The locked block may already be COMMITTED here (Codex P1 on 93948e2b, the mixed commit: U's
+/// Commit PC reached one honest replica only, the others re-certify U in later views and leaders
+/// re-propose it; without this replica's vote the honest replicas are no quorum). The vote then
+/// certifies the block this replica already committed and nothing else; callers vote without
+/// validating, inserting or re-applying the justify of a committed block
+/// ([`is_committed_block`]): its justify was applied when it was first processed, and a stale
+/// Decide justify would mark the replica's undecided update as decided.
 ///
 /// See the module docs ("Checking against the Lock") and docs/plans/disjoint-vset-livelock.md
 /// ("Reflexive lock rule") for the safety argument.
@@ -416,22 +422,28 @@ pub(crate) fn safe_proposal_lock<K: KVStore>(
     justify: &PhaseCertificate,
     block_tree: &BlockTreeSingleton<K>,
 ) -> Result<bool, BlockTreeError> {
-    Ok(is_uncommitted_locked_block(block_hash, block_tree)? || safe_pc_lock_clause(justify, block_tree)?)
+    Ok(is_locked_block(block_hash, block_tree)? || safe_pc_lock_clause(justify, block_tree)?)
 }
 
-/// Whether `block_hash` is `block_tree`'s `locked_pc.block` (never the genesis PC's) and that block
-/// is not committed: its height (if the block is in the tree) is above the highest committed one.
-fn is_uncommitted_locked_block<K: KVStore>(
+/// Whether `block_hash` is `block_tree`'s `locked_pc.block` (never the genesis PC's).
+fn is_locked_block<K: KVStore>(
     block_hash: &CryptoHash,
     block_tree: &BlockTreeSingleton<K>,
 ) -> Result<bool, BlockTreeError> {
     let locked_pc = block_tree.locked_pc()?;
-    if locked_pc.is_genesis_pc() || *block_hash != locked_pc.block {
-        return Ok(false);
-    }
+    Ok(!locked_pc.is_genesis_pc() && *block_hash == locked_pc.block)
+}
+
+/// Whether `block_hash` is a committed block of `block_tree`: in the tree, at or below the
+/// highest committed height. A proposal of a committed block (only the reflexive lock arm admits
+/// one, [`safe_proposal_lock`]) is voted on without validating, inserting or updating anything.
+pub(crate) fn is_committed_block<K: KVStore>(
+    block_hash: &CryptoHash,
+    block_tree: &BlockTreeSingleton<K>,
+) -> Result<bool, BlockTreeError> {
     Ok(match block_tree.block_height(block_hash)? {
-        None => true,
-        Some(height) => block_tree.highest_committed_block_height()?.is_none_or(|committed| height > committed),
+        None => false,
+        Some(height) => block_tree.highest_committed_block_height()?.is_some_and(|committed| height <= committed),
     })
 }
 
