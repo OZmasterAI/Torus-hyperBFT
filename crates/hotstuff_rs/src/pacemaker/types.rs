@@ -78,6 +78,9 @@ impl TipInfo {
     ///
     /// - its height, justify and data hash recompute its block hash ([`Block::hash`]), so the
     ///   fields the protocol reads from a tip (`block_justify` above all) are the block's own;
+    /// - its block justifies on a PC of chain `chain_id` (or the genesis PC): the leader signs only
+    ///   the hash, so a Byzantine leader could otherwise sign a header justified by a real QC of
+    ///   another chain its validators' keys sign (the justify's signatures are not checked here);
     /// - `leader_signature` is the signature of the view's one fresh proposer
     ///   ([`fresh_proposer`]) over `(chain_id, view, block_hash)`
     ///   ([`proposal_header_bytes`](crate::types::signing::proposal_header_bytes)): leader(`view`) of
@@ -105,6 +108,9 @@ impl TipInfo {
         reputation: Option<&LeaderReputation>,
     ) -> bool {
         if Block::hash(self.block_height, &self.block_justify, &self.block_data_hash) != self.block_hash {
+            return false;
+        }
+        if self.block_justify.chain_id != chain_id && !self.block_justify.is_genesis_pc() {
             return false;
         }
         fresh_proposer(self.view, validator_set_state, reputation).is_some_and(|leader| {
@@ -226,10 +232,19 @@ impl Certificate for TimeoutCertificate {
     /// voter could make a forged high-view QC the TC's high QC, and VALIDPROPOSAL V3 would then
     /// reject every case-3 proposal backed by that TC. Honest collectors drop such votes
     /// (`Pacemaker::on_receive_timeout_vote`); this rejects a TC built by anyone else.
+    ///
+    /// The TC, its high tip and its high QC must all be of chain `chain_id`: its signers sign only
+    /// the high QC's `(view, block)`, so a Byzantine signer could otherwise report a real QC of
+    /// another chain its keys validate, and a high QC is acted on without `safe_pc` (VALIDPROPOSAL
+    /// V3, the leader's case 3).
     fn is_correct<K: KVStore>(
         &self,
+        chain_id: ChainID,
         block_tree: &BlockTreeSingleton<K>,
     ) -> Result<bool, BlockTreeError> {
+        if self.chain_id != chain_id {
+            return Ok(false);
+        }
         let validator_set_state = block_tree.validator_set_state()?;
         let signed = if validator_set_state.update_decided() {
             self.is_correctly_signed(validator_set_state.committed_validator_set())
@@ -244,14 +259,15 @@ impl Certificate for TimeoutCertificate {
         // leader signed).
         if let Some(tip) = &self.high_tip {
             let reputation = tip_leader_reputation(block_tree);
-            if !tip.is_correct_under(self.chain_id, &validator_set_state, reputation.as_ref()) {
+            if !tip.is_correct_under(chain_id, &validator_set_state, reputation.as_ref()) {
                 return Ok(false);
             }
         }
         // This replica's own highest PC was verified when it was accepted; skip its n
         // signature checks (the common case: the TC's signers report the same QC).
         match &self.high_qc {
-            Some(high_qc) => Ok(*high_qc == block_tree.highest_pc()? || high_qc.is_correct(block_tree)?),
+            Some(high_qc) => Ok((high_qc.chain_id == chain_id && *high_qc == block_tree.highest_pc()?)
+                || high_qc.is_correct(chain_id, block_tree)?),
             None => Ok(true),
         }
     }

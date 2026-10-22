@@ -294,7 +294,10 @@ impl<N: Network> Pacemaker<N> {
         // is dropped like a forged high QC.
         let vote_ok = timeout_vote.is_correct(origin)
             && match &timeout_vote.highest_qc {
-                Some(qc) => *qc == block_tree.highest_pc()? || qc.is_correct(block_tree)?,
+                Some(qc) => {
+                    (qc.chain_id == self.config.chain_id && *qc == block_tree.highest_pc()?)
+                        || qc.is_correct(self.config.chain_id, block_tree)?
+                }
                 None => true,
             }
             && timeout_vote.local_tip.as_ref().is_none_or(|tip| {
@@ -373,7 +376,7 @@ impl<N: Network> Pacemaker<N> {
             }
 
             let fallback_tc = match &timeout_vote.highest_tc {
-                Some(tc) if tc.is_correct(block_tree)? => Some(tc.clone()),
+                Some(tc) if tc.is_correct(self.config.chain_id, block_tree)? => Some(tc.clone()),
                 _ => None,
             };
 
@@ -533,10 +536,10 @@ impl<N: Network> Pacemaker<N> {
         // 2. Check whether the progress certificate contained in the Advance View message is "valid".
         let progress_certificate = advance_view.progress_certificate.clone();
         let is_valid = match &progress_certificate {
-            ProgressCertificate::PhaseCertificate(pc) => pc.is_correct(block_tree)?,
+            ProgressCertificate::PhaseCertificate(pc) => pc.is_correct(self.config.chain_id, block_tree)?,
             // FIX CONS-FIND-18: Accept TCs in AdvanceView for ANY view, not just
             // epoch-change views. TCs are valid for liveness at any view.
-            ProgressCertificate::TimeoutCertificate(tc) => tc.is_correct(block_tree)?,
+            ProgressCertificate::TimeoutCertificate(tc) => tc.is_correct(self.config.chain_id, block_tree)?,
         };
 
         if is_valid {

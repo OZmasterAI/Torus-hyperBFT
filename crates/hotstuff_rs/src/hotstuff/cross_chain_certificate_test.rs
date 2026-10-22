@@ -82,15 +82,15 @@ pub(crate) fn tc_on(
 
 // The checks under test, in one place (RED: main's `is_correct` took no chain ID).
 fn tc_correct(tc: &TimeoutCertificate, tree: &BlockTreeSingleton<MemKV>) -> bool {
-    tc.is_correct(tree).unwrap()
+    tc.is_correct(CHAIN_ID, tree).unwrap()
 }
 
-fn pc_correct(pc: &PhaseCertificate, _chain_id: ChainID, tree: &BlockTreeSingleton<MemKV>) -> bool {
-    pc.is_correct(tree).unwrap()
+fn pc_correct(pc: &PhaseCertificate, chain_id: ChainID, tree: &BlockTreeSingleton<MemKV>) -> bool {
+    pc.is_correct(chain_id, tree).unwrap()
 }
 
-fn block_correct(block: &Block, _chain_id: ChainID, tree: &BlockTreeSingleton<MemKV>) -> bool {
-    block.is_correct(tree).unwrap()
+fn block_correct(block: &Block, chain_id: ChainID, tree: &BlockTreeSingleton<MemKV>) -> bool {
+    block.is_correct(chain_id, tree).unwrap()
 }
 
 fn tip_correct(tip: &TipInfo, chain_id: ChainID, tree: &BlockTreeSingleton<MemKV>) -> bool {

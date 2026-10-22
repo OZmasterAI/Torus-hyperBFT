@@ -434,7 +434,7 @@ impl<N: Network> BlockSyncClient<N> {
         // committed chain which may diverge from our locked_pc branch. The lock
         // rule prevents conflicting votes in live consensus but must not reject
         // valid committed blocks during catch-up.
-        if !block.is_correct(block_tree)? {
+        if !block.is_correct(self.config.chain_id, block_tree)? {
             log::warn!("block_sync: block failed is_correct, blacklisting peer");
             self.block_sync_client_state
                 .blacklist_sync_server(peer, self.config.blacklist_expiry_time);
@@ -593,7 +593,7 @@ impl<N: Network> BlockSyncClient<N> {
     ) -> Result<(), BlockSyncClientError> {
         let highest_pc = self.pending_sync.as_ref().and_then(|s| s.highest_pc.clone());
         if let Some(highest_pc) = highest_pc {
-            if highest_pc.is_correct(block_tree)?
+            if highest_pc.is_correct(self.config.chain_id, block_tree)?
                 && safe_pc(&highest_pc, block_tree, self.config.chain_id)?
             {
                 let update_result = block_tree.update(&highest_pc, &self.event_publisher)?;
@@ -659,7 +659,7 @@ impl<N: Network> BlockSyncClient<N> {
         let view_difference = (advertise_pc.highest_pc.view - local_highest_pc_view) as u64;
         if self.pending_sync.is_none()
             && view_difference >= self.config.block_sync_trigger_min_view_difference
-            && advertise_pc.highest_pc.is_correct(block_tree)?
+            && advertise_pc.highest_pc.is_correct(self.config.chain_id, block_tree)?
         {
             log::info!(
                 "block_sync: advertise_pc trigger fired, remote_pc_view={}, local_pc_view={}, diff={}",
