@@ -15930,7 +15930,19 @@ impl NativeExecutor {
             // placement that advanced the counter got the id it read before.
             let next_oid = ctx.next_global_order_id;
             let result = match core_writer_to_native(qa) {
-                Ok(Some(action)) => Self::execute(ctx, &qa.trader, &action),
+                Ok(Some(action)) => {
+                    let r = Self::execute(ctx, &qa.trader, &action);
+                    // Codex P2 (s139): a placement refused before the book
+                    // (tick, margin, ...) gets its `orderUpdates` rejection,
+                    // with the row's parameters, as a native one does (the
+                    // book logs its own refusals).
+                    if let NativeAction::PlaceOrder(params) = &action {
+                        if !r.success && !r.is_book_reject() {
+                            ctx.record_pre_book_reject(&qa.trader, params, None, r.reason);
+                        }
+                    }
+                    r
+                }
                 Ok(None) => Self::exec_settle_lockbox_deposit(ctx, qa),
                 Err(e) => NativeActionResult::err("core_writer", e),
             };

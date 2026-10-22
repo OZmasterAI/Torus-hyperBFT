@@ -1548,13 +1548,26 @@ impl OrderBook {
         makers: Option<&dyn MakerAccountSource>,
         cloid_checked: bool,
     ) -> PlaceResult {
-        let logged = self
-            .order_events
-            .is_some()
-            .then(|| order_events::PlacedParams::new(&params, trader));
+        let logged = self.order_events.is_some().then(|| {
+            // Codex P2 (s139): an accepted policed reduce-only Limit /
+            // Market order is clamped to the position before it matches
+            // (`place_order_checked_inner`); its event reports the clamped
+            // size, the stored order's `original_qty`. Read before the
+            // placement: its fills move the position.
+            let clamp = (params.reduce_only
+                && matches!(params.order_type, OrderType::Limit | OrderType::Market))
+            .then(|| self.reduce_only_positions.get(&trader))
+            .flatten()
+            .map(|pos| reduce_only_allowance(pos, params.is_buy))
+            .filter(|allowed| *allowed > FixedPoint::ZERO);
+            (order_events::PlacedParams::new(&params, trader), clamp)
+        });
         let result =
             self.place_order_checked_inner(params, trader, timestamp, margin, makers, cloid_checked);
-        if let Some(p) = logged {
+        if let Some((mut p, clamp)) = logged {
+            if let (Some(allowed), None) = (clamp, result.reject) {
+                p.qty = p.qty.min(allowed);
+            }
             self.log_placement(&p, &result);
         }
         result

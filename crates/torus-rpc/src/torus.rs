@@ -2659,14 +2659,20 @@ impl RpcState {
                 }
                 Err(RecvError::Closed) => return Ok(()),
             };
+            // Codex P2 (s139): only a tick carrying this market moves the
+            // height; another market's tick at height h must not swallow a
+            // forced refresh of this one at the same h (a subscription that
+            // joined during a publisher read).
+            let Some(update) = tick.books.get(&market) else {
+                continue;
+            };
             if tick.height <= height {
                 continue;
             }
             height = tick.height;
-            match tick.books.get(&market) {
-                None => {}
-                Some(Err(e)) => return Err(e.clone().into()),
-                Some(Ok(snap)) => {
+            match update {
+                Err(e) => return Err(e.clone().into()),
+                Ok(snap) => {
                     let raw = snap.levels_json(levels)?;
                     if raw.get() == last.get() {
                         continue;
