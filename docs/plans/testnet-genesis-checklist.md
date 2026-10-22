@@ -10,6 +10,19 @@ Paths: **RM** = `docs/Torus-hyperBFT-roadmap.md` (line numbers at the s136 refre
 Status values: **decided**, **open**, **conflict** (sources disagree; owner to confirm), **pending code** (decided,
 waiting for a merge). "Blocks" names what cannot be finished until the item is settled.
 
+## 0. Owner decisions s138 (2026-10-22)
+
+| Item | Decision |
+|---|---|
+| Price band before a market's first mark | **A + C.** A (ops): list no markets / keep trading closed until every validator's oracle signer is registered and marks are fresh. C (code, pre-genesis): reject order placement on a market that has never had a mark until its first mark lands; listing a market therefore needs a feeder that quotes it. Builder: `fix/reject-orders-before-first-mark` |
+| RPC freshness option (b) | **(a) for the testnet:** not built; wallets use `--rpc-only` nodes (checkpoint interval 0) |
+| M2 timestamp lower bound | **Before genesis** (resolves the conflict below). Builder: `fix/m2-timestamp-lower-bound` |
+| 9n (8f deep-book re-run) gates the launch | **Yes** (bench queue 9n) |
+| Validator count (3 / 4 / 5) | Deferred: owner decides right before the testnet |
+| Liquidator-vault seed amount | Deferred: owner decides right before the testnet |
+| Item 7 T timing | Pending owner answer (s127 said before genesis; option: after genesis behind a P0.0 bit) |
+| Jailing / `JailVote` gate | Pending owner answer (recommended: skip the gate for the testnet if every validator is owner-run, fix before mainnet; jailing timing T2) |
+
 ## 1. Chain identity and validators
 
 | Question | Options | What we know | Status | Blocks |
@@ -85,9 +98,10 @@ waiting for a merge). "Blocks" names what cannot be finished until the item is s
   whether it gates genesis, section 2).
 - Batch 10 (L6.1 + L2.1 with P0.0, the defaults): **landed on main `2d2f3ed9` (s136).** The testnet genesis must name its activations explicitly (hash + L6.1 from block 1); a file without the field means off.
 - Dead-leader b1 phases 2-4: only if it goes into the genesis (section 2).
-- M2: only if the conflict resolves to "before genesis" (section 2).
+- M2: **before genesis (owner s138)**, `fix/m2-timestamp-lower-bound`.
+- Price band before the first mark (C): `fix/reject-orders-before-first-mark` (owner s138).
 - Item 7 T: only if the s127 order still holds (section 4).
 - Capacity (not a genesis field, a launch-readiness check): the 1M-account RAM check PASSED (bench 8f, perf doc
   section 93: 8.1-9.2 GB per node, restarts <= 11 s). Open: its deep-book throughput finding (~1-1.7M resting
   orders: matched/s -14.3%, blocks/s 13.3 -> 3.0) predates L3.1 / L6.1. Re-run 8f on main after batch 10 (9n, on
-  hold; blocked by the bench pause). Open question: does a re-run gate the launch?
+  hold; blocked by the bench pause). **It gates the launch (owner s138).** Benches unpaused s138.

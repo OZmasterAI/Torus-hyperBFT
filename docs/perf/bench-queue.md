@@ -1134,7 +1134,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    sections 113, 117; the last profile 8u, section 105, predates L3.1 / L6.1)? If yes, item 6 Phase 5 is revisited
    (rebase step 2, move the drain to the flush worker, re-A/B under the exec-path rule); if no, it stays parked.
    Report the top exec-thread functions with shares, per shape. Doc target: the next results-doc section.
-9n. **[GO, owner s138] 8f re-run: deep-book capacity on
+9n. **[GO, owner s138; GATES THE TESTNET LAUNCH (owner s138)] 8f re-run: deep-book capacity on
    main after batch 10.** Section 93's stage b cell (3 nodes, 1M accounts, 1M pre-loaded resting orders, 600 s
    standard load) on main after batch 10, plus the same binary's standard cell. Section 93 passed RAM (8.1-9.2 GB per
    node) and restarts, but found matched/s -14.3%, native blocks/s 13.3 -> 3.0, p50 15 -> 240 ms, `save_books`
