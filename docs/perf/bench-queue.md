@@ -1077,12 +1077,14 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    `STATE_HASH_ACTIVATION=off` explicitly. Report per window (pre-kill / post-kill): blocks/s, matched/s, timeout
    views per minute, p50 / p99 commit latency, plus the end-of-load cancel-all tail (archy s136 open question).
    ~2-2.5 h (estimate). Doc target: the next results-doc section.
+   **Config (s136, batch 10 on main `2d2f3ed9`):** run as the testnet will: hash + attestation + L6.1 + L2.1 + fail-stop on. `gen-weighted-genesis.sh` (needed for 2/2/1 stakes) still defaults the hash OFF, so set `STATE_HASH_ACTIVATION` explicitly ON (hash from block 1; L6.1 follows it for Classic); L2.1 and fail-stop are on by default. Check the startup lines read `on=true`.
 9o. **[HOLD, owner s136] TC-required phase D: one-down bench, main vs main + TC set.** After the TC set lands (batch 9
    + `fix/tc-liveness`) and after 9k. Same cells as 9k on both binaries, 3 runs each (design
    `docs/plans/tc-required-and-tip-signing.md` section 7): all-up and one-down (stake 2/2/1, stake-1 node killed, no
    restart). Report blocks/s, matched/s, timeout views per minute, TC wait (enter_view -> propose), p50 / p99 commit
    latency. Pass: all-up within noise; one-down blocks/s within -5%. Optional: WAN netem cell at 227 / 502 ms (trial
    net instead, owner s136). ~2 h (estimate).
+   **Config (s136, batch 10 on main `2d2f3ed9`):** run as the testnet will: hash + attestation + L6.1 + L2.1 + fail-stop on. `gen-weighted-genesis.sh` (needed for 2/2/1 stakes) still defaults the hash OFF, so set `STATE_HASH_ACTIVATION` explicitly ON (hash from block 1; L6.1 follows it for Classic); L2.1 and fail-stop are on by default. Check the startup lines read `on=true`.
 9p. **[HOLD, owner s136] Dead-leader skip (b1) phase 4: before / after.** After dead-leader phases 1-3 land (rebased on
    the TC set) and after 9k. Design `docs/plans/dead-leader-skip.md` section 5: before = 9k's cells; after = the same
    cells on the branch, ABBA, 3 runs each; `VALIDATOR_STAKES=2,2,1`, `KILL_NO_RESTART=val2`,
@@ -1090,6 +1092,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    to exclusion update / post-exclusion): blocks/s, matched/s, timeout views per minute, p50 / p99 order latency,
    kill-to-exclusion time (s and heights). Pass: post-exclusion blocks/s >= 90% of all-up; all-up within noise; no
    new stalls. Note: at 2/2/1 a dead stake-1 node is excludable (eligible 4 of 5 >= quorum 4). ~2 h of cells (estimate).
+   **Config (s136, batch 10 on main `2d2f3ed9`):** run as the testnet will: hash + attestation + L6.1 + L2.1 + fail-stop on. `gen-weighted-genesis.sh` (needed for 2/2/1 stakes) still defaults the hash OFF, so set `STATE_HASH_ACTIVATION` explicitly ON (hash from block 1; L6.1 follows it for Classic); L2.1 and fail-stop are on by default. Check the startup lines read `on=true`.
 9l. **[HOLD, owner s136: queued, NOT ready; do not start until the owner says go] Binary gap: `53a6d83c` vs
    `29bfc705`, hash-off Classic.** Section 124 found R (hash off, `29bfc705`) below section 120's A (hash off,
    `53a6d83c`) across campaigns: matched/s 0.983 / 0.970 (deep / standard), exec-thread on-CPU per 1k fills 1.053 /
