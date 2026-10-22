@@ -589,11 +589,22 @@ impl PendingState {
     /// s99 (c): this layer's deletes in `cf` grouped by their first
     /// `prefix_len` bytes (one market).
     fn delete_groups(&self, cf: &str, prefix_len: usize) -> Vec<DeleteGroup<'_>> {
+        self.delete_groups_where(cf, prefix_len, |_, _| true)
+    }
+
+    /// [`Self::delete_groups`] over the deletes `keep` accepts (s80 close
+    /// stack: a stacked set's deletes no later set rewrites).
+    fn delete_groups_where(
+        &self,
+        cf: &str,
+        prefix_len: usize,
+        keep: impl Fn(CfId, &[u8]) -> bool,
+    ) -> Vec<DeleteGroup<'_>> {
         let mut out: Vec<DeleteGroup<'_>> = Vec::new();
         let Some(id) = intern_cf(cf) else {
             return out;
         };
-        for key in &self.cf(id).deletes {
+        for key in self.cf(id).deletes.iter().filter(|k| keep(id, k)) {
             let prefix = &key[..prefix_len.min(key.len())];
             match out.last_mut() {
                 Some(g) if g.0 == prefix => {
@@ -997,6 +1008,11 @@ impl Drop for OutOfBatchRecorder {
         OUT_OF_BATCH.with(|r| *r.borrow_mut() = None);
     }
 }
+
+/// s80 close stack: the overlay's frozen layers under its own set, newest
+/// first: parent, L, then C's [`crate::checkpoint_layer::STACK_SLOTS`] sets.
+pub(crate) const LOWER_SLOTS: usize = 2 + crate::checkpoint_layer::STACK_SLOTS;
+pub(crate) type Lower<'a> = [Option<&'a PendingState>; LOWER_SLOTS];
 
 /// bl2 exec pipeline (`TORUS_EXEC_PIPELINE`): the CLOSED pending set of one
 /// committed block, moved out of its [`NativeStateOverlay`] by
@@ -1608,13 +1624,17 @@ impl NativeStateOverlay {
     /// DB. Without L and C this is exactly the parent alone (bl2).
     /// p3 merge wait: for a deferred CF (with L split), L is the deferred
     /// part, waited for if still being merged; `Err` if that merge failed.
+    /// s80 close stack: C fills the last [`STACK_SLOTS`] slots (its sets
+    /// newest first; a merged C only the last).
     #[inline]
-    fn lower(&self, id: CfId) -> Result<[Option<&PendingState>; 3], StateError> {
-        Ok([
-            self.parent_for_reads().map(|p| &p.state),
-            self.layer_for(id)?,
-            self.inflight_for_reads().map(|c| c.pending_state()),
-        ])
+    fn lower(&self, id: CfId) -> Result<Lower<'_>, StateError> {
+        let mut out: Lower<'_> = [None; LOWER_SLOTS];
+        out[0] = self.parent_for_reads().map(|p| &p.state);
+        out[1] = self.layer_for(id)?;
+        if let Some(c) = self.inflight_for_reads() {
+            out[2..].copy_from_slice(&c.states_newest_first());
+        }
+        Ok(out)
     }
 
     /// The parent layer as reads see it (a `test-probes` planted fault can
@@ -1693,9 +1713,7 @@ impl NativeStateOverlay {
             self.probe_point::<LEN>(id, key, self.l_tag(id), hit);
             return Ok(Some(hit));
         }
-        let hit = self
-            .inflight_for_reads()
-            .and_then(|c| c.pending_state().lookup(id, key));
+        let hit = self.inflight_for_reads().and_then(|c| c.lookup(id, key));
         #[cfg(feature = "test-probes")]
         if let Some(hit) = hit {
             self.probe_point::<LEN>(id, key, crate::probes::Layer::Checkpoint, hit);
@@ -1742,12 +1760,11 @@ impl NativeStateOverlay {
 
     /// `test-probes`: the probe tags of `lower`'s slots (parent, L, C).
     #[cfg(feature = "test-probes")]
-    fn lower_tags(&self, id: CfId) -> [crate::probes::Layer; 3] {
-        [
-            crate::probes::Layer::Parent,
-            self.l_tag(id),
-            crate::probes::Layer::Checkpoint,
-        ]
+    fn lower_tags(&self, id: CfId) -> [crate::probes::Layer; LOWER_SLOTS] {
+        let mut tags = [crate::probes::Layer::Checkpoint; LOWER_SLOTS];
+        tags[0] = crate::probes::Layer::Parent;
+        tags[1] = self.l_tag(id);
+        tags
     }
 
     /// `test-probes`: the DB answers `key` otherwise than `v` now.
@@ -1764,10 +1781,10 @@ impl NativeStateOverlay {
     fn effective_rows<'a>(
         id: CfId,
         own: &PendingState,
-        lower: &[Option<&'a PendingState>; 3],
+        lower: &[Option<&'a PendingState>; LOWER_SLOTS],
         start: &[u8],
         within: impl Fn(&[u8]) -> bool,
-    ) -> [LayerRows<'a>; 3] {
+    ) -> [LayerRows<'a>; LOWER_SLOTS] {
         std::array::from_fn(|i| {
             let Some(layer) = lower[i] else {
                 return Vec::new();
@@ -1813,7 +1830,7 @@ impl NativeStateOverlay {
         &self,
         id: CfId,
         own: &PendingState,
-        lower: &[Option<&PendingState>; 3],
+        lower: &[Option<&PendingState>; LOWER_SLOTS],
         start: &[u8],
         in_range: impl Fn(&[u8]) -> bool,
         upto: Option<&[u8]>,
@@ -1842,7 +1859,7 @@ impl NativeStateOverlay {
         &self,
         id: CfId,
         own: &PendingState,
-        lower: &[Option<&PendingState>; 3],
+        lower: &[Option<&PendingState>; LOWER_SLOTS],
         covers: impl Fn(&[u8]) -> bool,
     ) {
         let tags = self.lower_tags(id);
@@ -1872,7 +1889,7 @@ impl NativeStateOverlay {
         &self,
         id: CfId,
         own: &PendingState,
-        lower: &[Option<&PendingState>; 3],
+        lower: &[Option<&PendingState>; LOWER_SLOTS],
         prefix: &[u8],
         exists: bool,
     ) {
@@ -1906,7 +1923,8 @@ impl NativeStateOverlay {
                     .find(|k| !held(k))
             });
             let mut first: Option<(&[u8], Option<usize>)> = own_first.map(|k| (k.as_slice(), None));
-            for i in 0..3 {
+            // s80 close stack: every slot (C's stacked sets included).
+            for i in 0..LOWER_SLOTS {
                 if let Some(k) = first_write(i) {
                     if first.is_none_or(|(f, _)| k < f) {
                         first = Some((k, Some(i)));
@@ -1922,7 +1940,7 @@ impl NativeStateOverlay {
                 crate::probes::record(id.name(), tags[i], || {
                     let other_live = own_first.is_some()
                         || db_first.is_some()
-                        || (0..3).any(|j| j != i && first_write(j).is_some());
+                        || (0..LOWER_SLOTS).any(|j| j != i && first_write(j).is_some());
                     !other_live && !rows[i].iter().any(|(k, _)| in_db(k))
                 });
             }
@@ -2539,6 +2557,7 @@ fn flush_pending_with_native_trie_stats(
 pub(crate) fn flush_checkpoint_batch(
     prefix: WriteBatch,
     state: &PendingState,
+    upper: &[&PendingState],
     side: Option<&PendingState>,
     rows: &crate::running_hash::ChainRows,
     target: &StateDb,
@@ -2546,9 +2565,10 @@ pub(crate) fn flush_checkpoint_batch(
     trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
     member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
 ) -> Result<NativeFlushStats, StateError> {
-    flush_pending_after_batch(
+    flush_stack_after_batch(
         prefix,
         state,
+        upper,
         side,
         target,
         Some(height),
@@ -2573,6 +2593,94 @@ fn flush_pending_after_batch(
     maintain_trie: bool,
     chain: ChainSrc<'_>,
 ) -> Result<NativeFlushStats, StateError> {
+    flush_stack_after_batch(
+        prefix,
+        state,
+        &[],
+        sidecar,
+        target,
+        applied_height,
+        trie_cache,
+        member_cache,
+        maintain_trie,
+        chain,
+    )
+}
+
+/// s80 close stack: a key's newest entry in `state` + `upper` (`at` = the
+/// index of the set holding the entry: 0 = `state`, i + 1 = `upper[i]`) is
+/// that one, i.e. no later set of the stack holds the key.
+fn newest_in_stack(upper: &[&PendingState], at: usize, id: CfId, key: &[u8]) -> bool {
+    upper[at..].iter().all(|s| s.lookup(id, key).is_none())
+}
+
+/// s80 close stack: [`native_dirty_counts`] over a stack (`state`, then
+/// `upper` oldest first, then `sidecar`): each distinct key counts once,
+/// as in the merged set. With `upper` empty: [`native_dirty_counts`].
+fn native_dirty_counts_stack(
+    state: &PendingState,
+    upper: &[&PendingState],
+    sidecar: Option<&PendingState>,
+) -> [usize; 7] {
+    if upper.is_empty() {
+        return native_dirty_counts(state, sidecar);
+    }
+    let mut counts = [0usize; 7];
+    let layers: Vec<&PendingState> = std::iter::once(state)
+        .chain(upper.iter().copied())
+        .chain(sidecar)
+        .collect();
+    for idx in 0..NUM_CFS {
+        let id = CfId(idx as u8);
+        let Some(tag) = crate::native_trie::cf_tag(id.name()) else {
+            continue;
+        };
+        // Each key counts at its FIRST set (oldest): the base counts its
+        // lengths alone (no walk); each later, small set looks its keys up
+        // in the sets below it (as `native_dirty_counts` does the sidecar).
+        let mut n = 0usize;
+        for (j, layer) in layers.iter().enumerate() {
+            let cfp = &layer.cfs[idx];
+            if j == 0 {
+                n += cfp.writes.len() + cfp.deletes.len();
+                continue;
+            }
+            let older = &layers[..j];
+            let first = |k: &Vec<u8>| older.iter().all(|s| s.lookup(id, k).is_none());
+            n += cfp.writes.keys().filter(|k| first(k)).count();
+            n += cfp.deletes.iter().filter(|k| first(k)).count();
+        }
+        if let Some(slot) = counts.get_mut(tag as usize) {
+            *slot += n;
+        }
+    }
+    counts
+}
+
+/// [`flush_pending_after_batch`] over a stack: `state`, then `upper` (s80
+/// close stack: the frozen blocks stacked on a checkpoint layer, oldest
+/// first; empty everywhere else), then `sidecar`. The batch carries each
+/// set in that order (RocksDB applies in order: a later set's entry
+/// replaces an earlier one's), so the DB state equals the merged set's.
+#[allow(clippy::too_many_arguments)]
+fn flush_stack_after_batch(
+    prefix: WriteBatch,
+    state: &PendingState,
+    upper: &[&PendingState],
+    sidecar: Option<&PendingState>,
+    target: &StateDb,
+    applied_height: Option<u64>,
+    trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
+    member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
+    maintain_trie: bool,
+    chain: ChainSrc<'_>,
+) -> Result<NativeFlushStats, StateError> {
+    // s80: a stack is only a checkpoint's (its running-hash rows were
+    // digested block by block; no step of its own).
+    assert!(
+        upper.is_empty() || matches!(chain, ChainSrc::Rows(_)),
+        "s80 close stack: a stacked flush outside a checkpoint"
+    );
     let (memo, rows) = match chain {
         ChainSrc::Meta => (None, None),
         ChainSrc::Memo(m) => (Some(m), None),
@@ -2636,6 +2744,10 @@ fn flush_pending_after_batch(
         let build_timer = std::time::Instant::now();
         let mut batch = prefix;
         state.append_to_batch(raw, &mut batch)?;
+        // s80 close stack: the stacked blocks, oldest first, after the base.
+        for s in upper {
+            s.append_to_batch(raw, &mut batch)?;
+        }
         // Deferred book save: the sidecar (worker-side book writes) joins the
         // SAME atomic batch, appended after the main set (last-wins on the — in
         // practice disjoint — key sets).
@@ -2650,6 +2762,10 @@ fn flush_pending_after_batch(
         // metric and the stale marker need just the per-CF counts.
         let dirty = maintain_trie.then(|| {
             let mut dirty = state.native_dirty_ref();
+            // s80 close stack: later sets replace earlier entries (newest wins).
+            for s in upper {
+                dirty.extend(s.native_dirty_ref());
+            }
             // Deferred book save: the sidecar's root-CF entries enter the ROOT
             // computation exactly as if the exec thread had written them into its
             // overlay (same canonical (tag, key) order — BTreeMap merge).
@@ -2704,7 +2820,7 @@ fn flush_pending_after_batch(
                     }
                 }
             }
-            None => stats.dirty_entries_by_cf = native_dirty_counts(state, sidecar),
+            None => stats.dirty_entries_by_cf = native_dirty_counts_stack(state, upper, sidecar),
         }
         let has_native_writes = stats.dirty_entries_by_cf.iter().any(|&n| n > 0);
         let trie_result = if !has_native_writes {
@@ -2851,15 +2967,40 @@ fn flush_pending_after_batch(
         }
         // s89 fix B: the batch is durable; if it pruned oracle submissions,
         // compact their range off this thread (node-local, never fails here).
-        if state.deletes_oracle_submissions()
-            || sidecar.is_some_and(PendingState::deletes_oracle_submissions)
-        {
+        let stack_prunes = || {
+            // s80 close stack: a stacked set's prune counts only where no
+            // later stacked set rewrites the key (the merged set's deletes).
+            let oracle = intern_cf(crate::cf::CF_NATIVE_ORACLE);
+            std::iter::once(state)
+                .chain(upper.iter().copied())
+                .enumerate()
+                .any(|(j, s)| {
+                    oracle.is_some_and(|id| {
+                        s.deletes_under(id, crate::cf::ORACLE_SUBMISSION_PREFIX)
+                            .any(|k| newest_in_stack(upper, j, id, k))
+                    })
+                })
+        };
+        let prunes = if upper.is_empty() {
+            state.deletes_oracle_submissions()
+        } else {
+            stack_prunes()
+        };
+        if prunes || sidecar.is_some_and(PendingState::deletes_oracle_submissions) {
             target.compact_pruned_submissions_in_background();
         }
         // s99 (c): count the deleted book rows per market; a market that
         // reaches the threshold gets its span compacted off this thread.
         for (cf, prefix_len) in crate::cf::READER_SCANNED_CFS {
-            for layer in std::iter::once(&*state).chain(sidecar) {
+            // s80 close stack: each stacked set's deletes that stay the
+            // key's newest entry in the stack (the merged set's deletes).
+            for (j, layer) in std::iter::once(state).chain(upper.iter().copied()).enumerate() {
+                let keep = |id: CfId, k: &[u8]| j == upper.len() || newest_in_stack(upper, j, id, k);
+                for (prefix, n, first, last) in layer.delete_groups_where(cf, prefix_len, keep) {
+                    target.note_scanned_deletes(cf, prefix, n, first, last);
+                }
+            }
+            if let Some(layer) = sidecar {
                 for (prefix, n, first, last) in layer.delete_groups(cf, prefix_len) {
                     target.note_scanned_deletes(cf, prefix, n, first, last);
                 }
@@ -3407,7 +3548,7 @@ impl StateBackend for NativeStateOverlay {
         let lower = if rows.is_none() {
             self.lower(id)?
         } else {
-            [None; 3]
+            [None; LOWER_SLOTS]
         };
         let live = |key: &[u8]| -> bool {
             if let Some(hit) = self.pending.read().unwrap().lookup(id, key) {

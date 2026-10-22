@@ -16,7 +16,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use rocksdb::WriteBatch;
 
@@ -182,6 +182,43 @@ pub struct CheckpointLayer {
     /// Item 6 Phase 3 (s114): this layer's share of the exec context's
     /// retention gauges, once attached ([`Self::track`]).
     tracked: Option<crate::retention::Tracked>,
+    /// s80 close stack (`TORUS_S80_CLOSE_STACK`): frozen blocks stacked on
+    /// top of `state` (oldest first, at most [`MAX_STACKED`]) instead of
+    /// merged into it ([`Self::push_frozen`]). Reads resolve newest first
+    /// (`head`, then the tail newest first, then `state`); the checkpoint
+    /// batch writes `state`, then the tail in order, then `head`, so
+    /// RocksDB's in-order apply gives the merged layer's DB state.
+    tail: Vec<Arc<FrozenPending>>,
+    /// s80: rows put on top of a stacked layer ([`Self::put_raw`] after
+    /// [`Self::push_frozen`]: the L3.1 coalesced books at the close).
+    head: Option<Box<PendingState>>,
+    /// s80: the tail's bytes in the layer's measure (an upper bound of what
+    /// merging it would add, as the byte cap's estimate). Not in this
+    /// layer's retention share: each stacked block keeps its own.
+    tail_bytes: usize,
+    /// s80: `head`'s bytes (exact, as `bytes` for `state`).
+    head_bytes: usize,
+}
+
+/// s80 close stack: at most this many frozen blocks stack on one layer (a
+/// close stacks n-1 and n; a drain stacks the top block).
+pub const MAX_STACKED: usize = 2;
+
+/// s80: the slots of [`CheckpointLayer::states_newest_first`]: head, the
+/// tail, the base.
+pub(crate) const STACK_SLOTS: usize = MAX_STACKED + 2;
+
+/// s80 close stack: `TORUS_S80_CLOSE_STACK=1` (read once per process): a
+/// window close stacks the frozen blocks n-1 and n on L
+/// ([`CheckpointLayer::push_frozen`]) instead of merging them on the exec
+/// thread. Default off (merge, exactly as before).
+pub fn close_stack_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("TORUS_S80_CLOSE_STACK").is_ok_and(|v| v.trim() == "1");
+        tracing::info!("TORUS_S80_CLOSE_STACK on={on}");
+        on
+    })
 }
 
 impl Default for CheckpointLayer {
@@ -197,15 +234,79 @@ impl CheckpointLayer {
             bytes: [0; NUM_CFS],
             top: None,
             tracked: None,
+            tail: Vec::new(),
+            head: None,
+            tail_bytes: 0,
+            head_bytes: 0,
         }
     }
 
+    /// s80 close stack: put `frozen` (the next block) on top WITHOUT merging
+    /// it: O(1) on the caller (an `Arc` clone and one walk of the set's
+    /// lengths for the byte count). Reads and the checkpoint batch see the
+    /// same rows a [`Self::merge`] gives. Only a closing layer stacks (L is
+    /// never stacked: a stacked layer refuses [`Self::merge_part`]).
+    pub fn push_frozen(&mut self, frozen: Arc<FrozenPending>) {
+        assert!(
+            self.tail.len() < MAX_STACKED,
+            "s80 close stack: at most {MAX_STACKED} stacked blocks"
+        );
+        assert!(
+            self.head.is_none(),
+            "s80 close stack: a block stacked over put_raw rows"
+        );
+        let bytes = frozen.state_bytes();
+        frozen.note_bytes(LayerPart::All, bytes);
+        self.tail_bytes += bytes;
+        self.top = Some(self.top.map_or(frozen.height(), |t| t.max(frozen.height())));
+        self.tail.push(frozen);
+    }
+
+    /// s80: whether blocks are stacked on this layer.
+    pub fn is_stacked(&self) -> bool {
+        !self.tail.is_empty()
+    }
+
+    /// s80 close stack: the layer's pending sets, NEWEST first (`head`, the
+    /// tail newest first, the base); `None` slots for absent parts. A read
+    /// resolves in the first set holding the key. Unstacked: the base alone.
+    #[inline]
+    pub(crate) fn states_newest_first(&self) -> [Option<&PendingState>; STACK_SLOTS] {
+        let mut out = [None; STACK_SLOTS];
+        out[0] = self.head.as_deref();
+        for (slot, f) in out[1..=MAX_STACKED].iter_mut().zip(self.tail.iter().rev()) {
+            *slot = Some(f.pending_state());
+        }
+        out[STACK_SLOTS - 1] = Some(&self.state);
+        out
+    }
+
+    /// s80: the layer's sets OLDEST first (the batch order).
+    fn states_oldest_first(&self) -> impl Iterator<Item = &PendingState> {
+        std::iter::once(&self.state)
+            .chain(self.tail.iter().map(|f| f.pending_state()))
+            .chain(self.head.as_deref())
+    }
+
+    /// s80: the layer's point read `(cf id, key)` over the stack (newest wins).
+    #[inline]
+    pub(crate) fn lookup(&self, id: crate::backend::CfId, key: &[u8]) -> Option<Option<&[u8]>> {
+        if self.tail.is_empty() {
+            return self.state.lookup(id, key);
+        }
+        self.states_newest_first()
+            .into_iter()
+            .flatten()
+            .find_map(|s| s.lookup(id, key))
+    }
+
     /// Item 6 Phase 3 (s114): count this layer against `stats` until it is
-    /// freed (a no-op if already tracked); its bytes follow [`Self::bytes`].
+    /// freed (a no-op if already tracked); its bytes follow [`Self::bytes`]
+    /// (s80: a stacked layer's blocks count in their own shares).
     /// A [`Self::duplicate`] of a tracked layer is tracked.
     pub fn track(&mut self, stats: &std::sync::Arc<crate::RetentionStats>) {
         if self.tracked.is_none() {
-            self.tracked = Some(crate::retention::Tracked::new(stats, self.bytes(), None));
+            self.tracked = Some(crate::retention::Tracked::new(stats, self.own_bytes(), None));
         }
     }
 
@@ -221,6 +322,10 @@ impl CheckpointLayer {
     /// end-of-block merge folds [`LayerPart::Main`] into L, hands it back,
     /// then folds [`LayerPart::Deferred`] into the part split off it).
     pub fn merge_part(&mut self, frozen: &FrozenPending, part: LayerPart) {
+        assert!(
+            self.tail.is_empty() && self.head.is_none(),
+            "s80 close stack: merge into a stacked layer"
+        );
         let src = frozen.pending_state();
         let mut seen = 0usize;
         for (i, ((dst, bytes), cfp)) in self
@@ -247,6 +352,10 @@ impl CheckpointLayer {
     /// top), leaving this one without them. O(number of CFs): the maps
     /// move, nothing is copied. [`Self::absorb`] puts them back.
     pub fn split_deferred(&mut self) -> CheckpointLayer {
+        assert!(
+            self.tail.is_empty() && self.head.is_none(),
+            "s80 close stack: split of a stacked layer"
+        );
         let mut out = CheckpointLayer::new();
         for i in (0..NUM_CFS).filter(|i| is_deferred_slot(*i)) {
             std::mem::swap(&mut self.state.cfs[i], &mut out.state.cfs[i]);
@@ -266,6 +375,10 @@ impl CheckpointLayer {
     /// holds moves over without copying (the [`Self::split_deferred`] part
     /// coming back); a CF both hold merges entry by entry, `newer` winning.
     pub fn absorb(&mut self, mut newer: CheckpointLayer) {
+        assert!(
+            self.tail.is_empty() && self.head.is_none() && newer.tail.is_empty() && newer.head.is_none(),
+            "s80 close stack: absorb with a stacked layer"
+        );
         for i in 0..NUM_CFS {
             let src = &mut newer.state.cfs[i];
             if src.is_empty() {
@@ -300,7 +413,14 @@ impl CheckpointLayer {
             .ok_or_else(|| {
                 StateError::Io(std::io::Error::other(format!("unregistered CF {cf}")))
             })?;
-        let (dst, bytes) = (&mut self.state.cfs[i], &mut self.bytes[i]);
+        // s80 close stack: on a stacked layer the row goes on top of the
+        // tail (newest), into `head`.
+        let (dst, bytes) = if self.tail.is_empty() {
+            (&mut self.state.cfs[i], &mut self.bytes[i])
+        } else {
+            let head = self.head.get_or_insert_with(|| Box::new(PendingState::new()));
+            (&mut head.cfs[i], &mut self.head_bytes)
+        };
         if dst.deletes.remove(&key) {
             *bytes -= key.len();
         }
@@ -315,7 +435,7 @@ impl CheckpointLayer {
             }
         }
         if let Some(t) = &self.tracked {
-            t.set_bytes(self.bytes());
+            t.set_bytes(self.own_bytes());
         }
         Ok(())
     }
@@ -328,6 +448,14 @@ impl CheckpointLayer {
             dst.writes.clone_from(&src.writes);
             dst.deletes.clone_from(&src.deletes);
         }
+        let head = self.head.as_ref().map(|h| {
+            let mut copy = PendingState::new();
+            for (dst, src) in copy.cfs.iter_mut().zip(h.cfs.iter()) {
+                dst.writes.clone_from(&src.writes);
+                dst.deletes.clone_from(&src.deletes);
+            }
+            Box::new(copy)
+        });
         Self {
             state,
             bytes: self.bytes,
@@ -335,13 +463,26 @@ impl CheckpointLayer {
             tracked: self
                 .tracked
                 .as_ref()
-                .map(|t| crate::retention::Tracked::new(t.stats(), self.bytes(), None)),
+                .map(|t| crate::retention::Tracked::new(t.stats(), self.own_bytes(), None)),
+            tail: self.tail.clone(),
+            head,
+            tail_bytes: self.tail_bytes,
+            head_bytes: self.head_bytes,
         }
     }
 
     /// Bytes held (key + value per write, key per tombstone).
+    /// s80: a stacked layer adds its stacked blocks' bytes (a key in two
+    /// sets counts twice: an upper bound of the merged layer's bytes).
     pub fn bytes(&self) -> usize {
-        self.bytes.iter().sum()
+        self.own_bytes() + self.tail_bytes
+    }
+
+    /// s80: the bytes this layer allocated itself (`state` + `head`): its
+    /// retention share. The stacked blocks are shared `Arc`s, each counted
+    /// in its own share.
+    fn own_bytes(&self) -> usize {
+        self.bytes.iter().sum::<usize>() + self.head_bytes
     }
 
     /// Height of the last merged block.
@@ -350,10 +491,11 @@ impl CheckpointLayer {
     }
 
     /// Writes + tombstones held.
+    /// s80: a stacked layer counts every set's entries (a key in two sets
+    /// counts twice: an upper bound of the merged count).
     pub fn entry_count(&self) -> usize {
-        self.state
-            .cfs
-            .iter()
+        self.states_oldest_first()
+            .flat_map(|s| s.cfs.iter())
             .map(|c| c.writes.len() + c.deletes.len())
             .sum()
     }
@@ -365,6 +507,7 @@ impl CheckpointLayer {
     /// The layer as a pending set (crate-internal: overlay reads, the
     /// checkpoint flush).
     pub(crate) fn pending_state(&self) -> &PendingState {
+        debug_assert!(self.tail.is_empty(), "s80: a stacked layer read as one set");
         &self.state
     }
 
@@ -373,12 +516,18 @@ impl CheckpointLayer {
     /// (or an unregistered CF).
     pub fn lookup_row(&self, cf: &str, key: &[u8]) -> Option<Option<Vec<u8>>> {
         let id = crate::backend::intern_cf(cf)?;
-        self.state.lookup(id, key).map(|v| v.map(<[u8]>::to_vec))
+        self.lookup(id, key).map(|v| v.map(<[u8]>::to_vec))
     }
 
     /// Append every write and tombstone to `batch` (CF order, key order).
+    /// s80: a stacked layer appends its base, then each stacked block in
+    /// order, then `head`: RocksDB applies a batch in order, so a later set's
+    /// put or delete of a key replaces the earlier one (the merged state).
     pub fn append_to_batch(&self, db: &StateDb, batch: &mut WriteBatch) -> Result<(), StateError> {
-        self.state.append_to_batch(db.inner(), batch)
+        for s in self.states_oldest_first() {
+            s.append_to_batch(db.inner(), batch)?;
+        }
+        Ok(())
     }
 
     /// Item 6 Phase 3 (`Job::Checkpoint` on the flush worker): write the
@@ -424,9 +573,15 @@ impl CheckpointLayer {
         trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
         member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
     ) -> Result<crate::NativeFlushStats, StateError> {
+        assert!(
+            side.is_none_or(|s| !s.is_stacked() && s.head.is_none()),
+            "s80 close stack: a stacked side layer"
+        );
+        let upper: Vec<&PendingState> = self.states_oldest_first().skip(1).collect();
         crate::backend::flush_checkpoint_batch(
             prefix,
             &self.state,
+            &upper,
             side.map(|s| &s.state),
             rows,
             target,

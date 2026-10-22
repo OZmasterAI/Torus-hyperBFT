@@ -197,9 +197,14 @@ impl ReadView {
             .blocks
             .iter()
             .map(|b| Some(b.pending_state()))
-            .chain(std::iter::once(
-                self.layers.inflight.as_deref().map(|c| c.pending_state()),
-            ))
+            .chain(
+                // s80 close stack: C's sets newest first (a merged C: one).
+                self.layers
+                    .inflight
+                    .as_deref()
+                    .map(|c| c.states_newest_first())
+                    .unwrap_or_default(),
+            )
             .collect()
     }
 }

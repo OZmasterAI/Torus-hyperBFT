@@ -40,7 +40,9 @@ pub use backend::{
     OutOfBatchRecorder, OwnPendingRow, StateBackend,
 };
 pub use bg_writer::{BackgroundCfWriter, BgWriterPolicy, EncodeRows, PackedCfBatch, RawCfKv};
-pub use checkpoint_layer::{CheckpointLayer, DeferredLayer, LayerPart, DEFERRED_CFS};
+pub use checkpoint_layer::{
+    close_stack_enabled, CheckpointLayer, DeferredLayer, LayerPart, DEFERRED_CFS, MAX_STACKED,
+};
 pub use db::{
     consensus_db_path, DbTuning, RocksdbHist, RocksdbHistograms, RocksdbRuntimeStats,
     RocksdbTickers, StateDb, CONSENSUS_DB_CFS, CONSENSUS_DB_DIR,

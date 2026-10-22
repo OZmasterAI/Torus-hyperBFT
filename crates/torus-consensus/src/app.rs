@@ -3882,11 +3882,22 @@ impl ExecutionContext {
         });
         if let Some(kind) = due {
             let mut layer = st.take_layer();
-            if let Some(p) = &fold {
-                layer.merge(p);
-            }
-            if let Some(c) = &current {
-                layer.merge(c);
+            if torus_state::close_stack_enabled() {
+                // s80 close stack: n-1 and n go on top of L as they are (Arc
+                // clones); W writes L, n-1, n in order in the one batch.
+                if let Some(p) = &fold {
+                    layer.push_frozen(p.clone());
+                }
+                if let Some(c) = &current {
+                    layer.push_frozen(c.clone());
+                }
+            } else {
+                if let Some(p) = &fold {
+                    layer.merge(p);
+                }
+                if let Some(c) = &current {
+                    layer.merge(c);
+                }
             }
             // Item 7 option 0 step 0: a checkpoint hand-off waits for the
             // previous checkpoint (a barrier's drain is covered by the
@@ -4011,7 +4022,12 @@ impl ExecutionContext {
             return true;
         };
         let mut layer = st.take_layer();
-        layer.merge(&top);
+        if torus_state::close_stack_enabled() {
+            // s80 close stack: the top block stacks on L (see the close).
+            layer.push_frozen(top.clone());
+        } else {
+            layer.merge(&top);
+        }
         #[cfg(test)]
         {
             self.test_path("checkpoint.drain");
@@ -4170,6 +4186,8 @@ impl ExecutionContext {
         hash_activation: Option<u64>,
         book_window: Option<u64>,
     ) {
+        // s80: resolve (and log) `TORUS_S80_CLOSE_STACK` at startup.
+        let _ = torus_state::close_stack_enabled();
         self.configure_book_coalesce_with(
             requested,
             hash_activation,
@@ -45876,6 +45894,32 @@ mod crash_recovery_tests {
     /// s114: a reader holding an old ingress view shows in the gauges (one
     /// more live view, the oldest live set ageing past the window) and both
     /// fall back once it lets go.
+    /// s80 close stack (`TORUS_S80_CLOSE_STACK`, read once per process): a
+    /// window close hands W a stacked C (L with n-1 and n on top, not merged)
+    /// iff the flag is on. Run the crate with the flag off and on: this test
+    /// proves which arm ran; the crate's checkpoint differentials (DB and
+    /// running hash vs the per-block path) then hold for both.
+    #[test]
+    fn close_stack_flag_decides_the_closing_layer() {
+        const EVERY: u64 = 5;
+        let (ctx, _mempool, db, blocks) = retention_fixture(17, EVERY);
+        let on = torus_state::close_stack_enabled();
+        let mut closes = 0;
+        for b in &blocks {
+            let h = b.header.height;
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fail-stop at {h}");
+            let c = ctx.ckpt.lock().unwrap().inflight.clone();
+            if let Some((ch, c)) = c.filter(|(ch, _)| *ch == h) {
+                assert_eq!(c.is_stacked(), on, "h{h}: C at {ch}, flag on={on}");
+                assert_eq!(c.top_height(), Some(h));
+                closes += 1;
+            }
+            assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+        }
+        assert!(closes >= 2, "closes seen: {closes}");
+    }
+
     #[test]
     fn checkpoint_retention_gauges_show_a_held_view() {
         use std::time::{Duration, Instant};
