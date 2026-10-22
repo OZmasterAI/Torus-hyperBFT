@@ -131,8 +131,10 @@ def load_rows(path, dead):
             node = r.get("node")
             if ts is None or not node:
                 continue
-            if node == dead and num(r.get("scrape_valid")) == 0:
-                continue  # the killed node's failed scrapes, as summarize.py
+            if num(r.get("scrape_valid")) == 0:
+                # a failed scrape (zero counters) is no sample, on the killed node and on a
+                # survivor alike: kept, a survivor's 10 -> 0 -> 10 reads as a late timeout
+                continue
             rows.setdefault(node, []).append(dict(r, ts=ts))
     for rs in rows.values():
         rs.sort(key=lambda r: r["ts"])

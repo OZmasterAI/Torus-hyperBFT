@@ -1139,5 +1139,162 @@ class DlWindowTest(unittest.TestCase):
         self.assertIn("FAILED", r.stdout)
 
 
+
+# ------------------------------------------------------------------ Codex P2s (s138): stale val3, resummarize, failed survivor scrapes
+class StaleVal3ArtifactsTest(unittest.TestCase):
+    """OVERWRITE=1 N_VALIDATORS=3 on a former 4-validator result dir: the validator count comes from this run
+    (run-id.json n_validators), and reset_run_artifacts clears the old run's val3 files."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="stale-val3-")
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+
+    def reset(self, n):
+        fn = src_between(RUN_CELL_SH, "reset_run_artifacts() {", "\n}\n")
+        r = bash("set -uo pipefail\n" + fn + '\nreset_run_artifacts "$1" "$2" "$3" "$4"', self.d, "c", "", n)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(self.d, "run-id.json")) as f:
+            return json.load(f)
+
+    VAL3 = ("metrics-before-val3.txt", "metrics-after-val3.txt", "funnel-val3.csv", "phase-val3.csv",
+            "state-digest-val3.txt", "digest-val3.out", "vault-val3.json", "val3.log.gz", "val3.log.excerpt",
+            "analysis-val3.txt")
+    KEEP = ("metrics-before-val2.txt", "val2.log.gz", "sampler.csv")
+
+    def touch_all(self):
+        for n in self.VAL3 + self.KEEP:
+            open(os.path.join(self.d, n), "w").write("x")
+
+    def test_reset_records_the_count_and_clears_val3_on_three(self):
+        self.touch_all()
+        ident = self.reset("3")
+        self.assertEqual(ident["n_validators"], 3)
+        for n in self.VAL3:
+            self.assertFalse(os.path.exists(os.path.join(self.d, n)), n)
+        for n in self.KEEP:
+            self.assertTrue(os.path.exists(os.path.join(self.d, n)), n)
+
+    def test_reset_keeps_val3_on_four(self):
+        self.touch_all()
+        self.assertEqual(self.reset("4")["n_validators"], 4)
+        for n in self.VAL3 + self.KEEP:
+            self.assertTrue(os.path.exists(os.path.join(self.d, n)), n)
+
+    def test_wiring_passes_n_validators(self):
+        with open(RUN_CELL_SH) as f:
+            self.assertIn('reset_run_artifacts "$OUT" "$LABEL" "$KILL_NO_RESTART" "$N_VALIDATORS"', f.read())
+
+    def test_summarize_trusts_run_id_over_a_stale_val3_file(self):
+        from test_harness import write_agreement, write_cell
+
+        twin = tempfile.mkdtemp(prefix="stale-val3-twin-")
+        self.addCleanup(shutil.rmtree, twin, ignore_errors=True)
+        for d in (self.d, twin):
+            write_cell(d, 1000, 1000, dur=120)
+            write_agreement(d, ["0xaa"] * 3)
+            with open(os.path.join(d, "run-id.json"), "w") as f:
+                json.dump({"label": "t", "run_id": RUN_ID, "kill_no_restart": None, "n_validators": 3}, f)
+        open(os.path.join(self.d, "metrics-before-val3.txt"), "w").write("torus_block_height 0\n")
+        s, _ = run_summarize(self.d, dur=120)
+        base, _ = run_summarize(twin, dur=120)
+        self.assertNotEqual(s["agreement"]["agreement_verdict"], "INCOMPLETE")
+        self.assertEqual(s["agreement"]["agreement_verdict"], base["agreement"]["agreement_verdict"])
+        self.assertEqual(sorted(s["liveness"]["nodes"]), ["val0", "val1", "val2"])
+        self.assertEqual(s["validity"]["verdict"], base["validity"]["verdict"])
+        self.assertEqual(s["liveness"], base["liveness"])
+
+    def test_summarize_run_id_four_without_file(self):
+        write_four_cell(self.d, kill=None)
+        with open(os.path.join(self.d, "run-id.json"), "w") as f:
+            json.dump({"label": "t", "run_id": RUN_ID, "kill_no_restart": None, "n_validators": 4}, f)
+        os.remove(os.path.join(self.d, "metrics-before-val3.txt"))
+        s, _ = run_summarize(self.d, dur=120, extra=["--digest-quiescent", "1", "--digest-heights", "1200 1201 1202 1203"])
+        self.assertEqual(sorted(s["liveness"]["nodes"]), ["val0", "val1", "val2", "val3"])
+
+
+class ResummarizeFourTest(unittest.TestCase):
+    """resummarize.sh keeps .cell.n_validators, .genesis.leader_* and regenerates .dead_leader."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="resumm4-")
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+
+    def test_shape_and_dead_leader_survive(self):
+        write_four_cell(self.d)
+        dissem = " ".join("%s:exhausted=0,sync_fallback=0,da_outbound_fail=0,starvation=0" % n
+                          for n in ("val0", "val1", "val2", "val3"))
+        run_summarize(self.d, dur=120, extra=["--dissem", dissem, "--digest-quiescent", "1",
+                                              "--digest-heights", "1200 1201 1202"])
+        sp = os.path.join(self.d, "summary.json")
+        with open(sp) as f:
+            s = json.load(f)
+        s["cell"]["n_validators"] = 4
+        s["genesis"]["leader_miss_threshold"] = 3
+        s["genesis"]["leader_exclusion_cap"] = 6
+        with open(sp, "w") as f:
+            json.dump(s, f)
+        kill_ts = BENCH_START + KILL_AT + 0.5
+        for n in ("val0", "val1", "val2", "val3"):
+            with gzip.open(os.path.join(self.d, n + ".log.gz"), "wt") as f:
+                f.write("2026-10-22T00:00:00.000000Z  INFO torus_node: started\n")
+                if n != "val3":
+                    f.write(delta_line(kill_ts + 15.2, 800))
+        r = subprocess.run([sys.executable, os.path.join(HERE, "dl_window.py"), "--dir", self.d,
+                            "--t-bench0", str(BENCH_START), "--t-bench1", str(BENCH_START + 120),
+                            "--dl-k", "3", "--dl-jcap", "6"], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(sp) as f:
+            before = json.load(f)["dead_leader"]
+        os.remove(os.path.join(self.d, "dl-window.json"))
+        r = subprocess.run(["bash", os.path.join(HERE, "resummarize.sh"), self.d],
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(sp) as f:
+            s = json.load(f)
+        self.assertEqual(s["cell"]["n_validators"], 4)
+        self.assertEqual(s["genesis"]["leader_miss_threshold"], 3)
+        self.assertEqual(s["genesis"]["leader_exclusion_cap"], 6)
+        self.assertEqual(s["dead_leader"], before)
+        self.assertTrue(os.path.exists(os.path.join(self.d, "dl-window.json")))  # regenerated
+
+    def test_three_val_cell_gets_no_shape_fields(self):
+        from test_harness import write_agreement, write_cell
+
+        write_cell(self.d, 1000, 1000, dur=120)
+        write_agreement(self.d, ["0xaa"] * 3)
+        run_summarize(self.d, dur=120)
+        r = subprocess.run(["bash", os.path.join(HERE, "resummarize.sh"), self.d],
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(self.d, "summary.json")) as f:
+            s = json.load(f)
+        self.assertNotIn("n_validators", s["cell"])
+        self.assertNotIn("leader_miss_threshold", s["genesis"])
+        self.assertNotIn("dead_leader", s)
+
+
+class DlWindowFailedScrapeTest(DlWindowTest):
+    """a survivor's failed scrape (scrape_valid=0, zero counters) is not a sample: 10 -> 0 -> 10 is no timeout."""
+
+    def test_survivor_failed_scrape_is_dropped(self):
+        p = os.path.join(self.d, "sampler.csv")
+        with open(p) as f:
+            rows = list(csv.reader(f))
+        hdr = rows[0]
+        bad_ts = str(BENCH_START + KILL_AT + 40)
+        for r in rows[1:]:
+            if r[0] == bad_ts and r[1] == "val1":
+                r[2:] = ["0"] * (len(hdr) - 2)
+        with open(p, "w", newline="") as f:
+            csv.writer(f).writerows(rows)
+        self.logs({"val0": [delta_line(self.kill_ts + 15.2, 800)]})
+        d, _ = self.run_dl()
+        self.assertEqual(d["timeouts"]["last_increment_after_kill_s_by_node"]["val1"], 19.5)
+        self.assertEqual(d["headline"]["post_exclusion"]["timeouts_per_min"], 0.0)
+        w = d["per_node"]["val1"]["post_exclusion"]
+        self.assertEqual(w["timeouts_per_min"], 0.0)
+        self.assertEqual(w["matched_s"], 1000.0)
+
+
 if __name__ == "__main__":
     unittest.main()

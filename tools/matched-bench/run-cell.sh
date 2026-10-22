@@ -1434,22 +1434,28 @@ mkdir -p "$OUT"
 # crash-kill.sh norestart copies its run_id into kill-norestart.json and
 # summarize.py applies the record's exclusion only when run_id and kill_node
 # match it (a record it cannot match REJECTs the cell: stale kill record).
-reset_run_artifacts() { # <out> <label> <KILL_NO_RESTART or empty>
-    local out=${1:?} f
+# run-id.json also carries this run's validator count (n_validators: summarize.py's node set), and a
+# 3-validator run clears a former 4-validator run's val3 files (summarize.py / gap_attr.py read
+# metrics-before-val3.txt as "this cell has a val3" when run-id.json has no count).
+reset_run_artifacts() { # <out> <label> <KILL_NO_RESTART or empty> <N_VALIDATORS (default 3)>
+    local out=${1:?} f n=${4:-3} val3=()
+    [ "$n" != 3 ] || val3=("$out"/*-val3.* "$out"/val3.*)
     for f in "$out"/kill-norestart.json "$out"/crash.json "$out"/crash-[0-9]*.json \
              "$out"/crash-kill.json "$out"/crash-kill-[0-9]*.json "$out"/crash-kill.skipped \
-             "$out"/crash-restart-tail.log "$out"/crash-restart-tail-[0-9]*.log "$out"/run-id.json; do
+             "$out"/crash-restart-tail.log "$out"/crash-restart-tail-[0-9]*.log "$out"/run-id.json \
+             ${val3[@]+"${val3[@]}"}; do
         [ -e "$f" ] || continue
         rm -f -- "${f:?}" || return 1
     done
-    python3 - "$out/run-id.json" "${2-}" "${3-}" "$(date +%s.%N)-$$-$RANDOM" <<'PY'
+    python3 - "$out/run-id.json" "${2-}" "${3-}" "$(date +%s.%N)-$$-$RANDOM" "$n" <<'PY'
 import json, sys
-path, label, knr, nonce = sys.argv[1:5]
+path, label, knr, nonce, n = sys.argv[1:6]
 with open(path, "w") as f:
-    json.dump({"label": label, "run_id": label + "/" + nonce, "kill_no_restart": knr or None}, f)
+    json.dump({"label": label, "run_id": label + "/" + nonce, "kill_no_restart": knr or None,
+               "n_validators": int(n)}, f)
 PY
 }
-reset_run_artifacts "$OUT" "$LABEL" "$KILL_NO_RESTART" \
+reset_run_artifacts "$OUT" "$LABEL" "$KILL_NO_RESTART" "$N_VALIDATORS" \
     || { echo "FATAL: could not clear the per-run kill artifacts / write $OUT/run-id.json" >&2; exit 1; }
 
 SAMPLER_PID=""; CPU_PID=""; BENCH_PID=""; CRASH_PID=""; KNR_PID=""; ORACLE_PID=""; ORACLE_RC=""
