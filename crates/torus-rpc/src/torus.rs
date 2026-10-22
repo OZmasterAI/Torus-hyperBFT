@@ -121,6 +121,12 @@ pub trait TorusApi {
     #[method(name = "getUserLimits")]
     async fn get_user_limits(&self, trader: String) -> RpcResult<RpcUserLimits>;
 
+    /// Trading fees: the maker / taker rates in force and the trader's
+    /// lifetime net fees (whether fees are charged yet: the `trading_fees`
+    /// entry of `torus_getFeatureSchedule`).
+    #[method(name = "getUserFees")]
+    async fn get_user_fees(&self, trader: String) -> RpcResult<RpcUserFees>;
+
     /// The liquidator vault's committed cash, deficit and open positions.
     #[method(name = "getLiquidatorVault")]
     async fn get_liquidator_vault(&self) -> RpcResult<RpcLiquidatorVault>;
@@ -1167,6 +1173,34 @@ fn book_read_err(e: torus_core::error::CoreError) -> ErrorObjectOwned {
 /// hold, so a user at the cap still sees every resting order.
 const OPEN_ORDERS_LIMIT: usize = OPEN_ORDER_MAX_LIMIT as usize;
 
+/// Trading fees: the `torus_getUserFees` reply for `trader` (two
+/// `CF_FEE_CONFIG` point reads and the trader's `cfee` row).
+pub(crate) fn user_fees<S: StateBackend + Clone>(
+    state: &S,
+    trader: &alloy_primitives::Address,
+) -> RpcResult<RpcUserFees> {
+    let rates = stored_fee_rates(state).map_err(book_read_err)?;
+    let cum = PositionManager::new(state.clone())
+        .get_cum_fee(trader)
+        .map_err(book_read_err)?;
+    Ok(RpcUserFees {
+        taker_fee_ppm: rates.taker_ppm,
+        maker_fee_ppm: rates.maker_ppm,
+        cum_fees: dec_fp(cum),
+    })
+}
+
+/// The fee rates in force, as the executor reads them
+/// (`TradingFeeRates::from_stored` over the two governance rows).
+fn stored_fee_rates<S: StateBackend>(
+    state: &S,
+) -> Result<torus_types::trading_fees::TradingFeeRates, torus_core::error::CoreError> {
+    use torus_types::trading_fees::{TradingFeeRates, MAKER_FEE_PARAM, TAKER_FEE_PARAM};
+    let taker = state.get_cf_raw(torus_state::cf::CF_FEE_CONFIG, TAKER_FEE_PARAM.as_bytes())?;
+    let maker = state.get_cf_raw(torus_state::cf::CF_FEE_CONFIG, MAKER_FEE_PARAM.as_bytes())?;
+    Ok(TradingFeeRates::from_stored(taker.as_deref(), maker.as_deref()))
+}
+
 /// P0.0 phase 6: the `torus_getFeatureSchedule` reply for `schedule` (this
 /// node's), the features `known` (the node passes `KNOWN_FEATURES`), at the
 /// latest served `height`, with the node's `UPGRADE REQUIRED` state
@@ -1445,6 +1479,11 @@ impl TorusApiServer for RpcState {
             open_order_limit: open_order_limit(cum_volume),
             cum_volume: dec_fp(cum_volume),
         })
+    }
+
+    async fn get_user_fees(&self, trader: String) -> RpcResult<RpcUserFees> {
+        let addr = parse_address(&trader).map_err(ErrorObjectOwned::from)?;
+        user_fees(&self.state, &addr)
     }
 
     // === 2.9.2: Market info ===

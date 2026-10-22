@@ -241,6 +241,7 @@ pub fn fills_for_user(block: &BlockFills, user: Address) -> Vec<RpcUserFill> {
                 e.maker_order_id,
                 e.maker_start_raw,
                 e.maker_pnl_raw,
+                e.maker_fee_raw,
             ));
         }
         if f.taker == user {
@@ -252,6 +253,7 @@ pub fn fills_for_user(block: &BlockFills, user: Address) -> Vec<RpcUserFill> {
                 e.taker_order_id,
                 e.taker_start_raw,
                 e.taker_pnl_raw,
+                e.taker_fee_raw,
             ));
         }
     }
@@ -259,7 +261,7 @@ pub fn fills_for_user(block: &BlockFills, user: Address) -> Vec<RpcUserFill> {
 }
 
 /// One `userFills` row for the party with `role`, `bought`, `order_id`,
-/// `start_raw` and `pnl_raw`.
+/// `start_raw`, `pnl_raw` and `fee_raw` (its trading fee).
 fn user_fill(
     block: &BlockFills,
     f: &TradeFill,
@@ -268,6 +270,7 @@ fn user_fill(
     order_id: u128,
     start_raw: i128,
     pnl_raw: i128,
+    fee_raw: i128,
 ) -> RpcUserFill {
     RpcUserFill {
         trade_id: hex_u128(f.trade_index as u128),
@@ -279,6 +282,7 @@ fn user_fill(
         order_id: hex_u128(order_id),
         start_position: dec_fp(FixedPoint::from_raw(start_raw)),
         closed_pnl: dec_fp(FixedPoint::from_raw(pnl_raw)),
+        fee: block.trading_fees.then(|| dec_fp(FixedPoint::from_raw(fee_raw))),
         dir: fill_dir(start_raw, bought, f.qty_raw).to_string(),
         block_number: hex_u64(block.height),
         timestamp: hex_u64(block.timestamp),
@@ -313,6 +317,7 @@ mod tests {
         BlockFills {
             height: 7,
             timestamp: 1_700_000_007,
+            trading_fees: true,
             fills: vec![
                 fill(0, 1, A, B, 100 * S, 25 * S / 10, 0),
                 fill(1, 2, C, A, 50 * S, S, 1),
@@ -326,6 +331,8 @@ mod tests {
                     taker_start_raw: 0,
                     maker_pnl_raw: -825 * S / 10,
                     taker_pnl_raw: 0,
+                    maker_fee_raw: 375 * S / 10_000,
+                    taker_fee_raw: 1_125 * S / 10_000,
                 },
                 FillExtras {
                     maker_order_id: 33,
@@ -334,6 +341,8 @@ mod tests {
                     taker_start_raw: S / 2,
                     maker_pnl_raw: 0,
                     taker_pnl_raw: 125 * S / 100,
+                    maker_fee_raw: 0,
+                    taker_fee_raw: 0,
                 },
                 FillExtras {
                     maker_order_id: 55,
@@ -342,6 +351,8 @@ mod tests {
                     taker_start_raw: 15 * S / 10,
                     maker_pnl_raw: 0,
                     taker_pnl_raw: 0,
+                    maker_fee_raw: 0,
+                    taker_fee_raw: 0,
                 },
             ],
         }
@@ -434,7 +445,7 @@ mod tests {
                 "price": "100.00000000", "quantity": "2.50000000",
                 "role": "taker", "orderId": "0x16",
                 "startPosition": "0.00000000", "closedPnl": "0.00000000",
-                "dir": "Open Long", "blockNumber": "0x7", "timestamp": "0x6553f107",
+                "fee": "0.11250000", "dir": "Open Long", "blockNumber": "0x7", "timestamp": "0x6553f107",
             })
         );
     }
@@ -451,7 +462,7 @@ mod tests {
                 "price": "100.00000000", "quantity": "2.50000000",
                 "role": "maker", "orderId": "0xb",
                 "startPosition": "3.00000000", "closedPnl": "-82.50000000",
-                "dir": "Close Long", "blockNumber": "0x7", "timestamp": "0x6553f107",
+                "fee": "0.03750000", "dir": "Close Long", "blockNumber": "0x7", "timestamp": "0x6553f107",
             })
         );
         // #1: A is the taker and sells 1 from long 0.5: a flip.
@@ -489,6 +500,32 @@ mod tests {
             ("0x42", "1.50000000")
         );
         assert_eq!(t.dir, "Open Long");
+    }
+
+    /// Codex s138 #3: before `trading_fees` is active the row is exactly the
+    /// pre-feature row (no `fee` key), and a pre-feature row still
+    /// deserializes (`fee` absent = `None`).
+    #[test]
+    fn streams_fills_for_user_omits_fee_before_activation_and_reads_legacy_rows() {
+        let mut pre = block();
+        pre.trading_fees = false;
+        let legacy = json!({
+            "tradeId": "0x0", "marketId": "0x1", "side": "buy",
+            "price": "100.00000000", "quantity": "2.50000000",
+            "role": "taker", "orderId": "0x16",
+            "startPosition": "0.00000000", "closedPnl": "0.00000000",
+            "dir": "Open Long", "blockNumber": "0x7", "timestamp": "0x6553f107",
+        });
+        let rows = fills_for_user(&pre, B);
+        assert_eq!(to_json(&rows)[0], legacy);
+        for r in &rows {
+            assert_eq!(r.fee, None);
+        }
+        let back: RpcUserFill = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.fee, None);
+        let on = to_json(&fills_for_user(&block(), B));
+        let round: RpcUserFill = serde_json::from_value(on[0].clone()).unwrap();
+        assert_eq!(round.fee.as_deref(), Some("0.11250000"));
     }
 
     #[test]
@@ -776,6 +813,7 @@ mod subscribe_ws_tests {
         BlockFills {
             height: 8,
             timestamp: 1_700_000_008,
+            trading_fees: true,
             fills: vec![f],
             extras: vec![b7.extras[1]],
         }

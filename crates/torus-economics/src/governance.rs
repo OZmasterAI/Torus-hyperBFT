@@ -698,16 +698,28 @@ pub struct GovernanceManager<T: StateBackend = StateDb> {
     /// feature bits before submitting or executing proposals; off (the
     /// default), they are refused as on main (`ParameterNotModifiable`).
     funding_keys: bool,
+    /// Trading fees (P0.0 `trading_fees`): accept the fee keys
+    /// (`torus_types::trading_fees::{TAKER,MAKER}_FEE_PARAM`). The executor
+    /// sets it from the executed block's feature bits before submitting or
+    /// executing proposals; off (the default), they are refused exactly as
+    /// before the feature (`ParameterNotModifiable`), so no proposal state
+    /// or fee row exists that a pre-feature node would not have.
+    fee_keys: bool,
 }
 
 impl<T: StateBackend> GovernanceManager<T> {
     pub fn new(state: T) -> Self {
-        Self { state, funding_keys: false }
+        Self { state, funding_keys: false, fee_keys: false }
     }
 
     /// Funding engine: accept the funding keys from now on (see the field).
     pub fn set_funding_keys(&mut self, on: bool) {
         self.funding_keys = on;
+    }
+
+    /// Trading fees: accept the fee keys from now on (see the field).
+    pub fn set_fee_keys(&mut self, on: bool) {
+        self.fee_keys = on;
     }
 
     pub fn state(&self) -> &T {
@@ -745,7 +757,9 @@ impl<T: StateBackend> GovernanceManager<T> {
     /// as not modifiable.
     /// [`Self::validate_param_change`], plus the funding keys while they are
     /// accepted ([`Self::set_funding_keys`]): a decimal u64 in the key's
-    /// range (`torus_types::FUNDING_PARAMS`).
+    /// range (`torus_types::FUNDING_PARAMS`); and with the trading fee keys
+    /// refused as not modifiable unless accepted ([`Self::set_fee_keys`]).
+    /// Each key family is gated on its own feature bit only.
     fn validate_param(&self, key: &str, value: &str) -> Result<()> {
         if let Some((_, range)) = torus_types::funding_param(key).filter(|_| self.funding_keys) {
             let v: u64 = value.parse().map_err(|_| EconomicsError::InvalidParameterValue {
@@ -759,6 +773,11 @@ impl<T: StateBackend> GovernanceManager<T> {
                 });
             }
             return Ok(());
+        }
+        let fee_key = key == torus_types::trading_fees::TAKER_FEE_PARAM
+            || key == torus_types::trading_fees::MAKER_FEE_PARAM;
+        if fee_key && !self.fee_keys {
+            return Err(EconomicsError::ParameterNotModifiable(key.to_string()));
         }
         Self::validate_param_change(key, value)
     }
@@ -896,6 +915,28 @@ impl<T: StateBackend> GovernanceManager<T> {
                     return Err(EconomicsError::InvalidParameterValue {
                         key: key.to_string(),
                         reason: format!("must be between {} and {}", range.start(), range.end()),
+                    });
+                }
+            }
+            // Trading fees (s138): own rows, read by the executor and RPC
+            // through `torus_types::trading_fees::TradingFeeRates`.
+            torus_types::trading_fees::TAKER_FEE_PARAM
+            | torus_types::trading_fees::MAKER_FEE_PARAM => {
+                let range = if key == torus_types::trading_fees::TAKER_FEE_PARAM {
+                    torus_types::trading_fees::TAKER_FEE_PPM_RANGE
+                } else {
+                    torus_types::trading_fees::MAKER_FEE_PPM_RANGE
+                };
+                let v: i64 = value
+                    .parse()
+                    .map_err(|_| EconomicsError::InvalidParameterValue {
+                        key: key.to_string(),
+                        reason: "must be a valid i64 (ppm of notional)".to_string(),
+                    })?;
+                if !range.contains(&v) {
+                    return Err(EconomicsError::InvalidParameterValue {
+                        key: key.to_string(),
+                        reason: format!("must be between {} and {} ppm", range.start(), range.end()),
                     });
                 }
             }

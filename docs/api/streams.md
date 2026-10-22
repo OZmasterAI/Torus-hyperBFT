@@ -89,7 +89,7 @@ serialization. `userFills` arrays are built per subscriber.
 ```json
 {"jsonrpc":"2.0","method":"torus_subscription","params":{"subscription":"<id>","result":[
   {"tradeId":"0x0","marketId":"0x1","side":"sell","price":"100.00000000","quantity":"2.50000000",
-   "role":"maker","orderId":"0xb","startPosition":"3.00000000","closedPnl":"-82.50000000",
+   "role":"maker","orderId":"0xb","startPosition":"3.00000000","closedPnl":"-82.50000000","fee":"0.03750000",
    "dir":"Close Long","blockNumber":"0x7","timestamp":"0x6553f107"}]}}
 ```
 
@@ -100,6 +100,7 @@ serialization. `userFills` arrays are built per subscriber.
 | `orderId` | The user's order that filled |
 | `startPosition` | The user's signed position in this market before the fill (long > 0, short < 0) |
 | `closedPnl` | Realized PnL of the fill's closing part; `0.00000000` when the fill only opened or increased |
+| `fee` | Trading fee the user paid on this fill (negative = maker rebate); absent for blocks before the `trading_fees` feature is active (docs/plans/trading-fees.md) |
 | `dir` | `Open Long`, `Open Short`, `Close Long`, `Close Short`, `Long > Short` or `Short > Long` (a flip) |
 
 There are no self-trades: an order that would match the same user's resting
@@ -134,7 +135,7 @@ order cancels that resting order instead (self-trade prevention).
   - After a reconnect, backfill the gap from the last `blockNumber` you saw
     with the history RPCs.
   - Dedupe merged rows by `blockNumber` + `tradeId` (+ `role` for `userFills`).
-- **Stream-only fields:** `orderId`, `startPosition`, `closedPnl` and `dir` are
+- **Stream-only fields:** `orderId`, `startPosition`, `closedPnl`, `fee` and `dir` are
   not yet in `torus_getUserTrades` rows. A backfilled row lacks them.
 
 ## Slow subscribers

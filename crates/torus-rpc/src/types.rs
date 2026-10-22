@@ -343,6 +343,19 @@ pub struct RpcLiquidatorVault {
     pub open_positions: u64,
 }
 
+/// `torus_getUserFees`: the trading fee rates in force and the trader's
+/// lifetime net fees.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcUserFees {
+    /// Taker fee, ppm of notional (450 = 0.045 %).
+    pub taker_fee_ppm: i64,
+    /// Maker fee, ppm of notional (negative = rebate).
+    pub maker_fee_ppm: i64,
+    /// Lifetime net fees paid (rebates subtracted), signed decimal string.
+    pub cum_fees: String,
+}
+
 /// `torus_getUserLimits`: the per-user open-order limit and its inputs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -518,6 +531,11 @@ pub struct RpcUserFill {
     pub order_id: String,
     pub start_position: String,
     pub closed_pnl: String,
+    /// Trading fee the user paid on this fill (negative = rebate). Absent
+    /// for blocks before `trading_fees` is active (the row is then exactly
+    /// the pre-feature row) and in pre-feature rows (Codex s138 #3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee: Option<String>,
     pub dir: String,
     pub block_number: String,
     pub timestamp: String,

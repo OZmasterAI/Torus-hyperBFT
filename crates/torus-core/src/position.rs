@@ -592,6 +592,33 @@ impl<T: StateBackend> PositionManager<T> {
         Ok(row.unwrap_or(FixedPoint::ZERO))
     }
 
+    /// Trading fees (`trading_fees` feature): `trader`'s lifetime net fees
+    /// (rebates negative), the `cfee` row
+    /// ([`torus_types::trading_fees::cum_fee_key`]); zero if absent.
+    pub fn get_cum_fee(&self, trader: &Address) -> Result<FixedPoint, CoreError> {
+        let key = torus_types::trading_fees::cum_fee_key(trader);
+        match self.state.get_cf_raw(CF_NATIVE_BALANCES, &key)? {
+            Some(data) => {
+                let raw: [u8; 16] = data.as_slice().try_into().map_err(|_| {
+                    CoreError::Borsh(format!("cum_fee row has {} bytes, expected 16", data.len()))
+                })?;
+                Ok(FixedPoint::from_raw(i128::from_be_bytes(raw)))
+            }
+            None => Ok(FixedPoint::ZERO),
+        }
+    }
+
+    /// Add `fee` to `trader`'s `cfee` row ([`Self::get_cum_fee`]).
+    pub fn add_cum_fee(&self, trader: &Address, fee: FixedPoint) -> Result<(), CoreError> {
+        let total = self.get_cum_fee(trader)? + fee;
+        self.state.put_cf_raw(
+            CF_NATIVE_BALANCES,
+            &torus_types::trading_fees::cum_fee_key(trader),
+            &total.raw().to_be_bytes(),
+        )?;
+        Ok(())
+    }
+
     pub fn put_cum_volume(&self, trader: &Address, volume: FixedPoint) -> Result<(), CoreError> {
         self.state.put_cf_raw(
             CF_NATIVE_BALANCES,
@@ -641,7 +668,7 @@ impl<T: StateBackend> PositionManager<T> {
             // existing position, so the delete always targets a live row.
             None => self.delete_position(trader, market_id)?,
         }
-        let effect = FillEffect { start_size, closed_pnl: pnl, funding };
+        let effect = FillEffect { start_size, closed_pnl: pnl, funding, fee: FixedPoint::ZERO };
         if let Some(cash) = effect.cash() {
             self.credit_realized_pnl(trader, cash)?;
         }
@@ -761,6 +788,7 @@ impl<T: StateBackend> PositionManager<T> {
                     start_size,
                     closed_pnl: pnl,
                     funding,
+                    fee: FixedPoint::ZERO,
                 },
             )
         })
@@ -789,23 +817,36 @@ pub struct FillEffect {
     /// Funding engine: funding the position settled at this fill (positive
     /// = paid), before the fill applied. 0 without funding.
     pub funding: FixedPoint,
+    /// Trading fee this side paid on the fill (negative = rebate). Set by the
+    /// executor's settlement (`trading_fees` feature); the position
+    /// transition itself leaves it zero.
+    pub fee: FixedPoint,
 }
 
 // Hand-written: `FixedPoint` has no `Default`.
 impl Default for FillEffect {
     fn default() -> Self {
-        Self { start_size: FixedPoint::ZERO, closed_pnl: None, funding: FixedPoint::ZERO }
+        Self {
+            start_size: FixedPoint::ZERO,
+            closed_pnl: None,
+            funding: FixedPoint::ZERO,
+            fee: FixedPoint::ZERO,
+        }
     }
 }
 
 impl FillEffect {
     /// The trader's cash change of this fill: the realized PnL less the
-    /// funding settled. `None` = no balance write (no close part and no
-    /// funding), exactly the cases where the pre-funding paths wrote none.
+    /// funding settled less the side's trading fee (negative fee = rebate,
+    /// a credit). `None` = no balance write (no close part, no funding and
+    /// no fee), exactly the cases where the pre-funding / pre-fee paths
+    /// wrote none.
     pub fn cash(&self) -> Option<FixedPoint> {
         match self.closed_pnl {
-            Some(pnl) => Some(pnl - self.funding),
-            None if self.funding != FixedPoint::ZERO => Some(FixedPoint::ZERO - self.funding),
+            Some(pnl) => Some(pnl - self.funding - self.fee),
+            None if self.funding != FixedPoint::ZERO || self.fee != FixedPoint::ZERO => {
+                Some(FixedPoint::ZERO - self.funding - self.fee)
+            }
             None => None,
         }
     }

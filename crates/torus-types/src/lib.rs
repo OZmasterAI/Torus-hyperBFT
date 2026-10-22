@@ -10,6 +10,7 @@ pub mod book_mode;
 pub mod eip1559;
 pub mod eip712;
 pub mod features;
+pub mod trading_fees;
 
 pub use features::{ActivationSchedule, Feature, DEFAULT_GENESIS_ACTIVATIONS, KNOWN_FEATURES};
 
