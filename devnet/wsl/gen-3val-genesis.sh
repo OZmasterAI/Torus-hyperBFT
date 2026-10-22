@@ -225,6 +225,12 @@ if [ "${BOOK_WINDOW_COMMIT:-0}" = 1 ]; then
     echo "  book_window_commit = on (L6.1)"
 fi
 
+# 6b. The node default of a Classic genesis naming no activation (unset
+#     STATE_HASH_ACTIVATION, no BOOK_MODE row mode) includes L6.1 from block 1.
+if [ -z "${STATE_HASH_ACTIVATION:-}" ] && [ -z "$BOOK_MODE_NAME" ] && [ "${BOOK_WINDOW_COMMIT:-0}" != 1 ]; then
+    echo "  book_window_commit = on (L6.1)"
+fi
+
 echo "wrote $OUT"
 # One jq pass for the whole summary (each pass parses the full genesis, ~3 s at 1M accounts).
 jq -r '

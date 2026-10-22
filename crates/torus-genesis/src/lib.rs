@@ -439,14 +439,20 @@ impl Genesis {
     pub fn activation_schedule(&self) -> Result<torus_types::ActivationSchedule, GenesisError> {
         use torus_types::Feature::{BookWindowCommit, RunningStateHash};
         // Owner s136: a genesis naming no activation runs the defaults (the
-        // running state hash from block 1); `"activations": {}` opts out.
+        // running state hash and, Classic only, L6.1 from block 1);
+        // `"activations": {}` opts out.
         let mut activations = match (
             &self.consensus.activations,
             self.consensus.state_hash_activation_height,
         ) {
             (Some(named), _) => named.clone(),
             (None, Some(_)) => Default::default(),
-            (None, None) => torus_types::DEFAULT_GENESIS_ACTIVATIONS.iter().copied().collect(),
+            // L6.1 is Classic-only: a row book mode gets the hash alone.
+            (None, None) => torus_types::DEFAULT_GENESIS_ACTIVATIONS
+                .iter()
+                .copied()
+                .filter(|(f, _)| *f != BookWindowCommit || self.consensus.book_mode.is_classic())
+                .collect(),
         };
         if let Some(alias) = self.consensus.state_hash_activation_height {
             if alias == 0 {
@@ -1481,13 +1487,15 @@ mod tests {
         }
     }
 
-    /// L6.1: `consensus.book_window_commit` is a CHAIN-WIDE genesis field,
-    /// absent (every existing genesis) = off; on needs the running hash.
+    /// L6.1: `consensus.book_window_commit` is a CHAIN-WIDE genesis field
+    /// (the alias of the feature); on needs the running hash.
     #[test]
     fn genesis_book_window_commit_is_chain_config() {
         let genesis = Genesis::from_json(&sample_genesis_json()).unwrap();
         assert!(!genesis.consensus.book_window_commit);
-        assert_eq!(genesis.chain_config().book_window_activation(), None, "off by default");
+        // Owner s136 / batch 10: a Classic genesis naming no activation runs
+        // L6.1 with the hash from block 1.
+        assert_eq!(genesis.chain_config().book_window_activation(), Some(1), "the default");
         let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
         json["consensus"]["book_window_commit"] = serde_json::json!(true);
         json["consensus"]["state_hash_activation_height"] = serde_json::json!(1);
