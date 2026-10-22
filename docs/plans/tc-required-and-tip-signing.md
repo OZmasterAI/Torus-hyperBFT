@@ -139,15 +139,72 @@ formed only in 8-16 s backed-off views and never in two consecutive views, and n
 - **Test.** `tests/slow_signature_check_liveness_test.rs` adds 40 ms to every check (test hook): 4 validators all up
   and 3 of 4 must commit height 6 in 90 s (56923063: no commit / height 2 in 60 s; main with the same hook: 15 s /
   27 s; fixed: 9 s / 15 s). Unit: `signature_check_tests`, `timeout_votes_carrying_a_checked_tc_cost_one_signature_check_each`.
-- **Not changed (owner, pre-existing on main).** After a backed-off view, the next view entered at multiplier 1 has its
-  scheduled deadline in the past (the per-epoch schedule is absolute and only too-far-future deadlines are rebased,
-  PM 2b), so it times out at once (`deadline_in_ms=0` in the trace, on main and batch 9 alike). Main recovers its
-  consecutive QCs by chance (the leader enters that view by its own timeout and proposes in the same loop pass while
-  the others sit in a backed-off view); a slow cluster can lose every such view. Rebasing a past deadline too would
-  close it; it changes the view schedule for every chain, so it is left for a separate decision.
+- **Fixed separately (pre-existing on main).** After a backed-off view, the next view entered at multiplier 1 had its
+  scheduled deadline in the past, so it timed out at once (`deadline_in_ms=0` in the trace, on main and batch 9
+  alike). See "As fixed (pacemaker past deadline, s137)" below.
 - **Rejected.** Re-broadcasting own timeout votes on every timeout (adds messages to queues already seconds behind);
   collecting votes for views further back (leader(v) has left v by the time a late TC(v-1) forms); certificate-driven
   view advance (the votes were not lost, they were late).
+
+**As fixed (pacemaker past deadline, s137).** Branch `fix/pacemaker-past-deadline` on `fix/tc-liveness`; it lands
+with the TC set.
+- **How the schedule works.** `PacemakerState.timeouts` gives each remaining view of the epoch an absolute deadline
+  `base + (v - base_view + 1) * mvt * m`, built from `Instant::now()` at boot (PM:935), at epoch entry and at a
+  rebase (`update_timeouts`, PM:995); `m` is the stall multiplier at the base (PM:896: `factor^min(depth, cap)`, depth
+  `v - (highest_qc_view + 1)`, max'd with the commit-lag term; 1 on a healthy entry). On entering v (`update_view`,
+  PM:619): 2b rebases the rest of the schedule from now if v's deadline is more than `2 * mvt * m` away (S395); 2c
+  stretches v alone to `now + mvt * m` when `m > 1` (Task A). A normal view is left on a QC/TC (AdvanceView) or on its
+  own deadline (TimeoutVote, then v+1); an epoch-change view extends instead (PM:129, PM:1038).
+- **Why the deadline was in the past.** 2c moves only the entered view; the views after it keep their old slots, and
+  a backed-off view (up to `mvt * m` long) outlasts them. When that view gets its QC, every replica enters v+1 on the
+  AdvanceView at multiplier 1 with v+1's deadline already gone; the next tick times it out before HotStuff enters it,
+  so leader(v+1) never proposes. v+2 is entered at x2, gets a QC on TC(v+1), and v+3 is lost the same way: QCs on
+  every other view and no 2-chain commit, until the lost views (one slot each, ~0 s) have used up the deficit (about
+  one lost view per 0.75 s of deficit in the test below). Main got its consecutive QCs back by chance (the leader
+  entering v+1 on its own timeout proposes in the same loop pass); the CPU-busy cluster of batch 9 did not.
+- **Rule.** `update_view` also rebases the rest of the schedule from now when the entered view's deadline is less than
+  one base view time away (`scheduled < now + mvt`, any multiplier; same routine as 2b). Every entered view then ends
+  in `[now + mvt * m, now + 2 * mvt * m]`: the lower bound from this rule and 2c, the upper from 2b. The multiplier,
+  2c, epoch entry, the epoch-change extend and all certificate handling are unchanged.
+- **What the absolute schedule gives, and why it still holds.**
+  - *Healthy chains keep their schedule.* On an intact schedule `deadline(v+1) = deadline(v) + mvt`, and v+1 is entered
+    no later than v's deadline (QC before it, or the timeout at it), so it already has a full slot. The rule fires only
+    after a backed-off view, a late tick or a jump. The fast-run surplus bound (2b, S395) is unchanged.
+  - *No clock agreement.* Deadlines are local `Instant` offsets. Replicas never compare clocks, and no two replicas
+    ever shared one schedule: each builds it at its own boot or epoch entry, and 2b and 2c already re-anchored it per
+    replica.
+  - *Replicas converge to one view.* Views move on certificates. After GST (delay Δ): QC(v-1) and TC(v-1) are broadcast
+    in an AdvanceView (leader tick step 3, PM:199; TC collector 3.2, PM:423), and every validator re-broadcasts the
+    first one it gets in a view (PM:567), so every honest replica below v enters v within Δ of the first. A replica
+    that times out of v-1 broadcasts TV(v-1); once f+1 power has, every honest replica votes (Bracha), TC(v-1) forms
+    and pulls the rest into v within about 2Δ. During a stall the multiplier depends only on (v, highest QC view,
+    committed view), which are frozen and equal at honest replicas, so each holds v at least `mvt * m` from entries at
+    most 2Δ apart: overlap `>= mvt * m - 2Δ`, which the backoff doubles until a QC round fits (as before). QC(v) then
+    takes every honest replica into v+1 within Δ, each with at least `mvt`: overlap `>= mvt - Δ`, which a healthy round
+    fits, so QC(v+1) forms and the 2-chain commits. Before the fix that overlap was `max(0, scheduled - now)`, 0 at
+    every replica after a long backed-off view: the argument failed exactly at this step.
+  - *Epoch change.* Epoch-change views still extend on timeout and leave only on a QC or TC; `update_timeouts` at
+    epoch entry is unchanged.
+  - *TC-required.* Leader(v) waits for QC(v-1) or TC(v-1) until v's deadline (L3). That wait is now at least `mvt`;
+    in this case it was 0.
+  - *Dead-leader exclusion* (feat/dead-leader-p1/p2) counts TCs (`record_leader_timeout` when a TC forms, PM:404), not
+    deadlines. A dead leader's view still costs 1 to 2 slots.
+- **Cost.** A replica whose own tick runs late now holds the next view a full slot instead of burning it. Its views
+  can trail the others' by that lateness until the next AdvanceView or TC pulls it forward. With backoff on, a timeout
+  entry is already backed off from entry (2c), so this only applies at multiplier 1. With the kill switch
+  (`backoff_cap = 0`) a timeout handled δ late moves that replica's schedule δ later, and the next TC corrects it.
+- **Tests (RED on 0937f178, commit 835c3a74).**
+  - Unit `update_view_after_backed_off_view_gets_a_full_view_time`: enter 11 at x4, QC(11) after view 12's slot,
+    enter 12 at x1. On 0937f178 the deadline is 224 ms in the past. `every_entry_gets_at_least_one_view_time` checks the
+    update_view and skip_to_view paths.
+  - Cluster `tests/pacemaker_past_deadline_liveness_test.rs`: 4 equal validators, every HotStuff message of views 8-11
+    dropped (TimeoutVotes and TCs flow), so those views time out at x1, x2, x4 and x8. After the first QC above the stall
+    (q0), two consecutive views must have QCs by q0 + 4. On 0937f178 the QCs are at 12, 14, 16, 18; fixed: 12, 13.
+  - Mutation (lower bound off): all three fail again (QCs 12, 14, 16, 18).
+- **Gates.** c300a015. cachyoz (stopped after three steps, owner s136): nextest 4647/4647 (0 flaky), doctest ok, clippy ok. 18c: `cargo test --workspace` 4648 passed / 0 failed, release torus-node build ok. 18c: hotstuff_rs
+  382/382. ubuntoz: p00 + failstop 11/11; p00 in one process 5x 9/9 (26-33 s); CPU-busy crossing test (24 busy
+  loops) 5x pass (8.4-9.1 s); hotstuff_rs liveness/TC/pacemaker set (65 tests incl. the new one) 5x 65/65; RED
+  835c3a74 3x 3/3 fail.
 
 ## 3. Change 2: tip signing
 
