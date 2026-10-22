@@ -264,6 +264,7 @@ fn top_up(fault: bool) -> ([u64; 3], Rows, Option<String>, usize) {
             mark: None,
             band: None,
             orders: 1,
+            cert: None,
         },
     );
     let mut pools: HashMap<Address, (MarketId, FixedPoint)> = HashMap::default();

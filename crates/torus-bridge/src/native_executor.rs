@@ -1672,6 +1672,92 @@ struct PrepPass {
     excess_im: FixedPoint,
 }
 
+/// s80 phase2-sender-certificate (`TORUS_S80_P2_CERT`, prototype, default
+/// off = the exact Phase-2 path). `probe`: the exact path plus the
+/// certificate's statistics; `1`: certified senders skip the F1 placement
+/// math; `shadow`: both, and a mismatch panics; `ub`: an UNSOUND
+/// upper-bound arm (every plain GTC / PostOnly limit skips; bench only).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum P2CertMode {
+    Off,
+    Probe,
+    On,
+    Shadow,
+    Ub,
+}
+
+/// s80: pure parse of `TORUS_S80_P2_CERT`.
+#[doc(hidden)]
+pub fn parse_p2_cert(v: Option<&str>) -> P2CertMode {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("1" | "on" | "true") => P2CertMode::On,
+        Some("probe") => P2CertMode::Probe,
+        Some("shadow") => P2CertMode::Shadow,
+        Some("ub") => P2CertMode::Ub,
+        _ => P2CertMode::Off,
+    }
+}
+
+thread_local! {
+    /// s80: this thread's pin of [`p2_cert_mode`] ([`with_p2_cert`]).
+    static P2_CERT_PIN: std::cell::Cell<Option<P2CertMode>> = const { std::cell::Cell::new(None) };
+}
+
+/// s80: runs `f` with `TORUS_S80_P2_CERT` pinned to `mode` on this thread
+/// (tests: flag-on vs flag-off differentials on one binary).
+#[doc(hidden)]
+pub fn with_p2_cert<R>(mode: P2CertMode, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<P2CertMode>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            P2_CERT_PIN.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(P2_CERT_PIN.with(|c| c.replace(Some(mode))));
+    f()
+}
+
+/// s80: the call's certificate mode (pin, else the env read once, logged once).
+fn p2_cert_mode() -> P2CertMode {
+    if let Some(m) = P2_CERT_PIN.with(std::cell::Cell::get) {
+        return m;
+    }
+    static MODE: std::sync::OnceLock<P2CertMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let m = parse_p2_cert(std::env::var("TORUS_S80_P2_CERT").ok().as_deref());
+        tracing::info!("TORUS_S80_P2_CERT on={} mode={m:?}", m != P2CertMode::Off);
+        m
+    })
+}
+
+/// s80 probe counters: [senders seen, senders certified, orders seen,
+/// orders covered (certified senders' orders), orders skipped (the skip
+/// path ran), bail: not eligible, senders with split runs (gathered, not a
+/// bail), bail: bound failed, bail: overflow, shadow checks].
+static P2_CERT_STATS: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+/// s80 probe: the smallest relative slack (slack / F0, ppm) seen.
+static P2_CERT_MIN_SLACK_PPM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// s80 (tests): a certified skip ran in this process (the M1 shadow then
+/// accepts a checked taker without `pre_pos`).
+#[cfg(test)]
+static P2_CERT_SKIPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn p2_stat(k: usize, n: u64) {
+    P2_CERT_STATS[k].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// s80: the probe counters ([`P2_CERT_STATS`]) and the min slack ppm, then reset.
+#[doc(hidden)]
+pub fn p2_cert_stats_take() -> ([u64; 10], u64) {
+    let mut out = [0u64; 10];
+    for (o, a) in out.iter_mut().zip(P2_CERT_STATS.iter()) {
+        *o = a.swap(0, std::sync::atomic::Ordering::Relaxed);
+    }
+    (out, P2_CERT_MIN_SLACK_PPM.swap(u64::MAX, std::sync::atomic::Ordering::Relaxed))
+}
+
 /// s58 (perf experiment sell-top-up-stitch-list; node-local, on by default):
 /// `TORUS_FAST_SELL_TOP_UPS` (unset, `1` or `true`) takes the B-blind
 /// top-ups from a candidate list the Phase-2 stitch records
@@ -3249,6 +3335,26 @@ struct Phase2Market<'a> {
     /// Item 6 cut 2: the call's PlaceOrders in the market (the capacity of
     /// its prepared batch: no regrowth while stitching).
     orders: usize,
+    /// s80 (`TORUS_S80_P2_CERT`): the certificate's per-market constants
+    /// (`None`: certificate off, or the market cannot be certified).
+    cert: Option<P2CertMarket>,
+}
+
+/// s80: one market's certificate constants ([`NativeExecutor::p2_cert_one`]),
+/// once per call: the market is marked (mark > 0, the band's reference),
+/// banded and flat-tiered.
+#[derive(Clone, Copy, Debug)]
+struct P2CertMarket {
+    /// The B-blind top-up price of its best bid (0: none).
+    tup: FixedPoint,
+    /// The highest price a checked sell there can fill at: `max(best bid,
+    /// band top)`.
+    p_fill: FixedPoint,
+    /// `max(p_fill, mark)`: bounds every price a check values an order at.
+    top: FixedPoint,
+    /// The flat leverage and cap ([`NativeExecutor::p2_flat_cap`]).
+    lev: u32,
+    cap: i128,
 }
 
 impl Phase2Market<'_> {
@@ -9359,7 +9465,10 @@ impl NativeExecutor {
         };
         // Option B (s87) best bids, fix A (s92) / row 42 tick and lot, the
         // configs and marks: each batch market's, once (item 6 M1).
-        let markets = Self::phase2_markets(&ctx.order_books, &ctx.state, &reader, &place_orders);
+        // s80: TORUS_S80_P2_CERT (read once per call).
+        let cert_mode = p2_cert_mode();
+        let cert_on = matches!(cert_mode, P2CertMode::Probe | P2CertMode::On | P2CertMode::Shadow);
+        let markets = Self::phase2_markets(&ctx.order_books, &ctx.state, &reader, &place_orders, cert_on);
         // s118: a margin reject's label split only feeds the reason metric.
         let split_margin_label = ctx.metrics.is_some();
 
@@ -9447,10 +9556,22 @@ impl NativeExecutor {
             // step ([`Self::prepare_one`]) over one fold, in flat order.
             // Item 6 M1: pre-sized (senders with slot-taking orders).
             let mut fold = SenderFold::with_capacity(open_at_start.len());
-            for &i in &place_order_indices {
+            // s80: the per-sender certificate over the call's PlaceOrders
+            // (flat order).
+            let certs: Vec<bool> = if cert_on {
+                Self::p2_certify(&reader, &ctx.order_books, &open_at_start, &basis, &markets, &place_orders)
+            } else {
+                Vec::new()
+            };
+            for (pos, &i) in place_order_indices.iter().enumerate() {
                 let (sender, params) = match &flat[i] {
                     (s, FlatAction::Place(p)) => (s, *p),
                     (_, FlatAction::Other(_)) => unreachable!(),
+                };
+                let certified = match cert_mode {
+                    P2CertMode::Off | P2CertMode::Probe | P2CertMode::Shadow => false,
+                    P2CertMode::Ub => Self::p2_cert_eligible(params),
+                    P2CertMode::On => certs[pos],
                 };
                 let outcome = Self::prepare_one(
                     &reader,
@@ -9462,7 +9583,30 @@ impl NativeExecutor {
                     sender,
                     params,
                     split_margin_label,
+                    certified,
                 );
+                // s80 shadow: the exact path ran; a certified sender's
+                // order must pass its account check (no margin reject, no
+                // placement_need overflow) with an excess of <= 1 raw.
+                if cert_mode == P2CertMode::Shadow && certs[pos] {
+                    p2_stat(9, 1);
+                    match &outcome {
+                        PrepOutcome::Pass(_pass) => {
+                            #[cfg(test)]
+                            assert!(
+                                _pass.excess_im <= FixedPoint::from_raw(1),
+                                "TORUS_S80_P2_CERT shadow: certified {sender} order {i}: excess {}",
+                                _pass.excess_im
+                            );
+                        }
+                        PrepOutcome::Reject { funnel, reason, msg } => {
+                            assert!(
+                                !matches!(funnel, RejectReason::Margin(_)) && *reason != FailureReason::Price,
+                                "TORUS_S80_P2_CERT shadow: certified {sender} order {i} rejected: {msg}"
+                            );
+                        }
+                    }
+                }
                 let stitched = Self::stitch_outcome(
                     &mut ctx.next_global_order_id,
                     &ctx.metrics,
@@ -9966,6 +10110,11 @@ impl NativeExecutor {
         sender: &Address,
         params: &PlaceOrderParams,
         split_margin_label: bool,
+        // s80 (`TORUS_S80_P2_CERT`): the sender is certified — its account
+        // check provably passes, so the position read, `placement_need`,
+        // the excess and the projection are skipped (`pre_pos` = None:
+        // Phase 3 reads the position itself).
+        certified: bool,
     ) -> PrepOutcome {
         let st = fold.state(sender);
         // Open-order limit first: a rejected order reserves nothing.
@@ -9999,6 +10148,7 @@ impl NativeExecutor {
                 mark: reader.mark(params.market_id),
                 band: None,
                 orders: 0,
+                cert: None,
             },
         };
         // Fix A (s92): the book's dust / off-tick rejects, before anything
@@ -10089,6 +10239,16 @@ impl NativeExecutor {
                         }
                     },
                 };
+                if certified {
+                    // s80: the certificate bounds every check of this
+                    // sender's run (F0 >= R + T + X_ub + C_ub): the order
+                    // passes; its excess is at most the X_ub dust, which
+                    // only feeds the (certified non-binding) pool.
+                    pos_net = pn;
+                    p2_stat(4, 1);
+                    #[cfg(test)]
+                    P2_CERT_SKIPPED.store(true, std::sync::atomic::Ordering::Relaxed);
+                } else {
                 // `position_px` with the market's mark read once per call.
                 let e = match st.proj.get_or_try_insert(params.market_id, || {
                     reader.get_position(sender, params.market_id).map(|pos| {
@@ -10160,6 +10320,7 @@ impl NativeExecutor {
                 }
                 pos_net = pn;
                 projection = Some(e);
+                }
             }
             if required > FixedPoint::ZERO {
                 bal.available -= required;
@@ -10221,6 +10382,278 @@ impl NativeExecutor {
             #[cfg(test)]
             excess_im: if checked { FixedPoint::ZERO } else { excess },
         })
+    }
+
+    /// s80 (`TORUS_S80_P2_CERT`): the per-sender Phase-2 headroom
+    /// certificate over the serial loop's PlaceOrders (`place_orders`, flat
+    /// order). Returns, per entry, whether its sender is certified: over ALL
+    /// the sender's PlaceOrders of the call (one run, or several runs
+    /// gathered in flat order), every one is [`Self::p2_cert_eligible`] in a
+    /// marked, banded, flat-tier market, and [`Self::p2_cert_one`]'s bound
+    /// holds. Pure reads of the frozen state.
+    fn p2_certify<T: StateBackend>(
+        reader: &AccountReader<'_, T>,
+        books: &HashMap<MarketId, OrderBook>,
+        open_at_start: &HashMap<Address, u32>,
+        basis: &HashMap<usize, (FixedPoint, FixedPoint)>,
+        markets: &HashMap<MarketId, Phase2Market<'_>>,
+        place_orders: &[(usize, Address, &PlaceOrderParams)],
+    ) -> Vec<bool> {
+        let n = place_orders.len();
+        let mut out = vec![false; n];
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut run_count: HashMap<Address, u32> = HashMap::default();
+        let mut k = 0;
+        while k < n {
+            let s = place_orders[k].1;
+            let mut e = k + 1;
+            while e < n && place_orders[e].1 == s {
+                e += 1;
+            }
+            runs.push((k, e));
+            *run_count.entry(s).or_insert(0) += 1;
+            k = e;
+        }
+        p2_stat(2, n as u64);
+        // A sender with several runs (its actions are not adjacent in the
+        // block) is certified over ALL its orders of the call, in flat
+        // order (one fold per sender): gathered once, at its first run.
+        let mut multi: HashMap<Address, Vec<(usize, usize)>> = HashMap::default();
+        for &(start, end) in &runs {
+            let sender = place_orders[start].1;
+            if run_count.get(&sender).copied().unwrap_or(0) > 1 {
+                multi.entry(sender).or_default().push((start, end));
+            }
+        }
+        for (start, end) in runs {
+            let sender = place_orders[start].1;
+            let spans: Vec<(usize, usize)> = match multi.get_mut(&sender) {
+                None => vec![(start, end)],
+                // Not the sender's first run: already decided.
+                Some(v) if v.is_empty() => continue,
+                Some(v) => {
+                    p2_stat(6, 1);
+                    std::mem::take(v)
+                }
+            };
+            p2_stat(0, 1);
+            let result = if let [(a, b)] = spans[..] {
+                Self::p2_cert_one(reader, books, open_at_start, basis, markets, &sender, &place_orders[a..b])
+            } else {
+                let all: Vec<(usize, Address, &PlaceOrderParams)> =
+                    spans.iter().flat_map(|&(a, b)| place_orders[a..b].iter().copied()).collect();
+                Self::p2_cert_one(reader, books, open_at_start, basis, markets, &sender, &all)
+            };
+            match result {
+                Ok((slack, f0)) => {
+                    p2_stat(1, 1);
+                    for &(a, b) in &spans {
+                        p2_stat(3, (b - a) as u64);
+                        out[a..b].fill(true);
+                    }
+                    if f0 > 0 {
+                        let ppm = u64::try_from(slack.saturating_mul(1_000_000) / f0).unwrap_or(u64::MAX);
+                        P2_CERT_MIN_SLACK_PPM.fetch_min(ppm, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                Err(kind) => p2_stat(kind, 1),
+            }
+        }
+        out
+    }
+
+    /// s80: the flat-tier cap of a market's IM — `Some(cap)`: `IM(n) =
+    /// n.raw / L` for every `0 <= n <= cap` (one leverage `L > 0` in every
+    /// tier; beyond the last tier the 1x fallback, so the cap is the largest
+    /// `max_notional` unless `L == 1`); `None`: tiered (or a 0x tier).
+    fn p2_flat_cap(tiers: Option<&[MarginTier]>) -> Option<i128> {
+        let Some(t) = tiers else { return Some(i128::MAX) };
+        let Some(first) = t.first() else { return Some(i128::MAX) };
+        let l = first.max_leverage;
+        if l == 0 || t.iter().any(|x| x.max_leverage != l) {
+            return None;
+        }
+        if l == 1 {
+            return Some(i128::MAX);
+        }
+        t.iter().map(|x| x.max_notional.raw()).max()
+    }
+
+    /// s80: one sender's certificate (its whole run of PlaceOrders in the
+    /// call, all eligible): `F0 = available + pos_net >= need` where `need`
+    /// sums, with checked arithmetic (overflow = not certified):
+    /// - R + T: `Σ U_i` with `U_i` = the order's reservation at its highest
+    ///   Phase-2 price (a bid-floor sell at `max(limit, top-up price)`),
+    ///   covering its reservation, floor and B-blind top-up; bounded as
+    ///   `floor(Σ notional_i / L_min) + 1` (flat tiers: `IM(n) = n / L`
+    ///   truncating, and `Σ floor(n_i / L_i) <= Σ n_i / L_min`);
+    /// - X_ub: 2 raw per order (flat tiers: `placement_need <= reservation
+    ///   + 1 raw`; the committed excess of earlier orders <= 1 raw each);
+    /// - C_ub in the sender's D2 pool market (the market of its FIRST
+    ///   checked order that passes the pure pre-book checks — the anchor;
+    ///   the open-order limit cannot bind, else no certificate): per own
+    ///   order there the mark loss bound `max(0, ±(limit − reference)) ×
+    ///   qty` (as taker or maker), per own checked sell its IM above the
+    ///   reservation at the highest price it can fill (`max(best bid, band
+    ///   top)`), per own resting order there the mark loss bound on its
+    ///   remainder, and 4 raw of rounding per possible fill there.
+    ///
+    /// Then every account check passes (need <= free), every top-up is
+    /// granted in full and the pool never binds, with the exact excess or
+    /// with the skip path's 0 (they differ by <= 1 raw per order). Also
+    /// guards placement_need's overflow and the flat-tier range (position
+    /// + order notionals far below `i128::MAX` and below every market's
+    /// flat cap). `Err` = the bail kind ([`P2_CERT_STATS`] index).
+    #[allow(clippy::too_many_arguments)]
+    fn p2_cert_one<T: StateBackend>(
+        reader: &AccountReader<'_, T>,
+        books: &HashMap<MarketId, OrderBook>,
+        open_at_start: &HashMap<Address, u32>,
+        basis: &HashMap<usize, (FixedPoint, FixedPoint)>,
+        markets: &HashMap<MarketId, Phase2Market<'_>>,
+        sender: &Address,
+        orders: &[(usize, Address, &PlaceOrderParams)],
+    ) -> Result<(i128, i128), usize> {
+        const NOT_ELIGIBLE: usize = 5;
+        const BOUND: usize = 7;
+        const OVERFLOW: usize = 8;
+        // Overflow guard: every notional the checks form stays below this.
+        const GUARD: i128 = i128::MAX >> 20;
+        let mul = |a: FixedPoint, b: FixedPoint| a.checked_mul(b).map(|x| x.raw()).map_err(|_| OVERFLOW);
+        let add = |a: i128, b: i128| a.checked_add(b).ok_or(OVERFLOW);
+        let im = |tiers: Option<&[MarginTier]>, n: i128| -> Result<i128, usize> {
+            if !(0..=GUARD).contains(&n) {
+                return Err(OVERFLOW);
+            }
+            Ok(order_initial_margin(tiers, FixedPoint::from_raw(n)).raw())
+        };
+        let n_orders = u32::try_from(orders.len()).map_err(|_| NOT_ELIGIBLE)?;
+        // The open-order limit (>= the base limit) cannot reject any order
+        // of the run, so the anchor below is the fold's pool market.
+        if open_at_start.get(sender).copied().unwrap_or(0).saturating_add(n_orders) > OPEN_ORDER_BASE_LIMIT {
+            return Err(NOT_ELIGIBLE);
+        }
+        // Pass 1: eligibility, Σ notional at the highest Phase-2 price,
+        // Σ quantity and the highest price any check values an order at,
+        // the anchor.
+        let mut sum_res: i128 = 0;
+        let mut sum_qty: i128 = 0;
+        let mut top = FixedPoint::ZERO;
+        let mut lev_min = u32::MAX;
+        let mut cap_min = GUARD;
+        let mut anchor: Option<MarketId> = None;
+        for &(i, _, p) in orders {
+            if !Self::p2_cert_eligible(p) || basis.contains_key(&i) {
+                return Err(NOT_ELIGIBLE);
+            }
+            let m = markets.get(&p.market_id).ok_or(NOT_ELIGIBLE)?;
+            let c = m.cert.ok_or(NOT_ELIGIBLE)?;
+            cap_min = cap_min.min(c.cap);
+            lev_min = lev_min.min(c.lev);
+            let base = Self::reserve_price(p);
+            let p_hi = if Self::takes_bid_floor(p) { base.max(c.tup) } else { base };
+            sum_res = add(sum_res, mul(p_hi, p.quantity)?)?;
+            sum_qty = add(sum_qty, p.quantity.raw())?;
+            top = top.max(p_hi).max(c.top);
+            if anchor.is_none()
+                && Self::match_margin_checked(p)
+                && Self::validate_order_price(p).is_ok()
+                && Self::book_shape_violation(p, m.shape).is_none()
+                && m.band.and_then(|b| price_band_violation(p, b)).is_none()
+            {
+                anchor = Some(p.market_id);
+            }
+        }
+        let sum_top = mul(top, FixedPoint::from_raw(sum_qty))?;
+        if lev_min == 0 || lev_min == u32::MAX {
+            return Err(NOT_ELIGIBLE);
+        }
+        let mut slot = None;
+        let available = SenderState::load_balance(&mut slot, reader.positions, reader.typed(), sender)
+            .map_err(|_| NOT_ELIGIBLE)?
+            .available;
+        let sums = reader.pos_sums(sender).map_err(|_| NOT_ELIGIBLE)?;
+        if sums.isolated > 0 || sums.abs[2] > GUARD as u128 {
+            return Err(NOT_ELIGIBLE);
+        }
+        let pn = sums.view(&NativeBalance::default()).pos_net();
+        let f0 = add(available.raw(), pn.raw())?;
+        let mut total_notional = add(sums.abs[2] as i128, sum_top)?;
+        // R + T and X_ub.
+        let mut need = add(sum_res / i128::from(lev_min), 1)?;
+        need = add(need, 2 * i128::from(n_orders))?;
+        // C_ub in the anchor (pool) market.
+        if let Some(pm) = anchor {
+            let m = markets.get(&pm).ok_or(NOT_ELIGIBLE)?;
+            let c = m.cert.ok_or(NOT_ELIGIBLE)?;
+            let r = m.band.ok_or(NOT_ELIGIBLE)?.reference;
+            let tiers = m.tiers();
+            let p_fill = c.p_fill;
+            for &(_, _, p) in orders.iter().filter(|o| o.2.market_id == pm) {
+                let base = Self::reserve_price(p);
+                let adverse = if p.is_buy { base - r } else { r - base };
+                if adverse > FixedPoint::ZERO {
+                    need = add(need, mul(adverse, p.quantity)?)?;
+                }
+                if Self::match_margin_checked(p) {
+                    let over = im(tiers, mul(p_fill.max(base), p.quantity)?)? - im(tiers, mul(base, p.quantity)?)?;
+                    need = add(need, add(over, 2)?)?;
+                }
+            }
+            let book = books.get(&pm);
+            let resting = book.map_or(0, OrderBook::order_count);
+            for o in book.map(|b| b.orders_for_trader(sender)).unwrap_or_default() {
+                let adverse = if o.side == Side::Buy { o.price - r } else { r - o.price };
+                if adverse > FixedPoint::ZERO {
+                    need = add(need, mul(adverse, o.remaining_qty)?)?;
+                }
+                total_notional = add(total_notional, mul(o.price.max(r), o.remaining_qty)?)?;
+            }
+            let fills = i128::try_from(2 * m.orders + resting).map_err(|_| OVERFLOW)?;
+            need = add(need, fills.checked_mul(4).ok_or(OVERFLOW)?)?;
+        }
+        if total_notional > cap_min {
+            return Err(NOT_ELIGIBLE);
+        }
+        let slack = f0.checked_sub(need).ok_or(OVERFLOW)?;
+        if slack < 0 {
+            return Err(BOUND);
+        }
+        Ok((slack, f0))
+    }
+
+    /// s80: a market's certificate constants ([`P2CertMarket`]); `None`
+    /// when it cannot be certified (no usable mark or band, the band's
+    /// reference is not the mark, tiered, or an overflow).
+    fn p2_cert_market(m: &Phase2Market<'_>) -> Option<P2CertMarket> {
+        let (mark, band) = (m.mark?, m.band?);
+        if mark <= FixedPoint::ZERO || band.reference != mark {
+            return None;
+        }
+        let cap = Self::p2_flat_cap(m.tiers())?;
+        let lev = match m.tiers() {
+            Some(t) => t.first().map_or(1, |t| t.max_leverage),
+            None => torus_core::margin::DEFAULT_ORDER_MAX_LEVERAGE,
+        };
+        if lev == 0 {
+            return None;
+        }
+        let p_fill = m.bid_floor.unwrap_or(FixedPoint::ZERO).max(Self::p2_band_hi(band)?);
+        Some(P2CertMarket {
+            tup: m.bid_floor.and_then(Self::sell_top_up_price).unwrap_or(FixedPoint::ZERO),
+            p_fill,
+            top: p_fill.max(mark),
+            lev,
+            cap,
+        })
+    }
+
+    /// s80: the band's top price, `reference + floor(reference × bps /
+    /// 10,000)` (the band rule's half width); `None` on overflow.
+    fn p2_band_hi(band: PriceBand) -> Option<FixedPoint> {
+        let (r, bps) = (band.reference.raw(), i128::from(band.bps));
+        let hw = (r / 10_000).checked_mul(bps)?.checked_add((r % 10_000) * bps / 10_000)?;
+        r.checked_add(hw).map(FixedPoint::from_raw)
     }
 
     /// L3-ENG: apply one Phase-2 outcome in flat order — a pass gets the
@@ -10338,6 +10771,7 @@ impl NativeExecutor {
                                             sender,
                                             params,
                                             split_margin_label,
+                                            false,
                                         ),
                                     ));
                                 }
@@ -12266,6 +12700,15 @@ impl NativeExecutor {
         !params.is_buy && Self::match_margin_checked(params) && params.time_in_force != TimeInForce::PostOnly
     }
 
+    /// s80 (`TORUS_S80_P2_CERT`): an order the certificate can cover — a
+    /// plain limit that can rest (GTC / PostOnly), not reduce-only. Stops,
+    /// market, IOC / FOK and reduce-only orders take the exact path.
+    fn p2_cert_eligible(params: &PlaceOrderParams) -> bool {
+        matches!(params.order_type, OrderType::Limit)
+            && !params.reduce_only
+            && !Self::never_rests(params)
+    }
+
     /// s515 review 5 (F2): an order that can never rest — market, or an IOC /
     /// FOK limit. Its whole placement reservation is released after matching
     /// (`rested_qty` = 0), so it reserves only for the quantity beyond what
@@ -12485,6 +12928,7 @@ impl NativeExecutor {
         state: &T,
         reader: &AccountReader<'a, T>,
         orders: &[(usize, Address, &PlaceOrderParams)],
+        cert_on: bool,
     ) -> HashMap<MarketId, Phase2Market<'a>> {
         let mut out: HashMap<MarketId, Phase2Market<'a>> = HashMap::default();
         for &(_, _, p) in orders {
@@ -12499,6 +12943,7 @@ impl NativeExecutor {
                     mark: None,
                     band: None,
                     orders: 0,
+                    cert: None,
                 })
                 .orders += 1;
         }
@@ -12513,6 +12958,9 @@ impl NativeExecutor {
             .map(|(m, mut market)| {
                 market.mark = reader.mark(m);
                 market.band = Self::price_band(reader, books.get(&m), m, market.mark, bps);
+                if cert_on {
+                    market.cert = Self::p2_cert_market(&market);
+                }
                 (m, market)
             })
             .collect()
@@ -13080,7 +13528,10 @@ impl NativeExecutor {
                 #[cfg(test)]
                 if let Some(s) = reader.sums.filter(|s| s.shadow) {
                     let want = reader.position_px(&p.sender, market_id).map_or(FixedPoint::ZERO, |(_, px)| px);
-                    if want != px || p.pre_pos.is_none() {
+                    // s80: a certified sender's order carries no `pre_pos`
+                    // (TORUS_S80_P2_CERT skip path): the read above is the
+                    // M1 fallback, not a mismatch.
+                    if want != px || (p.pre_pos.is_none() && !P2_CERT_SKIPPED.load(std::sync::atomic::Ordering::Relaxed)) {
                         s.shadow_mismatches.lock().unwrap().push(format!(
                             "M1 px {} {market_id}: reused {px:?}, position_px {want:?}, pre_pos {:?}",
                             p.sender, p.pre_pos
@@ -16983,7 +17434,7 @@ mod option_b_fold_pool_tests {
             let basis = NativeExecutor::phase2_reservation_basis(&ctx, &place_orders);
             let open_at_start = HashMap::default();
             let reader = AccountReader::of(&ctx);
-            let markets = NativeExecutor::phase2_markets(&ctx.order_books, &ctx.state, &reader, &place_orders);
+            let markets = NativeExecutor::phase2_markets(&ctx.order_books, &ctx.state, &reader, &place_orders, false);
 
             let mut fold = SenderFold::default();
             let mut batches: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::default();
@@ -17002,6 +17453,7 @@ mod option_b_fold_pool_tests {
                     i,
                     s,
                     p,
+                    false,
                     false,
                 );
                 if let PrepOutcome::Pass(pass) = &outcome {
@@ -17038,6 +17490,7 @@ mod option_b_fold_pool_tests {
                 candidates += usize::from(old);
                 // M1 cut 8: pre_pos = `position_px` (every order with an
                 // account check; checked takers always).
+                // s80: this oracle calls `prepare_one` uncertified.
                 assert_eq!(p.pre_pos.is_some(), !p.params.reduce_only, "round {round}");
                 if let Some(pre) = p.pre_pos {
                     assert_eq!(Ok(pre), reader.position_px(&p.sender, p.params.market_id).map_err(|e| e.to_string()));
@@ -17097,5 +17550,104 @@ mod option_b_fold_pool_tests {
         }
         assert!(candidates > 20 && held_positions == 0, "non-vacuous: {candidates} candidates");
         assert!(pooled > 100 && first_rejected > 10 && raised > 10, "non-vacuous");
+    }
+}
+
+/// s80 phase2-sender-certificate (`TORUS_S80_P2_CERT`): the certificate's
+/// pure helpers.
+#[cfg(test)]
+mod p2_cert_unit_tests {
+    use super::*;
+
+    fn tier(n: i64, lev: u32) -> MarginTier {
+        MarginTier { max_notional: FixedPoint::from_raw(i128::from(n) * FixedPoint::SCALE), max_leverage: lev }
+    }
+
+    #[test]
+    fn flat_cap_only_for_one_leverage() {
+        assert_eq!(NativeExecutor::p2_flat_cap(None), Some(i128::MAX));
+        assert_eq!(NativeExecutor::p2_flat_cap(Some(&[])), Some(i128::MAX));
+        assert_eq!(NativeExecutor::p2_flat_cap(Some(&[tier(1_000, 20)])), Some(1_000 * FixedPoint::SCALE));
+        assert_eq!(
+            NativeExecutor::p2_flat_cap(Some(&[tier(1_000, 20), tier(5_000, 20)])),
+            Some(5_000 * FixedPoint::SCALE)
+        );
+        assert_eq!(NativeExecutor::p2_flat_cap(Some(&[tier(1_000, 1)])), Some(i128::MAX));
+        assert_eq!(NativeExecutor::p2_flat_cap(Some(&[tier(1_000, 50), tier(5_000, 20)])), None, "tiered");
+        assert_eq!(NativeExecutor::p2_flat_cap(Some(&[tier(1_000, 0)])), None, "0x tier");
+        // Below the cap IM is n / L truncating; above it the 1x fallback.
+        let t = [tier(1_000, 20)];
+        let cap = NativeExecutor::p2_flat_cap(Some(&t)).unwrap();
+        let n = FixedPoint::from_raw(cap);
+        assert_eq!(order_initial_margin(Some(&t), n).raw(), cap / 20);
+        assert_eq!(order_initial_margin(Some(&t), FixedPoint::from_raw(cap + 1)).raw(), cap + 1);
+    }
+
+    #[test]
+    fn band_hi_is_the_band_rules_top() {
+        for (r, bps) in [(30_000i128, 5_000u64), (30_000, 5), (7, 3), (123_456_789, 250)] {
+            let band = PriceBand { reference: FixedPoint::from_raw(r * FixedPoint::SCALE + 17), bps };
+            let hi = NativeExecutor::p2_band_hi(band).unwrap();
+            assert!(band.contains(hi), "{r} {bps}");
+            assert!(!band.contains(FixedPoint::from_raw(hi.raw() + 1)), "{r} {bps}");
+        }
+        assert_eq!(
+            NativeExecutor::p2_band_hi(PriceBand { reference: FixedPoint::from_raw(i128::MAX - 5), bps: 10 }),
+            None
+        );
+    }
+
+    #[test]
+    fn eligible_orders_are_plain_resting_limits() {
+        let base = PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: FixedPoint::from_raw(100 * FixedPoint::SCALE),
+            quantity: FixedPoint::ONE,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let with = |f: &dyn Fn(&mut PlaceOrderParams)| {
+            let mut p = base.clone();
+            f(&mut p);
+            NativeExecutor::p2_cert_eligible(&p)
+        };
+        assert!(with(&|_| {}));
+        assert!(with(&|p| p.is_buy = false));
+        assert!(with(&|p| p.time_in_force = TimeInForce::PostOnly));
+        assert!(!with(&|p| p.time_in_force = TimeInForce::IOC));
+        assert!(!with(&|p| p.time_in_force = TimeInForce::FOK));
+        assert!(!with(&|p| p.reduce_only = true));
+        assert!(!with(&|p| p.order_type = OrderType::Market));
+        assert!(!with(&|p| p.order_type = OrderType::StopMarket { trigger: p.price }));
+        assert!(!with(&|p| p.order_type = OrderType::StopLimit { trigger: p.price, limit: p.price }));
+    }
+
+    #[test]
+    fn placement_need_is_at_most_the_reservation_plus_one_raw_under_flat_tiers() {
+        // The X_ub term: any position, any order that can rest, flat tiers.
+        let t = [tier(1_000_000_000, 20)];
+        let mut rng = 0x5EEDu64;
+        let mut next = |n: u64| {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (rng >> 11) % n
+        };
+        for _ in 0..20_000 {
+            let signed = FixedPoint::from_raw((next(2_000_000) as i128 - 1_000_000) * FixedPoint::SCALE / 1000 + next(997) as i128);
+            let px = FixedPoint::from_raw((1 + next(50_000) as i128) * FixedPoint::SCALE / 10 + next(13) as i128);
+            let price = FixedPoint::from_raw((1 + next(50_000) as i128) * FixedPoint::SCALE / 10 + next(7) as i128);
+            let qty = FixedPoint::from_raw((1 + next(5_000) as i128) * FixedPoint::SCALE / 100 + next(11) as i128);
+            let is_buy = next(2) == 0;
+            let reserved = NativeExecutor::try_reserve_for_qty_cfg(
+                Some(&MarketMarginConfig { market_id: 1, max_leverage: 20, maintenance_factor_bps: 5000, tiers: t.to_vec() }),
+                price,
+                qty,
+            )
+            .unwrap();
+            let need = torus_core::margin::placement_need(Some(&t), signed, px, is_buy, qty, price, true).unwrap();
+            assert!(need <= reserved + FixedPoint::from_raw(1), "{signed} {px} {is_buy} {qty} {price}: {need} > {reserved} + 1");
+        }
     }
 }

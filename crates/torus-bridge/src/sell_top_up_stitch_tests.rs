@@ -216,6 +216,7 @@ impl Round {
                         mark: None,
                         band: None,
                         orders: 0,
+                        cert: None,
                     },
                 )
             })
@@ -838,7 +839,7 @@ fn stitch_records_the_scan_candidates_on_real_phase2_runs() {
         let open_at_start = HashMap::default();
         let reader = AccountReader::of(&ctx);
         let markets =
-            NativeExecutor::phase2_markets(&ctx.order_books, &ctx.state, &reader, &place_orders);
+            NativeExecutor::phase2_markets(&ctx.order_books, &ctx.state, &reader, &place_orders, false);
 
         let pipeline = |sharded: bool, fast: bool| -> (Outcome, usize) {
             let mut batches: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::default();
@@ -894,6 +895,7 @@ fn stitch_records_the_scan_candidates_on_real_phase2_runs() {
                         i,
                         s,
                         p,
+                        false,
                         false,
                     );
                     let stitched = NativeExecutor::stitch_outcome(

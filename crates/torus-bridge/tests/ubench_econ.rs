@@ -257,6 +257,27 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
         metrics.maker_margin_cancels.get(),
         metrics.reduce_only_cuts.get(),
     );
+    // s80 phase2-sender-certificate (TORUS_S80_P2_CERT): whole run.
+    let (c, min_ppm) = torus_bridge::native_executor::p2_cert_stats_take();
+    if c.iter().any(|&v| v > 0) {
+        println!(
+            "UB CERT seed={seed} senders_pass/total={}/{} ({:.1}%) orders_covered/total={}/{} ({:.1}%) skipped={} \
+             bail not_eligible={} multi_run_senders={} bound={} overflow={} shadow_checks={} min_slack_ppm={}",
+            c[1],
+            c[0],
+            100.0 * c[1] as f64 / c[0].max(1) as f64,
+            c[3],
+            c[2],
+            100.0 * c[3] as f64 / c[2].max(1) as f64,
+            c[4],
+            c[5],
+            c[6],
+            c[7],
+            c[8],
+            c[9],
+            min_ppm,
+        );
+    }
     (samples, rc_measured, placed_measured, resting as u64, r_build, subs)
 }
 
