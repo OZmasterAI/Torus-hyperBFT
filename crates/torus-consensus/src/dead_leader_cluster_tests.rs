@@ -535,6 +535,22 @@ impl Cluster {
         nodes.iter().map(|&i| self.applied(i)).min().unwrap()
     }
 
+    /// The validator-statistics rows (`leader_stats:v:` keys) in node `i`'s write set at `height`.
+    fn validator_rows(&self, i: usize, height: u64) -> Vec<Vec<u8>> {
+        let meta = running_hash::hashed_cf_id(CF_CONSENSUS_META).unwrap();
+        self.nodes[i]
+            .writes
+            .get(&height)
+            .map(|writes| {
+                writes
+                    .iter()
+                    .filter(|(cf, key, _)| *cf == meta && key.starts_with(b"leader_stats:v:"))
+                    .map(|(_, key, _)| key.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Whether node `i`'s write set at `height` touches a `leader_stats:` or `epoch_vset:lx_` row.
     fn wrote_leader_rows(&self, i: usize, height: u64) -> bool {
         let meta = running_hash::hashed_cf_id(CF_CONSENSUS_META).unwrap();
@@ -693,6 +709,16 @@ fn one_down(weights: &[u64], dead: usize) {
     let top = c.min_applied(&live);
     c.stop_all();
     c.assert_agree(&live, top);
+    // The gap rule: the update block's later phases ran in views that are no leader slots. The
+    // first block after it (justified by the Decide PC) and the one after that attribute nothing:
+    // no validator row in their write sets.
+    for h in [update + 1, update + 2] {
+        assert_eq!(
+            c.validator_rows(a, h),
+            Vec::<Vec<u8>>::new(),
+            "height {h} (after the update at {update}) attributed leader slots"
+        );
+    }
 }
 
 #[test]

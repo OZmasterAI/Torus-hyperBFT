@@ -242,15 +242,14 @@ fn exclusion_of_a_down_validator_commits_and_its_slots_stop_timing_out() {
     let after = c.max_committed();
     c.wait_for_commits(after + 2 * EPOCH_LENGTH as u64, "after the update");
     let to = c.max_view();
-    let log = c.log.lock().unwrap();
+    // Copied out: an assert holding the log's lock would poison it for the network threads.
+    let lost: Vec<u64> = c.log.lock().unwrap().timeout_views.range(from..to).copied().collect();
     let x_slots: Vec<u64> = (from..to).filter(|v| c.leader(*v, &genesis) == x).collect();
-    let lost: Vec<u64> = log.timeout_views.range(from..to).copied().collect();
     assert!(x_slots.len() >= 4, "fixture: the span holds x's old slots: {x_slots:?}");
     assert!(
         lost.len() * 4 < x_slots.len(),
         "views timing out after the exclusion: {lost:?} (x's old slots {x_slots:?})"
     );
-    drop(log);
     c.assert_no_tc_less_proposals();
 }
 
