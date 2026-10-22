@@ -225,38 +225,51 @@ for i in $(seq "$3" $(( $3 + $5 - 1 ))); do printf '%s 0x%040x\\n' "$i" "$i"; do
     # torus_types::DEFAULT_EVM_BLOCK_INTERVAL = 11).
 
     def test_running_state_hash_defaults_on_and_off_is_explicit(self):
-        # Owner s136: the running state hash is on at genesis. Unset
-        # STATE_HASH_ACTIVATION leaves the genesis without activations (the
-        # node default: from block 1) and the summary says so; 'off' writes
-        # the explicit opt-out `consensus.activations = {}`.
+        # Owner s136: the running state hash is on in every newly generated
+        # genesis, WRITTEN EXPLICITLY (Codex P1: the node reads a genesis
+        # naming no activation as off, its legacy meaning). Unset
+        # STATE_HASH_ACTIVATION writes consensus.activations (hash + L6.1 from
+        # block 1, Classic); 'off' writes no activation at all (the pre-s136
+        # bytes); H writes the alias as before.
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
         final = json.loads(self.output.read_text())
-        self.assertNotIn('activations', final.get('consensus', {}))
-        self.assertNotIn('state_hash_activation_height', final.get('consensus', {}))
+        self.assertEqual(final['consensus']['activations'],
+                         {'running_state_hash': 1, 'book_window_commit': 1})
+        self.assertNotIn('state_hash_activation_height', final['consensus'])
+        self.assertNotIn('book_window_commit', final['consensus'])
         self.assertIn('  state_hash_activation = 1\n', result.stdout)
         result = self.run_script(STATE_HASH_ACTIVATION='off')
         self.assertEqual(result.returncode, 0, result.stderr)
         final = json.loads(self.output.read_text())
-        self.assertEqual(final['consensus']['activations'], {})
+        for field in ('activations', 'state_hash_activation_height', 'book_window_commit'):
+            self.assertNotIn(field, final['consensus'])
         self.assertIn('  state_hash_activation = off\n', result.stdout)
         result = self.run_script(STATE_HASH_ACTIVATION='7')
         self.assertEqual(result.returncode, 0, result.stderr)
+        final = json.loads(self.output.read_text())
+        self.assertEqual(final['consensus']['state_hash_activation_height'], 7)
+        self.assertNotIn('activations', final['consensus'])
         self.assertIn('  state_hash_activation = 7\n', result.stdout)
 
     def test_default_classic_genesis_reports_window_books_on(self):
-        # The node default for a Classic genesis naming no activation is the
-        # hash + L6.1 from block 1 (CL21); the summary says both. A row book
-        # mode or an explicit hash height gets no L6.1 line.
+        # The default for a Classic genesis is the hash + L6.1 from block 1
+        # (CL21), written as activations; the summary says both. A row book
+        # mode, BOOK_WINDOW_COMMIT=0, an explicit hash height or 'off' get no
+        # L6.1.
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('  book_window_commit = on (L6.1)\n', result.stdout)
-        for extra in ({'BOOK_MODE': '3'}, {'STATE_HASH_ACTIVATION': '1'},
-                      {'STATE_HASH_ACTIVATION': 'off'}):
+        for extra, activations in (({'BOOK_MODE': '3'}, {'running_state_hash': 1}),
+                                   ({'BOOK_WINDOW_COMMIT': '0'}, {'running_state_hash': 1}),
+                                   ({'STATE_HASH_ACTIVATION': '1'}, None),
+                                   ({'STATE_HASH_ACTIVATION': 'off'}, None)):
             with self.subTest(**extra):
                 result = self.run_script(**extra)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertNotIn('book_window_commit = on', result.stdout)
+                final = json.loads(self.output.read_text())
+                self.assertEqual(final['consensus'].get('activations'), activations)
 
     def test_book_window_commit_needs_the_state_hash_and_sets_the_consensus_flag(self):
         # L6.1 (ported from perf/l61-window-books 9930fc60): chain-wide genesis field

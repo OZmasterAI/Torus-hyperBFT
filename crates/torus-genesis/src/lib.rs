@@ -1176,8 +1176,9 @@ mod tests {
     fn genesis_state_hash_activation_height_is_chain_config() {
         let genesis = Genesis::from_json(&sample_genesis_json()).unwrap();
         assert_eq!(genesis.consensus.state_hash_activation_height, None);
-        // Owner s136: no activation named = the running hash from block 1.
-        assert_eq!(genesis.chain_config().state_hash_activation_height(), Some(1));
+        // Codex P1 (s136): a genesis naming no activation keeps its legacy
+        // meaning, off (generators write the default explicitly).
+        assert_eq!(genesis.chain_config().state_hash_activation_height(), None);
         let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
         json["consensus"]["state_hash_activation_height"] = serde_json::json!(5000);
         let genesis = Genesis::from_json(&json.to_string()).unwrap();
@@ -1324,38 +1325,25 @@ mod tests {
         }
     }
 
-    /// Owner s136: the running state hash is ON at genesis. A genesis that
-    /// names no activation (no `consensus.activations`, no
-    /// `state_hash_activation_height`: every fresh genesis the repo's
-    /// generators and checked-in files produce) schedules `running_state_hash`
-    /// from block 1 (P0.0: height 1, so the genesis parent header carries the
-    /// bit). `"activations": {}` is the explicit opt-out; the alias alone keeps
-    /// its own height.
-    /// RED before the change: absent meant off.
+    /// Codex P1 (s136 review): a genesis file naming no activation (no
+    /// `consensus.activations`, no `state_hash_activation_height`, no
+    /// `book_window_commit`) keeps its legacy meaning: no feature. Its file
+    /// digest (the data dir binding) is unchanged, so reading it as "hash +
+    /// L6.1 from block 1" would silently change the genesis parent header
+    /// (`features = active_at(0)`) and block 1 of an existing chain. The
+    /// sample and the checked-in files (devnet, ab-harness, devnet ladder)
+    /// all decode to the empty schedule, equal to an explicit `{}`.
+    /// RED before the fix: the absent field meant the defaults.
     #[test]
-    fn a_genesis_without_activations_runs_the_running_hash_from_block_1() {
-        use torus_types::Feature::RunningStateHash;
-        let with = |f: &dyn Fn(&mut serde_json::Value)| {
-            let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
-            f(&mut json);
+    fn an_old_genesis_without_activations_keeps_its_meaning_off() {
+        let empty = |text: &str| {
+            let mut json: serde_json::Value = serde_json::from_str(text).unwrap();
+            json["consensus"]["activations"] = serde_json::json!({});
             Genesis::from_json(&json.to_string()).unwrap().chain_config()
         };
-        let fresh = with(&|_| {});
-        assert_eq!(fresh.state_hash_activation_height(), Some(1));
-        assert_eq!(fresh.activations.height_of(RunningStateHash), Some(1));
-        assert_eq!(
-            fresh.activations.active_at(0) & RunningStateHash.bit(),
-            RunningStateHash.bit(),
-            "the genesis parent header carries block 1's bit"
-        );
-        let off = with(&|j| j["consensus"]["activations"] = serde_json::json!({}));
-        assert_eq!(off.state_hash_activation_height(), None, "explicit opt-out");
-        assert_eq!(off.activations.active_at(1), 0);
-        let alias = with(&|j| j["consensus"]["state_hash_activation_height"] = serde_json::json!(40));
-        assert_eq!(alias.state_hash_activation_height(), Some(40));
-        // The checked-in genesis files (devnet, ab-harness, devnet ladder)
-        // name no activation: they run it from block 1 too.
+        let sample = sample_genesis_json();
         for (name, text) in [
+            ("sample", sample.as_str()),
             ("devnet/genesis.json", include_str!("../../../devnet/genesis.json")),
             (
                 "devnet/ab-harness/devnet-genesis.json",
@@ -1366,27 +1354,50 @@ mod tests {
                 include_str!("../../../testnet/p3-testnet/devnet-ladder/genesis-10mkt.json"),
             ),
         ] {
-            let g = Genesis::from_json(text).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(g.chain_config().state_hash_activation_height(), Some(1), "{name}");
+            let json: serde_json::Value = serde_json::from_str(text).unwrap();
+            let consensus = json.get("consensus").cloned().unwrap_or_default();
+            for field in ["activations", "state_hash_activation_height", "book_window_commit"] {
+                assert!(consensus.get(field).is_none(), "{name}: names no {field}");
+            }
+            let config = Genesis::from_json(text)
+                .unwrap_or_else(|e| panic!("{name}: {e}"))
+                .chain_config();
+            assert_eq!(config.state_hash_activation_height(), None, "{name}: hash off");
+            assert_eq!(config.book_window_activation(), None, "{name}: L6.1 off");
+            assert_eq!(config.activations.active_at(0), 0, "{name}: genesis parent bits");
+            assert_eq!(config.activations, empty(text).activations, "{name}: = an explicit {{}}");
+            // The data dir binding is the file digest: unchanged by the parser.
+            assert_eq!(
+                crate::digest::GenesisDigest::of_json(text).unwrap(),
+                crate::digest::GenesisDigest::of_value(&json),
+                "{name}"
+            );
         }
     }
 
-    /// The genesis default runs what the 9j head-to-head measured (CL21:
-    /// Classic + L6.1 + hash on, section 124): a Classic genesis naming no
-    /// activation also schedules `book_window_commit` from block 1, so L3.1
-    /// (coalesced book saves) keeps running with the hash on. A row book mode
-    /// gets the hash only (L6.1 is Classic-only); `"activations": {}` and the
-    /// hash alias alone (an explicit, hash-only config) do not get it.
-    /// RED before the change: the default had no L6.1.
+    /// Owner s136: the hash and L6.1 are ON in every NEWLY generated genesis,
+    /// written explicitly (`gen-3val-genesis.sh` with STATE_HASH_ACTIVATION
+    /// unset writes [`torus_types::DEFAULT_GENESIS_ACTIVATIONS`] as
+    /// `consensus.activations`): both from block 1, the genesis parent header
+    /// carries both bits. A row book mode gets the hash only.
     #[test]
-    fn a_classic_genesis_without_activations_also_runs_window_books() {
+    fn a_generated_genesis_names_the_hash_and_window_books_from_block_1() {
         use torus_types::Feature::{BookWindowCommit, RunningStateHash};
+        let written: serde_json::Map<String, serde_json::Value> = torus_types::DEFAULT_GENESIS_ACTIVATIONS
+            .iter()
+            .map(|(f, h)| (f.name().to_string(), serde_json::json!(h)))
+            .collect();
+        assert_eq!(
+            serde_json::Value::Object(written.clone()),
+            serde_json::json!({"running_state_hash": 1, "book_window_commit": 1}),
+            "what gen-3val-genesis.sh writes"
+        );
         let with = |f: &dyn Fn(&mut serde_json::Value)| {
             let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
             f(&mut json);
             Genesis::from_json(&json.to_string()).unwrap().chain_config()
         };
-        let fresh = with(&|_| {});
+        let fresh = with(&|j| j["consensus"]["activations"] = serde_json::Value::Object(written.clone()));
         assert_eq!(fresh.state_hash_activation_height(), Some(1));
         assert_eq!(fresh.book_window_activation(), Some(1));
         assert_eq!(
@@ -1395,12 +1406,14 @@ mod tests {
             "the genesis parent header carries both"
         );
         assert!(fresh.validate().is_ok());
-        let rows = with(&|j| j["consensus"]["book_mode"] = serde_json::json!("level_authority_chunked"));
+        let rows = with(&|j| {
+            j["consensus"]["activations"] = serde_json::json!({"running_state_hash": 1});
+            j["consensus"]["book_mode"] = serde_json::json!("level_authority_chunked");
+        });
         assert_eq!(rows.state_hash_activation_height(), Some(1));
         assert_eq!(rows.book_window_activation(), None, "L6.1 is Classic-only");
-        let off = with(&|j| j["consensus"]["activations"] = serde_json::json!({}));
-        assert_eq!(off.book_window_activation(), None);
-        let alias = with(&|j| j["consensus"]["state_hash_activation_height"] = serde_json::json!(1));
+        let alias = with(&|j| j["consensus"]["state_hash_activation_height"] = serde_json::json!(40));
+        assert_eq!(alias.state_hash_activation_height(), Some(40));
         assert_eq!(alias.book_window_activation(), None, "explicit hash-only config");
     }
 
@@ -1493,9 +1506,9 @@ mod tests {
     fn genesis_book_window_commit_is_chain_config() {
         let genesis = Genesis::from_json(&sample_genesis_json()).unwrap();
         assert!(!genesis.consensus.book_window_commit);
-        // Owner s136 / batch 10: a Classic genesis naming no activation runs
-        // L6.1 with the hash from block 1.
-        assert_eq!(genesis.chain_config().book_window_activation(), Some(1), "the default");
+        // Codex P1 (s136): a genesis naming no activation keeps its legacy
+        // meaning (no L6.1); generators write it explicitly.
+        assert_eq!(genesis.chain_config().book_window_activation(), None, "absent = off");
         let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
         json["consensus"]["book_window_commit"] = serde_json::json!(true);
         json["consensus"]["state_hash_activation_height"] = serde_json::json!(1);
