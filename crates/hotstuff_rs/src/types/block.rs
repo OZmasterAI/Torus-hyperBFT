@@ -82,14 +82,16 @@ impl Block {
         CryptoHash::new(hasher.finalize().into())
     }
 
-    /// Checks if hash and justify are cryptographically correct.
+    /// Checks if hash and justify are cryptographically correct, the justify a PC of chain
+    /// `chain_id` (or the genesis PC; see [`Certificate::is_correct`]).
     pub fn is_correct<K: KVStore>(
         &self,
+        chain_id: ChainID,
         block_tree: &BlockTreeSingleton<K>,
     ) -> Result<bool, BlockTreeError> {
         Ok(
             self.hash == Block::hash(self.height, &self.justify, &self.data_hash)
-                && self.justify.is_correct(block_tree)?,
+                && self.justify.is_correct(chain_id, block_tree)?,
         )
     }
 }

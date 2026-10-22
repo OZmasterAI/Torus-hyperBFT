@@ -265,7 +265,7 @@ fn old_set_decide_pc_is_rejected_by_is_correct() {
     let old_set_decide_pc = decide_pc(view, block, &old_keys, &old_set);
     assert!(
         !old_set_decide_pc
-            .is_correct(&block_tree)
+            .is_correct(CHAIN_ID, &block_tree)
             .expect("is_correct must not error"),
         "an old-set Decide PC must be rejected during an in-flight VS transition"
     );
@@ -275,7 +275,7 @@ fn old_set_decide_pc_is_rejected_by_is_correct() {
     let new_set_decide_pc = decide_pc(view, block, &new_keys, &new_set);
     assert!(
         new_set_decide_pc
-            .is_correct(&block_tree)
+            .is_correct(CHAIN_ID, &block_tree)
             .expect("is_correct must not error"),
         "a correctly new-set-signed Decide PC must be accepted"
     );

@@ -37,7 +37,9 @@ Pull tools from main before the next campaign that has crash cells.
 explicitly for mode-3 arms. Each cell logs `cell=<label> book_mode=... <flag>='...'` and records `cell.book_mode` /
 `cell.node_flags` in summary.json. Pull tools from main before the next campaign.
 
-**Owner s136: new benches are PAUSED.** 9k-9p below are queued on HOLD; start none until the owner says go.
+**Live status (18c main session, updated s138):** 9k (`896240d4`): standard shape DONE, section 125 on main (K -47.5% matched/s whole, -58% post-kill; blocks/s 1.40 vs 15.86; survivor body-fetch fallback + 17-50 s freeze in 5 of 7 K cells, 18c investigating on `fix/body-fetch-dead-peer`). Deep shape RUNNING since 17:30 (`bench-ozarchy-9k2-deep2`, health.py `c8fff67d`, dissemination-only REJECTs logged, deep K smoke ACCEPT), ETA ~19:15; section 125.7 follows. health.py kill-cell fix on main (`32db7ad9`). Next on ozarchy: 9l / 9m / 9n, then 9o 'before' cells. 9o 'after' arm waits for batch 12 = D2 membership sync (`fix/vset-membership-sync`, Codex adversarial: approve) + lost-view timeout vote + reflexive lock rule (`fix/vsu-lock-reflexive`, cachyoz gate nextest 4715/4715; Codex adversarial found a P1 stall, fix in progress); 18c pings archy when it lands. 9p waits for dead-leader phases 1-3 (`feat/dead-leader-p3`, Codex: no findings), batch 12, and 4-validator run-cell.sh support (`tools/run-cell-4val`, building).
+
+**Owner s138: benches UNPAUSED.** Order: 9k first (pre-TC `896240d4`, a clean "before"); then 9l / 9m / 9n in any order; 9o's "after" arm on main after batch 12 (D2 membership sync + lost-view timeout vote + reflexive lock rule; 18c pings when it lands; its "before" cells may run earlier); 9p held until dead-leader phase 3 lands. Main now has the TC set (`d3de0abb`, `CONSENSUS_DB_FORMAT` v1): wipe data dirs for cells built from it; dead-leader will bump to v2.
 
 **Defaults on main (s136, batch 10 `2d2f3ed9`; pull main before preparing any cell):**
 * **Running state hash + L6.1 ON** for genesis files made by `devnet/wsl/gen-3val-genesis.sh` (hash from block 1; L6.1
@@ -1088,7 +1090,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
      row is the cost of hash on + attestation + L6.1 + L2.1. matched/s is not resolved (1.022 / 1.001).
    * R vs section 120 A (cross-campaign): matched/s -1.7% / -3.0% and exec CPU per fill +5.3% / +8.7%. The binary,
      not the hash, carries most of section 123's gap to section 120.
-9k. **[HOLD, owner s136: queued, NOT ready; do not start until the owner says go] One-validator-down baseline on
+9k. **[GO, owner s138] One-validator-down baseline on
    main (before TC-required and dead-leader skip land).** The "before" numbers for 9o (TC phase D) and 9p
    (dead-leader phase 4). Prepared by archy s136 (kill knob `cee86e4b` / `87e91dfd`, procstat fix `6f228433`, digest
    wait `9ea22dbd` + counter validation). The pre-TC main commit `896240d4` (owner s136: the TC set lands first; build this commit for 9k so it stays a clean "before" for 9o / 9p), feed off,
@@ -1099,14 +1101,20 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    views per minute, p50 / p99 commit latency, plus the end-of-load cancel-all tail (archy s136 open question).
    ~2-2.5 h (estimate). Doc target: the next results-doc section.
    **Config (s136, batch 10 on main `2d2f3ed9`):** run as the testnet will: hash + attestation + L6.1 + L2.1 + fail-stop on. `gen-weighted-genesis.sh` (needed for 2/2/1 stakes) still defaults the hash OFF, so set `STATE_HASH_ACTIVATION` explicitly ON (hash from block 1; L6.1 follows it for Classic); L2.1 and fail-stop are on by default. Check the startup lines read `on=true`.
-9o. **[HOLD, owner s136] TC-required phase D: one-down bench, main vs main + TC set.** After the TC set lands (batch 9
+   **Status (s138): standard shape DONE, deep running (`ozarchy-9k2-deep2`). Results: section 125 of
+   `ozarchy-antispam-item6-pf1-2026-10-04.md`.** K / U matched/s: whole cell 145.5k vs 277.3k (-47.5%), post-kill
+   115.9k vs 275.7k (-58.0%). Post-kill blocks/s 1.40 vs 15.86. val1 times out once per val2-led view (42.3 / min).
+   Cancel-all tail: K 4.5k in 6-10 s. Finding: in 5 of 7 K cells a survivor fell back to sync for the other survivor's
+   block body (17-50 s freeze; cause open, 18c). Caveat: the in-flight watcher is val1 in K vs val2 in U, which
+   confounds the pre-kill window.
+9o. **[GO s138: 'before' cells now; 'after' arm on main after batch 12] TC-required phase D: one-down bench, main vs main + TC set.** After the TC set lands (batch 9
    + `fix/tc-liveness`) and after 9k. Same cells as 9k on both binaries, 3 runs each (design
    `docs/plans/tc-required-and-tip-signing.md` section 7): all-up and one-down (stake 2/2/1, stake-1 node killed, no
    restart). Report blocks/s, matched/s, timeout views per minute, TC wait (enter_view -> propose), p50 / p99 commit
    latency. Pass: all-up within noise; one-down blocks/s within -5%. Optional: WAN netem cell at 227 / 502 ms (trial
    net instead, owner s136). ~2 h (estimate).
    **Config (s136, batch 10 on main `2d2f3ed9`):** run as the testnet will: hash + attestation + L6.1 + L2.1 + fail-stop on. `gen-weighted-genesis.sh` (needed for 2/2/1 stakes) still defaults the hash OFF, so set `STATE_HASH_ACTIVATION` explicitly ON (hash from block 1; L6.1 follows it for Classic); L2.1 and fail-stop are on by default. Check the startup lines read `on=true`.
-9p. **[HOLD, owner s136] Dead-leader skip (b1) phase 4: before / after.** After dead-leader phases 1-3 land (rebased on
+9p. **[HOLD: until dead-leader phase 3 + batch 12 land and run-cell.sh has 4-validator support (`tools/run-cell-4val`, building)] SHAPE CHANGED (owner s138): 4 validators, not 2/2/1.** At 2:2:1 with the stake-1 node down no validator-set update can commit (an update needs three consecutive live views; the dead node leads every third), so b1 would halt the chain at its first exclusion (`dead-leader-skip.md` section 8 finding 4). New shape: 4 nodes (1/1/1/1 or 2/2/1/1), one killed, at a MODERATE rate well below saturation (the question is recovery, not peak throughput; CPU starvation would mimic dead-leader timeouts). One short 4-node smoke cell first to check the rig keeps up. Before AND after arms both run in this 4-node shape (9k's 3-node cells are NOT its baseline); matched/s and p50/p99 are compared only inside 9p, never to the 3-node history. Original spec, superseded where it conflicts:** Dead-leader skip (b1) phase 4: before / after.** After dead-leader phases 1-3 land (rebased on
    the TC set) and after 9k. Design `docs/plans/dead-leader-skip.md` section 5: before = 9k's cells; after = the same
    cells on the branch, ABBA, 3 runs each; `VALIDATOR_STAKES=2,2,1`, `KILL_NO_RESTART=val2`,
    `KILL_NO_RESTART_AT_S=120`, `BENCH_RPCS=0,1`, feed off, 600 s, plus all-up. Report three windows (pre-kill / kill
@@ -1114,7 +1122,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    kill-to-exclusion time (s and heights). Pass: post-exclusion blocks/s >= 90% of all-up; all-up within noise; no
    new stalls. Note: at 2/2/1 a dead stake-1 node is excludable (eligible 4 of 5 >= quorum 4). ~2 h of cells (estimate).
    **Config (s136, batch 10 on main `2d2f3ed9`):** run as the testnet will: hash + attestation + L6.1 + L2.1 + fail-stop on. `gen-weighted-genesis.sh` (needed for 2/2/1 stakes) still defaults the hash OFF, so set `STATE_HASH_ACTIVATION` explicitly ON (hash from block 1; L6.1 follows it for Classic); L2.1 and fail-stop are on by default. Check the startup lines read `on=true`.
-9l. **[HOLD, owner s136: queued, NOT ready; do not start until the owner says go] Binary gap: `53a6d83c` vs
+9l. **[GO, owner s138] Binary gap: `53a6d83c` vs
    `29bfc705`, hash-off Classic.** Section 124 found R (hash off, `29bfc705`) below section 120's A (hash off,
    `53a6d83c`) across campaigns: matched/s 0.983 / 0.970 (deep / standard), exec-thread on-CPU per 1k fills 1.053 /
    1.087, CPU-s per 1M fills 1.023 / 1.048; native blocks/s 0.974 / 1.321 (standard up, likely T5.3). Cross-campaign,
@@ -1127,14 +1135,14 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
      first: executor unlisted-market reject `d78ea41b`; delist / UpdateMarketParams `6eba584a`, `23b0190e`;
      aliased-row refusals `73e8068d`, `d46234af`; L2.1 / b0 / b1 paths with flags off; RH4 DA GC `bbc38711` ff.
    * Report per step: the exec-path rule rows (section 91 rule) with CIs. Doc target: the next results-doc section.
-9m. **[HOLD, owner s136: queued, NOT ready; do not start until the owner says go] Item 6 Phase 5 revisit check: exec
+9m. **[GO, owner s138] Item 6 Phase 5 revisit check: exec
    profile on the batch-10 head.** Q8 recipe (perf record on the exec thread + the exec timers), standard (hsdb-300m)
    and deep shapes, main after batch 10 (Classic, hash on + attestation, L6.1, L2.1 on, 15 s checkpoints), ~1-1.5 h.
    Question: are `flush_all` (cache flush) + overlay writes still >= ~15% of exec-thread CPU (timers hint ~18%,
    sections 113, 117; the last profile 8u, section 105, predates L3.1 / L6.1)? If yes, item 6 Phase 5 is revisited
    (rebase step 2, move the drain to the flush worker, re-A/B under the exec-path rule); if no, it stays parked.
    Report the top exec-thread functions with shares, per shape. Doc target: the next results-doc section.
-9n. **[HOLD, owner s136: queued, NOT ready; do not start until the owner says go] 8f re-run: deep-book capacity on
+9n. **[GO, owner s138; GATES THE TESTNET LAUNCH (owner s138)] 8f re-run: deep-book capacity on
    main after batch 10.** Section 93's stage b cell (3 nodes, 1M accounts, 1M pre-loaded resting orders, 600 s
    standard load) on main after batch 10, plus the same binary's standard cell. Section 93 passed RAM (8.1-9.2 GB per
    node) and restarts, but found matched/s -14.3%, native blocks/s 13.3 -> 3.0, p50 15 -> 240 ms, `save_books`

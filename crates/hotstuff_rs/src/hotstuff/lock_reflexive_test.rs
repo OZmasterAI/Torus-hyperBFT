@@ -447,7 +447,7 @@ fn mixed_commit_replica(replica: usize, committed: bool, a_updates: bool) -> Mix
     }
     // Prepare(U, 7): the uncommitted honest replicas 1, 2 and the Byzantine keys[3].
     let prepare7 = phase_pc(7, u.hash, Phase::Prepare, &keys[1..], &set);
-    assert!(prepare7.is_correct(&block_tree).unwrap(), "fixture: Prepare(7) verifies at replica {replica}");
+    assert!(prepare7.is_correct(CHAIN_ID, &block_tree).unwrap(), "fixture: Prepare(7) verifies at replica {replica}");
     block_tree.advance_highest_pc_from_remote(&prepare7, &None).expect("Prepare(7) via a TC summary");
     let tc8 = tc_reporting(8, &prepare7, &keys[..3], &set);
     MixedCommit { keys, block_tree, u, tc8 }

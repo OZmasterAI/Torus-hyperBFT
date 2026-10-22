@@ -339,10 +339,10 @@ fn window_tie_at_the_tc_view_resolves_to_the_voted_block() {
 
     let names_x = collected_tc(v, &[Some(tip_x.clone()), Some(tip_b.clone()), Some(tip_b.clone())]);
     assert!(names_x.high_tip.as_ref() == Some(&tip_x), "fixture: the collector keeps the first tip at view v");
-    assert!(!names_x.is_correct(&tree).unwrap(), "a TC naming X is not correct");
+    assert!(!names_x.is_correct(CHAIN_ID, &tree).unwrap(), "a TC naming X is not correct");
 
     let names_b = collected_tc(v, &[Some(tip_b.clone()), Some(tip_b.clone()), Some(tip_b)]);
-    assert!(names_b.is_correct(&tree).unwrap(), "control: the TC naming B is correct");
+    assert!(names_b.is_correct(CHAIN_ID, &tree).unwrap(), "control: the TC naming B is correct");
 
     let next = v + 1;
     for origin in [new_leader(next), old_leader(next)] {
@@ -541,8 +541,8 @@ fn decided_and_undecided_replicas_accept_a_tc_naming_a_pre_update_tip() {
     let no_tip = collected_tc_in(new_set(), v, &[None, None, None], None);
     for decided in [false, true] {
         let tree = window_tree(u, decided);
-        assert!(no_tip.is_correct(&tree).unwrap(), "control, decided={decided}: the TC without a tip is correct");
-        assert!(names_t.is_correct(&tree).unwrap(), "decided={decided}: the TC naming the pre-update tip is correct");
+        assert!(no_tip.is_correct(CHAIN_ID, &tree).unwrap(), "control, decided={decided}: the TC without a tip is correct");
+        assert!(names_t.is_correct(CHAIN_ID, &tree).unwrap(), "decided={decided}: the TC naming the pre-update tip is correct");
         assert_eq!(
             window_votes_as(decided, next, u, &t, &new_leader(next), Some(names_t.clone())),
             (true, true),
@@ -603,7 +603,7 @@ fn case3_leader_decided_by_the_tc_high_qc_votes_for_its_own_proposal() {
     assert!(state.committed_validator_set() == &new_set(), "fixture: the committed set is the new set");
 
     let decide = signed_pc(d, &updating, Phase::Decide, &new_set());
-    assert!(decide.is_correct(&tree).unwrap(), "fixture: the Decide PC is correct");
+    assert!(decide.is_correct(CHAIN_ID, &tree).unwrap(), "fixture: the Decide PC is correct");
     let tip = tip_by(&block(97), t_view, &old_leader(t_view));
     let tc = collected_tc_in(new_set(), next - 1, &[Some(tip.clone()), Some(tip.clone()), Some(tip)], Some(decide.clone()));
     assert!(!tc.high_tip_is_winner, "fixture: case 3 (the high QC wins)");

@@ -10,6 +10,22 @@ Paths: **RM** = `docs/Torus-hyperBFT-roadmap.md` (line numbers at the s136 refre
 Status values: **decided**, **open**, **conflict** (sources disagree; owner to confirm), **pending code** (decided,
 waiting for a merge). "Blocks" names what cannot be finished until the item is settled.
 
+## 0. Owner decisions s138 (2026-10-22)
+
+| Item | Decision |
+|---|---|
+| Price band before a market's first mark | **A + C.** A (ops): list no markets / keep trading closed until every validator's oracle signer is registered and marks are fresh. C (code, pre-genesis): reject order placement on a market that has never had a mark until its first mark lands; listing a market therefore needs a feeder that quotes it. Builder: `fix/reject-orders-before-first-mark` |
+| RPC freshness option (b) | **(a) for the testnet:** not built; wallets use `--rpc-only` nodes (checkpoint interval 0) |
+| M2 timestamp lower bound | **Before genesis** (resolves the conflict below). Builder: `fix/m2-timestamp-lower-bound` |
+| 9n (8f deep-book re-run) gates the launch | **Yes** (bench queue 9n) |
+| Validator count (3 / 4 / 5) | Deferred: owner decides right before the testnet |
+| Liquidator-vault seed amount | Deferred: owner decides right before the testnet |
+| Item 7 T timing | **After genesis, activated through P0.0** (a new `Feature` bit switched on at a height; replaces the s127 "before genesis"). Not on the testnet critical path |
+| M2 design | **Ship the current vote-rule bound for the testnet if its delta review is clean; build the time floor from timeout votes as the pre-mainnet version. If the review finds another P1, switch to the time floor now** (owner s138) |
+| Funding (`feat/funding-engine`, P0.0 id 3) | Settle in cash at the position's next fill (possible later upgrade: Hyperliquid-style hourly settlement to every position, own P0.0 bit, no O(positions) spike); HL default values, impact notional 10000 for all markets; pro-rate the first partial interval; +32 MB per 1M positions accepted; one chain-wide cap now, per-market later (owner s138) |
+| Trading fees (`feat/trading-fees`, P0.0 id 4) | Liquidation fills as built (book fills pay, backstop / ADL / delist exempt). Fee not reserved at placement, as built; revisit (possible upgrade: reserve the worst-case fee). One global taker / maker pair, as built; **revisit pre-testnet or during the testnet: per-market rates or Hyperliquid-style per-user tiers (owner leans per-user)**. Rates and rebate values: decided right before the testnet. Destination: pending (likely burn / validators / treasury split, no dev share, paid once per block) (owner s138) |
+| Jailing / `JailVote` gate | **Leave as is for the testnet; fix before mainnet.** `JailVote` stays ungated (every testnet validator is owner-run), and jailing (J2 + E1/E2) plus the `JailVote` gate are pre-mainnet items. A testnet upgrade through P0.0 stays possible if live testing is wanted later. Dead-leader skip (b1) still handles dead leaders on the testnet |
+
 ## 1. Chain identity and validators
 
 | Question | Options | What we know | Status | Blocks |
@@ -85,9 +101,10 @@ waiting for a merge). "Blocks" names what cannot be finished until the item is s
   whether it gates genesis, section 2).
 - Batch 10 (L6.1 + L2.1 with P0.0, the defaults): **landed on main `2d2f3ed9` (s136).** The testnet genesis must name its activations explicitly (hash + L6.1 from block 1); a file without the field means off.
 - Dead-leader b1 phases 2-4: only if it goes into the genesis (section 2).
-- M2: only if the conflict resolves to "before genesis" (section 2).
-- Item 7 T: only if the s127 order still holds (section 4).
+- M2: **before genesis (owner s138)**, `fix/m2-timestamp-lower-bound`.
+- Price band before the first mark (C): `fix/reject-orders-before-first-mark` (owner s138).
+- Item 7 T: **not needed (owner s138: after genesis through P0.0).**
 - Capacity (not a genesis field, a launch-readiness check): the 1M-account RAM check PASSED (bench 8f, perf doc
   section 93: 8.1-9.2 GB per node, restarts <= 11 s). Open: its deep-book throughput finding (~1-1.7M resting
   orders: matched/s -14.3%, blocks/s 13.3 -> 3.0) predates L3.1 / L6.1. Re-run 8f on main after batch 10 (9n, on
-  hold; blocked by the bench pause). Open question: does a re-run gate the launch?
+  hold; blocked by the bench pause). **It gates the launch (owner s138).** Benches unpaused s138.

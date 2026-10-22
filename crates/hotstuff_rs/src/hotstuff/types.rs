@@ -45,14 +45,19 @@ impl Certificate for PhaseCertificate {
     /// Determine the appropriate validator set that the PC should be checked against, and check if the
     /// signatures in the certificate are correct and form a quorum given this validator set.
     ///
-    /// A special case is if the PC is the Genesis PC, in which case it is automatically correct.
+    /// A special case is if the PC is the Genesis PC, in which case it is automatically correct. Any
+    /// other PC must be of chain `chain_id`.
     fn is_correct<K: KVStore>(
         &self,
+        chain_id: ChainID,
         block_tree: &BlockTreeSingleton<K>,
     ) -> Result<bool, BlockTreeError> {
         if self.is_genesis_pc() {
             return Ok(true);
         };
+        if self.chain_id != chain_id {
+            return Ok(false);
+        }
 
         let block_height = block_tree.block_height(&self.block)?;
 
@@ -492,7 +497,7 @@ pub(crate) fn valid_proposal_certificates<K: KVStore>(
     if !extends_tc_high_qc(block_hash, justify, tc, nec) {
         return Ok(false);
     }
-    tc.is_correct(block_tree)
+    tc.is_correct(chain_id, block_tree)
 }
 
 /// VALIDPROPOSAL rule V1 (docs/plans/tc-required-and-tip-signing.md §2): a
