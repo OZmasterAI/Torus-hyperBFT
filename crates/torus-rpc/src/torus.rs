@@ -2760,11 +2760,17 @@ mod ack_scratch_tests {
     }
 
     fn fixtures(state: &torus_state::StateDb) -> Vec<SignedNativeAction> {
-        // Owner s138: a fixture from before the never-marked rule (test-only seam).
-        torus_core::oracle::test_treat_unmarked_as_marked_on_this_thread();
         use torus_types::{FixedPoint, OrderType, PlaceOrderParams, TimeInForce};
         state
             .put_cf_raw(CF_NATIVE_MARKETS, &1u64.to_be_bytes(), b"market")
+            .unwrap();
+        // Owner s138: orders need the market's first oracle mark. A stale
+        // aggregate (the intake band reads usable marks only); a row, not the
+        // per-thread seam: the parallel variant verifies on pool threads.
+        let agg = [(10 * FixedPoint::SCALE).to_be_bytes().as_slice(), &1u64.to_be_bytes(), &3u32.to_be_bytes(), &0u64.to_be_bytes()]
+            .concat();
+        state
+            .put_cf_raw(torus_state::cf::CF_NATIVE_ORACLE, &[b"agg".as_slice(), &1u64.to_be_bytes()].concat(), &agg)
             .unwrap();
         let key = k256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();
         let sign = |action, nonce| torus_types::eip712::sign_native_action(action, nonce, &key);
