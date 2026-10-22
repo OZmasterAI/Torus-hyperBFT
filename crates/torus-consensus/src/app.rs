@@ -26062,15 +26062,22 @@ mod crash_recovery_tests {
         assert_crash_after_evm_section_replays_identically(&b1, &key);
     }
 
+    /// s136 owner decision: fail-stop is ON by default. Unset, empty, `1`,
+    /// `true` and anything unknown = on; only an explicit `0` / `false`
+    /// (trimmed, any case) turns it off. A default node (env unset) runs it.
     #[test]
-    fn state_hash_mismatch_failstop_env_is_off_unless_exactly_1() {
-        use crate::state_hash::parse_failstop;
-        assert!(!parse_failstop(None));
-        for off in ["0", "", "true", "yes", "2"] {
+    fn state_hash_mismatch_failstop_env_is_on_unless_explicitly_off() {
+        use crate::state_hash::{failstop_enabled, parse_failstop};
+        assert!(parse_failstop(None), "on by default");
+        for on in ["1", " 1 ", "", "true", "TRUE", "yes", "2"] {
+            assert!(parse_failstop(Some(on.to_string())), "{on:?}");
+        }
+        for off in ["0", " 0 ", "false", "FALSE", " False "] {
             assert!(!parse_failstop(Some(off.to_string())), "{off:?}");
         }
-        assert!(parse_failstop(Some("1".to_string())));
-        assert!(parse_failstop(Some(" 1 ".to_string())));
+        if std::env::var_os("TORUS_STATE_HASH_FAILSTOP").is_none() {
+            assert!(failstop_enabled(), "a default node fail-stops");
+        }
     }
 
     // ---- T0: epoch processing on EVERY boundary block ----
