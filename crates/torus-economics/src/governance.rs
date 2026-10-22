@@ -869,6 +869,28 @@ impl<T: StateBackend> GovernanceManager<T> {
                     });
                 }
             }
+            // Trading fees (s138): own rows, read by the executor and RPC
+            // through `torus_types::trading_fees::TradingFeeRates`.
+            torus_types::trading_fees::TAKER_FEE_PARAM
+            | torus_types::trading_fees::MAKER_FEE_PARAM => {
+                let range = if key == torus_types::trading_fees::TAKER_FEE_PARAM {
+                    torus_types::trading_fees::TAKER_FEE_PPM_RANGE
+                } else {
+                    torus_types::trading_fees::MAKER_FEE_PPM_RANGE
+                };
+                let v: i64 = value
+                    .parse()
+                    .map_err(|_| EconomicsError::InvalidParameterValue {
+                        key: key.to_string(),
+                        reason: "must be a valid i64 (ppm of notional)".to_string(),
+                    })?;
+                if !range.contains(&v) {
+                    return Err(EconomicsError::InvalidParameterValue {
+                        key: key.to_string(),
+                        reason: format!("must be between {} and {} ppm", range.start(), range.end()),
+                    });
+                }
+            }
             torus_types::EVM_BIG_BLOCK_INTERVAL_PARAM => {
                 let v: u64 = value
                     .parse()

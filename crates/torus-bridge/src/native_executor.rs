@@ -42,6 +42,7 @@ use torus_types::{
     Cloid, FixedPoint, MarketId, NativeAction, OrderId, OrderType, PlaceOrderParams, SessionScope,
     Side, TimeInForce, ValidatorSet, VoteOption, U256,
 };
+use torus_types::trading_fees::TradingFeeRates;
 
 use crate::market_workers::{MarketWorkerPool, MatchRequest};
 
@@ -229,19 +230,58 @@ struct BalanceUndo {
     prior: Vec<(Address, Option<(NativeBalance, bool)>)>,
 }
 
-/// Per-call `cum_volume` increments: maker and taker each add `price * qty`
-/// for every fill side whose position effect applied. Flushed with the
-/// balance cache, in sorted-address order.
-type VolumeCache = HashMap<Address, FixedPoint>;
+/// One trader's per-call fill totals: traded notional (`cum_volume`) and,
+/// with the `trading_fees` feature, the fees its sides paid (the `cfee` row
+/// and the treasury credit). A fill side counts for both or for neither.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FillTotals {
+    volume: FixedPoint,
+    fee: FixedPoint,
+}
+
+impl Default for FillTotals {
+    fn default() -> Self {
+        Self { volume: FixedPoint::ZERO, fee: FixedPoint::ZERO }
+    }
+}
+
+impl std::ops::AddAssign for FillTotals {
+    fn add_assign(&mut self, rhs: Self) {
+        self.volume += rhs.volume;
+        self.fee += rhs.fee;
+    }
+}
+
+/// Per-call `cum_volume` (and fee) increments: maker and taker each add
+/// `price * qty` (and their fee) for every fill side whose position effect
+/// applied. Flushed with the balance cache, in sorted-address order.
+type VolumeCache = HashMap<Address, FillTotals>;
+
+/// Trading fees: the `(taker, maker)` fee on a fill of `notional` (both zero
+/// without rates, i.e. with the `trading_fees` feature off).
+fn side_fees(fees: Option<TradingFeeRates>, notional: FixedPoint) -> (FixedPoint, FixedPoint) {
+    match fees {
+        Some(r) => (r.taker_fee(notional), r.maker_fee(notional)),
+        None => (FixedPoint::ZERO, FixedPoint::ZERO),
+    }
+}
 
 /// Adds the first `sides` fill sides of `fills` (in order: fill 0 taker, fill
-/// 0 maker, fill 1 taker, ...) to `volumes`, one `price * qty` per fill.
-fn add_fill_volumes(volumes: &mut VolumeCache, fills: &[Fill], sides: usize) {
+/// 0 maker, fill 1 taker, ...) to `volumes`, one `price * qty` per fill and
+/// each side's fee at `fees`.
+fn add_fill_volumes(
+    volumes: &mut VolumeCache,
+    fills: &[Fill],
+    sides: usize,
+    fees: Option<TradingFeeRates>,
+) {
     for (k, fill) in fills.iter().enumerate().take(sides.div_ceil(2)) {
         let notional = fill.price * fill.quantity;
-        *volumes.entry(fill.taker).or_insert(FixedPoint::ZERO) += notional;
+        let (taker_fee, maker_fee) = side_fees(fees, notional);
+        *volumes.entry(fill.taker).or_default() += FillTotals { volume: notional, fee: taker_fee };
         if 2 * k + 1 < sides {
-            *volumes.entry(fill.maker).or_insert(FixedPoint::ZERO) += notional;
+            *volumes.entry(fill.maker).or_default() +=
+                FillTotals { volume: notional, fee: maker_fee };
         }
     }
 }
@@ -315,7 +355,7 @@ mod volume_cache_probe {
                     } else {
                         VolumeCache::default()
                     };
-                    add_fill_volumes(&mut v, f, 2 * f.len());
+                    add_fill_volumes(&mut v, f, 2 * f.len(), None);
                     v
                 })
                 .collect()
@@ -338,7 +378,7 @@ mod volume_cache_probe {
                 let mut merged = VolumeCache::with_capacity_and_hasher(cap, Default::default());
                 for p in &built {
                     for (t, add) in p {
-                        *merged.entry(*t).or_insert(FixedPoint::ZERO) += *add;
+                        *merged.entry(*t).or_default() += *add;
                     }
                 }
                 std::hint::black_box(merged);
@@ -623,6 +663,9 @@ struct MarketSettlePlan {
     /// `cum_volume` of every fill side of this market (summed per trader on
     /// the worker). Pass B adds it whole unless an order stops early there.
     volumes: VolumeCache,
+    /// The call's fee rates (`None`: `trading_fees` off), for pass B's
+    /// per-side volume walk after an early stop.
+    fees: Option<TradingFeeRates>,
 }
 
 /// C3 runtime toggle for the parallel settle path. Default ON (plan 9.13:
@@ -5931,8 +5974,8 @@ impl TradeSink<'_> {
             taker_start_raw: taker.start_size.raw(),
             maker_pnl_raw: maker.closed_pnl.map_or(0, |p| p.raw()),
             taker_pnl_raw: taker.closed_pnl.map_or(0, |p| p.raw()),
-            maker_fee_raw: 0,
-            taker_fee_raw: 0,
+            maker_fee_raw: maker.fee.raw(),
+            taker_fee_raw: taker.fee.raw(),
         });
         debug_assert_eq!(self.pending_extras.len(), self.pending_fills.len());
     }
@@ -6127,6 +6170,8 @@ struct StreamJobs<'j, 'r, T: StateBackend> {
     positions: &'j PositionManager<T>,
     typed: Option<&'j dyn TypedRows>,
     record_fills: bool,
+    /// Trading fees: the call's rates (`None`: feature off).
+    fees: Option<TradingFeeRates>,
     timestamp: u64,
     probe: SettleStreamProbe,
     /// Pool jobs (each takes markets in id order until they run out).
@@ -6351,6 +6396,10 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// ([`Self::feature_active`]), never on node config, so replay runs each
     /// height under the rules it was agreed under.
     pub features: u128,
+    /// Trading fees: the rates of the running `execute_batch` call (`None`:
+    /// the `trading_fees` bit is off), set at the call's start
+    /// ([`NativeExecutor::resolve_trade_fees`]).
+    pub(crate) trade_fees: Option<TradingFeeRates>,
 
     /// T1.5: set (never cleared) when a market worker panicked mid-matching.
     /// The panicking worker consumed its market's `OrderBook`, so this block's
@@ -6975,6 +7024,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             evm_fee_window: None,
             evm_gas: (0, 0),
             features: 0,
+            trade_fees: None,
             fatal_error: load_error,
             reader_fault: std::sync::OnceLock::new(),
             book_mode,
@@ -9295,6 +9345,9 @@ impl NativeExecutor {
             return NativeBatchResult { results, total_gas };
         }
 
+        // Trading fees: this call's rates (two point reads, bit on only).
+        ctx.trade_fees = Self::resolve_trade_fees(ctx);
+
         // ---- Phase 2: Pre-reserve margin, assign IDs, partition by market ----
         let margin_timer = std::time::Instant::now();
         // C2: `PreparedOrder.params` borrows from the caller's `actions` slice
@@ -9691,6 +9744,7 @@ impl NativeExecutor {
                         positions: &ctx.positions,
                         typed,
                         record_fills: ctx.record_fills,
+                        fees: ctx.trade_fees,
                         timestamp: ctx.timestamp,
                         probe,
                         jobs,
@@ -9930,14 +9984,38 @@ impl NativeExecutor {
         if let Err(e) = pos_flushed {
             ctx.fatal_error = Some(format!("position cache flush failed: {e}"));
         }
+        // Trading fees: the treasury takes the exact sum of every fee the
+        // call's fill sides paid (rebates subtracted; exact i128 sum, so the
+        // order is irrelevant), through the balance cache before its flush.
+        // Zero (always, with the feature off): no read, no write.
+        let fee_total = vol_cache
+            .values()
+            .fold(FixedPoint::ZERO, |sum, t| sum + t.fee);
+        if fee_total != FixedPoint::ZERO {
+            let treasury = ctx.treasury_address;
+            match bal_cache.load(&ctx.positions, ctx.typed_rows(), &treasury) {
+                Ok(mut bal) => {
+                    bal.available += fee_total;
+                    bal_cache.set(&treasury, bal);
+                }
+                Err(e) => Self::latch_core_fault(ctx, "trading fee treasury credit", &e),
+            }
+        }
         if let Err(e) = bal_cache.flush_all(&ctx.positions) {
             ctx.fatal_error = Some(format!("balance cache flush failed: {e}"));
         }
         let mut volumes: Vec<_> = vol_cache.into_iter().collect();
         volumes.sort_unstable_by_key(|(trader, _)| *trader);
         for (trader, add) in volumes {
-            if let Err(e) = Self::add_cum_volume(&ctx.positions, ctx.typed_rows(), &trader, add) {
+            if let Err(e) =
+                Self::add_cum_volume(&ctx.positions, ctx.typed_rows(), &trader, add.volume)
+            {
                 ctx.fatal_error = Some(format!("cum_volume flush failed: {e}"));
+            }
+            if add.fee != FixedPoint::ZERO {
+                if let Err(e) = ctx.positions.add_cum_fee(&trader, add.fee) {
+                    ctx.fatal_error = Some(format!("cum_fee flush failed: {e}"));
+                }
             }
         }
         ctx.phase_accum.cache_flush_ns += cache_flush_timer.elapsed().as_nanos();
@@ -10570,6 +10648,7 @@ impl NativeExecutor {
             positions,
             typed,
             record_fills,
+            fees,
             timestamp,
             probe,
             jobs,
@@ -10595,6 +10674,7 @@ impl NativeExecutor {
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]),
                 record_fills,
+                fees,
                 probe.plan_panic,
             )
         };
@@ -11020,6 +11100,7 @@ impl NativeExecutor {
                 for fill in &result.fills {
                     let taker_is_buy = fill.maker_side != Side::Buy;
                     let notional = fill.price * fill.quantity;
+                    let (taker_fee, maker_fee) = side_fees(ctx.trade_fees, notional);
                     let taker = match Self::apply_fill_via_caches(
                         &ctx.positions,
                         ctx.typed_rows(),
@@ -11030,6 +11111,7 @@ impl NativeExecutor {
                         taker_is_buy,
                         fill.quantity,
                         fill.price,
+                        taker_fee,
                     ) {
                         Ok(effect) => effect,
                         Err(e) => {
@@ -11044,7 +11126,8 @@ impl NativeExecutor {
                             break;
                         }
                     };
-                    *vol_cache.entry(fill.taker).or_insert(FixedPoint::ZERO) += notional;
+                    *vol_cache.entry(fill.taker).or_default() +=
+                        FillTotals { volume: notional, fee: taker_fee };
                     let maker = match Self::apply_fill_via_caches(
                         &ctx.positions,
                         ctx.typed_rows(),
@@ -11055,6 +11138,7 @@ impl NativeExecutor {
                         fill.maker_side == Side::Buy,
                         fill.quantity,
                         fill.price,
+                        maker_fee,
                     ) {
                         Ok(effect) => effect,
                         Err(e) => {
@@ -11067,7 +11151,8 @@ impl NativeExecutor {
                             break;
                         }
                     };
-                    *vol_cache.entry(fill.maker).or_insert(FixedPoint::ZERO) += notional;
+                    *vol_cache.entry(fill.maker).or_default() +=
+                        FillTotals { volume: notional, fee: maker_fee };
                     if record_fills {
                         ctx.fill_effects_scratch.push([taker, maker]);
                     }
@@ -11260,6 +11345,7 @@ impl NativeExecutor {
             let typed = ctx.typed_rows();
             let margin_configs = &ctx.margin_configs;
             let record_fills = ctx.record_fills;
+            let fees = ctx.trade_fees;
             let mrs: &[crate::market_workers::MarketBatchResult] = &market_results;
             // 8k L2.1 test seam (`None` unless a test pinned it).
             let plan_panic = SETTLE_STREAM_PROBE.with(std::cell::Cell::get).plan_panic;
@@ -11290,6 +11376,7 @@ impl NativeExecutor {
                     mbr,
                     prepared,
                     record_fills,
+                    fees,
                     plan_panic,
                 )
             };
@@ -11648,7 +11735,7 @@ impl NativeExecutor {
         // to its last fill side; otherwise per side, up to each stop.
         if stops.is_empty() {
             for (trader, add) in plan.volumes {
-                *out.vol_cache.entry(trader).or_insert(FixedPoint::ZERO) += add;
+                *out.vol_cache.entry(trader).or_default() += add;
             }
         } else {
             for (k, match_result) in mbr.results.iter().take(prepared.len()).enumerate() {
@@ -11657,7 +11744,7 @@ impl NativeExecutor {
                     .iter()
                     .find(|stop| stop.0 == k)
                     .map_or(2 * fills.len(), |stop| stop.1);
-                add_fill_volumes(out.vol_cache, fills, sides);
+                add_fill_volumes(out.vol_cache, fills, sides, plan.fees);
             }
         }
 
@@ -11695,13 +11782,22 @@ impl NativeExecutor {
         mbr: &crate::market_workers::MarketBatchResult,
         prepared: &[PreparedOrder<'_>],
         record_fills: bool,
+        fees: Option<TradingFeeRates>,
         plan_panic: Option<MarketId>,
     ) -> Result<MarketSettlePlan, String> {
         crate::panic_scope::catch_recoverable(|| {
             if plan_panic == Some(mbr.market_id) {
                 panic!("planted settle plan panic (L2.1 test seam)");
             }
-            Self::compute_market_settle_plan(positions, typed, cfg, mbr, prepared, record_fills)
+            Self::compute_market_settle_plan(
+                positions,
+                typed,
+                cfg,
+                mbr,
+                prepared,
+                record_fills,
+                fees,
+            )
         })
         .map_err(|payload| {
             if let Some(s) = payload.downcast_ref::<&'static str>() {
@@ -11726,6 +11822,7 @@ impl NativeExecutor {
         mbr: &crate::market_workers::MarketBatchResult,
         prepared: &[PreparedOrder<'_>],
         record_fills: bool,
+        fees: Option<TradingFeeRates>,
     ) -> MarketSettlePlan {
         let market_id = mbr.market_id;
         let mut pos_cache = PositionCache::new();
@@ -11751,12 +11848,13 @@ impl NativeExecutor {
             let mut fill_fault: Option<String> = None;
             'fills: for (k, fill) in result.fills.iter().enumerate() {
                 let taker_is_buy = fill.maker_side != Side::Buy;
+                let (taker_fee, maker_fee) = side_fees(fees, fill.price * fill.quantity);
                 let mut pair = [FillEffect::default(); 2];
-                for (s, (slot, (side, trader, is_buy))) in pair
+                for (s, (slot, (side, trader, is_buy, fee))) in pair
                     .iter_mut()
                     .zip([
-                        ("taker", &fill.taker, taker_is_buy),
-                        ("maker", &fill.maker, fill.maker_side == Side::Buy),
+                        ("taker", &fill.taker, taker_is_buy, taker_fee),
+                        ("maker", &fill.maker, fill.maker_side == Side::Buy, maker_fee),
                     ])
                     .enumerate()
                 {
@@ -11770,9 +11868,13 @@ impl NativeExecutor {
                         fill.price,
                         MarginType::Cross,
                     ) {
-                        Ok(effect) => {
-                            if let Some(pnl) = effect.closed_pnl {
-                                pnl_events.push((side, *trader, pnl, 2 * k + s));
+                        Ok(mut effect) => {
+                            // Trading fees: one event per side, PnL minus
+                            // fee (as `apply_fill_via_caches`).
+                            effect.fee = fee;
+                            if effect.closed_pnl.is_some() || fee != FixedPoint::ZERO {
+                                let delta = effect.closed_pnl.unwrap_or(FixedPoint::ZERO) - fee;
+                                pnl_events.push((side, *trader, delta, 2 * k + s));
                             }
                             *slot = effect;
                         }
@@ -11792,7 +11894,7 @@ impl NativeExecutor {
             // A position failure sends the whole call to the sequential loop,
             // so these sums are only used when every side applied.
             if fill_error.is_none() {
-                add_fill_volumes(&mut volumes, &result.fills, 2 * result.fills.len());
+                add_fill_volumes(&mut volumes, &result.fills, 2 * result.fills.len(), fees);
             }
 
             orders.push(OrderSettlePlan {
@@ -11817,6 +11919,7 @@ impl NativeExecutor {
             pos_cache,
             maker_releases,
             volumes,
+            fees,
         }
     }
 
@@ -11838,8 +11941,9 @@ impl NativeExecutor {
         is_buy: bool,
         qty: FixedPoint,
         price: FixedPoint,
+        fee: FixedPoint,
     ) -> Result<FillEffect, CoreError> {
-        let effect = positions.apply_fill_cached_effect_typed(
+        let mut effect = positions.apply_fill_cached_effect_typed(
             pos_cache,
             typed,
             trader,
@@ -11849,9 +11953,12 @@ impl NativeExecutor {
             price,
             MarginType::Cross,
         )?;
-        if let Some(pnl) = effect.closed_pnl {
+        // Trading fees: the side's fee rides in the same balance update as
+        // its PnL (pass B applies the same delta as one event).
+        effect.fee = fee;
+        if effect.closed_pnl.is_some() || fee != FixedPoint::ZERO {
             let mut bal = bal_cache.load(positions, typed, trader)?;
-            bal.available += pnl;
+            bal.available += effect.closed_pnl.unwrap_or(FixedPoint::ZERO) - fee;
             bal_cache.set(trader, bal);
         }
         Ok(effect)
@@ -12209,6 +12316,28 @@ impl NativeExecutor {
             .collect()
     }
 
+    /// Trading fees on the single-action path (no write-back caches): debit
+    /// `fee` from `trader`'s `available`, credit it to the treasury and add
+    /// it to the trader's `cfee` row, all straight to the backend. Zero: no
+    /// read, no write.
+    fn charge_fee_direct<T: StateBackend>(
+        positions: &PositionManager<T>,
+        trader: &Address,
+        treasury: Address,
+        fee: FixedPoint,
+    ) -> Result<(), CoreError> {
+        if fee == FixedPoint::ZERO {
+            return Ok(());
+        }
+        let mut bal = positions.get_native_balance(trader)?;
+        bal.available -= fee;
+        positions.put_native_balance(trader, &bal)?;
+        let mut t = positions.get_native_balance(&treasury)?;
+        t.available += fee;
+        positions.put_native_balance(&treasury, &t)?;
+        positions.add_cum_fee(trader, fee)
+    }
+
     /// Add `amount` to `trader`'s stored lifetime volume (`cum_volume`).
     fn add_cum_volume<T: StateBackend>(
         positions: &PositionManager<T>,
@@ -12546,6 +12675,37 @@ impl NativeExecutor {
     fn price_band_bps<T: StateBackend>(state: &T) -> Result<u64, CoreError> {
         let stored = state.get_cf_raw(torus_state::cf::CF_FEE_CONFIG, torus_types::PRICE_BAND_PARAM.as_bytes())?;
         Ok(torus_types::price_band_bps(stored.as_deref()))
+    }
+
+    /// Trading fees: the rates in force — governance keys
+    /// [`torus_types::trading_fees::TAKER_FEE_PARAM`] /
+    /// [`torus_types::trading_fees::MAKER_FEE_PARAM`] in `CF_FEE_CONFIG`
+    /// (defaults when absent or invalid). A failed read is the `Err`.
+    pub fn trading_fee_rates<T: StateBackend>(state: &T) -> Result<TradingFeeRates, CoreError> {
+        use torus_types::trading_fees::{MAKER_FEE_PARAM, TAKER_FEE_PARAM};
+        let cf = torus_state::cf::CF_FEE_CONFIG;
+        let taker = state.get_cf_raw(cf, TAKER_FEE_PARAM.as_bytes())?;
+        let maker = state.get_cf_raw(cf, MAKER_FEE_PARAM.as_bytes())?;
+        Ok(TradingFeeRates::from_stored(taker.as_deref(), maker.as_deref()))
+    }
+
+    /// Trading fees: `None` while the executed block's header lacks the
+    /// `trading_fees` bit (nothing read: byte-identical to before the
+    /// feature), else the rates. R02: a failed read is a local fault (the
+    /// block fail-stops); the defaults stand in meanwhile.
+    pub(crate) fn resolve_trade_fees<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+    ) -> Option<TradingFeeRates> {
+        if !ctx.feature_active(torus_types::Feature::TradingFees) {
+            return None;
+        }
+        match Self::trading_fee_rates(&ctx.state) {
+            Ok(rates) => Some(rates),
+            Err(e) => {
+                Self::latch_core_fault(ctx, "trading fee params read", &e);
+                Some(TradingFeeRates::default())
+            }
+        }
     }
 
     /// s94 option 2: `market_id`'s band — its usable `mark`, else the book
@@ -13640,9 +13800,17 @@ impl NativeExecutor {
         if record_fills {
             ctx.fill_effects_scratch.clear();
         }
+        // Trading fees: the rates (bit on and the order filled only).
+        let fees = if result.fills.is_empty() {
+            None
+        } else {
+            Self::resolve_trade_fees(ctx)
+        };
+        let treasury = ctx.treasury_address;
         for fill in &result.fills {
             let taker_is_buy = fill.maker_side != Side::Buy;
             let notional = fill.price * fill.quantity;
+            let (taker_fee, maker_fee) = side_fees(fees, notional);
             let taker = match ctx
                 .positions
                 .apply_fill(
@@ -13653,8 +13821,10 @@ impl NativeExecutor {
                     fill.price,
                     MarginType::Cross,
                 )
-                .and_then(|effect| {
+                .and_then(|mut effect| {
                     Self::add_cum_volume(&ctx.positions, ctx.typed_rows(), &fill.taker, notional)?;
+                    Self::charge_fee_direct(&ctx.positions, &fill.taker, treasury, taker_fee)?;
+                    effect.fee = taker_fee;
                     Ok(effect)
                 }) {
                 Ok(effect) => effect,
@@ -13683,8 +13853,10 @@ impl NativeExecutor {
                     fill.price,
                     MarginType::Cross,
                 )
-                .and_then(|effect| {
+                .and_then(|mut effect| {
                     Self::add_cum_volume(&ctx.positions, ctx.typed_rows(), &fill.maker, notional)?;
+                    Self::charge_fee_direct(&ctx.positions, &fill.maker, treasury, maker_fee)?;
+                    effect.fee = maker_fee;
                     Ok(effect)
                 }) {
                 Ok(effect) => effect,

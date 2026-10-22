@@ -2110,3 +2110,32 @@ async fn validators_reply_is_unchanged_by_the_address_map() {
         .collect();
     assert_eq!(got, expected);
 }
+
+// ---------------------------------------------------------------------------
+// getUserFees (trading fees, s138)
+// ---------------------------------------------------------------------------
+
+/// The rates in force (defaults without governance rows, else the rows,
+/// maker clamped to `>= -taker`) and the trader's `cfee` row.
+#[tokio::test]
+async fn user_fees_report_the_rates_and_the_lifetime_fees() {
+    use torus_types::trading_fees::{MAKER_FEE_PARAM, TAKER_FEE_PARAM};
+    let (_d, state) = db();
+    let s = server(&state, 100_000);
+    let f = s.state().get_user_fees(hex_addr(addr(MAKER))).await.unwrap();
+    assert_eq!((f.taker_fee_ppm, f.maker_fee_ppm), (450, 150));
+    assert_eq!(f.cum_fees, dec_fp(FixedPoint::ZERO));
+
+    let cf = torus_state::cf::CF_FEE_CONFIG;
+    state.put_cf_raw(cf, TAKER_FEE_PARAM.as_bytes(), b"300").unwrap();
+    state.put_cf_raw(cf, MAKER_FEE_PARAM.as_bytes(), b"-500").unwrap();
+    let pm = PositionManager::new(state.clone());
+    pm.add_cum_fee(&addr(MAKER), fp(2)).unwrap();
+    pm.add_cum_fee(&addr(MAKER), FixedPoint::from_raw(-FixedPoint::SCALE / 2)).unwrap();
+    let f = s.state().get_user_fees(hex_addr(addr(MAKER))).await.unwrap();
+    assert_eq!((f.taker_fee_ppm, f.maker_fee_ppm), (300, -300));
+    assert_eq!(f.cum_fees, dec_fp(FixedPoint::from_raw(3 * FixedPoint::SCALE / 2)));
+    let json = serde_json::to_value(&f).unwrap();
+    assert_eq!(json["takerFeePpm"], 300);
+    assert!(json.get("cumFees").is_some());
+}

@@ -84,6 +84,7 @@ means the method counts rows toward `TORUS_RPC_MAX_SCAN_ROWS` and stops with
 | `torus_getDelegations(delegator)` | Answer: the delegator's delegations. | none needed |
 | `torus_getStateHash(height?)` | Constant: the retained checkpoint keys (at most 64), then that height's votes (in the reply, at most one per validator). | none needed |
 | `torus_getEpoch`, `torus_getGovernanceParams`, `torus_getTreasuryInfo` | Constant: none, or a few point reads. | none needed |
+| `torus_getUserFees(trader)` | Constant: the two fee-rate governance rows and the trader's `cfee` row (three point reads). | `user_fees_report_the_rates_and_the_lifetime_fees` |
 | `torus_getFeatureSchedule` | Constant: no state read (the schedule and the known features are in memory; at most 128 features). | none needed |
 | `torus_getBlockBody(blockNumber)` | Answer: one body, its status record, and one link per CoreWriter row in it. | none needed |
 | `torus_subscribe` | No DB reads: items are pushed from execution. | none needed |
