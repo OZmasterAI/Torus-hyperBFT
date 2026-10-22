@@ -27,9 +27,19 @@
 //! the legacy names (`/torus/direct/2.0`, `/torus/1.0`) and refuses peers
 //! that advertise a digest, and they refuse it.
 
+use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::fmt;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
-use libp2p::StreamProtocol;
+use libp2p::core::transport::PortUse;
+use libp2p::core::Endpoint;
+use libp2p::swarm::{
+    dummy, ConnectionDenied, ConnectionId, FromSwarm, NetworkBehaviour, THandler, THandlerInEvent,
+    THandlerOutEvent, ToSwarm,
+};
+use libp2p::{Multiaddr, PeerId, StreamProtocol};
 
 /// Identify protocol version of a node without a genesis digest, and the
 /// prefix of one with a digest.
@@ -209,6 +219,200 @@ impl fmt::Display for NetworkGenesis {
     }
 }
 
+/// First cooldown after a peer is refused for its genesis; it doubles on each
+/// further refusal of the same peer up to [`MISMATCH_COOLDOWN_MAX`].
+pub const MISMATCH_COOLDOWN_MIN: Duration = Duration::from_secs(5);
+/// Cap of the per-peer mismatch cooldown.
+pub const MISMATCH_COOLDOWN_MAX: Duration = Duration::from_secs(60);
+/// Entries kept before stale ones (cooldown long over) are pruned.
+const COOLDOWN_PRUNE_AT: usize = 1024;
+
+#[derive(Clone, Copy, Debug)]
+struct Cooldown {
+    until: Instant,
+    interval: Duration,
+    strikes: u32,
+}
+
+/// Per-peer cooldown after a genesis refusal (Codex P2 on the handshake
+/// branch). A refused validator stays in the peer map, so without it every
+/// consensus send, the mesh tick, kademlia and gossipsub's explicit-peer tick
+/// redialed it: each new QUIC connection ran identify, was refused, closed,
+/// and the next send dialed again (~20 connections/s per peer). While a peer
+/// cools down, [`GenesisGate`] denies every connection to or from it, so no
+/// dial path reaches the wire.
+#[derive(Debug, Default)]
+pub struct MismatchCooldown {
+    peers: HashMap<PeerId, Cooldown>,
+}
+
+impl MismatchCooldown {
+    /// Record a refusal of `peer` at `now`; returns the cooldown applied and
+    /// how many refusals in a row this peer has had.
+    pub fn record(&mut self, peer: PeerId, now: Instant) -> (Duration, u32) {
+        if self.peers.len() >= COOLDOWN_PRUNE_AT {
+            self.peers
+                .retain(|_, c| c.until + MISMATCH_COOLDOWN_MAX > now);
+        }
+        let c = self.peers.entry(peer).or_insert(Cooldown {
+            until: now,
+            interval: Duration::ZERO,
+            strikes: 0,
+        });
+        c.interval = if c.strikes == 0 {
+            MISMATCH_COOLDOWN_MIN
+        } else {
+            (c.interval * 2).min(MISMATCH_COOLDOWN_MAX)
+        };
+        c.strikes = c.strikes.saturating_add(1);
+        c.until = now + c.interval;
+        (c.interval, c.strikes)
+    }
+
+    /// Whether `peer` is still cooling down at `now`.
+    pub fn is_cooling(&self, peer: &PeerId, now: Instant) -> bool {
+        self.peers.get(peer).is_some_and(|c| now < c.until)
+    }
+
+    /// Forget `peer` (it was accepted).
+    pub fn clear(&mut self, peer: &PeerId) {
+        self.peers.remove(peer);
+    }
+}
+
+/// Whether the `strikes`-th refusal in a row of one peer is logged at WARN
+/// (the first two, then powers of two); the rest go to DEBUG. With the
+/// cooldown a refusal happens at most every 5..60 s per peer already.
+pub fn warn_on_strike(strikes: u32) -> bool {
+    strikes <= 2 || strikes.is_power_of_two()
+}
+
+/// A connection denied because its peer is cooling down after a genesis
+/// refusal.
+#[derive(Debug)]
+pub struct GenesisCooldown(pub PeerId);
+
+impl fmt::Display for GenesisCooldown {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "peer {} cooling down after a genesis digest refusal",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for GenesisCooldown {}
+
+/// Connection gate keyed by the genesis handshake. Must be the FIRST field of
+/// `TorusBehaviour` (with the other deniers): it denies, it never registers
+/// connection state.
+///
+/// - **Cooldown**: every connection to or from a peer in its
+///   [`MismatchCooldown`] is denied, before the dial reaches the wire for a
+///   dial by peer id.
+/// - **Acceptance**: a peer is `accepted` once identify on one of its
+///   connections has passed the genesis check, until its last connection
+///   closes. Buffered sends are flushed to a peer only once it is accepted,
+///   and direct sends to a connected but not yet accepted peer are buffered.
+#[derive(Debug, Default)]
+pub struct GenesisGate {
+    cooldown: MismatchCooldown,
+    accepted: HashSet<PeerId>,
+}
+
+impl GenesisGate {
+    /// Refuse `peer`: start or extend its cooldown and drop its acceptance.
+    pub fn refuse(&mut self, peer: PeerId) -> (Duration, u32) {
+        self.accepted.remove(&peer);
+        self.cooldown.record(peer, Instant::now())
+    }
+
+    /// Identify accepted `peer`; true when it was not accepted before (its
+    /// buffered sends are due now).
+    pub fn accept(&mut self, peer: PeerId) -> bool {
+        self.cooldown.clear(&peer);
+        self.accepted.insert(peer)
+    }
+
+    pub fn is_accepted(&self, peer: &PeerId) -> bool {
+        self.accepted.contains(peer)
+    }
+
+    pub fn is_cooling(&self, peer: &PeerId) -> bool {
+        self.cooldown.is_cooling(peer, Instant::now())
+    }
+
+    fn enforce(&self, peer: &PeerId) -> Result<(), ConnectionDenied> {
+        if self.is_cooling(peer) {
+            return Err(ConnectionDenied::new(GenesisCooldown(*peer)));
+        }
+        Ok(())
+    }
+}
+
+impl NetworkBehaviour for GenesisGate {
+    type ConnectionHandler = dummy::ConnectionHandler;
+    type ToSwarm = Infallible;
+
+    fn handle_established_inbound_connection(
+        &mut self,
+        _: ConnectionId,
+        peer: PeerId,
+        _: &Multiaddr,
+        _: &Multiaddr,
+    ) -> Result<THandler<Self>, ConnectionDenied> {
+        self.enforce(&peer)?;
+        Ok(dummy::ConnectionHandler)
+    }
+
+    fn handle_pending_outbound_connection(
+        &mut self,
+        _: ConnectionId,
+        peer: Option<PeerId>,
+        _: &[Multiaddr],
+        _: Endpoint,
+    ) -> Result<Vec<Multiaddr>, ConnectionDenied> {
+        if let Some(peer) = peer {
+            self.enforce(&peer)?;
+        }
+        Ok(vec![])
+    }
+
+    fn handle_established_outbound_connection(
+        &mut self,
+        _: ConnectionId,
+        peer: PeerId,
+        _: &Multiaddr,
+        _: Endpoint,
+        _: PortUse,
+    ) -> Result<THandler<Self>, ConnectionDenied> {
+        self.enforce(&peer)?;
+        Ok(dummy::ConnectionHandler)
+    }
+
+    fn on_swarm_event(&mut self, event: FromSwarm) {
+        if let FromSwarm::ConnectionClosed(c) = event {
+            if c.remaining_established == 0 {
+                self.accepted.remove(&c.peer_id);
+            }
+        }
+    }
+
+    fn on_connection_handler_event(
+        &mut self,
+        _: PeerId,
+        _: ConnectionId,
+        event: THandlerOutEvent<Self>,
+    ) {
+        match event {}
+    }
+
+    fn poll(&mut self, _: &mut Context<'_>) -> Poll<ToSwarm<Infallible, THandlerInEvent<Self>>> {
+        Poll::Pending
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,5 +523,50 @@ mod tests {
         );
         assert_eq!(g.topic("/torus/consensus/1.0"), "/torus/consensus/1.0");
         assert!(g.kad_protocol().is_none());
+    }
+
+    #[test]
+    fn mismatch_cooldown_backs_off_caps_and_expires() {
+        let peer = PeerId::random();
+        let mut c = MismatchCooldown::default();
+        let t0 = Instant::now();
+        assert!(!c.is_cooling(&peer, t0));
+        assert_eq!(c.record(peer, t0), (MISMATCH_COOLDOWN_MIN, 1));
+        assert!(c.is_cooling(&peer, t0 + MISMATCH_COOLDOWN_MIN / 2));
+        assert!(!c.is_cooling(&peer, t0 + MISMATCH_COOLDOWN_MIN));
+        assert_eq!(c.record(peer, t0).0, MISMATCH_COOLDOWN_MIN * 2);
+        let mut last = Duration::ZERO;
+        for _ in 0..20 {
+            last = c.record(peer, t0).0;
+        }
+        assert_eq!(last, MISMATCH_COOLDOWN_MAX, "capped");
+        assert!(!c.is_cooling(&PeerId::random(), t0), "per peer");
+        c.clear(&peer);
+        assert!(!c.is_cooling(&peer, t0));
+        assert_eq!(
+            c.record(peer, t0),
+            (MISMATCH_COOLDOWN_MIN, 1),
+            "fresh after clear"
+        );
+    }
+
+    #[test]
+    fn gate_denies_a_cooling_peer_and_accept_lifts_it() {
+        let peer = PeerId::random();
+        let mut g = GenesisGate::default();
+        assert!(g.enforce(&peer).is_ok());
+        assert!(g.accept(peer), "first acceptance is new");
+        assert!(!g.accept(peer), "second is not");
+        g.refuse(peer);
+        assert!(!g.is_accepted(&peer), "refusal drops acceptance");
+        assert!(g.enforce(&peer).is_err(), "cooling peer is denied");
+        assert!(g.accept(peer));
+        assert!(g.enforce(&peer).is_ok(), "accepted peer is let through");
+    }
+
+    #[test]
+    fn refusal_warn_is_rate_limited() {
+        let warned: Vec<u32> = (1..=40).filter(|s| warn_on_strike(*s)).collect();
+        assert_eq!(warned, vec![1, 2, 4, 8, 16, 32]);
     }
 }

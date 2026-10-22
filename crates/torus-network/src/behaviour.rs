@@ -23,6 +23,10 @@ pub const NATIVE_ACTION_TOPIC: &str = "/torus/native-actions/1.0";
 
 #[derive(NetworkBehaviour)]
 pub struct TorusBehaviour {
+    /// Genesis handshake gate (owner s138; Codex P2): denies every connection
+    /// to or from a peer cooling down after a genesis refusal and tracks which
+    /// peers identify accepted. A denier: stays among the first fields.
+    pub genesis_gate: crate::genesis_id::GenesisGate,
     /// Peer block list for banning (Phase 3: 3.1.7).
     ///
     /// The two connection-DENYING behaviours (`block_list`,
@@ -264,6 +268,7 @@ impl TorusBehaviour {
         let block_list = allow_block_list::Behaviour::default();
 
         Ok(Self {
+            genesis_gate: crate::genesis_id::GenesisGate::default(),
             gossipsub,
             direct,
             block_data,
