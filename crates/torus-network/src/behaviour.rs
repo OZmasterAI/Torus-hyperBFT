@@ -1,7 +1,9 @@
 use std::time::Duration;
 
 use libp2p::swarm::NetworkBehaviour;
-use libp2p::{allow_block_list, connection_limits, gossipsub, identify, kad, request_response};
+use libp2p::{
+    allow_block_list, connection_limits, gossipsub, identify, kad, request_response,
+};
 
 use crate::codec::{
     BlockDataCodec, BorshCodec, NativeDaCodec, NativeDaShardsCodec, NATIVE_DA_SHARDS_PROTOCOL,
@@ -239,9 +241,7 @@ impl TorusBehaviour {
         // never enters our routing table (libp2p's default name without one).
         let store = kad::store::MemoryStore::new(peer_id);
         let mut kademlia = match genesis.kad_protocol() {
-            Some(protocol) => {
-                kad::Behaviour::with_config(peer_id, store, kad::Config::new(protocol))
-            }
+            Some(protocol) => kad::Behaviour::with_config(peer_id, store, kad::Config::new(protocol)),
             None => kad::Behaviour::new(peer_id, store),
         };
         kademlia.set_mode(Some(kad::Mode::Server));

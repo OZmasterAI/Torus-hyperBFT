@@ -131,9 +131,7 @@ pub fn consensus_gossip_mirror() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         parse_env_flag(
-            std::env::var("TORUS_CONSENSUS_GOSSIP_MIRROR")
-                .ok()
-                .as_deref(),
+            std::env::var("TORUS_CONSENSUS_GOSSIP_MIRROR").ok().as_deref(),
             true,
         )
     })

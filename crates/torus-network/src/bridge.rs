@@ -240,7 +240,9 @@ impl LibP2PNetwork {
             recently_deposed: RwLock::new(HashMap::new()),
             redial_backoff: Mutex::new(HashMap::new()),
             allow_private_addrs: config.allow_private_addrs,
-            pending_da_fetches: Mutex::new(PendingSendQueue::new(crate::swarm::DA_FETCH_QUEUE_CAP)),
+            pending_da_fetches: Mutex::new(PendingSendQueue::new(
+                crate::swarm::DA_FETCH_QUEUE_CAP,
+            )),
             // B2 consensus isolation (TORUS_CONSENSUS_DIRECT_FAN /
             // TORUS_CONSENSUS_GOSSIP_MIRROR via NetworkConfig::default; fan
             // OFF + mirror ON = exact-today rollback).
@@ -854,7 +856,9 @@ mod tests {
             recently_deposed: RwLock::new(HashMap::new()),
             redial_backoff: Mutex::new(HashMap::new()),
             allow_private_addrs: false,
-            pending_da_fetches: Mutex::new(PendingSendQueue::new(crate::swarm::DA_FETCH_QUEUE_CAP)),
+            pending_da_fetches: Mutex::new(PendingSendQueue::new(
+                crate::swarm::DA_FETCH_QUEUE_CAP,
+            )),
             // B2 defaults (fan OFF, mirror ON) — exact-today behavior.
             consensus_direct_fan: false,
             consensus_gossip_mirror: true,
@@ -1095,7 +1099,8 @@ mod tests {
         let peer_c = test_signing_key(4).verifying_key();
 
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
-        let shared = shared_with_validators(&[local.verifying_key(), peer_a, peer_b, peer_c]);
+        let shared =
+            shared_with_validators(&[local.verifying_key(), peer_a, peer_b, peer_c]);
         let net = LibP2PNetwork {
             command_tx,
             shared,
@@ -1298,10 +1303,7 @@ mod tests {
         );
         // r4 default floor (8 MB): 6 MB is honored, 8 MB exactly is honored,
         // anything above is clamped to the floor.
-        assert_eq!(
-            effective_push_threshold_at(6_000_000, DIRECT_PUSH_BODY_BYTES),
-            6_000_000
-        );
+        assert_eq!(effective_push_threshold_at(6_000_000, DIRECT_PUSH_BODY_BYTES), 6_000_000);
         assert_eq!(
             effective_push_threshold_at(DIRECT_PUSH_BODY_BYTES, DIRECT_PUSH_BODY_BYTES),
             DIRECT_PUSH_BODY_BYTES

@@ -173,7 +173,8 @@ fn encode_forward_batch(
 /// through the exact decode the Direct request arm runs.
 fn decode_pre_proposal_batch(
     bytes: &[u8],
-) -> Result<Vec<(torus_types::Address, torus_types::SignedNativeAction)>, Box<bincode::ErrorKind>> {
+) -> Result<Vec<(torus_types::Address, torus_types::SignedNativeAction)>, Box<bincode::ErrorKind>>
+{
     bincode::deserialize(bytes)
 }
 
@@ -331,10 +332,7 @@ fn serve_native_da_bodies(store: Option<&NativeDaStore>, hashes: &[[u8; 32]]) ->
         match store.get_raw_batch(chunk) {
             Ok(slots) => bodies.extend(slots.into_iter().map(Option::unwrap_or_default)),
             Err(e) => {
-                warn!(
-                    ?e,
-                    "native-da serve: batch read failed; retrying individual bodies"
-                );
+                warn!(?e, "native-da serve: batch read failed; retrying individual bodies");
                 // An aggregate error must not hide the other healthy bodies.
                 // Retain the original independent per-key error behavior.
                 bodies.extend(chunk.iter().map(|h| match store.get_raw(h) {
@@ -1143,7 +1141,8 @@ pub async fn run_swarm_with_config(
     // v2 subscriber had to inflate any peer's frames — a cluster-wide DoS that
     // `--no-gossip-zstd` could not close (it only stopped local publishing).
     // Per-peer zstd survives on the request_response body paths, not gossip.
-    let native_action_topic = gossipsub::IdentTopic::new(shared.genesis.topic(NATIVE_ACTION_TOPIC));
+    let native_action_topic =
+        gossipsub::IdentTopic::new(shared.genesis.topic(NATIVE_ACTION_TOPIC));
 
     subscribe_gossip_topics(&mut swarm.behaviour_mut().gossipsub, &shared.genesis);
 
@@ -1190,12 +1189,9 @@ pub async fn run_swarm_with_config(
     let (shard_serve_tx, mut shard_serve_rx) = mpsc::unbounded_channel::<DaShardServeDone>();
     let da_serve = DaServePool::new(da_serve_tx, shard_serve_tx);
 
-    let mut poll_trace =
-        crate::swarm_poll_trace::enabled().then(crate::swarm_poll_trace::PollTrace::new);
+    let mut poll_trace = crate::swarm_poll_trace::enabled().then(crate::swarm_poll_trace::PollTrace::new);
     loop {
-        if let Some(trace) = poll_trace.as_mut() {
-            trace.maybe_emit();
-        }
+        if let Some(trace) = poll_trace.as_mut() { trace.maybe_emit(); }
         let action = tokio::select! {
             biased;
 
@@ -1300,9 +1296,7 @@ pub async fn run_swarm_with_config(
         };
 
         if let SwarmAction::Command(command) = &action {
-            if let Some(trace) = poll_trace.as_mut() {
-                trace.command(command.is_none());
-            }
+            if let Some(trace) = poll_trace.as_mut() { trace.command(command.is_none()); }
         }
         match action {
             SwarmAction::Event(event) => {
@@ -1677,9 +1671,7 @@ fn handle_event(
             // Ban gate — validator-set peers exempt (s350 FIX B): /torus/direct
             // carries consensus unicasts; refusing a validator stalls quorum.
             if should_drop_banned_gossip(&mut *peer_scoring, shared, &peer) {
-                if let Some(trace) = receive_trace.as_mut() {
-                    trace.outcome = "banned";
-                }
+                if let Some(trace) = receive_trace.as_mut() { trace.outcome = "banned"; }
                 let _ = swarm
                     .behaviour_mut()
                     .direct
@@ -1693,9 +1685,7 @@ fn handle_event(
                 {
                     Some(vk) => vk,
                     None => {
-                        if let Some(trace) = receive_trace.as_mut() {
-                            trace.outcome = "sender_rejected";
-                        }
+                        if let Some(trace) = receive_trace.as_mut() { trace.outcome = "sender_rejected"; }
                         let _ = swarm
                             .behaviour_mut()
                             .direct
@@ -1893,10 +1883,7 @@ fn handle_event(
         })) => {
             // A refused connection is closed only once our info went out on
             // it, so the peer sees the mismatch too (genesis_id::GenesisGate).
-            swarm
-                .behaviour_mut()
-                .genesis_gate
-                .identify_sent(connection_id);
+            swarm.behaviour_mut().genesis_gate.identify_sent(connection_id);
         }
         SwarmEvent::Behaviour(TorusBehaviourEvent::Identify(identify::Event::Received {
             peer_id,
@@ -2542,11 +2529,7 @@ fn handle_command(
         NetworkCommand::Send { target, message } => {
             send_direct(swarm, shared, local_key, &target, message);
         }
-        NetworkCommand::SendTraced {
-            target,
-            message,
-            mut trace,
-        } => {
+        NetworkCommand::SendTraced { target, message, mut trace } => {
             send_direct_observed(swarm, shared, local_key, &target, message, Some(&mut trace));
             trace.emit();
         }
@@ -3286,13 +3269,9 @@ fn enqueue_inbound_traced(
     // this tee still precedes chain-id/view/QC admission and queue capacity checks.
     // Admission/cache poisoning, pre-verification DA writes, and duplicate
     // validation histogram observations remain flag-ON gates.
-    if let Some(t) = trace.as_deref_mut() {
-        t.tee_begin_us = Some(ReceiveTrace::stamp());
-    }
+    if let Some(t) = trace.as_deref_mut() { t.tee_begin_us = Some(ReceiveTrace::stamp()); }
     tee_proposal_datum(shared, &msg);
-    if let Some(t) = trace.as_deref_mut() {
-        t.tee_end_us = Some(ReceiveTrace::stamp());
-    }
+    if let Some(t) = trace.as_deref_mut() { t.tee_end_us = Some(ReceiveTrace::stamp()); }
     if hotstuff_rs::logging::body_fetch_trace_enabled() {
         if let Some(meta) = body_fetch_trace_metadata(&msg) {
             return enqueue_body_fetch_traced_stages(shared, sender, msg, meta, trace, |record| {
@@ -3305,19 +3284,13 @@ fn enqueue_inbound_traced(
         }
     }
     // Keep the disabled path's allocation, queue and logging behavior unchanged.
-    if let Some(t) = trace.as_deref_mut() {
-        t.lock_begin_us = Some(ReceiveTrace::stamp());
-    }
+    if let Some(t) = trace.as_deref_mut() { t.lock_begin_us = Some(ReceiveTrace::stamp()); }
     let mut queue = shared.inbound.lock().unwrap();
-    if let Some(t) = trace.as_deref_mut() {
-        t.lock_acquired_us = Some(ReceiveTrace::stamp());
-    }
+    if let Some(t) = trace.as_deref_mut() { t.lock_acquired_us = Some(ReceiveTrace::stamp()); }
     let full = queue.len() >= MAX_INBOUND_QUEUE;
     if let Some(t) = trace.as_deref_mut() {
         t.admission_us = Some(ReceiveTrace::stamp());
-        if t.kind.is_some() {
-            t.outcome = if full { "queue_full" } else { "admitted" };
-        }
+        if t.kind.is_some() { t.outcome = if full { "queue_full" } else { "admitted" }; }
     }
     if full {
         warn!("inbound queue full ({MAX_INBOUND_QUEUE}), dropping incoming message");
@@ -3346,12 +3319,8 @@ fn body_fetch_trace_metadata(
     let (kind, view, hash) = match msg {
         ProgressMessage::HotStuffMessage(msg) => match msg {
             HotStuffMessage::ProposalHeader(header) => ("header", header.view, header.block_hash),
-            HotStuffMessage::BlockDataRequest(request) => {
-                ("request", request.view, request.block_hash)
-            }
-            HotStuffMessage::BlockDataResponse(response) => {
-                ("response", response.view, response.block.hash)
-            }
+            HotStuffMessage::BlockDataRequest(request) => ("request", request.view, request.block_hash),
+            HotStuffMessage::BlockDataResponse(response) => ("response", response.view, response.block.hash),
             // s70 proposal->QC split: vote arrivals at the collector.
             HotStuffMessage::PhaseVote(vote) => ("vote", vote.view, vote.block),
             _ => return None,
@@ -3365,11 +3334,7 @@ fn body_fetch_trace_metadata(
         }
         _ => return None,
     };
-    Some(BodyFetchTraceMetadata {
-        kind,
-        view: view.int(),
-        hash: hash.bytes(),
-    })
+    Some(BodyFetchTraceMetadata { kind, view: view.int(), hash: hash.bytes() })
 }
 
 struct BodyFetchAdmissionTrace {
@@ -3391,13 +3356,9 @@ fn enqueue_body_fetch_traced_stages(
     mut trace: Option<&mut ReceiveTrace>,
     emit: impl FnOnce(BodyFetchAdmissionTrace),
 ) -> bool {
-    if let Some(t) = trace.as_deref_mut() {
-        t.lock_begin_us = Some(ReceiveTrace::stamp());
-    }
+    if let Some(t) = trace.as_deref_mut() { t.lock_begin_us = Some(ReceiveTrace::stamp()); }
     let mut queue = shared.inbound.lock().unwrap();
-    if let Some(t) = trace.as_deref_mut() {
-        t.lock_acquired_us = Some(ReceiveTrace::stamp());
-    }
+    if let Some(t) = trace.as_deref_mut() { t.lock_acquired_us = Some(ReceiveTrace::stamp()); }
     let depth_before = queue.len();
     let admitted = depth_before < MAX_INBOUND_QUEUE;
     let stamp = hotstuff_rs::logging::BodyFetchTraceStamp::capture();
@@ -3414,13 +3375,7 @@ fn enqueue_body_fetch_traced_stages(
     if !admitted {
         warn!("inbound queue full ({MAX_INBOUND_QUEUE}), dropping incoming message");
     }
-    emit(BodyFetchAdmissionTrace {
-        stamp,
-        meta,
-        admitted,
-        depth_before,
-        depth_after,
-    });
+    emit(BodyFetchAdmissionTrace { stamp, meta, admitted, depth_before, depth_after });
     admitted
 }
 
@@ -3432,9 +3387,7 @@ fn enqueue_body_fetch_traced_stages(
 fn tee_proposal_datum(shared: &SharedState, msg: &hotstuff_rs::networking::messages::Message) {
     use hotstuff_rs::hotstuff::messages::HotStuffMessage;
     use hotstuff_rs::networking::messages::{Message, ProgressMessage};
-    let Some(tee) = shared.validate_tee.get() else {
-        return;
-    };
+    let Some(tee) = shared.validate_tee.get() else { return };
     let block = match msg {
         Message::ProgressMessage(ProgressMessage::HotStuffMessage(m)) => match m {
             HotStuffMessage::Proposal(p) => &p.block,
@@ -3526,11 +3479,7 @@ fn enqueue_consensus_inbound_traced(
         if let Some(ref m) = shared.metrics {
             m.consensus_dedup_dropped.inc();
         }
-        if let Some(t) = trace.as_deref_mut() {
-            if t.kind.is_some() {
-                t.outcome = "duplicate";
-            }
-        }
+        if let Some(t) = trace.as_deref_mut() { if t.kind.is_some() { t.outcome = "duplicate"; } }
         return ConsensusEnqueue::Duplicate;
     }
     if !enqueue_inbound_traced(shared, sender, msg, trace) {
@@ -3574,14 +3523,10 @@ fn handle_consensus_direct_traced(
     if let Some(t) = trace.as_deref_mut() {
         t.decode_end_us = Some(ReceiveTrace::stamp());
         if let Some(meta) = body_fetch_trace_metadata(&msg) {
-            t.kind = Some(meta.kind);
-            t.hash = Some(meta.hash);
-            t.view = Some(meta.view);
+            t.kind = Some(meta.kind); t.hash = Some(meta.hash); t.view = Some(meta.view);
         }
     }
-    if enqueue_consensus_inbound_traced(shared, sender_vk, msg, payload, trace)
-        == ConsensusEnqueue::Duplicate
-    {
+    if enqueue_consensus_inbound_traced(shared, sender_vk, msg, payload, trace) == ConsensusEnqueue::Duplicate {
         debug!(%peer, "dual-path duplicate consensus message (direct after gossip) — dropped");
     }
     // The delivery itself was valid either way — dual-path duplicates are a
@@ -3975,116 +3920,55 @@ mod tests {
     #[test]
     fn swarm_receive_trace_stages_correlate_local_instances() {
         let shared = test_shared();
-        let sender = test_vk(54);
-        let peer = test_peer(54);
+        let sender = test_vk(54); let peer = test_peer(54);
         let mut scoring = PeerScoring::new(None);
         let message = test_block_data_response_message();
         let bytes = message.try_to_vec().unwrap();
         for id in [101, 102] {
             let mut trace = ReceiveTrace::for_test(id);
-            assert!(handle_consensus_direct_traced(
-                &bytes,
-                sender,
-                &shared,
-                &mut scoring,
-                &peer,
-                Some(&mut trace)
-            ));
+            assert!(handle_consensus_direct_traced(&bytes, sender, &shared, &mut scoring, &peer, Some(&mut trace)));
             assert_eq!(trace.kind, Some("response"));
             assert_eq!(trace.outcome, "admitted");
             assert_eq!(trace.sender, Some(sender.to_bytes()));
             let value = serde_json::to_value(&trace).unwrap();
             assert_eq!(value["id"], id);
-            let stamps: Vec<u128> = [
-                "event_us",
-                "decode_begin_us",
-                "decode_end_us",
-                "tee_begin_us",
-                "tee_end_us",
-                "lock_begin_us",
-                "lock_acquired_us",
-                "admission_us",
-            ]
-            .iter()
-            .map(|name| value[*name].as_u64().unwrap() as u128)
-            .collect();
+            let stamps: Vec<u128> = ["event_us", "decode_begin_us", "decode_end_us", "tee_begin_us", "tee_end_us", "lock_begin_us", "lock_acquired_us", "admission_us"]
+                .iter().map(|name| value[*name].as_u64().unwrap() as u128).collect();
             assert!(stamps.windows(2).all(|pair| pair[0] <= pair[1]));
         }
         let queue = shared.inbound.lock().unwrap();
         assert_eq!(queue.len(), 2);
-        for (_, queued) in queue.iter() {
-            assert_eq!(queued.try_to_vec().unwrap(), bytes);
-        }
+        for (_, queued) in queue.iter() { assert_eq!(queued.try_to_vec().unwrap(), bytes); }
     }
 
     #[test]
     fn swarm_receive_trace_filtered_errors_and_full_queue_preserve_behavior() {
         let shared = test_shared();
-        let sender = test_vk(54);
-        let peer = test_peer(54);
+        let sender = test_vk(54); let peer = test_peer(54);
         let mut scoring = PeerScoring::new(None);
         let mut error = ReceiveTrace::for_test(1);
-        assert!(!handle_consensus_direct_traced(
-            &[],
-            sender,
-            &shared,
-            &mut scoring,
-            &peer,
-            Some(&mut error)
-        ));
+        assert!(!handle_consensus_direct_traced(&[], sender, &shared, &mut scoring, &peer, Some(&mut error)));
         assert_eq!(error.outcome, "decode_error");
-        assert!(error.decode_end_us.is_some());
-        assert!(error.tee_begin_us.is_none());
-        assert!(error.admission_us.is_none());
-        assert!(shared.inbound.lock().unwrap().is_empty());
+        assert!(error.decode_end_us.is_some()); assert!(error.tee_begin_us.is_none());
+        assert!(error.admission_us.is_none()); assert!(shared.inbound.lock().unwrap().is_empty());
         let mut filtered = ReceiveTrace::for_test(2);
-        assert!(handle_consensus_direct_traced(
-            &test_consensus_message().try_to_vec().unwrap(),
-            sender,
-            &shared,
-            &mut scoring,
-            &peer,
-            Some(&mut filtered)
-        ));
-        assert!(filtered.kind.is_none());
-        assert_eq!(filtered.outcome, "filtered");
+        assert!(handle_consensus_direct_traced(&test_consensus_message().try_to_vec().unwrap(), sender, &shared, &mut scoring, &peer, Some(&mut filtered)));
+        assert!(filtered.kind.is_none()); assert_eq!(filtered.outcome, "filtered");
         let message = test_block_data_request_message();
-        shared
-            .inbound
-            .lock()
-            .unwrap()
-            .resize_with(MAX_INBOUND_QUEUE, || (sender, message.clone()));
+        shared.inbound.lock().unwrap().resize_with(MAX_INBOUND_QUEUE, || (sender, message.clone()));
         let mut full = ReceiveTrace::for_test(3);
-        assert!(handle_consensus_direct_traced(
-            &message.try_to_vec().unwrap(),
-            sender,
-            &shared,
-            &mut scoring,
-            &peer,
-            Some(&mut full)
-        ));
-        assert_eq!(full.outcome, "queue_full");
-        assert!(full.admission_us.is_some());
+        assert!(handle_consensus_direct_traced(&message.try_to_vec().unwrap(), sender, &shared, &mut scoring, &peer, Some(&mut full)));
+        assert_eq!(full.outcome, "queue_full"); assert!(full.admission_us.is_some());
         assert_eq!(shared.inbound.lock().unwrap().len(), MAX_INBOUND_QUEUE);
         // Exercise linkage to the existing admission sequence independently of env.
         shared.inbound.lock().unwrap().clear();
         let meta = body_fetch_trace_metadata(&message).unwrap();
-        let mut exact = ReceiveTrace::for_test(4);
-        exact.kind = Some("request");
+        let mut exact = ReceiveTrace::for_test(4); exact.kind = Some("request");
         let mut seq = None;
-        assert!(enqueue_body_fetch_traced_stages(
-            &shared,
-            sender,
-            message,
-            meta,
-            Some(&mut exact),
-            |record| {
-                seq = Some(record.stamp.seq);
-                assert!(shared.inbound.try_lock().is_ok());
-            }
-        ));
-        assert_eq!(exact.admission_seq, seq);
-        assert_eq!(exact.outcome, "admitted");
+        assert!(enqueue_body_fetch_traced_stages(&shared, sender, message, meta, Some(&mut exact), |record| {
+            seq = Some(record.stamp.seq); assert!(shared.inbound.try_lock().is_ok());
+        }));
+        assert_eq!(exact.admission_seq, seq); assert_eq!(exact.outcome, "admitted");
     }
 
     #[test]
@@ -4094,43 +3978,23 @@ mod tests {
         };
         use hotstuff_rs::hotstuff::types::PhaseCertificate;
         use hotstuff_rs::types::block::Block;
-        use hotstuff_rs::types::data_types::{
-            BlockHeight, ChainID, CryptoHash, Data, Datum, ViewNumber,
-        };
+        use hotstuff_rs::types::data_types::{BlockHeight, ChainID, CryptoHash, Data, Datum, ViewNumber};
         let proposal = Proposal {
-            chain_id: ChainID::new(7),
-            view: ViewNumber::new(42),
-            block: Block::new(
-                BlockHeight::new(3),
-                PhaseCertificate::genesis_pc(),
-                CryptoHash::new([2; 32]),
-                Data::new(vec![Datum::new(vec![9, 8, 7])]),
-            ),
-            tc: None,
-            nec: None,
+            chain_id: ChainID::new(7), view: ViewNumber::new(42),
+            block: Block::new(BlockHeight::new(3), PhaseCertificate::genesis_pc(),
+                CryptoHash::new([2; 32]), Data::new(vec![Datum::new(vec![9, 8, 7])])),
+            tc: None, nec: None,
             leader_signature: hotstuff_rs::types::data_types::SignatureBytes::new([0; 64]),
         };
         let hash = proposal.block.hash.bytes();
         let messages = [
-            (
-                "header",
-                HotStuffMessage::ProposalHeader(ProposalHeader::from_proposal(&proposal, false)),
-            ),
-            (
-                "request",
-                HotStuffMessage::BlockDataRequest(BlockDataRequest {
-                    chain_id: proposal.chain_id,
-                    view: proposal.view,
-                    block_hash: proposal.block.hash,
-                }),
-            ),
-            (
-                "response",
-                HotStuffMessage::BlockDataResponse(BlockDataResponse {
-                    view: proposal.view,
-                    block: proposal.block.clone(),
-                }),
-            ),
+            ("header", HotStuffMessage::ProposalHeader(ProposalHeader::from_proposal(&proposal, false))),
+            ("request", HotStuffMessage::BlockDataRequest(BlockDataRequest {
+                chain_id: proposal.chain_id, view: proposal.view, block_hash: proposal.block.hash,
+            })),
+            ("response", HotStuffMessage::BlockDataResponse(BlockDataResponse {
+                view: proposal.view, block: proposal.block.clone(),
+            })),
         ];
         let shared = test_shared();
         for (index, (kind, message)) in messages.into_iter().enumerate() {
@@ -4138,38 +4002,20 @@ mod tests {
             let meta = body_fetch_trace_metadata(&message).unwrap();
             let expected = message.try_to_vec().unwrap();
             let mut emitted = 0;
-            assert!(enqueue_body_fetch_traced_stages(
-                &shared,
-                test_vk(1),
-                message,
-                meta,
-                None,
-                |record| {
-                    // The real production emission boundary must not hold the mutex.
-                    assert!(shared.inbound.try_lock().is_ok());
-                    emitted += 1;
-                    assert_eq!(record.meta.kind, kind);
-                    assert_eq!(record.meta.hash, hash);
-                    assert_eq!(record.meta.view, 42);
-                    assert!(record.admitted);
-                    assert_eq!(record.depth_before, index);
-                    assert_eq!(record.depth_after, index + 1);
-                    assert_eq!(record.stamp.pid, std::process::id());
-                }
-            ));
+            assert!(enqueue_body_fetch_traced_stages(&shared, test_vk(1), message, meta, None, |record| {
+                // The real production emission boundary must not hold the mutex.
+                assert!(shared.inbound.try_lock().is_ok());
+                emitted += 1;
+                assert_eq!(record.meta.kind, kind);
+                assert_eq!(record.meta.hash, hash);
+                assert_eq!(record.meta.view, 42);
+                assert!(record.admitted);
+                assert_eq!(record.depth_before, index);
+                assert_eq!(record.depth_after, index + 1);
+                assert_eq!(record.stamp.pid, std::process::id());
+            }));
             assert_eq!(emitted, 1);
-            assert_eq!(
-                shared
-                    .inbound
-                    .lock()
-                    .unwrap()
-                    .back()
-                    .unwrap()
-                    .1
-                    .try_to_vec()
-                    .unwrap(),
-                expected
-            );
+            assert_eq!(shared.inbound.lock().unwrap().back().unwrap().1.try_to_vec().unwrap(), expected);
         }
         assert!(body_fetch_trace_metadata(&HotStuffMessage::Proposal(proposal).into()).is_none());
     }
@@ -4183,15 +4029,10 @@ mod tests {
         use hotstuff_rs::hotstuff::types::{Phase, PhaseCertificate};
         use hotstuff_rs::pacemaker::messages::PacemakerMessage;
         use hotstuff_rs::types::data_types::{ChainID, CryptoHash, SignatureBytes, ViewNumber};
-        let vote: hotstuff_rs::networking::messages::Message =
-            HotStuffMessage::PhaseVote(PhaseVote {
-                chain_id: ChainID::new(7),
-                view: ViewNumber::new(42),
-                block: CryptoHash::new([2; 32]),
-                phase: Phase::Generic,
-                signature: SignatureBytes::new([0; 64]),
-            })
-            .into();
+        let vote: hotstuff_rs::networking::messages::Message = HotStuffMessage::PhaseVote(PhaseVote {
+            chain_id: ChainID::new(7), view: ViewNumber::new(42), block: CryptoHash::new([2; 32]),
+            phase: Phase::Generic, signature: SignatureBytes::new([0; 64]),
+        }).into();
         let meta = body_fetch_trace_metadata(&vote).expect("vote classified");
         assert_eq!((meta.kind, meta.view, meta.hash), ("vote", 42, [2; 32]));
 
@@ -4201,10 +4042,7 @@ mod tests {
         let advance: hotstuff_rs::networking::messages::Message =
             PacemakerMessage::advance_view(pc.into()).into();
         let meta = body_fetch_trace_metadata(&advance).expect("PC advance view classified");
-        assert_eq!(
-            (meta.kind, meta.view, meta.hash),
-            ("advance_view", 43, [3; 32])
-        );
+        assert_eq!((meta.kind, meta.view, meta.hash), ("advance_view", 43, [3; 32]));
     }
 
     #[test]
@@ -4214,40 +4052,22 @@ mod tests {
         let shared = test_shared();
         let message: hotstuff_rs::networking::messages::Message =
             HotStuffMessage::BlockDataRequest(BlockDataRequest {
-                chain_id: ChainID::new(1),
-                view: ViewNumber::new(9),
-                block_hash: CryptoHash::new([5; 32]),
-            })
-            .into();
+                chain_id: ChainID::new(1), view: ViewNumber::new(9), block_hash: CryptoHash::new([5; 32]),
+            }).into();
         let meta = body_fetch_trace_metadata(&message).unwrap();
         let original_sender = test_vk(1);
-        shared
-            .inbound
-            .lock()
-            .unwrap()
-            .resize_with(MAX_INBOUND_QUEUE, || (original_sender, message.clone()));
+        shared.inbound.lock().unwrap().resize_with(MAX_INBOUND_QUEUE, || (original_sender, message.clone()));
         let expected = message.try_to_vec().unwrap();
         let mut emitted = 0;
-        assert!(!enqueue_body_fetch_traced_stages(
-            &shared,
-            test_vk(2),
-            message,
-            meta,
-            None,
-            |record| {
-                emitted += 1;
-                let queue = shared
-                    .inbound
-                    .try_lock()
-                    .expect("logger runs outside queue lock");
-                assert!(!record.admitted);
-                assert_eq!(record.depth_before, MAX_INBOUND_QUEUE);
-                assert_eq!(record.depth_after, MAX_INBOUND_QUEUE);
-                assert_eq!(queue.len(), MAX_INBOUND_QUEUE);
-                assert!(queue.iter().all(|(sender, msg)| *sender == original_sender
-                    && msg.try_to_vec().unwrap() == expected));
-            }
-        ));
+        assert!(!enqueue_body_fetch_traced_stages(&shared, test_vk(2), message, meta, None, |record| {
+            emitted += 1;
+            let queue = shared.inbound.try_lock().expect("logger runs outside queue lock");
+            assert!(!record.admitted);
+            assert_eq!(record.depth_before, MAX_INBOUND_QUEUE);
+            assert_eq!(record.depth_after, MAX_INBOUND_QUEUE);
+            assert_eq!(queue.len(), MAX_INBOUND_QUEUE);
+            assert!(queue.iter().all(|(sender, msg)| *sender == original_sender && msg.try_to_vec().unwrap() == expected));
+        }));
         assert_eq!(emitted, 1);
     }
 
@@ -4268,10 +4088,7 @@ mod tests {
         let sink = seen.clone();
         assert!(shared
             .validate_tee
-            .set(Arc::new(move |bytes: Vec<u8>| sink
-                .lock()
-                .unwrap()
-                .push(bytes)))
+            .set(Arc::new(move |bytes: Vec<u8>| sink.lock().unwrap().push(bytes)))
             .is_ok());
 
         let datum = vec![7u8, 8, 9];
@@ -4401,10 +4218,7 @@ mod tests {
             .insert(vk.to_bytes(), Instant::now());
         let mut scoring = PeerScoring::new(None);
         let result = verify_sender_key(&vk.to_bytes(), &peer, &shared, &mut scoring, "test");
-        assert!(
-            result.is_none(),
-            "deposed peer's vote is still not accepted"
-        );
+        assert!(result.is_none(), "deposed peer's vote is still not accepted");
         assert_eq!(
             scoring.score(&peer),
             100,
@@ -4448,14 +4262,8 @@ mod tests {
         );
         let m = shared.redial_backoff.lock().unwrap();
         let (next_at, interval) = m.get(&peer).copied().unwrap();
-        assert!(
-            interval >= REDIAL_BACKOFF_MIN,
-            "backoff interval is recorded"
-        );
-        assert!(
-            next_at > Instant::now(),
-            "next dial is scheduled in the future"
-        );
+        assert!(interval >= REDIAL_BACKOFF_MIN, "backoff interval is recorded");
+        assert!(next_at > Instant::now(), "next dial is scheduled in the future");
     }
 
     /// S447 val1 body starvation (RED first): a native-DA fetch to a
@@ -4624,12 +4432,8 @@ mod tests {
         // caller order across the bounded MultiGet chunk boundary.
         let malformed = [0xDE; 32];
         let empty = [0xEF; 32];
-        db.put_cf_raw(
-            torus_state::cf::CF_NATIVE_PENDING,
-            &malformed,
-            b"not-bincode",
-        )
-        .unwrap();
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_PENDING, &malformed, b"not-bincode")
+            .unwrap();
         db.put_cf_raw(torus_state::cf::CF_NATIVE_PENDING, &empty, b"")
             .unwrap();
         let hashes: Vec<_> = [malformed, known, unknown, empty, known]
@@ -4729,11 +4533,7 @@ mod tests {
         let action = SignedNativeAction {
             action: NativeAction::ClaimRewards,
             nonce: 1,
-            signature: ActionSignature::Eip712(Signature {
-                v: 27,
-                r: [0u8; 32],
-                s: [0u8; 32],
-            }),
+            signature: ActionSignature::Eip712(Signature { v: 27, r: [0u8; 32], s: [0u8; 32] }),
         };
         store
             .put_shards_batch(std::slice::from_ref(&action), ErasureParams::new(2, 3))
@@ -4744,9 +4544,7 @@ mod tests {
         assert!(resp.present, "custodied shard must be present");
         assert_eq!(resp.shard_index, 1);
         assert_eq!((resp.k, resp.n), (2, 3));
-        let proof = ShardProof {
-            siblings: resp.proof.iter().map(|h| (*h).into()).collect(),
-        };
+        let proof = ShardProof { siblings: resp.proof.iter().map(|h| (*h).into()).collect() };
         assert!(
             verify_shard(resp.erasure_root.into(), 1, &resp.shard_bytes, &proof),
             "served shard must verify against its shipped root"
@@ -4783,11 +4581,7 @@ mod tests {
         let action = SignedNativeAction {
             action: NativeAction::ClaimRewards,
             nonce: 2,
-            signature: ActionSignature::Eip712(Signature {
-                v: 27,
-                r: [0u8; 32],
-                s: [0u8; 32],
-            }),
+            signature: ActionSignature::Eip712(Signature { v: 27, r: [0u8; 32], s: [0u8; 32] }),
         };
         store
             .put_shards_batch(std::slice::from_ref(&action), ErasureParams::new(2, 3))
@@ -5411,39 +5205,21 @@ mod tests {
             let shared = test_shared();
             let mut swarm = test_swarm();
             if mapped {
-                shared
-                    .peer_map
-                    .write()
-                    .unwrap()
-                    .insert(target, test_peer(71));
+                shared.peer_map.write().unwrap().insert(target, test_peer(71));
             }
             for message in messages() {
                 let expected = message.try_to_vec().unwrap();
                 let mut trace = BodySendTrace::new(target, &message).unwrap();
                 trace.dequeued(0);
                 assert!(matches!(
-                    send_direct_observed(
-                        &mut swarm,
-                        &shared,
-                        &local,
-                        &target,
-                        message,
-                        Some(&mut trace)
-                    ),
+                    send_direct_observed(&mut swarm, &shared, &local, &target, message, Some(&mut trace)),
                     DirectSendOutcome::Buffered
                 ));
                 let buffered = shared.pending_sends.lock().unwrap().flush(&target);
                 assert_eq!(buffered.len(), 1);
                 assert_eq!(buffered[0].try_to_vec().unwrap(), expected);
                 let value = trace.snapshot();
-                assert_eq!(
-                    value["outcome"],
-                    if mapped {
-                        "buffered_disconnected"
-                    } else {
-                        "buffered_unmapped"
-                    }
-                );
+                assert_eq!(value["outcome"], if mapped { "buffered_disconnected" } else { "buffered_unmapped" });
                 assert!(value["encode_begin"].is_null());
                 assert!(value["request_id"].is_null());
                 assert!(shared.outbound_direct.lock().unwrap().is_empty());
@@ -5459,14 +5235,7 @@ mod tests {
             let expected = message.try_to_vec().unwrap();
             let mut trace = BodySendTrace::new(local, &message).unwrap();
             assert!(matches!(
-                send_direct_observed(
-                    &mut swarm,
-                    &shared,
-                    &local,
-                    &local,
-                    message,
-                    Some(&mut trace)
-                ),
+                send_direct_observed(&mut swarm, &shared, &local, &local, message, Some(&mut trace)),
                 DirectSendOutcome::SelfDelivered
             ));
             let (sender, delivered) = shared.inbound.lock().unwrap().pop_front().unwrap();
@@ -5489,46 +5258,21 @@ mod tests {
             trace.dequeued(0);
             // Invoke the exact connected branch with an inert dummy transport.
             // send_request queues libp2p work; no swarm poll/socket is required.
-            assert!(matches!(
-                send_direct_connected(
-                    &mut swarm,
-                    &shared,
-                    &local,
-                    &target,
-                    test_peer(71),
-                    message,
-                    Some(&mut trace),
-                ),
-                DirectSendOutcome::Sent
-            ));
+            assert!(matches!(send_direct_connected(
+                &mut swarm, &shared, &local, &target, test_peer(71), message,
+                Some(&mut trace),
+            ), DirectSendOutcome::Sent));
             let id = trace.request_id.unwrap();
-            let (tracked_target, tracked) =
-                shared.outbound_direct.lock().unwrap().remove(&id).unwrap();
+            let (tracked_target, tracked) = shared.outbound_direct.lock().unwrap().remove(&id).unwrap();
             assert_eq!(tracked_target, target);
             assert_eq!(tracked.try_to_vec().unwrap(), expected);
             assert_eq!(trace.payload_bytes, Some(expected.len()));
             let value = trace.snapshot();
             assert_eq!(value["outcome"], "initiated");
-            let stages = [
-                "pre_enqueue",
-                "dequeue",
-                "encode_begin",
-                "encode_end",
-                "send_begin",
-                "send_end",
-                "tracking_begin",
-                "tracking_end",
-                "finished",
-            ];
+            let stages = ["pre_enqueue", "dequeue", "encode_begin", "encode_end", "send_begin", "send_end", "tracking_begin", "tracking_end", "finished"];
             for pair in stages.windows(2) {
-                assert!(
-                    value[pair[0]]["seq"].as_u64().unwrap()
-                        < value[pair[1]]["seq"].as_u64().unwrap()
-                );
-                assert!(
-                    value[pair[0]]["mono_us"].as_u64().unwrap()
-                        <= value[pair[1]]["mono_us"].as_u64().unwrap()
-                );
+                assert!(value[pair[0]]["seq"].as_u64().unwrap() < value[pair[1]]["seq"].as_u64().unwrap());
+                assert!(value[pair[0]]["mono_us"].as_u64().unwrap() <= value[pair[1]]["mono_us"].as_u64().unwrap());
             }
             assert!(shared.outbound_direct.try_lock().is_ok());
             trace.emit();
@@ -5668,9 +5412,7 @@ mod tests {
                 };
                 let deliver_direct = |scoring: &mut PeerScoring| {
                     assert!(
-                        handle_consensus_direct_traced(
-                            &msg_bytes, sender, &shared, scoring, &peer, None
-                        ),
+                        handle_consensus_direct_traced(&msg_bytes, sender, &shared, scoring, &peer, None),
                         "a hotstuff message must be consumed by the direct branch"
                     );
                 };
@@ -5743,14 +5485,7 @@ mod tests {
             // one-shot message. Only the latter may be suppressed.
             for _ in 0..2 {
                 assert!(
-                    handle_consensus_direct_traced(
-                        &msg_bytes,
-                        sender,
-                        &shared,
-                        &mut scoring,
-                        &peer,
-                        None
-                    ),
+                    handle_consensus_direct_traced(&msg_bytes, sender, &shared, &mut scoring, &peer, None),
                     "{name}: consensus message must be consumed by the direct branch"
                 );
             }
@@ -5953,10 +5688,7 @@ mod tests {
         let pointer = body.as_ptr();
         handle_command(
             NetworkCommand::BroadcastNativeActions { envelope: body },
-            &mut swarm,
-            &shared,
-            &local,
-            &gossipsub::IdentTopic::new(CONSENSUS_TOPIC),
+            &mut swarm, &shared, &local, &gossipsub::IdentTopic::new(CONSENSUS_TOPIC),
         );
         let retained = shared
             .recent_native_bundles
