@@ -3695,21 +3695,23 @@ impl<N: Network> HotStuff<N> {
             if now.duration_since(*last_req) < BODY_RETRY_INTERVAL {
                 continue;
             }
-            if *count >= MAX_BODY_RETRIES_TOTAL {
+            // 9k one-down: live validators first; the last fast asks are
+            // reserved for quiet ones (no slow phase here), the budget
+            // extended so no live validator loses its ask (Codex P2).
+            let peers = block_tree
+                .committed_validator_set()
+                .map(|vs| FetchPeers::split(vs.validators().copied(), &me, origin, &is_live))
+                .unwrap_or_default();
+            let budget = peers.fast_budget(QUIET_JUSTIFY_FETCH_SLOTS);
+            if *count >= budget {
                 log::warn!(
                     "justify fetch exhausted {} retries for {:?} — falling back to sync",
-                    MAX_BODY_RETRIES_TOTAL,
+                    budget,
                     hash
                 );
                 expired.push(*hash);
                 continue;
             }
-            // 9k one-down: live validators first; the last fast asks are
-            // reserved for quiet ones (no slow phase here).
-            let peers = block_tree
-                .committed_validator_set()
-                .map(|vs| FetchPeers::split(vs.validators().copied(), &me, origin, &is_live))
-                .unwrap_or_default();
             let Some(target) = peers.fast_target(*count, origin, QUIET_JUSTIFY_FETCH_SLOTS) else {
                 expired.push(*hash);
                 continue;
@@ -3853,8 +3855,11 @@ pub(crate) const BODY_FETCH_DEADLINE: Duration = Duration::from_secs(4);
 /// timeout, longer than the 4 s fetch budget.
 pub(crate) const PEER_SILENCE_WINDOW: Duration = Duration::from_secs(2);
 /// 9k one-down: the by-hash justify fetch has no slow phase, so its last fast
-/// asks (up to this many) are reserved for quiet validators, one each.
-pub(crate) const QUIET_JUSTIFY_FETCH_SLOTS: u8 = 2;
+/// asks (up to this many) are reserved for quiet validators, one each, after
+/// every live ask ([`FetchPeers::fast_budget`] grows to fit them). Equal to the
+/// rotation length, so every validator the old all-others rotation asked is
+/// still asked (Codex P2 on 5f216e6a); at most 2 + 7 + 7 = 16 asks (1.6 s).
+pub(crate) const QUIET_JUSTIFY_FETCH_SLOTS: u8 = MAX_BODY_RETRIES_TOTAL - MAX_BODY_RETRIES;
 /// 9k one-down: bound on [`HotStuff::note_peer_heard`] entries (senders are
 /// validators; the cap only guards against unexpected senders).
 pub(crate) const PEER_LAST_HEARD_CAP: usize = 4096;
@@ -3993,7 +3998,8 @@ fn peer_recently_heard(
 ///   validators round-robin — or the proposer again if none is live (before
 ///   9k, 10 of the 16 asks of the 4 s budget went to a dead peer in a
 ///   3-validator net and the live proposer got 6); an optional tail of the
-///   fast asks is reserved for the quiet validators, one each;
+///   fast asks is reserved for the quiet validators, one each, the budget
+///   extended so it never displaces a live ask ([`FetchPeers::fast_budget`]);
 /// - slow phase (body fetch only): the odd (non-proposer) asks go to each quiet
 ///   validator once first, then rotate the live validators as before.
 ///
@@ -4016,13 +4022,22 @@ impl FetchPeers {
         Self { live, quiet }
     }
 
-    /// Fast-phase attempt budget (RED stub: the current fixed budget).
-    fn fast_budget(&self, _quiet_tail: u8) -> u8 {
-        MAX_BODY_RETRIES_TOTAL
+    /// Fast-phase attempt budget with `quiet_tail` quiet slots: [`MAX_BODY_RETRIES_TOTAL`], extended
+    /// so the reserved quiet asks never displace a live ask (Codex P2 on 5f216e6a): the live
+    /// validators keep `min(live, rotation)` asks, as many as the old all-others rotation had.
+    /// Equal to [`MAX_BODY_RETRIES_TOTAL`] when nobody is quiet or `quiet_tail` is 0.
+    fn fast_budget(&self, quiet_tail: u8) -> u8 {
+        let rotation = MAX_BODY_RETRIES_TOTAL - MAX_BODY_RETRIES;
+        let live_asks = self.live.len().min(rotation as usize) as u8;
+        MAX_BODY_RETRIES + rotation.max(live_asks + self.reserved_quiet(quiet_tail))
     }
 
-    /// Fast-phase target for attempt `attempt` (0-based, `< MAX_BODY_RETRIES_TOTAL`); the last
-    /// `min(quiet, quiet_tail)` attempts go to the quiet validators. `None` when there is no
+    fn reserved_quiet(&self, quiet_tail: u8) -> u8 {
+        self.quiet.len().min(quiet_tail as usize) as u8
+    }
+
+    /// Fast-phase target for attempt `attempt` (0-based, `< self.fast_budget(quiet_tail)`); the
+    /// last `min(quiet, quiet_tail)` attempts go to the quiet validators. `None` when there is no
     /// validator besides the origin (the old "no remaining targets" give-up).
     fn fast_target(&self, attempt: u8, origin: &VerifyingKey, quiet_tail: u8) -> Option<VerifyingKey> {
         if attempt < MAX_BODY_RETRIES {
@@ -4031,9 +4046,7 @@ impl FetchPeers {
         if self.live.is_empty() && self.quiet.is_empty() {
             return None;
         }
-        let reserved = (self.quiet.len().min(quiet_tail as usize) as u8)
-            .min(MAX_BODY_RETRIES_TOTAL - MAX_BODY_RETRIES);
-        let tail_start = MAX_BODY_RETRIES_TOTAL - reserved;
+        let tail_start = self.fast_budget(quiet_tail) - self.reserved_quiet(quiet_tail);
         if attempt >= tail_start {
             return Some(self.quiet[(attempt - tail_start) as usize % self.quiet.len()]);
         }
