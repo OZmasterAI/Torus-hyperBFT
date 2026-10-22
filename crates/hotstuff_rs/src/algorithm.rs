@@ -351,6 +351,10 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
         } else {
             self.pm_stub.recv(self.chain_id, view_info.view, recv_deadline)
         };
+        if let Ok((origin, _)) = &received {
+            // 9k one-down: body / justify fetch rotation skips silent peers.
+            self.hotstuff.note_peer_heard(origin, Instant::now());
+        }
         match received {
             Ok((origin, msg)) => match msg {
                 ProgressMessage::HotStuffMessage(msg) => {
