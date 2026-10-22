@@ -22,6 +22,7 @@ use torus_types::{
 
 use crate::error::CoreError;
 use torus_state::action_status::FailureReason;
+use torus_state::order_events::{OrderEvent, OrderEventReason, OrderEventStatus};
 use crate::position::{borsh_read_address, borsh_read_fp, borsh_write_address, borsh_write_fp};
 
 mod cancel_batch;
@@ -30,6 +31,8 @@ mod classic_encode;
 #[cfg(test)]
 mod classic_encode_tests;
 mod cloid_key;
+// s139: the order event log (`orderUpdates` stream).
+mod order_events;
 mod trader_orders;
 
 pub use cloid_key::CloidKey;
@@ -44,6 +47,8 @@ mod account_margins_p1_tests;
 mod mark_charge_tests;
 #[cfg(test)]
 mod cloid_tests;
+#[cfg(test)]
+mod order_events_tests;
 
 // perf/cloid-engine-cost fix 4.
 #[cfg(test)]
@@ -1310,6 +1315,16 @@ pub struct OrderBook {
     /// serialized; `None` after a load (the next save writes the row again;
     /// the CF is unhashed, so a repeated put changes nothing).
     saved_bbo: Option<[u8; 32]>,
+
+    // ---- s139: order event log for the `orderUpdates` stream (in-RAM only) ----
+    /// `Some` while the executor wants order events
+    /// ([`Self::set_order_events`]): every public mutation logs what it did
+    /// to each order it touched. Never serialized, hashed, or read by
+    /// matching or saving; `None` (the default) costs one branch per call.
+    order_events: Option<Vec<OrderEvent>>,
+    /// The reason logged for cancels by the public cancel paths
+    /// ([`Self::set_cancel_cause`]; default `User`). Only read for the log.
+    cancel_cause: OrderEventReason,
 }
 
 /// s120 (Codex r2): [`OrderBook::log_mark`]: which in-memory book, and how
@@ -1415,6 +1430,8 @@ impl OrderBook {
             instance: BookInstance::fresh(),
             log_drains: 0,
             saved_bbo: None,
+            order_events: None,
+            cancel_cause: OrderEventReason::User,
         }
     }
 
