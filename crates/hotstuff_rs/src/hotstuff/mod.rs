@@ -207,3 +207,6 @@ mod window_tip_leader_test;
 
 #[cfg(test)]
 mod lock_reflexive_test;
+
+#[cfg(test)]
+mod vsu_sibling_unlock_test;

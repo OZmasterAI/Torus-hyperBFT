@@ -106,6 +106,58 @@ fn sibling_of_the_locked_block_with_its_stale_justify_is_refused() {
     );
 }
 
+/// The locked fixture plus a sibling U' (same parent and justify QC(A), another hash, inserted)
+/// and `highest` as the replica's highest PC.
+fn locked_with_sibling(highest: impl FnOnce(&LockedOnUpdate, CryptoHash) -> PhaseCertificate) -> (LockedOnUpdate, Block) {
+    let mut f = locked_on_update_block();
+    let sibling = Block::new(BlockHeight::new(1), f.qc_a.clone(), CryptoHash::new([12u8; 32]), Data::new(vec![]));
+    let mut updates = ValidatorSetUpdates::new();
+    updates.insert(f.keys[2].verifying_key(), Power::new(2));
+    f.block_tree.insert(&sibling, None, Some(&updates)).expect("insert sibling");
+    let pc = highest(&f, sibling.hash);
+    let mut wb: BlockTreeWriteBatch<MemWb> = BlockTreeWriteBatch::new();
+    wb.set_highest_pc(&pc).expect("set_highest_pc");
+    f.block_tree.write(wb);
+    (f, sibling)
+}
+
+/// Codex P1 on 8af2b949 (the sibling livelock): a sibling U' that a PC NEWER than the lock
+/// certifies (Prepare(U', 4) > Precommit(U, 3), this replica's highest PC) satisfies the lock,
+/// as a block justified by such a PC does (standard HotStuff unlock): that PC exists, so no
+/// block conflicting with U' can have been committed before its view, U included.
+///
+/// RED before the fix: the lock looked at U''s stale justify and the locked block only.
+#[test]
+fn sibling_certified_above_the_lock_by_the_highest_pc_is_safe() {
+    let (f, sibling) = locked_with_sibling(|f, sibling| phase_pc(4, sibling, Phase::Prepare, &f.keys[1..], &f.set));
+    assert!(
+        safe_block(&sibling, &f.block_tree, CHAIN_ID).expect("safe_block"),
+        "a sibling certified above the lock must satisfy it"
+    );
+}
+
+/// A PC on the sibling at the lock's view (only a Byzantine equivocation can form one: one honest
+/// vote per view) does not unlock: the rule is strictly newer than the lock, like `pc_to_lock`.
+#[test]
+fn sibling_certified_at_the_lock_view_is_refused() {
+    let (f, sibling) = locked_with_sibling(|f, sibling| phase_pc(3, sibling, Phase::Prepare, &f.keys[1..], &f.set));
+    assert!(
+        !safe_block(&sibling, &f.block_tree, CHAIN_ID).expect("safe_block"),
+        "a PC on the sibling that is not newer than the lock must not unlock"
+    );
+}
+
+/// A highest PC above the lock on ANOTHER block does not admit the sibling: the PC must certify
+/// the proposed block itself (U' extends U''s certificate, nothing else).
+#[test]
+fn sibling_with_a_newer_pc_on_another_block_is_refused() {
+    let (f, sibling) = locked_with_sibling(|f, _| phase_pc(4, f.u.hash, Phase::Prepare, &f.keys[1..], &f.set));
+    assert!(
+        !safe_block(&sibling, &f.block_tree, CHAIN_ID).expect("safe_block"),
+        "a newer PC on U does not make U' safe"
+    );
+}
+
 /// A descendant of the locked block (justified by a PC on U, at a view not above the lock) is
 /// safe through the "extends" arm, unchanged by the fix.
 #[test]
