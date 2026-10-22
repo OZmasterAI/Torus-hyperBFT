@@ -357,8 +357,9 @@ only local devnets exist.
   Bracha-echo timeouts (a replica counted in TC(w) may still vote in w). Old rule: a stall needing
   no Byzantine tip (a fresh sibling of view 3 outranks QC(U, 2)); each half of the fix alone
   stalls; the fix commits in every honest synchronous suffix, and with the Byzantine timeout vote
-  in every TC next to the replica with the highest lock (prefixes of up to 12 events). Agreement
-  holds in all modes.
+  in every TC next to the replica with the highest lock (prefixes of up to 13 events, 12 for the
+  active-Byzantine check, release build; the default test run uses 11 and 10). Agreement holds in all
+  modes.
 - **Residual (not fixed).** An active Byzantine validator whose timeout vote is in every TC together
   with the two honest replicas that do NOT hold the highest lock, reporting a low QC, keeps its tip
   of V compatible with the TC's high QC: leaders re-propose V, the replica locked on U refuses, the
