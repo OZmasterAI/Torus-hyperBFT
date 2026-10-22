@@ -2911,7 +2911,10 @@ impl<N: Network> HotStuff<N> {
     /// The validator-set state is the one after `justify`: a Decide PC on an updating block this
     /// replica has not committed yet (the first block after an update; a header-path replica only
     /// commits on body arrival) names the proposer under the set that update brings in, as every
-    /// replica that has committed it does.
+    /// replica that has committed it does. That rebuilt state has no update view: the proposal's
+    /// view is above `justify.view`, which is at least the update view, so the committed set's
+    /// leader is the fresh proposer either way (`fresh_proposer_set`). A future update kind that
+    /// changes leaders (dead-leader exclusion) flows through the same `apply_updates`.
     fn is_fresh_proposer<K: KVStore>(
         proposer: &VerifyingKey,
         view: ViewNumber,

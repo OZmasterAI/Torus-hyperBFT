@@ -200,9 +200,10 @@ view's.
   proposer) is dropped before equivocation detection, so a forged header cannot frame a leader; a full proposal must
   also be for the current view. `ProposalResponse` carries the block only (the recovering leader re-signs).
 - **F2.** `TipInfo::is_correct`: `Block::hash` recompute, then the signature of the view's one fresh proposer
-  (`fresh_proposer`, §4 "Validator-set update window"): leader(view) of the previous set while an update is undecided
-  and `view <= update_view`, else of the committed set. (First built as "committed or previous set", which let one
-  view have two valid tips; review fix s134.)
+  (`fresh_proposer`, §4 "Validator-set update window"): leader(view) of the previous set if `view <= update_view`,
+  else of the committed set, decided or not. (First built as "committed or previous set", which let one view have two
+  valid tips; review fix s134. The s134 rule also switched to the committed set once the update was decided; s136
+  dropped that, see §4.)
 - **F3.** `summaries_are_signed`: the high tip is a signed `(hash, view)` at the highest signed tip view, and no
   signed tip is newer than the TC's view. `is_correct` runs F2 on the high tip. `voter_metadata` must cover every
   validator position (the unsigned-base fallback is gone).
@@ -250,16 +251,36 @@ only local devnets exist.
   re-proposal fails, an NEC then lets a fresh block drop B, and no rollback fires (equivocation is keyed by
   (view, leader)). Committed blocks stay safe (the lock).
   - *Rule: one fresh proposer per view* (`ValidatorSetState::fresh_proposer_set`, `pacemaker::types::fresh_proposer`).
-    Undecided: the PVS leader for `v <= update_view`, the CVS leader for `v > update_view`; decided: the CVS leader.
-    `update_view` (block-tree variable 24) is recorded when the updating block U is committed: the view of the Commit
-    or Decide PC on U the commit rests on (a commit through a descendant uses U's child's justify, U's Decide PC).
-    Honest fresh proposals before it were made under the PVS; between U's Commit PC and Decide PC honest leaders only
-    nudge; every block after U justifies on U's Decide PC or later.
-  - Applied in three places: F2 (one signature check now); a vote that sets the voter's tip (fresh Generic proposal,
-    NEC proposals included, both paths) only for that proposer, judged under the state after the justify (a Decide PC
-    on an update this replica has not committed yet is read as if committed); a leader proposes a fresh block (or an
-    NEC block) only if it is that proposer. Nudges, VSU re-proposals and TC re-proposals (which copy the TC's high
-    tip) keep the two-leader rule.
+    The PVS leader for `v <= update_view`, the CVS leader for `v > update_view` (or with no `update_view`: no update
+    committed yet). Whether the update is decided does not matter (owner s136). `update_view` (block-tree variable
+    24) is recorded when the updating block U is committed: the view of the Commit or Decide PC on U the commit rests
+    on (a commit through a descendant uses U's child's justify, U's Decide PC). Honest fresh proposals before it were
+    made under the PVS; between U's Commit PC and Decide PC honest leaders only nudge; every block after U justifies
+    on U's Decide PC or later.
+  - *Why decided-ness dropped out (s136, [claude-review] P3).* The s134 rule switched every view to the CVS leader
+    once the update was decided. VSU proposals and nudges set no tip, so every honest tip in the window is a
+    pre-update one, signed by the PVS leader at a view `<= update_view`. A replica that had applied the Decide PC
+    judged it against the CVS leader: it dropped undecided replicas' timeout votes, rejected every TC whose high tip
+    was such a tip (also as the losing tip of a case-3 TC) and every proposal carrying one. A case-3 leader became
+    decided by applying the TC's high QC (the Decide PC) and then rejected its own header. Cost: about 1-3 lost views
+    per update, more once dead-leader exclusion makes updates frequent. The rule now depends only on the view and
+    the committed `update_view`, so it is still exactly one leader per view, and replicas that differ only in
+    whether they saw the Decide PC agree on it.
+  - *When the PVS is dropped.* The rule reads the PVS for views `<= update_view` after the decision too. Nothing
+    changes in storage: the decision only sets `VALIDATOR_SET_UPDATE_DECIDED`; `PREVIOUS_VALIDATOR_SET` and
+    `update_view` stay until the next updating block U' is committed, which overwrites the committed set, the
+    previous set (with the old committed set), `update_view` and the decided flag in one write batch. From then on
+    a tip at a view `<=` the old `update_view` is judged against U''s previous set (the old CVS) and fails unless
+    that leader matches: open question 4 (drop, not archive). Such a tip can no longer matter: an honest replica
+    holding one omits it from its timeout votes (`own_timeout_summaries`), and the TC argument above needs only the
+    tips of blocks still uncertified, which are newer than U''s commit.
+  - Applied everywhere `fresh_proposer` is used: F2 (one signature check; the pacemaker's timeout-vote check F4 and
+    `TimeoutCertificate::is_correct`); a vote that sets the voter's tip (fresh Generic proposal, NEC proposals
+    included, both paths) only for that proposer, judged under the state after the justify (a Decide PC on an update
+    this replica has not committed yet is read as if committed; that rebuilt state has no `update_view`, which is
+    right because the proposal's view exceeds the justify's, which is at least `update_view`); a leader proposes a
+    fresh block (or an NEC block) only if it is that proposer; the timeout blame. Nudges, VSU re-proposals and TC
+    re-proposals (which copy the TC's high tip) keep the two-leader `is_proposer` rule.
   - Options rejected: "PVS only while undecided" alone still has two leaders per view in the window. Ranking tied tips
     by signer count fails (X can have up to 2f reporters, B only f+1). Treating both leaders' proposals in one view as
     equivocation would make the undo detectable but TC(v) could still drop B. A single leader per view keeps the
@@ -325,6 +346,14 @@ TC(v) resolving to B, fresh votes only for the view's fresh proposer incl. a Dec
 view), two window cases in `prev_view_collector_test.rs` (F4 drops the vote reporting X; timeout blame), the
 reputation-mode refusal, and `torus-consensus` slashing: a real phase-vote signature verifies through
 `build_vote_message`, which now builds hotstuff_rs's tagged phase-vote bytes.
+
+The s136 window rule (decided-ness dropped) adds, RED on c300a015: in `window_tip_leader_test.rs` F2 per view the same
+decided or not (and the committed set without an update view), a TC naming a pre-update tip correct and its
+re-proposal voted on both paths by decided and undecided replicas, a case-3 leader decided by the TC's high QC (the
+Decide PC) voting for its own header; in `prev_view_collector_test.rs` a decided replica collecting timeout votes
+with a pre-update tip and blaming the view's fresh proposer; in `tests/tc_required_byzantine_test.rs`
+`validator_set_update_window_timeout_loses_no_further_view` (4 validators, power update, the first fresh proposal
+after the update and one validator's timeout votes lost: view w+1 must still get a QC).
 
 **Mutation checks** (each must fail at least one test): revert V1 to `Ok(true)`; drop V3; unsign `tip.view`; skip
 the F2 hash recompute; skip the leader-signature check; drop the domain tag; drop `prev_collector` (expect the

@@ -81,10 +81,10 @@ impl TipInfo {
     /// - `leader_signature` is the signature of the view's one fresh proposer
     ///   ([`fresh_proposer`]) over `(chain_id, view, block_hash)`
     ///   ([`proposal_header_bytes`](crate::types::signing::proposal_header_bytes)): leader(`view`) of
-    ///   the previous set while an update is undecided and `view` is at most the update view, else of
-    ///   the committed set. One leader per view, so a view has at most one valid tip unless that
-    ///   leader equivocated (docs/plans/tc-required-and-tip-signing.md §4). A tip signed under an
-    ///   older set fails (open question 4: drop, not archive).
+    ///   the previous set if `view` is at most the update view, else of the committed set, whether
+    ///   or not the update is decided. One leader per view, so a view has at most one valid tip
+    ///   unless that leader equivocated (docs/plans/tc-required-and-tip-signing.md §4). A tip signed
+    ///   under a set older than the previous one fails (open question 4: drop, not archive).
     ///
     /// Costs one hash and one signature check.
     pub fn is_correct<K: KVStore>(
