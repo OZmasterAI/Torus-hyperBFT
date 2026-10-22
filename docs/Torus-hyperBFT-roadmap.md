@@ -1,7 +1,7 @@
 # Torus-hyperBFT — Performance, Correctness & Product Roadmap to Hyperliquid Parity
 
 **Author:** architecture review synthesis
-**Status:** the July text was a proposal for sequencing, not accepted at the time. **s131 (2026-10-20):** every item carries a dated **Status s131** line from a status audit against main `be87c86e` (owner-approved); see "Status summary (s131)" below. **s134 (2026-10-21):** lines that later merges contradicted are updated in place against main `42c408e4` and marked s134. The original reasoning is kept; text that later work overtook is marked "(July text, superseded)".
+**Status:** the July text was a proposal for sequencing, not accepted at the time. **s131 (2026-10-20):** every item carries a dated **Status s131** line from a status audit against main `be87c86e` (owner-approved); see "Status summary (s131)" below (s136: now "Status summary (s136)"). **s134 (2026-10-21):** lines that later merges contradicted are updated in place against main `42c408e4` and marked s134. **s136 (2026-10-22):** the status summary is rewritten against main `9ea22dbd`, stale lines are updated in place and marked s136, and two items are new (T1.7 dead-leader skip; the trial net as a pre-testnet milestone). The open testnet genesis questions are listed in `plans/testnet-genesis-checklist.md`. The original reasoning is kept; text that later work overtook is marked "(July text, superseded)".
 **Companion docs:** `Torus-hyperBFT-review.md` (full architecture + critical findings) · `reports/hl-parity-2026-10-01/` (product-parity sprint: 220-agent gap analysis behind the Product-parity track)
 
 ---
@@ -25,24 +25,27 @@ This is a single-file roadmap **plus** the detailed work packages ("PRPs" — Pr
 
 ---
 
-## Status summary (s131, 2026-10-20; audited against main `be87c86e`)
+## Status summary (s136, 2026-10-22; against main `9ea22dbd`)
 
-Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 journaling all landed between June and October (SHAs in each item). T1.2 was answered: the grandparent lock was **unsafe** for the 2-chain commit and was changed to lock-on-parent. Still open: T0.2 (co-location), T3.1 beyond recovery Phase A, Block-STM (T4.4, deferred by design), Tier 5 (T5.3's fix merged s134, `dfb55f70`), and most of the product-parity track (P2-P5).
+Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 journaling all landed between June and October (SHAs in each item). T1.2 was answered: the grandparent lock was **unsafe** for the 2-chain commit and was changed to lock-on-parent. Still open: T0.2 (co-location), T3.1 beyond recovery Phase A, Block-STM (T4.4, deferred by design), T1.7 (dead-leader skip, new s136), Tier 5 (T5.3's fix merged s134, `dfb55f70`), and most of the product-parity track (P2-P5). No testnet exists yet; every run so far is a local devnet or a one-host bench.
 
-**Open before the testnet** (one line each, with where it is tracked):
-- **Validator count (T1.4 vs trial testnet):** T1.4 set f=1 (4 validators) as the minimum, but the planned trial testnet runs 3 validators (f=0). Owner s131: deferred to one of the last pre-trial decisions; it blocks nothing (4-validator support exists since July). Tracked in T1.4 and in "Trial testnet" under Pre-testnet decisions.
+**On main since s134** (s136): batch 6, a settled delisted market keeps its close price (`52a95d86`); batch 7, the fail-stop delivered-height fix (`6eabad95`); batch 8, P0.0 activation-height gating phases 1-6 (`40705baf`); the attest hole-wait harness fix (`482803ad`); bench oracle signers, one `SetOracleSigner` key per bench validator (`c3808eac`); the kill-knob procstat fix and perf doc section 124 (`af53295c`); builder rule 12 (`02c01433`); the bench harness digest fix, the digest waits for a durable post-drain checkpoint (`9ea22dbd`, found by the 9k one-validator-down baseline smoke). Earlier in s134: RH4 prune-by-default, the TC validation fixes, delist option C + decisions + the EIP-712 fix, aliased rows reject-on-load, the book-mode genesis field, the delist RPC follow-ups, disk tools, the attest harness, the kill knob, sections 120-123.
+
+**Open before the testnet** (one line each, with where it is tracked; the full genesis list is `plans/testnet-genesis-checklist.md`):
+- **Validator count (T1.4 vs trial net):** T1.4 set f=1 (4 validators) as the minimum, but the planned trial net runs 3 validators (f=0). Owner s131: deferred to one of the last pre-trial decisions; it blocks nothing (4-validator support exists since July). Tracked in T1.4 and in "Trial net" under Pre-testnet decisions.
 - **Unknown market ids in the executor (P0):** **DONE (s134)**, rejected in consensus (`UnknownMarket`, code 16), merged with `fix/pretestnet-p0-p1` in `de70325d`.
-- **Block timestamp lower bound (P0, review M2):** removed from the testnet genesis (owner s131), so not in the `de70325d` merge; a pre-mainnet item, work kept on `wip/m2-timestamp-lower-bound`. Tracked in P0.
-- **Governance Delist / UpdateMarketParams executor effect (P1):** **DONE (s134)**, merged in `de70325d`; delist settlement option C (`21f385c6`) and the owner s134 delist decisions (`9f02839a`) are on main too. Still open: RPC does not show the grace / settlement state. Tracked in P1.
-- **P0.0 activation-height gating:** in progress (s134): phases 1-4 built on `feat/p00-activation-gating` and `feat/p00-phase2` .. `feat/p00-phase4` (phase 5 work on `feat/p00-phase5`), not on main; main still has only `state_hash_activation_height`. Tracked in P0.0.
+- **Block timestamp lower bound (P0, review M2):** removed from the testnet genesis (owner s131), so not in the `de70325d` merge; a pre-mainnet item, work kept on `wip/m2-timestamp-lower-bound`. **s136:** one later list named it "fix before genesis"; owner to confirm which holds. Tracked in P0.
+- **Governance Delist / UpdateMarketParams executor effect (P1):** **DONE (s134)**, merged in `de70325d`; delist settlement option C (`21f385c6`), the owner s134 delist decisions (`9f02839a`) and the RPC grace / settlement state (`ed1d6426`) are on main. **s136:** a settled market keeps its close price in state (`52a95d86`). Tracked in P1.
+- **P0.0 activation-height gating:** **DONE for the testnet (s136):** phases 1-6 on main in `40705baf` (built-in schedule per chain id, genesis `consensus.activations`, header feature bits, genesis digest, integration tests, ops). Phase 7, governance `ScheduleActivation`, is a pre-mainnet item. Tracked in P0.0.
 - **Liquidator-vault deficit (P5):** monitoring is done. Owner s131 (as decided s99): for the testnet, seed the liquidator vault with capital in the genesis, with ADL as the backstop once the vault runs dry; an HLP-style deposit vault before mainnet. Still open: the seed amount. Tracked in P5.
 - **Aliased opaque position rows in the parallel settle:** answered s132 (they cannot exist on a fresh genesis); reject-on-load fix **merged (s134)** in `b57b3fd4`. Tracked in Pre-testnet decisions.
 - **EVM proposer concentration (Q12):** decided s131: keep N = 11 for the testnet (coprime to 3 / 4 validators); revisit before mainnet. Tracked in Pre-testnet decisions.
-- **Retention default (prune by default or not):** decided s131: prune by default, N = 100,000 blocks, archive nodes opt out with `--archive` (RH4 GC worker + compaction filter, perf doc sections 103 and 112; prune-by-default on main since `b452b4af`, s134; the 9i 100k retention disk soak on `b452b4af` passed, section 121). Still open: which testnet node runs as the archive node; revisit N if the trial testnet's catch-up or disk numbers say so. Tracked in Pre-testnet decisions.
-- **Book storage mode for the genesis (Classic vs mode 3):** bench 8p / 8s and owner decision. The mode is a genesis field on main (`1646d99e`, s134; built s131 on `feat/book-mode-genesis`): `consensus.book_mode`, absent = Classic, `"level_authority_chunked"` = mode 3; the node refuses a disagreeing `TORUS_BOOK_ROWS` or DB marker. What is left is the value (the Classic vs mode 3 head-to-head is pending). Tracked in Pre-testnet decisions and `docs/perf/bench-queue.md`.
-- **Running state hash in the genesis:** whether the testnet genesis sets `consensus.state_hash_activation_height` (absent = running hash off; `docs/plans/running-state-hash-impl.md`). Owner decision before the genesis. **s134:** owner leaning ON, together with L6.1 (window-committed books, genesis `consensus.book_window_commit`, branch `perf/l61-window-books`, not on main); decided after the 9j head-to-head. L6.1's h_n value-for-value check passed (section 122, `f8956086`).
-- **TC validation (hotstuff):** the validation gap is fixed on main (`1b751f6c`, s134: proposal certificate checks on the header-first and full paths, TC summaries bound to what the signers signed, NEC checked against the committed set). TC required (option B, owner s134) and TipInfo signing: design `docs/plans/tc-required-and-tip-signing.md` (`e54a5f43`), phases A-D in progress on `feat/tc-required-phase-*`, not on main. Pre-genesis.
-- **WAN measurements:** PE on WAN, push-manifest threshold, header re-send and the T2.5 cap of 400 were all measured on one host only. The trial testnet doubles as the WAN test. Tracked in Pre-testnet decisions.
+- **Retention default (prune by default or not):** decided s131: prune by default, N = 100,000 blocks, archive nodes opt out with `--archive` (RH4 GC worker + compaction filter, perf doc sections 103 and 112; prune-by-default on main since `b452b4af`, s134; the 9i 100k retention disk soak on `b452b4af` passed, section 121). Which node runs as the archive node is decided at the trial net (owner s134); revisit N if the trial net's catch-up or disk numbers say so. Tracked in Pre-testnet decisions.
+- **Book storage mode for the genesis:** **decided s136: Classic.** 9j stage 2 (perf doc section 124): Classic CL21 beats mode 3 M15 on both shapes (M15 / CL21 matched/s 0.963 deep / 0.952 standard, blocks/s 0.714 / 0.747, so Classic runs ~40% more deep blocks/s). The genesis leaves `consensus.book_mode` absent (Classic). b1, mode 3 and b0 are **parked, not dropped**. Tracked in Pre-testnet decisions.
+- **Running state hash in the genesis:** **decided s136: ON at genesis,** with checkpoints every 15 s. L6.1 (window-committed books) and L2.1 (streamed settle) are being merged in batch 10 (`merge/s136-batch10`, in progress): there a genesis that names no activation runs the running hash and, Classic only, L6.1 from block 1. On main the genesis key `consensus.book_window_commit` is not read by any code yet. Tracked in Pre-testnet decisions.
+- **TC required + tip signing (hotstuff):** the validation gap is fixed on main (`1b751f6c`, s134). TC required (option B, owner s134) and tip signing: design `docs/plans/tc-required-and-tip-signing.md` (`e54a5f43`). **s136:** phases A-C built; batch 9 (`merge/s134-batch9` `56923063`, phases A+B+C plus `CONSENSUS_DB_FORMAT` v1, which refuses old data dirs at start) **failed its final gate**: a liveness stall under CPU load in `p00_cluster_tests` (QCs stop; lost previous-view timeout votes suspected). Fix builder on `fix/tc-liveness`. Owner accepted the one-fresh-proposer-per-view rule for the validator-set update window. Phase D (one-down bench) comes after. Pre-genesis.
+- **Dead-leader skip (T1.7, new s136):** b1, leader exclusion through the epoch plan. Phase 1 done, phase 2 in review fixes, phases 3-4 left. Stacked on TC phase B. Tracked in T1.7.
+- **WAN measurements:** PE on WAN, push-manifest threshold, header re-send and the T2.5 cap of 400 were all measured on one host only. **Owner s136:** these, the network ideas L4.1-L4.4 (`docs/perf/8k-explore-ideas.md`) and the T3.1 follow-ups wait for the trial net, which doubles as the WAN test. Tracked in Pre-testnet decisions ("Trial net").
 
 ---
 
@@ -138,6 +141,14 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
 - **Acceptance:** Kill a pruning node mid-block; on restart it replays the gap correctly (today it doesn't).
 - **Effort:** small. **Risk:** low. **Impact:** correctness under the default archive-off config.
 
+### T1.7 — Dead-leader skip: stop giving leader slots to a dead validator [LOCKSTEP] *(added s136)*
+- **Status s136: IN PROGRESS, not on main.** Design `docs/plans/dead-leader-skip.md` (main `d8156eca`; owner s134 decisions in its section 7a: b1 chosen, W = L, genesis parameters, a2 a possible later upgrade, jailing separate). Phase 1 (hotstuff_rs set and update encoding, `select_leader` filter, leader hints) done and Codex clean (`feat/dead-leader-p1` `dc174a0f`). Phase 2 (execution: miss attribution, exclusion, re-admission) built (`feat/dead-leader-p2` `48e44257`); its [claude-review] P1 (the leader evidence row is lost on power loss, which leads to a permanent fail-stop; also a T5.3 commit-hook slowdown) is being fixed. Phases 3 (multi-node and mutation tests) and 4 (bench) left. Stacked on TC-required phase B (see the status summary), so it lands after the TC set.
+- **Problem:** with a validator down, nobody proposes in the views it leads; each replica waits out its deadline (~1.8 s on average against ~61 ms live views), so with 4 equal stakes and one down the design derives ~1.5 blk/s, -87% to -93% (design section 1, derived, not measured). Nothing removes a dead leader from the rotation (`DowntimeTracker` has no caller; B3 reputation is off and would not skip it).
+- **Plan (b1):** execution counts missed leader slots from committed blocks; a validator with K missed slots in a row is excluded from leading at the next epoch plan (voting power and quorums unchanged) and re-admitted once a committed QC carries its signature and it has been out for at least L·2^j heights. Genesis parameters `consensus.leader_miss_threshold` K (default 3; 0 = off, else 2-64) and `consensus.leader_exclusion_cap` j (default 6, range 0-10), range-checked at genesis load.
+- **Later options:** (a2) a ~250 ms short timeout for a leader that missed its last slot (local timers, no format change), decided after the one-down bench. Jailing (removing voting power) is a separate design, before testnet or as a testnet upgrade (open).
+- **Acceptance:** determinism tests (same exclusions on every node, replay included); multi-node one-down tests; a one-down bench before / after (phase 4; the "before" is the 9k one-validator-down baseline; its harness digest fix merged s136 in `9ea22dbd`; owner s136 paused new benches).
+- **Effort:** 6.5-8 days in total (design section 6). **Risk:** medium (consensus-visible, genesis-bound encodings).
+
 ---
 
 ## Tier 2 — Orders/s: raise the ceiling toward 20k orders/block
@@ -224,7 +235,7 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
 - **Effort:** medium. **Risk:** low (behind the existing determinism oracle). **Impact:** removes ~2/3 of state-root cost per block.
 
 ### T4.2 — Incremental native state root (A2 / "O6") [LOCKSTEP]
-- **Status s131: DONE** in June, before this roadmap was written: native bucketed-Merkle trie with a full-scan oracle (`cd803ede`) and the incremental root on by default (`64c46193`). A running state hash was added later (`docs/plans/running-state-hash-impl.md`, activated per genesis by `consensus.state_hash_activation_height`).
+- **Status s131: DONE** in June, before this roadmap was written: native bucketed-Merkle trie with a full-scan oracle (`cd803ede`) and the incremental root on by default (`64c46193`). A running state hash was added later (`docs/plans/running-state-hash-impl.md`, activated per genesis by `consensus.state_hash_activation_height`). **s136:** decided ON at the testnet genesis (owner s136); since P0.0 (`40705baf`) the field is the alias of `consensus.activations.running_state_hash`.
 - **Problem (July text, superseded):** The EVM half (A1) is done and **proven flat (3.19ms @1M accounts vs 6.98s full-scan)**. The native half is still a full keccak over 6 CFs, ~200ms/block at 1M native entries (×2/block) — "the last unbounded-growth term on the hot path."
 - **Plan:** Ship the designed bucketed-Merkle native root (65,536 buckets, 16-bit prefix, keccak-ordered mirror CF) with the same determinism doctrine as A1: full-scan oracle in CI, delete-to-default discipline, crash/reopen survival, `four_node_consensus` green with the oracle on.
 - **Acceptance:** Native root time flat vs state size (target ~1–6ms); zero oracle divergence over ≥10k blocks; genesis/migration plan for the flat→bucketed transition (it's a binary-format change ⇒ coordinated relaunch).
@@ -249,6 +260,8 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
 ## Tier 5 — Latency: block cadence and tail *(after item 6 and item 7; added s121)*
 
 > **Status s131:** item 7 steps 1-2 merged (s123, s127); step 3 option 0, the EVM fast path, merged s131 and on by default (`TORUS_EVM_FAST_PATH`, perf doc section 107: EVM blocks no longer barrier the exec pipeline). T, HL order and C0 not built.
+>
+> **Status s136, item 7 follow-ups** (`plans/item7-step3-design.md`, `perf/bench-queue.md`): **option S** (raise the EVM cadence N, bench Q12): r1 ran (section 85), then superseded s128 by Q11, no r2 / r3, N stays 11 (bench queue item 7). **C0** (EVM on its own thread): parked (owner s127, question 6 a; trigger: EVM above ~3% of exec time). **Next EVM-lanes phase, T** (same-block EVM -> native for non-order kinds, step 3 plan P3): owner s127 placed it after option 0 and before the testnet genesis (question 3 a); not built, no builder or date found, so its place in the current pre-testnet order is status unknown. RPC freshness option (b) "before testnet if wallets need fresher receipts" (question 4): status unknown.
 >
 > **Order (owner s121):** item 7 steps 1-2 (EVM lanes, `plans/item7-evm-lanes.md`; overdue, see there) -> item 6 Phase 5 build steps (after archy's step 0 re-profile) -> Tier 5. Tier 5 comes after item 7 because item 7 changes the block cadence itself (EVM only every Nth block, then HL-style small and big blocks). The measurement-only first steps of T5.1 and T5.2 need no code and can run on archy's rig whenever it is free.
 >
@@ -295,7 +308,7 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
 > **Interaction with the perf tiers:** P0 runs in parallel with Tier 1 and is a hard gate before any public trading. P1–P2 add per-block work (oracle aggregation, liquidation sweep, funding, fee debits), so **T0.3's harness must gain a trading-semantics mix** (stops, modifies, liquidations, multi-market) before Tier 4 numbers are trusted. Today's benches send only GTC limits, which is why the P0 bugs went unseen.
 
 ### P0.0 — Activation-height gating for state-transition changes [LOCKSTEP]
-- **Status s134: IN PROGRESS, not on main.** Phases 1-4 built on `feat/p00-activation-gating`, `feat/p00-phase2` .. `feat/p00-phase4` (phase 5 work on `feat/p00-phase5`); plan `docs/plans/p00-activation-height-gating.md`. **Status s131 (still true on main): OPEN.** No general activation gating exists; the only height-activated feature is the running state hash (`consensus.state_hash_activation_height`). The P0 / P1 fixes so far shipped as fresh-genesis changes.
+- **Status s136: DONE for the testnet (phases 1-6 on main, `40705baf`, batch 8; cachyoz final nextest 4541/4541, cargo test 4542/0).** Feature registry and genesis `consensus.activations` (`state_hash_activation_height` is the alias of `running_state_hash`), a built-in schedule per chain id (empty until the testnet chain id exists), feature bits in the block header, old binaries stop with UPGRADE REQUIRED past a height they do not know, a genesis-file digest stored at first boot (a changed genesis file refuses to start), integration tests and ops (gauges, RPC schedule listing, runbook). Plan `docs/plans/p00-activation-height-gating.md`. **Phase 7, governance `ScheduleActivation`, is pre-mainnet** (owner s131). Was (s134): in progress on `feat/p00-*`, not on main. Was (s131): OPEN; the P0 / P1 fixes so far shipped as fresh-genesis changes.
 - **Problem:** No protocol-upgrade mechanism exists: no app/protocol version, no feature activation by height, no hl-visor equivalent. Every P item changes execution results, so today each one would need a flag day plus a coordinated restart.
 - **Plan:** Add `ChainConfig.activations: BTreeMap<Feature, u64>` and an `is_active(feature, height)` helper read by the executor. Ship binaries ahead of the height and flip behaviour at the height. Add an `app_version` field to the block header (or derive it from activations) so mixed-version validators fail loudly instead of forking silently.
 - **Acceptance:** A test chain runs old behaviour below height H and new behaviour at H and above, with identical state roots across nodes. A validator missing a scheduled feature halts with a clear error at H.
@@ -326,7 +339,7 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
   | EVM gas fees credited twice | DONE (s94 batch) | `71e0f1b`: tip to the proposer via revm, the fee distributor gets the base-fee part only. Was: no fix commit; `compute_fee_revenue` and `distribute_fees` unchanged |
   | Inflation pays self-stake share to delegators | DONE (s94 batch) | `cbb97b6`: self-stake gets its pro-rata share, commission only on the delegators' share. Was: no fix commit in `torus-economics` |
   | CoreWriter fake order id, stop types as limits | DONE (s94 batch) | `ebec041`: `placeOrder` returns bytes32(0) (fire and forget, like HL), stop types revert. Was: `placeOrder` still returns a synthetic id (block and queue sequence); `decode_order_type` maps 2 and 3 to Limit |
-  | Read precompiles flat gas | DONE (s94 batch) | `6f8c507`: 2,600 + 50 per unit (row / 32 B), work bounded by gas paid; 50 is a placeholder, microbench before testnet. Was: `GAS_PRECOMPILE_READ` 2,600 flat for 0x0800–0x0803 |
+  | Read precompiles flat gas | DONE (s94 batch; gas settled s100) | `6f8c507`: 2,600 + 50 per unit (row / 32 B), work bounded by gas paid. **s136:** the placeholder was replaced after the microbench, s100 decisions merged in `00bf7346` (base 16,400, `getPosition` 16,500, scans base + 500 per row + 20 per word, `getOpenOrders` removed, `getOrderBook` 64 levels per side) and `b26bd3b3` (tombstone bound re-accepted for testnet; in-memory `getOrderBook` before mainnet). Was: `GAS_PRECOMPILE_READ` 2,600 flat for 0x0800–0x0803 |
   | Nonce window only at the mempool | DONE (s94 batch) | `e3a7821`: enforced against the block time in execution (out-of-window actions skipped, like bad signatures). Was: window checked in mempool / RPC only, not in block validation |
   | Unknown market ids create books | DONE (pre-testnet, branch `fix/pretestnet-p0-p1`, merged `de70325d` s134) | `d78ea41b` (bench follow-up `d0da9b60`): an action on a market with no `CF_NATIVE_MARKETS` row is rejected in consensus (reason `unknown_market`, text `unknown market_id N`, gas 0, nothing written): place (single, batch pre-pass, triggered stops, liquidation guard), cancel-all of a market, cancel by cloid, CoreWriter rows. Was: the executor created a book (`e81aa2e`: row tick/lot, or 1/1 with no row). |
   | Stop orders bypass the order cap | DONE | per-user open-order limit counts pending stops (`007fce6`, `0b20364`, `60f219f`; merge `2567e56`) |
@@ -443,11 +456,11 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
     - **Interim rule, needed before testnet (s94; monitoring DONE in the s94 batch: gauge `torus_liquidator_vault_deficit` `c46156b` (s131: that is the monitoring docs commit; the gauge itself is `cfd2db4f`), RPC `torus_getLiquidatorVault` `86c42f4`; who covers a deficit is still open (s94 text; s131: decided, see the P5 status line)):** today's system `LIQUIDATOR_VAULT` has no capital and cannot unwind positions, so a deficit moved there sits unnoticed (the bad-debt probe left it at -900). Interim: record and expose the vault's deficit (a metric and an RPC field), and decide who covers it. Full fix: an HLP-style vault with capital.
   - Native spot (token registry, spot book, `spotSend`) and an external-chain bridge with validator-signed withdrawals.
   - Multisig accounts.
-  - Permissionless validator entry with automated downtime jailing, once T1.4 has landed.
+  - Permissionless validator entry with automated downtime jailing, once T1.4 has landed. *(s136: jailing is a separate design from T1.7, deferred; open whether it lands before the testnet or as a testnet upgrade through P0.0, and before mainnet at the latest; `plans/dead-leader-skip.md` 7a.)*
 - **Effort:** XL each. Sequence by product priority.
 
 ### Trading UI *(parallel, not on the critical path)*
-- The `torus-trading-app` repo planned in `research/writing-plan-trading-app.md` exists on crab (`/home/crab/projects/torus-trading-app`, last commit 2026-09-28; this line said "never created" until s94). Its proposal status type lacks `"Failed"`, which the RPC can return since `e439982`: add it (plan row 79). Phase 1 (limit and market orders, book, positions) can start once P0 has landed. The leverage slider, cross/isolated toggle and TP/SL panels are blocked on P2 and P3.
+- The `torus-trading-app` repo planned in `research/writing-plan-trading-app.md` exists on crab (`/home/crab/projects/torus-trading-app`, last commit 2026-09-28; this line said "never created" until s94). Its proposal status type lacks `"Failed"`, which the RPC can return since `e439982`: add it (plan row 79). Phase 1 (limit and market orders, book, positions) can start once P0 has landed. The leverage slider, cross/isolated toggle and TP/SL panels are blocked on P2 and P3. **Status s136: PARKED** (owner s134: do not touch the app now, it may be rebuilt). Its TS EIP-712 signer does not match the governance signing change of `9f02839a` (P0); any client must match `tests/fixtures/eip712_vectors.json`.
 
 ### Pre-testnet decisions *(owner revisits these before the testnet launch; added s126)*
 - **Header re-send code default (`TORUS_HEADER_RESEND_MS`).** Benches and the devnet run 250 ms (`devnet/wsl/env.sh`,
@@ -472,6 +485,7 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
   mixed-flag agree check (2 nodes on, 1 off); size the worker count to the validator's cores (bench: 4 workers).
 - **Push-manifest threshold on WAN.** Benches pin 8 MB (`devnet/wsl/env.sh`), devnet compose 6 MB, code default 512 KB.
   Bench queue step 7b measures the CPU side on one host; the WAN threshold needs a WAN measurement.
+  **Status s136 (PE and this item): waits for the trial net** (owner s136).
 - **Parallel-settle merge drops a position update for "aliased" opaque rows (s128, found while fixing Phase 5 step
   2's Codex finding).** An opaque position row whose payload market differs from its storage key (e.g. key (T, 1)
   holding a market-2 position; `users.rs` keeps such rows opaque on purpose) can appear in two markets' position
@@ -530,8 +544,8 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
   max(N, 1000) + 128). Opt out: `--archive` or `--retention-blocks 0`. **s134:** on main since `b452b4af` (merged
   with the T5.3 persist-writer conflict resolved); section 121 (9i, 100k retention disk soak on `b452b4af`): PASS. Still open: at least one archive node per
   network as the genesis-sync source (no state sync; which testnet node), and revisit N if catch-up or disk numbers
-  say so.
-- **Trial testnet before the real testnet (owner s131; after the current work).** Three validators: archy and cachy
+  say so. **s136:** which node runs `--archive` is decided at the trial net (owner s134).
+- **Trial net: trial testnet before the real testnet (owner s131; after the current work).** Three validators: archy and cachy
   (the owner's home PCs, same house, wired, 1 Gbit internet) and the 18c server. No router setup: archy and cachy
   peer over the LAN with explicit `--p2p-peers` LAN addresses, and both dial out to 18c (public), so every pair is
   connected without port forwarding and CGNAT does not matter (`docs/validator-home-network.md`, option B, which
@@ -546,7 +560,20 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
   **s131 note: conflicts with T1.4,** which sets f=1 (4 validators) as the minimum credible posture; 3 validators are
   f=0. Owner s131: deferred to one of the last decisions before the trial; it blocks nothing (4-validator support,
   genesis and epoch rejoin, exists since July: `1b4c3b9f`, `d995f68a`).
-- **Book storage mode for the testnet genesis (s131).** 8m (perf doc section 99, n = 1): at 1M resting orders mode 3
+  **Status s136: OPEN, a pre-testnet milestone** (plan in roadmap commit `2bf267f3`; archy + cachyoz + 18c). Not
+  started; no testnet or trial net exists yet, only local devnets. **Owner s136:** the WAN items wait for it: PE on
+  WAN, the push-manifest threshold, the 250 ms header re-send check, L4.1-L4.4 from `docs/perf/8k-explore-ideas.md`
+  and the T3.1 follow-ups. Also decided at the trial net: which node runs `--archive` (owner s134). The genesis
+  questions it needs answered first are in `plans/testnet-genesis-checklist.md`.
+- **Book storage mode for the testnet genesis (s131).** **Status s136: DECIDED, Classic.** 9j stage 2 (perf doc
+  section 124, `af53295c`; one binary `perf/h2h-combined` `29bfc705`, hash on + attestation in both arms, n = 4):
+  Classic CL21 (L3.1 + L6.1 + L2.1, 15 s checkpoints; the Classic arm by owner exception, section 123) beats mode 3
+  M15 (+ b1) on both shapes: M15 / CL21 matched/s 0.963 deep / 0.952 standard, native blocks/s 0.714 / 0.747 (Classic
+  ~40% more deep blocks/s), CPU-s per 1M fills 1.159 / 1.149. Mode 3 wins only exec-thread on-CPU per fill (0.918 /
+  0.973), by moving the book save to the flush worker. The testnet genesis leaves `consensus.book_mode` absent
+  (Classic). b1, mode 3 and b0 are **parked, not dropped**. So L3.1 and L3.3 below are live code, not dead code; the
+  "if the genesis picks mode 3" sentences are superseded. s131 text follows.
+  8m (perf doc section 99, n = 1): at 1M resting orders mode 3
   (`TORUS_BOOK_ROWS=3`) cuts the exec-thread book save from 65.70 to 4.93 ms per block and blocks/s 3.24 -> 10.14, but
   costs the flush worker (per-block flush, +18% whole-process CPU-s per 1M fills); mode 3 is the candidate. Pending:
   bench 8p (longer Classic vs mode 3 A/B, deep and standard shape) and the owner's decision; design note
@@ -564,7 +591,9 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
   advance, running state hash not configured; otherwise one startup warning and off; `0` turns it off). Section 110
   (bench 8y, n = 2): deep matched/s 1.160, exec-thread CPU per 1k fills 0.802, blocks/s 3.42 -> 15.76, p50 193 -> 13 ms,
   p99 1,461 -> 672 ms; standard exec CPU 0.958. Also Classic-only (dead code under mode 3), and its gain is 0 once the
-  running state hash is activated (it then turns itself off).
+  running state hash is activated (it then turns itself off). **s136:** with the hash on at genesis, L3.1 keeps its
+  gain only together with L6.1 (window-committed books; the `l31_hash_blocker` helper keys on L6.1's activation),
+  which is why L6.1 is merging in batch 10.
 
 ---
 
@@ -600,7 +629,7 @@ graph TD
     P2 --> T0_3x[T0.3 harness gains<br/>trading-semantics mix]
 ```
 
-**s131 note on the graph (July text, kept as written):** the arrows T1.4 -> T3.1 -> T2.5 are not how it happened. The block cap went to 400 (T2.5, `7bcc179a`) without erasure coding, on loopback benches; T3.1 Phase A (recovery) merged without waiting for a large validator set, and shard custody is off by default. T1.2 / T1.3 did gate T1.4 as drawn. The graph is kept as the July reasoning; the per-item **Status s131** lines are the current state.
+**s131 note on the graph (July text, kept as written):** the arrows T1.4 -> T3.1 -> T2.5 are not how it happened. The block cap went to 400 (T2.5, `7bcc179a`) without erasure coding, on loopback benches; T3.1 Phase A (recovery) merged without waiting for a large validator set, and shard custody is off by default. T1.2 / T1.3 did gate T1.4 as drawn. The graph is kept as the July reasoning; the per-item **Status s131** lines are the current state (s136: or a later s134 / s136 line where one exists).
 
 **Critical path to the two headline numbers:**
 - **~70–100ms blocks:** T0.1 + T0.2 (hardware/RTT) → T1.1 (no load stalls) → T4.1/T4.2 (root cost off the hot path at scale). *Most of this is Tier 0.*
@@ -618,7 +647,7 @@ graph TD
 
 ## One-paragraph executive summary
 
-The architecture is already correct and matches Hyperliquid's (2-chain MonadBFT, commit-then-execute, hash-only proposals, one-signature batching). The gap to parity is, in order: **(0) run on isolated, co-located hardware** — this alone closes a large fraction of both gaps and must precede any measurement; **(1) make the chain survive load** by landing the disabled S430 fix, settling the 2-chain lock-depth safety question *before* adding fault tolerance, and killing the zombie-execution mode; **(2) unblock ingress** with parallel verification and incremental pool ordering; **(3) scale dissemination** by enabling the already-built zstd protocols and building erasure coding (which only pays off once the validator set is large); and **(4) grind execution** — compute the state root once, finish the incremental native root, cache margin/settlement, and journal the writer precompiles (a correctness fix that also unblocks eventual parallel execution). No consensus redesign is required. The single highest-leverage action is Tier 0, and the single most important *not-yet-answered* question is T1.2. *(s131: July text, superseded: T1.2 was answered in July: the grandparent lock was unsafe for the 2-chain commit and was changed to lock-on-parent, `4a94e8bc`, model-checked in `f6fac872`. Tiers 1, 2 and 4 are now largely done, so the open work sits in Tier 0 (co-location), T3.1, Tier 5 and the product-parity track; see "Status summary (s131)".)*
+The architecture is already correct and matches Hyperliquid's (2-chain MonadBFT, commit-then-execute, hash-only proposals, one-signature batching). The gap to parity is, in order: **(0) run on isolated, co-located hardware** — this alone closes a large fraction of both gaps and must precede any measurement; **(1) make the chain survive load** by landing the disabled S430 fix, settling the 2-chain lock-depth safety question *before* adding fault tolerance, and killing the zombie-execution mode; **(2) unblock ingress** with parallel verification and incremental pool ordering; **(3) scale dissemination** by enabling the already-built zstd protocols and building erasure coding (which only pays off once the validator set is large); and **(4) grind execution** — compute the state root once, finish the incremental native root, cache margin/settlement, and journal the writer precompiles (a correctness fix that also unblocks eventual parallel execution). No consensus redesign is required. The single highest-leverage action is Tier 0, and the single most important *not-yet-answered* question is T1.2. *(s131: July text, superseded: T1.2 was answered in July: the grandparent lock was unsafe for the 2-chain commit and was changed to lock-on-parent, `4a94e8bc`, model-checked in `f6fac872`. Tiers 1, 2 and 4 are now largely done, so the open work sits in Tier 0 (co-location), T3.1, Tier 5 and the product-parity track; see "Status summary (s131)"; s136: "Status summary (s136)".)*
 
 **Product parity is a separate track and it is further behind than performance.** The matching engine is sound, but the exchange around it is not. The track runs in this order:
 - **P0.0** — activation-height gating, so state-transition changes can ship without relaunching.
