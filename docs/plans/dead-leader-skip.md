@@ -242,14 +242,14 @@ before TC phase C, since F2 checks leader(view).
 
 | Test | What it proves | Status |
 |---|---|---|
-| `dl_cluster_one_down_at_rotation_position_{0..3}` | 4 equal stakes, one never runs: the update lands exactly at the predicted height (within 2L of the K-th miss); its old slots stop costing timeouts; its stats are the exclusion's (no miss counted after the plan); never re-admitted while down (3 more boundaries); the update's Decide and the block after it attribute nothing (gap rule); write sets agree | ignored, flaky (window livelock, below) |
-| `dl_cluster_restarted_validator_is_readmitted_and_proposes` | re-admitted by the plan of the first boundary whose window holds a QC with its signature; proposes again; its success resets run and j; not excluded again | ignored, flaky |
-| `dl_cluster_readmission_floor_doubles_up_to_the_cap` | cap 1, three exclusions without a success in between: (j, floor) = (1, L), (1, 2L), (1, 2L) | ignored, flaky |
+| `dl_cluster_one_down_at_rotation_position_{0..3}` | 4 equal stakes, one never runs: the update lands exactly at the predicted height (within 2L of the K-th miss); its old slots stop costing timeouts; its stats are the exclusion's (no miss counted after the plan); never re-admitted while down (3 more boundaries); the update's Decide and the block after it attribute nothing (gap rule); write sets agree | runs (batch C) |
+| `dl_cluster_restarted_validator_is_readmitted_and_proposes` | re-admitted by the plan of the first boundary whose window holds a QC with its signature; proposes again; its success resets run and j; not excluded again | runs (batch C) |
+| `dl_cluster_readmission_floor_doubles_up_to_the_cap` | cap 1, three exclusions without a success in between: (j, floor) = (1, L), (1, 2L), (1, 2L) | runs (batch C) |
 | `dl_cluster_crash_with_execution_behind_replays_the_same_rows` | execution held at 6, commits past boundary L, crash: the boot replay executes from the durable headers and their evidence rows; plan rows agree | runs |
 | `dl_cluster_power_loss_keeps_the_leader_evidence_in_the_manifests` | power loss drops every unexecuted height's header, body and evidence rows; the heights park on their manifests and execute with the envelopes' evidence; write sets agree | runs |
 | `dl_cluster_power_loss_parked_plan_source_drains_for_the_boundary` | the same with the parked heights holding the plan source of the boundary that needs this node's vote (finding 2) | runs (K = 0) |
 | `dl_cluster_mixed_k_config_diverges_in_state_and_halts_at_the_exclusion` | one node K = 0: same headers, running hashes differ from height 1; with a validator down the chain halts below the planned update, no fork | runs |
-| `dl_cluster_crash_between_the_exclusion_plan_and_its_update` | a node crashes between the plan and the update | ignored, RED (window livelock, deterministic) |
+| `dl_cluster_crash_between_the_exclusion_plan_and_its_update` | a node crashes between the plan and the update | runs (batch C) |
 | `dl_cluster_2_2_1_stake_one_down_is_excluded` | the bench shape | ignored, RED (finding 4) |
 | hotstuff `exclusion_of_a_down_validator_commits_and_its_slots_stop_timing_out` | an exclusion update of a down validator commits under the TC rules (no TC-less proposal), power kept, its old slots stop timing out across pacemaker epoch changes | runs |
 | hotstuff `readmitted_validator_proposes_again` | the excluded validator syncs back, is re-admitted and leads again | runs |
@@ -259,6 +259,11 @@ Repeats: the six running multi-node tests (four cluster, two hotstuff) 5 of 5 on
 ignored-flaky cluster tests livelocked at the exclusion update in 3 of 24 runs on 18c; with a throwaway prototype of
 the f407d49c vote rule all ten cluster tests passed 3 of 3 (18c). torus-consensus + torus-economics + hotstuff_rs at
 2d24a458: 1283 of 1283 on cachyoz.
+
+Batch C (`merge/s138-batch-c`, s138): with the reflexive lock (batch 12) and the sibling unlock rule merged, the
+seven window-livelock cluster tests (the four one-down positions, re-admission, the j cap, the crash between plan
+and update) passed 5 of 5 stress runs on ubuntoz and are no longer ignored. The 2:2:1 tests stay ignored (finding 4;
+owner: 9p runs 4 validators).
 
 ### Findings
 

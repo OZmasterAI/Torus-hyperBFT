@@ -16,13 +16,14 @@
 //! the boundary that plans its exclusion and the height of the update. Every test ends with the
 //! running-hash write sets of the nodes that ran compared height by height.
 //!
-//! Open (s138): every test whose exclusion update is committed while the dead validator still
-//! leads is `#[ignore]`d until the update-window vote rule lands (fix/vsu-window-flake
-//! f407d49c: an update block proposed two views before a silent leader's slot gets its
-//! Precommit PC locked at the backup aggregator, which then refuses the block's re-proposal; with
-//! one of four down every vote is needed and the window livelocks). With a throwaway prototype of
-//! that rule all of them pass (3 of 3 runs). At 2:2:1 the update cannot commit even then
-//! (`dl_cluster_2_2_1_stake_one_down_is_excluded`). Run them with `--run-ignored all`.
+//! The tests whose exclusion update is committed while the dead validator still leads were
+//! `#[ignore]`d until the update-window vote rule landed (fix/vsu-window-flake f407d49c: an
+//! update block proposed two views before a silent leader's slot gets its Precommit PC locked at
+//! the backup aggregator, which then refused the block's re-proposal; with one of four down every
+//! vote is needed and the window livelocked). With the reflexive lock (batch 12) and the sibling
+//! unlock rule (batch C) they run again (batch C: 7 tests, 5 of 5 stress runs). Still open: at
+//! 2:2:1 the update cannot commit (`dl_cluster_2_2_1_stake_one_down_is_excluded`, ignored; run it
+//! with `--run-ignored all`).
 
 use super::*;
 
@@ -722,25 +723,21 @@ fn one_down(weights: &[u64], dead: usize) {
 }
 
 #[test]
-#[ignore = "flaky until the update-window vote rule lands (fix/vsu-window-flake f407d49c): the exclusion update livelocks when the dead validator leads right after its Precommit PC (s138: 3 of 24 runs)"]
 fn dl_cluster_one_down_at_rotation_position_0() {
     one_down(&[1, 1, 1, 1], 0);
 }
 
 #[test]
-#[ignore = "flaky until the update-window vote rule lands (fix/vsu-window-flake f407d49c): the exclusion update livelocks when the dead validator leads right after its Precommit PC (s138: 3 of 24 runs)"]
 fn dl_cluster_one_down_at_rotation_position_1() {
     one_down(&[1, 1, 1, 1], 1);
 }
 
 #[test]
-#[ignore = "flaky until the update-window vote rule lands (fix/vsu-window-flake f407d49c): the exclusion update livelocks when the dead validator leads right after its Precommit PC (s138: 3 of 24 runs)"]
 fn dl_cluster_one_down_at_rotation_position_2() {
     one_down(&[1, 1, 1, 1], 2);
 }
 
 #[test]
-#[ignore = "flaky until the update-window vote rule lands (fix/vsu-window-flake f407d49c): the exclusion update livelocks when the dead validator leads right after its Precommit PC (s138: 3 of 24 runs)"]
 fn dl_cluster_one_down_at_rotation_position_3() {
     one_down(&[1, 1, 1, 1], 3);
 }
@@ -786,7 +783,6 @@ fn first_seen_boundary(qcs: &[(u64, LeaderEvidence)], from: u64, pos: usize) -> 
 /// committed blocks again, its first success resets its run and j, and it is not excluded again
 /// (two more boundaries pass). All four nodes' write sets agree.
 #[test]
-#[ignore = "flaky until the update-window vote rule lands (fix/vsu-window-flake f407d49c): the exclusion update livelocks when the dead validator leads right after its Precommit PC (s138: 3 of 24 runs)"]
 fn dl_cluster_restarted_validator_is_readmitted_and_proposes() {
     let mut c = Cluster::new(&[1, 1, 1, 1]);
     let x = 2;
@@ -838,7 +834,6 @@ fn dl_cluster_restarted_validator_is_readmitted_and_proposes() {
 /// before it takes effect (no success in between, so j is kept), three times. The floors are
 /// L, 2L, 2L (not 4L: the cap) and j stays 1; no re-admission comes before its floor.
 #[test]
-#[ignore = "flaky until the update-window vote rule lands (fix/vsu-window-flake f407d49c): the exclusion update livelocks when the dead validator leads right after its Precommit PC (s138: 3 of 24 runs)"]
 fn dl_cluster_readmission_floor_doubles_up_to_the_cap() {
     let mut c = Cluster::new(&[1, 1, 1, 1]);
     let run = Run::on().cap(1);
@@ -942,9 +937,8 @@ fn dl_cluster_crash_with_execution_behind_replays_the_same_rows() {
 /// four every vote is needed: the window livelocks at the update. The same wedge as
 /// fix/vsu-window-flake f407d49c (`validator_set_update_survives_a_silent_leader_after_the_precommit_pc`);
 /// the vote-rule fix it names (a proposal of the locked block itself satisfies the lock) makes
-/// this test pass (throwaway prototype, s138).
+/// this test pass (the reflexive lock, on main since batch 12).
 #[test]
-#[ignore = "RED: the update window livelocks when the dead validator leads right after the update block's Precommit PC (vote rule, fix/vsu-window-flake f407d49c)"]
 fn dl_cluster_crash_between_the_exclusion_plan_and_its_update() {
     let mut c = Cluster::new(&[1, 1, 1, 1]);
     let (dead, z) = (3, 2);
