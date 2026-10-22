@@ -5446,8 +5446,12 @@ impl ExecutionContext {
         // R02 branch 8 (B): a queue read error is a node fault: fail-stop
         // (C4), never "assume due" — as the oracle / liquidation due-checks.
         // Item 7 option 0 (task 1.3): through the block overlay (DB + in-flight
-        // layers), after the EVM part; this block's own queue rows target later
-        // heights, so they never answer for `height`.
+        // layers), after the EVM part and its absorb. Without item 7 T this
+        // block's own queue rows target later heights, so they never answer for
+        // `height`; under `Feature::SameBlockCoreWriter` its non-order rows
+        // target `height` and are seen here (the absorb precedes the check on
+        // every path: serial, barrier, replay, fast path), so an EVM block whose
+        // only native work is its own rows still runs the drain.
         let core_writer_due = {
             #[cfg(test)]
             let _probe_scope = torus_state::probes::scope(torus_state::probes::Reader::DueCheck);
@@ -31517,12 +31521,14 @@ mod crash_recovery_tests {
     /// at h + 1.
     #[test]
     fn t_same_block_deposit_drains_in_its_own_block_on_every_path() {
+        // T from 2: a feature at 1 would also be in the genesis parent
+        // header's bits (P0.0), which `make_block(1)` links to without it.
         let deposits = [2u64, 5, 7, 9];
-        let blocks = t_blocks(&deposits, Some(1));
+        let blocks = t_blocks(&deposits, Some(2));
         let mut dumps = Vec::new();
         for (what, worker, ckpt, fast) in t_configs() {
             let db = t_db();
-            let ctx = t_ctx(&db, Some(1), worker, ckpt, fast);
+            let ctx = t_ctx(&db, Some(2), worker, ckpt, fast);
             for b in &blocks {
                 let h = b.header.height;
                 dispatch_and_execute(&ctx, &db, b);
@@ -31813,7 +31819,10 @@ mod crash_recovery_tests {
             dump_all_cfs(&db)
         };
         let db = t_db();
-        let mut old_ctx = t_ctx(&db, None, true, Some(ckpt_every(2)), true);
+        // Serial, so every block below H is durable when it stops (a
+        // pipelined node keeps its since-checkpoint window in memory: the
+        // replay then starts lower, as in `t_crash_replay_run`).
+        let mut old_ctx = t_ctx(&db, None, false, None, false);
         old_ctx.known_features = torus_types::KNOWN_FEATURES & !T_BIT;
         for b in &blocks[..H as usize - 1] {
             dispatch_and_execute(&old_ctx, &db, b);
