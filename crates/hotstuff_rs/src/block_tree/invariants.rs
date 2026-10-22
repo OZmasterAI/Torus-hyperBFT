@@ -473,11 +473,9 @@ fn certified_above_lock<K: KVStore>(
     block_tree: &BlockTreeSingleton<K>,
 ) -> Result<bool, BlockTreeError> {
     let locked_view = block_tree.locked_pc()?.view;
+    let certifies = |pc: &PhaseCertificate| !pc.is_genesis_pc() && pc.block == *block_hash && pc.view > locked_view;
     let highest_pc = block_tree.highest_pc()?;
-    Ok([Some(&highest_pc), tc_high_qc]
-        .into_iter()
-        .flatten()
-        .any(|pc| !pc.is_genesis_pc() && pc.block == *block_hash && pc.view > locked_view))
+    Ok(certifies(&highest_pc) || tc_high_qc.is_some_and(certifies))
 }
 
 /// Whether `block_hash` is `block_tree`'s `locked_pc.block` (never the genesis PC's).
