@@ -182,6 +182,8 @@ fn setup_300(ctx: &mut NativeExecContext, path: Path) {
 /// no cloid, no check. (The pre-index scan probed all 300 books.)
 #[test]
 fn one_book_probe_per_check_at_300_markets() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     for path in PATHS {
         let what = format!("{path:?}");
         let dir = tempfile::tempdir().unwrap();
@@ -263,6 +265,8 @@ fn one_book_probe_per_check_at_300_markets() {
 /// it. Every book mode, resident books on and off.
 #[test]
 fn a_cloid_in_an_untouched_market_is_found_after_a_reload() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     for mode in MODES {
         for resident in [false, true] {
             let what = format!("{mode:?} resident={resident}");
@@ -417,6 +421,8 @@ fn with_ids(
 /// leaves an entry behind, no add is missing.
 #[test]
 fn the_carried_index_equals_a_rebuild_after_every_block() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     for mode in [BookMode::Classic, BookMode::LevelAuthorityChunked] {
         for path in PATHS {
             let what = format!("{mode:?} {path:?}");
@@ -498,6 +504,8 @@ fn run_traffic(
     resident: bool,
     restart_at: Option<usize>,
 ) -> (Vec<Vec<(bool, FailureReason)>>, B256) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     // Pre-testnet P0: orders need a listed market (placeholder rows,

@@ -21,6 +21,11 @@ tracing = { workspace = true }
 # `test-reference-paths` feature can switch to them from other crates' tests.
 # Never enabled by a normal dependency: no node build reaches it.
 test-reference-paths = []
+# Owner s138: TEST-ONLY. `oracle::test_treat_unmarked_as_marked` lets test
+# fixtures written before the never-marked rule (orders on a market without
+# any oracle mark are refused) keep trading on unmarked markets. Enabled from
+# dev-dependencies only: no node build reaches it.
+test-unmarked-markets = []
 
 [dev-dependencies]
 criterion = { workspace = true }

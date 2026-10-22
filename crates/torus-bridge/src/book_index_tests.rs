@@ -149,6 +149,8 @@ fn stash_and_check(mut ctx: NativeExecContext, holder: &mut ResidentBooks, what:
 /// market without a book gets a new one): the indexes stay exact.
 #[test]
 fn batch_move_keeps_indexes_consistent() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     // Pre-testnet P0: orders need a listed market (placeholder rows,
@@ -182,6 +184,8 @@ fn batch_move_keeps_indexes_consistent() {
 /// reaches its orders.
 #[test]
 fn insert_and_replace_book_keep_indexes_consistent() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     // Pre-testnet P0: orders need a listed market (placeholder rows,
@@ -213,6 +217,8 @@ fn insert_and_replace_book_keep_indexes_consistent() {
 /// carry books across blocks do): neither context keeps a stale index.
 #[test]
 fn take_and_set_books_keep_indexes_consistent() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     // Pre-testnet P0: orders need a listed market (placeholder rows,
@@ -257,6 +263,8 @@ fn take_and_set_books_keep_indexes_consistent() {
 /// do) is in both indexes.
 #[test]
 fn order_book_mut_feeds_indexes() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     // Pre-testnet P0: orders need a listed market (placeholder rows,
@@ -337,6 +345,8 @@ fn put_book(ctx: &mut NativeExecContext, via: Via, op: Op, market: MarketId, boo
 /// and `C + 71`: both are found, `addr(1)`'s `C + 3` left with the old
 /// book, a cancel-all of `addr(3)` reaches market 3.
 fn loaded_book_is_indexed(via: Via, op: Op) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let what = format!("{via:?} {op:?} loaded");
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
@@ -374,6 +384,8 @@ fn loaded_book_is_indexed(via: Via, op: Op) {
 /// `C + 3` was cancelled and `addr(2)`'s `C + 50` rested: `C + 3` is live
 /// again, `C + 50` is free, a cancel-all of `addr(1)` reaches market 3.
 fn stale_copy_is_indexed(via: Via, op: Op) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let what = format!("{via:?} {op:?} copy");
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
@@ -456,6 +468,8 @@ enum Leak {
 /// then its logs leave through `leak` and the same book goes back in its
 /// slot. `C + 80` is found, a cancel-all of `addr(3)` reaches market 3.
 fn drained_logs_roundtrip_is_indexed(via: Via, leak: Leak) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let what = format!("{via:?} {leak:?} roundtrip");
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();

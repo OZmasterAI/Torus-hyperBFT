@@ -83,6 +83,8 @@ impl StateBackend for FailBal {
 }
 
 fn fail_ctx() -> (tempfile::TempDir, FailBal, NativeExecContext<FailBal>) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().unwrap();
     let inner = StateDb::open(dir.path()).unwrap();
     // Pre-testnet P0: orders need a listed market (placeholder rows).
@@ -748,6 +750,8 @@ fn fast_top_ups_retry_after_a_transient_read_fault() {
 /// scan's on the fold's own cache, pools and excess.
 #[test]
 fn stitch_records_the_scan_candidates_on_real_phase2_runs() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let mut rng = Lcg(0x5717_C4ED);
     let (mut listed, mut granted) = (0usize, 0u64);
     for round in 0..80u64 {
@@ -1151,6 +1155,8 @@ fn fast_sell_top_ups_pin_nests_and_restores() {
 /// on, the stitch list and the batched loop run instead — same state.
 #[test]
 fn execute_batch_routes_top_ups_by_the_flag() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let (t, b, mk) = (
         Address::new([1; 20]),
         Address::new([2; 20]),

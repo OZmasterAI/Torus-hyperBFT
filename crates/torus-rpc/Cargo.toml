@@ -32,6 +32,8 @@ rayon = "1"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Owner s138: fixtures from before the never-marked rule (test-only seam).
+torus-core = { workspace = true, features = ["test-unmarked-markets"] }
 revm = { workspace = true }
 k256 = { workspace = true }
 sha3 = { workspace = true }

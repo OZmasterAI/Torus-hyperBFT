@@ -90,6 +90,8 @@ fn put_validator_status(db: &StateDb, n: u8, status: ValidatorStatus) {
 }
 
 fn list_market(db: &StateDb, id: MarketId) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     db.put_cf_raw(CF_NATIVE_MARKETS, &id.to_be_bytes(), b"listed").unwrap();
 }
 

@@ -126,6 +126,8 @@ fn exec(ctx: &mut NativeExecContext, mode: Mode, block: &[(Address, NativeAction
 /// Book m1 (tick 2, lot 2) with maker addr(2)'s ask 5 @60; then `block`
 /// from a (addr 1) and c (addr 3).
 fn run(mode: Mode, block: &[(Address, NativeAction)]) -> Run {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     // Pre-testnet P0: orders need a listed market (placeholder rows,
@@ -237,6 +239,8 @@ fn rejects_take_no_order_id_and_dust_is_checked_first() {
 /// m2 sell gets the pool: 1 + 99 = IM(2,000) → fills 20 @100.
 #[test]
 fn off_tick_sell_does_not_claim_the_d2_pool() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let (t, b) = (addr(1), addr(3));
     let off_tick_sell = order(1, false, fp(200) + half(), fp(1), TimeInForce::GTC);
     let block = vec![

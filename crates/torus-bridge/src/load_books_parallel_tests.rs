@@ -38,6 +38,8 @@ fn place(market_id: u64, is_buy: bool, price: u64, order_type: OrderType) -> Nat
 /// A mode-3 store: markets 1..=9 get resting bids and asks over uneven level
 /// counts plus a few stop orders; market 10 stays empty (no rows at all).
 fn build_store(chunked: bool) -> (tempfile::TempDir, StateDb) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     // Pre-testnet P0: orders need a listed market (placeholder rows,
