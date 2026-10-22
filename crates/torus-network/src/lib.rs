@@ -18,6 +18,7 @@ pub mod body_send_trace;
 pub mod caps;
 pub mod codec;
 pub mod config;
+pub mod genesis_id;
 pub mod mesh_watchdog;
 pub mod peer;
 pub mod peer_scoring;

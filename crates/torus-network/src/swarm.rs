@@ -527,6 +527,9 @@ pub struct SharedState {
     /// worker. Installed once at startup; an empty cell (flag off, tests,
     /// observers) costs a presence check but no lock acquisition or datum copy.
     pub(crate) validate_tee: OnceLock<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+    /// Owner s138: the genesis this node's network is keyed by (gossip topic
+    /// names, the identify check; see [`crate::genesis_id`]).
+    pub genesis: crate::genesis_id::NetworkGenesis,
 }
 
 /// Capacity of the B2 dual-path dedup LRU. Sized for arrival skew, not
@@ -910,9 +913,15 @@ fn deserialize_native_batch(data: &[u8]) -> Option<Vec<&[u8]>> {
 /// gossip therefore rides only the raw v1 topic; per-peer zstd lives on the
 /// request_response body paths (`/torus/{native-da,block-data,direct}/2.0`),
 /// which DO negotiate per peer and stay.
-fn subscribe_gossip_topics(gossipsub: &mut gossipsub::Behaviour) {
-    for topic in [CONSENSUS_TOPIC, TX_TOPIC, NATIVE_ACTION_TOPIC] {
-        let ident = gossipsub::IdentTopic::new(topic);
+///
+/// Topic names carry the genesis tag (owner s138, [`crate::genesis_id`]).
+fn subscribe_gossip_topics(
+    gossipsub: &mut gossipsub::Behaviour,
+    genesis: &crate::genesis_id::NetworkGenesis,
+) {
+    for base in [CONSENSUS_TOPIC, TX_TOPIC, NATIVE_ACTION_TOPIC] {
+        let topic = genesis.topic(base);
+        let ident = gossipsub::IdentTopic::new(topic.clone());
         if let Err(e) = gossipsub.subscribe(&ident) {
             warn!(topic, "failed to subscribe to gossip topic: {e:?}");
         }
@@ -1125,16 +1134,17 @@ pub async fn run_swarm_with_config(
     local_key: VerifyingKey,
     config: &NetworkConfig,
 ) {
-    let consensus_topic = gossipsub::IdentTopic::new(CONSENSUS_TOPIC);
-    let tx_topic = gossipsub::IdentTopic::new(TX_TOPIC);
+    let consensus_topic = gossipsub::IdentTopic::new(shared.genesis.topic(CONSENSUS_TOPIC));
+    let tx_topic = gossipsub::IdentTopic::new(shared.genesis.topic(TX_TOPIC));
     // Native-action batches gossip ONLY on the raw v1 topic. The zstd v2 topic
     // was removed (s364): gossipsub cannot negotiate compression per-peer, so a
     // v2 subscriber had to inflate any peer's frames — a cluster-wide DoS that
     // `--no-gossip-zstd` could not close (it only stopped local publishing).
     // Per-peer zstd survives on the request_response body paths, not gossip.
-    let native_action_topic = gossipsub::IdentTopic::new(NATIVE_ACTION_TOPIC);
+    let native_action_topic =
+        gossipsub::IdentTopic::new(shared.genesis.topic(NATIVE_ACTION_TOPIC));
 
-    subscribe_gossip_topics(&mut swarm.behaviour_mut().gossipsub);
+    subscribe_gossip_topics(&mut swarm.behaviour_mut().gossipsub, &shared.genesis);
 
     let mut tx_gossip_state =
         TxGossipState::new(config.tx_dedup_window_secs, config.tx_rate_limit_per_peer);
@@ -1464,7 +1474,8 @@ fn handle_event(
                 m.gossip_messages_received.inc();
             }
 
-            let consensus_hash = gossipsub::IdentTopic::new(CONSENSUS_TOPIC).hash();
+            let consensus_hash =
+                gossipsub::IdentTopic::new(shared.genesis.topic(CONSENSUS_TOPIC)).hash();
             if message.topic == consensus_hash {
                 // Message size validation (Phase 3: 3.1.7). Penalty goes to the
                 // AUTHOR — the forwarder merely relayed it (s350 FIX B).
@@ -1518,7 +1529,9 @@ fn handle_event(
                     return;
                 }
                 handle_consensus_gossip(&message.data, shared, peer_scoring, &author);
-            } else if message.topic == gossipsub::IdentTopic::new(NATIVE_ACTION_TOPIC).hash() {
+            } else if message.topic
+                == gossipsub::IdentTopic::new(shared.genesis.topic(NATIVE_ACTION_TOPIC)).hash()
+            {
                 if message.data.len() > max_tx_msg_size {
                     // Penalty goes to the AUTHOR, never the relayer — forwarder
                     // penalties on this exact path banned friend2 (validator) for
@@ -1869,6 +1882,27 @@ fn handle_event(
             info,
             ..
         })) => {
+            // Owner s138 (K question, option B): a peer of another genesis is
+            // refused before it enters the address book or the peer map. Its
+            // app protocols and topics already carry another genesis tag, so
+            // nothing else crossed; this names the mismatch and drops it.
+            if let Err(mismatch) = shared.genesis.check_peer(&info.protocol_version) {
+                // Codex P2: the refused peer cools down (5 s doubling to 60 s)
+                // and the gate denies every dial path meanwhile, so consensus
+                // sends to a still-mapped validator do not redial it in a loop.
+                let (cooldown, strikes) = swarm.behaviour_mut().genesis_gate.refuse(peer_id);
+                if crate::genesis_id::warn_on_strike(strikes) {
+                    warn!(%peer_id, ?cooldown, strikes, "peer {peer_id} {mismatch}: refusing");
+                } else {
+                    debug!(%peer_id, ?cooldown, strikes, "peer {peer_id} {mismatch}: refusing");
+                }
+                if let Some(ref m) = shared.metrics {
+                    m.p2p_genesis_mismatch_refusals.inc();
+                }
+                swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
+                let _ = swarm.disconnect_peer_id(peer_id);
+                return;
+            }
             // Validator-set peers exempt (s350 FIX B): identify keeps the peer
             // map fresh, which the validator exemption itself depends on.
             if should_drop_banned_gossip(&mut *peer_scoring, shared, &peer_id) {
@@ -1899,6 +1933,28 @@ fn handle_event(
                     pm.insert(vk, peer_id);
                     info!(%peer_id, "registered peer from identify exchange");
                 }
+            }
+            // Genesis accepted: what was buffered for this peer is due now
+            // (deferred from ConnectionEstablished until this check passed).
+            if swarm.behaviour_mut().genesis_gate.accept(peer_id) {
+                flush_to_accepted_peer(swarm, shared, local_key, peer_id);
+            }
+        }
+        // Identify failed on a connection (timeout, stream error): the genesis
+        // check cannot run, so fall back to accepting rather than stranding the
+        // buffered sends. A peer of another genesis still negotiates none of
+        // the tagged protocols.
+        SwarmEvent::Behaviour(TorusBehaviourEvent::Identify(identify::Event::Error {
+            peer_id,
+            error,
+            ..
+        })) => {
+            debug!(%peer_id, %error, "identify failed");
+            if swarm.is_connected(&peer_id)
+                && !swarm.behaviour().genesis_gate.is_cooling(&peer_id)
+                && swarm.behaviour_mut().genesis_gate.accept(peer_id)
+            {
+                flush_to_accepted_peer(swarm, shared, local_key, peer_id);
             }
         }
         // Block-data fetch protocol: inbound request — serve from network-thread block store.
@@ -2222,75 +2278,11 @@ fn handle_event(
                     m.peers_connected.set(count);
                 }
                 let _ = swarm.behaviour_mut().kademlia.bootstrap();
-                // Corrected reconnect seam (Task 1a): a validator stays mapped in
-                // peer_map across disconnects, so ConnectionEstablished — not
-                // RegisterPeer/Identify — is what fires when the link returns.
-                // Flush any consensus messages buffered while it was unreachable.
-                let reconnected_vk = shared.peer_map.read().unwrap().get_vk(&peer_id).copied();
-                if let Some(vk) = reconnected_vk {
-                    let pending = shared.pending_sends.lock().unwrap().flush(&vk);
-                    if !pending.is_empty() {
-                        info!(%peer_id, count = pending.len(), "flushing pending consensus sends on (re)connect");
-                        for message in pending {
-                            if let Some(ref m) = shared.metrics {
-                                m.pending_sends_flushed.inc();
-                            }
-                            send_direct(swarm, shared, local_key, &vk, message);
-                        }
-                    }
-                    // T7: deliver native-action pushes that were QUEUED while this
-                    // validator was disconnected (targeted, in enqueue order) — so a
-                    // push is never dropped just because its target was offline.
-                    let queued_pushes = shared.pending_native_pushes.lock().unwrap().flush(&vk);
-                    if !queued_pushes.is_empty() {
-                        info!(%peer_id, count = queued_pushes.len(), "flushing queued native pushes on (re)connect");
-                        for envelope in queued_pushes {
-                            let req = DirectRequest {
-                                sender_key: local_key.to_bytes(),
-                                payload: envelope.into(),
-                            };
-                            swarm.behaviour_mut().direct.send_request(&peer_id, req);
-                        }
-                    }
-                    // S447: deliver native-DA fetches that were BUFFERED while this
-                    // validator was disconnected — the pull-side twin of the queued
-                    // pushes above, so a mesh-degraded node's body pull reaches every
-                    // committed validator that (re)connects, not just its live mesh.
-                    let queued_fetches = flush_pending_da_fetches(shared, &vk);
-                    if !queued_fetches.is_empty() {
-                        info!(%peer_id, count = queued_fetches.len(), "flushing buffered native-DA fetches on (re)connect");
-                        for hashes in queued_fetches {
-                            swarm
-                                .behaviour_mut()
-                                .native_da
-                                .send_request(&peer_id, NativeDaNetRequest { hashes });
-                        }
-                    }
-                    // T4: re-push recent native-action bundles so a (re)connecting
-                    // validator's mempool catches up before the next CompactBlock it
-                    // must reconstruct. Validator-gated; dedup is free on the receiver.
-                    if shared.validators.read().unwrap().contains(&vk.to_bytes()) {
-                        let bundles: Vec<Arc<Vec<u8>>> = shared
-                            .recent_native_bundles
-                            .lock()
-                            .unwrap()
-                            .iter()
-                            .cloned()
-                            .collect();
-                        if !bundles.is_empty() {
-                            info!(%peer_id, count = bundles.len(), "re-pushing recent native bundles on (re)connect");
-                            for envelope in bundles {
-                                let req = DirectRequest {
-                                    sender_key: local_key.to_bytes(),
-                                    payload: envelope.into(),
-                                };
-                                swarm.behaviour_mut().direct.send_request(&peer_id, req);
-                                if let Some(ref m) = shared.metrics {
-                                    m.native_bundle_repushed.inc();
-                                }
-                            }
-                        }
-                    }
+                // Codex P2: the flush waits for identify to accept the
+                // peer's genesis (`flush_to_accepted_peer`); only a peer
+                // already accepted on another live connection flushes here.
+                if swarm.behaviour().genesis_gate.is_accepted(&peer_id) {
+                    flush_to_accepted_peer(swarm, shared, local_key, peer_id);
                 }
             }
         }
@@ -2319,14 +2311,24 @@ fn handle_event(
                 && matches!(&error, libp2p::swarm::DialError::Transport(errs)
                     if !errs.is_empty()
                         && errs.iter().all(|(a, _)| !crate::config::is_global_addr(a)));
-            if only_filtered {
+            let cooling = matches!(&error, libp2p::swarm::DialError::Denied { cause }
+                if cause.downcast_ref::<crate::genesis_id::GenesisCooldown>().is_some());
+            if cooling {
+                debug!(?peer_id, %error, "outgoing connection denied (genesis cooldown)");
+            } else if only_filtered {
                 debug!(?peer_id, %error, "outgoing connection failed (non-global addresses filtered)");
             } else {
                 warn!(?peer_id, %error, "outgoing connection failed");
             }
         }
         SwarmEvent::IncomingConnectionError { error, .. } => {
-            warn!(%error, "incoming connection failed");
+            if matches!(&error, libp2p::swarm::ListenError::Denied { cause }
+                if cause.downcast_ref::<crate::genesis_id::GenesisCooldown>().is_some())
+            {
+                debug!(%error, "incoming connection denied (genesis cooldown)");
+            } else {
+                warn!(%error, "incoming connection failed");
+            }
         }
         SwarmEvent::Behaviour(TorusBehaviourEvent::Kademlia(
             kad::Event::OutboundQueryProgressed {
@@ -2367,6 +2369,88 @@ fn handle_event(
         }
         SwarmEvent::Behaviour(TorusBehaviourEvent::Kademlia(_)) => {}
         _ => {}
+    }
+}
+
+/// Deliver what was buffered for `peer_id` while it was unreachable (consensus
+/// sends, native pushes, DA fetches) and re-push recent bundles. Runs once a
+/// connection's genesis is accepted by identify (owner s138; Codex P2), not on
+/// `ConnectionEstablished`: a peer of another genesis gets nothing flushed.
+fn flush_to_accepted_peer(
+    swarm: &mut Swarm<TorusBehaviour>,
+    shared: &SharedState,
+    local_key: &VerifyingKey,
+    peer_id: PeerId,
+) {
+    // Corrected reconnect seam (Task 1a): a validator stays mapped in
+    // peer_map across disconnects, so the link returning (now: its
+    // genesis accepted on the new connection) is what flushes, not
+    // RegisterPeer. Flush any consensus messages buffered meanwhile.
+    let reconnected_vk = shared.peer_map.read().unwrap().get_vk(&peer_id).copied();
+    if let Some(vk) = reconnected_vk {
+        let pending = shared.pending_sends.lock().unwrap().flush(&vk);
+        if !pending.is_empty() {
+            info!(%peer_id, count = pending.len(), "flushing pending consensus sends on (re)connect");
+            for message in pending {
+                if let Some(ref m) = shared.metrics {
+                    m.pending_sends_flushed.inc();
+                }
+                send_direct(swarm, shared, local_key, &vk, message);
+            }
+        }
+        // T7: deliver native-action pushes that were QUEUED while this
+        // validator was disconnected (targeted, in enqueue order) — so a
+        // push is never dropped just because its target was offline.
+        let queued_pushes = shared.pending_native_pushes.lock().unwrap().flush(&vk);
+        if !queued_pushes.is_empty() {
+            info!(%peer_id, count = queued_pushes.len(), "flushing queued native pushes on (re)connect");
+            for envelope in queued_pushes {
+                let req = DirectRequest {
+                    sender_key: local_key.to_bytes(),
+                    payload: envelope.into(),
+                };
+                swarm.behaviour_mut().direct.send_request(&peer_id, req);
+            }
+        }
+        // S447: deliver native-DA fetches that were BUFFERED while this
+        // validator was disconnected — the pull-side twin of the queued
+        // pushes above, so a mesh-degraded node's body pull reaches every
+        // committed validator that (re)connects, not just its live mesh.
+        let queued_fetches = flush_pending_da_fetches(shared, &vk);
+        if !queued_fetches.is_empty() {
+            info!(%peer_id, count = queued_fetches.len(), "flushing buffered native-DA fetches on (re)connect");
+            for hashes in queued_fetches {
+                swarm
+                    .behaviour_mut()
+                    .native_da
+                    .send_request(&peer_id, NativeDaNetRequest { hashes });
+            }
+        }
+        // T4: re-push recent native-action bundles so a (re)connecting
+        // validator's mempool catches up before the next CompactBlock it
+        // must reconstruct. Validator-gated; dedup is free on the receiver.
+        if shared.validators.read().unwrap().contains(&vk.to_bytes()) {
+            let bundles: Vec<Arc<Vec<u8>>> = shared
+                .recent_native_bundles
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect();
+            if !bundles.is_empty() {
+                info!(%peer_id, count = bundles.len(), "re-pushing recent native bundles on (re)connect");
+                for envelope in bundles {
+                    let req = DirectRequest {
+                        sender_key: local_key.to_bytes(),
+                        payload: envelope.into(),
+                    };
+                    swarm.behaviour_mut().direct.send_request(&peer_id, req);
+                    if let Some(ref m) = shared.metrics {
+                        m.native_bundle_repushed.inc();
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2950,8 +3034,25 @@ fn send_direct_observed(
             return DirectSendOutcome::Buffered;
         }
     };
+    if swarm.is_connected(&pid) && !swarm.behaviour().genesis_gate.is_accepted(&pid) {
+        // Connected but identify has not accepted its genesis yet (Codex P2):
+        // buffer; the acceptance flushes it, a refusal leaves it queued.
+        shared
+            .pending_sends
+            .lock()
+            .unwrap()
+            .enqueue(target, message);
+        if let Some(ref m) = shared.metrics {
+            m.pending_sends_enqueued.inc();
+        }
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.finish("buffered_unaccepted");
+        }
+        return DirectSendOutcome::Buffered;
+    }
     if !swarm.is_connected(&pid) {
         // Mapped but disconnected — buffer + nudge a dial; flush on reconnect.
+        // A peer cooling down after a genesis refusal: the gate denies the dial.
         shared
             .pending_sends
             .lock()
@@ -3520,7 +3621,10 @@ mod tests {
     fn no_node_subscribes_to_v2_gossip_topic() {
         let key = libp2p::identity::Keypair::generate_ed25519();
         let mut behaviour = TorusBehaviour::new(&key).expect("build behaviour");
-        subscribe_gossip_topics(&mut behaviour.gossipsub);
+        subscribe_gossip_topics(
+            &mut behaviour.gossipsub,
+            &crate::genesis_id::NetworkGenesis::default(),
+        );
 
         let subscribed: Vec<_> = behaviour.gossipsub.topics().cloned().collect();
         let v2 = gossipsub::IdentTopic::new("/torus/native-actions/2.0").hash();
@@ -3796,6 +3900,7 @@ mod tests {
             outbound_forward_batches: Mutex::new(HashMap::new()),
             leader_resolver: RwLock::new(None),
             validate_tee: OnceLock::new(),
+            genesis: crate::genesis_id::NetworkGenesis::default(),
         }
     }
 

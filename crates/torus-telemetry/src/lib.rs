@@ -1002,6 +1002,9 @@ pub struct Metrics {
     /// connection while we still held an older one (fast restart over a dead
     /// QUIC connection: gossipsub skips sending our subscriptions on it).
     pub mesh_stale_conn_disconnects: Counter,
+    /// Owner s138 (K question, option B): peers refused because their
+    /// identify-advertised genesis digest differs from ours (or is missing).
+    pub p2p_genesis_mismatch_refusals: Counter,
     /// s114: time from a validator's connect to our seeing it subscribed to
     /// the consensus topic, spanning watchdog/stale-connection reconnects
     /// (a wedge shows up as one long observation).
@@ -3204,6 +3207,13 @@ impl Metrics {
             mesh_stale_conn_disconnects.clone(),
         );
 
+        let p2p_genesis_mismatch_refusals = Counter::default();
+        registry.register(
+            "torus_p2p_genesis_mismatch_refusals",
+            "Peers disconnected because their genesis digest differs from ours (or is missing)",
+            p2p_genesis_mismatch_refusals.clone(),
+        );
+
         // 50 ms .. ~102 s.
         let consensus_subscribe_delay_seconds = Histogram::new(exponential_buckets(0.05, 2.0, 12));
         registry.register(
@@ -3626,6 +3636,7 @@ impl Metrics {
             consensus_subscribed_validators,
             mesh_watchdog_disconnects,
             mesh_stale_conn_disconnects,
+            p2p_genesis_mismatch_refusals,
             consensus_subscribe_delay_seconds,
             rocksdb_l0_files,
             rocksdb_memtable_bytes,
@@ -4629,6 +4640,7 @@ mod tests {
         m.consensus_subscribed_validators.set(2);
         m.mesh_watchdog_disconnects.inc();
         m.mesh_stale_conn_disconnects.inc();
+        m.p2p_genesis_mismatch_refusals.inc();
         m.consensus_subscribe_delay_seconds.observe(0.3);
         let text = m.encode();
         for name in [
@@ -4636,6 +4648,7 @@ mod tests {
             "torus_consensus_subscribed_validators",
             "torus_mesh_watchdog_disconnects",
             "torus_mesh_stale_conn_disconnects",
+            "torus_p2p_genesis_mismatch_refusals",
             "torus_consensus_subscribe_delay_seconds",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
