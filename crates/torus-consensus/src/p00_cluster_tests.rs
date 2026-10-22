@@ -218,6 +218,7 @@ impl Cluster {
         let options = AppOptions {
             known_features: binary.known,
             exec_hold: binary.hold.clone(),
+            keep_manifests: false,
         };
         let metrics = Arc::new(torus_telemetry::Metrics::new());
         let app = TorusApp::try_new_with_options(

@@ -8220,6 +8220,12 @@ pub(crate) struct AppOptions {
     /// Test-only: hold the execution thread before a height.
     #[cfg(test)]
     pub(crate) exec_hold: Option<Arc<ExecHold>>,
+    /// Test-only: never prune a commit manifest (the state DB's WAL is never synced as far as
+    /// the manifests know), so a simulated power loss can drop the state-DB rows of every
+    /// unexecuted height and leave each one parked on its manifest
+    /// (`dead_leader_cluster_tests`).
+    #[cfg(test)]
+    pub(crate) keep_manifests: bool,
 }
 
 impl Default for AppOptions {
@@ -8228,6 +8234,8 @@ impl Default for AppOptions {
             known_features: torus_types::KNOWN_FEATURES,
             #[cfg(test)]
             exec_hold: None,
+            #[cfg(test)]
+            keep_manifests: false,
         }
     }
 }
@@ -8752,6 +8760,15 @@ impl TorusApp {
         }
 
         let commit_persist = (!manifest_in_state_db).then(|| {
+            #[cfg(test)]
+            if options.keep_manifests {
+                return CommitPersistWriter::spawn(
+                    state_db.clone(),
+                    ManifestPruner::detached(std::sync::mpsc::channel().0),
+                    metrics.clone(),
+                    header_hook.clone(),
+                );
+            }
             CommitPersistWriter::spawn(
                 state_db.clone(),
                 ManifestPruner::spawn(
@@ -51462,3 +51479,8 @@ mod crash_recovery_tests {
 #[cfg(test)]
 #[path = "p00_cluster_tests.rs"]
 mod p00_cluster_tests;
+
+/// Dead-leader skip phase 3: the multi-node tests (docs/plans/dead-leader-skip.md §4).
+#[cfg(test)]
+#[path = "dead_leader_cluster_tests.rs"]
+mod dead_leader_cluster_tests;

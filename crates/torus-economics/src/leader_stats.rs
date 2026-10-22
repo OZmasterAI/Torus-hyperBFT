@@ -755,6 +755,48 @@ mod tests {
         assert_eq!(leader_stats(mgr.state(), &addr(4)).unwrap().j, 0);
     }
 
+    /// Phase 3 (multi-node, s138): an excluded validator stays leader-eligible from the plan
+    /// boundary until the install boundary L heights later, and a dead one misses its slots in
+    /// between. Those misses must not survive into its re-admission: re-admitted, it has had no
+    /// leader slot since (excluded until the update), so the plan written at the first boundary
+    /// after its re-admission must not exclude it again. RED on 4137444b: the misses between plan
+    /// and install were counted into `miss_run`, which the re-admission kept (>= K), so the
+    /// recovered validator was excluded again at once, with j + 1.
+    #[test]
+    fn misses_between_plan_and_install_do_not_re_exclude_after_readmission() {
+        let (_d, mgr) = setup(&[100, 100, 100, 100]);
+        // K misses at 1: boundary 4 plans the exclusion for 8.
+        exec(&mgr, 1, &missed(&[4, 4, 4], 1, 4));
+        let mut view = 4;
+        quiet(&mgr, 2, 4, &mut view);
+        assert_eq!(excluded(&plan(&mgr, 8).expect("planned for 8")), vec![addr(4)]);
+        // Still leader-eligible until 8 and still dead: three more misses.
+        for h in 5..=7 {
+            view += 2;
+            exec(&mgr, h, &missed(&[4], 1, view));
+        }
+        quiet(&mgr, 8, 8, &mut view);
+        assert_eq!(installed_leader_exclusions(mgr.state()).unwrap().len(), 1);
+        assert_eq!(
+            leader_stats(mgr.state(), &addr(4)).unwrap().miss_run,
+            0,
+            "misses of a validator in the exclusion lifecycle do not count"
+        );
+        // Recovered: seen at 10, re-admitted by the plan boundary 12 writes for 16.
+        quiet(&mgr, 9, 9, &mut view);
+        view += 1;
+        exec(&mgr, 10, &signed(1, view, &[4]));
+        quiet(&mgr, 11, 16, &mut view);
+        assert!(installed_leader_exclusions(mgr.state()).unwrap().is_empty());
+        // No slot (excluded until 16) and so no miss since: the plan for 20 is empty.
+        assert_eq!(
+            plan(&mgr, 20),
+            None,
+            "re-excluded at once on the misses it had before its re-admission"
+        );
+        assert_eq!(leader_stats(mgr.state(), &addr(4)).unwrap().miss_run, 0);
+    }
+
     /// The j cap: the floor exponent never exceeds the cap (j saturates at it).
     #[test]
     fn exclusion_count_saturates_at_the_cap() {
