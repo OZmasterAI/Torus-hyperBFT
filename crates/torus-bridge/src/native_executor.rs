@@ -15742,10 +15742,12 @@ impl NativeExecutor {
     /// earlier for order kinds and rows a full block moved on, item 7 step 2) and ride
     /// that block's consensus writes (s515 F1). Item 7 option 0 (task 1.3): `state` is
     /// the block overlay (DB + the in-flight layers: parent, L, C), read after the
-    /// block's own EVM rows were absorbed into it. Those target `height + 1` or later,
-    /// so they never answer for `height`; an earlier block's row may still sit in a
-    /// layer (not durable yet), and a drained row may be a layer tombstone over a DB
-    /// row. The answer equals `pending_count > 0`. R02 (C4): a read error is a local
+    /// block's own EVM rows were absorbed into it. Without item 7 T those target
+    /// `height + 1` or later, so they never answer for `height`; with
+    /// `Feature::SameBlockCoreWriter` the non-order kinds target `height` itself and
+    /// are found here because the check runs after the absorb. An earlier block's row
+    /// may still sit in a layer (not durable yet), and a drained row may be a layer
+    /// tombstone over a DB row. The answer equals `pending_count > 0`. R02 (C4): a read error is a local
     /// fault and propagates; the caller fail-stops the block (never "assume due").
     pub fn core_writer_due<T: StateBackend>(state: &T, height: u64) -> Result<bool, CoreError> {
         Ok(state.prefix_exists(torus_state::cf::CF_CORE_WRITER_QUEUE, &height.to_be_bytes())?)
@@ -15762,10 +15764,15 @@ impl NativeExecutor {
 
     /// Drain and execute the CoreWriter actions that target this block: queued one
     /// block earlier, or K blocks earlier for order kinds (item 7 step 2), at most
-    /// `CORE_WRITER_DRAIN_CAP` rows (the cap is applied at enqueue).
+    /// `CORE_WRITER_DRAIN_CAP` rows (the cap is applied at enqueue). Item 7 T
+    /// (`Feature::SameBlockCoreWriter`): non-order kinds queued by this block's own
+    /// EVM part too, in the same-block seq range, drained first (key order); at most
+    /// `2 * CORE_WRITER_DRAIN_CAP` rows.
     ///
     /// Task 3.1.5 (anti-MEV): Asserts the delay is enforced — all
-    /// drained actions must have been queued in a strictly earlier block.
+    /// drained actions must have been queued in a strictly earlier block
+    /// (item 7 T: except same-block-range rows of non-order kinds, which may
+    /// come from this block).
     ///
     /// FIX EVM-FIND-12: Propagates drain errors instead of silently returning empty vec.
     ///
@@ -15830,8 +15837,18 @@ impl NativeExecutor {
             };
             // BUG FIX (3.1): CoreWriter delay guard — skip any action that was
             // queued in the current or a future block (should never happen, but
-            // guards against bypass bugs).
-            if qa.block_queued >= ctx.block_height {
+            // guards against bypass bugs). Item 7 T (question 9 a): per seq
+            // range under `Feature::SameBlockCoreWriter`: a non-order kind in
+            // the same-block range (seq < CORE_WRITER_ORDER_SEQ_BASE) may come
+            // from this block itself (it runs after every native batch of the
+            // block, and its contract read block-start state); an order kind,
+            // an order-range row or a later block's row may not.
+            let same_block = ctx.feature_active(torus_types::Feature::SameBlockCoreWriter)
+                && *seq < torus_types::CORE_WRITER_ORDER_SEQ_BASE
+                && !qa.kind.is_order();
+            if qa.block_queued > ctx.block_height
+                || (qa.block_queued == ctx.block_height && !same_block)
+            {
                 tracing::error!(
                     queued_block = qa.block_queued,
                     current_block = ctx.block_height,

@@ -309,3 +309,61 @@ fn drain_entries_report_the_order_id_each_placement_got() {
         "the IOC filled against the native sell and rests nowhere"
     );
 }
+
+/// Item 7 T (question 9 a): the anti-MEV delay guard is per seq range under
+/// `Feature::SameBlockCoreWriter`. A same-block-range row (seq < 200) of a
+/// non-order kind may drain in the block that queued it (it runs after every
+/// native batch of that block); an order kind there, any row of the order
+/// range (seq >= 200) and any row from a later block are still refused. With
+/// the bit off nothing queued at the drain height runs (as before).
+#[test]
+fn t_drain_guard_is_per_seq_range() {
+    let order_base = torus_types::CORE_WRITER_ORDER_SEQ_BASE;
+    let row = |db: &StateDb, seq: u64, kind: QueuedActionKind, queued: u64, trader: u8| {
+        let bytes = borsh::to_vec(&QueuedAction {
+            trader: addr(trader),
+            kind,
+            block_queued: queued,
+        })
+        .unwrap();
+        db.put_cf_raw(CF_CORE_WRITER_QUEUE, &key(2, seq), &bytes).unwrap();
+    };
+    let guard = "action queued in block 2 cannot execute in block 2";
+    for t_on in [false, true] {
+        let (_dir, db) = open_test_db();
+        // Same-block range: a deposit of block 2 (the T case), a CancelAll of
+        // block 2 (an order kind: never same-block), a deposit of block 3.
+        row(&db, 0, QueuedActionKind::LockboxDeposit { amount: fp(5) }, 2, 7);
+        row(&db, 1, QueuedActionKind::CancelAll { market_id: 1 }, 2, 12);
+        row(&db, 2, QueuedActionKind::LockboxDeposit { amount: fp(1) }, 3, 8);
+        // Order range: a deposit of block 2 (wrong range), a cancel of block 1.
+        row(&db, order_base, QueuedActionKind::LockboxDeposit { amount: fp(2) }, 2, 9);
+        row(&db, order_base + 1, QueuedActionKind::CancelOrder { order_id: 1 }, 1, 10);
+        let mut ctx = ctx(&db);
+        if t_on {
+            ctx.features = torus_types::Feature::SameBlockCoreWriter.bit();
+        }
+        let entries = NativeExecutor::drain_core_writer_entries(&mut ctx).expect("queue reads");
+        assert_eq!(ctx.take_fatal_error(), None);
+        let seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![0, 1, 2, order_base, order_base + 1], "key order");
+        let msg = |i: usize| entries[i].result.error.clone().unwrap_or_default();
+        assert_eq!(entries[0].result.success, t_on, "t_on={t_on}: same-block deposit");
+        if !t_on {
+            assert_eq!(msg(0), guard);
+        }
+        assert_eq!(msg(1), guard, "t_on={t_on}: an order kind is never same-block");
+        assert_eq!(
+            msg(2),
+            "action queued in block 3 cannot execute in block 2",
+            "t_on={t_on}: a later block's row"
+        );
+        assert_eq!(msg(3), guard, "t_on={t_on}: the order range keeps h + 1");
+        assert_ne!(msg(4), guard, "t_on={t_on}: an earlier block's order runs");
+        let credited = torus_core::position::PositionManager::new(db.clone())
+            .get_native_balance(&addr(7))
+            .unwrap()
+            .available;
+        assert_eq!(credited, if t_on { fp(5) } else { FixedPoint::ZERO });
+    }
+}
