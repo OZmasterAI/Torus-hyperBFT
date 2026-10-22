@@ -425,12 +425,11 @@ fn a_copied_byzantine_tip_does_not_strand_the_update() {
     assert!(matches!(&msg, HotStuffMessage::ProposalHeader(h) if h.block_hash == u_prime.hash), "leader(5) re-proposes U' (V2)");
     let votes = c.deliver(5, &msg, &leader5);
     assert_eq!(votes.len(), 2, "the unlocked replicas vote for U', the locked one refuses");
-    for (i, tree) in c.trees.iter().enumerate() {
-        assert!(
-            tree.local_tip().unwrap().is_none_or(|tip| tip.block_hash != u_prime.hash),
-            "replica {i} took the Byzantine tip of the validator-set-updating U'"
-        );
-    }
+    let tips: Vec<bool> = c
+        .trees
+        .iter()
+        .map(|tree| tree.local_tip().unwrap().is_some_and(|tip| tip.block_hash == u_prime.hash))
+        .collect();
 
     // The Byzantine one withholds its vote: no PC in view 5. Synchronous suffix from view 6.
     let log = c.synchronous_suffix(6, true);
@@ -441,4 +440,5 @@ fn a_copied_byzantine_tip_does_not_strand_the_update() {
             "replica {i} must commit U (re-proposed on Precommit(U, 3)) in the synchronous suffix; {log:?}"
         );
     }
+    assert_eq!(tips, vec![false; 3], "no replica takes the Byzantine tip of the validator-set-updating U'");
 }
