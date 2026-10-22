@@ -1,7 +1,8 @@
 # Dead-leader skip: design
 
-Status: design only, s134, base main 42c408e4. Derived from code; nothing measured yet (the one-validator-down
-baseline on archy will be the "before").
+Status: design s134 (base main 42c408e4); phases 1-2 built on the TC set (feat/dead-leader-p2-on-tc); phase 3
+multi-node and mutation tests s138 (§8: two bugs fixed, the 2:2:1 bench shape halts at its first exclusion, open).
+Nothing benched yet (the one-validator-down baseline on archy will be the "before").
 Paths under `crates/hotstuff_rs/src/` unless stated: **PM** pacemaker/implementation.rs, **HS**
 hotstuff/implementation.rs, **HT** hotstuff/types.rs, **RO** hotstuff/roles.rs, **VS** types/validator_set.rs;
 **TT** crates/torus-types/src/lib.rs, **APP** crates/torus-consensus/src/app.rs, **EP**
@@ -222,6 +223,112 @@ before TC phase C, since F2 checks leader(view).
 6. Excluded validators lose only proposer rewards. Acceptable? Wire `DowntimeTracker` jailing separately?
 7. A per-epoch seeded rotation order, to stop fixed-neighbour framing at n >= 7?
 8. Add (a2) now, or only if the bench shows the transient matters?
+
+## 8. Phase 3 results (s138, feat/dead-leader-p3)
+
+### Harness
+
+- **torus-consensus `dead_leader_cluster_tests.rs`:** hotstuff_rs replicas over the in-process `ChannelNetwork`, each
+  with a real `TorusApp` (state DB, consensus DB, execution pipeline, running hash), stopped, restarted and crashed
+  like processes; every state DB seeded with the genesis validators (staking rows and the installed epoch set, as
+  `torus-genesis` does). K = 3, L = 10, max view time 1 s. Expected heights come from the committed QC chain in a
+  live replica's block tree: the update is the plan of the first boundary at or above the height whose execution
+  brings the dead validator's run to K, plus L. Every test compares the running-hash write sets of the nodes that
+  ran, height by height. (Torus height = hotstuff height + 1.)
+- **hotstuff_rs `leader_exclusion_multi_node_test.rs`:** NumberApp `ExcludeLeader` / `ReadmitLeader` transactions,
+  so the update's proposer (and its view) is chosen.
+
+### Tests
+
+| Test | What it proves | Status |
+|---|---|---|
+| `dl_cluster_one_down_at_rotation_position_{0..3}` | 4 equal stakes, one never runs: the update lands exactly at the predicted height (within 2L of the K-th miss); its old slots stop costing timeouts; its stats are the exclusion's (no miss counted after the plan); never re-admitted while down (3 more boundaries); the update's Decide and the block after it attribute nothing (gap rule); write sets agree | ignored, flaky (window livelock, below) |
+| `dl_cluster_restarted_validator_is_readmitted_and_proposes` | re-admitted by the plan of the first boundary whose window holds a QC with its signature; proposes again; its success resets run and j; not excluded again | ignored, flaky |
+| `dl_cluster_readmission_floor_doubles_up_to_the_cap` | cap 1, three exclusions without a success in between: (j, floor) = (1, L), (1, 2L), (1, 2L) | ignored, flaky |
+| `dl_cluster_crash_with_execution_behind_replays_the_same_rows` | execution held at 6, commits past boundary L, crash: the boot replay executes from the durable headers and their evidence rows; plan rows agree | runs |
+| `dl_cluster_power_loss_keeps_the_leader_evidence_in_the_manifests` | power loss drops every unexecuted height's header, body and evidence rows; the heights park on their manifests and execute with the envelopes' evidence; write sets agree | runs |
+| `dl_cluster_power_loss_parked_plan_source_drains_for_the_boundary` | the same with the parked heights holding the plan source of the boundary that needs this node's vote (finding 2) | runs (K = 0) |
+| `dl_cluster_mixed_k_config_diverges_in_state_and_halts_at_the_exclusion` | one node K = 0: same headers, running hashes differ from height 1; with a validator down the chain halts below the planned update, no fork | runs |
+| `dl_cluster_crash_between_the_exclusion_plan_and_its_update` | a node crashes between the plan and the update | ignored, RED (window livelock, deterministic) |
+| `dl_cluster_2_2_1_stake_one_down_is_excluded` | the bench shape | ignored, RED (finding 4) |
+| hotstuff `exclusion_of_a_down_validator_commits_and_its_slots_stop_timing_out` | an exclusion update of a down validator commits under the TC rules (no TC-less proposal), power kept, its old slots stop timing out across pacemaker epoch changes | runs |
+| hotstuff `readmitted_validator_proposes_again` | the excluded validator syncs back, is re-admitted and leads again | runs |
+| hotstuff `{exclusion,power}_update_commits_at_2_2_1_with_the_stake_one_validator_down` | any update at 2:2:1 with the stake-1 validator down | ignored, RED (finding 4) |
+
+Repeats: the six running multi-node tests (four cluster, two hotstuff) 5 of 5 on ubuntoz at 2d24a458; the
+ignored-flaky cluster tests livelocked at the exclusion update in 3 of 24 runs on 18c; with a throwaway prototype of
+the f407d49c vote rule all ten cluster tests passed 3 of 3 (18c). torus-consensus + torus-economics + hotstuff_rs at
+2d24a458: 1283 of 1283 on cachyoz.
+
+### Findings
+
+1. **Fixed (RED af6827cc, fix 2530c354): stale misses re-excluded a re-admitted validator.** A planned validator
+   still leads until the install boundary and, dead, misses those slots; they were counted, A3 keeps the run, so it
+   came back with miss_run >= K and the next plan excluded it again (j + 1) before it led once. A validator in the
+   exclusion lifecycle now collects no misses.
+2. **Fixed (RED be86c1f9): a power-loss-parked node never drains when its vote is needed for the boundary its
+   parked heights plan.** Not dead-leader specific. After a power loss the boot parks committed heights on their
+   manifests (FIX 1b / FIX 6); they drain only with the next commit (or the rank-2 tick, off by default). If that
+   commit needs this node's vote on boundary block B and the parked heights hold B - L, the node answers
+   `EpochPlanNotReady` forever: the chain halts (one of four already down). Now the boundary paths (validate,
+   propose, vote check) dispatch what is parked; a no-op when nothing is parked.
+3. **Open (owner), = fix/vsu-window-flake f407d49c: the update window livelocks when a silent leader follows the
+   update block's Precommit PC.** The backup aggregator locks on the Precommit PC and refuses the block's
+   re-proposal (its justify is below the lock); with one of four down every vote is needed. b1 emits its exclusion
+   update exactly while a validator is down, so it hits this whenever the update is proposed two views before the
+   dead slot (3 of 24 cluster runs). The vote rule f407d49c names (a proposal of the locked block satisfies the lock)
+   makes every affected test pass.
+4. **Open (owner), critical for phase 4: at 2:2:1 with the stake-1 validator down no validator-set update commits,
+   so b1 halts the bench shape at its first exclusion.** IWRR [A, B, C] gives the dead C every third view; an update
+   needs Prepare, Precommit and Commit QCs in consecutive views (`safe_nudge` 4, `repropose_block`), and three
+   consecutive live views never come (for the first 3M of every 5M views at powers 2M/2M/1M). Without the vote rule
+   it wedges at the first Precommit lock; with the prototype it livelocks (Prepare, Precommit, timeout,
+   re-proposal: views 10 to 105 in 150 s). Pre-existing for any update (a power update wedges the same way); today
+   the bench shape just never has one. Options: (a) bench a shape where the dead validator leads at most one view in
+   four (4 equal stakes, or 2/2/1/1), after the vote rule; (b) let a view certified only by a TC (nothing proposed)
+   not break the consecutive-views chain of an update (protocol change, needs a safety argument); (c) apply an
+   exclusion-only delta without the phased protocol (it changes no voting power; agreement on leader(v) then needs
+   another mechanism); (d) b2 or a2 (§2).
+5. **Mixed K is neither refused nor consistent.** Nothing compares K across nodes. A K = 0 node commits the same
+   headers until an exclusion is due, but its state lacks the `leader_stats:` rows from height 1, so only the
+   state-hash attestation catches it. Once an exclusion is planned, the K = 3 nodes' update for that block differs
+   from the K = 0 node's (Prepare vs Generic votes): with a validator down the chain halts below the update, without
+   a fork. A refusal at startup would need K and the cap in something every node checks (a chain-config fingerprint
+   in the genesis-bound state or the handshake): owner decision.
+6. **The A2 quorum cap cannot bind on a live chain of honest-but-dead validators** (dead power <= total - quorum,
+   else no QCs): no multi-node test can kill its removal; the unit tests do.
+
+### Mutations
+
+Each applied alone, the tests listed run (the ignored cluster tests included, on the f407d49c vote-rule
+prototype so they run deterministically), restored after.
+
+| Mutation | Killed by (multi-node) | Killed by (unit) |
+|---|---|---|
+| M1 attribution ignores the installed exclusions | one_down_0 | `installed_exclusions_change_the_attributed_leaders` |
+| M2 A2 drops the quorum cap | none (finding 6) | `exclusion_never_takes_eligible_power_below_quorum`, `exclusion_keeps_eligible_power_at_quorum_most_misses_first` |
+| M3 A3 re-admits without signature evidence | one_down_0 | `readmission_needs_signature_evidence_and_the_floor`, `third_consecutive_miss_excludes_at_the_next_plan` |
+| M4 `select_leader` ignores the exclusions | one_down_0, hotstuff `exclusion_of_a_down_validator_...` | 5 `pacemaker::leader_exclusion_test` |
+| M5 no gap rule (phased QCs attributed as generic) | one_down_0 (the post-update write-set check) | `phased_and_genesis_qcs_skip_attribution` |
+| M6 K off by one (miss_run > K) | one_down_1, one_down_3 | 9 `leader_stats` |
+| M7 the floor ignores j | readmission_floor_doubles_up_to_the_cap | `exclusion_count_saturates_at_the_cap`, `readmission_floor_doubles_until_a_success` |
+| M8 j not capped | readmission_floor_doubles_up_to_the_cap | `exclusion_count_saturates_at_the_cap` |
+| M9 a missing evidence row guessed (no fail-stop) | none (never missing on the cluster) | `dead_leader_missing_evidence_fail_stops` |
+| M10 the manifest carries no evidence | power_loss_keeps_the_leader_evidence | `dead_leader_evidence_survives_a_power_loss_that_keeps_the_manifest`, `dead_leader_kill_after_the_manifest_heals_in_either_order`, `dead_leader_commit_writes_the_evidence_row` |
+| M11 the header batch carries no evidence row | crash_with_execution_behind, power_loss_keeps_the_leader_evidence | `dead_leader_evidence_survives_with_the_header_after_the_manifest_prune` and 2 more |
+| M12 dispatch ignores the manifest's evidence | power_loss_keeps_the_leader_evidence | `dead_leader_evidence_survives_a_power_loss_that_keeps_the_manifest`, `dead_leader_kill_after_the_manifest_heals_in_either_order` |
+| M13 consensus ignores the exclusion plan | one_down_0 | `boundary_updates_carry_the_leader_exclusion_delta` |
+| M14 execution never installs `lx_current` | one_down_0 | 8 (`dead_leader_rows_identical_*`, `leader_stats`) |
+| M15 a success does not reset j | restarted_validator_is_readmitted_and_proposes | `readmission_floor_doubles_until_a_success` |
+| M16 lifecycle misses counted (finding 1 reverted) | one_down_0, restarted_validator_is_readmitted_and_proposes | `misses_between_plan_and_install_do_not_re_exclude_after_readmission` |
+| M17 the installed-set cache key ignores the exclusions row | one_down_0 | none |
+
+### Phase 4 (bench) prerequisites
+
+- The f407d49c vote rule merged (else roughly one exclusion in three livelocks the window at 4 equal stakes).
+- Finding 4 decided: the planned 2:2:1 `KILL_NO_RESTART=val2` cell halts at the first exclusion update. A 4-equal
+  (or 2/2/1/1) one-down cell works with the vote rule.
+- Then: kill-to-exclusion time (expected 1-2 epochs after the 3rd miss), blocks/s before and after.
 
 Sources: Aptos consensus_config.rs (LeaderReputation defaults); Aptos governance proposal 12 (exclude_round 20->40);
 Hyperliquid staking docs (jailing); Monad docs (MonadBFT); Chorus One, Monad architecture.
