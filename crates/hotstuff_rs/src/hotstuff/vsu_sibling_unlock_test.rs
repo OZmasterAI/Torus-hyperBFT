@@ -479,3 +479,109 @@ fn byzantine_tip_of_the_sibling_in_view_4() -> (Cluster, (TipInfo, PhaseCertific
     assert_eq!(votes.len(), 2, "the unlocked replicas vote for U', the locked one refuses");
     (c, (tip, prepare2))
 }
+
+/// Codex adversarial probe on 8bd323af (fix/tc-embedded-chain-id): the same validator keys sign
+/// another chain (chain 7), where a real quorum of honest votes certifies a genesis-justified
+/// sibling of the block chain 0 committed at height 0. The Byzantine validator reports that chain-7
+/// QC as its highest QC in TC(4) of chain 0; `TimeoutCertificate::is_correct` checked only its
+/// signatures, so the TC was valid and its high QC (view 4, above every lock) the unlock witness:
+/// all three honest replicas voted for the sibling, which then committed at replica 1 while
+/// replica 0 had committed the original block. A TC must not carry another chain's QC.
+#[test]
+fn a_qc_of_another_chain_in_a_tc_does_not_unlock_a_conflicting_sibling() {
+    use crate::hotstuff::header_fast_path_regression_test::NullNetwork;
+    use crate::hotstuff::implementation::{HotStuff, HotStuffConfiguration};
+    use crate::networking::{network::ValidatorSetUpdateHandle, sending::SenderHandle};
+
+    let mut c = Cluster::new(4);
+    c.trees = c.honest.iter().map(|_| steady_block_tree(&c.set).0).collect();
+    let committed = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(), CryptoHash::new([31; 32]), Data::new(vec![]));
+    let sibling = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(), CryptoHash::new([32; 32]), Data::new(vec![]));
+    for tree in &mut c.trees {
+        tree.insert(&committed, None, None).unwrap();
+    }
+    let ordinary_header = |block: &Block, view, tc| ProposalHeader { has_validator_set_updates: false, ..header(block, view, tc) };
+
+    // Chain 0: QC(committed, 1), its child, QC(child, 2); replica 0 commits `committed`.
+    let leader1 = c.leader(1);
+    let votes1 = c.deliver(1, &HotStuffMessage::ProposalHeader(signed_by(ordinary_header(&committed, 1, None), &leader1)), &leader1);
+    assert_eq!(votes1.len(), 3);
+    let qc1 = certify(1, votes1, &c.set);
+    let child = Block::new(BlockHeight::new(1), qc1.clone(), CryptoHash::new([33; 32]), Data::new(vec![]));
+    for tree in &mut c.trees {
+        tree.insert(&child, None, None).unwrap();
+    }
+    let leader2 = c.leader(2);
+    let votes2 = c.deliver(2, &HotStuffMessage::ProposalHeader(signed_by(ordinary_header(&child, 2, None), &leader2)), &leader2);
+    assert_eq!(votes2.len(), 3);
+    let qc2 = certify(2, votes2, &c.set);
+    let key0 = c.honest[0].clone();
+    run(&mut c.trees[0], &key0, 3, HotStuffMessage::NewView(NewView { chain_id: CHAIN_ID, view: ViewNumber::new(2), highest_pc: qc2.clone() }), &leader2);
+    assert!(c.trees[0].highest_committed_block().unwrap() == Some(committed.hash), "fixture: replica 0 commits `committed`");
+    assert!(c.trees[1].highest_committed_block().unwrap().is_none());
+
+    // Chain 7: honest replicas (same keys, fresh trees) vote for the sibling in view 4; no vote
+    // equivocates within chain 7.
+    let foreign_chain = ChainID::new(7);
+    let leader4 = c.leader(4);
+    let foreign_header = signed_by(ProposalHeader { chain_id: foreign_chain, ..ordinary_header(&sibling, 4, None) }, &leader4);
+    let mut foreign_collector = PhaseVoteCollector::new(foreign_chain, ViewNumber::new(4), c.set.clone());
+    let mut foreign_qc = None;
+    for key in &c.honest {
+        let (mut tree, vss) = steady_block_tree(&c.set);
+        tree.insert(&sibling, None, None).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut hs = HotStuff::new(
+            HotStuffConfiguration { chain_id: foreign_chain, keypair: Keypair::new(key.clone()) },
+            ViewInfo::new(ViewNumber::new(4), Instant::now() + Duration::from_secs(3600)),
+            SenderHandle::new(NullNetwork),
+            ValidatorSetUpdateHandle::new(NullNetwork),
+            vss,
+            Some(tx),
+        );
+        hs.on_receive_msg(HotStuffMessage::ProposalHeader(foreign_header.clone()), &leader4, &mut tree, &mut TreeApp).unwrap();
+        let vote = rx
+            .try_iter()
+            .find_map(|e| if let Event::PhaseVote(e) = e { Some(e.vote) } else { None })
+            .expect("an honest chain-7 vote");
+        foreign_qc = foreign_collector.collect(&key.verifying_key(), vote).or(foreign_qc);
+    }
+    let foreign_qc = foreign_qc.expect("a real chain-7 quorum");
+
+    // Chain 0, view 5: leader(5) proposes the sibling with TC(4) whose high QC is chain 7's.
+    for tree in &mut c.trees {
+        tree.insert(&sibling, None, None).unwrap();
+    }
+    let tc = timeout_certificate(
+        4,
+        vec![
+            (c.honest[0].clone(), None, Some(qc2)),
+            (c.honest[1].clone(), None, Some(qc1)),
+            (c.byzantine.clone(), None, Some(foreign_qc)),
+        ],
+        &c.set,
+    );
+    let leader5 = c.leader(5);
+    let votes5 = c.deliver(5, &HotStuffMessage::ProposalHeader(signed_by(ordinary_header(&sibling, 5, Some(tc)), &leader5)), &leader5);
+    let sibling_votes = votes5.len();
+    if sibling_votes >= 3 {
+        // The probe's continuation: the sibling commits at replica 1.
+        let qc5 = certify(5, votes5, &c.set);
+        let sibling_child = Block::new(BlockHeight::new(1), qc5, CryptoHash::new([34; 32]), Data::new(vec![]));
+        for tree in &mut c.trees {
+            tree.insert(&sibling_child, None, None).unwrap();
+        }
+        let leader6 = c.leader(6);
+        let votes6 = c.deliver(6, &HotStuffMessage::ProposalHeader(signed_by(ordinary_header(&sibling_child, 6, None), &leader6)), &leader6);
+        assert_eq!(votes6.len(), 3);
+        let qc6 = certify(6, votes6, &c.set);
+        let key1 = c.honest[1].clone();
+        run(&mut c.trees[1], &key1, 7, HotStuffMessage::NewView(NewView { chain_id: CHAIN_ID, view: ViewNumber::new(6), highest_pc: qc6 }), &leader6);
+    }
+    let committed_at = |i: usize| c.trees[i].highest_committed_block().unwrap();
+    assert!(
+        committed_at(1).is_none_or(|hash| hash == committed.hash),
+        "AGREEMENT VIOLATED: replica 0 committed `committed`, replica 1 the sibling (on {sibling_votes} sibling votes)"
+    );
+    assert_eq!(sibling_votes, 0, "honest replicas voted for the conflicting sibling on chain 7's QC");
+}
