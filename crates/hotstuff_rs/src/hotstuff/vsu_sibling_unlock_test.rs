@@ -199,14 +199,20 @@ impl Cluster {
         self.deliver(view, &msg, origin);
     }
 
-    /// TC(`view`) from the honest replicas' timeout votes (their local tip and highest QC).
-    fn honest_tc(&self, view: u64) -> TimeoutCertificate {
-        let entries = self
+    /// TC(`view`) from the honest replicas' timeout votes (their local tip and highest QC), or,
+    /// with `byzantine`, from the Byzantine timeout vote (that tip and QC) and the first two
+    /// honest ones (it arrives first).
+    fn timeout_certificate(&self, view: u64, byzantine: Option<&(TipInfo, PhaseCertificate)>) -> TimeoutCertificate {
+        let mut entries: Vec<_> = self
             .honest
             .iter()
             .zip(&self.trees)
             .map(|(k, tree)| (k.clone(), tree.local_tip().unwrap(), tree.highest_qc_for_timeout().unwrap()))
             .collect();
+        if let Some((tip, qc)) = byzantine {
+            entries.truncate(2);
+            entries.insert(0, (self.byzantine.clone(), Some(tip.clone()), Some(qc.clone())));
+        }
         timeout_certificate(view, entries, &self.set)
     }
 
@@ -238,12 +244,18 @@ impl Cluster {
             .unwrap_or_else(|| panic!("the leader of view {view} proposes or nudges"))
     }
 
-    /// The synchronous suffix from `first` (TC(first - 1) from the honest replicas if
-    /// `previous_failed`): the Byzantine validator is silent (no votes; no message in the views
-    /// it leads), honest leaders run their own leader rules, every honest replica receives every
-    /// message, and every PC the honest votes form reaches every honest replica. Runs until every
-    /// honest replica committed a block or 30 views passed; returns a log line per view.
-    fn synchronous_suffix(&mut self, first: u64, mut previous_failed: bool) -> Vec<String> {
+    /// The synchronous suffix from `first` (TC(first - 1) if `previous_failed`): the Byzantine
+    /// validator casts no vote and sends nothing in the views it leads; it sends no timeout vote
+    /// either, unless `byzantine_timeout` (then its vote, with that tip and QC, is in every TC).
+    /// Honest leaders run their own leader rules, every honest replica receives every message,
+    /// and every PC the honest votes form reaches every honest replica. Runs until every honest
+    /// replica committed a block or 30 views passed; returns a log line per view.
+    fn synchronous_suffix(
+        &mut self,
+        first: u64,
+        mut previous_failed: bool,
+        byzantine_timeout: Option<&(TipInfo, PhaseCertificate)>,
+    ) -> Vec<String> {
         let byzantine_vk = self.byzantine.verifying_key();
         let mut log = Vec::new();
         for view in first..first + 30 {
@@ -256,7 +268,7 @@ impl Cluster {
                 previous_failed = true;
                 continue;
             }
-            let tc = previous_failed.then(|| self.honest_tc(view - 1));
+            let tc = previous_failed.then(|| self.timeout_certificate(view - 1, byzantine_timeout));
             let msg = self.leader_message(view, tc.as_ref());
             let what = match &msg {
                 HotStuffMessage::ProposalHeader(h) => format!("proposal of {}", self.name(&h.block_hash)),
@@ -373,7 +385,7 @@ fn locked_replica_votes_for_a_sibling_certified_above_its_lock() {
     assert!(c.trees[locked].locked_pc().unwrap() == precommit3, "the lock on U stays");
 
     // View 5's nudge is lost. Synchronous suffix from view 6.
-    let log = c.synchronous_suffix(6, true);
+    let log = c.synchronous_suffix(6, true, None);
     for (i, tree) in c.trees.iter().enumerate() {
         assert_eq!(
             tree.highest_committed_block().unwrap(),
@@ -395,6 +407,46 @@ fn locked_replica_votes_for_a_sibling_certified_above_its_lock() {
 /// refuses it (no PC certifies U'), and nothing is ever committed.
 #[test]
 fn a_copied_byzantine_tip_does_not_strand_the_update() {
+    let (mut c, _) = byzantine_tip_of_the_sibling_in_view_4();
+    let (u, u_prime) = (c.u.clone(), c.u_prime.clone());
+    let tips: Vec<bool> = c
+        .trees
+        .iter()
+        .map(|tree| tree.local_tip().unwrap().is_some_and(|tip| tip.block_hash == u_prime.hash))
+        .collect();
+
+    // The Byzantine one withholds its vote: no PC in view 5. Synchronous suffix from view 6.
+    let log = c.synchronous_suffix(6, true, None);
+    for (i, tree) in c.trees.iter().enumerate() {
+        assert_eq!(
+            tree.highest_committed_block().unwrap(),
+            Some(u.hash),
+            "replica {i} must commit U (re-proposed on Precommit(U, 3)) in the synchronous suffix; {log:?}"
+        );
+    }
+    assert_eq!(tips, vec![false; 3], "no replica takes the Byzantine tip of the validator-set-updating U'");
+}
+
+/// RESIDUAL, not fixed (docs/plans/disjoint-vset-livelock.md section 9, "Active Byzantine
+/// tip"): the same prefix, but the Byzantine validator stays active after it. It casts no vote,
+/// yet its timeout vote, carrying its own tip (U', 4), arrives first and is in every TC; the tip
+/// beats every honest QC (Precommit(U, 3) at most), so every honest leader re-proposes U' (V2),
+/// which no PC certifies, and replica 0, locked on U, refuses it. Needs a decision on the
+/// leader / NEC rules for a validator-set-updating tip (see the doc).
+#[test]
+#[ignore = "residual liveness gap: an active Byzantine VSU tip (disjoint-vset-livelock.md section 9)"]
+fn an_active_byzantine_tip_does_not_strand_the_update() {
+    let (mut c, byzantine_timeout) = byzantine_tip_of_the_sibling_in_view_4();
+    let u = c.u.clone();
+    let log = c.synchronous_suffix(6, true, Some(&byzantine_timeout));
+    for (i, tree) in c.trees.iter().enumerate() {
+        assert_eq!(tree.highest_committed_block().unwrap(), Some(u.hash), "replica {i} must commit U; {log:?}");
+    }
+}
+
+/// The prefix of the copied-tip livelock, up to the failed view 5; returns the Byzantine
+/// timeout vote's tip (U', 4) and QC (Prepare(U, 2)).
+fn byzantine_tip_of_the_sibling_in_view_4() -> (Cluster, (TipInfo, PhaseCertificate)) {
     let mut c = Cluster::new(4);
     let (u, u_prime) = (c.u.clone(), c.u_prime.clone());
     let byzantine_vk = c.byzantine.verifying_key();
@@ -415,7 +467,7 @@ fn a_copied_byzantine_tip_does_not_strand_the_update() {
     let entries = vec![
         (c.honest[1].clone(), None, Some(prepare2.clone())),
         (c.honest[2].clone(), None, Some(prepare2.clone())),
-        (c.byzantine.clone(), Some(tip), Some(prepare2.clone())),
+        (c.byzantine.clone(), Some(tip.clone()), Some(prepare2.clone())),
     ];
     let tc4 = timeout_certificate(4, entries, &c.set);
     assert!(tc4.high_tip_is_winner);
@@ -425,20 +477,5 @@ fn a_copied_byzantine_tip_does_not_strand_the_update() {
     assert!(matches!(&msg, HotStuffMessage::ProposalHeader(h) if h.block_hash == u_prime.hash), "leader(5) re-proposes U' (V2)");
     let votes = c.deliver(5, &msg, &leader5);
     assert_eq!(votes.len(), 2, "the unlocked replicas vote for U', the locked one refuses");
-    let tips: Vec<bool> = c
-        .trees
-        .iter()
-        .map(|tree| tree.local_tip().unwrap().is_some_and(|tip| tip.block_hash == u_prime.hash))
-        .collect();
-
-    // The Byzantine one withholds its vote: no PC in view 5. Synchronous suffix from view 6.
-    let log = c.synchronous_suffix(6, true);
-    for (i, tree) in c.trees.iter().enumerate() {
-        assert_eq!(
-            tree.highest_committed_block().unwrap(),
-            Some(u.hash),
-            "replica {i} must commit U (re-proposed on Precommit(U, 3)) in the synchronous suffix; {log:?}"
-        );
-    }
-    assert_eq!(tips, vec![false; 3], "no replica takes the Byzantine tip of the validator-set-updating U'");
+    (c, (tip, prepare2))
 }

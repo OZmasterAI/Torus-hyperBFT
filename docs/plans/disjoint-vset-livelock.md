@@ -304,10 +304,119 @@ decides the update. The justify-only rule and 93948e2b's rule both fail (93948e2
 above); the fix passes, a committed-locked-block vote is exercised, and Agreement holds with a conflicting sibling U'.
 Outside this fix: with the sibling U' the suffix property also fails under the fixed rule (replica locked on U, highest PC a
 Prepare on U', U' re-proposed with its stale justify); the model ignores the TC-required V1-V4 rules, which may exclude
-that proposal, so it is not a confirmed bug.
+that proposal, so it is not a confirmed bug. (Confirmed with V1-V4 by Codex, and fixed: §9.)
 
 **Model check.** `tests/stateright_2chain_safety.rs` now has re-proposals (a block certified again in a later view,
 children on any parent QC) and the reflexive arm: Agreement holds and the reflexive arm is used
 (`reflexive_lock_with_reproposals_upholds_agreement`, views 2..=4 in the suite; views 2..=5 `#[ignore]`d, ~9 min).
 
 No message, signing or DB format change.
+
+## 9. Sibling unlock and validator-set-update tips (s138, fix/vsu-sibling-unlock)
+
+**Bug 1 (Codex torus-adversarial P1 on 8af2b949, the sibling livelock).** 4 validators, one Byzantine, the leader of
+view 3. Prepare(U, 2) and Precommit(U, 3) form; only the backup aggregator leader(5) learns Precommit(U, 3) and locks
+on U. The Byzantine leader signs a header of U' (a sibling of U: same parent A, same justify QC(A, 1)) for its view 3
+and reports it as its tip, so TC(3) (two unlocked honest replicas reporting Prepare(U, 2), plus the Byzantine one) is
+correct and its high tip wins. Honest leader(4) re-proposes U' (V2); the locked replica refuses it, the other two and
+the Byzantine one certify Prepare(U', 4), which everyone learns. View 5's nudge is lost. Every later TC's high QC is
+Prepare(U', 4), so leaders re-propose U' with its stale justify (`repropose_block`; V3 admits "the high QC's block"),
+and the replica locked on Precommit(U, 3) refuses it: the justify is older than the lock and does not extend U, and U'
+is not its locked block. With the Byzantine one withholding, two honest votes never make a quorum of three. Test:
+`vsu_sibling_unlock_test::locked_replica_votes_for_a_sibling_certified_above_its_lock` (RED 35a8454b: 2 honest votes
+in every view through view 30).
+
+**Fix 1: the certified arm.** For a proposed block B (justify J) the lock is also satisfied when a correct PC on B
+itself has a view strictly greater than `locked_pc.view` (`invariants::certified_above_lock`, a third arm of
+`safe_proposal_lock`). Two PCs count: the high QC of the TC the proposal carries (checked first by
+`valid_proposal_certificates`: `TimeoutCertificate::is_correct` verifies the high QC) and the replica's own highest
+PC (verified when it was accepted). It is the liveness clause ("J.view > lock.view, and B extends J.block") with B's
+own certificate in place of its justify: B extends (is) that PC's block. Strictly greater, like `pc_to_lock`.
+Sites, all through `safe_proposal_lock(block_hash, justify, tc_high_qc, block_tree)`: the full proposal path
+(`safe_block`, `proposal.tc`), the header path in both branches (`header.tc`), `cast_header_vote` (`header.tc`), the
+recovery re-proposal `on_receive_proposal_response` (the recovery's TC) and the block-sync log-only check (`None`).
+Unchanged: `safe_nudge`, `safe_pc` for PCs on their own, `pc_to_lock`, `block_to_commit`, V1-V4.
+
+**Why it is safe.** Lemma: if a block C is committed with a Commit PC of view c (so Precommit(C, c-1) exists:
+`safe_nudge` 4 makes the phases consecutive), every PC of view >= c-1 certifies C or a descendant. Suppose not, and
+let P (view w >= c-1, block X) be the first such PC formed, in real time. If w is c-1 or c, P's signers and those of
+Precommit(C, c-1) or Commit(C, c) share an honest replica, which votes once per view: contradiction. So w > c. P's
+signers and the Commit PC's signers share an honest replica h. h voted Commit in view c before voting in view w
+(`highest_view_voted` only grows), and before that Commit vote it held a lock of view >= c-1 (it processed the
+nudge's Precommit(C, c-1): `pc_to_lock` locks on it unless the lock is already at least that new). Locks only move
+forward, so when h voted for X its lock L had view >= c-1; L was formed before P, so L's block extends C. Every PC h
+used for that vote was formed before P too, so each one of view >= c-1 extends C. h voted for X through one of:
+- a nudge or Decide justify J (`safe_pc`, unchanged): J newer than L (view >= c-1, so J's block X extends C), or J's
+  block extends L's;
+- a proposal of X with justify J: J newer than L (J extends C, and X extends J's block), or J extends L, or X is L's
+  block (reflexive, §8), or **(new) a correct PC W on X newer than L**: W was formed before P and has view > c-1, so
+  W's block, X, extends C.
+In every case X extends C: contradiction. So no block conflicting with C is ever certified at a view >= c-1, so none
+is committed (Agreement). The pipelined 2-chain commit (QC(B, r), then QC(child, r+1), whose voters lock on QC(B, r))
+has the same proof from view r. The new arm is used exactly where the liveness clause is ("a PC newer than the lock
+that the proposed block extends"), with the block's own certificate as that PC.
+
+**Interactions.**
+1. *Phases of an update.* A vote through the certified arm is a proposal vote: Prepare for a validator-set-updating
+   block, Generic otherwise. Precommit, Commit and Decide votes still come only from nudges (`safe_nudge`, consecutive
+   views), so the commit rules are unchanged. The locked replica moves its lock to U' only on a Precommit PC on U'
+   (`pc_to_lock`, strictly newer). A replica that committed U never sees a PC on U' newer than its lock (it locked on
+   U's Precommit, Commit or Decide PC, at view >= c-1; lemma), so the arm cannot make it vote for a sibling of its
+   committed block.
+2. *The stale justify.* As for the reflexive arm (§8 point 3): the header path runs `update_locks_only(J)` and the body
+   path `update(J)` on a justify that fails the lock clause. Highest PC and lock only move forward, J commits only
+   ancestors through valid certificates, and a Decide J decides only its own (already decided) update: the same
+   processing every replica not locked on U does for the same proposal.
+3. *V1-V4.* Checked before the lock and unchanged. The certified arm reads the TC's high QC only after the TC is
+   verified. It is the lock-side counterpart of V3's "or the high QC's block" arm.
+4. *Reflexive lock (§8).* Unchanged; for the locked block itself it already passes.
+5. *Signed tips.* See fix 2. The arm never sets a tip.
+6. *M2 freshness (fix/m2-timestamp-lower-bound).* `freshness_exempt`'s "certified" case is exactly the blocks of the
+   highest PC, the locked PC and the TC's high QC, i.e. the blocks the reflexive and certified arms admit with a stale
+   justify, so every re-proposal the new arm admits is freshness-exempt there too. Both branches touch
+   `on_receive_proposal` and `cast_header_vote` (M2 adds an argument to `vote_check`, this branch to
+   `safe_block` / `safe_proposal_lock` and the tip rule); textual merge only.
+7. *Equivocation / slashing.* Unchanged (one vote per view, on one hash).
+
+**Bug 2 (found by the extended model, every lock rule, also on main): the copied tip.** The Byzantine validator leads
+view 4. Replica 0 alone locks on Precommit(U, 3). The Byzantine leader signs a header of U' for view 4 and TC(4)
+(replicas 1 and 2 reporting Prepare(U, 2), plus the Byzantine tip (U', 4)) has that tip winning; honest leader(5)
+re-proposes U' (V2); replicas 1 and 2 vote for it and, as a TC re-proposal vote, COPY the TC's tip (U', 4); replica 0
+refuses; the Byzantine one withholds. From then on every honest TC has the tip (U', 4) beating replica 0's
+Precommit(U, 3) (4 > 3), so every leader re-proposes U', which no PC certifies, and replica 0 refuses it forever,
+even with the Byzantine validator gone. Test: `vsu_sibling_unlock_test::a_copied_byzantine_tip_does_not_strand_the_update`
+(RED 573228a7: real leaders re-propose U' in every view, 2 honest votes); model:
+`copied_validator_set_update_tips_strand_the_update`.
+
+**Fix 2: only a Generic vote takes a tip** (`HotStuff::vote_takes_tip`, both vote paths). A Prepare vote (a
+validator-set-updating block) leaves the local tip, also on a TC re-proposal; so does a Generic vote on a block this
+replica holds as validator-set-updating (a Byzantine leader's mislabeled header). Why it is safe: tips are a
+liveness device (tail-fork resistance); commit safety comes from the lock alone (tc-required-and-tip-signing.md §4).
+The tail-fork argument keeps a block 2f+1 replicas voted for as the tip across timeout views; votes on
+validator-set-updating blocks never set a tip for a fresh proposal, so no honest vote ever made such a block a tip,
+and the copy only spread a Byzantine one. NE signing (`last_voted_proposal`) is unchanged.
+
+**Residual, not fixed (needs a decision): an active Byzantine tip.** With fixes 1 and 2 every model state decides in
+the synchronous suffix where the Byzantine validator is silent. If it stays active it can put its own tip of a
+sibling, signed in a view it led and above every honest QC, into every TC (its timeout vote arrives first); the tip
+wins, every honest leader re-proposes that sibling (V2), the replicas locked on the other block refuse it, and it
+withholds its vote. An NEC does not help today: the replicas that voted for the re-proposal in the TC's view withhold
+their No-Endorsement, and an NEC proposal extends the tip's justify (QC(A, 1)), which the locked replicas refuse too.
+Test: `vsu_sibling_unlock_test::an_active_byzantine_tip_does_not_strand_the_update` (`#[ignore]`, RED). Options, none
+built:
+- (a) leader-local: an honest leader never re-proposes a winning tip whose block it holds as validator-set-updating
+  (no honest vote made it a tip); it seeks an NEC as for a missing tip (honest replicas then never voted for it, so
+  all sign), and an NEC proposal acts on the TC's high QC (`propose_from_highest_pc`, re-proposing U here) instead of
+  extending the tip's justify. Changes MonadBFT recovery; the Generic-tip case needs its own look.
+- (b) format: bind the validator-set-update flag into the signed header and tip, and let a validator-set-updating
+  tip never win a TC. Uniform, but a header / TC format change (genesis-bound).
+
+**Model.** `tests/stateright_vsu_mixed_commit.rs` gained signed tips and V1-V4 (`tips`): a proposal of U or U' in
+view v > 2 carries a TC(v-1) formed then from any three timeout votes (honest: local tip, `highest_qc_for_timeout`;
+Byzantine: any formed PC, any tip it can sign) and must satisfy V2 / V3; with `copy_tips` a TC re-proposal vote copies
+the TC's tip; the suffix forms honest TCs, re-proposes a winning tip (case 4) or acts on the high QC; the Byzantine
+validator leads view 3 or 4. Results: the reflexive rule strands a certified sibling (the Codex trace); the certified
+arm (`LockRule::Unlock`) keeps Agreement even with ANY formed PC as the witness and no V1-V4, decides after a mixed
+commit, and with signed tips decides from every state for Byzantine views 3 and 4 when votes on updating blocks copy
+no tip; with the copy, a Byzantine view-4 tip strands the update under every rule. No message, signing or DB format
+change.
