@@ -37,6 +37,8 @@ Pull tools from main before the next campaign that has crash cells.
 explicitly for mode-3 arms. Each cell logs `cell=<label> book_mode=... <flag>='...'` and records `cell.book_mode` /
 `cell.node_flags` in summary.json. Pull tools from main before the next campaign.
 
+**Live status (18c main session, updated s138):** 9k RUNNING on ozarchy since 14:10 (`bench-ozarchy-9k2`, pre-TC `896240d4`, node md5 4719fce1, smokes U std / K std / K deep PASS, ETA ~17:45). Next on ozarchy: 9l / 9m / 9n, then 9o 'before' cells. 9o 'after' arm waits for batch 12 = D2 membership sync (`fix/vset-membership-sync`, Codex adversarial: approve) + lost-view timeout vote + reflexive lock rule (`fix/vsu-lock-reflexive`, cachyoz gate nextest 4715/4715, Codex adversarial review running); 18c pings archy when it lands. 9p waits for dead-leader phases 1-3 (`feat/dead-leader-p3`, Codex: no findings), batch 12, and 4-validator run-cell.sh support (`tools/run-cell-4val`, building).
+
 **Owner s138: benches UNPAUSED.** Order: 9k first (pre-TC `896240d4`, a clean "before"); then 9l / 9m / 9n in any order; 9o's "after" arm on main after batch 12 (D2 membership sync + lost-view timeout vote + reflexive lock rule; 18c pings when it lands; its "before" cells may run earlier); 9p held until dead-leader phase 3 lands. Main now has the TC set (`d3de0abb`, `CONSENSUS_DB_FORMAT` v1): wipe data dirs for cells built from it; dead-leader will bump to v2.
 
 **Defaults on main (s136, batch 10 `2d2f3ed9`; pull main before preparing any cell):**
