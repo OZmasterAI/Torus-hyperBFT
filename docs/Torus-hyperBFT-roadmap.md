@@ -565,6 +565,20 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
   WAN, the push-manifest threshold, the 250 ms header re-send check, L4.1-L4.4 from `docs/perf/8k-explore-ideas.md`
   and the T3.1 follow-ups. Also decided at the trial net: which node runs `--archive` (owner s134). The genesis
   questions it needs answered first are in `plans/testnet-genesis-checklist.md`.
+- **Deep-book capacity re-check before the testnet (s136).** The 1M-account RAM check (bench 8f, perf doc section 93,
+  s68) PASSED: 8.1-9.2 GB per node under load (limit ~15 GB), restarts 2-11 s (limit 60 s). Its open finding is
+  throughput with ~1-1.7M resting orders: matched/s -14.3%, native blocks/s 13.3 -> 3.0, p50 15 -> 240 ms, book save
+  4.0 -> 76.7 ms per block. L3.1 / L3.3 / L6.1 since target that save (deep `save_order_books` 56.4 -> 0.71 ms per
+  block, sections 117, 120), but 8f was not re-run on them. **Status s136: OPEN, blocked by the bench pause.** Re-run
+  8f on main after batch 10 (queued on hold as 9n, not yet on main's bench queue).
+- **Item 6 Phase 5 (full in-memory execution): PARKED s128, re-assessed s136: stay parked, measure first.** Nothing
+  landed since s128 removes step 2's cost (+5% exec-thread CPU per fill, section 91); L3.3 / L3.1 / L6.1 and L2.2
+  already took most of its gain (sections 101, 108, 117, 120). New headroom: exec thread 84-88% busy (was 94.5%),
+  flush worker 13-21% busy (section 124). Trigger 2 (flush_all / save_order_books back among top exec costs) is
+  unconfirmed: the last exec profile (8u, section 105) predates L3.1 / L6.1. **Next:** an exec profile on the batch-10
+  head, standard + deep (~1-1.5 h; queued on hold as 9m). Revisit only if cache flush + overlay writes are still
+  >= ~15% of exec-thread CPU: rebase step 2 (492 commits behind), move the drain to the flush worker, re-A/B under
+  the exec-path rule (`plans/item6-phase5-impl.md`).
 - **Book storage mode for the testnet genesis (s131).** **Status s136: DECIDED, Classic.** 9j stage 2 (perf doc
   section 124, `af53295c`; one binary `perf/h2h-combined` `29bfc705`, hash on + attestation in both arms, n = 4):
   Classic CL21 (L3.1 + L6.1 + L2.1, 15 s checkpoints; the Classic arm by owner exception, section 123) beats mode 3

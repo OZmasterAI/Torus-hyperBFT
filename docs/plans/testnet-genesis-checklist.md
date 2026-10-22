@@ -87,3 +87,7 @@ waiting for a merge). "Blocks" names what cannot be finished until the item is s
 - Dead-leader b1 phases 2-4: only if it goes into the genesis (section 2).
 - M2: only if the conflict resolves to "before genesis" (section 2).
 - Item 7 T: only if the s127 order still holds (section 4).
+- Capacity (not a genesis field, a launch-readiness check): the 1M-account RAM check PASSED (bench 8f, perf doc
+  section 93: 8.1-9.2 GB per node, restarts <= 11 s). Open: its deep-book throughput finding (~1-1.7M resting
+  orders: matched/s -14.3%, blocks/s 13.3 -> 3.0) predates L3.1 / L6.1. Re-run 8f on main after batch 10 (9n, on
+  hold; blocked by the bench pause). Open question: does a re-run gate the launch?
