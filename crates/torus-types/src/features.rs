@@ -34,7 +34,7 @@ pub enum Feature {
     /// from the side's quote balance and credits the sum to the treasury's
     /// native balance. Not in any built-in table and not in
     /// [`DEFAULT_GENESIS_ACTIVATIONS`]: off until a release schedules it.
-    TradingFees = 2,
+    TradingFees = 4,
     /// TEST-ONLY (cargo feature `test-features`, enabled from
     /// torus-consensus's dev-dependencies; no node build reaches it): the P0.0
     /// integration tests' feature with a state-visible rule (the block pipeline
@@ -275,9 +275,9 @@ mod tests {
         // of phase 5, P2): see `known_features_never_hold_a_test_feature`.
         assert_eq!(Feature::BookWindowCommit.id(), 1);
         assert_eq!(Feature::BookWindowCommit.name(), "book_window_commit");
-        assert_eq!(Feature::TradingFees.id(), 2);
+        assert_eq!(Feature::TradingFees.id(), 4);
         assert_eq!(Feature::TradingFees.name(), "trading_fees");
-        assert_eq!(KNOWN_FEATURES, 0b111);
+        assert_eq!(KNOWN_FEATURES, 0b1_0011);
         assert_eq!(first_unknown_feature_in(0b11, 0b01), Some(1));
         assert_eq!(first_unknown_feature_in(0b01, 0b01), None);
         assert_eq!(unknown_features(0b1001), 0b1000);

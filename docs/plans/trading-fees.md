@@ -11,7 +11,8 @@ native ledger (`NativeBalance.available`, `FixedPoint`, 8 decimals). The two nev
 
 ## Feature bit
 
-`Feature::TradingFees = 2`, name `trading_fees`. In `KNOWN_FEATURES`, **not** in the
+`Feature::TradingFees = 4`, name `trading_fees` (ids 2 and 3 are taken by item 7 T
+`SameBlockCoreWriter` and `FundingEngine` on their branches). In `KNOWN_FEATURES`, **not** in the
 built-in table (`builtin_activations` stays empty) and not in
 `DEFAULT_GENESIS_ACTIVATIONS`: no chain charges a fee until a release schedules it (a
 genesis `consensus.activations.trading_fees = H` on a new chain, or a built-in row for
@@ -136,7 +137,8 @@ Governance: the two keys validate and stage to their own rows.
 
 ## Expected conflicts
 
-`feat/funding-engine` (settlement, likely also a new `Feature` id: take 3 if this
-lands first) and `fix/reject-orders-before-first-mark` (orders on never-marked markets;
+`feat/funding-engine` (settlement; its `Feature::FundingEngine = 3`, item 7 T's
+`SameBlockCoreWriter = 2`: fees take 4, so the three enum variants and `Feature::ALL`
+merge as a textual conflict only) and `fix/reject-orders-before-first-mark` (orders on never-marked markets;
 the new tests list placeholder markets like the existing differential tests and will
 need marks once that lands).
