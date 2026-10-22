@@ -5,8 +5,29 @@ Gate hosts (owner s134): order 1. 18c, 2. cachyoz, 3. ubuntoz. Heavy runs: 18c (
 command), else cachyoz, never ubuntoz. Small tests: first free of 18c, cachyoz, ubuntoz. Archy only between benches.
 Owner decisions s134: trial-net `--archive` validator decided at trial net; no Codex second opinions on the
 Claude-reviewed items; archy go for 9g. Open: running state hash on or off (9g gives the data).
+**Status s136 (2026-10-22, main `9ea22dbd`):** decided: genesis book mode Classic (9j stage 2, perf doc section 124:
+CL21 beats mode 3 M15 on both shapes, ~40% more deep blocks/s); running state hash ON at genesis; checkpoints 15 s;
+L6.1 + L2.1 merge in batch 10; b1 / mode 3 / b0 PARKED (not dropped); dead-leader genesis defaults K = 3, j cap 6.
+Owner s136: WAN items wait for the trial net; new benches paused. Open genesis questions:
+`docs/plans/testnet-genesis-checklist.md`.
 
-## In progress
+## In progress (s136)
+
+| item | branch | agent | state |
+|---|---|---|---|
+| Batch 9: TC required phases A+B+C + `CONSENSUS_DB_FORMAT` v1 | merge/s134-batch9 56923063 | builder, fix on fix/tc-liveness | FAILED its final gate: liveness stall under CPU load in p00_cluster_tests (QCs stop; lost previous-view timeout votes suspected). Fix builder on fix/tc-liveness. v1 refuses old consensus data dirs at start. Owner accepted the one-fresh-proposer-per-view rule for the validator-set update window. Then phase D (one-down bench) |
+| Batch 10: L6.1 + L2.1 onto main with P0.0 | merge/s136-batch10 8986bf74 | builder | in progress: L6.1 is Feature::BookWindowCommit (id 1) on P0.0; a genesis naming no activation runs the running hash and, Classic only, L6.1 from block 1; L2.1 (`TORUS_SETTLE_STREAMED`) merged by owner exception, still off by default. On main `consensus.book_window_commit` is never read (archy) |
+| Dead-leader skip phase 2 | feat/dead-leader-p2 48e44257 (fix head 0f3f6524) | builder | built; [claude-review] P1 (leader evidence row lost on power loss -> permanent fail-stop; also a T5.3 commit-hook slowdown) being fixed (RED a3d716c6, fix 0f3f6524). Phase 1 done + Codex clean (feat/dead-leader-p1 dc174a0f). Phases 3 (multi-node + mutation tests) and 4 (bench) left; a2 short timeout possible later. Stacked on TC phase B |
+| 9k one-validator-down baseline | — | archy | harness digest race found (digest read pre-checkpoint durable state; drain quiet 10 s < 15 s checkpoints); fix fix/digest-ckpt-wait merged to main 9ea22dbd (s136). Owner paused new benches |
+| 9l binary-gap check (53a6d83c vs 29bfc705, hash-off Classic) | docs/bench-queue-binary-gap 7e9e694a (local) | archy | ON HOLD until owner go; NOT in main's bench queue. Section 124: R ran -1.7% / -3.0% matched/s and +5.3% / +8.7% exec CPU per fill vs section 120's A (cross-campaign) |
+
+## In progress at s134 (closed out s136)
+
+Outcome of each row below (s136): 3b in batch 1; 3c in batch 3 (1646d99e); 4-4e and phase 6 in batch 8 (40705baf);
+2a + 2d in batch 1 (1b751f6c); 2e option B chosen, built as TC phases A-C (batch 9, see above); 3a + 2b/2c in batch
+2; 5 PARKED (b1 not for main; 9j picked Classic); 6b served 9j (not for main); 3d merging in batch 10; 6 (9g) section
+120; harness attest key + drain fix + hole wait on main (54ffec29, 0f8eedb3, 482803ad); 6c sections 123 / 124; 6 (9i)
+section 121.
 
 | item | branch | agent | state |
 |---|---|---|---|
@@ -19,10 +40,10 @@ Claude-reviewed items; archy go for 9g. Open: running state hash on or off (9g g
 | 4e. P0.0 phase 5 (integration tests) + phase-4 P2 fixes | feat/p00-phase5 342aa460 | builder, opus high | built: phase-4 P2s fixed (genesis checked before any boot write; digest stored before genesis apply; exact numbers); 4-validator cluster tests: crossing, mixed binaries (3/4 continues, 2/4 stalls without fork), crash across H, schedule change; 2 mutations caught; 5x ubuntoz 45/45; nextest 4437/4437 (18c + cachyoz). No P0.0 bugs found. Codex review: 2 P2 (test bit 127 leaks into --all-features production KNOWN_FEATURES; mixed-binaries test assumes consecutive commits -> flaky) -> sent to the phase 6 builder |
 | 2a. TC validation gap | fix/tc-validation-gap 46f58794 | builder, opus high | built + gated (cachyoz nextest 4339/4339, doc, clippy 0 errors, 18c release); Codex review blocked by OpenAI cyber filter; [claude-review]: mergeable, no liveness regression, paths share the check (8/9 mutations caught); final cargo test on 18c running |
 | 2d. TC review gaps + NEC set mismatch | fix/tc-require-tc 62c1964a (tests 8ae8358f; on 46f58794) | builder, opus high | built: winner-rule tie test, header-view test, valid_nec accepts committed set (+ previous before update decided). cachyoz nextest 4342/4342, doc, clippy 0 errors, release; ubuntoz hotstuff+consensus 858/858. Merges after the TC gap branch; needs a quick review |
-| 2e. TC required (P1, VALIDPROPOSAL) | exp/tc-require-tc-probe | — | BLOCKED on owner design decision: strict rule stalls the chain (one_down_liveness_test: no commit in 120 s) because the pacemaker advances on timeout without a TC and drops older-view messages. Options: (A) advance views only on QC/TC (pacemaker rewrite), (B) leader waits for / collects a TC for view-1 (leader-skip + RECOVER changes), (C) keep TC optional, document no tail-fork resistance |
+| 2e. TC required (P1, VALIDPROPOSAL) | exp/tc-require-tc-probe | — | **s136: DECIDED, option B (owner s134)**; design docs/plans/tc-required-and-tip-signing.md e54a5f43, phases A-C built (batch 9). Was: BLOCKED on owner design decision: strict rule stalls the chain (one_down_liveness_test: no commit in 120 s) because the pacemaker advances on timeout without a TC and drops older-view messages. Options: (A) advance views only on QC/TC (pacemaker rewrite), (B) leader waits for / collects a TC for view-1 (leader-skip + RECOVER changes), (C) keep TC optional, document no tail-fork resistance |
 | 3a. Aliased rows reject-on-load (pre-genesis) | fix/aliased-rows-reject efb01bad (on 9f8fb795) | builder, opus high | built: cannot exist on a fresh genesis (only put_position writes rows, keyed from the row); decode_position_row rejects mismatched key/row on every load path, fail-stop like an undecodable row. RED: serial vs parallel settle disagreed (size 4 vs 1). cachyoz nextest 4327/4327, doc, clippy 0 errors, release; ubuntoz 9/9. Codex torus review: 1 P2 (RPC scans trader_positions / open_interest skip the check) -> fixed d46234af (RPC returns an error on a bad row; RED 834d0055; ubuntoz 695/695 + 418/418, clippy 0 errors), head 17035b17. Final cargo test goes with batch 2. Note: item6 phase 5 step 2 (parked) would need a rebase in position.rs / native_executor.rs if revived |
 | 2b+2c. Delist option C (grace N blocks reduce-only, then force-close at oracle mark) + P0/P1 test gaps | fix/delist-option-c 23b0190e (RED 46792ffc) | builder, opus high | built: governance key delist_grace_blocks (default 43,200 = 24 h), bounded close step (2,048 traders / 256 positions per block) moving positions to the liquidator vault at one fixed price (fresh mark, else last aggregate, else wait); Part B found no bugs. 18c nextest 4342/4342; cachyoz full PASS. Codex torus review: 1 P2 (stale-price settlement leaves ADL escrow/vault exposure stranded; drain needs a fresh mark) -> fixed ad3f967d (adl_drain ranks a delisted market at the obligation's stored price when no usable mark; RED 6189ddd6/eeff055a; ubuntoz 91/91, 18c nextest 4344/4344, doc, clippy 0 errors, release). Codex quick review of the fix + cachyoz final running |
-| 5. b1 onto main | perf/mode3-b1-main f4faa419 (main 9f8fb795 merged into ab4ded4e) | builder, opus high | built: 18c targeted 130/130, nextest 4339/4339, doc, clippy 0 errors, release (md5 95932e0e on 18c). Codex torus review of the merge: no findings. Head-to-head needs TORUS_BOOK_ROWS=3, no TORUS_CHECKPOINT_MAX_BYTES; Classic arm has L3.1 on by default. Not for main until the head-to-head |
+| 5. b1 onto main | perf/mode3-b1-main f4faa419 (main 9f8fb795 merged into ab4ded4e) | builder, opus high | **s136: PARKED, not dropped** (9j stage 2: Classic CL21 beats mode 3 M15 + b1; genesis book mode Classic). Was: built: 18c targeted 130/130, nextest 4339/4339, doc, clippy 0 errors, release (md5 95932e0e on 18c). Codex torus review of the merge: no findings. Head-to-head needs TORUS_BOOK_ROWS=3, no TORUS_CHECKPOINT_MAX_BYTES; Classic arm has L3.1 on by default. Not for main until the head-to-head |
 | 6b. Head-to-head combined binary | perf/h2h-combined 29bfc705 (main + L6.1 + b1 + L2.1) | builder, opus high | built: mode 3 + b1 SAFE with hash on (b1_mode3_hash_on_same_h_n_at_every_height_on_every_node: identical h_n heights 1-300 across checkpoint timings + crash/replay; mutation B1_MUT_SKIP_SIDE diverges by h 2-4); L6.1 + non-classic book_mode refused; L2.1 tests adapted to main (listed markets; aliased-row tests now stop the block like flag-off -> owner/reviewer glance). cachyoz nextest 4498/4498, doc, clippy 0 errors, release md5 8e188408 (cachyoz). Codex torus review: only a P2 in the b0 microbench fixture (markets never listed -> timing empty books) -> fixed: h2h e13831cd (bench/test files only; node binary = 29bfc705, staged on archy) + fix/b0-ubench-markets 956d4969 for main (engine_parallel_bench, l3_savebooks_ubench, load_books_ubench, exec_* benches also listed markets; l3 ubench also had an open-order-limit and wrong-owner ModifyOrder bug). Merge resolutions and the mode-3 hash test: no findings |
 | 3d. L6.1 review nits + main merge | perf/l61-window-books 87cbeee5 (nits e044e53c) | builder, opus medium | done: forced-transition test asserts L3.1 actually on; L3.1 hash dependency in one helper l31_hash_blocker keyed on ChainConfig::book_window_activation() (P0.0 switches that one method); main b452b4af merged, no conflicts; 18c targeted 26/26, nextest 4397/4397, doc, clippy 0 errors, release. Merge waits on the h_n check + running-hash decision |
 | 6. 9g L6.1 3-arm (53a6d83c) | docs/perf-section-120-9g e3d610ae | archy | DONE, section 120: passes the queue rule. Deep matched/s B/A 0.997 [0.867, 1.147], B/C 1.167, blk/s 4.82x vs C; std exec on-CPU/1k fills B/A +0.9% (cost of hash on, not of L6.1). Caveat: h_n not compared value for value (no attest key) -> follow-up asked of archy (attest key or h_n dump + short B check) |
@@ -38,7 +59,7 @@ collision (oracle feed shares the validator key, ms nonces; node re-signs after 
 archy; stage 2 LAUNCHED 21:49 (CL21 re-smoke clean, no holes), done
 ~01:00; attest verdicts with healed holes re-checked offline in the analysis.
 - Delist keep close price (feat/delist-keep-close-price bf532e56): Codex no findings; cachyoz nextest 4469/4469.
-  Batch 6 candidate merge/s134-batch6 52a95d86 (cachyoz final running).
+  Batch 6 candidate merge/s134-batch6 52a95d86 (cachyoz final running). *(s136: batch 6 on main 52a95d86.)*
 - Batch 5 pushed to main **b78ca907**: delist node-local follow-ups ed1d6426 (cachyoz final 4467/0), kill knob
   bc408dab, section 123 b78ca907. torus-clean-merged freed 61 GB (delist-node-local worktree, p00-phase2 / tc-a /
   tc-b-dbg target dirs). Kill knob (tools/harness-kill-no-restart 87e91dfd; Codex 2 P2 fixed, re-check clean; merged into local main bc408dab with batch 5): KILL_NO_RESTART, VALIDATOR_STAKES; decided: one-down baseline feed-off (same for TC phase D), 2/2/1 stakes. Then: no-restart kill knob + one-validator-down baseline on main |
@@ -58,23 +79,28 @@ archy; stage 2 LAUNCHED 21:49 (CL21 re-smoke clean, no holes), done
 - Design doc: dead-leader skip (explore, opus xhigh) -> docs/plans/dead-leader-skip.md. DONE (main d8156eca,
   decisions 7a 6c16e5c0 / 287701a5: b1 chosen, W=L, genesis parameters, a2 possible upgrade, jailing separate).
 - Dead-leader b1 phase 1 (feat/dead-leader-p1, stacked on TC phase B; must land before TC phase C), opus high.
+  *(s136: phase 1 done + Codex clean dc174a0f; phase 2 in review fixes, see In progress (s136).)*
 - Investigation: fail-stop restart bug -> CONFIRMED reachable in production (feed marks blocks delivered after the
   fail-stop latch during the ~200-450 ms before exit(70); after restart execution freezes silently). Fix builder:
   fix/failstop-delivered-height (app halt signal stops the feed advancing the delivered height + boot safety net),
   opus high. BUILT 69206dbe: feed stops at a halted app; boot lowers the delivered height and re-delivers the gap from
   the block tree when complete; drain logs 'execution FROZEN'. RED: delivered 8 vs app 3; cluster node stuck at 3 vs
   432. Mutations 2/2 caught; 5x 526/526 ubuntoz; cachyoz nextest 4469/4469. Codex review: no findings -> batch 7 after batch 6
-  lands. Note: P0.0 merge must update chain_config() in failstop_feed_tests.rs (activations).
+  lands. *(s136: batch 7 on main 6eabad95.)* Note: P0.0 merge must update chain_config() in failstop_feed_tests.rs (activations).
 - Jailing design doc: DEFERRED; revisit before testnet; plan = testnet upgrade or before mainnet.
 - Delist: keep settled close price in state (feat/delist-keep-close-price), opus medium.
 
 ## Queued (order)
 
+*(s136: items 1-3 and 5 are on main (batches 1-3, 8); item 4 is PARKED; the 9g, 9i and 9j benches of item 6 ran,
+sections 120-124.)*
+
+
 1. 2b. Delist option C (grace period of N blocks reduce-only, then force-close at the oracle mark).
 2. 2c. P0/P1 test gaps (resident-mode governance cancel, reduce-only).
 3. 3. Small builds: aliased-rows reject-on-load cleanup; L3.1 off-log line; book-mode fixes (summarize.py env read P1,
    upgrade note, bench-throughput set_process_book_mode, explicit classic omit). L6.1 nits wait for 9g.
-4. 5. Rebase b1 onto main.
+4. 5. Rebase b1 onto main. *(s136: PARKED with mode 3 and b0; genesis book mode is Classic.)*
 5. 4. P0.0 activation-height gating (~8-9 days; docs/plans/p00-activation-height-gating.md).
 6. Benches (archy, one at a time): L2.1 deep rerun on new main (after 9g); 100k retention disk soak (after RH4 merges;
    archive arms TORUS_RETENTION_BLOCKS=0); final head-to-head (after b1 rebase + running-hash decision).
@@ -110,17 +136,23 @@ archy; stage 2 LAUNCHED 21:49 (CL21 re-smoke clean, no holes), done
   updates: F2 accepts the previous-set leader's tip even after the update is decided, and both leaders can propose
   during the window -> TC can name the other block) + P2 (reputation-on guard) + nit (slashing build_vote_message).
   Owner s134: option a (fix the window) + P2 guard + delete/align the slashing encoder, as ONE small builder;
-  LAUNCHED (owner go): builder on feat/tc-required-phase-c, opus high.
+  LAUNCHED (owner go): builder on feat/tc-required-phase-c, opus high. *(s136: done, 76862c2c / 504cc589, in batch 9.)*
 - Oracle vs attestation keys: production does NOT share them (feeder uses a separate SetOracleSigner key; nonce rule
   is a per-sender set, not monotonic). Bench-only collision. Owner s134: do both (document --state-hash-attest-key
   in the validator/operator guides; bench registers separate oracle signers) — LAUNCHED (owner go):
-  tools/bench-oracle-signers, opus medium; archy informed.
-- NEW (from TC phase C): slashing evidence format in torus-consensus doesn't match real phase-vote bytes (pre-existing). Head-to-head: best per family then best vs best, hash on, checkpoints 15 s default
+  tools/bench-oracle-signers, opus medium; archy informed. *(s136: on main c3808eac.)*
+- NEW (from TC phase C): slashing evidence format in torus-consensus doesn't match real phase-vote bytes (pre-existing).
+  *(s136: fixed in batch 9, 76862c2c "slashing vote bytes are hotstuff's" + 504cc589; batch 9 not on main yet.)* Head-to-head: best per family then best vs best, hash on, checkpoints 15 s default
   (5 s screen arm), L2.1 included -> combined-binary builder started (perf/h2h-combined: main + L6.1 + b1 + L2.1,
   plus the mode 3 + b1 hash-on determinism test). Book-mode genesis left out (harness/roadmap conflicts with main) -> merged main into it: c644d48f (both
   sides kept; python suite 630/0, genesis/types/book_mode_genesis 174/174, clippy 0 errors). Batch 3 = book-mode
   c644d48f + watchdog flake 867de0f3, after batch 2 lands.
 - RH4 merged to main **b452b4af** (from 3b31e8ab; cachyoz cargo test 4384/0, nextest 4383/4383; Codex: approve).
+- s136 on main: batch 6 delist keeps close price **52a95d86**; batch 7 fail-stop delivered-height fix **6eabad95**;
+  batch 8 P0.0 phases 1-6 **40705baf** (cachyoz final nextest 4541/4541, cargo test 4542/0; phase 7 governance
+  ScheduleActivation is pre-mainnet); attest hole-wait harness fix **482803ad**; bench oracle signers, one
+  SetOracleSigner key per bench validator **c3808eac**; kill-knob procstat fix + section 124 **af53295c**; builder
+  rule 12 update **02c01433**; harness digest waits for a durable post-drain checkpoint **9ea22dbd**.
 
 ## Unlocked by finished work
 
@@ -165,7 +197,7 @@ archy; stage 2 LAUNCHED 21:49 (CL21 re-smoke clean, no holes), done
   re-review: no findings; cachyoz final running. EXTERNAL: torus-trading-app TS signer (eip712.spec.ts) is NOT updated
   (owner s134: don't touch the app now, it may be rebuilt); any client must match tests/fixtures/eip712_vectors.json.
 - RUNNING STATE HASH (owner s134): LEANING ON (with L6.1). Final decision after the head-to-head (it has a hash-off
-  Classic reference arm), before genesis.
+  Classic reference arm), before genesis. *(s136: DECIDED ON at genesis; L6.1 + L2.1 merging in batch 10.)*
 - Infra: the shared ~/.cargo-target gives stale-artifact build failures across worktrees (L6.1 nits: 33 errors; delist
   clippy: torus-core failed to compile) -> builders fell back to per-branch target dirs. Worth a rule or a fix.
 - Flake: torus-network resubscribe_wedge restarted_validator_recovers_via_watchdog_alone (20 s budget fails under load)
@@ -180,9 +212,10 @@ archy; stage 2 LAUNCHED 21:49 (CL21 re-smoke clean, no holes), done
   UnknownMarket it may time rejected orders (Codex stop-review WARN). Small fix.
 - PRE-EXISTING BUG (found by P0.0 phase 5): after an execution fail-stop the app ignores new commits but hotstuff
   marks them delivered, so an in-process restarted node is stuck (real process restarts avoid it). Codex asked
-  whether it is reachable in production; fix if so.
+  whether it is reachable in production; fix if so. *(s136: reachable; fixed, batch 7 on main 6eabad95.)*
 - Head-to-head design (owner): Classic arm on b1-main's binary (same code, L3.1 on) or on main's? And with the running
-  hash on (Classic needs L6.1) or off? Decide after the h_n check on 53a6d83c.
+  hash on (Classic needs L6.1) or off? Decide after the h_n check on 53a6d83c. *(s136: settled; one combined binary
+  perf/h2h-combined 29bfc705, hash on, sections 123 / 124.)*
 - Build/disk plan (owner s134): (1) sccache cap 15 GB on 18c when builders idle; (2)+(3) torus-clean-merged +
   torus-target-dir on tools/disk-hygiene (building; then builder.md rule via the framework instance); (4) opt-level 1
   dependency A/B on 18c and (5) merge test binaries -> cargo-hakari: PARKED for later. Remote runners
