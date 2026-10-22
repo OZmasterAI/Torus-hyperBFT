@@ -11,7 +11,7 @@
 //! the TC-stripped headers, so both byzantine-leader cases fail.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -618,7 +618,9 @@ struct WindowLog {
 /// fails under the committed set. The Decide votes reach only the committed set's leader of the
 /// next view (w), and the other messages carrying the Decide PC are lost until a proposal after w
 /// is out. Its fresh proposal (justified by the Decide PC, so only it has applied that PC)
-/// is lost, and so are one
+/// is lost, so is the previous set's leader of w's Commit nudge for w (s138: still undecided when
+/// TC(w - 1) brings it into w, it re-runs the Decide phase there and w gets a QC, depending on which
+/// replica's pacemaker deadline comes first), and so are one
 /// power-1 validator's timeout votes for w, so TC(w) carries the leader of w's vote: its high QC
 /// is the Decide PC (case 3) and its high tip the pre-update tip. leader(w + 1) applies the Decide
 /// PC and proposes with that TC. Under the decided-ness rule that leader and leader(w) (both
@@ -679,6 +681,18 @@ fn validator_set_update_window_timeout_loses_no_further_view() {
         {
             let view = m.view().int();
             if w.skipped.contains(&view) || w.dropped == Some(view) {
+                return None;
+            }
+        }
+        // While undecided, the previous set's leader of w is a proposer of w as well (nudges,
+        // `is_proposer`). If TC(w - 1) brings it into w before the Decide PC reaches it, it nudges
+        // the Commit PC, the Decide phase runs again in w and w ends with a QC, not a timeout (the
+        // scenario is missed; a race of pacemaker deadlines across replicas, lost under CPU load).
+        // So every nudge for w is lost, whoever sends it: that nudger is the only one (the
+        // committed set's leader of w holds the Decide PC and proposes on it, and that proposal
+        // is dropped above).
+        if let Message::ProgressMessage(ProgressMessage::HotStuffMessage(HotStuffMessage::Nudge(nudge))) = &message {
+            if w.dropped == Some(nudge.view.int()) {
                 return None;
             }
         }
@@ -755,4 +769,110 @@ fn validator_set_update_window_timeout_loses_no_further_view() {
         "view w + 1 was lost: leader(w + 1) never proposed under TC(w); {trace}"
     );
     assert!(log.headers.iter().any(|h| h.justify_view == w + 1), "view w + 1 was lost: no header justifies on QC(w + 1); {trace}");
+}
+
+// ---------------------------------------------------------------------------
+// s138: a silent validator leads the view after the update block's Precommit PC.
+// ---------------------------------------------------------------------------
+
+/// Bound on the live validators applying the update in the silent-leader window test.
+const WINDOW_BOUND: Duration = Duration::from_secs(120);
+
+#[derive(Default)]
+struct PrecommitWindowLog {
+    /// The update block U and the view of its first header.
+    update: Option<(CryptoHash, u64)>,
+    /// Views of the Precommit PCs on U seen in AdvanceViews.
+    precommit_pcs: BTreeSet<u64>,
+    /// Views of U's later headers (re-proposals).
+    reproposals: BTreeSet<u64>,
+    /// Senders of Prepare votes for U, per view.
+    prepare_votes: BTreeMap<u64, BTreeSet<usize>>,
+}
+
+/// One old-set validator is silent and leads the view right after the update block's Precommit PC
+/// (s138, reported by the D2 builder: a window livelocked in 3 of 9 runs with one old-set
+/// validator cut off; docs/plans/disjoint-vset-livelock.md section 3.2, D1, at the Precommit stage).
+///
+/// Four equal validators; n3 never runs, so the three live ones are the exact quorum. The power
+/// update (n2 1 -> 2) goes to n1, which leads only the views v = 0 mod 4, so U is proposed in such a
+/// view and leader(v + 2) is n3. n0 nudges U's Prepare PC (v) in v + 1; the Precommit votes reach
+/// the backup aggregator n2 = leader(v + 3), which forms U's Precommit PC (v + 1) and locks on it;
+/// v + 2 times out. A Precommit PC is nudged only in the view after it (`safe_nudge`), so each later
+/// leader re-proposes U (`repropose_block`, under a TC whose high QC is that Precommit PC). n2 is
+/// locked on U's Precommit PC and U's header justifies on U's parent, which neither extends U nor is
+/// newer than the lock. Before s138 the lock clause looked only at that justify, so n2 never voted
+/// for U again and no later view reached the quorum: the window livelocked (deterministic, n2's
+/// lock alone blocked every quorum). The lock rule of a proposal is now reflexive
+/// (`invariants::safe_proposal_lock`): n2 votes for the re-proposal of U, the block it is locked on.
+#[test]
+fn validator_set_update_survives_a_silent_leader_after_the_precommit_pc() {
+    let mut cluster = Cluster::new();
+    let down = 3;
+    let (proposer, target) = (1, 2);
+    let keys: Vec<VerifyingKey> = (0..4).map(|i| cluster.key(i)).collect();
+    let log = Arc::new(Mutex::new(PrecommitWindowLog::default()));
+    let log_in = log.clone();
+    let keys_in = keys.clone();
+    cluster.filter.rewrite(Arc::new(move |sender, _recipient, message| {
+        let mut w = log_in.lock().unwrap();
+        if let Some(h) = header_of(&message) {
+            match w.update {
+                None if h.has_validator_set_updates => w.update = Some((h.block_hash, h.view.int())),
+                Some((block, view)) if h.block_hash == block && h.view.int() > view => {
+                    w.reproposals.insert(h.view.int());
+                }
+                _ => {}
+            }
+        }
+        if let Some((block, _)) = w.update {
+            if let Some(pc) = carried_pc(&message) {
+                if pc.block == block && pc.phase == Phase::Precommit {
+                    w.precommit_pcs.insert(pc.view.int());
+                }
+            }
+            if let Message::ProgressMessage(ProgressMessage::HotStuffMessage(HotStuffMessage::PhaseVote(vote))) = &message {
+                if vote.block == block && vote.phase == Phase::Prepare {
+                    let from = keys_in.iter().position(|k| k == sender).unwrap();
+                    w.prepare_votes.entry(vote.view.int()).or_default().insert(from);
+                }
+            }
+        }
+        Some(message)
+    }));
+    cluster.start(&[down]);
+    cluster.wait_for_commits(2, "before the update");
+    let target_key = cluster.key(target);
+    cluster.nodes[proposer]
+        .as_mut()
+        .unwrap()
+        .submit_transaction(NumberAppTransaction::SetValidator(target_key.to_bytes(), Power::new(2)));
+    let applied = || cluster.live().all(|n| n.committed_validator_set().power(&target_key).map(|p| p.int()) == Some(2));
+    let deadline = std::time::Instant::now() + WINDOW_BOUND;
+    while !applied() && std::time::Instant::now() < deadline {
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    let log = log.lock().unwrap();
+    let (_, v) = log.update.expect("scenario: the update block was proposed");
+    let trace = format!(
+        "U first proposed in view {v} (leaders v .. v + 3: n{} n{} n{} n{}); Precommit PCs on U at views {:?}; \
+         U re-proposed in views {:?}; Prepare votes for U per view (sender indices): {:?}; {}",
+        cluster.leader(v),
+        cluster.leader(v + 1),
+        cluster.leader(v + 2),
+        cluster.leader(v + 3),
+        log.precommit_pcs,
+        log.reproposals,
+        log.prepare_votes,
+        cluster.describe()
+    );
+    let precommit_pc = log.precommit_pcs.contains(&(v + 1));
+    drop(log);
+    assert_eq!(cluster.leader(v), proposer, "scenario: n{proposer} proposed U; {trace}");
+    assert_eq!(cluster.leader(v + 2), down, "scenario: the silent validator leads v + 2; {trace}");
+    assert!(precommit_pc, "scenario: U's Precommit PC (v + 1) formed; {trace}");
+    assert!(applied(), "the update window livelocked: every live validator must commit U within {WINDOW_BOUND:?}; {trace}");
+    let after = cluster.max_committed();
+    cluster.wait_for_commits(after + 2, "after the update");
 }

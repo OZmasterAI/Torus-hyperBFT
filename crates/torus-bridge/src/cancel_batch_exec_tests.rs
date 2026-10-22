@@ -170,6 +170,8 @@ fn new_ctx(dir: &tempfile::TempDir, mode: BookMode) -> NativeExecContext {
 /// `resident: false`: the off path (`TORUS_RESIDENT_BOOKS=0`), every
 /// cancel-all scans every book (row 23).
 fn new_ctx_with(dir: &tempfile::TempDir, mode: BookMode, resident: bool) -> NativeExecContext {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let db = StateDb::open(dir.path()).expect("open db");
     // Pre-testnet P0: orders need a listed market (placeholder rows,
     // tick / lot 1, as the old implicit book).

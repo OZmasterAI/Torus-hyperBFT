@@ -148,6 +148,12 @@ pub enum FailureReason {
     /// Pre-testnet P1: a placement that is not reduce-only on a market that
     /// governance delisted (reduce-only wind-down). Recorded `Failed`.
     MarketDelisted = 17,
+    /// Owner s138: a placement (or a modify, or a triggered stop) on a
+    /// market that has never had an oracle mark (no aggregate price was ever
+    /// recorded, so it has no price band yet). Orders open there with the
+    /// first mark; a later stale mark keeps the band's stale fallback.
+    /// Recorded `Failed`.
+    MarketNeverMarked = 18,
 }
 
 impl FailureReason {
@@ -171,6 +177,7 @@ impl FailureReason {
             15 => Self::DuplicateCloid,
             16 => Self::UnknownMarket,
             17 => Self::MarketDelisted,
+            18 => Self::MarketNeverMarked,
             _ => Self::Other,
         }
     }
@@ -196,6 +203,7 @@ impl FailureReason {
             Self::DuplicateCloid => "duplicate_cloid",
             Self::UnknownMarket => "unknown_market",
             Self::MarketDelisted => "market_delisted",
+            Self::MarketNeverMarked => "market_never_marked",
         }
     }
 
@@ -1154,6 +1162,7 @@ mod tests {
             (FailureReason::DuplicateCloid, 15, "duplicate_cloid"),
             (FailureReason::UnknownMarket, 16, "unknown_market"),
             (FailureReason::MarketDelisted, 17, "market_delisted"),
+            (FailureReason::MarketNeverMarked, 18, "market_never_marked"),
         ];
         for (reason, code, name) in all {
             assert_eq!(reason as u8, code, "{name}");

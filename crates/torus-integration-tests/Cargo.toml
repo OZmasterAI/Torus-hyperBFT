@@ -5,7 +5,8 @@ edition.workspace = true
 publish = false
 
 [dev-dependencies]
-torus-core = { workspace = true }
+# Owner s138: fixtures from before the never-marked rule (test-only seam).
+torus-core = { workspace = true, features = ["test-unmarked-markets"] }
 torus-economics = { workspace = true }
 torus-bridge = { workspace = true }
 torus-genesis = { workspace = true }

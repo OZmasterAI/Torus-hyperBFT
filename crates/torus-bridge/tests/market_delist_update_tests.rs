@@ -86,6 +86,8 @@ const TRADERS: [u8; 6] = [10, 11, 12, 13, 14, 15];
 fn setup() -> (tempfile::TempDir, StateDb) {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let s = FixedPoint::SCALE;
     for m in [M, OTHER] {
         db.put_cf_raw(

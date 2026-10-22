@@ -36,6 +36,8 @@ impl TestHarness {
     pub fn new() -> Self {
         let tmp_dir = TempDir::new().expect("create temp dir");
         let state_db = StateDb::open(tmp_dir.path()).expect("open StateDb");
+        // Owner s138: a fixture from before the never-marked rule (test-only seam).
+        torus_core::oracle::test_treat_unmarked_as_marked();
         let positions = PositionManager::new(state_db.clone());
         let executor = Arc::new(EvmExecutor::new(TORUS_CHAIN_ID));
         let mempool = Arc::new(Mempool::new(state_db.clone(), MempoolConfig::default()));

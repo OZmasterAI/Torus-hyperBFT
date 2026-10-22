@@ -272,6 +272,8 @@ fn fnv(s: &str) -> u64 {
 
 /// `(digest, duplicate-cloid rejects, successes)` of `seed`'s stream.
 fn seeded_run(seed: u64, mode: BookMode, run: Run) -> (u64, usize, usize) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     // Pre-testnet P0: orders need a listed market (placeholder rows,
@@ -371,6 +373,8 @@ fn a_seeded_cloid_stream_gives_the_pinned_results_and_root() {
 /// the cross-market check, the first order resting by then.)
 #[test]
 fn a_second_order_with_the_cloid_in_the_same_book_and_call_is_a_duplicate() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let gtc = |px: i64, cloid: u128| {
         params(
             1,

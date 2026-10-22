@@ -213,9 +213,24 @@
 #                /proc/<pid>/stat into $OUT/procstat.raw (summarize.py ->
 #                proc_cpu_by_node: user / sys ms per native block and per 1k
 #                fills, item 6 Phase 2 step 0.2).
+#   ORACLE_FEED=seed (default, owner s138)  a market takes no orders before its
+#                first oracle mark (FailureReason::MarketNeverMarked), so a
+#                cell without marks would bench nothing. seed = run the feed
+#                below (same prerequisites as 1) until every market has a
+#                fresh mark, stop it, then wait until val0 reports NO usable
+#                mark on any market (60 s past the last fresh aggregate;
+#                ORACLE_STALE_TIMEOUT, default 150 s, else the cell FAILS):
+#                the load then runs on stale marks only, like the pre-s138
+#                no-feed cell (positions at entry, no liquidation), except the
+#                price band's stale fallback (book median clamped to +-10% of
+#                ORACLE_PRICE, +-50% wide) and its mark charge. Artifacts:
+#                oracle-feed.log, oracle-marks-{before,fresh,seeded}.json,
+#                summary.json .oracle_feed {oracle_feed: "seed", ...}.
+#                ORACLE_WALK_BP / ORACLE_SHOCK_BP / ORACLE_FEED_DRAIN need 1.
 #   ORACLE_FEED=1  run an oracle price feed during the cell (s87), so the stack
-#                is benched with fresh MARK prices like a real chain. Unset/0
-#                (default) = no feed, exactly the pre-s87 cell. When 1: after the
+#                is benched with fresh MARK prices like a real chain. 0 = no
+#                feed, exactly the pre-s87 cell (a post-s138 binary rejects
+#                every order then: only for pre-s138 worktrees). When 1: after the
 #                idle probe, `bench-throughput oracle-feed` signs submissions for
 #                all MARKETS markets with the 3 devnet validator keys
 #                ($MAINREPO/devnet/wsl/bench-validator-keys.json) every
@@ -622,7 +637,8 @@ ALL_IDX=(0 1 2)
 [ "$N_VALIDATORS" = 3 ] || ALL_IDX+=(3)
 HOTSTUFF_CPUS=${HOTSTUFF_CPUS:-}
 SCHED_THREADS="hotstuff-algo torus-execution torus-flush-worker"
-ORACLE_FEED=${ORACLE_FEED:-0}
+ORACLE_FEED=${ORACLE_FEED:-seed}
+ORACLE_STALE_TIMEOUT=${ORACLE_STALE_TIMEOUT:-150}
 STATE_HASH_ATTEST=${STATE_HASH_ATTEST:-0}
 ORACLE_PRICE=${ORACLE_PRICE:-30000}
 ORACLE_INTERVAL_MS=${ORACLE_INTERVAL_MS:-2000}
@@ -1024,10 +1040,30 @@ ORACLE_FEED_DRAIN_MAX_LAG=$((10#$ORACLE_FEED_DRAIN_MAX_LAG))
 FEED_STOP_SETTLE_MAX_S=$((10#$FEED_STOP_SETTLE_MAX_S))
 [ "$FEED_STOP_SETTLE_MAX_S" = 600 ] || [ "$ORACLE_FEED_DRAIN" = 1 ] \
     || { echo "FATAL: FEED_STOP_SETTLE_MAX_S=$FEED_STOP_SETTLE_MAX_S needs ORACLE_FEED_DRAIN=1" >&2; exit 2; }
+# ---- 4-validator devnet (N_VALIDATORS=4) pre-flight: the worktree's devnet/wsl starts val3, and the scoring tools
+# (TOOLS_DIR) know a 4th node; an older copy would launch 3 nodes against a 4-validator genesis (no quorum with
+# 2:2:1:1-like stakes, a skipped leader every 4th view) or refuse 4 URLs mid-cell. Before the oracle-feed pre-flight (ORACLE_FEED=seed is the default): a 3-node
+# worktree has no keys-4val/, and its missing-key error would hide this one.
+if [ "$N_VALIDATORS" = 4 ]; then
+    { grep -q '^KEY3=' "$WSL/env.sh" 2>/dev/null && grep -q 'N_VALIDATORS' "$WSL/launch-3val.sh" 2>/dev/null \
+        && grep -q 'PEER_TO_V2' "$WSL/start-node.sh" 2>/dev/null; } \
+        || { echo "FATAL: N_VALIDATORS=4 but $WSL (env.sh / launch-3val.sh / start-node.sh) has no 4-validator devnet: merge the harness branch (tools/run-cell-4val) into the worktree" >&2; exit 1; }
+    for f in summarize.py health.py collect_logs.py crash-kill.sh; do
+        grep -q 'N_VALIDATORS=4' "$TOOLS_DIR/$f" 2>/dev/null \
+            || { echo "FATAL: N_VALIDATORS=4 but $TOOLS_DIR/$f has no 4-node support (TOOLS_FROM_WORKTREE=$TOOLS_FROM_WORKTREE; point TOOLS_DIR= at a tools/matched-bench with it, or merge the harness branch into the worktree)" >&2; exit 1; }
+    done
+    [ -s "$ORACLE_KEYS" ] || { echo "FATAL: N_VALIDATORS=4 needs $ORACLE_KEYS (the 4 validators' account keys)" >&2; exit 1; }
+fi
+
 case "$ORACLE_FEED" in
     0) [ "$ORACLE_WALK_BP" = 0 ] || { echo "FATAL: ORACLE_WALK_BP=$ORACLE_WALK_BP needs ORACLE_FEED=1" >&2; exit 2; }
        [ "$ORACLE_SHOCK_BP" = 0 ] || { echo "FATAL: ORACLE_SHOCK_BP=$ORACLE_SHOCK_BP needs ORACLE_FEED=1" >&2; exit 2; } ;;
-    1)
+    1|seed)
+        if [ "$ORACLE_FEED" = seed ]; then
+            [ "$ORACLE_WALK_BP" = 0 ] || { echo "FATAL: ORACLE_WALK_BP=$ORACLE_WALK_BP needs ORACLE_FEED=1 (seed stops the feed before the load)" >&2; exit 2; }
+            [ "$ORACLE_SHOCK_BP" = 0 ] || { echo "FATAL: ORACLE_SHOCK_BP=$ORACLE_SHOCK_BP needs ORACLE_FEED=1 (seed stops the feed before the load)" >&2; exit 2; }
+            [[ "$ORACLE_STALE_TIMEOUT" =~ ^[1-9][0-9]{0,4}$ ]] || { echo "FATAL: ORACLE_STALE_TIMEOUT must be a positive integer number of seconds (got '$ORACLE_STALE_TIMEOUT')" >&2; exit 2; }
+        fi
         [[ "$ORACLE_PRICE" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v p="$ORACLE_PRICE" 'BEGIN{exit !(p>0)}' \
             || { echo "FATAL: ORACLE_PRICE must be a positive number (got '$ORACLE_PRICE')" >&2; exit 2; }
         # a fresh aggregate needs all 3 validators inside one 10 s window
@@ -1044,7 +1080,7 @@ case "$ORACLE_FEED" in
         [ "$ORACLE_SHOCK_BP" = 0 ] || "$BENCH" oracle-feed --help 2>/dev/null | grep -q -- --shock-bp \
             || { echo "FATAL: ORACLE_SHOCK_BP=$ORACLE_SHOCK_BP but $BENCH oracle-feed has no --shock-bp" >&2; exit 1; }
         ;;
-    *) echo "FATAL: ORACLE_FEED must be unset, 0 or 1 (got '$ORACLE_FEED')" >&2; exit 2 ;;
+    *) echo "FATAL: ORACLE_FEED must be unset, seed, 0 or 1 (got '$ORACLE_FEED')" >&2; exit 2 ;;
 esac
 
 # ---- running state hash attestation (STATE_HASH_ATTEST=1) pre-flight. Every
@@ -1142,20 +1178,6 @@ if [ -n "$CRASH_KILL_AT_S" ]; then
     crash_kill_list_ok "$CRASH_KILL_AT_S" "$DUR" || {
         echo "FATAL: CRASH_KILL_AT_S=$CRASH_KILL_AT_S is not a valid kill list for a ${DUR}s cell (each offset >= 10 and <= $((DUR-30)); killing during the drain hangs the agreement probe; a list must strictly increase with >= ${CRASH_KILL_MIN_GAP_S}s between kills)" >&2; exit 2; }
     IFS=, read -r -a CRASH_AT <<< "$CRASH_KILL_AT_S"
-fi
-
-# ---- 4-validator devnet (N_VALIDATORS=4) pre-flight: the worktree's devnet/wsl starts val3, and the scoring tools
-# (TOOLS_DIR) know a 4th node; an older copy would launch 3 nodes against a 4-validator genesis (no quorum with
-# 2:2:1:1-like stakes, a skipped leader every 4th view) or refuse 4 URLs mid-cell.
-if [ "$N_VALIDATORS" = 4 ]; then
-    { grep -q '^KEY3=' "$WSL/env.sh" 2>/dev/null && grep -q 'N_VALIDATORS' "$WSL/launch-3val.sh" 2>/dev/null \
-        && grep -q 'PEER_TO_V2' "$WSL/start-node.sh" 2>/dev/null; } \
-        || { echo "FATAL: N_VALIDATORS=4 but $WSL (env.sh / launch-3val.sh / start-node.sh) has no 4-validator devnet: merge the harness branch (tools/run-cell-4val) into the worktree" >&2; exit 1; }
-    for f in summarize.py health.py collect_logs.py crash-kill.sh; do
-        grep -q 'N_VALIDATORS=4' "$TOOLS_DIR/$f" 2>/dev/null \
-            || { echo "FATAL: N_VALIDATORS=4 but $TOOLS_DIR/$f has no 4-node support (TOOLS_FROM_WORKTREE=$TOOLS_FROM_WORKTREE; point TOOLS_DIR= at a tools/matched-bench with it, or merge the harness branch into the worktree)" >&2; exit 1; }
-    done
-    [ -s "$ORACLE_KEYS" ] || { echo "FATAL: N_VALIDATORS=4 needs $ORACLE_KEYS (the 4 validators' account keys)" >&2; exit 1; }
 fi
 
 # ---- no-restart kill (KILL_NO_RESTART) pre-flight. Off (the default): KNR_IDX
@@ -1541,7 +1563,7 @@ PY
 }
 trap 'log "interrupted"; finish_fail; exit 130' INT TERM
 # Exit paths that bypass finish_fail (plain `exit`) must not leave a feed behind.
-if [ "$ORACLE_FEED" = 1 ]; then trap 'stop_oracle_feed' EXIT; fi
+if [ "$ORACLE_FEED" = 1 ] || [ "$ORACLE_FEED" = seed ]; then trap 'stop_oracle_feed' EXIT; fi
 # ... nor a tx-flood (stop_oracle_feed is a no-op without a feed).
 if evm_load_on; then trap 'stop_oracle_feed; evm_load_stop' EXIT; fi
 
@@ -1552,7 +1574,7 @@ if liq_stress_on; then
     log "liquidation stress ON: liq_thin=$LIQ_THIN liq_thin_avail=$LIQ_THIN_AVAIL shock_bp=$ORACLE_SHOCK_BP shock_round=$ORACLE_SHOCK_ROUND vault=$LIQUIDATOR_VAULT adl_escrows=$ADL_ESCROW_LONG,$ADL_ESCROW_SHORT (balances + positions in the digest; vault-val<i>.json; liquidation metrics sampled)"
     [ -z "$MPS" ] || log "WARNING: MPS=$MPS: the locality shape sets sides by owner rank, not (sender + market) parity, so the shock's 'even-index senders lose on every position' does not hold"
 fi
-[ "$ORACLE_FEED" = 1 ] && log "oracle feed ON: price=$ORACLE_PRICE walk_bp=$ORACLE_WALK_BP shock_bp=$ORACLE_SHOCK_BP shock_round=$ORACLE_SHOCK_ROUND interval=${ORACLE_INTERVAL_MS}ms markets=$MARKETS keys=$ORACLE_KEYS fresh_timeout=${ORACLE_FRESH_TIMEOUT}s"
+{ [ "$ORACLE_FEED" = 1 ] || [ "$ORACLE_FEED" = seed ]; } && log "oracle feed ON (ORACLE_FEED=$ORACLE_FEED): price=$ORACLE_PRICE walk_bp=$ORACLE_WALK_BP shock_bp=$ORACLE_SHOCK_BP shock_round=$ORACLE_SHOCK_ROUND interval=${ORACLE_INTERVAL_MS}ms markets=$MARKETS keys=$ORACLE_KEYS fresh_timeout=${ORACLE_FRESH_TIMEOUT}s"
 if evm_load_on; then
     log "EVM load ON: rate=$EVM_LOAD_RATE tx/s senders=$EVM_LOAD_SENDERS (bench senders $EVM_LOAD_OFFSET..$((EVM_LOAD_OFFSET + EVM_LOAD_SENDERS - 1)), the k-th sender -> val k % ${#ALL_IDX[@]} only) tx_flood=$TX_FLOOD md5=$(md5sum "$TX_FLOOD" | cut -d' ' -f1)"
     if awk -v r="$EVM_LOAD_RATE" -v s="$EVM_LOAD_SENDERS" 'BEGIN{exit !(r / s > 2)}'; then
@@ -1879,8 +1901,8 @@ if out["head"] is not None and out["oldest_usable_agg_block"] is not None:
 sys.stdout.write(json.dumps(out) + "\n")
 PYO
 }
-ORACLE_FRESH_S=""; ORACLE_MEND=""
-if [ "$ORACLE_FEED" = 1 ]; then
+ORACLE_FRESH_S=""; ORACLE_MEND=""; ORACLE_STALE_S=""
+if [ "$ORACLE_FEED" = 1 ] || [ "$ORACLE_FEED" = seed ]; then
     ORACLE_M=$(oracle_marks 0)
     printf '%s\n' "$ORACLE_M" > "$OUT/oracle-marks-before.json"
     ORACLE_H0=$(jq -r '.head // empty' <<<"$ORACLE_M")
@@ -1904,6 +1926,23 @@ if [ "$ORACLE_FEED" = 1 ]; then
     printf '%s\n' "$ORACLE_M" > "$OUT/oracle-marks-fresh.json"
     [ -n "$ORACLE_FRESH_S" ] || die "oracle marks NOT fresh on all $MARKETS markets after ${ORACLE_FRESH_TIMEOUT}s: $ORACLE_M (see oracle-feed.log)"
     log "oracle marks fresh on all $MARKETS markets after ${ORACLE_FRESH_S}s: $ORACLE_M"
+    if [ "$ORACLE_FEED" = seed ]; then
+        # Owner s138: every market has had its first mark; stop the feed and
+        # wait until no mark is usable, so the whole load runs on stale marks.
+        stop_oracle_feed
+        T_STALE0=$(date +%s)
+        while [ $(( $(date +%s) - T_STALE0 )) -lt "$ORACLE_STALE_TIMEOUT" ]; do
+            sleep 5
+            ORACLE_M=$(oracle_marks 0)
+            # every market read (the probe stops at its 30 s budget), no error, none usable
+            [ "$(jq -r .checked <<<"$ORACLE_M")" = "$MARKETS" ] && [ "$(jq -r .usable <<<"$ORACLE_M")" = 0 ] \
+                && [ "$(jq -r .errors <<<"$ORACLE_M")" = 0 ] \
+                && { ORACLE_STALE_S=$(( $(date +%s) - T_STALE0 )); break; }
+        done
+        printf '%s\n' "$ORACLE_M" > "$OUT/oracle-marks-seeded.json"
+        [ -n "$ORACLE_STALE_S" ] || die "oracle seed: marks still usable (or unreadable) ${ORACLE_STALE_TIMEOUT}s after the feed stopped: $ORACLE_M"
+        log "oracle seed: first marks landed on all $MARKETS markets, feed stopped, every mark stale after ${ORACLE_STALE_S}s: $ORACLE_M"
+    fi
 fi
 
 # ---------------------------------------------------------------- 4c. pre-load (PRELOAD > 0)
@@ -2624,6 +2663,22 @@ d['oracle_feed'] = o
 with open(p, 'w') as f:
     json.dump(d, f, indent=1)
 PYS
+fi
+# summary.json .oracle_feed for ORACLE_FEED=seed (owner s138).
+if [ "$ORACLE_FEED" = seed ] && [ "$rc" = 0 ]; then
+    python3 - "$OUT" "$ORACLE_PRICE" "$ORACLE_FRESH_S" "$ORACLE_STALE_S" <<'PYSEED' \
+        || log "WARNING: summary.json .oracle_feed (seed) not written"
+import json, os, sys
+out, price, fresh_s, stale_s = sys.argv[1:5]
+p = os.path.join(out, 'summary.json')
+with open(p) as f:
+    d = json.load(f)
+d['oracle_feed'] = {'oracle_feed': 'seed', 'price': price, 'shock_bp': 0, 'shock_round': 0, 'walk_bp': 0,
+                    'fresh_after_s': int(fresh_s) if fresh_s.isdigit() else None,
+                    'stale_after_s': int(stale_s) if stale_s.isdigit() else None}
+with open(p, 'w') as f:
+    json.dump(d, f, indent=1)
+PYSEED
 fi
 # summary.json .state_attest (+ its REJECT fold): from state-attest.json.
 if state_attest_on && [ "$rc" = 0 ]; then

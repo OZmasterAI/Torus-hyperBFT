@@ -24,8 +24,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Makes two different kinds of validator set updates in sequence:
 /// 1. A validator set update that adds a validator with much more power than the rest.
 /// 2. A validator set update that removes all existing validators and adds completely new ones.
+///
+/// s138 (docs/plans/disjoint-vset-livelock.md §6 T0/T2): step 4 passed 10 of 10 runs on d3de0abb,
+/// so the test is no longer ignored. Step 5 also checks that every replica decided the
+/// replacement and that the new set makes progress.
 #[test]
-#[ignore = "step-4 disjoint-set replacement livelocks: new set cannot bootstrap quorum (known limitation, fix deferred)"]
 fn multiple_validator_set_updates_test() {
     // 1. Initialize test components.
 
@@ -162,6 +165,50 @@ fn multiple_validator_set_updates_test() {
                     .iter()
                     .map(|node| node.committed_validator_set().len())
                     .collect::<Vec<_>>()
+            )
+        },
+    );
+
+    // 5. s138 T2: the new set decides the replacement and makes progress.
+
+    // 5.1. Poll until every replica has seen the replacement's Decide PC.
+    log_with_context(
+        None,
+        "Polling until every replica has decided the disjoint replacement.",
+    );
+    wait_until(
+        Duration::from_secs(120),
+        POLL_INTERVAL,
+        "every replica to decide the disjoint replacement",
+        || nodes.iter().all(|node| node.validator_set_update_decided()),
+        || {
+            format!(
+                "decided = {:?}",
+                nodes
+                    .iter()
+                    .map(|node| node.validator_set_update_decided())
+                    .collect::<Vec<_>>()
+            )
+        },
+    );
+
+    // 5.2. Submit an Increment transaction to each new validator and poll until every replica sees
+    // the number as 2.
+    log_with_context(
+        None,
+        "Submitting an Increment transaction to each new validator.",
+    );
+    nodes[4].submit_transaction(NumberAppTransaction::Increment);
+    nodes[5].submit_transaction(NumberAppTransaction::Increment);
+    wait_until(
+        Duration::from_secs(120),
+        POLL_INTERVAL,
+        "every replica to see the number as 2 (progress under the new set)",
+        || nodes.iter().all(|node| node.number() == 2),
+        || {
+            format!(
+                "replica numbers = {:?}",
+                nodes.iter().map(|node| node.number()).collect::<Vec<_>>()
             )
         },
     );

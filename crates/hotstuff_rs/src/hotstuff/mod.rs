@@ -204,3 +204,6 @@ mod tc_leader_test;
 
 #[cfg(test)]
 mod window_tip_leader_test;
+
+#[cfg(test)]
+mod lock_reflexive_test;

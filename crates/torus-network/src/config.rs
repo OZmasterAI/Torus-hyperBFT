@@ -78,6 +78,12 @@ pub struct NetworkConfig {
     /// connection, where gossipsub skips sending our subscriptions)
     /// (`TORUS_MESH_STALE_CONN_KICK`, default ON; `0` = watchdog only).
     pub mesh_stale_conn_kick: bool,
+    /// Owner s138: the genesis digest (`torus_genesis::GenesisDigest::digest`)
+    /// the network layer is keyed by (see [`crate::genesis_id`]): protocol and
+    /// topic names carry its tag, identify advertises it, and a peer with
+    /// another one is refused. `None` (no `--genesis`): legacy names; a peer
+    /// advertising a digest is refused.
+    pub genesis_digest: Option<[u8; 32]>,
 }
 
 /// Effective gossipsub per-peer send-queue length: `TORUS_GOSSIP_QUEUE_LEN`
@@ -285,6 +291,7 @@ impl Default for NetworkConfig {
             mesh_watchdog_grace: mesh_watchdog_grace(),
             mesh_watchdog_tick: mesh_watchdog_tick(),
             mesh_stale_conn_kick: mesh_stale_conn_kick(),
+            genesis_digest: None,
         }
     }
 }

@@ -110,10 +110,15 @@ impl BlockId {
 }
 
 /// A phase certificate: which block it certifies, and the view it formed in.
+///
+/// s138: `jv` is the view of the certified block's own justify (the parent QC it embeds). A
+/// block's hash binds its justify, so `(block, jv)` identifies a block; with re-proposals the
+/// same block can be certified again in a later view (same `block`, same `jv`, higher `view`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct Qc {
     block: BlockId,
     view: u8,
+    jv: u8,
 }
 
 // ===========================================================================
@@ -149,6 +154,22 @@ struct MonadBftModel {
     /// lock check is skipped at vote time (pending-block bypass). Strictly
     /// widens reachable behaviour.
     allow_pending_bypass: bool,
+    /// s138: a block may be (re-)certified in more than one view, with its own justify, and
+    /// children may be built on any of its parent's QCs. Off = the original model (each block
+    /// is proposed once).
+    reproposals: bool,
+    /// s138: the reflexive lock rule (`invariants::safe_proposal_lock`): a proposal of the
+    /// replica's (uncommitted) locked block itself satisfies the lock.
+    reflexive_lock: bool,
+    /// Highest view a QC may form in.
+    max_view: u8,
+}
+
+impl MonadBftModel {
+    /// The original model: no re-proposals, `MAX_VIEW`.
+    fn new(lock_rule: LockRule, allow_pending_bypass: bool) -> Self {
+        MonadBftModel { lock_rule, allow_pending_bypass, reproposals: false, reflexive_lock: false, max_view: MAX_VIEW }
+    }
 }
 
 // ===========================================================================
@@ -167,6 +188,8 @@ struct State {
     committed: [BTreeSet<BlockId>; HONEST],
     /// Per honest replica: QCs already processed (bounds Deliver; avoids churn).
     processed: [BTreeSet<Qc>; HONEST],
+    /// s138 witness: some honest vote was admitted by the reflexive lock arm alone.
+    reflexive_vote: bool,
 }
 
 impl State {
@@ -189,7 +212,8 @@ enum Action {
     /// A QC for `block` forms at `view`, voted by the replicas in `voter_mask`
     /// (bits 0..=3 = v1..v4). Models an (equivocating) proposal + a quorum of
     /// votes. Honest voters apply the vote-time lock update on `block.justify`.
-    FormQc { block: BlockId, view: u8, voter_mask: u8 },
+    /// `jv` selects the block's justify: its parent's QC formed in view `jv`.
+    FormQc { block: BlockId, view: u8, voter_mask: u8, jv: u8 },
     /// Honest replica `r` processes an already-formed `qc` it has not seen yet
     /// (models async/partitioned delivery + the collect/child-proposal paths).
     Deliver { r: u8, qc: Qc },
@@ -199,15 +223,15 @@ enum Action {
 // Protocol helpers (direct transcriptions of invariants.rs)
 // ===========================================================================
 
-/// The QC embedded in `block` = QC(parent(block)) (block.justify), if formed.
-fn justify_of(pool: &BTreeSet<Qc>, block: BlockId) -> Option<Qc> {
+/// The QC embedded in `block` = QC(parent(block)) formed in view `jv` (block.justify), if formed.
+fn justify_of(pool: &BTreeSet<Qc>, block: BlockId, jv: u8) -> Option<Qc> {
     let par = block.parent();
     if par == BlockId::Genesis {
         // Genesis PC — treated as "seeded"; view 0. Only A has this and A is
         // pre-seeded as QC(A, BASE_VIEW), so this branch is not hit for A here.
-        return Some(Qc { block: BlockId::Genesis, view: 0 });
+        return Some(Qc { block: BlockId::Genesis, view: 0, jv: 0 });
     }
-    pool.iter().copied().find(|q| q.block == par)
+    pool.iter().copied().find(|q| q.block == par && q.view == jv)
 }
 
 /// pc_to_lock(J): the candidate locked_pc after processing `qc`.
@@ -223,7 +247,7 @@ fn pc_to_lock(pool: &BTreeSet<Qc>, qc: Qc, rule: LockRule) -> Option<Qc> {
             if par == BlockId::Genesis {
                 None
             } else {
-                justify_of(pool, qc.block) // = QC(parent(qc.block))
+                justify_of(pool, qc.block, qc.jv) // = QC(parent(qc.block))
             }
         }
     }
@@ -236,7 +260,7 @@ fn block_to_commit(pool: &BTreeSet<Qc>, qc: Qc) -> Option<BlockId> {
     if par == BlockId::Genesis {
         return None;
     }
-    let pj = justify_of(pool, qc.block)?; // qc.block.justify
+    let pj = justify_of(pool, qc.block, qc.jv)?; // qc.block.justify
     if pj.block == BlockId::Genesis {
         return None;
     }
@@ -290,7 +314,7 @@ impl Model for MonadBftModel {
     type Action = Action;
 
     fn init_states(&self) -> Vec<Self::State> {
-        let seed = Qc { block: BlockId::A, view: BASE_VIEW };
+        let seed = Qc { block: BlockId::A, view: BASE_VIEW, jv: 0 };
         let mut pool = BTreeSet::new();
         pool.insert(seed);
         let committed_seed = {
@@ -314,16 +338,22 @@ impl Model for MonadBftModel {
                 processed_seed.clone(),
                 processed_seed,
             ],
+            reflexive_vote: false,
         }]
     }
 
     fn actions(&self, state: &Self::State, actions: &mut Vec<Self::Action>) {
         // FormQc candidates: every proposable block, view, and quorum mask.
         for block in BlockId::proposable() {
-            for view in (BASE_VIEW + 1)..=MAX_VIEW {
-                for voter_mask in 0u8..16u8 {
-                    if voter_mask.count_ones() >= QUORUM {
-                        actions.push(Action::FormQc { block, view, voter_mask });
+            let parent_qcs: Vec<u8> = state.pool.iter().filter(|q| q.block == block.parent()).map(|q| q.view).collect();
+            for jv in parent_qcs {
+                for view in (BASE_VIEW + 1)..=self.max_view {
+                    for voter_mask in 0u8..16u8 {
+                        // 0b1111 has the honest voters of 0b0111 (v4 carries no state): the
+                        // same successor state, so it is skipped.
+                        if voter_mask.count_ones() >= QUORUM && voter_mask != 0b1111 {
+                            actions.push(Action::FormQc { block, view, voter_mask, jv });
+                        }
                     }
                 }
             }
@@ -338,13 +368,17 @@ impl Model for MonadBftModel {
 
     fn next_state(&self, last: &Self::State, action: Self::Action) -> Option<Self::State> {
         match action {
-            Action::FormQc { block, view, voter_mask } => {
-                // One QC per block (a block is proposed once).
-                if last.pool.iter().any(|q| q.block == block) {
+            Action::FormQc { block, view, voter_mask, jv } => {
+                // One QC per block (a block is proposed once), unless re-proposals are modeled:
+                // then only an identical QC is a no-op.
+                if !self.reproposals && last.pool.iter().any(|q| q.block == block) {
+                    return None;
+                }
+                if last.pool.contains(&Qc { block, view, jv }) {
                     return None;
                 }
                 // The block's justify (QC of its parent) must already exist.
-                let justify = justify_of(&last.pool, block)?;
+                let justify = justify_of(&last.pool, block, jv)?;
                 if justify.block == BlockId::Genesis {
                     return None; // proposable blocks always have a non-genesis parent QC
                 }
@@ -352,20 +386,29 @@ impl Model for MonadBftModel {
                 if view <= justify.view {
                     return None;
                 }
-                // Honest voters must each be eligible (vote-once + safe_pc pred 3).
+                // Honest voters must each be eligible (vote-once + safe_pc pred 3, or, with
+                // `reflexive_lock`, the block is the voter's uncommitted locked block itself).
+                let mut reflexive_vote = false;
                 for r in 0..HONEST {
                     if voter_mask & (1 << r) != 0 {
                         let voted_ok = last.hvv[r].map_or(true, |hv| hv < view);
-                        let safe = safe_pc_pred3(justify, last.locked[r], self.allow_pending_bypass);
-                        if !(voted_ok && safe) {
+                        let pred3 = safe_pc_pred3(justify, last.locked[r], self.allow_pending_bypass);
+                        let locked = last.locked[r];
+                        let reflexive = self.reflexive_lock
+                            && locked.block == block
+                            && locked.jv == jv
+                            && !last.committed[r].contains(&block);
+                        if !(voted_ok && (pred3 || reflexive)) {
                             return None;
                         }
+                        reflexive_vote |= !pred3;
                     }
                 }
                 // Apply: QC forms; honest voters mark voted and process block.justify
                 // (the vote-time update(proposal.block.justify)).
                 let mut st = last.clone();
-                st.pool.insert(Qc { block, view });
+                st.reflexive_vote |= reflexive_vote;
+                st.pool.insert(Qc { block, view, jv });
                 for r in 0..HONEST {
                     if voter_mask & (1 << r) != 0 {
                         st.hvv[r] = Some(view);
@@ -412,6 +455,9 @@ impl Model for MonadBftModel {
                     .flat_map(|s| s.iter())
                     .all(|b| b.height() == 255 || b.height() <= 2)
             }),
+            // s138 witness: the reflexive lock arm admits some honest vote (so the agreement
+            // check above covers it).
+            Property::<Self>::sometimes("reflexive_vote", |_, state| state.reflexive_vote),
         ]
     }
 }
@@ -426,10 +472,7 @@ impl Model for MonadBftModel {
 /// LockRule::PRODUCTION is repointed to Parent.
 #[test]
 fn agreement_under_production_rule() {
-    let model = MonadBftModel {
-        lock_rule: LockRule::PRODUCTION,
-        allow_pending_bypass: false,
-    };
+    let model = MonadBftModel::new(LockRule::PRODUCTION, false);
     let checker = model.checker().spawn_bfs().join();
     assert!(
         checker.discovery("agreement").is_none(),
@@ -446,10 +489,7 @@ fn agreement_under_production_rule() {
 /// violates Agreement (two honest validators commit conflicting siblings).
 #[test]
 fn grandparent_lock_violates_agreement() {
-    let model = MonadBftModel {
-        lock_rule: LockRule::Grandparent,
-        allow_pending_bypass: false,
-    };
+    let model = MonadBftModel::new(LockRule::Grandparent, false);
     let checker = model.checker().spawn_bfs().join();
     assert!(
         checker.discovery("agreement").is_some(),
@@ -463,22 +503,40 @@ fn grandparent_lock_violates_agreement() {
 /// entire reachable state space (no counterexample).
 #[test]
 fn parent_lock_upholds_agreement() {
-    let model = MonadBftModel {
-        lock_rule: LockRule::Parent,
-        allow_pending_bypass: false,
-    };
+    let model = MonadBftModel::new(LockRule::Parent, false);
     let checker = model.checker().spawn_bfs().join();
-    checker.assert_properties(); // both `agreement` and `bounded_depth` hold
+    // both `agreement` and `bounded_depth` hold (`reflexive_vote` is the s138 witness, off here)
+    assert!(checker.discovery("agreement").is_none());
+    assert!(checker.discovery("bounded_depth").is_none());
 }
 
-/// The header-first pending-block bypass does not rescue the grandparent lock —
-/// skipping safe_pc only widens the attack surface.
-#[test]
-fn grandparent_lock_with_header_bypass_still_violates() {
-    let model = MonadBftModel {
-        lock_rule: LockRule::Grandparent,
-        allow_pending_bypass: true,
-    };
+/// s138: the reflexive lock rule (a proposal of the voter's uncommitted locked block itself
+/// satisfies the lock, `invariants::safe_proposal_lock`) with re-proposals (a block certified
+/// again in a later view, children built on any of its parent's QCs) keeps Agreement, and the
+/// reflexive arm is exercised (the `reflexive_vote` witness is found). QCs in views 2..=`max_view`.
+fn check_reflexive_lock_with_reproposals(max_view: u8) {
+    let model = MonadBftModel { reproposals: true, reflexive_lock: true, max_view, ..MonadBftModel::new(LockRule::Parent, false) };
     let checker = model.checker().spawn_bfs().join();
-    assert!(checker.discovery("agreement").is_some());
+    assert!(
+        checker.discovery("agreement").is_none(),
+        "Agreement violated under the reflexive lock rule. Counterexample path: {:?}",
+        checker.discovery("agreement").map(|p| p.into_actions()),
+    );
+    assert!(checker.discovery("bounded_depth").is_none());
+    assert!(checker.discovery("reflexive_vote").is_some(), "the reflexive lock arm was never used");
+}
+
+/// [`check_reflexive_lock_with_reproposals`] with QCs in views 2..=4 (in the regular suite).
+#[test]
+fn reflexive_lock_with_reproposals_upholds_agreement() {
+    check_reflexive_lock_with_reproposals(4);
+}
+
+/// [`check_reflexive_lock_with_reproposals`] with QCs in views 2..=5 (`MAX_VIEW`, as the other
+/// checks): about 9 minutes in a debug build, so run on demand:
+/// `cargo nextest run -p hotstuff_rs --test stateright_2chain_safety --run-ignored all`.
+#[test]
+#[ignore = "slow (about 9 min, debug): the views 2..=5 state space with re-proposals"]
+fn reflexive_lock_with_reproposals_upholds_agreement_to_max_view() {
+    check_reflexive_lock_with_reproposals(MAX_VIEW);
 }

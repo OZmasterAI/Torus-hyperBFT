@@ -1641,6 +1641,13 @@ pub fn market_delisted_reason(market_id: MarketId) -> String {
     format!("market {market_id} is delisted: only reduce-only orders")
 }
 
+/// Owner s138: the rejection text of an order (or a modify) on a market that
+/// has never had an oracle mark: the executor's
+/// (`FailureReason::MarketNeverMarked`) and RPC intake's, one string.
+pub fn market_never_marked_reason(market_id: MarketId) -> String {
+    format!("market {market_id} has no oracle mark yet: orders open after its first mark")
+}
+
 /// Delist decisions (owner s134, 3b): the `CF_NATIVE_MARKETS` key of a
 /// delisted market's oracle-closed marker: the 8-byte big-endian market id
 /// followed by `b'S'` (nine bytes, skipped by every market-row scan, like

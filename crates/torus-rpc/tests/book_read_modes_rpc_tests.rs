@@ -84,6 +84,8 @@ fn gtc(market_id: MarketId, is_buy: bool, price: i64, qty: i64) -> PlaceOrderPar
 /// Market 1 ends with bids 100 (qty 3, after a partial fill) and 99 (qty 7),
 /// ask 105 (qty 4); last trade price 100. Market 2 holds one bid.
 fn seed(db: &StateDb, mode: BookMode) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     // Pre-testnet P0: orders need a listed market (a placeholder row
     // where the test has none).
     for m in [1u64, 2] {

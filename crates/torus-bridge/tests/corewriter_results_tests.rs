@@ -17,6 +17,8 @@ use torus_state::{StateBackend, StateDb};
 use torus_types::FixedPoint;
 
 fn open_test_db() -> (tempfile::TempDir, StateDb) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().expect("create temp dir");
     let db = StateDb::open(dir.path()).expect("open db");
     // Pre-testnet P0: actions need a listed market (placeholder rows).

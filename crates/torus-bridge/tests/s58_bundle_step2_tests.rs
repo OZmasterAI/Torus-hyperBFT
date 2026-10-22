@@ -155,6 +155,8 @@ fn run(on: Option<bool>, cap: usize) -> Fingerprint {
 }
 
 fn block(cap: usize) -> Fingerprint {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().expect("tempdir");
     let db = StateDb::open(dir.path()).expect("open db");
     // Pre-testnet P0: orders need a listed market (placeholder rows,

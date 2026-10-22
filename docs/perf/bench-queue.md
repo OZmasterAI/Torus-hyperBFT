@@ -37,6 +37,8 @@ Pull tools from main before the next campaign that has crash cells.
 explicitly for mode-3 arms. Each cell logs `cell=<label> book_mode=... <flag>='...'` and records `cell.book_mode` /
 `cell.node_flags` in summary.json. Pull tools from main before the next campaign.
 
+**Live status (18c main session, updated s138):** 9k (`896240d4`): standard shape DONE, section 125 on main (K -47.5% matched/s whole, -58% post-kill; blocks/s 1.40 vs 15.86; survivor body-fetch fallback + 17-50 s freeze in 5 of 7 K cells, 18c investigating on `fix/body-fetch-dead-peer`). Deep shape RUNNING since 17:30 (`bench-ozarchy-9k2-deep2`, health.py `c8fff67d`, dissemination-only REJECTs logged, deep K smoke ACCEPT), ETA ~19:15; section 125.7 follows. health.py kill-cell fix on main (`32db7ad9`). **Batch 12 LANDED (`cc8c9c4a`): 9o's 'after' arm can build main `cc8c9c4a`.** The post-kill body-fetch fix (`fix/body-fetch-dead-peer`, reviewed) lands in the next batch; K cells built before it still show the freezes. **Batch A LANDED (`d595f77e`):** orders on never-marked markets are rejected (code 18), so cells built from `d595f77e`+ must use main's run-cell.sh seed mode; nodes refuse peers with a different genesis digest (same binary + genesis per cell). Pin 9o's 'after' arm to one commit for the whole arm. Next on ozarchy: 9l / 9m / 9n, then 9o 'before' cells. 9o 'after' arm waits for batch 12 = D2 membership sync (`fix/vset-membership-sync`, Codex adversarial: approve) + lost-view timeout vote + reflexive lock rule (`fix/vsu-lock-reflexive`, cachyoz gate nextest 4715/4715; Codex adversarial found a P1 stall, fix in progress); 18c pings archy when it lands. 9p waits for dead-leader phases 1-3 (`feat/dead-leader-p3`, Codex: no findings), batch 12, and 4-validator run-cell.sh support (`tools/run-cell-4val`, building).
+
 **Owner s138: benches UNPAUSED.** Order: 9k first (pre-TC `896240d4`, a clean "before"); then 9l / 9m / 9n in any order; 9o's "after" arm on main after batch 12 (D2 membership sync + lost-view timeout vote + reflexive lock rule; 18c pings when it lands; its "before" cells may run earlier); 9p held until dead-leader phase 3 lands. Main now has the TC set (`d3de0abb`, `CONSENSUS_DB_FORMAT` v1): wipe data dirs for cells built from it; dead-leader will bump to v2.
 
 **Defaults on main (s136, batch 10 `2d2f3ed9`; pull main before preparing any cell):**
@@ -1099,6 +1101,12 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    views per minute, p50 / p99 commit latency, plus the end-of-load cancel-all tail (archy s136 open question).
    ~2-2.5 h (estimate). Doc target: the next results-doc section.
    **Config (s136, batch 10 on main `2d2f3ed9`):** run as the testnet will: hash + attestation + L6.1 + L2.1 + fail-stop on. `gen-weighted-genesis.sh` (needed for 2/2/1 stakes) still defaults the hash OFF, so set `STATE_HASH_ACTIVATION` explicitly ON (hash from block 1; L6.1 follows it for Classic); L2.1 and fail-stop are on by default. Check the startup lines read `on=true`.
+   **Status (s138): standard shape DONE, deep running (`ozarchy-9k2-deep2`). Results: section 125 of
+   `ozarchy-antispam-item6-pf1-2026-10-04.md`.** K / U matched/s: whole cell 145.5k vs 277.3k (-47.5%), post-kill
+   115.9k vs 275.7k (-58.0%). Post-kill blocks/s 1.40 vs 15.86. val1 times out once per val2-led view (42.3 / min).
+   Cancel-all tail: K 4.5k in 6-10 s. Finding: in 5 of 7 K cells a survivor fell back to sync for the other survivor's
+   block body (17-50 s freeze; cause open, 18c). Caveat: the in-flight watcher is val1 in K vs val2 in U, which
+   confounds the pre-kill window.
 9o. **[GO s138: 'before' cells now; 'after' arm on main after batch 12] TC-required phase D: one-down bench, main vs main + TC set.** After the TC set lands (batch 9
    + `fix/tc-liveness`) and after 9k. Same cells as 9k on both binaries, 3 runs each (design
    `docs/plans/tc-required-and-tip-signing.md` section 7): all-up and one-down (stake 2/2/1, stake-1 node killed, no
