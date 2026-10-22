@@ -24,7 +24,11 @@ use hotstuff_rs::{
         types::{Phase, PhaseCertificate},
     },
     networking::messages::{Message, ProgressMessage},
-    pacemaker::{messages::PacemakerMessage, select_leader, types::TipInfo},
+    pacemaker::{
+        messages::{AdvanceView, PacemakerMessage, ProgressCertificate},
+        select_leader,
+        types::TipInfo,
+    },
     types::{
         crypto_primitives::{SigningKey, VerifyingKey},
         data_types::{CryptoHash, Power, SignatureBytes, SignatureSet, ViewNumber},
@@ -556,4 +560,179 @@ fn validator_set_update_commits_through_timeout_views() {
         !amended.is_empty(),
         "scenario: no VSU re-proposal under a TC whose high QC certifies the block itself (the V3 amendment case)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// s136 ([claude-review] P3): the validator-set update window.
+// ---------------------------------------------------------------------------
+
+/// One proposal header the cluster sent: its view, its justify's view, and, if it carries a TC,
+/// the TC's view, high-QC phase and high-tip view.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HeaderViews {
+    view: u64,
+    justify_view: u64,
+    tc: Option<(u64, Option<Phase>, Option<u64>)>,
+}
+
+#[derive(Default)]
+struct WindowLog {
+    /// The update block whose header was let through (the first one proposed right after a view
+    /// whose leader differs between the two sets).
+    update_block: Option<CryptoHash>,
+    /// Views of update-block proposals dropped to get there.
+    skipped: HashSet<u64>,
+    /// The view of the first fresh header justified by the update's Decide PC (dropped).
+    dropped: Option<u64>,
+    /// The validator whose timeout votes for `dropped` are lost.
+    silent: Option<VerifyingKey>,
+    headers: Vec<HeaderViews>,
+    /// Timeout votes for `dropped` and the view after it as sent: (view, sender index, tip view,
+    /// high-QC view and phase), for the failure messages.
+    timeout_votes: Vec<(u64, usize, Option<u64>, Option<(u64, Phase)>)>,
+}
+
+/// No view is lost after the timeout of the first view after an update (s136).
+///
+/// Four validators; a power update of n0 (1 -> 2: total 5, quorum 4). Votes on the update block
+/// and its nudges set no tip, so every honest tip is a pre-update one, signed by the previous
+/// set's leader: the update block is only let through when proposed right after a view whose
+/// leader differs between the two sets (n0's earlier update proposals are dropped), so that tip
+/// fails under the committed set. The Decide votes reach only the committed set's leader of the
+/// next view (w), and its AdvanceView with the Decide PC is lost. Its fresh proposal (justified by the Decide PC, so only it has applied that PC)
+/// is lost, and so are one
+/// power-1 validator's timeout votes for w, so TC(w) carries the leader of w's vote: its high QC
+/// is the Decide PC (case 3) and its high tip the pre-update tip. leader(w + 1) applies the Decide
+/// PC and proposes with that TC. Under the decided-ness rule that leader and leader(w) (both
+/// decided) refused the TC, the two others could not reach the quorum and view w + 1 was lost
+/// too. With one fresh proposer per view regardless of the decision, QC(w + 1) forms.
+#[test]
+fn validator_set_update_window_timeout_loses_no_further_view() {
+    let mut cluster = Cluster::new();
+    let keys: Vec<VerifyingKey> = (0..4).map(|i| cluster.key(i)).collect();
+    let target = keys[0];
+    let old_set = cluster.validator_set();
+    let mut new_set = old_set.clone();
+    let mut power_update = ValidatorSetUpdates::new();
+    power_update.insert(target, Power::new(2));
+    new_set.apply_updates(&power_update);
+    let split = {
+        let (old_set, new_set) = (old_set.clone(), new_set.clone());
+        move |view: u64| select_leader(ViewNumber::new(view), &old_set) != select_leader(ViewNumber::new(view), &new_set)
+    };
+
+    let log = Arc::new(Mutex::new(WindowLog::default()));
+    let log_in = log.clone();
+    let split_in = split.clone();
+    let (keys_in, new_set_in) = (keys.clone(), new_set.clone());
+    cluster.filter.rewrite(Arc::new(move |sender, recipient, message| {
+        let mut w = log_in.lock().unwrap();
+        // Only the committed set's leader of the next view collects the Decide votes, so it alone
+        // holds the Decide PC until it proposes on it (otherwise the votes also reach the previous
+        // set's leader and the backup aggregators, and every validator is decided by then).
+        if let Message::ProgressMessage(ProgressMessage::HotStuffMessage(HotStuffMessage::PhaseVote(vote))) = &message {
+            if vote.phase == Phase::Decide && *recipient != select_leader(ViewNumber::new(vote.view.int() + 1), &new_set_in) {
+                return None;
+            }
+        }
+        // Its AdvanceView carrying the Decide PC is lost too (asynchrony): the others stay undecided.
+        if let Message::ProgressMessage(ProgressMessage::PacemakerMessage(PacemakerMessage::AdvanceView(AdvanceView {
+            progress_certificate: ProgressCertificate::PhaseCertificate(pc),
+        }))) = &message
+        {
+            if pc.phase == Phase::Decide && recipient != sender {
+                return None;
+            }
+        }
+        if let Some(h) = header_of(&message) {
+            let view = h.view.int();
+            if h.has_validator_set_updates && w.update_block.is_none() && !w.skipped.contains(&view) {
+                if split_in(view - 1) {
+                    w.update_block = Some(h.block_hash);
+                } else {
+                    w.skipped.insert(view);
+                }
+            }
+            if w.update_block.is_some() && w.dropped.is_none() && h.justify.phase == Phase::Decide && !h.has_validator_set_updates {
+                let next_leader = select_leader(ViewNumber::new(view + 1), &new_set_in);
+                w.dropped = Some(view);
+                w.silent = keys_in[1..].iter().copied().find(|k| k != sender && *k != next_leader);
+            }
+        }
+        if let Message::ProgressMessage(ProgressMessage::HotStuffMessage(
+            m @ (HotStuffMessage::Proposal(_) | HotStuffMessage::ProposalHeader(_) | HotStuffMessage::BlockDataResponse(_)),
+        )) = &message
+        {
+            let view = m.view().int();
+            if w.skipped.contains(&view) || w.dropped == Some(view) {
+                return None;
+            }
+        }
+        if let Message::ProgressMessage(ProgressMessage::PacemakerMessage(PacemakerMessage::TimeoutVote(tv))) = &message {
+            if w.dropped.is_some_and(|view| tv.view.int() == view || tv.view.int() == view + 1) {
+                let entry = (
+                    tv.view.int(),
+                    keys_in.iter().position(|k| k == sender).unwrap(),
+                    tv.local_tip.as_ref().map(|tip| tip.view.int()),
+                    tv.highest_qc.as_ref().map(|qc| (qc.view.int(), qc.phase)),
+                );
+                if !w.timeout_votes.contains(&entry) {
+                    w.timeout_votes.push(entry);
+                }
+            }
+            if Some(tv.view.int()) == w.dropped && w.silent.as_ref() == Some(sender) {
+                return None;
+            }
+        }
+        if let Some(h) = header_of(&message) {
+            let entry = HeaderViews {
+                view: h.view.int(),
+                justify_view: h.justify.view.int(),
+                tc: h.tc.as_ref().map(|tc| {
+                    (tc.view.int(), tc.high_qc.as_ref().map(|qc| qc.phase), tc.high_tip.as_ref().map(|tip| tip.view.int()))
+                }),
+            };
+            if w.headers.last() != Some(&entry) {
+                w.headers.push(entry);
+            }
+        }
+        Some(message)
+    }));
+    cluster.start(&[]);
+    cluster.wait_for_commits(2, "before the update");
+    cluster.nodes[0]
+        .as_mut()
+        .unwrap()
+        .submit_transaction(NumberAppTransaction::SetValidator(target.to_bytes(), Power::new(2)));
+    wait_until(
+        LIVENESS_BOUND,
+        POLL_INTERVAL,
+        "every validator to commit the power update of n0",
+        || cluster.live().all(|n| n.committed_validator_set().power(&target).map(|p| p.int()) == Some(2)),
+        || cluster.describe(),
+    );
+    let after = cluster.max_committed();
+    cluster.wait_for_commits(after + 3, "after the update");
+
+    let log = log.lock().unwrap();
+    let w = log.dropped.expect("scenario: the first fresh proposal after the update was seen and dropped");
+    let trace = format!(
+        "w = {w}, skipped {:?}, silent n{:?}, leaders(w, w + 1) = n{} n{}; timeout votes (view, sender, tip view, high QC): {:?}; headers: {:?}",
+        log.skipped,
+        log.silent.and_then(|s| keys.iter().position(|k| *k == s)),
+        keys.iter().position(|k| *k == select_leader(ViewNumber::new(w), &new_set)).unwrap(),
+        keys.iter().position(|k| *k == select_leader(ViewNumber::new(w + 1), &new_set)).unwrap(),
+        log.timeout_votes,
+        log.headers
+    );
+    let recovery = log
+        .headers
+        .iter()
+        .find(|h| h.view == w + 1 && h.tc.is_some_and(|(tc_view, _, _)| tc_view == w))
+        .unwrap_or_else(|| panic!("scenario: leader(w + 1) proposed under TC(w); {trace}"));
+    let (_, high_qc_phase, high_tip_view) = recovery.tc.unwrap();
+    assert_eq!(high_qc_phase, Some(Phase::Decide), "scenario: case 3 on the Decide PC; {trace}");
+    let tip_view = high_tip_view.unwrap_or_else(|| panic!("scenario: TC(w) has a high tip; {trace}"));
+    assert!(split(tip_view), "scenario: the high tip's view {tip_view} has different leaders in the two sets; {trace}");
+    assert!(log.headers.iter().any(|h| h.justify_view == w + 1), "view w + 1 was lost: no header justifies on QC(w + 1); {trace}");
 }
