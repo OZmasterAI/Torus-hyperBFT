@@ -326,8 +326,10 @@ fn mixed_commit_replica(replica: usize, committed: bool, a_updates: bool) -> Mix
     let (mut block_tree, _vss) = steady_block_tree(&set);
     let a = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(), CryptoHash::new([10u8; 32]), Data::new(vec![]));
     let u_justify = if a_updates {
+        // keys[2] signs both the honest-quorum PCs (keys[..3]) and Prepare(7) (keys[1..]), so
+        // both stay a quorum under A's powers.
         let mut updates = ValidatorSetUpdates::new();
-        updates.insert(keys[0].verifying_key(), Power::new(2));
+        updates.insert(keys[2].verifying_key(), Power::new(2));
         block_tree.insert(&a, None, Some(&updates)).expect("insert A");
         let decide_a = phase_pc(2, a.hash, Phase::Decide, &keys[..3], &set);
         block_tree.update(&decide_a, &None).expect("A's Decide PC");
