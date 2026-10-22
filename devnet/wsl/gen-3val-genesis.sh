@@ -202,19 +202,25 @@ if [ -n "$BOOK_MODE_NAME" ]; then
     tmp=$(mktemp) && jq --arg m "$BOOK_MODE_NAME" '.consensus.book_mode = $m' "$OUT" > "$tmp" && mv "$tmp" "$OUT"
 fi
 
-# 5. Optional running state hash activation (docs/plans/running-state-hash-impl.md).
-#    CHAIN-WIDE genesis field: every node hashes from this height; absent = off.
-if [ -n "${STATE_HASH_ACTIVATION:-}" ]; then
+# 5. Running state hash activation (docs/plans/running-state-hash-impl.md).
+#    CHAIN-WIDE: every node hashes from this height. Owner s136: ON at genesis:
+#    unset = the genesis names no activation, so the node default applies
+#    (running_state_hash from block 1); an integer H = from H (the alias
+#    field); 'off' = the explicit opt-out `.consensus.activations = {}`.
+if [ "${STATE_HASH_ACTIVATION:-}" = off ]; then
+    tmp=$(mktemp) && jq '.consensus.activations = {}' "$OUT" > "$tmp" && mv "$tmp" "$OUT"
+elif [ -n "${STATE_HASH_ACTIVATION:-}" ]; then
     [[ "$STATE_HASH_ACTIVATION" =~ ^[0-9]+$ ]] && [ "$STATE_HASH_ACTIVATION" -ge 1 ] \
-        || { echo "FATAL: STATE_HASH_ACTIVATION must be an integer >= 1 (got '$STATE_HASH_ACTIVATION')" >&2; exit 1; }
+        || { echo "FATAL: STATE_HASH_ACTIVATION must be an integer >= 1 or 'off' (got '$STATE_HASH_ACTIVATION')" >&2; exit 1; }
     tmp=$(mktemp) && jq --argjson h "$STATE_HASH_ACTIVATION" '.consensus.state_hash_activation_height = $h' "$OUT" > "$tmp" && mv "$tmp" "$OUT"
 fi
 
 # 6. Optional L6.1 window-committed Classic books (docs/plans/l61-window-committed-books.md).
-#    CHAIN-WIDE genesis field; needs STATE_HASH_ACTIVATION (the node refuses it otherwise).
+#    CHAIN-WIDE genesis field (alias of activations.book_window_commit at the running
+#    hash's height); needs the running hash (the node refuses it otherwise).
 if [ "${BOOK_WINDOW_COMMIT:-0}" = 1 ]; then
-    [ -n "${STATE_HASH_ACTIVATION:-}" ] \
-        || { echo "FATAL: BOOK_WINDOW_COMMIT=1 needs STATE_HASH_ACTIVATION" >&2; exit 1; }
+    [ "${STATE_HASH_ACTIVATION:-}" != off ] \
+        || { echo "FATAL: BOOK_WINDOW_COMMIT=1 needs the running state hash (STATE_HASH_ACTIVATION=off)" >&2; exit 1; }
     tmp=$(mktemp) && jq '.consensus.book_window_commit = true' "$OUT" > "$tmp" && mv "$tmp" "$OUT"
     echo "  book_window_commit = on (L6.1)"
 fi
@@ -224,7 +230,7 @@ echo "wrote $OUT"
 jq -r '
     "  timeout_ms = \(.consensus.timeout_base_ms)",
     "  evm_block_interval = \(.evm.block_interval // "absent (node default 11)")",
-    "  state_hash_activation = \(.consensus.state_hash_activation_height // "off")",
+    "  state_hash_activation = \(if (.consensus | has("activations")) then (.consensus.activations.running_state_hash // "off") else (.consensus.state_hash_activation_height // 1) end)",
     "  book_mode  = \(.consensus.book_mode // "absent (classic)")",
     "  chain_id   = \(.chain_id)",
     "  validators = \(.validators|length)  (\([.validators[].address] | join(" ")) )",

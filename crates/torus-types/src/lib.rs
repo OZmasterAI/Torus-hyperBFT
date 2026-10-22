@@ -11,7 +11,7 @@ pub mod eip1559;
 pub mod eip712;
 pub mod features;
 
-pub use features::{ActivationSchedule, Feature, KNOWN_FEATURES};
+pub use features::{ActivationSchedule, Feature, DEFAULT_GENESIS_ACTIVATIONS, KNOWN_FEATURES};
 
 // ============================================================================
 // Identifiers

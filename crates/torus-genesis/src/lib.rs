@@ -139,8 +139,10 @@ pub struct ConsensusConfig {
     /// P0.0: `{ "<feature_name>": height }`, when each gated feature switches
     /// on (0 or 1 = from block 1). An unknown name refuses to start;
     /// `state_hash_activation_height` is the alias of `running_state_hash`.
+    /// Absent (and no alias): [`torus_types::DEFAULT_GENESIS_ACTIVATIONS`]
+    /// (owner s136: the running state hash from block 1); `{}` = none.
     #[serde(default)]
-    pub activations: std::collections::BTreeMap<torus_types::Feature, u64>,
+    pub activations: Option<std::collections::BTreeMap<torus_types::Feature, u64>>,
     /// L6.1 window-committed Classic order books (CHAIN-WIDE, consensus-
     /// changing; docs/plans/l61-window-committed-books.md). P0.0: the alias
     /// of `activations.book_window_commit` at the running hash's height
@@ -436,7 +438,16 @@ impl Genesis {
     /// differs from the genesis one, refuse to start.
     pub fn activation_schedule(&self) -> Result<torus_types::ActivationSchedule, GenesisError> {
         use torus_types::Feature::{BookWindowCommit, RunningStateHash};
-        let mut activations = self.consensus.activations.clone();
+        // Owner s136: a genesis naming no activation runs the defaults (the
+        // running state hash from block 1); `"activations": {}` opts out.
+        let mut activations = match (
+            &self.consensus.activations,
+            self.consensus.state_hash_activation_height,
+        ) {
+            (Some(named), _) => named.clone(),
+            (None, Some(_)) => Default::default(),
+            (None, None) => torus_types::DEFAULT_GENESIS_ACTIVATIONS.iter().copied().collect(),
+        };
         if let Some(alias) = self.consensus.state_hash_activation_height {
             if alias == 0 {
                 return Err(GenesisError::InvalidActivations(
@@ -1159,7 +1170,8 @@ mod tests {
     fn genesis_state_hash_activation_height_is_chain_config() {
         let genesis = Genesis::from_json(&sample_genesis_json()).unwrap();
         assert_eq!(genesis.consensus.state_hash_activation_height, None);
-        assert_eq!(genesis.chain_config().state_hash_activation_height(), None);
+        // Owner s136: no activation named = the running hash from block 1.
+        assert_eq!(genesis.chain_config().state_hash_activation_height(), Some(1));
         let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
         json["consensus"]["state_hash_activation_height"] = serde_json::json!(5000);
         let genesis = Genesis::from_json(&json.to_string()).unwrap();
@@ -1185,7 +1197,9 @@ mod tests {
             f(&mut json);
             Genesis::from_json(&json.to_string())
         };
-        let none = with(&|_| {}).unwrap().chain_config();
+        let none = with(&|j| j["consensus"]["activations"] = serde_json::json!({}))
+            .unwrap()
+            .chain_config();
         assert_eq!(none.activations, torus_types::ActivationSchedule::default());
 
         let g = with(&|j| {

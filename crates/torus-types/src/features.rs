@@ -132,6 +132,11 @@ pub fn builtin_activations(chain_id: u64) -> &'static [(Feature, u64)] {
         .map_or(&[], |(_, activations)| activations)
 }
 
+/// Owner s136: the activations of a genesis that names none (no
+/// `consensus.activations`, no `state_hash_activation_height`): the running
+/// state hash from block 1. An explicit `"activations": {}` opts out.
+pub const DEFAULT_GENESIS_ACTIVATIONS: &[(Feature, u64)] = &[(Feature::RunningStateHash, 1)];
+
 /// Heights 0 and 1 are both block 1 (the genesis parent header at 0 carries
 /// block 1's bits).
 const fn first_block(height: u64) -> u64 {

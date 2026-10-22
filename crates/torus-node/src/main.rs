@@ -467,12 +467,14 @@ fn default_chain_config() -> ChainConfig {
         commit_lag_backoff_cap: 0,
         reputation_leader_selection: false,
         exec_trust_cache: false,
-        // P0.0: no genesis, so only the built-in table (it cannot conflict).
+        // P0.0: no genesis, so the defaults of a genesis naming no activation
+        // (owner s136: the running state hash from block 1) and the built-in
+        // table.
         activations: torus_types::ActivationSchedule::for_chain(
             torus_evm::TORUS_CHAIN_ID,
-            &Default::default(),
+            &torus_types::DEFAULT_GENESIS_ACTIVATIONS.iter().copied().collect(),
         )
-        .expect("an empty genesis set never conflicts with the built-in table"),
+        .expect("the default genesis set never conflicts with the built-in table"),
         book_mode: Default::default(),
     }
 }

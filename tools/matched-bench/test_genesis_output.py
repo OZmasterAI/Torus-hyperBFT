@@ -253,9 +253,12 @@ for i in $(seq "$3" $(( $3 + $5 - 1 ))); do printf '%s 0x%040x\\n' "$i" "$i"; do
             with self.subTest(value=value):
                 final = self.generate(STATE_HASH_ACTIVATION='1', BOOK_WINDOW_COMMIT=value)[1]
                 self.assertNotIn('book_window_commit', final.get('consensus', {}))
-        result = self.run_script(BOOK_WINDOW_COMMIT='1')
+        # Owner s136: unset = the node default (hash on), so only 'off' refuses.
+        final = self.generate(BOOK_WINDOW_COMMIT='1')[1]
+        self.assertIs(final['consensus']['book_window_commit'], True)
+        result = self.run_script(STATE_HASH_ACTIVATION='off', BOOK_WINDOW_COMMIT='1')
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('BOOK_WINDOW_COMMIT=1 needs STATE_HASH_ACTIVATION', result.stderr)
+        self.assertIn('BOOK_WINDOW_COMMIT=1 needs the running state hash', result.stderr)
 
     def test_evm_block_interval_sets_the_final_genesis_only(self):
         # MARKETS=3 > the base's 2: the synthesis branch, which is the one the

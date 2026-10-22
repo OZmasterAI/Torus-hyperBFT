@@ -194,6 +194,9 @@ table built into the binary for the chain id:
   unknown feature name refuses to start (`invalid activations: ...`). The old
   field `consensus.state_hash_activation_height` is an alias of
   `activations.running_state_hash`; both set and different refuses to start.
+  **Default (owner s136):** a genesis naming no activation (no
+  `activations`, no alias) runs the running state hash from block 1;
+  `"activations": {}` turns every feature off.
 - **Running chain (a release):** the genesis file of a running chain cannot
   change (see "Genesis": the data dir refuses a changed file). A release
   carries the height in its built-in table (`builtin_activations`,
