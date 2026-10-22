@@ -216,6 +216,8 @@ fn block_actions(rng: &mut Lcg) -> Vec<(Address, NativeAction)> {
 fn run(seed: u64, cached: bool, stats: &mut Stats) -> Vec<String> {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     for m in 1..=MARKETS {
         db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), &market_row(5)).unwrap();
     }

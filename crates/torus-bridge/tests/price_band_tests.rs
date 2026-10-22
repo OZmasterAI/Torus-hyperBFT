@@ -81,6 +81,8 @@ fn set_mark(ctx: &NativeExecContext, m: MarketId, price: FixedPoint) {
 /// Market 1 listed (test row: default 20x, tick / lot 1), traders 1..=4
 /// rich; `mark` aggregated at block 1, time 1,001.
 fn setup(mark: Option<i64>) -> (tempfile::TempDir, NativeExecContext) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     db.put_cf_raw(CF_NATIVE_MARKETS, &M.to_be_bytes(), b"listed").unwrap();

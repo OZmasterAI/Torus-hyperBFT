@@ -2099,6 +2099,8 @@ fn p5_actions(ctx: &NativeExecContext<Shadow>, rng: &mut Lcg) -> Vec<(Address, N
 /// equal a cold build of the block's post-state.
 #[test]
 fn dirty_rows_equal_overlay_rows_every_block() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let mut ws = WriterStats::default();
     let mut ms = MutStats::default();
     let (mut rows_checked, mut tombstones, mut opaque_blocks) = (0usize, 0usize, 0usize);

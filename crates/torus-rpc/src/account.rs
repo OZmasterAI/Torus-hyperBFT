@@ -342,6 +342,8 @@ mod tests {
     /// Markets listed with the test-fixture row (undecodable: default 20x,
     /// tick / lot 1).
     fn test_db(markets: &[MarketId]) -> (tempfile::TempDir, StateDb) {
+        // Owner s138: a fixture from before the never-marked rule (test-only seam).
+        torus_core::oracle::test_treat_unmarked_as_marked_on_this_thread();
         let dir = tempfile::tempdir().unwrap();
         let db = StateDb::open(dir.path()).unwrap();
         for m in markets {

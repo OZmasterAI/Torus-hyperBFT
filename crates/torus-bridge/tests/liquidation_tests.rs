@@ -21,6 +21,8 @@ mod counting_backend;
 use counting_backend::CountingBackend;
 
 fn open_test_db() -> (tempfile::TempDir, StateDb) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().expect("create temp dir");
     let db = StateDb::open(dir.path()).expect("open db");
     // Pre-testnet P0: orders need a listed market (no implicit books).
@@ -48,6 +50,8 @@ fn ctx_at(db: StateDb, height: u64) -> NativeExecContext {
 
 /// Markets listed with the test-fixture row (undecodable ⇒ default 20x config).
 fn liq_db(markets: &[MarketId]) -> (tempfile::TempDir, StateDb) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let (dir, db) = open_test_db();
     for m in markets {
         db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
@@ -208,6 +212,8 @@ fn marks(v: &[(MarketId, i64)]) -> BTreeMap<MarketId, FixedPoint> {
 /// initial_margin %), one flat tier; undecodable / non-positive rows: none.
 #[test]
 fn margin_configs_load_from_market_rows() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let (_d, db) = open_test_db();
     let rows: [(u64, Vec<u8>); 6] = [
         (1, market_row(fp(5))),             // 20x
@@ -237,6 +243,8 @@ fn margin_configs_load_from_market_rows() {
 /// (today's production IM) — single and sharded batch paths.
 #[test]
 fn twenty_x_market_config_is_byte_identical_to_no_config() {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let run = |row: &[u8], workers: usize| {
         let (dir, db) = open_test_db();
         db.put_cf_raw(CF_NATIVE_MARKETS, &1u64.to_be_bytes(), row).unwrap();

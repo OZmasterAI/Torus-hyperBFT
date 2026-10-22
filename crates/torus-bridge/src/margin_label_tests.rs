@@ -134,6 +134,8 @@ const MARGIN_REJECTS: u64 = 4;
 /// (funded) rest a bid 1 @40 and an ask 1 @200. Every reject has a
 /// reservation, so with metrics each runs the label's second check.
 fn run(mode: Mode, metrics: bool) -> Run {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let (mk, p, u, v, w) = (addr(1), addr(6), addr(7), addr(8), addr(9));
     let blocks = [
         vec![place(mk, gtc(3, false, 100, 5))],

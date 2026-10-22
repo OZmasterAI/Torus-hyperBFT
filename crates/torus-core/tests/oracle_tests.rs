@@ -589,3 +589,32 @@ fn quorum_survives_one_cut_outlier_with_enough_stake_left() {
     assert_eq!(mgr.aggregate_price(1, 2, 1_000, &equal_stakes(10)).unwrap(), fp(100));
     assert_eq!(mgr.get_price(1, 1_000).unwrap().num_reporters, 7);
 }
+
+/// Owner s138: `ever_marked` — no aggregate row: false; a fresh or a stale
+/// aggregate with a price > 0: true (it stays true as the mark ages); a
+/// non-positive stored price: false (as `band_reference`'s "never marked");
+/// an undecodable row: a local fault (`Err`), never "not marked".
+#[test]
+fn ever_marked_is_an_aggregate_row_with_a_positive_price() {
+    let (_dir, db) = setup();
+    let key = |m: MarketId| [b"agg".as_slice(), &m.to_be_bytes()].concat();
+    let row = |price: FixedPoint, ts: u64| {
+        [price.raw().to_be_bytes().as_slice(), &1u64.to_be_bytes(), &3u32.to_be_bytes(), &ts.to_be_bytes()].concat()
+    };
+    let mgr = OracleManager::new(db.clone(), OracleConfig::default());
+    assert!(!mgr.ever_marked(1).unwrap(), "no row");
+
+    let stakes: Vec<(Address, FixedPoint)> = (1..=3).map(|n| (addr(n), fp(1))).collect();
+    for (v, _) in &stakes {
+        mgr.submit_price(v, 1, fp(100), 1, 1_000).unwrap();
+    }
+    mgr.aggregate_price(1, 1, 1_000, &stakes).unwrap();
+    assert!(mgr.ever_marked(1).unwrap(), "fresh aggregate");
+    assert!(mgr.get_price(1, 1_000_000).unwrap().stale);
+    assert!(torus_core::oracle::ever_marked(&db, 1).unwrap(), "still marked when stale");
+
+    db.put_cf_raw(CF_NATIVE_ORACLE, &key(2), &row(FixedPoint::ZERO, 1_000)).unwrap();
+    assert!(!mgr.ever_marked(2).unwrap(), "a zero price is no mark");
+    db.put_cf_raw(CF_NATIVE_ORACLE, &key(3), b"garbage").unwrap();
+    assert!(mgr.ever_marked(3).is_err(), "undecodable row: local fault");
+}

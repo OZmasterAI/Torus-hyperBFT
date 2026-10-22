@@ -1590,6 +1590,21 @@ mod tests {
                 b"seeded-market",
             )
             .unwrap();
+        // Owner s138: orders need the market's first oracle mark (a stale
+        // aggregate: the intake band reads usable marks only).
+        state
+            .put_cf_raw(
+                torus_state::cf::CF_NATIVE_ORACLE,
+                &[b"agg".as_slice(), &1u64.to_be_bytes()].concat(),
+                &[
+                    (100 * torus_types::FixedPoint::SCALE).to_be_bytes().as_slice(),
+                    &1u64.to_be_bytes(),
+                    &3u32.to_be_bytes(),
+                    &0u64.to_be_bytes(),
+                ]
+                .concat(),
+            )
+            .unwrap();
         let (handle, addr) = start_server(state, mempool.clone(), executor).await;
         use jsonrpsee::core::client::ClientT;
         let client = jsonrpsee::http_client::HttpClientBuilder::default()
@@ -1974,6 +1989,21 @@ mod tests {
                 torus_state::cf::CF_NATIVE_MARKETS,
                 &1u64.to_be_bytes(),
                 b"seeded-market",
+            )
+            .unwrap();
+        // Owner s138: orders need the market's first oracle mark (a stale
+        // aggregate: the intake band reads usable marks only).
+        state
+            .put_cf_raw(
+                torus_state::cf::CF_NATIVE_ORACLE,
+                &[b"agg".as_slice(), &1u64.to_be_bytes()].concat(),
+                &[
+                    (100 * torus_types::FixedPoint::SCALE).to_be_bytes().as_slice(),
+                    &1u64.to_be_bytes(),
+                    &3u32.to_be_bytes(),
+                    &0u64.to_be_bytes(),
+                ]
+                .concat(),
             )
             .unwrap();
         let key = k256::ecdsa::SigningKey::from_slice(

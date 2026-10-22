@@ -82,6 +82,8 @@ fn exec(ctx: &mut NativeExecContext, mode: Mode, block: &[(Address, NativeAction
 /// Market 1 with tick 2 and lot 2 (from its row); addr(1) rich, addr(2)
 /// holding 1.
 fn fresh() -> (tempfile::TempDir, NativeExecContext) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     // Pre-testnet P0: orders need a listed market (placeholder rows,

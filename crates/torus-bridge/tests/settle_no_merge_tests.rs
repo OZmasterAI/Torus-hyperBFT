@@ -422,6 +422,8 @@ fn run_seeded(
     aliases: Aliases<'_>,
     parallel: bool,
 ) -> (RunOut, RunStats) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked();
     let dir = tempfile::tempdir().expect("temp dir");
     let db = StateDb::open(dir.path()).expect("open db");
     // Pre-testnet P0: orders need a listed market (placeholder rows,

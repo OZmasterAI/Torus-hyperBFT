@@ -99,6 +99,8 @@ fn gtc(market_id: MarketId, is_buy: bool, price: i64, cloid: Option<u128>) -> Pl
 /// Books persisted by the real executor save path in `mode`: `orders` (no
 /// crossing), every trader funded.
 fn seed_books(state: &StateDb, mode: BookMode, orders: Vec<(Address, PlaceOrderParams)>) {
+    // Owner s138: a fixture from before the never-marked rule (test-only seam).
+    torus_core::oracle::test_treat_unmarked_as_marked_on_this_thread();
     // Pre-testnet P0: orders need a listed market (a placeholder row
     // where the test has none).
     for m in orders.iter().map(|(_, p)| p.market_id).collect::<std::collections::BTreeSet<_>>() {
