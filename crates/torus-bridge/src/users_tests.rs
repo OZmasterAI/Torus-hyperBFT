@@ -51,6 +51,7 @@ fn position(t: Address, m: MarketId, raw: u64, long: bool) -> Position {
         realized_pnl: FixedPoint::from_raw(-(i128::from(raw))),
         isolated_margin: FixedPoint::ZERO,
         margin_type: if raw.is_multiple_of(5) { MarginType::Isolated } else { MarginType::Cross },
+        funding: None,
     }
 }
 
@@ -1988,6 +1989,7 @@ fn p5_direct_writes(
                             realized_pnl: FixedPoint::ZERO,
                             isolated_margin: FixedPoint::ZERO,
                             margin_type: MarginType::Cross,
+                            funding: None,
                         });
                     pm.put_position(&pos).unwrap();
                     ws.puts += 1;

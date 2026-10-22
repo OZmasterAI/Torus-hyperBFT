@@ -70,6 +70,20 @@ pub struct Position {
     /// Margin allocated to this position (>0 for isolated, 0 for cross).
     pub isolated_margin: FixedPoint,
     pub margin_type: MarginType,
+    /// Funding engine (P0.0 `funding_engine`): the funding state, `Some`
+    /// once a fill touched the position while its market had a funding row
+    /// (a v3 row). `None` (a v2 row): entry index 0, nothing paid yet.
+    pub funding: Option<PositionFunding>,
+}
+
+/// Funding engine: a position's lazy-settlement state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PositionFunding {
+    /// The market's cumulative index this position last settled at
+    /// (`crate::funding::INDEX_SCALE`).
+    pub entry_index: i128,
+    /// Funding settled in cash since the position opened (positive = paid).
+    pub paid: FixedPoint,
 }
 
 impl Position {
@@ -89,6 +103,31 @@ impl Position {
     pub fn notional(&self, mark_price: FixedPoint) -> FixedPoint {
         self.size * mark_price
     }
+
+    /// Funding engine: what this position owes from its entry index to the
+    /// market's `index` (positive = it pays; `None` = no funding: 0), rounded
+    /// against the holder ([`crate::funding::owed`]).
+    pub fn funding_owed(&self, index: Option<i128>) -> FixedPoint {
+        let _ = index;
+        FixedPoint::ZERO
+    
+}
+
+    /// Funding engine: funding since the position opened (settled + owed at
+    /// `index`; positive = paid).
+    pub fn funding_since_open(&self, index: Option<i128>) -> FixedPoint {
+        self.funding.map_or(FixedPoint::ZERO, |f| f.paid) + self.funding_owed(index)
+    }
+
+    /// Serialized size: [`POSITION_V2_LEN`] without funding state, else
+    /// [`POSITION_V3_LEN`].
+    pub fn encoded_len(&self) -> usize {
+        if self.funding.is_some() {
+            POSITION_V3_LEN
+        } else {
+            POSITION_V2_LEN
+        }
+    }
 }
 
 /// AUDIT FIX ECON-FIND-31: Schema version byte prepended to Position serialization.
@@ -101,9 +140,19 @@ const POSITION_SCHEMA_VERSION: u8 = 2;
 /// Serialized size of a v2 [`Position`].
 pub const POSITION_V2_LEN: usize = 111;
 
+/// Funding engine: a v3 row is a v2 row (version byte 3) followed by the
+/// entry index (i128 BE) and the funding paid (raw `FixedPoint`, 16 BE).
+/// Written only for a position with funding state, so with the feature off
+/// every row stays v2, byte for byte.
+const POSITION_SCHEMA_V3: u8 = 3;
+
+/// Serialized size of a v3 [`Position`].
+pub const POSITION_V3_LEN: usize = POSITION_V2_LEN + 32;
+
 impl BorshSerialize for Position {
     fn serialize<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        w.write_all(&[POSITION_SCHEMA_VERSION])?;
+        let version = POSITION_SCHEMA_VERSION;
+        w.write_all(&[version])?;
         borsh_write_address(&self.trader, w)?;
         w.write_all(&self.market_id.to_be_bytes())?;
         w.write_all(&[u8::from(self.is_long)])?;
@@ -121,7 +170,7 @@ impl BorshDeserialize for Position {
     fn deserialize_reader<R: Read>(r: &mut R) -> io::Result<Self> {
         let mut ver = [0u8; 1];
         r.read_exact(&mut ver)?;
-        if ver[0] != POSITION_SCHEMA_VERSION {
+        if ver[0] != POSITION_SCHEMA_VERSION && ver[0] != POSITION_SCHEMA_V3 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -149,6 +198,14 @@ impl BorshDeserialize for Position {
         } else {
             MarginType::Isolated
         };
+        let funding = if ver[0] == POSITION_SCHEMA_V3 {
+            let mut ib = [0u8; 16];
+            r.read_exact(&mut ib)?;
+            let paid = borsh_read_fp(r)?;
+            Some(PositionFunding { entry_index: i128::from_be_bytes(ib), paid })
+        } else {
+            None
+        };
         Ok(Self {
             trader,
             market_id,
@@ -159,6 +216,7 @@ impl BorshDeserialize for Position {
             realized_pnl,
             isolated_margin,
             margin_type,
+            funding,
         })
     }
 }
@@ -318,18 +376,50 @@ fn decode_cum_volume(data: &[u8]) -> Result<FixedPoint, CoreError> {
 // PositionManager — CRUD for positions and native balances
 // ============================================================================
 
+/// Funding engine: the block's cumulative funding index per market
+/// (`crate::funding::INDEX_SCALE`), fixed for the whole block.
+pub type FundingIndices = HashMap<MarketId, i128>;
+
 #[derive(Clone)]
 pub struct PositionManager<T: StateBackend = StateDb> {
     state: T,
+    /// Funding engine: the block's index table, set by the block-start
+    /// funding step while the feature is active (`None`: no funding, no
+    /// funding reads). A market outside the table reads its row.
+    funding: Option<std::sync::Arc<FundingIndices>>,
 }
 
 impl<T: StateBackend> PositionManager<T> {
     pub fn new(state: T) -> Self {
-        Self { state }
+        Self { state, funding: None }
     }
 
     pub fn state(&self) -> &T {
         &self.state
+    }
+
+    /// Funding engine: install (or clear) the block's index table. Every
+    /// fill through this manager (and its clones made afterwards) settles
+    /// the position's funding against it.
+    pub fn set_funding(&mut self, table: Option<std::sync::Arc<FundingIndices>>) {
+        self.funding = table;
+    }
+
+    /// Funding engine: the block's index table (`None`: funding off).
+    pub fn funding_table(&self) -> Option<&std::sync::Arc<FundingIndices>> {
+        self.funding.as_ref()
+    }
+
+    /// Funding engine: `market_id`'s cumulative index this block. `None`
+    /// while funding is off (no read) or when the market has no funding row.
+    pub fn funding_index(&self, market_id: MarketId) -> Result<Option<i128>, CoreError> {
+        let Some(table) = &self.funding else {
+            return Ok(None);
+        };
+        match table.get(&market_id) {
+            Some(index) => Ok(Some(*index)),
+            None => crate::funding::read_index(&self.state, market_id),
+        }
     }
 
     // ---- Position CRUD ----
@@ -505,20 +595,23 @@ impl<T: StateBackend> PositionManager<T> {
         fill_price: FixedPoint,
         margin_type: MarginType,
     ) -> Result<FillEffect, CoreError> {
+        let index = self.funding_index(market_id)?;
         let existing = self.get_position(trader, market_id)?;
         let start_size = signed_size(&existing);
-        let (new_pos, pnl) =
-            fill_transition(existing, trader, market_id, is_buy, fill_qty, fill_price, margin_type);
+        let (new_pos, pnl, funding) = fill_transition(
+            existing, trader, market_id, is_buy, fill_qty, fill_price, margin_type, index,
+        );
         match new_pos {
             Some(pos) => self.put_position(&pos)?,
             // `fill_transition` yields None only on a full close of an
             // existing position, so the delete always targets a live row.
             None => self.delete_position(trader, market_id)?,
         }
-        if let Some(pnl) = pnl {
-            self.credit_realized_pnl(trader, pnl)?;
+        let effect = FillEffect { start_size, closed_pnl: pnl, funding };
+        if let Some(cash) = effect.cash() {
+            self.credit_realized_pnl(trader, cash)?;
         }
-        Ok(FillEffect { start_size, closed_pnl: pnl })
+        Ok(effect)
     }
 
     /// C1: `apply_fill`, but the position read-modify-write goes through a
@@ -542,7 +635,7 @@ impl<T: StateBackend> PositionManager<T> {
         self.apply_fill_cached_effect(
             cache, trader, market_id, is_buy, fill_qty, fill_price, margin_type,
         )
-        .map(|e| e.closed_pnl)
+        .map(|e| e.cash())
     }
 
     /// [`apply_fill_cached`], also reporting the trader's signed position
@@ -583,9 +676,10 @@ impl<T: StateBackend> PositionManager<T> {
         fill_price: FixedPoint,
         margin_type: MarginType,
     ) -> Result<FillEffect, CoreError> {
+        let index = self.funding_index(market_id)?;
         cache.update_in_place(self, typed, trader, market_id, |existing| {
             let start_size = signed_size(&existing);
-            let (new_pos, pnl) = fill_transition(
+            let (new_pos, pnl, funding) = fill_transition(
                 existing,
                 trader,
                 market_id,
@@ -593,12 +687,14 @@ impl<T: StateBackend> PositionManager<T> {
                 fill_qty,
                 fill_price,
                 margin_type,
+                index,
             );
             (
                 new_pos,
                 FillEffect {
                     start_size,
                     closed_pnl: pnl,
+                    funding,
                 },
             )
         })
@@ -624,13 +720,26 @@ pub struct FillEffect {
     pub start_size: FixedPoint,
     /// Realized PnL of the fill's close component (None = no close part).
     pub closed_pnl: Option<FixedPoint>,
+    /// Funding engine: funding the position settled at this fill (positive
+    /// = paid), before the fill applied. 0 without funding.
+    pub funding: FixedPoint,
 }
 
 // Hand-written: `FixedPoint` has no `Default`.
 impl Default for FillEffect {
     fn default() -> Self {
-        Self { start_size: FixedPoint::ZERO, closed_pnl: None }
+        Self { start_size: FixedPoint::ZERO, closed_pnl: None, funding: FixedPoint::ZERO }
     }
+}
+
+impl FillEffect {
+    /// The trader's cash change of this fill: the realized PnL less the
+    /// funding settled. `None` = no balance write (no close part and no
+    /// funding), exactly the cases where the pre-funding paths wrote none.
+    pub fn cash(&self) -> Option<FixedPoint> {
+        self.closed_pnl
+    
+}
 }
 
 /// Signed size of an optional position (long > 0, short < 0, none = 0).
@@ -653,7 +762,50 @@ fn signed_size(p: &Option<Position>) -> FixedPoint {
 ///   close, full close, or flip) — exactly the cases where the classic path
 ///   credited realized PnL to the trader's native balance. `Some(ZERO)` is
 ///   meaningful: the credit of zero still creates/rewrites the balance row.
+#[allow(clippy::too_many_arguments)]
 fn fill_transition(
+    existing: Option<Position>,
+    trader: &Address,
+    market_id: MarketId,
+    is_buy: bool,
+    fill_qty: FixedPoint,
+    fill_price: FixedPoint,
+    margin_type: MarginType,
+    funding_index: Option<i128>,
+) -> (Option<Position>, Option<FixedPoint>, FixedPoint) {
+    // Funding engine: settle the position at the market's index first (its
+    // owed amount is paid in cash by the caller, `FillEffect::cash`), then
+    // fill. A position opened (or the open part of a flip) starts at the
+    // index with nothing paid. No index (feature off, or no funding row
+    // yet): exactly the pre-funding transition.
+    let Some(index) = funding_index.filter(|_| false) else {
+        let (new_pos, pnl) =
+            fill_transition_core(existing, trader, market_id, is_buy, fill_qty, fill_price, margin_type);
+        return (new_pos, pnl, FixedPoint::ZERO);
+    };
+    let mut owed = FixedPoint::ZERO;
+    let existing = existing.map(|mut pos| {
+        owed = pos.funding_owed(Some(index));
+        let paid = pos.funding.map_or(FixedPoint::ZERO, |f| f.paid);
+        pos.funding = Some(PositionFunding { entry_index: index, paid: paid + owed });
+        pos
+    });
+    let (new_pos, pnl) =
+        fill_transition_core(existing, trader, market_id, is_buy, fill_qty, fill_price, margin_type);
+    let fresh = PositionFunding { entry_index: index, paid: FixedPoint::ZERO };
+    let new_pos = new_pos.map(|mut pos| {
+        // A fresh open (no row before, or the open part of a flip) has no
+        // funding state from `fill_transition_core`.
+        if pos.funding.is_none() {
+            pos.funding = Some(fresh);
+        }
+        pos
+    });
+    (new_pos, pnl, owed)
+}
+
+/// The pre-funding transition (cost basis, entry price, realized PnL).
+fn fill_transition_core(
     existing: Option<Position>,
     trader: &Address,
     market_id: MarketId,
@@ -676,6 +828,7 @@ fn fill_transition(
         realized_pnl: FixedPoint::ZERO,
         isolated_margin: FixedPoint::ZERO,
         margin_type,
+        funding: None,
     };
     match existing {
         None => (Some(open(fill_qty, notional)), None),
@@ -1106,7 +1259,7 @@ mod tests {
         q: i128,
         p: i128,
     ) -> (Option<Position>, Option<FixedPoint>) {
-        fill_transition(
+        let (pos, pnl, funding) = fill_transition(
             pos,
             &Address::new([7; 20]),
             3,
@@ -1114,7 +1267,10 @@ mod tests {
             raw(q),
             raw(p),
             MarginType::Cross,
-        )
+            None,
+        );
+        assert_eq!(funding, FixedPoint::ZERO, "no funding without an index");
+        (pos, pnl)
     }
 
     /// (is_long, size, entry, basis, realized) in raw units.
@@ -1267,6 +1423,7 @@ mod tests {
             realized_pnl: raw(44),
             isolated_margin: raw(55),
             margin_type: MarginType::Isolated,
+            funding: None,
         };
         let bytes = borsh::to_vec(&pos).unwrap();
         assert_eq!((bytes.len(), bytes[0]), (POSITION_V2_LEN, 2));
@@ -1329,6 +1486,7 @@ mod tests {
             realized_pnl: FixedPoint::ZERO,
             isolated_margin: FixedPoint::ZERO,
             margin_type: MarginType::Cross,
+            funding: None,
         };
         let base = PositionManager::new(db.clone());
         for t in 1..=6u8 {

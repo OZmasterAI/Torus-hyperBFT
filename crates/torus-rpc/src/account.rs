@@ -70,6 +70,9 @@ struct Market {
     tiers: Option<Vec<MarginTier>>,
     listed: bool,
     mark: Option<FixedPoint>,
+    /// Funding engine: the market's cumulative funding index (`None`: no
+    /// funding row), for the positions' pending funding.
+    funding: Option<i128>,
 }
 
 /// The rows every figure is computed from: one balance read, the trader's
@@ -119,6 +122,7 @@ impl AccountRows {
                 }
                 None => None,
             };
+            let funding = torus_core::funding::read_index(state, p.market_id).map_err(internal)?;
             markets.insert(
                 p.market_id,
                 Market {
@@ -128,6 +132,7 @@ impl AccountRows {
                         .map(|c| c.tiers),
                     listed: row.is_some(),
                     mark,
+                    funding,
                 },
             );
         }
@@ -140,6 +145,12 @@ impl AccountRows {
 
     fn tiers(&self, m: MarketId) -> Option<&[MarginTier]> {
         self.markets.get(&m).and_then(|x| x.tiers.as_deref())
+    }
+
+    /// Funding engine: `m`'s funding index (pending funding in the UPnL, as
+    /// the executor values accounts).
+    fn funding(&self, m: MarketId) -> Result<Option<i128>, CoreError> {
+        Ok(self.markets.get(&m).and_then(|x| x.funding))
     }
 
     /// The executor's mark (placement, withdraw): any market's usable mark.
@@ -183,8 +194,8 @@ pub(crate) fn account_figures_bounded(
 fn figures(a: &AccountRows) -> Result<AccountFigures, CoreError> {
     let of = |_| CoreError::Overflow("account margin overflows i128".into());
     let (bal, positions) = (&a.bal, &a.positions);
-    let view = AccountView::build(bal, positions, |m| a.mark(m), |m| a.tiers(m))?;
-    let liq_view = AccountView::build(bal, positions, |m| a.liq_mark(m), |m| a.tiers(m))?;
+    let view = AccountView::build_funded(bal, positions, |m| a.mark(m), |m| a.funding(m), |m| a.tiers(m))?;
+    let liq_view = AccountView::build_funded(bal, positions, |m| a.liq_mark(m), |m| a.funding(m), |m| a.tiers(m))?;
 
     let mut total_margin_used = bal.order_margin.checked_add(view.position_im).map_err(of)?;
     for p in positions
@@ -275,10 +286,11 @@ pub(crate) fn cross_liquidation_price_bounded(
     // overflow (the step skips the account: indeterminate, neither side).
     let liquidatable = |raw: i128| {
         let px = FixedPoint::from_raw(raw);
-        AccountView::build(
+        AccountView::build_funded(
             &a.bal,
             &a.positions,
             |m| if m == market { Some(px) } else { a.liq_mark(m) },
+            |m| a.funding(m),
             |m| a.tiers(m),
         )
         .ok()

@@ -73,6 +73,7 @@ fn seed(db: &StateDb) {
             realized_pnl: FixedPoint::ZERO,
             isolated_margin: fp(10),
             margin_type: MarginType::Cross,
+            funding: None,
         })
         .unwrap();
 }

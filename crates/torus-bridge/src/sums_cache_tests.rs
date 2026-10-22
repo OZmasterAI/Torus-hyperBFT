@@ -132,7 +132,13 @@ fn check_slot_sums(holder: &ResidentBooks, tag: &str) -> usize {
                 None
             })
         };
-        let want = build_sums(&ps, mark, |m| t.configs.get(&m).map(|c| c.tiers.as_slice()));
+        let funding = |m: MarketId| {
+            Ok(t.marks.funding_of(m).unwrap_or_else(|| {
+                in_table.set(false);
+                None
+            }))
+        };
+        let want = build_sums(&ps, mark, funding, |m| t.configs.get(&m).map(|c| c.tiers.as_slice()));
         assert!(in_table.get(), "{tag}: cached {trader} uses a market outside the table");
         assert_eq!(*cached, want, "{tag}: slot sums of {trader} != cold build over R");
     }
@@ -195,6 +201,7 @@ fn write_positions<T: StateBackend>(ctx: &NativeExecContext<T>, rng: &mut Lcg, h
             realized_pnl: FixedPoint::ZERO,
             isolated_margin: FixedPoint::ZERO,
             margin_type: MarginType::Cross,
+            funding: None,
         });
         match rng.below(7) {
             // open / increase
@@ -246,6 +253,7 @@ fn write_positions<T: StateBackend>(ctx: &NativeExecContext<T>, rng: &mut Lcg, h
                 realized_pnl: FixedPoint::ZERO,
                 isolated_margin: FixedPoint::ZERO,
                 margin_type: MarginType::Cross,
+                funding: None,
             };
             ctx.positions.state().put_cf_raw(CF_NATIVE_POSITIONS, &odd_key, &borsh::to_vec(&odd).unwrap()).unwrap();
         }
@@ -544,6 +552,7 @@ fn end_resident_carries_dirtied_traders_and_rebuild_starts_empty() {
                 realized_pnl: FixedPoint::ZERO,
                 isolated_margin: FixedPoint::ZERO,
                 margin_type: MarginType::Cross,
+                funding: None,
             })
             .unwrap();
     }
@@ -609,6 +618,7 @@ fn stale_version_entry_never_read() {
         realized_pnl: FixedPoint::ZERO,
         isolated_margin: FixedPoint::ZERO,
         margin_type: MarginType::Cross,
+        funding: None,
     };
     for (i, t) in [a, b, c].into_iter().enumerate() {
         let pm = PositionManager::new(db.clone());
@@ -727,6 +737,7 @@ fn maker_dirtied_by_an_earlier_batch_is_not_rebuilt_per_market() {
                 realized_pnl: FixedPoint::ZERO,
                 isolated_margin: FixedPoint::ZERO,
                 margin_type: MarginType::Cross,
+                funding: None,
             })
             .unwrap();
         }
@@ -810,6 +821,7 @@ fn delta_guard_falls_back_when_build_order_overflows() {
         realized_pnl: FixedPoint::ZERO,
         isolated_margin: FixedPoint::ZERO,
         margin_type: MarginType::Cross,
+        funding: None,
     };
     {
         let pm = PositionManager::new(db.clone());
@@ -873,6 +885,7 @@ fn maker_valued_at_most_once_per_batch() {
                     realized_pnl: FixedPoint::ZERO,
                     isolated_margin: FixedPoint::ZERO,
                     margin_type: MarginType::Cross,
+                    funding: None,
                 })
                 .unwrap();
             }
@@ -980,6 +993,7 @@ fn worker_maker_cache_is_per_batch() {
             realized_pnl: FixedPoint::ZERO,
             isolated_margin: FixedPoint::ZERO,
             margin_type: MarginType::Cross,
+            funding: None,
         })
         .unwrap();
     // UPnL +100, IM 10 x 1000 / 20 = 500.
@@ -1006,6 +1020,7 @@ fn dirty_trader_reads_pending_rows_not_its_record() {
         realized_pnl: FixedPoint::ZERO,
         isolated_margin: FixedPoint::ZERO,
         margin_type: MarginType::Cross,
+        funding: None,
     };
     {
         let pm = PositionManager::new(db.clone());
@@ -1117,6 +1132,7 @@ fn slot_guards(worker: bool) {
                 realized_pnl: FixedPoint::ZERO,
                 isolated_margin: FixedPoint::ZERO,
                 margin_type: MarginType::Cross,
+                funding: None,
             };
             ctx.positions.put_position(&p).unwrap();
         }

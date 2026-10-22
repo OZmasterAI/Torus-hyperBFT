@@ -240,6 +240,7 @@ fn order_book_reader_get_position() {
         realized_pnl: fp(100),
         isolated_margin: fp(2_500),
         margin_type: torus_core::position::MarginType::Isolated,
+        funding: None,
     })
     .unwrap();
 
@@ -432,6 +433,7 @@ fn order_book_reader_get_position_ignores_a_stale_oracle_price() {
             realized_pnl: fp(100),
             isolated_margin: fp(2_500),
             margin_type: torus_core::position::MarginType::Isolated,
+            funding: None,
         })
         .unwrap();
     write_oracle_price(&db, 1, fp(51_000), 100, 1_000);

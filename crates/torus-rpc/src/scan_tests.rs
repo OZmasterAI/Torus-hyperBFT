@@ -218,6 +218,7 @@ fn position(trader: Address, market_id: MarketId, is_long: bool, size: i64) -> P
         realized_pnl: FixedPoint::ZERO,
         isolated_margin: FixedPoint::ZERO,
         margin_type: MarginType::Cross,
+        funding: None,
     }
 }
 

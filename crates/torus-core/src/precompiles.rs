@@ -656,7 +656,14 @@ fn read_position(
 
     // Compute unrealized PnL using oracle price
     let unrealized_pnl = match get_oracle_price_fp(state_db, market_id, now) {
-        Ok(mark) => pos.unrealized_pnl(mark),
+        // Funding engine: less the position's pending funding (a market has
+        // a funding row only once the feature ran; without one, nothing).
+        Ok(mark) => {
+            let index = crate::funding::read_index(state_db, market_id).map_err(|e| {
+                CoreError::PrecompileLocalFault(format!("getPosition funding read: {e}"))
+            })?;
+            pos.unrealized_pnl(mark) - pos.funding_owed(index)
+        }
         // No usable price (absent, stale, non-positive, short row: the same
         // bytes on every validator): UPnL 0.
         Err(e) if !e.is_local_fault() => FixedPoint::ZERO,
@@ -2126,6 +2133,7 @@ mod r02_oracle_price_tests {
                 realized_pnl: FixedPoint::ZERO,
                 isolated_margin: FixedPoint::ZERO,
                 margin_type: crate::position::MarginType::Cross,
+                funding: None,
             })
             .unwrap();
         match read_position(&FailingOracleRead(db.clone()), &trader, 1, 1_000) {
@@ -2160,6 +2168,7 @@ mod r02_oracle_price_tests {
             realized_pnl: FixedPoint::ZERO,
             isolated_margin: FixedPoint::ZERO,
             margin_type: crate::position::MarginType::Cross,
+            funding: None,
         };
         db.put_cf_raw(
             CF_NATIVE_POSITIONS,

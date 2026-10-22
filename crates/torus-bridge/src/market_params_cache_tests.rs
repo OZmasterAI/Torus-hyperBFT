@@ -150,6 +150,7 @@ fn setup(db: &StateDb) {
             realized_pnl: FixedPoint::ZERO,
             isolated_margin: FixedPoint::ZERO,
             margin_type: MarginType::Cross,
+            funding: None,
         })
         .unwrap();
     drop(ctx);

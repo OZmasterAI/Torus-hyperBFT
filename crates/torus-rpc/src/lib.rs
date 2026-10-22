@@ -6206,6 +6206,7 @@ mod tests {
             realized_pnl: fp(100),
             isolated_margin: fp(2500),
             margin_type: MarginType::Isolated,
+            funding: None,
         })
         .unwrap();
         let (handle, addr) = start_server(state, mempool, executor).await;
@@ -6229,6 +6230,62 @@ mod tests {
         // R23: isolated keeps the simplified entry − margin / size estimate.
         assert_eq!(pos.liquidation_price, Some(dec_fp(fp(49_500))));
         handle.stop().unwrap();
+    }
+
+    /// Funding engine: `getFundingRate` before and after a market's funding
+    /// row exists, and `getPosition`'s `fundingSinceOpen` (settled + pending;
+    /// omitted without funding state). RED before the funding engine: no
+    /// method, no field.
+    #[tokio::test]
+    async fn torus_funding_rate_and_position_funding() {
+        use torus_core::funding::{write_row, FundingParams, FundingRow, INDEX_SCALE};
+        use torus_core::position::PositionFunding;
+        let (_dir, state, mempool, executor) = setup();
+        let trader = Address::from([0x12; 20]);
+        let pm = PositionManager::new(state.clone());
+        let pos = |funding| Position {
+            trader,
+            market_id: 1,
+            is_long: true,
+            size: fp(2),
+            entry_price: fp(100),
+            cost_basis: fp(200),
+            realized_pnl: FixedPoint::ZERO,
+            isolated_margin: FixedPoint::ZERO,
+            margin_type: MarginType::Cross,
+            funding,
+        };
+        pm.put_position(&pos(Some(PositionFunding { entry_index: INDEX_SCALE, paid: fp(3) }))).unwrap();
+        pm.put_position(&Position { market_id: 2, ..pos(None) }).unwrap();
+        let params = FundingParams::default();
+        let mut row = FundingRow::new(7_250, &params);
+        row.cum_index = 4 * INDEX_SCALE; // 2 long × (4 − 1) = 6 pending
+        row.samples = 2;
+        row.last_rate = -INDEX_SCALE / 80_000; // -0.0000125
+        row.last_settle_ts = 7_200;
+        write_row(&state, 1, &row).unwrap();
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let r: RpcFundingRate = client.request("torus_getFundingRate", jsonrpsee::rpc_params!["0x1"]).await.unwrap();
+        assert!(r.active);
+        assert_eq!((r.cum_index.as_str(), r.last_rate.as_str()), ("4", "-0.0000125"));
+        assert_eq!((r.interval_secs, r.next_funding_time, r.last_funding_time, r.samples), (3_600, 10_800, 7_200, 2));
+        assert_eq!(r.predicted_rate, "0", "no premium summed");
+        let none: RpcFundingRate = client.request("torus_getFundingRate", jsonrpsee::rpc_params!["0x2"]).await.unwrap();
+        assert!(!none.active);
+        assert_eq!((none.cum_index.as_str(), none.next_funding_time), ("0", 0));
+        let p: Option<RpcPosition> =
+            client.request("torus_getPosition", jsonrpsee::rpc_params![hex_address(trader), "0x1"]).await.unwrap();
+        assert_eq!(p.unwrap().funding_since_open, Some(dec_fp(fp(9))), "3 paid + 6 pending");
+        let raw: serde_json::Value =
+            client.request("torus_getPosition", jsonrpsee::rpc_params![hex_address(trader), "0x2"]).await.unwrap();
+        assert!(raw.get("fundingSinceOpen").is_none(), "omitted without funding state: {raw}");
+        handle.stop().unwrap();
+        assert_eq!(crate::types::dec_e18(-1), "-0.000000000000000001");
+        assert_eq!(crate::types::dec_e18(15 * INDEX_SCALE / 10), "1.5");
     }
 
     /// R23: a cross position's liquidationPrice is the account-wide
@@ -6394,6 +6451,7 @@ mod tests {
             realized_pnl: FixedPoint::ZERO,
             isolated_margin: fp(500),
             margin_type: MarginType::Isolated,
+            funding: None,
         })
         .unwrap();
         let (handle, addr) = start_server(state, mempool, executor).await;
@@ -6525,6 +6583,7 @@ mod tests {
             realized_pnl: FixedPoint::ZERO,
             isolated_margin: FixedPoint::ZERO,
             margin_type: MarginType::Cross,
+            funding: None,
         }
     }
 
@@ -6874,6 +6933,7 @@ mod tests {
             realized_pnl: FixedPoint::ZERO,
             isolated_margin: fp(5000),
             margin_type: MarginType::Cross,
+            funding: None,
         })
         .unwrap();
         pm.put_position(&Position {
@@ -6886,6 +6946,7 @@ mod tests {
             realized_pnl: FixedPoint::ZERO,
             isolated_margin: fp(3500),
             margin_type: MarginType::Cross,
+            funding: None,
         })
         .unwrap();
         let (handle, addr) = start_server(state, mempool, executor).await;
@@ -7024,6 +7085,7 @@ mod tests {
                 realized_pnl: fp(100),
                 isolated_margin: fp(2500),
                 margin_type: MarginType::Isolated,
+                funding: None,
             })
             .unwrap();
         let oracle = OracleManager::new(state.clone(), OracleConfig::default());
@@ -7091,6 +7153,7 @@ mod tests {
                     realized_pnl: fp(100),
                     isolated_margin: fp(2500),
                     margin_type: MarginType::Isolated,
+                    funding: None,
                 })
                 .unwrap();
             let oracle = OracleManager::new(state.clone(), OracleConfig::default());

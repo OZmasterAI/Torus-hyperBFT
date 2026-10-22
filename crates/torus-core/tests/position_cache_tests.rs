@@ -184,7 +184,7 @@ fn apply_fill_cached_effect_reports_start_and_pnl() {
             .unwrap();
         assert_eq!(
             effect,
-            FillEffect { start_size: start, closed_pnl: pnl },
+            FillEffect { start_size: start, closed_pnl: pnl, funding: FixedPoint::ZERO },
             "cached step {i}"
         );
         if i == 3 {
@@ -205,7 +205,7 @@ fn apply_fill_cached_effect_reports_start_and_pnl() {
             .unwrap();
         assert_eq!(
             effect,
-            FillEffect { start_size: start, closed_pnl: pnl },
+            FillEffect { start_size: start, closed_pnl: pnl, funding: FixedPoint::ZERO },
             "uncached step {i}"
         );
     }
@@ -370,6 +370,7 @@ fn owned_position_and_balance_writes_match_legacy_borsh_bytes() {
             realized_pnl: FixedPoint::from_raw(-1),
             isolated_margin: FixedPoint::ZERO,
             margin_type,
+            funding: None,
         };
         let balance = torus_core::position::NativeBalance {
             available: FixedPoint::MIN,
@@ -593,6 +594,7 @@ fn rows_naming_another_key_are_refused_on_load() {
         realized_pnl: FixedPoint::ZERO,
         isolated_margin: FixedPoint::ZERO,
         margin_type: MarginType::Cross,
+        funding: None,
     };
     // (key trader, key market, the row's fields): another market, another
     // trader, both.
@@ -911,6 +913,7 @@ fn overlapping_runs(pm: &PositionManager<Recorder>, collision: bool, extra: u8) 
         realized_pnl: FixedPoint::ZERO,
         isolated_margin: FixedPoint::ZERO,
         margin_type: MarginType::Cross,
+        funding: None,
     };
     pm.put_position(&row(2, 4)).unwrap();
     pm.state().log.lock().unwrap().clear();
@@ -1030,6 +1033,7 @@ fn foreign_market_keys_fall_back_and_match() {
         realized_pnl: FixedPoint::ZERO,
         isolated_margin: FixedPoint::ZERO,
         margin_type: MarginType::Cross,
+        funding: None,
     };
     // (into run 0 a key of market 3 | into the batch cache a key of market 2)
     for into_batch in [false, true] {

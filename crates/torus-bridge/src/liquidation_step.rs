@@ -213,7 +213,9 @@ impl NativeExecutor {
                                 continue;
                             }
                             let p = <Position as borsh::BorshDeserialize>::try_from_slice(v).map_err(borsh)?;
-                            torus_core::margin::position_terms(&p, Some(FixedPoint::ZERO), None)?.upnl
+                            // Funding engine: pending funding is value too.
+                            let index = ctx.positions.funding_index(p.market_id)?;
+                            torus_core::margin::position_terms_funded(&p, Some(FixedPoint::ZERO), index, None)?.upnl
                         };
                         sum = sum.checked_add(x).map_err(of)?;
                     }
@@ -252,7 +254,8 @@ impl NativeExecutor {
             let b = ctx.positions.get_native_balance(&e)?;
             deficit = deficit.checked_add(b.available).and_then(|d| d.checked_add(b.order_margin)).map_err(of)?;
             for p in ctx.positions.positions_for_trader(&e)? {
-                let t = torus_core::margin::position_terms(&p, marks.get(&p.market_id).copied(), None)?;
+                let index = ctx.positions.funding_index(p.market_id)?;
+                let t = torus_core::margin::position_terms_funded(&p, marks.get(&p.market_id).copied(), index, None)?;
                 notional = notional.checked_add(t.notional).map_err(of)?;
                 deficit = deficit.checked_add(t.upnl).map_err(of)?;
             }
@@ -838,7 +841,13 @@ impl NativeExecutor {
         }
         let bal = ctx.positions.get_native_balance(trader)?;
         let reader = AccountReader::of(ctx);
-        Ok(AccountView::build(&bal, &ps, |m| marks.get(&m).copied(), |m| reader.tiers(m)).ok())
+        // Funding engine: pending funding in the UPnL (as the sums cache).
+        let funding = |m| ctx.positions.funding_index(m);
+        match AccountView::build_funded(&bal, &ps, |m| marks.get(&m).copied(), funding, |m| reader.tiers(m)) {
+            Ok(v) => Ok(Some(v)),
+            Err(CoreError::Overflow(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Review M2: the pending row of `trader` after its action — set iff it is
@@ -965,6 +974,12 @@ impl NativeExecutor {
         u: &Address,
     ) -> Result<u64, CoreError> {
         let ps = ctx.positions.positions_for_trader(u)?;
+        // Funding engine: each position's market index (pending funding is in
+        // its UPnL; the transfer below settles its own in cash first).
+        let index: HashMap<MarketId, Option<i128>> = ps
+            .iter()
+            .map(|p| Ok((p.market_id, ctx.positions.funding_index(p.market_id)?)))
+            .collect::<Result<_, CoreError>>()?;
         // `build`'s terms per position (adl_rest's `build`); None = overflow
         // -> no bankruptcy price (adl_rest's None).
         // Review L2 (accepted, no behavior change): one position's UPnL
@@ -975,7 +990,8 @@ impl NativeExecutor {
         // remainder); only the test-only shadow assert below would differ.
         // It needs ~1e30-token notional: unreachable.
         let upnl = |p: &Position| {
-            torus_core::margin::position_terms(p, marks.get(&p.market_id).copied(), None).ok().map(|t| t.upnl)
+            let i = index.get(&p.market_id).copied().flatten();
+            torus_core::margin::position_terms_funded(p, marks.get(&p.market_id).copied(), i, None).ok().map(|t| t.upnl)
         };
         let mut total = ps.iter().try_fold(FixedPoint::ZERO, |a, p| a.checked_add(upnl(p)?).ok());
         let mut rows = 0u64;
@@ -991,8 +1007,13 @@ impl NativeExecutor {
             #[cfg(test)]
             assert_eq!(rest, Self::adl_rest(ctx, marks, u, m)?, "running rest == adl_rest ({u}, {m})");
             let base = prev.get(&m).copied().unwrap_or(mark);
-            let bankruptcy =
-                rest.and_then(|r| liq::bankruptcy_price(r, p.is_long, p.size, p.cost_basis));
+            // Funding engine: the transfer pays this position's pending
+            // funding in cash before it moves, so the price that leaves the
+            // account at zero is computed on `rest` less that amount.
+            let owed = p.funding_owed(index.get(&m).copied().flatten());
+            let bankruptcy = rest
+                .and_then(|r| r.checked_sub(owed).ok())
+                .and_then(|r| liq::bankruptcy_price(r, p.is_long, p.size, p.cost_basis));
             let px = liq::adl_price(base, bankruptcy, mark, p.is_long);
             liq::transfer(&ctx.positions, u, &liq::adl_escrow(p.is_long), m, p.size, px)?;
             total = (|| total?.checked_sub(own?).ok())();
@@ -1039,7 +1060,8 @@ impl NativeExecutor {
             .into_iter()
             .filter(|q| q.market_id != m)
             .collect();
-        let v = match AccountView::build(&bal, &others, |x| marks.get(&x).copied(), |_| None) {
+        let funding = |x| ctx.positions.funding_index(x);
+        let v = match AccountView::build_funded(&bal, &others, |x| marks.get(&x).copied(), funding, |_| None) {
             Ok(v) => v,
             Err(CoreError::Overflow(_)) => return Ok(None),
             Err(e) => return Err(e),
