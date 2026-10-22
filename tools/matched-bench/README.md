@@ -17,7 +17,9 @@ summarizer, so its whole change was a no-op (bl3 10m-r1). `TOOLS_FROM_WORKTREE=0
 restores the old behaviour, `TOOLS_DIR=<dir>` pins it, and
 `RUN_CELL_PRINT_PATHS=1` prints the resolution and exits without touching the
 devnet. `resummarize.sh <cell-dir>` re-scores an existing cell in place from its
-own `summary.json` provenance.
+own `summary.json` provenance; every top-level key it does not regenerate
+(`.oracle_feed` and the other records run-cell.sh adds after summarize.py) is kept
+from the old summary.
 
 **Start every cell detached:** `run-cell.sh` refuses to run outside a
 `bench-*.service` unit. Start it, or the script that drives several cells,

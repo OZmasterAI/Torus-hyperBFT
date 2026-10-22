@@ -4,6 +4,14 @@
 set -euo pipefail
 D=$(cd "$1" && pwd); T=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 j() { jq -r "$@" "$D/summary.json"; }
+# The old summary as a whole: any top-level key still missing once everything below has run
+# (summarize.py rewrites summary.json from scratch) is put back from it. That keeps every
+# record run-cell.sh adds after summarize.py and nothing here re-derives (.oracle_feed for
+# ORACLE_FEED=1|seed, and any later one) without a hand list; keys present in the new
+# summary (validity, headline, the re-derived records below) always win.
+OLD_SUMMARY=$(mktemp "${TMPDIR:-/tmp}/resummarize-old.XXXXXX")
+trap 'rm -f "${OLD_SUMMARY:?}"' EXIT
+cp "$D/summary.json" "$OLD_SUMMARY"
 # EVM_LOAD_RATE cells: summarize.py rewrites summary.json without .evm_load;
 # it is re-derived below from the retained evm-load-* artifacts.
 EVM_LOAD=$(jq -c '.evm_load // empty' "$D/summary.json")
@@ -88,3 +96,6 @@ fi
 if [ -f "$D/state-attest.json" ] || [ -n "$STATE_ATTEST" ]; then
     python3 -I "$T/state_attest.py" summary --dir "$D" >/dev/null
 fi
+# Top-level keys of the old summary nothing above regenerated (see OLD_SUMMARY).
+tmp="$D/summary.json.keep.tmp"
+jq --slurpfile old "$OLD_SUMMARY" '$old[0] + .' "$D/summary.json" > "$tmp" && mv -f "$tmp" "$D/summary.json"
