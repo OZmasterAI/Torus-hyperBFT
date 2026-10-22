@@ -122,14 +122,16 @@ def scrape(url, timeout=3.0):
     except (OSError, ValueError):
         return None
     # Every line of either counter is a sample, malformed or not: a line
-    # without a value or a labelled series of the same metric is an invalid
-    # sample (None), never skipped (it would hide a duplicate).
+    # without a value, a labelled series of the same metric, or anything
+    # after the value but an optional int64 timestamp is an invalid sample
+    # (None), never skipped (it would hide a duplicate).
     samples = {SUBMITS: [], WRITES: []}
     for line in text.splitlines():
         f = line.split()
         name = f[0].split("{", 1)[0] if f else None
         if name in samples:
-            samples[name].append(f[1] if len(f) >= 2 and f[0] == name else None)
+            ok = f[0] == name and len(f) in (2, 3) and (len(f) == 2 or is_timestamp(f[2]))
+            samples[name].append(f[1] if ok else None)
     vals = {SUBMITS: None, WRITES: None, "invalid": []}
     for name, raws in samples.items():
         if len(raws) > 1:
@@ -147,6 +149,21 @@ def scrape(url, timeout=3.0):
     if vals["invalid"]:
         vals[SUBMITS] = vals[WRITES] = None
     return vals
+
+
+def is_timestamp(raw):
+    """A Prometheus text-format sample timestamp: an int64 (milliseconds),
+    ASCII digits with an optional sign, leading zeros allowed. More than 19
+    significant digits is out of range before int() sees it: CPython raises
+    ValueError above 4300 digits, which must not crash the scrape."""
+    sign = raw[:1] if raw[:1] in ("+", "-") else ""
+    body = raw[len(sign):]
+    if not body or not all("0" <= ch <= "9" for ch in body):
+        return False
+    digits = body.lstrip("0") or "0"
+    if len(digits) > 19:
+        return False
+    return -2**63 <= int(sign + digits) <= 2**63 - 1
 
 
 def counter_value(raw):
