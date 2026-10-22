@@ -20,7 +20,7 @@ waiting for a merge). "Blocks" names what cannot be finished until the item is s
 | 9n (8f deep-book re-run) gates the launch | **Yes** (bench queue 9n) |
 | Validator count (3 / 4 / 5) | Deferred: owner decides right before the testnet |
 | Liquidator-vault seed amount | Deferred: owner decides right before the testnet |
-| Item 7 T timing | Pending owner answer (s127 said before genesis; option: after genesis behind a P0.0 bit) |
+| Item 7 T timing | **After genesis, activated through P0.0** (a new `Feature` bit switched on at a height; replaces the s127 "before genesis"). Not on the testnet critical path |
 | Jailing / `JailVote` gate | **Leave as is for the testnet; fix before mainnet.** `JailVote` stays ungated (every testnet validator is owner-run), and jailing (J2 + E1/E2) plus the `JailVote` gate are pre-mainnet items. A testnet upgrade through P0.0 stays possible if live testing is wanted later. Dead-leader skip (b1) still handles dead leaders on the testnet |
 
 ## 1. Chain identity and validators
@@ -100,7 +100,7 @@ waiting for a merge). "Blocks" names what cannot be finished until the item is s
 - Dead-leader b1 phases 2-4: only if it goes into the genesis (section 2).
 - M2: **before genesis (owner s138)**, `fix/m2-timestamp-lower-bound`.
 - Price band before the first mark (C): `fix/reject-orders-before-first-mark` (owner s138).
-- Item 7 T: only if the s127 order still holds (section 4).
+- Item 7 T: **not needed (owner s138: after genesis through P0.0).**
 - Capacity (not a genesis field, a launch-readiness check): the 1M-account RAM check PASSED (bench 8f, perf doc
   section 93: 8.1-9.2 GB per node, restarts <= 11 s). Open: its deep-book throughput finding (~1-1.7M resting
   orders: matched/s -14.3%, blocks/s 13.3 -> 3.0) predates L3.1 / L6.1. Re-run 8f on main after batch 10 (9n, on
