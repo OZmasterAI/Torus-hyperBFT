@@ -2382,76 +2382,76 @@ fn flush_to_accepted_peer(
     local_key: &VerifyingKey,
     peer_id: PeerId,
 ) {
-        // Corrected reconnect seam (Task 1a): a validator stays mapped in
-        // peer_map across disconnects, so the link returning (now: its
-        // genesis accepted on the new connection) is what flushes, not
-        // RegisterPeer. Flush any consensus messages buffered meanwhile.
-        let reconnected_vk = shared.peer_map.read().unwrap().get_vk(&peer_id).copied();
-        if let Some(vk) = reconnected_vk {
-            let pending = shared.pending_sends.lock().unwrap().flush(&vk);
-            if !pending.is_empty() {
-                info!(%peer_id, count = pending.len(), "flushing pending consensus sends on (re)connect");
-                for message in pending {
-                    if let Some(ref m) = shared.metrics {
-                        m.pending_sends_flushed.inc();
-                    }
-                    send_direct(swarm, shared, local_key, &vk, message);
+    // Corrected reconnect seam (Task 1a): a validator stays mapped in
+    // peer_map across disconnects, so the link returning (now: its
+    // genesis accepted on the new connection) is what flushes, not
+    // RegisterPeer. Flush any consensus messages buffered meanwhile.
+    let reconnected_vk = shared.peer_map.read().unwrap().get_vk(&peer_id).copied();
+    if let Some(vk) = reconnected_vk {
+        let pending = shared.pending_sends.lock().unwrap().flush(&vk);
+        if !pending.is_empty() {
+            info!(%peer_id, count = pending.len(), "flushing pending consensus sends on (re)connect");
+            for message in pending {
+                if let Some(ref m) = shared.metrics {
+                    m.pending_sends_flushed.inc();
                 }
+                send_direct(swarm, shared, local_key, &vk, message);
             }
-            // T7: deliver native-action pushes that were QUEUED while this
-            // validator was disconnected (targeted, in enqueue order) — so a
-            // push is never dropped just because its target was offline.
-            let queued_pushes = shared.pending_native_pushes.lock().unwrap().flush(&vk);
-            if !queued_pushes.is_empty() {
-                info!(%peer_id, count = queued_pushes.len(), "flushing queued native pushes on (re)connect");
-                for envelope in queued_pushes {
+        }
+        // T7: deliver native-action pushes that were QUEUED while this
+        // validator was disconnected (targeted, in enqueue order) — so a
+        // push is never dropped just because its target was offline.
+        let queued_pushes = shared.pending_native_pushes.lock().unwrap().flush(&vk);
+        if !queued_pushes.is_empty() {
+            info!(%peer_id, count = queued_pushes.len(), "flushing queued native pushes on (re)connect");
+            for envelope in queued_pushes {
+                let req = DirectRequest {
+                    sender_key: local_key.to_bytes(),
+                    payload: envelope.into(),
+                };
+                swarm.behaviour_mut().direct.send_request(&peer_id, req);
+            }
+        }
+        // S447: deliver native-DA fetches that were BUFFERED while this
+        // validator was disconnected — the pull-side twin of the queued
+        // pushes above, so a mesh-degraded node's body pull reaches every
+        // committed validator that (re)connects, not just its live mesh.
+        let queued_fetches = flush_pending_da_fetches(shared, &vk);
+        if !queued_fetches.is_empty() {
+            info!(%peer_id, count = queued_fetches.len(), "flushing buffered native-DA fetches on (re)connect");
+            for hashes in queued_fetches {
+                swarm
+                    .behaviour_mut()
+                    .native_da
+                    .send_request(&peer_id, NativeDaNetRequest { hashes });
+            }
+        }
+        // T4: re-push recent native-action bundles so a (re)connecting
+        // validator's mempool catches up before the next CompactBlock it
+        // must reconstruct. Validator-gated; dedup is free on the receiver.
+        if shared.validators.read().unwrap().contains(&vk.to_bytes()) {
+            let bundles: Vec<Arc<Vec<u8>>> = shared
+                .recent_native_bundles
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect();
+            if !bundles.is_empty() {
+                info!(%peer_id, count = bundles.len(), "re-pushing recent native bundles on (re)connect");
+                for envelope in bundles {
                     let req = DirectRequest {
                         sender_key: local_key.to_bytes(),
                         payload: envelope.into(),
                     };
                     swarm.behaviour_mut().direct.send_request(&peer_id, req);
-                }
-            }
-            // S447: deliver native-DA fetches that were BUFFERED while this
-            // validator was disconnected — the pull-side twin of the queued
-            // pushes above, so a mesh-degraded node's body pull reaches every
-            // committed validator that (re)connects, not just its live mesh.
-            let queued_fetches = flush_pending_da_fetches(shared, &vk);
-            if !queued_fetches.is_empty() {
-                info!(%peer_id, count = queued_fetches.len(), "flushing buffered native-DA fetches on (re)connect");
-                for hashes in queued_fetches {
-                    swarm
-                        .behaviour_mut()
-                        .native_da
-                        .send_request(&peer_id, NativeDaNetRequest { hashes });
-                }
-            }
-            // T4: re-push recent native-action bundles so a (re)connecting
-            // validator's mempool catches up before the next CompactBlock it
-            // must reconstruct. Validator-gated; dedup is free on the receiver.
-            if shared.validators.read().unwrap().contains(&vk.to_bytes()) {
-                let bundles: Vec<Arc<Vec<u8>>> = shared
-                    .recent_native_bundles
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .cloned()
-                    .collect();
-                if !bundles.is_empty() {
-                    info!(%peer_id, count = bundles.len(), "re-pushing recent native bundles on (re)connect");
-                    for envelope in bundles {
-                        let req = DirectRequest {
-                            sender_key: local_key.to_bytes(),
-                            payload: envelope.into(),
-                        };
-                        swarm.behaviour_mut().direct.send_request(&peer_id, req);
-                        if let Some(ref m) = shared.metrics {
-                            m.native_bundle_repushed.inc();
-                        }
+                    if let Some(ref m) = shared.metrics {
+                        m.native_bundle_repushed.inc();
                     }
                 }
             }
         }
+    }
 }
 
 fn handle_command(
