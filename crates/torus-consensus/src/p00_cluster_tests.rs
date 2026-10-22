@@ -126,6 +126,9 @@ fn chain_config(schedule: ActivationSchedule) -> ChainConfig {
         exec_trust_cache: false,
         activations: schedule,
         book_mode: Default::default(),
+        // Dead-leader skip off, as the other consensus fixtures (no justify evidence).
+        leader_miss_threshold: 0,
+        leader_exclusion_cap: torus_types::DEFAULT_LEADER_EXCLUSION_CAP,
     }
 }
 

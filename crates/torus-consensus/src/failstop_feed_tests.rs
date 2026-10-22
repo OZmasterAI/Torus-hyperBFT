@@ -59,6 +59,9 @@ fn chain_config() -> ChainConfig {
         // the fail-stop here is the injected one, never `UPGRADE REQUIRED`.
         activations: Default::default(),
         book_mode: Default::default(),
+        // Dead-leader skip off, as the other consensus fixtures (no justify evidence).
+        leader_miss_threshold: 0,
+        leader_exclusion_cap: torus_types::DEFAULT_LEADER_EXCLUSION_CAP,
     }
 }
 

@@ -1976,6 +1976,8 @@ impl ChainConfig {
         self.activations
             .height_of(Feature::RunningStateHash)
             .map(|h| h.max(1))
+    }
+
     /// Dead-leader skip: the parameters in force for the block with `header`, `None` = off (the
     /// execution of that block attributes no leader slots and plans no exclusion; consensus then
     /// emits no exclusion delta, as no plan carries one).
@@ -2097,6 +2099,8 @@ mod tests {
             ..with(&[(rsh, 1)])
         };
         assert!(rows_off.validate().is_ok());
+    }
+
     /// Dead-leader skip: the chain config range check and the activation hook (off for K = 0
     /// and under reputation-weighted leader selection).
     #[test]
@@ -2149,6 +2153,7 @@ mod tests {
             big_base_fee_per_gas: 0,
             epoch: 0,
             validator_set_hash: B256::ZERO,
+            features: 0,
             sig_attestation: [0; 64],
         };
         assert_eq!(
