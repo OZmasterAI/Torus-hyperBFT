@@ -1408,7 +1408,12 @@ impl<N: Network> HotStuff<N> {
         // 1. Check if block is correct and safe.
         let is_correct = proposal.block.is_correct(block_tree)?;
         let is_safe = if is_correct {
-            safe_block(&proposal.block, block_tree, self.config.chain_id)?
+            safe_block(
+                &proposal.block,
+                proposal.tc.as_ref().and_then(|tc| tc.high_qc.as_ref()),
+                block_tree,
+                self.config.chain_id,
+            )?
         } else {
             false
         };
@@ -2003,7 +2008,13 @@ impl<N: Network> HotStuff<N> {
         if !resp.block.is_correct(block_tree)? {
             return Ok(());
         }
-        if !safe_block(&resp.block, block_tree, self.config.chain_id)? {
+        // The recovery's TC (this leader's TC(v-1)); its high QC may certify the tip above this
+        // leader's lock (`safe_proposal_lock`).
+        let tc_high_qc = match &self.recovery_state {
+            RecoveryState::Recovering { tc, .. } => tc.high_qc.clone(),
+            _ => None,
+        };
+        if !safe_block(&resp.block, tc_high_qc.as_ref(), block_tree, self.config.chain_id)? {
             return Ok(());
         }
 
@@ -2436,6 +2447,9 @@ impl<N: Network> HotStuff<N> {
         // (body still in flight) but we already validated and voted for it. Tracked
         // entries in pending_headers/pending_bodies are proof of prior validation.
         let justify_correct = header.justify.is_correct(block_tree)?;
+        // s138: the high QC of the TC checked above (`valid_proposal_certificates`), for the lock's
+        // certified arm (`safe_proposal_lock`).
+        let tc_high_qc = header.tc.as_ref().and_then(|tc| tc.high_qc.as_ref());
         let justify_previously_validated = self.pending_headers.contains_key(&header.justify.block)
             || self.pending_bodies.contains_key(&header.justify.block);
         let is_safe = if justify_correct {
@@ -2463,9 +2477,9 @@ impl<N: Network> HotStuff<N> {
                 header.justify.is_block_justify()
                     && (header.justify.chain_id == self.config.chain_id
                         || header.justify.is_genesis_pc())
-                    && safe_proposal_lock(&header.block_hash, &header.justify, block_tree)?
+                    && safe_proposal_lock(&header.block_hash, &header.justify, tc_high_qc, block_tree)?
             } else {
-                safe_proposal_pc(&header.block_hash, &header.justify, block_tree, self.config.chain_id)?
+                safe_proposal_pc(&header.block_hash, &header.justify, tc_high_qc, block_tree, self.config.chain_id)?
                     && header.justify.is_block_justify()
             }
         } else {
@@ -2984,7 +2998,12 @@ impl<N: Network> HotStuff<N> {
         if header.view != self.view_info.view
             || !is_phase_voter(&self.config.keypair.public(), &validator_set_state, &header.justify)
             || block_tree.highest_view_voted()?.is_some_and(|voted| voted >= header.view)
-            || !safe_proposal_lock(&header.block_hash, &header.justify, block_tree)?
+            || !safe_proposal_lock(
+                &header.block_hash,
+                &header.justify,
+                header.tc.as_ref().and_then(|tc| tc.high_qc.as_ref()),
+                block_tree,
+            )?
         {
             return Ok(());
         }

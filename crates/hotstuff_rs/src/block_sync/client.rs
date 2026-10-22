@@ -487,7 +487,7 @@ impl<N: Network> BlockSyncClient<N> {
         // blocks), but it must be visible when it happens. Log-only: errors are swallowed and
         // behavior is unchanged. The proposal lock rule (`safe_proposal_lock`, reflexive since
         // s138) is the one checked, so a synced copy of the locked block itself is no conflict.
-        if !safe_proposal_lock(&block.hash, &block.justify, block_tree).unwrap_or(true) {
+        if !safe_proposal_lock(&block.hash, &block.justify, None, block_tree).unwrap_or(true) {
             if let Ok(locked_pc) = block_tree.locked_pc() {
                 log::warn!(
                     "block_sync: synced block {:?} justify (block={:?}, view={}) conflicts with local locked_pc (block={:?}, view={}) — proceeding with catch-up, lock superseded by peer's committed chain",

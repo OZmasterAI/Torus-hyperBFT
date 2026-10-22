@@ -84,7 +84,7 @@ fn locked_on_update_block() -> LockedOnUpdate {
 fn reproposal_of_the_locked_block_is_safe() {
     let f = locked_on_update_block();
     assert!(
-        safe_block(&f.u, &f.block_tree, CHAIN_ID).expect("safe_block"),
+        safe_block(&f.u, None, &f.block_tree, CHAIN_ID).expect("safe_block"),
         "a proposal of the locked block itself must satisfy the lock"
     );
 }
@@ -101,7 +101,7 @@ fn sibling_of_the_locked_block_with_its_stale_justify_is_refused() {
     let mut block_tree = f.block_tree;
     block_tree.insert(&sibling, None, Some(&updates)).expect("insert sibling");
     assert!(
-        !safe_block(&sibling, &block_tree, CHAIN_ID).expect("safe_block"),
+        !safe_block(&sibling, None, &block_tree, CHAIN_ID).expect("safe_block"),
         "a conflicting sibling of the locked block must not satisfy the lock"
     );
 }
@@ -131,7 +131,7 @@ fn locked_with_sibling(highest: impl FnOnce(&LockedOnUpdate, CryptoHash) -> Phas
 fn sibling_certified_above_the_lock_by_the_highest_pc_is_safe() {
     let (f, sibling) = locked_with_sibling(|f, sibling| phase_pc(4, sibling, Phase::Prepare, &f.keys[1..], &f.set));
     assert!(
-        safe_block(&sibling, &f.block_tree, CHAIN_ID).expect("safe_block"),
+        safe_block(&sibling, None, &f.block_tree, CHAIN_ID).expect("safe_block"),
         "a sibling certified above the lock must satisfy it"
     );
 }
@@ -142,7 +142,7 @@ fn sibling_certified_above_the_lock_by_the_highest_pc_is_safe() {
 fn sibling_certified_at_the_lock_view_is_refused() {
     let (f, sibling) = locked_with_sibling(|f, sibling| phase_pc(3, sibling, Phase::Prepare, &f.keys[1..], &f.set));
     assert!(
-        !safe_block(&sibling, &f.block_tree, CHAIN_ID).expect("safe_block"),
+        !safe_block(&sibling, None, &f.block_tree, CHAIN_ID).expect("safe_block"),
         "a PC on the sibling that is not newer than the lock must not unlock"
     );
 }
@@ -153,9 +153,53 @@ fn sibling_certified_at_the_lock_view_is_refused() {
 fn sibling_with_a_newer_pc_on_another_block_is_refused() {
     let (f, sibling) = locked_with_sibling(|f, _| phase_pc(4, f.u.hash, Phase::Prepare, &f.keys[1..], &f.set));
     assert!(
-        !safe_block(&sibling, &f.block_tree, CHAIN_ID).expect("safe_block"),
+        !safe_block(&sibling, None, &f.block_tree, CHAIN_ID).expect("safe_block"),
         "a newer PC on U does not make U' safe"
     );
+}
+
+/// The certified arm also takes the attached TC's high QC (verified with the TC): this replica
+/// never learned Prepare(U', 4) (its highest PC is its lock), the TC carrying the re-proposal
+/// reports it. A TC high QC on U' at the lock's view does not unlock.
+#[test]
+fn sibling_certified_above_the_lock_by_the_tc_high_qc_is_safe() {
+    let (f, sibling) = locked_with_sibling(|f, _| phase_pc(3, f.u.hash, Phase::Precommit, &f.keys[..3], &f.set));
+    let prepare4 = phase_pc(4, sibling.hash, Phase::Prepare, &f.keys[1..], &f.set);
+    let prepare3 = phase_pc(3, sibling.hash, Phase::Prepare, &f.keys[1..], &f.set);
+    assert!(!safe_block(&sibling, None, &f.block_tree, CHAIN_ID).expect("safe_block"), "no certificate above the lock");
+    assert!(
+        safe_block(&sibling, Some(&prepare4), &f.block_tree, CHAIN_ID).expect("safe_block"),
+        "the TC's high QC certifies the sibling above the lock"
+    );
+    assert!(
+        !safe_block(&sibling, Some(&prepare3), &f.block_tree, CHAIN_ID).expect("safe_block"),
+        "a TC high QC at the lock's view does not unlock"
+    );
+}
+
+/// Header path (production): the leader of view 5 re-proposes U' under TC(4), whose high QC is
+/// Prepare(U', 4); the replica locked on Precommit(U, 3), which never learned Prepare(U', 4),
+/// votes Prepare for it. Without a newer certificate the same header is refused
+/// (`header_sibling_of_the_locked_block_is_not_voted`).
+#[test]
+fn header_reproposal_of_a_sibling_certified_by_the_tc_is_voted() {
+    let (f, sibling) = locked_with_sibling(|f, _| phase_pc(3, f.u.hash, Phase::Precommit, &f.keys[..3], &f.set));
+    let mut block_tree = f.block_tree;
+    let view = 5;
+    let prepare4 = phase_pc(4, sibling.hash, Phase::Prepare, &f.keys[1..], &f.set);
+    let tc = tc_reporting(view - 1, &prepare4, &f.keys[1..], &f.set);
+    let header = reproposal_header(&sibling, f.qc_a.clone(), view, tc);
+    let leader = proposer_for(ViewNumber::new(view), &f.keys, &f.vss, &block_tree);
+    let mut hotstuff = hotstuff_at(ViewNumber::new(view), f.keys[0].clone(), f.vss.clone());
+    hotstuff
+        .on_receive_msg(HotStuffMessage::ProposalHeader(signed_by(header, &leader)), &leader, &mut block_tree, &mut TreeApp)
+        .expect("processing the sibling's re-proposal header must not error");
+    assert_eq!(
+        block_tree.highest_view_voted().expect("highest_view_voted"),
+        Some(ViewNumber::new(view)),
+        "the replica locked on U must vote for U' certified above its lock"
+    );
+    assert_eq!(block_tree.locked_pc().unwrap().block, f.u.hash, "voting Prepare moves no lock");
 }
 
 /// A descendant of the locked block (justified by a PC on U, at a view not above the lock) is
@@ -166,7 +210,7 @@ fn descendant_of_the_locked_block_is_safe() {
     let decide_u = phase_pc(3, f.u.hash, Phase::Decide, &f.keys[..3], &f.set);
     let child = Block::new(BlockHeight::new(2), decide_u, CryptoHash::new([13u8; 32]), Data::new(vec![]));
     assert!(
-        safe_block(&child, &f.block_tree, CHAIN_ID).expect("safe_block"),
+        safe_block(&child, None, &f.block_tree, CHAIN_ID).expect("safe_block"),
         "a child of the locked block must satisfy the lock"
     );
 }
@@ -184,7 +228,7 @@ fn reproposal_of_a_committed_locked_block_is_safe() {
     wb.set_highest_committed_block(&f.u.hash).expect("set_highest_committed_block");
     block_tree.write(wb);
     assert!(
-        safe_block(&f.u, &block_tree, CHAIN_ID).expect("safe_block"),
+        safe_block(&f.u, None, &block_tree, CHAIN_ID).expect("safe_block"),
         "a proposal of the committed locked block itself must satisfy the lock"
     );
 }
@@ -199,7 +243,7 @@ fn sibling_of_a_committed_locked_block_is_refused() {
     block_tree.write(wb);
     let sibling = Block::new(BlockHeight::new(1), f.qc_a.clone(), CryptoHash::new([12u8; 32]), Data::new(vec![]));
     assert!(
-        !safe_block(&sibling, &block_tree, CHAIN_ID).expect("safe_block"),
+        !safe_block(&sibling, None, &block_tree, CHAIN_ID).expect("safe_block"),
         "a sibling of the committed locked block must not satisfy the lock"
     );
 }
@@ -311,18 +355,18 @@ fn proposal_lock_without_the_block_in_the_tree() {
     let stale = generic_pc(ViewNumber::new(1), CryptoHash::new([20u8; 32]), &keys[..3], &set);
 
     // Genesis lock: any PC above view 0 satisfies it (view arm).
-    assert!(safe_proposal_lock(&other, &stale, &block_tree).expect("lock"));
+    assert!(safe_proposal_lock(&other, &stale, None, &block_tree).expect("lock"));
 
     let lock = phase_pc(3, locked, Phase::Precommit, &keys[..3], &set);
     let mut wb: BlockTreeWriteBatch<MemWb> = BlockTreeWriteBatch::new();
     wb.set_locked_pc(&lock).expect("set_locked_pc");
     block_tree.write(wb);
     assert!(
-        safe_proposal_lock(&locked, &stale, &block_tree).expect("lock"),
+        safe_proposal_lock(&locked, &stale, None, &block_tree).expect("lock"),
         "the uncommitted locked block (body pending) satisfies the lock with its stale justify"
     );
     assert!(
-        !safe_proposal_lock(&other, &stale, &block_tree).expect("lock"),
+        !safe_proposal_lock(&other, &stale, None, &block_tree).expect("lock"),
         "another block with a stale justify that does not extend the lock must fail"
     );
 }
