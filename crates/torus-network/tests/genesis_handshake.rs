@@ -63,6 +63,7 @@ struct Node {
     net: LibP2PNetwork,
     vk: VerifyingKey,
     metrics: Arc<Metrics>,
+    port: u16,
     // Dropping a gossip handle closes its channel and the swarm loop's biased
     // select would spin on it: keep them alive.
     _handles: (TxGossipHandle, NativeGossipHandle),
@@ -90,6 +91,7 @@ async fn start(
         net,
         vk: sk.verifying_key(),
         metrics,
+        port,
         _handles: (tx, na),
     }
 }
@@ -206,5 +208,60 @@ async fn peer_without_genesis_digest_is_refused() {
     assert!(
         !a_heard && !b_heard,
         "no message crosses a genesis mismatch: a_heard={a_heard} b_heard={b_heard}"
+    );
+}
+
+fn refusals(a: &Node, b: &Node) -> (u64, u64) {
+    (
+        a.metrics.p2p_genesis_mismatch_refusals.get(),
+        b.metrics.p2p_genesis_mismatch_refusals.get(),
+    )
+}
+
+/// Codex P2 on the handshake branch: a refused validator stays in the peer
+/// map, so every consensus send (here: a direct send and a broadcast every
+/// 200 ms, as hotstuff does) redialed it. Each new QUIC connection ran
+/// identify again and was refused again: ~130 connections and refusal lines
+/// per side in 6 s. A refused peer must be held off for a cooldown across
+/// every dial path, so the 6 s of sends add at most a couple of connections.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refused_peer_is_not_redialed_by_ordinary_sends() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (mut a, mut b) = pair(Some(DIGEST_A), Some(DIGEST_B)).await;
+    wait_refusals(&a, &b, Duration::from_secs(20)).await;
+    let before = refusals(&a, &b);
+    assert!(before.0 > 0 && before.1 > 0, "both sides refused: {before:?}");
+    let (a_heard, b_heard) = exchange(&mut a, &mut b, Duration::from_secs(6), false).await;
+    let after = refusals(&a, &b);
+    assert!(!a_heard && !b_heard, "nothing crosses");
+    assert!(
+        after.0 - before.0 <= 3 && after.1 - before.1 <= 3,
+        "a refused peer is not redialed in a loop: refusals before={before:?} after 6 s of sends={after:?}"
+    );
+}
+
+/// The cooldown is not a permanent ban: a validator refused for its genesis
+/// and restarted (same key) WITH the right genesis is accepted once the
+/// cooldown has passed, and messages, including ones buffered meanwhile,
+/// flow both ways.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_restarted_with_the_right_genesis_is_accepted_after_cooldown() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (mut a, b) = pair(Some(DIGEST_A), Some(DIGEST_B)).await;
+    wait_refusals(&a, &b, Duration::from_secs(20)).await;
+    assert!(a.metrics.p2p_genesis_mismatch_refusals.get() > 0, "a refused b");
+    // Restart b with the same key, A's genesis, on a fresh port.
+    drop(b);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let a_peer = (peer_id_from_verifying_key(&a.vk), quic_addr(a.port));
+    let mut b = start(42, free_udp_port(), vec![a_peer], Some(DIGEST_A)).await;
+    let mut vs = ValidatorSet::new();
+    vs.put(&a.vk, Power::new(100));
+    vs.put(&b.vk, Power::new(100));
+    b.net.init_validator_set(vs);
+    let (a_heard, b_heard) = exchange(&mut a, &mut b, Duration::from_secs(60), true).await;
+    assert!(
+        a_heard && b_heard,
+        "a peer restarted with the right genesis is accepted after the cooldown: a_heard={a_heard} b_heard={b_heard}"
     );
 }
