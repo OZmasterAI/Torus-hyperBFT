@@ -571,6 +571,12 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
   not block the testnet, but dead-leader skip and jailing make validator-set updates frequent. **Status s136: OPEN, not
   started.** First step: confirm partial changes (one member added / removed, power changes, exclusion-only updates)
   never hit it, then decide on a fix before mainnet.
+  **Status s138: analysed (static), `plans/disjoint-vset-livelock.md`.** No deterministic step-4 livelock on current
+  code; the only evidence is an April note. Two real defects: D1 (a failed window view stalls the update for good;
+  fixed by the TC set, `d3de0abb`) and **D2 (testnet-relevant): a replica that misses the update window (laggard,
+  joiner, fresh node syncing from genesis) can never cross a membership change** (Decide PC checked against the old
+  set; block sync blacklists every server). Partial changes complete on `d3de0abb`, but D2 strands any node that
+  misses the window. Fix option A (no format or vote-rule change) being built on `fix/vset-membership-sync`.
 - **Deep-book capacity re-check before the testnet (s136).** The 1M-account RAM check (bench 8f, perf doc section 93,
   s68) PASSED: 8.1-9.2 GB per node under load (limit ~15 GB), restarts 2-11 s (limit 60 s). Its open finding is
   throughput with ~1-1.7M resting orders: matched/s -14.3%, native blocks/s 13.3 -> 3.0, p50 15 -> 240 ms, book save
