@@ -101,10 +101,14 @@ impl<N: Network + 'static> BlockSyncWorker<N> {
                         start_height,
                         limit,
                     };
+                    let diag_t0 = Instant::now();
+                    log::info!("DIAG worker: send request start={}", start_height.int());
                     self.sender.send(peer, request);
 
                     let deadline = Instant::now() + self.response_timeout;
-                    match self.receiver.recv_response(peer, deadline) {
+                    let diag_r = self.receiver.recv_response(peer, deadline);
+                    log::info!("DIAG worker: response ok={} after {:?}", diag_r.is_ok(), diag_t0.elapsed());
+                    match diag_r {
                         Ok(response) => {
                             if response.blocks.is_empty() {
                                 let _ = self.results.send(SyncResult::Empty { peer });
