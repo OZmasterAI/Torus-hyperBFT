@@ -375,6 +375,55 @@ mod tests {
         }
     }
 
+    /// s139: the pre-book rejections of a list map to their sender and
+    /// order (a batch's orders one by one); the book's own refusals
+    /// (borrowed canonical message) and successes are not taken; a count
+    /// mismatch adds nothing.
+    #[test]
+    fn order_rejections_take_only_pre_book_refusals() {
+        use torus_state::order_events::{OrderEventReason, OrderEventStatus};
+        let a = Address::repeat_byte(1);
+        let b = Address::repeat_byte(2);
+        let book_reject = NativeActionResult {
+            action_type: "place_order",
+            success: false,
+            error: Some(std::borrow::Cow::Borrowed(FailureReason::IocCancel.book_reject_message())),
+            gas_used: 1000,
+            reason: FailureReason::IocCancel,
+        };
+        assert!(book_reject.is_book_reject());
+        let mut cloid_order = order(7);
+        cloid_order.client_order_id = Some(0xabc);
+        let list = vec![
+            (a, NativeAction::PlaceOrder(cloid_order)),
+            (b, NativeAction::PlaceOrderBatch(vec![order(1), order(2), order(3)])),
+            (a, NativeAction::CancelAllOrders { market_id: None }),
+        ];
+        let result = batch(vec![
+            err(FailureReason::Tick, "off tick"),
+            ok(),
+            book_reject.clone(),
+            err(FailureReason::Margin, "insufficient margin"),
+            err(FailureReason::Other, "cancel failed"),
+        ]);
+        let mut out = Vec::new();
+        order_rejections(&list, &result, &mut out);
+        let got: Vec<_> = out
+            .iter()
+            .map(|e| (e.trader, e.price.raw(), e.order_id, e.cloid, e.status, e.reason))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (a, 7, None, Some(0xabc), OrderEventStatus::Rejected, OrderEventReason::Reject(FailureReason::Tick)),
+                (b, 3, None, None, OrderEventStatus::Rejected, OrderEventReason::Reject(FailureReason::Margin)),
+            ]
+        );
+        let mut none = Vec::new();
+        order_rejections(&list, &batch(vec![ok()]), &mut none);
+        assert!(none.is_empty());
+    }
+
     fn batch(results: Vec<NativeActionResult>) -> NativeBatchResult {
         NativeBatchResult {
             results,

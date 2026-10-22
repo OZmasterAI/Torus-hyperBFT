@@ -22572,6 +22572,81 @@ mod crash_recovery_tests {
         }
     }
 
+    /// s139: a sink with an `orderUpdates` subscriber (order events wanted,
+    /// fills not).
+    struct OrderEventSink {
+        seen: Arc<std::sync::Mutex<Vec<Arc<torus_state::order_events::BlockOrderEvents>>>>,
+    }
+
+    impl torus_state::trade_rows::FillSink for OrderEventSink {
+        fn wants_fills(&self) -> bool {
+            false
+        }
+        fn send_fills(&self, _block: Arc<torus_state::trade_rows::BlockFills>) {}
+        fn wants_order_events(&self) -> bool {
+            true
+        }
+        fn send_order_events(&self, block: Arc<torus_state::order_events::BlockOrderEvents>) {
+            self.seen.lock().unwrap().push(block);
+        }
+    }
+
+    /// s139: with an order-event subscriber, every executed block with order
+    /// events reaches the sink once, in height order, serial and pipelined
+    /// alike, with the events of its placements and fills; and every CF and
+    /// the native root equal a run without a sink (the events never touch
+    /// state).
+    #[test]
+    fn order_event_sink_receives_each_block_and_state_is_unchanged() {
+        use torus_state::order_events::OrderEventStatus as S;
+        for on in [false, true] {
+            let (plain, root_plain, _) = run_fill_fixture(on, true, None);
+            torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
+            let (_cfg, state_db) = make_test_config_and_db();
+            fund_pipeline_fixture(&state_db);
+            let mut ctx = pipeline_ctx(&state_db, on, None);
+            ctx.trade_history = true;
+            let seen: Arc<std::sync::Mutex<Vec<_>>> = Default::default();
+            let sink: Arc<dyn torus_state::trade_rows::FillSink> =
+                Arc::new(OrderEventSink { seen: seen.clone() });
+            assert!(ctx.fill_sink.set(sink).is_ok());
+            for b in &pipeline_fixture_blocks() {
+                dispatch_and_execute(&ctx, &state_db, b);
+            }
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fixture must not fail-stop");
+            drop(ctx);
+            let root = torus_state::native_trie::persisted_native_root(&state_db).unwrap();
+            assert_dumps_equal(&plain, &dump_all_cfs(&state_db), &format!("order sink vs none (on={on})"));
+            assert_eq!(root_plain, root, "native root (on={on})");
+
+            let seen = seen.lock().unwrap().clone();
+            let got: Vec<(u64, Vec<S>)> = seen
+                .iter()
+                .map(|b| {
+                    let mut st: Vec<S> = b.events.iter().map(|e| e.status).collect();
+                    st.sort_by_key(|s| format!("{s:?}"));
+                    (b.height, st)
+                })
+                .collect();
+            assert_eq!(
+                got,
+                vec![
+                    // A rests, B crosses it: the maker and the taker fill.
+                    (3, vec![S::Filled, S::Filled, S::Open]),
+                    (5, vec![S::Open]),
+                    (6, vec![S::Filled, S::Filled]),
+                    (10, vec![S::Open]),
+                    (11, vec![S::Filled, S::Filled]),
+                ],
+                "pipeline on={on}"
+            );
+            for b in &seen {
+                assert!(b.timestamp > 0, "on={on}");
+                assert!(b.events.iter().all(|e| e.order_id.is_some() && e.market == 1), "on={on}");
+            }
+        }
+    }
+
     /// OFF yields byte-identical state in EVERY CF and the same persisted native
     /// root — across empties, an epoch boundary (serial), a duplicated action
     /// (nonce guard through the layer), a session created in k and used by verify
