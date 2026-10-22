@@ -488,8 +488,11 @@ pub struct RpcUserFill {
     pub order_id: String,
     pub start_position: String,
     pub closed_pnl: String,
-    /// Trading fee the user paid on this fill (negative = rebate).
-    pub fee: String,
+    /// Trading fee the user paid on this fill (negative = rebate). Absent
+    /// for blocks before `trading_fees` is active (the row is then exactly
+    /// the pre-feature row) and in pre-feature rows (Codex s138 #3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee: Option<String>,
     pub dir: String,
     pub block_number: String,
     pub timestamp: String,

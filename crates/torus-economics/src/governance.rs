@@ -693,11 +693,23 @@ impl ProposalSnapshot {
 #[derive(Clone)]
 pub struct GovernanceManager<T: StateBackend = StateDb> {
     state: T,
+    /// Trading fees (P0.0 `trading_fees`): accept the fee keys
+    /// (`torus_types::trading_fees::{TAKER,MAKER}_FEE_PARAM`). The executor
+    /// sets it from the executed block's feature bits before submitting or
+    /// executing proposals; off (the default), they are refused exactly as
+    /// before the feature (`ParameterNotModifiable`), so no proposal state
+    /// or fee row exists that a pre-feature node would not have.
+    fee_keys: bool,
 }
 
 impl<T: StateBackend> GovernanceManager<T> {
     pub fn new(state: T) -> Self {
-        Self { state }
+        Self { state, fee_keys: false }
+    }
+
+    /// Trading fees: accept the fee keys from now on (see the field).
+    pub fn set_fee_keys(&mut self, on: bool) {
+        self.fee_keys = on;
     }
 
     pub fn state(&self) -> &T {
@@ -733,6 +745,17 @@ impl<T: StateBackend> GovernanceManager<T> {
     /// read (MM is half the IM, leverage is per market, no liquidation
     /// penalty by design), so a vote changed nothing; they are now refused
     /// as not modifiable.
+    /// [`Self::validate_param_change`], with the trading fee keys refused
+    /// as not modifiable unless accepted ([`Self::set_fee_keys`]).
+    fn validate_param(&self, key: &str, value: &str) -> Result<()> {
+        let fee_key = key == torus_types::trading_fees::TAKER_FEE_PARAM
+            || key == torus_types::trading_fees::MAKER_FEE_PARAM;
+        if fee_key && !self.fee_keys {
+            return Err(EconomicsError::ParameterNotModifiable(key.to_string()));
+        }
+        Self::validate_param_change(key, value)
+    }
+
     fn validate_param_change(key: &str, value: &str) -> Result<()> {
         match key {
             "voting_period_blocks" => {
@@ -962,7 +985,7 @@ impl<T: StateBackend> GovernanceManager<T> {
             ref new_value,
         }) = execution_payload
         {
-            Self::validate_param_change(param_key, new_value)?;
+            self.validate_param(param_key, new_value)?;
         }
 
         // An explicit (nonzero) listing id must not collide with a live market.
@@ -1405,7 +1428,7 @@ impl<T: StateBackend> GovernanceManager<T> {
                 new_value,
             } => {
                 // FIX 13: Validate parameter change at execution time (defense-in-depth).
-                Self::validate_param_change(param_key, new_value)?;
+                self.validate_param(param_key, new_value)?;
                 match Self::with_governance_param(params, param_key, new_value)? {
                     // s99: one write of the whole record governance reads.
                     Some(updated) => {

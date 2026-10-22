@@ -100,7 +100,7 @@ serialization. `userFills` arrays are built per subscriber.
 | `orderId` | The user's order that filled |
 | `startPosition` | The user's signed position in this market before the fill (long > 0, short < 0) |
 | `closedPnl` | Realized PnL of the fill's closing part; `0.00000000` when the fill only opened or increased |
-| `fee` | Trading fee the user paid on this fill (negative = maker rebate); `0.00000000` while the `trading_fees` feature is off (docs/plans/trading-fees.md) |
+| `fee` | Trading fee the user paid on this fill (negative = maker rebate); absent for blocks before the `trading_fees` feature is active (docs/plans/trading-fees.md) |
 | `dir` | `Open Long`, `Open Short`, `Close Long`, `Close Short`, `Long > Short` or `Short > Long` (a flip) |
 
 There are no self-trades: an order that would match the same user's resting

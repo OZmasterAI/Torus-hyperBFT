@@ -266,6 +266,21 @@ fn side_fees(fees: Option<TradingFeeRates>, notional: FixedPoint) -> (FixedPoint
     }
 }
 
+/// Trading fees: `available + order_margin` (`None` on i128 overflow).
+fn collateral_of(b: &NativeBalance) -> Option<FixedPoint> {
+    b.available.checked_add(b.order_margin).ok()
+}
+
+/// Trading fees (Codex s138 #2): the part of a flat trader's net `fee` it
+/// could not pay, given its `collateral` after the fee: `min(-collateral,
+/// fee)` when the collateral is negative and the fee positive, else zero.
+fn unpaid_fee(collateral: FixedPoint, fee: FixedPoint) -> FixedPoint {
+    if collateral >= FixedPoint::ZERO || fee <= FixedPoint::ZERO {
+        return FixedPoint::ZERO;
+    }
+    std::cmp::min(FixedPoint::ZERO - collateral, fee)
+}
+
 /// Adds the first `sides` fill sides of `fills` (in order: fill 0 taker, fill
 /// 0 maker, fill 1 taker, ...) to `volumes`, one `price * qty` per fill and
 /// each side's fee at `fees`.
@@ -485,6 +500,11 @@ impl BalanceCache {
             },
         );
         Ok(bal)
+    }
+
+    /// The cached balance of `addr`, if loaded (no read).
+    fn peek(&self, addr: &Address) -> Option<&NativeBalance> {
+        self.map.get(addr).map(|e| &e.balance)
     }
 
     /// Update the cached balance and mark it dirty (write-back — no overlay PUT yet).
@@ -9984,6 +10004,16 @@ impl NativeExecutor {
         if let Err(e) = pos_flushed {
             ctx.fatal_error = Some(format!("position cache flush failed: {e}"));
         }
+        // Trading fees (Codex s138 #2): a trader the call left FLAT with
+        // negative collateral pays at most what it held: the unpaid part of
+        // its fees is waived (never credited), and any deficit left (a
+        // realized loss) moves to the vault after the flush below, as every
+        // flat deficit does (D9). Feature off: nothing (no read, no write).
+        let flat_deficits = if ctx.trade_fees.is_some() {
+            Self::waive_unpaid_fees(ctx, &mut bal_cache, &mut vol_cache)
+        } else {
+            Vec::new()
+        };
         // Trading fees: the treasury takes the exact sum of every fee the
         // call's fill sides paid (rebates subtracted; exact i128 sum, so the
         // order is irrelevant), through the balance cache before its flush.
@@ -10016,6 +10046,16 @@ impl NativeExecutor {
                 if let Err(e) = ctx.positions.add_cum_fee(&trader, add.fee) {
                     ctx.fatal_error = Some(format!("cum_fee flush failed: {e}"));
                 }
+            }
+        }
+        // D9 for the flat accounts still in deficit (sorted; written straight
+        // to the overlay after the flush, as the liquidation step does).
+        for trader in flat_deficits {
+            let vault = torus_core::liquidation::LIQUIDATOR_VAULT;
+            if let Err(e) =
+                torus_core::liquidation::settle_flat_deficit(&ctx.positions, &trader, &vault)
+            {
+                Self::latch_core_fault(ctx, "trading fee flat deficit", &e);
             }
         }
         ctx.phase_accum.cache_flush_ns += cache_flush_timer.elapsed().as_nanos();
@@ -12316,26 +12356,100 @@ impl NativeExecutor {
             .collect()
     }
 
-    /// Trading fees on the single-action path (no write-back caches): debit
-    /// `fee` from `trader`'s `available`, credit it to the treasury and add
-    /// it to the trader's `cfee` row, all straight to the backend. Zero: no
-    /// read, no write.
-    fn charge_fee_direct<T: StateBackend>(
-        positions: &PositionManager<T>,
-        trader: &Address,
-        treasury: Address,
-        fee: FixedPoint,
-    ) -> Result<(), CoreError> {
-        if fee == FixedPoint::ZERO {
-            return Ok(());
+    /// Trading fees (Codex s138 #2), batch path, after the position flush:
+    /// for each trader of the call (`vol_cache`) whose cached balance has
+    /// negative collateral (`available + order_margin`) and who holds no
+    /// position, the unpaid part of its net fees, `min(-collateral, fee)`, is
+    /// given back (balance) and taken off its `fee` total (so the `cfee` row
+    /// and the treasury credit count only what was paid). Returns, sorted,
+    /// the flat traders still in deficit (a realized loss), for D9 after the
+    /// balance flush. A trader with a position is left to the liquidation
+    /// step, which values it. Only negative accounts cost a position read.
+    fn waive_unpaid_fees<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        bal_cache: &mut BalanceCache,
+        vol_cache: &mut VolumeCache,
+    ) -> Vec<Address> {
+        let mut negative: Vec<Address> = vol_cache
+            .keys()
+            .filter(|t| {
+                bal_cache
+                    .peek(t)
+                    .and_then(collateral_of)
+                    .is_some_and(|c| c < FixedPoint::ZERO)
+            })
+            .copied()
+            .collect();
+        negative.sort_unstable();
+        let mut deficits = Vec::new();
+        for trader in negative {
+            match ctx.positions.positions_for_trader(&trader) {
+                Ok(p) if !p.is_empty() => continue,
+                Ok(_) => {}
+                Err(e) => {
+                    Self::latch_core_fault(ctx, "trading fee flat check", &e);
+                    continue;
+                }
+            }
+            let Some(mut bal) = bal_cache.peek(&trader).cloned() else { continue };
+            let Some(c) = collateral_of(&bal) else { continue };
+            let totals = vol_cache.entry(trader).or_default();
+            let unpaid = unpaid_fee(c, totals.fee);
+            if unpaid != FixedPoint::ZERO {
+                bal.available += unpaid;
+                bal_cache.set(&trader, bal);
+                totals.fee -= unpaid;
+            }
+            if c + unpaid < FixedPoint::ZERO {
+                deficits.push(trader);
+            }
         }
-        let mut bal = positions.get_native_balance(trader)?;
-        bal.available -= fee;
-        positions.put_native_balance(trader, &bal)?;
-        let mut t = positions.get_native_balance(&treasury)?;
-        t.available += fee;
-        positions.put_native_balance(&treasury, &t)?;
-        positions.add_cum_fee(trader, fee)
+        deficits
+    }
+
+    /// Trading fees on the single-action path (no write-back caches), after
+    /// the order's fills: per trader (ascending), debit its summed fee from
+    /// `available`; a trader left FLAT with negative collateral pays at most
+    /// what it held (the unpaid part is waived, as on the batch path,
+    /// [`Self::waive_unpaid_fees`]) and a deficit still left moves to the
+    /// vault (D9). The paid part goes to the trader's `cfee` row and, summed,
+    /// to the treasury in one write. All straight to the backend.
+    fn charge_order_fees<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        fees: std::collections::BTreeMap<Address, FixedPoint>,
+    ) -> Result<(), CoreError> {
+        let positions = &ctx.positions;
+        let mut total = FixedPoint::ZERO;
+        for (trader, fee) in fees {
+            let mut bal = positions.get_native_balance(&trader)?;
+            bal.available -= fee;
+            let mut paid = fee;
+            let mut deficit = false;
+            if let Some(c) = collateral_of(&bal).filter(|c| *c < FixedPoint::ZERO) {
+                if positions.positions_for_trader(&trader)?.is_empty() {
+                    let unpaid = unpaid_fee(c, fee);
+                    bal.available += unpaid;
+                    paid -= unpaid;
+                    deficit = c + unpaid < FixedPoint::ZERO;
+                }
+            }
+            if paid != FixedPoint::ZERO {
+                positions.put_native_balance(&trader, &bal)?;
+                positions.add_cum_fee(&trader, paid)?;
+                total += paid;
+            }
+            if deficit {
+                let vault = torus_core::liquidation::LIQUIDATOR_VAULT;
+                torus_core::liquidation::settle_flat_deficit(positions, &trader, &vault)?;
+            }
+        }
+        if total != FixedPoint::ZERO {
+            let treasury = ctx.treasury_address;
+            let mut t = positions.get_native_balance(&treasury)?;
+            t.available += total;
+            positions.put_native_balance(&treasury, &t)?;
+        }
+        Ok(())
     }
 
     /// Add `amount` to `trader`'s stored lifetime volume (`cum_volume`).
@@ -13806,11 +13920,18 @@ impl NativeExecutor {
         } else {
             Self::resolve_trade_fees(ctx)
         };
-        let treasury = ctx.treasury_address;
+        // Each fill side's fee, summed per trader, charged once after the
+        // fills (`charge_order_fees`): every side is listed with the feature
+        // on (a zero fee too: its flat check), none with it off.
+        let mut order_fees: std::collections::BTreeMap<Address, FixedPoint> = Default::default();
         for fill in &result.fills {
             let taker_is_buy = fill.maker_side != Side::Buy;
             let notional = fill.price * fill.quantity;
             let (taker_fee, maker_fee) = side_fees(fees, notional);
+            if fees.is_some() {
+                *order_fees.entry(fill.taker).or_insert(FixedPoint::ZERO) += taker_fee;
+                *order_fees.entry(fill.maker).or_insert(FixedPoint::ZERO) += maker_fee;
+            }
             let taker = match ctx
                 .positions
                 .apply_fill(
@@ -13823,7 +13944,6 @@ impl NativeExecutor {
                 )
                 .and_then(|mut effect| {
                     Self::add_cum_volume(&ctx.positions, ctx.typed_rows(), &fill.taker, notional)?;
-                    Self::charge_fee_direct(&ctx.positions, &fill.taker, treasury, taker_fee)?;
                     effect.fee = taker_fee;
                     Ok(effect)
                 }) {
@@ -13855,7 +13975,6 @@ impl NativeExecutor {
                 )
                 .and_then(|mut effect| {
                     Self::add_cum_volume(&ctx.positions, ctx.typed_rows(), &fill.maker, notional)?;
-                    Self::charge_fee_direct(&ctx.positions, &fill.maker, treasury, maker_fee)?;
                     effect.fee = maker_fee;
                     Ok(effect)
                 }) {
@@ -13875,6 +13994,11 @@ impl NativeExecutor {
             };
             if record_fills {
                 ctx.fill_effects_scratch.push([taker, maker]);
+            }
+        }
+        if !order_fees.is_empty() {
+            if let Err(e) = Self::charge_order_fees(ctx, order_fees) {
+                Self::latch_core_fault(ctx, "place order trading fees", &e);
             }
         }
 
@@ -15707,6 +15831,10 @@ impl NativeExecutor {
             }
         };
 
+        // Trading fees: governance takes the fee keys only while the block
+        // runs the feature (off: refused exactly as before; Codex s138 #1).
+        let fee_keys = ctx.feature_active(torus_types::Feature::TradingFees);
+        ctx.governance.set_fee_keys(fee_keys);
         match ctx.governance.submit_proposal(
             *sender,
             proposal.title.clone(),
@@ -16244,6 +16372,8 @@ impl NativeExecutor {
         ctx: &mut NativeExecContext<T>,
     ) -> Vec<NativeActionResult> {
         use torus_economics::governance::ProposalOutcome;
+        let fee_keys = ctx.feature_active(torus_types::Feature::TradingFees);
+        ctx.governance.set_fee_keys(fee_keys);
         match ctx.governance.process_pending_proposals(ctx.block_height) {
             Ok(outcomes) => {
                 // Pre-testnet P1: the live-state side of executed market

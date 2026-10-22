@@ -71,7 +71,20 @@ state (and the running state hash) is byte-identical to today. Pinned by
 ## Taker (or maker) without margin for the fee
 
 The fee is charged anyway. `available` may go below zero, exactly as a realized loss
-already can; account health (and liquidation / the vault backstop) handles it. No fee
+already can; account health (and liquidation / the vault backstop) handles it while
+the trader holds a position. **A trader left flat** (no position) with negative
+collateral (`available + order_margin`) is never visited by a liquidation scan, so
+it is reconciled at once (Codex s138 #2): it pays at most what it held, the unpaid
+part of its fees (`min(-collateral, fee)`) is waived (not debited, not in its
+`cfee` row, not credited to the treasury: the treasury never keeps a credit nobody
+paid), and a deficit still left (a realized loss) moves to the liquidator vault
+through D9 `settle_flat_deficit`, as every flat deficit does. Batch path: once per
+`execute_batch` call after the position flush, over the call's traders whose cached
+balance is negative (only those cost a position read), ascending; single path: per
+order after its fills. Chosen over capping each closing fill's fee at
+`available + pnl`: that makes the fee depend on the balance at the fill, which C3
+pass A plans without, and a capped fee still leaves the realized-loss deficit on a
+flat account. The `userFills` row shows the fee as charged on the fill. No fee
 is reserved at placement in v1 (the A5 telescoping reservation stays as is) and the F1
 match-time margin check does not include the fee: at <= 1 % of notional against an IM
 of >= 2 % this is a small overshoot. Owner option: add the taker fee to the placement
@@ -122,7 +135,17 @@ seeding the two rows is additive.
 
 - `torus_getUserFees(trader)`: `{takerFeePpm, makerFeePpm, cumFees}` (rates in force,
   lifetime net fees from the `cfee` row).
-- `userFills` stream rows get `fee` (the user's fee on that fill, signed decimal).
+- `userFills` stream rows get `fee` (the user's fee on that fill, signed decimal) for
+  blocks that ran the feature; before activation the field is absent (the row is
+  the pre-feature row), and a row without it deserializes (`fee: None`).
+
+## Governance keys and the bit
+
+The two fee keys are accepted only while the executed block runs `trading_fees`
+(`GovernanceManager::set_fee_keys`, set by the executor from the header bits before
+submitting and before executing proposals, like the funding keys). Bit off: refused
+as `ParameterNotModifiable`, exactly as before the feature, at submission and at
+execution (Codex s138 #1).
 - Trade-history rows (`CF_NATIVE_TRADES` / `CF_NATIVE_USER_TRADES`, node-local) do not
   carry the fee in v1 (a row-version bump; follow-up).
 
@@ -134,6 +157,22 @@ treasury, `cfee`), conservation, rebate, close + fee in one event, bit off ident
 no rate rows, activation boundary at H (blocks < H charge nothing), state identical
 across serial / engine / C3 parallel / streamed, triggered-stop (single path) fee.
 Governance: the two keys validate and stage to their own rows.
+
+## Decisions (owner s138)
+
+- **(a) Fee not reserved at placement**: kept as built. Revisit; possible upgrade to
+  reserving the worst-case fee in the order's margin hold.
+- **(b) Rate structure**: kept as built, one global taker / maker pair. Revisit
+  pre-testnet or during testnet: implement per-market rates or Hyperliquid-style
+  per-user tiers (14-day volume tiers, staking discounts, maker rebates); the owner
+  leans to per-user tiers. Needs a design that keeps per-fill volume tracking off
+  the hot path and avoids a daily O(users) tier recompute spike.
+- **(c) Liquidation fills**: as built (book fills pay fees; backstop / ADL / delist
+  exempt).
+- **(d) Destination**: PENDING owner. Likely a split burn / validators / treasury
+  (no dev share), paid once per block. Not built yet: today the treasury's native
+  balance is credited once per `execute_batch` call (sum of the call) and once per
+  order on the single path.
 
 ## Expected conflicts
 

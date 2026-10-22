@@ -76,6 +76,9 @@ pub struct FillExtras {
 pub struct BlockFills {
     pub height: u64,
     pub timestamp: u64,
+    /// The block ran the `trading_fees` feature: `userFills` rows carry the
+    /// fee (before activation they are the pre-feature rows).
+    pub trading_fees: bool,
     pub fills: Vec<TradeFill>,
     /// Either empty (no stream subscriber when the block executed) or exactly
     /// `fills.len()` long, `extras[i]` belonging to `fills[i]`.

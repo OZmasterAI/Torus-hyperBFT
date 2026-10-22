@@ -6349,6 +6349,7 @@ impl ExecutionContext {
             // O3: this block's fills (their rows go to the background writer
             // AFTER the flush / hand-off below, never before).
             let (fills_block, fills_ts) = (ctx.block_height, ctx.timestamp);
+            let fills_fees = ctx.feature_active(torus_types::Feature::TradingFees);
             // s80: `extras` is empty unless a stream wanted this block's fills.
             let (fills, extras) = ctx.take_pending_fills_and_extras();
             // Item 6 C2: this block's mark table / configs ride the block's
@@ -6661,6 +6662,7 @@ impl ExecutionContext {
                 let block = Arc::new(torus_state::trade_rows::BlockFills {
                     height: fills_block,
                     timestamp: fills_ts,
+                    trading_fees: fills_fees,
                     fills,
                     extras,
                 });

@@ -282,7 +282,7 @@ fn user_fill(
         order_id: hex_u128(order_id),
         start_position: dec_fp(FixedPoint::from_raw(start_raw)),
         closed_pnl: dec_fp(FixedPoint::from_raw(pnl_raw)),
-        fee: dec_fp(FixedPoint::from_raw(fee_raw)),
+        fee: block.trading_fees.then(|| dec_fp(FixedPoint::from_raw(fee_raw))),
         dir: fill_dir(start_raw, bought, f.qty_raw).to_string(),
         block_number: hex_u64(block.height),
         timestamp: hex_u64(block.timestamp),
@@ -317,6 +317,7 @@ mod tests {
         BlockFills {
             height: 7,
             timestamp: 1_700_000_007,
+            trading_fees: true,
             fills: vec![
                 fill(0, 1, A, B, 100 * S, 25 * S / 10, 0),
                 fill(1, 2, C, A, 50 * S, S, 1),
@@ -499,6 +500,32 @@ mod tests {
             ("0x42", "1.50000000")
         );
         assert_eq!(t.dir, "Open Long");
+    }
+
+    /// Codex s138 #3: before `trading_fees` is active the row is exactly the
+    /// pre-feature row (no `fee` key), and a pre-feature row still
+    /// deserializes (`fee` absent = `None`).
+    #[test]
+    fn streams_fills_for_user_omits_fee_before_activation_and_reads_legacy_rows() {
+        let mut pre = block();
+        pre.trading_fees = false;
+        let legacy = json!({
+            "tradeId": "0x0", "marketId": "0x1", "side": "buy",
+            "price": "100.00000000", "quantity": "2.50000000",
+            "role": "taker", "orderId": "0x16",
+            "startPosition": "0.00000000", "closedPnl": "0.00000000",
+            "dir": "Open Long", "blockNumber": "0x7", "timestamp": "0x6553f107",
+        });
+        let rows = fills_for_user(&pre, B);
+        assert_eq!(to_json(&rows)[0], legacy);
+        for r in &rows {
+            assert_eq!(r.fee, None);
+        }
+        let back: RpcUserFill = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.fee, None);
+        let on = to_json(&fills_for_user(&block(), B));
+        let round: RpcUserFill = serde_json::from_value(on[0].clone()).unwrap();
+        assert_eq!(round.fee.as_deref(), Some("0.11250000"));
     }
 
     #[test]
@@ -786,6 +813,7 @@ mod subscribe_ws_tests {
         BlockFills {
             height: 8,
             timestamp: 1_700_000_008,
+            trading_fees: true,
             fills: vec![f],
             extras: vec![b7.extras[1]],
         }
