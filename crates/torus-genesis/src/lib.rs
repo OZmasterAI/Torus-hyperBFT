@@ -1567,8 +1567,42 @@ mod tests {
         let genesis = Genesis::from_json(&json.to_string()).unwrap();
         assert_eq!(genesis.chain_config().chain_id, torus_types::eip712::TORUS_CHAIN_ID);
         json["chain_id"] = 7779.into();
+        json["evm"]["chain_id"] = 7779.into();
         let genesis = Genesis::from_json(&json.to_string()).unwrap();
         assert_eq!(genesis.chain_config().chain_id, 7779);
+    }
+
+    /// s138 audit: the top-level `chain_id` drives the node, but EVM signers
+    /// (tools/matched-bench/run-cell.sh) read `evm.chain_id`; a genesis whose
+    /// two ids differ is refused at load, naming both values.
+    #[test]
+    fn genesis_refuses_evm_chain_id_mismatch() {
+        let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        json["chain_id"] = 7779.into();
+        json["evm"]["chain_id"] = 7778.into();
+        let err = Genesis::from_json(&json.to_string()).unwrap_err();
+        assert!(matches!(err, GenesisError::InvalidEvm(_)), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("evm.chain_id") && msg.contains("7778"), "{msg}");
+        assert!(msg.contains("7779"), "{msg}");
+        // A genesis without top-level chain_id means devnet 7778.
+        json.as_object_mut().unwrap().remove("chain_id");
+        json["evm"]["chain_id"] = 1.into();
+        let err = Genesis::from_json(&json.to_string()).unwrap_err();
+        assert!(matches!(err, GenesisError::InvalidEvm(_)), "{err}");
+    }
+
+    #[test]
+    fn genesis_accepts_matching_evm_chain_id() {
+        let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        json["chain_id"] = 7780.into();
+        json["evm"]["chain_id"] = 7780.into();
+        let genesis = Genesis::from_json(&json.to_string()).unwrap();
+        assert_eq!(genesis.chain_id, 7780);
+        assert_eq!(genesis.evm.chain_id, 7780);
+        json.as_object_mut().unwrap().remove("chain_id");
+        json["evm"]["chain_id"] = torus_types::eip712::TORUS_CHAIN_ID.into();
+        Genesis::from_json(&json.to_string()).unwrap();
     }
 
     /// Row 80 option D (s100): fees are split by the built-in constants
