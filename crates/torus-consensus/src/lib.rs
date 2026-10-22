@@ -15,6 +15,7 @@ pub mod exec_pipeline;
 pub mod genesis;
 pub mod kv_store;
 pub mod network;
+pub mod plan_handoff;
 pub mod shard_recovery;
 pub mod slashing;
 pub mod state_hash;

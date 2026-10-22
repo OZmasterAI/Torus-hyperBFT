@@ -1844,6 +1844,11 @@ struct ExecutionContext {
     /// State, roots and the running hash are identical; only timing changes.
     /// No effect without W.
     epoch_fast_path: bool,
+    /// s80 epoch-plan-logical-ready (`TORUS_S80_PLAN_LOGICAL=1`, node-local,
+    /// default off, read once at construction): shared with the app. A
+    /// pipelined boundary publishes the plan it wrote, then each hand-off
+    /// publishes the logical height (`exec_applied`). `None` = today.
+    plan_handoff: Option<Arc<crate::plan_handoff::PlanHandoff>>,
     /// Item 7 option 0 (task 3.1): the EVM fast path
     /// (`TORUS_EVM_FAST_PATH`, node-local, default on since s131, read once
     /// at construction; see `exec_pipeline::evm_fast_path_enabled`). With it
@@ -3561,6 +3566,11 @@ impl ExecutionContext {
             m.publish_read_view(None);
         }
         self.exec_applied.store(applied, Ordering::SeqCst);
+        // s80 plan hand-off: a fresh W starts at the durable marker; the map
+        // is empty after a restart, so consensus reads the DB as today.
+        if let Some(h) = &self.plan_handoff {
+            h.set_logical(applied);
+        }
         *self.last_job.lock().unwrap() = None;
         self.last_job_books_deferred.store(false, Ordering::SeqCst);
         tracing::info!(
@@ -3700,6 +3710,11 @@ impl ExecutionContext {
             return true;
         };
         self.exec_applied.store(height, Ordering::SeqCst);
+        // s80 plan hand-off: the logical height, after any plan this block
+        // wrote was published (`publish_plan` runs before the hand-off).
+        if let Some(h) = &self.plan_handoff {
+            h.set_logical(height);
+        }
         *self.last_job.lock().unwrap() = Some(pending);
         if self.checkpoint.is_some() {
             // b1: the open window has deferred books until a barrier (a
@@ -5914,6 +5929,33 @@ impl ExecutionContext {
             ctx.stash_resident(&mut resident_books);
             drop(resident_books);
 
+            // s80 epoch-plan-logical-ready (`TORUS_S80_PLAN_LOGICAL`): a
+            // boundary wrote the plan for `height + L` into this block's
+            // overlay (every fatal-error check of the block is behind us);
+            // read it back for the consensus hand-off. A read error only
+            // loses the shortcut: consensus keeps the durable rule.
+            let plan_publish = match &self.plan_handoff {
+                Some(_) if EpochManager::is_epoch_boundary(height, self.epoch_length) => {
+                    let boundary = height.saturating_add(self.epoch_length);
+                    match StateBackend::get_cf_raw(
+                        &overlay,
+                        CF_CONSENSUS_META,
+                        &torus_economics::epoch_plan_key(boundary),
+                    ) {
+                        Ok(bytes) => bytes.map(|b| (boundary, b)),
+                        Err(e) => {
+                            tracing::warn!(
+                                %e,
+                                height,
+                                "s80 plan hand-off: plan read failed — consensus keeps the durable rule"
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+
             let flush_timer = std::time::Instant::now();
             for (sender, nonce) in &consumed_nonces {
                 let nonce_key = torus_state::cf::native_nonce_key(sender, *nonce);
@@ -6040,6 +6082,16 @@ impl ExecutionContext {
                     resident_delta =
                         torus_bridge::native_executor::BlockDelta::Frozen(frozen.clone());
                 }
+                // s80 plan hand-off: the plan goes in BEFORE the hand-off
+                // publishes this height (consensus reads the height, then
+                // the map); a failed hand-off takes it back out.
+                let published = match (&self.plan_handoff, plan_publish) {
+                    (Some(h), Some((boundary, bytes))) => {
+                        h.publish_plan(height, self.epoch_length, boundary, bytes);
+                        Some(boundary)
+                    }
+                    _ => None,
+                };
                 if !self.pipeline_handoff(crate::exec_pipeline::Job::Flush {
                     height,
                     pending: frozen,
@@ -6053,6 +6105,9 @@ impl ExecutionContext {
                     // Digest into the window). `None` for a native block.
                     evm: evm_job.take(),
                 }) {
+                    if let (Some(h), Some(boundary)) = (&self.plan_handoff, published) {
+                        h.retract_plan(boundary);
+                    }
                     return;
                 }
                 // 8k L3.1: this block's skipped books join the window's debt
@@ -6210,6 +6265,11 @@ impl ExecutionContext {
             {
                 self.test_path("serial.flush");
                 self.test_complete(crate::exec_pipeline::CompleteSite::ESerialFlush, height);
+            }
+            // s80 plan hand-off: a serial boundary's plan is durable now;
+            // the map mirrors the DB rows (and prunes as the DB did).
+            if let (Some(h), Some((boundary, bytes))) = (&self.plan_handoff, plan_publish) {
+                h.publish_plan(height, self.epoch_length, boundary, bytes);
             }
             } // end serial flush
 
@@ -6776,6 +6836,11 @@ pub struct TorusApp {
     epoch_length: u64,
     last_validator_set: ValidatorSet,
     cached_vs_updates: Option<(u64, Option<ValidatorSetUpdates>)>,
+    /// s80 epoch-plan-logical-ready (`TORUS_S80_PLAN_LOGICAL=1`): the
+    /// execution context's plan hand-off; boundary readiness is then
+    /// `max(durable, logical)` with the plan read from it first
+    /// ([`Self::epoch_plan`]). `None` = today (durable marker + DB).
+    plan_handoff: Option<Arc<crate::plan_handoff::PlanHandoff>>,
     /// Tests: the local clock (UNIX s) the pre-vote timestamp check reads.
     #[cfg(test)]
     test_now_secs: Option<u64>,
@@ -7713,6 +7778,12 @@ impl TorusApp {
         // T5.3: header-persisted hook slot (see `set_header_persisted_hook`).
         let header_hook: HeaderHookSlot = Default::default();
         let state_hash = Arc::new(crate::state_hash::StateHashMonitor::new());
+        // s80 epoch-plan-logical-ready: the plan hand-off shared with the
+        // exec thread (`TORUS_S80_PLAN_LOGICAL=1`; off = `None`, today).
+        let plan_logical = crate::plan_handoff::plan_logical_enabled();
+        tracing::info!(on = plan_logical, "TORUS_S80_PLAN_LOGICAL");
+        let plan_handoff =
+            plan_logical.then(|| Arc::new(crate::plan_handoff::PlanHandoff::default()));
 
         // Execution pipeline context — owns its own copies for thread safety.
         let mut exec_validator = BlockValidator::new(
@@ -7829,6 +7900,7 @@ impl TorusApp {
             test_window_evm: Default::default(),
             liq_value_sum: liq_value_sum_enabled(),
             epoch_fast_path: crate::exec_pipeline::epoch_fast_path_enabled(),
+            plan_handoff: plan_handoff.clone(),
             evm_fast_path: crate::exec_pipeline::evm_fast_path_enabled(),
             last_block_end: Default::default(),
         };
@@ -8061,6 +8133,7 @@ impl TorusApp {
             epoch_length: config.epoch_length,
             last_validator_set: genesis_validator_set,
             cached_vs_updates: None,
+            plan_handoff,
             #[cfg(test)]
             test_now_secs: None,
             #[cfg(test)]
@@ -9117,7 +9190,46 @@ impl TorusApp {
             }
         };
         let needed = height.saturating_sub(self.epoch_length);
-        if applied < needed {
+        // s80 epoch-plan-logical-ready (`TORUS_S80_PLAN_LOGICAL=1`): ready
+        // once execution LOGICALLY applied `needed` (max with the durable
+        // marker); the plan it published first, the DB only when durable.
+        // A logical-only readiness without the plan in memory is NOT ready
+        // (never "no change", bug-b2 class).
+        if let Some(handoff) = &self.plan_handoff {
+            match handoff.source(height, needed, applied) {
+                crate::plan_handoff::PlanSource::Memory(bytes) => {
+                    return torus_economics::decode_epoch_rotation_plan(&bytes)
+                        .map(Some)
+                        .map_err(|e| {
+                            tracing::error!(%e, height, "failed to decode the handed-off epoch plan");
+                            EpochPlanNotReady
+                        });
+                }
+                crate::plan_handoff::PlanSource::Db => {}
+                crate::plan_handoff::PlanSource::NotReady { logical } if logical < needed => {
+                    tracing::warn!(
+                        height,
+                        applied,
+                        logical,
+                        needed,
+                        "epoch boundary: execution has not applied the previous boundary yet — \
+                         validator-set plan not ready, refusing this boundary block for now"
+                    );
+                    return Err(EpochPlanNotReady);
+                }
+                crate::plan_handoff::PlanSource::NotReady { logical } => {
+                    tracing::warn!(
+                        height,
+                        applied,
+                        logical,
+                        needed,
+                        "epoch boundary: execution applied the previous boundary but its plan is \
+                         not in the hand-off and not durable yet — refusing this boundary block for now"
+                    );
+                    return Err(EpochPlanNotReady);
+                }
+            }
+        } else if applied < needed {
             tracing::warn!(
                 height,
                 applied,
@@ -10480,10 +10592,32 @@ impl TorusApp {
             return;
         }
         let needed = boundary.saturating_sub(self.epoch_length);
-        if !matches!(self.applied_height(), Ok(applied) if applied.unwrap_or(0) >= needed) {
+        let Ok(applied) = self.applied_height() else {
             return;
-        }
-        if let Ok(plan) = self.staking.epoch_rotation_plan(boundary) {
+        };
+        let applied = applied.unwrap_or(0);
+        // s80 plan hand-off: as `epoch_plan` (memory first, the DB only once
+        // durable; not ready = keep predicting from the committed values).
+        let plan = match self
+            .plan_handoff
+            .as_ref()
+            .map(|h| h.source(boundary, needed, applied))
+        {
+            Some(crate::plan_handoff::PlanSource::Memory(bytes)) => {
+                match torus_economics::decode_epoch_rotation_plan(&bytes) {
+                    Ok(plan) => Ok(Some(plan)),
+                    Err(_) => return,
+                }
+            }
+            Some(crate::plan_handoff::PlanSource::NotReady { .. }) => return,
+            Some(crate::plan_handoff::PlanSource::Db) | None => {
+                if applied < needed {
+                    return;
+                }
+                self.staking.epoch_rotation_plan(boundary)
+            }
+        };
+        if let Ok(plan) = plan {
             let v = plan.map(|p| p.evm).unwrap_or_default().resolve(header);
             self.leader_state
                 .set_upcoming(boundary, v.block_interval, v.big_block_interval);
@@ -17092,6 +17226,8 @@ mod crash_recovery_tests {
             liq_value_sum: liq_value_sum_enabled(),
             // s124: the epoch fast path is off unless a test sets it.
             epoch_fast_path: false,
+            // s80: no plan hand-off unless a test sets it.
+            plan_handoff: None,
             // Item 7 option 0: off unless a test sets it.
             evm_fast_path: false,
             last_block_end: Default::default(),
@@ -42876,6 +43012,20 @@ mod crash_recovery_tests {
         evm_at: Option<u64>,
         slash_at: Option<u64>,
     ) -> FastPathRun {
+        fast_path_run_plan(on, fast, evm_fast, policy, evm_at, slash_at, None)
+    }
+
+    /// [`fast_path_run_evm`] with the s80 plan hand-off
+    /// (`TORUS_S80_PLAN_LOGICAL`) = `plan` on the context.
+    fn fast_path_run_plan(
+        on: bool,
+        fast: bool,
+        evm_fast: bool,
+        policy: Option<crate::exec_pipeline::CheckpointPolicy>,
+        evm_at: Option<u64>,
+        slash_at: Option<u64>,
+        plan: Option<Arc<crate::plan_handoff::PlanHandoff>>,
+    ) -> FastPathRun {
         torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         let key = k256::ecdsa::SigningKey::from_slice(&[61u8; 32]).unwrap();
         let validator = Address::repeat_byte(0x77);
@@ -42916,6 +43066,7 @@ mod crash_recovery_tests {
         ctx.checkpoint = policy;
         ctx.epoch_fast_path = fast;
         ctx.evm_fast_path = evm_fast;
+        ctx.plan_handoff = plan;
         if on {
             ctx.attach_flush_worker(None);
         }
@@ -43059,6 +43210,180 @@ mod crash_recovery_tests {
             "boundary 4 checkpointed at its own height"
         );
         drop(ctx);
+    }
+
+    // ---- s80 epoch-plan-logical-ready (TORUS_S80_PLAN_LOGICAL) ----
+
+    /// s80 plan hand-off (a), (b), (c) and the bug-b2 guard. Epoch length 4,
+    /// W attached, checkpoints never by time, the epoch fast path on. W is
+    /// parked on boundary 4's own checkpoint, so execution has LOGICALLY
+    /// applied 4 while the durable marker is still below it (the 9j2 deep
+    /// refusal: applied=1100 needed=1200 with execution at 1242).
+    /// - (b) before block 4: neither ready -> Err.
+    /// - Flag off (no hand-off): today's refusal, the leader proposes nothing.
+    /// - Logically ready, no plan in memory, durable behind -> Err, never
+    ///   `Ok(None)` ("no change").
+    /// - (a) flag on: the plan from memory, the leader proposes block 8; once
+    ///   the checkpoint lands the DB row has the same bytes.
+    /// - (c) a restart (empty hand-off) reads the DB as today.
+    #[test]
+    fn s80_plan_logical_durable_lags_map_hit_equals_db_plan() {
+        use crate::plan_handoff::PlanHandoff;
+        let (mut app, db, config) = epoch4_app(1_010);
+        let gate = crate::exec_pipeline::WorkerGate::new();
+        let handoff = Arc::new(PlanHandoff::default());
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.checkpoint = Some(ckpt_never());
+        ctx.epoch_fast_path = true;
+        ctx.plan_handoff = Some(handoff.clone());
+        ctx.attach_flush_worker(Some(gate.clone()));
+        let mut blocks: Vec<TorusBlock> = (1..=7).map(|h| make_block(h, vec![])).collect();
+        link_blocks(&mut blocks);
+        for b in &blocks[..3] {
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        }
+        app.plan_handoff = Some(handoff.clone());
+        assert_eq!(handoff.logical(), 3);
+        assert_eq!(
+            app.epoch_plan(8),
+            Err(EpochPlanNotReady),
+            "(b) neither ready"
+        );
+
+        gate.hold_checkpoints();
+        dispatch_and_execute(&ctx, &db, &blocks[3]);
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        o0_wait("checkpoint 4 parked", || {
+            gate.parked_checkpoint() == Some(4)
+        });
+        assert!(
+            read_native_applied_height(&db).unwrap_or(0) < 4,
+            "boundary 4 is not durable"
+        );
+        assert_eq!(handoff.logical(), 4, "execution handed 4 to W");
+        assert_eq!(
+            handoff.boundaries(),
+            vec![8],
+            "boundary 4 published plan(8)"
+        );
+
+        // Flag off: today's refusal.
+        app.plan_handoff = None;
+        assert_eq!(app.epoch_plan(8), Err(EpochPlanNotReady), "flag off");
+        assert!(app.epoch_validator_set_updates(8).is_err(), "flag off");
+        assert!(
+            app.build_proposal(blocks[6].header.clone())
+                .data
+                .vec()
+                .is_empty(),
+            "flag off: the leader refuses block 8"
+        );
+
+        // Logically ready, no plan in memory, durable behind: Err.
+        let miss = Arc::new(PlanHandoff::default());
+        miss.set_logical(4);
+        app.plan_handoff = Some(miss);
+        assert_eq!(
+            app.epoch_plan(8),
+            Err(EpochPlanNotReady),
+            "map miss: never no change"
+        );
+        assert_eq!(app.boundary_evm(8), Err(EpochPlanNotReady));
+
+        // (a) flag on: from memory.
+        app.plan_handoff = Some(handoff.clone());
+        let mem = app
+            .epoch_plan(8)
+            .expect("flag on: ready from memory")
+            .expect("boundary 4 wrote a plan for 8");
+        assert_eq!(mem.boundary, 8);
+        assert!(app.boundary_evm(8).is_ok());
+        assert!(app.epoch_validator_set_updates(8).is_ok());
+        let _ = app.build_proposal(blocks[6].header.clone());
+        assert!(
+            app.pending_proposals.contains_key(&8),
+            "flag on: the leader proposes block 8"
+        );
+        let mem_bytes = handoff.plan(8).unwrap();
+
+        // The checkpoint lands: the DB row has the same bytes.
+        gate.release();
+        assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+        assert_eq!(read_native_applied_height(&db), Some(4));
+        let db_bytes = db
+            .get_cf_raw(CF_CONSENSUS_META, &torus_economics::epoch_plan_key(8))
+            .unwrap()
+            .expect("the plan row for 8 is durable");
+        assert_eq!(mem_bytes, db_bytes, "the hand-off bytes are the row's");
+        assert_eq!(
+            StakingManager::new(db.clone())
+                .epoch_rotation_plan(8)
+                .unwrap(),
+            Some(mem.clone())
+        );
+        drop(ctx);
+
+        // (c) restart: an empty hand-off reads the DB.
+        let mut fresh = TorusApp::new(db.clone(), &config, None, None, None);
+        fresh.plan_handoff = Some(Arc::new(PlanHandoff::default()));
+        assert_eq!(fresh.epoch_plan(8), Ok(Some(mem)), "(c) restart: DB path");
+    }
+
+    /// s80 plan hand-off: it only reads the plan back. Flag on equals flag
+    /// off (both with the epoch fast path) in every block's consensus write
+    /// set, the running hash, the native root, every CF and the durable
+    /// marker after each block, per block, with checkpoints never by time
+    /// and every 5 blocks. At the end the hand-off holds exactly the DB's
+    /// plan rows (12, 16; 8 pruned at 12 in both) with the same bytes, and
+    /// the logical height is the last block. With a serial EVM boundary 8
+    /// and a serial slash boundary 12 the map still mirrors the DB rows.
+    #[test]
+    fn s80_plan_logical_on_matches_off_and_mirrors_the_db_rows() {
+        let check = |what: &str, h: &crate::plan_handoff::PlanHandoff, run: &FastPathRun| {
+            assert_eq!(h.boundaries(), vec![12, 16], "{what}: plans held");
+            for b in [8u64, 12, 16] {
+                assert_eq!(
+                    h.plan(b),
+                    run.db
+                        .get_cf_raw(CF_CONSENSUS_META, &torus_economics::epoch_plan_key(b))
+                        .unwrap(),
+                    "{what}: plan({b}) bytes = DB row"
+                );
+            }
+        };
+        for (what, policy) in [
+            ("per-block", None),
+            ("never", Some(ckpt_never())),
+            ("every 5", Some(ckpt_every(5))),
+        ] {
+            let off = fast_path_run(true, true, policy, None, None);
+            let h = Arc::new(crate::plan_handoff::PlanHandoff::default());
+            let on = fast_path_run_plan(true, true, false, policy, None, None, Some(h.clone()));
+            assert_eq!(on.pipelined, off.pipelined, "{what}: same paths");
+            assert_fast_path_runs_equal(&off, &on, &format!("{what}: plan hand-off on vs off"));
+            assert_eq!(on.markers, off.markers, "{what}: durable markers");
+            assert_eq!(h.logical(), 13, "{what}: logical height");
+            check(what, &h, &on);
+
+            let off = fast_path_run(true, true, policy, Some(8), Some(12));
+            let h = Arc::new(crate::plan_handoff::PlanHandoff::default());
+            let on = fast_path_run_plan(
+                true,
+                true,
+                false,
+                policy,
+                Some(8),
+                Some(12),
+                Some(h.clone()),
+            );
+            assert_fast_path_runs_equal(
+                &off,
+                &on,
+                &format!("{what}: plan hand-off on vs off, serial boundaries"),
+            );
+            check(&format!("{what}, serial boundaries"), &h, &on);
+        }
     }
 
     /// s124 epoch fast path (d): with the flag on, a boundary block with an
