@@ -1067,6 +1067,29 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
      row is the cost of hash on + attestation + L6.1 + L2.1. matched/s is not resolved (1.022 / 1.001).
    * R vs section 120 A (cross-campaign): matched/s -1.7% / -3.0% and exec CPU per fill +5.3% / +8.7%. The binary,
      not the hash, carries most of section 123's gap to section 120.
+9k. **[HOLD, owner s136: queued, NOT ready; do not start until the owner says go] One-validator-down baseline on
+   main (before TC-required and dead-leader skip land).** The "before" numbers for 9o (TC phase D) and 9p
+   (dead-leader phase 4). Prepared by archy s136 (kill knob `cee86e4b` / `87e91dfd`, procstat fix `6f228433`, digest
+   wait `9ea22dbd` + counter validation). Main WITHOUT the TC set (or TC off if it has landed; say which), feed off,
+   `VALIDATOR_STAKES=2,2,1`, `KILL_NO_RESTART=val2` (the stake-1 node), `KILL_NO_RESTART_AT_S=120`, `BENCH_RPCS=0,1`,
+   600 s cells, plus the all-up arm; standard + deep shapes, per shape U K K U K U U K (U = all up, K = kill). Check
+   every restart path passes `--genesis` (P0.0 refuses a genesis-bound dir without it) and that hash-off arms set
+   `STATE_HASH_ACTIVATION=off` explicitly. Report per window (pre-kill / post-kill): blocks/s, matched/s, timeout
+   views per minute, p50 / p99 commit latency, plus the end-of-load cancel-all tail (archy s136 open question).
+   ~2-2.5 h (estimate). Doc target: the next results-doc section.
+9o. **[HOLD, owner s136] TC-required phase D: one-down bench, main vs main + TC set.** After the TC set lands (batch 9
+   + `fix/tc-liveness`) and after 9k. Same cells as 9k on both binaries, 3 runs each (design
+   `docs/plans/tc-required-and-tip-signing.md` section 7): all-up and one-down (stake 2/2/1, stake-1 node killed, no
+   restart). Report blocks/s, matched/s, timeout views per minute, TC wait (enter_view -> propose), p50 / p99 commit
+   latency. Pass: all-up within noise; one-down blocks/s within -5%. Optional: WAN netem cell at 227 / 502 ms (trial
+   net instead, owner s136). ~2 h (estimate).
+9p. **[HOLD, owner s136] Dead-leader skip (b1) phase 4: before / after.** After dead-leader phases 1-3 land (rebased on
+   the TC set) and after 9k. Design `docs/plans/dead-leader-skip.md` section 5: before = 9k's cells; after = the same
+   cells on the branch, ABBA, 3 runs each; `VALIDATOR_STAKES=2,2,1`, `KILL_NO_RESTART=val2`,
+   `KILL_NO_RESTART_AT_S=120`, `BENCH_RPCS=0,1`, feed off, 600 s, plus all-up. Report three windows (pre-kill / kill
+   to exclusion update / post-exclusion): blocks/s, matched/s, timeout views per minute, p50 / p99 order latency,
+   kill-to-exclusion time (s and heights). Pass: post-exclusion blocks/s >= 90% of all-up; all-up within noise; no
+   new stalls. Note: at 2/2/1 a dead stake-1 node is excludable (eligible 4 of 5 >= quorum 4). ~2 h of cells (estimate).
 9l. **[HOLD, owner s136: queued, NOT ready; do not start until the owner says go] Binary gap: `53a6d83c` vs
    `29bfc705`, hash-off Classic.** Section 124 found R (hash off, `29bfc705`) below section 120's A (hash off,
    `53a6d83c`) across campaigns: matched/s 0.983 / 0.970 (deep / standard), exec-thread on-CPU per 1k fills 1.053 /
