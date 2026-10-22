@@ -22637,6 +22637,7 @@ mod crash_recovery_tests {
                     (6, vec![S::Filled, S::Filled]),
                     (10, vec![S::Open]),
                     (11, vec![S::Filled, S::Filled]),
+                    (13, vec![S::Open]),
                 ],
                 "pipeline on={on}"
             );

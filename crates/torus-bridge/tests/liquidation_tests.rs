@@ -415,6 +415,82 @@ fn cancels_resting_orders_and_pending_stops_with_their_reservations() {
     assert_eq!(pos(&ctx, &t, 1), FixedPoint::ZERO);
 }
 
+/// s139: with an `orderUpdates` subscriber, the liquidation's cancels are
+/// logged with reason `liquidation` (the resting order and the stop).
+#[test]
+fn liquidation_cancels_are_logged_as_liquidation() {
+    use torus_state::order_events::{OrderEventReason as R, OrderEventStatus as S};
+    let (_d, db) = liq_db(&[1]);
+    let mut ctx = ctx_at(db, 1);
+    let (t, s, m) = (addr(1), addr(2), addr(3));
+    fund(&ctx, &t, fp(300));
+    fund(&ctx, &s, fp(1_000_000));
+    fund(&ctx, &m, fp(1_000_000));
+    ctx.set_order_events(true);
+    place(&mut ctx, &t, limit(1, true, 900, 1));
+    place(&mut ctx, &t, stop_market(1, true, 1_100, 1_200, 1, false));
+    open_pair(&ctx, &t, &s, 1, 10, 1_000);
+    place(&mut ctx, &m, limit(1, true, 985, 10));
+    set_mark(&ctx, 1, fp(990));
+    let placed = ctx.take_order_events();
+    assert_eq!(placed.iter().filter(|e| e.trader == t).count(), 2, "{placed:?}");
+    NativeExecutor::run_liquidations(&mut ctx);
+    let cancels: Vec<_> = ctx
+        .take_order_events()
+        .into_iter()
+        .filter(|e| e.trader == t && e.status == S::Canceled)
+        .map(|e| (e.trigger_price.is_some(), e.reason))
+        .collect();
+    assert_eq!(cancels.len(), 2, "{cancels:?}");
+    assert!(cancels.contains(&(false, R::Liquidation)), "{cancels:?}");
+    assert!(cancels.contains(&(true, R::Liquidation)), "{cancels:?}");
+}
+
+/// s139: a triggered stop refused before the book (a reduce-only stop whose
+/// position closed meanwhile) is logged `triggered`, then `rejected` with
+/// the stop's own id and reason `reduce_only`.
+#[test]
+fn triggered_stop_refused_before_the_book_is_logged_rejected() {
+    use torus_state::action_status::FailureReason;
+    use torus_state::order_events::{OrderEventReason as R, OrderEventStatus as S};
+    let (_d, db) = liq_db(&[1]);
+    let mut ctx = ctx_at(db, 1);
+    let (t, s, m, x, y) = (addr(1), addr(2), addr(3), addr(4), addr(5));
+    for a in [&t, &s, &m, &x, &y] {
+        fund(&ctx, a, fp(1_000_000));
+    }
+    open_pair(&ctx, &t, &s, 1, 10, 1_000);
+    ctx.set_order_events(true);
+    // t: reduce-only stop sell 10, trigger 950.
+    place(&mut ctx, &t, stop_market(1, false, 950, 900, 10, true));
+    // t closes its long into m's bid at 1,000.
+    place(&mut ctx, &m, limit(1, true, 1_000, 10));
+    place(&mut ctx, &t, limit(1, false, 1_000, 10));
+    assert_eq!(pos(&ctx, &t, 1), FixedPoint::ZERO);
+    let stop_id = ctx
+        .take_order_events()
+        .iter()
+        .find(|e| e.trader == t && e.status == S::TriggerPending)
+        .and_then(|e| e.order_id)
+        .expect("stop stored");
+    // A trade at 950 fires it; t has nothing left to reduce.
+    place(&mut ctx, &x, limit(1, false, 950, 1));
+    place(&mut ctx, &y, limit(1, true, 950, 1));
+    let t_events: Vec<_> = ctx
+        .take_order_events()
+        .into_iter()
+        .filter(|e| e.trader == t)
+        .map(|e| (e.order_id, e.status, e.reason))
+        .collect();
+    assert_eq!(
+        t_events,
+        vec![
+            (Some(stop_id), S::Triggered, R::None),
+            (Some(stop_id), S::Rejected, R::Reject(FailureReason::ReduceOnly)),
+        ]
+    );
+}
+
 /// Healthy accounts: positions / balances / books unchanged; only the
 /// previous-mark row is written (no cooldown, no cursor).
 #[test]

@@ -289,3 +289,40 @@ fn order_events_never_change_the_book() {
     };
     assert_eq!(run(true), run(false));
 }
+
+/// Cost probe (run by hand: `--ignored --nocapture`): ns per placement of a
+/// crossing flow (every other order fills one maker) with the log off and on,
+/// interleaved rounds, median of each.
+#[test]
+#[ignore]
+fn order_events_cost_ubench() {
+    const N: i64 = 200_000;
+    let flow = |on: bool| {
+        let mut b = OrderBook::new(1, fp(1), fp(1));
+        b.set_order_events(on);
+        let t = std::time::Instant::now();
+        for i in 0..N {
+            let px = 1_000 + (i % 50);
+            if i % 2 == 0 {
+                b.place_order(gtc(false, px, 1), addr(A), 1);
+            } else {
+                b.place_order(gtc(true, px, 1), addr(B), 1);
+            }
+            if i % 1_000 == 999 {
+                std::hint::black_box(b.take_order_events());
+            }
+        }
+        t.elapsed().as_nanos() as f64 / N as f64
+    };
+    let (mut off, mut on) = (Vec::new(), Vec::new());
+    for _ in 0..7 {
+        off.push(flow(false));
+        on.push(flow(true));
+    }
+    off.sort_by(f64::total_cmp);
+    on.sort_by(f64::total_cmp);
+    eprintln!(
+        "order_events_cost_ubench: ns/placement off {:.1} on {:.1} (median of 7, N={N})",
+        off[3], on[3]
+    );
+}

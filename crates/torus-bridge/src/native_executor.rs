@@ -16266,7 +16266,11 @@ impl NativeExecutor {
         match payload {
             Some(ExecutionPayload::MarketDelist { market_id }) => {
                 ctx.delisted_markets.insert(market_id);
-                Self::cancel_market_orders_and_stops(ctx, market_id);
+                Self::cancel_market_orders_and_stops(
+                    ctx,
+                    market_id,
+                    torus_state::order_events::OrderEventReason::Delisted,
+                );
                 Self::schedule_delist_settlement(ctx, market_id);
             }
             Some(ExecutionPayload::MarketParamsUpdate { market_id, .. }) => {
@@ -16294,7 +16298,11 @@ impl NativeExecutor {
                 if config_changed || shape_changed {
                     // Codex P1: released under the old config (still in
                     // `margin_configs`), before anything changes.
-                    Self::cancel_market_orders_and_stops(ctx, market_id);
+                    Self::cancel_market_orders_and_stops(
+                        ctx,
+                        market_id,
+                        torus_state::order_events::OrderEventReason::MarketParams,
+                    );
                 }
                 if let (Some((tick, lot)), Some(book)) =
                     (shape, ctx.order_books.get_mut(&market_id))
@@ -16325,9 +16333,12 @@ impl NativeExecutor {
     /// `market_id`'s book, trader by trader in ascending address order, each
     /// trader's reservation released at the market's CURRENT margin config
     /// (the user cancel-all path). No book: nothing to do.
+    ///
+    /// s139: `cause` is the reason the `orderUpdates` stream gets.
     fn cancel_market_orders_and_stops<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
         market_id: MarketId,
+        cause: torus_state::order_events::OrderEventReason,
     ) {
         let Some(book) = ctx.order_books.get(&market_id) else {
             return;
@@ -16335,11 +16346,7 @@ impl NativeExecutor {
         let mut traders: Vec<Address> = book.traders_present().copied().collect();
         traders.sort_unstable();
         traders.dedup();
-        // s139: logged as delist cancels.
-        let prev = std::mem::replace(
-            &mut ctx.cancel_cause,
-            torus_state::order_events::OrderEventReason::Delisted,
-        );
+        let prev = std::mem::replace(&mut ctx.cancel_cause, cause);
         for trader in traders {
             let total = Self::cancel_orders_and_stops(ctx, &trader, Some(market_id));
             Self::release_order_margin(ctx, &trader, total);

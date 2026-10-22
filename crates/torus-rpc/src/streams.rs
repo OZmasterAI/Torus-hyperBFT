@@ -137,6 +137,7 @@ fn order_update(block: &BlockOrderEvents, e: &OrderEvent) -> RpcOrderUpdate {
         R::Margin => Some("margin"),
         R::Liquidation => Some("liquidation"),
         R::Delisted => Some("delisted"),
+        R::MarketParams => Some("market_params"),
         R::Unfilled => Some("unfilled"),
         R::Reject(f) => Some(f.as_str()),
     };

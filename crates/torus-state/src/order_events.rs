@@ -51,8 +51,11 @@ pub enum OrderEventReason {
     Margin,
     /// The owner was liquidated.
     Liquidation,
-    /// The market was delisted.
+    /// The market was delisted (or its delist settlement ran).
     Delisted,
+    /// A governance update of the market's tick, lot or margin parameters
+    /// canceled the market's orders.
+    MarketParams,
     /// The unfilled remainder of an order that never rests (IOC, market, FOK,
     /// a taker out of margin, a reduce-only clamp).
     Unfilled,
