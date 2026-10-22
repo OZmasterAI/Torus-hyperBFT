@@ -471,6 +471,91 @@ def wait_for_drain(urls, out, timeout_s, quiet_s, feed_live=False, max_lag=DEFAU
     return 0 if result['drained'] else TARGET_MISSED_RC if target_missed else 1
 
 
+DISSEM_FAIL_KEYS = ('exhausted', 'sync_fallback', 'da_outbound_fail', 'starvation')
+
+
+def failure_targets(record, peer_nodes):
+    """The nodes a dissemination-failure line (a collect_logs.py record) is
+    reported toward: the OUTBOUND FAILURE peer, else the fetched block's
+    proposers (report only: a fetch rotates across every other validator
+    before it falls back to sync); [] when the evidence names none (or names
+    an unknown peer id)."""
+    if record.get('peer_id') is not None:
+        node = peer_nodes.get(record['peer_id'])
+        return [node] if node else []
+    return list(record.get('proposers') or [])
+
+
+def kill_dissemination(log_summary, killed, kill_ts, counts=None):
+    """KILL_NO_RESTART dissemination verdict from per-peer evidence
+    (collect_logs.py's log-summary.json); None when no node was killed (that
+    cell is judged on its counts, as always).
+
+    A failure line is EXEMPT only when the line itself names the killed node
+    as its peer (an OUTBOUND FAILURE toward its peer id) and is dated at or
+    after kill_ts. Everything else counts: failures between the survivors,
+    toward the killed node before its kill, the killed node's own lines (all
+    from before its SIGKILL), lines that name no peer, every body / justify
+    fetch fallback (the fetch rotates across all other validators before it
+    falls back to sync, so a survivor failed too, whoever proposed the block;
+    its proposer is reported in live_by_node, never exempted), and counted
+    lines without a per-line record
+    (truncated, or a log-summary.json from before the records). counts
+    (summarize.py's --dissem, per node) must equal the log summary's own,
+    else nothing is exempt.
+    -> {clean, killed_node, kill_ts, exempt_toward_killed, live_failures,
+        live_by_node: {node: {lines, toward: {node|'unknown': n}}}, evidence}"""
+    if not killed:
+        return None
+    nodes = ('val0', 'val1', 'val2')
+    entries = {n: log_summary.get(n) or {} for n in nodes}
+    peer_nodes = {e['local_peer_id']: n for n, e in entries.items() if e.get('local_peer_id')}
+    exempt, live, notes = 0, {}, {}
+
+    def count_live(node, toward, lines=1):
+        row = live.setdefault(node, {'lines': 0, 'toward': {}})
+        row['lines'] += lines
+        for t in toward:
+            row['toward'][t] = row['toward'].get(t, 0) + lines
+
+    for n, entry in entries.items():
+        given = (counts or {}).get(n) or {}
+        node_counts = entry.get('counts') or given
+        if counts is not None and any((given.get(k) or 0) != (node_counts.get(k) or 0)
+                                      for k in DISSEM_FAIL_KEYS):
+            notes.setdefault('mismatch', '%s: --dissem counts differ from log-summary.json' % n)
+        records = entry.get('failures')
+        if records is None:
+            records = []
+            notes.setdefault('counts only', '%s: no per-line records' % n)
+        tally = dict.fromkeys(DISSEM_FAIL_KEYS, 0)
+        for r in records:
+            for k in r.get('kinds') or ():
+                tally[k] = tally.get(k, 0) + 1
+            targets = failure_targets(r, peer_nodes)
+            ts = r.get('ts')
+            toward_killed = r.get('peer_id') is not None and peer_nodes.get(r['peer_id']) == killed
+            if (n != killed and toward_killed and ts is not None
+                    and kill_ts is not None and ts >= kill_ts):
+                exempt += 1
+            else:
+                count_live(n, targets or ['unknown'])
+        # counted failures no record covers: unattributed, so they count
+        missing = sum(max(0, (node_counts.get(k) or 0) - tally[k]) for k in DISSEM_FAIL_KEYS)
+        if missing:
+            notes.setdefault('incomplete', '%s: %d counted failures without a record' % (n, missing))
+            count_live(n, ['unknown'], missing)
+    if 'mismatch' in notes:
+        exempt, clean = 0, False
+    else:
+        clean = not live
+    evidence = '; '.join('%s (%s)' % kv for kv in notes.items()) or 'per-line'
+    return {'clean': clean, 'killed_node': killed, 'kill_ts': kill_ts,
+            'exempt_toward_killed': exempt,
+            'live_failures': sum(r['lines'] for r in live.values()),
+            'live_by_node': live, 'evidence': evidence}
+
+
 def acceptance(liveness, drained, bench_rc, agreement, dissemination_clean, crash=None):
     failed, unknown = [], []
     if bench_rc != 0:

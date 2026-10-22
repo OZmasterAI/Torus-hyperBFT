@@ -706,6 +706,27 @@ VALIDATOR_STAKES=2,2,1 BENCH_RPCS=0,1 KILL_NO_RESTART=val2 KILL_NO_RESTART_AT_S=
   `killed_node`, `kill_at_s`, `height_at_kill`. Timeout views per minute over
   time: `sampler.csv`, column `torus_consensus_timeout_total_total` (1 Hz, per
   node); `torus_consensus_view` beside it.
+- **Dissemination verdict (s138, bench 9k2):** the survivors' sends to the
+  killed validator fail once it is gone (`native-da OUTBOUND FAILURE
+  peer=<its id>`, ~10 s after the kill when the QUIC connection times out).
+  Those lines alone do not REJECT the cell; summary.json `dissemination`
+  keeps the raw `total_failures` and gains `kill_exemption`
+  (`health.kill_dissemination`: `exempt_toward_killed`, `live_failures`,
+  `live_by_node` {node: {lines, toward}}, `evidence`). Per-peer evidence is
+  `log-summary.json` from `collect_logs.py` (the node logs): each node's
+  `local_peer_id=` line maps peer ids to nodes; OUTBOUND FAILURE lines name
+  their peer. A line is exempt only when it names the killed node as its
+  peer and is dated at or after `kill_ts`. Still counted: failures between
+  the survivors, toward the killed node before its kill, the killed node's
+  own lines, lines naming no peer, every body / justify fetch fallback (the
+  fetch rotates across all other validators before it falls back to sync, so
+  a survivor failed too; the block's proposer, from the `header re-send: ...
+  block=<prefix>` line, is reported in `live_by_node` only), counted lines without
+  a per-line record (an older `log-summary.json`), and any `--dissem` /
+  `log-summary.json` count mismatch. Cells without a kill are unchanged.
+  `rescore.sh <cell> <dest-root>` re-scores a finished cell in a reflink copy
+  (`<dest-root>/<label>`, `rescore.json` = old vs new validity) and never
+  touches the original.
 - **Campaign driver:** put the knobs in the arm's `harness_env`
   (`campaign/run_cell.py` allows them too). `watch_nodes` accepts the death of
   exactly the pid named in the marker line; any other node death still aborts
@@ -737,7 +758,9 @@ that an older sampler already replaced with zero. Copy historical results before
 re-scoring if their original summaries must be retained.
 
 `collect_logs.py` streams logs once for dissemination counts and records queue
-warning counts/bytes in `log-summary.json`. It avoids whole-log shell variables;
+warning counts/bytes in `log-summary.json`. It also records every dissemination-failure line
+with its per-peer evidence (`failures`: ts, kinds, peer_id, block, proposers;
+`local_peer_id` per node) for the KILL_NO_RESTART verdict, and reads `.gz` logs. It avoids whole-log shell variables;
 it does not change node logging or repair dissemination failures.
 
 Regression checks (no devnet or build):
