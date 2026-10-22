@@ -3,7 +3,11 @@
 Status: revision 2 (s127). **Option 0 (P1 + P2) BUILT** on `feat/item7-option0` (plan `item7-option0-impl.md`,
 steps 0-4, G0-G4, 2026-10-19), behind `TORUS_EVM_FAST_PATH`; Q11 passed (perf doc section 107) and the owner merged it
 with the flag **on by default** (s131; `TORUS_EVM_FAST_PATH=0` turns it off per node). RPC freshness as
-question 4 a (`docs/api/eth-head.md`). T (P3), HL order and C0 are not built. Revision 1 (`3b79a617`) went through two
+question 4 a (`docs/api/eth-head.md`). **T (P3) BUILT** on `feat/item7-t-same-block` behind the
+P0.0 feature `same_block_core_writer` (id 2), scheduled nowhere (owner s138: after the testnet genesis, activated
+at a height); with the bit off every rule is the step 2 one. T's own order-range cursor rows are
+`core_writer_t_first_open_order_target` / `core_writer_t_full_order_run` (the step 2 rows speak for the shared range
+of the blocks below the activation). HL order and C0 are not built. Revision 1 (`3b79a617`) went through two
 adversarial reviews: Codex (`reviews/codex-item7-step3-adv.md`, needs-attention: P1 + P2) and Claude
 (`reviews/item7-step3-claude-review.md`, build with changes: 3 high, 5 medium, 2 weak spots, missing tests). Every
 finding is verified in code and handled; section 10 maps each one to the change. Owner direction s127 is in: the RPC
