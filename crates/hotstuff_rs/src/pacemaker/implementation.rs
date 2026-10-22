@@ -670,7 +670,21 @@ impl<N: Network> Pacemaker<N> {
         // backed-off schedule (slots are `max_view_time * multiplier` wide) is
         // not rebased away on every entry, while a genuinely stale jump — whose
         // surplus exceeds even the backed-off allowance — still rebases.
-        if scheduled > Instant::now() + self.config.max_view_time * 2 * multiplier {
+        //
+        // s137 (past deadline): the schedule is rebased from now as well when
+        // it leaves the entered view less than one base view time. 2c stretches
+        // a stalled view in place without moving the views after it, so after
+        // a backed-off view the next views' deadlines lie in the past; entered
+        // on the backed-off view's QC (multiplier 1), the view timed out on the
+        // next tick and its QC never formed. With both bounds every entered
+        // view ends within [now + mvt * multiplier, now + 2 * mvt * multiplier]
+        // (2c below supplies the multiplier on the lower bound). On an intact
+        // schedule a view entered by its predecessor's deadline already has a
+        // full slot, so a healthy chain keeps its schedule unchanged.
+        let now = Instant::now();
+        if scheduled > now + self.config.max_view_time * 2 * multiplier
+            || scheduled < now + self.config.max_view_time
+        {
             self.state
                 .update_timeouts(next_view, &self.config, highest_qc_view, committed_view);
         }
@@ -1794,7 +1808,7 @@ fn update_view_fast_run_deadline_bounded() {
 /// Task A (pacemaker backoff): entering a view while views have outrun the QC
 /// frontier must yield a deadline stretched to `max_view_time * multiplier`
 /// from now — through both the rebase path (scheduled deadline far off) and
-/// the in-place path (scheduled deadline near, the common mid-epoch stall).
+/// the near-deadline path (the common mid-epoch stall).
 #[test]
 fn update_view_threads_qc_frontier() {
     let mvt = Duration::from_millis(500);
@@ -1814,8 +1828,9 @@ fn update_view_threads_qc_frontier() {
     );
     assert!(deadline <= after + mvt * 8);
 
-    // In-place path: real time has consumed the schedule (deadline near), so
-    // the rebase clamp stays quiet and the entered view is stretched in place.
+    // Real time has consumed the schedule (deadline 300 ms away, under one
+    // view time), so the schedule is rebased from now at the multiplier (s137
+    // lower bound); the entered deadline is the same as the in-place stretch.
     let (mut pacemaker, vss) = test_pacemaker(1);
     std::thread::sleep(Duration::from_millis(1200));
     let before = Instant::now();
@@ -1826,7 +1841,7 @@ fn update_view_threads_qc_frontier() {
     let deadline = pacemaker.query().deadline;
     assert!(
         deadline >= before + mvt * 2,
-        "mid-epoch stalled entry must be stretched in place (depth 1 => x2)"
+        "mid-epoch stalled entry must be backed off from entry (depth 1 => x2)"
     );
     assert!(deadline <= after + mvt * 2);
 }
