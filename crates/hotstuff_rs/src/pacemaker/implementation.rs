@@ -2285,3 +2285,7 @@ fn update_view_threads_commit_lag() {
 #[cfg(test)]
 #[path = "prev_view_collector_test.rs"]
 mod prev_view_collector_test;
+
+#[cfg(test)]
+#[path = "cross_chain_timeout_test.rs"]
+mod cross_chain_timeout_test;

@@ -2025,6 +2025,70 @@ mod fatal_violation_wiring_tests {
         assert!(!app.fatal_called);
     }
 
+    /// fix/tc-embedded-chain-id (RED first: `Block::is_correct` checked the justify's
+    /// signatures, not its chain). A sync server serves the committed chain of
+    /// chain 7, whose validators use our keys: every justify is a real quorum, of
+    /// chain 7. The syncing replica must not insert or commit any of it.
+    #[test]
+    fn synced_blocks_justified_by_another_chain_are_rejected() {
+        use crate::hotstuff::types::Phase;
+        use crate::types::crypto_primitives::Keypair;
+        use crate::types::data_types::{SignatureSet, ViewNumber};
+
+        struct SyncValidApp;
+        impl App<MemKV> for SyncValidApp {
+            fn produce_block(&mut self, _r: ProduceBlockRequest<MemKV>) -> ProduceBlockResponse {
+                unreachable!()
+            }
+            fn validate_block(&mut self, _r: ValidateBlockRequest<MemKV>) -> ValidateBlockResponse {
+                unreachable!()
+            }
+            fn validate_block_for_sync(&mut self, _r: ValidateBlockRequest<MemKV>) -> ValidateBlockResponse {
+                ValidateBlockResponse::Valid { app_state_updates: None, validator_set_updates: None }
+            }
+        }
+
+        let foreign = ChainID::new(7);
+        let set = validator_set();
+        let key = SigningKey::from_bytes(&[1u8; 32]);
+        let vss = ValidatorSetState::new(set.clone(), set.clone(), None, true);
+        let mut tree = BlockTreeSingleton::new(MemKV::default());
+        tree.initialize(&AppStateUpdates::new(), &vss).unwrap();
+        let certify = |view: u64, hash| {
+            let view = ViewNumber::new(view);
+            let mut signatures = SignatureSet::new(1);
+            let message = crate::types::signing::phase_vote_bytes(foreign, view, &hash, Phase::Generic);
+            signatures.set(0, Some(Keypair::new(key.clone()).sign(&message)));
+            PhaseCertificate { chain_id: foreign, view, block: hash, phase: Phase::Generic, signatures }
+        };
+        let mut blocks = Vec::new();
+        let mut justify = PhaseCertificate::genesis_pc();
+        for h in 0..3 {
+            let block = Block::new(BlockHeight::new(h), justify, CryptoHash::new([40 + h as u8; 32]), Data::new(vec![]));
+            justify = certify(h + 1, block.hash);
+            blocks.push(block);
+        }
+        let mut cli = client();
+        cli.pending_sync = Some(PendingSyncSession {
+            peer: key.verifying_key(),
+            pending_blocks: VecDeque::from(blocks.clone()),
+            highest_pc: None,
+            blocks_synced: 0,
+            init_height: BlockHeight::new(0),
+            fetch_iterations: 1,
+            session_start: Instant::now(),
+            awaiting_fetch: false,
+            last_fetch_start_height: Some(BlockHeight::new(0)),
+            is_backfill: false,
+        });
+        for _ in 0..blocks.len() {
+            let _ = cli.process_pending_block(&mut tree, &mut SyncValidApp);
+        }
+        assert!(!tree.contains(&blocks[1].hash), "a block justified by chain 7's QC was inserted");
+        assert_eq!(tree.highest_committed_block_height().unwrap(), None, "chain 7's blocks were committed");
+        assert!(tree.highest_pc().unwrap().chain_id != foreign, "chain 7's QC became the highest PC");
+    }
+
     /// s428 BACKFILL FIX (RED first — `request_sync` returned `()` and reset the
     /// no-progress clock even on a no-server no-op, so a crash-restarted node
     /// with an empty `available_sync_servers` map went silent). After restart the
