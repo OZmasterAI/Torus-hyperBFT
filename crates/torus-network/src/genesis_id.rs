@@ -27,7 +27,7 @@
 //! the legacy names (`/torus/direct/2.0`, `/torus/1.0`) and refuses peers
 //! that advertise a digest, and they refuse it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::fmt;
 use std::future::Future;
@@ -340,6 +340,8 @@ pub struct GenesisGate {
     identify_sent: HashMap<ConnectionId, Instant>,
     /// Refused connections still open: peer, close-at.
     closing: HashMap<ConnectionId, (PeerId, Instant)>,
+    /// Due closes not yet handed to the swarm (one per `poll`).
+    ready_closes: VecDeque<(PeerId, ConnectionId)>,
     /// Wakes `poll` at the earliest close-at.
     timer: Option<Pin<Box<tokio::time::Sleep>>>,
 }
@@ -483,9 +485,13 @@ impl NetworkBehaviour for GenesisGate {
 
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<ToSwarm<Infallible, THandlerInEvent<Self>>> {
         loop {
-            if let Some((peer_id, connection)) = self.take_due(Instant::now()).into_iter().next() {
-                // Any other due entry is picked up by the next poll (the
-                // swarm polls a behaviour again after it returns Ready).
+            if self.ready_closes.is_empty() {
+                let due = self.take_due(Instant::now());
+                self.ready_closes.extend(due);
+            }
+            // One close per poll; the rest stay queued (the swarm polls a
+            // behaviour again after it returns Ready).
+            if let Some((peer_id, connection)) = self.ready_closes.pop_front() {
                 self.timer = None;
                 return Poll::Ready(ToSwarm::CloseConnection {
                     peer_id,
@@ -706,6 +712,36 @@ mod tests {
         g.refuse_at(peer, conn, t0);
         assert!(g.take_due(t0 + REFUSAL_CLOSE_MAX_WAIT / 2).is_empty());
         assert_eq!(g.take_due(t0 + REFUSAL_CLOSE_MAX_WAIT), vec![(peer, conn)]);
+    }
+
+    /// Codex stop review: two refusals due at once must both be closed (the
+    /// first poll took every due entry off the schedule but emitted one).
+    #[tokio::test]
+    async fn every_due_refused_connection_is_closed() {
+        let mut g = GenesisGate::default();
+        let t0 = Instant::now() - REFUSAL_CLOSE_MAX_WAIT * 2;
+        let (p1, p2) = (PeerId::random(), PeerId::random());
+        let (c1, c2) = (
+            ConnectionId::new_unchecked(11),
+            ConnectionId::new_unchecked(12),
+        );
+        g.refuse_at(p1, c1, t0);
+        g.refuse_at(p2, c2, t0);
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut closed = Vec::new();
+        while let Poll::Ready(ev) = g.poll(&mut cx) {
+            match ev {
+                ToSwarm::CloseConnection {
+                    peer_id,
+                    connection: CloseConnection::One(c),
+                } => closed.push((peer_id, c)),
+                _ => panic!("only closes are emitted"),
+            }
+            assert!(closed.len() <= 2, "each close once");
+        }
+        closed.sort_by_key(|(_, c)| format!("{c:?}"));
+        assert_eq!(closed, vec![(p1, c1), (p2, c2)]);
     }
 
     #[test]
