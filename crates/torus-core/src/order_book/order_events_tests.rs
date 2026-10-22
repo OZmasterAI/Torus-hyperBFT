@@ -200,7 +200,7 @@ fn order_events_cancel_all_logs_orders_and_stops_with_the_cause() {
     b.cancel_all(addr(A), None);
     b.set_cancel_cause(prev);
     let mut s = summary(&b.take_order_events());
-    s.sort();
+    s.sort_by_key(|e| e.0);
     assert_eq!(
         s,
         vec![
@@ -264,7 +264,7 @@ fn order_events_cancel_all_many_logs_every_sender() {
         .iter()
         .map(|e| (e.order_id.unwrap(), e.status, e.reason))
         .collect();
-    got.sort();
+    got.sort_by_key(|e| e.0);
     let want: Vec<_> = ids.iter().map(|&id| (id, S::Canceled, R::User)).collect();
     assert_eq!(got, want);
 }
