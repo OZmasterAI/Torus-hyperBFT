@@ -1,0 +1,12 @@
+The opt-in joined path can permanently skip queued CoreWriter work and drop actions that are valid at their committed block timestamps. A crash before the joined transition is durable also causes replay to apply a different transition than uninterrupted execution.
+
+Full review comments:
+
+- [P1] Do not strand CoreWriter rows due inside a unit — /home/oz/projects/wt/novel-s80/proto/exec-commit-units/crates/torus-consensus/src/app.rs:6935-6939
+  If an earlier EVM block queues a CoreWriter entry for height `h`, and `h` is the first member of a safe unit (for example, `h=3` with `K=2`), this loop collects `h` and executes only the merged block at `h+1`. CoreWriter due checks and drains use the exact execution height, so the row for `h` is never drained and remains stranded after the applied marker advances. Stop joining across heights with queued work or process CoreWriter entries for every member height.
+
+- [P1] Replay joined units with the same grouping — /home/oz/projects/wt/novel-s80/proto/exec-commit-units/crates/torus-consensus/src/app.rs:6688-6690
+  With `TORUS_S80_EXEC_JOIN>1`, a crash after member rows are durable but before the joined unit's state flush leaves those blocks for boot replay. Replay currently executes each stored block separately, and the join setting is initialized only after replay; because joined execution can produce a different transition, the restarted node can diverge from an uninterrupted peer. Make replay apply the same unit grouping or otherwise preserve enough information to reconstruct the joined transition.
+
+- [P2] Verify joined actions at their committed timestamps — /home/oz/projects/wt/novel-s80/proto/exec-commit-units/crates/torus-consensus/src/app.rs:6666-6668
+  The merged block uses the last member's header timestamp, which is then used to re-verify every member's native actions. If that later timestamp pushes an earlier member's nonce outside the ±60-second window, an action that would pass execution at its own block timestamp is silently dropped from the committed unit. Preserve each action's member timestamp for verification or avoid joining units where this changes validity.

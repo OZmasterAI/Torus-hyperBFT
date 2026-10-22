@@ -1,0 +1,6 @@
+The new non-ignored bridge test fails in debug builds because the tie-only arm passes placeholder hashes to a helper that asserts every hash is exact. The torus-types tests pass, but this regression prevents the bridge test from passing.
+
+Review comment:
+
+- [P1] Keep tie-only sort hashes valid in debug builds — /home/oz/projects/wt/novel-s80/proto/keyed-local-trust-key/crates/torus-bridge/tests/exec_hash_once_ubench.rs:335-336
+  When the non-ignored correctness test exercises `Sha256TieOnly`, non-tied cached actions retain `B256::ZERO`; `sort_native_actions_indexed_with_sort_hashes` debug-asserts that every supplied hash equals `keccak(C)`, so the standard debug test suite fails. Keep placeholders out of this helper or use a sorting path that permits them.

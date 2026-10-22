@@ -1,0 +1,6 @@
+The opt-in certificate does not skip placement math when Phase 2 uses the sharded prepare path, so the feature does not behave as advertised for those batches.
+
+Review comment:
+
+- [P2] Pass certifications to sharded prepare workers — /home/oz/projects/wt/novel-s80/proto/phase2-sender-certificate/crates/torus-bridge/src/native_executor.rs:9561-9564
+  When `TORUS_PARALLEL_ENGINE` enables the sharded path and the batch meets its threshold, execution skips this serial-only `p2_certify` call; the worker path calls `prepare_one` with `certified = false`. Consequently, `TORUS_S80_P2_CERT=1` silently performs no skips for those batches. Apply the certificates in the sharded path or otherwise ensure the mode’s behavior is explicit.

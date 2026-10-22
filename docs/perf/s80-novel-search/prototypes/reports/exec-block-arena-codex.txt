@@ -1,0 +1,12 @@
+The patch appears to preserve execution outputs, but the arena does not recycle pass-A position caches when no-merge is disabled and can retain excessive scratch-map memory after high-cardinality blocks.
+
+Full review comments:
+
+- [P2] Recycle merged plan caches when no-merge is disabled — /home/oz/projects/wt/novel-s80/proto/exec-block-arena/crates/torus-bridge/src/native_executor.rs:11773-11773
+  When `TORUS_S80_EXEC_ARENA=1` and `TORUS_SETTLE_NO_MERGE=0`, pass A takes recycled caches here, but Pass B consumes and drops each cache in `merge_disjoint`; only `pos_runs` are returned to the pool at the end of the call, and that list is empty in this mode. Successful calls therefore never return these pass-A caches to `POSITION_CACHES` and keep reallocating them; the fallback path also drops its plans. Recycle plan caches after merging or abandoning them.
+
+- [P2] Bound total retained recycler capacity — /home/oz/projects/wt/novel-s80/proto/exec-block-arena/crates/torus-core/src/recycle.rs:28-28
+  After a high-cardinality block touching many markets, each free list can retain up to 1,024 maps with capacities up to 65,536; `clear()` keeps their bucket storage, so the position caches alone can pin tens of millions of position and dirty-map buckets, in addition to the other pools. This can leave the process holding many gigabytes after a burst. Add an aggregate retained-byte or capacity budget rather than relying only on per-map and per-list limits.
+
+- [P2] Drop oversized maker caches before retaining them — /home/oz/projects/wt/novel-s80/proto/exec-block-arena/crates/torus-bridge/src/native_executor.rs:3111-3111
+  When a batch has an unusually large set of distinct makers, `clear()` retains the full allocation on this persistent pool worker, and this path has no capacity limit. The map then remains resident after the batch, with multiple workers potentially retaining their own high-water allocations. Apply the same oversize-drop policy used by the core recyclers.

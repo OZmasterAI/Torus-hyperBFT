@@ -1,0 +1,9 @@
+The A/B runner can collect THP samples from a different benchmark invocation while waiting for the heavy lock, and inherited allocator environment variables can invalidate the stated baseline arms. Both issues can produce misleading comparison results.
+
+Full review comments:
+
+- [P2] Start sampling only after this arm owns the benchmark lock — /home/oz/projects/wt/novel-s80/proto/thp-heap/tools/s80/thp-ub-ab.sh:20-20
+  When another `ubench_econ` run holds the heavy lock, this sampler starts before `ub.sh` waits for that lock and matches the other run. It can record only that run and exit before this arm starts; the summary filter cannot distinguish D from G or separate runs using the same `MALLOC_CONF`, so the reported THP metrics can be wrong. Scope sampling to the specific invocation or start it after the lock is acquired.
+
+- [P2] Clear inherited allocator settings for baseline arms — /home/oz/projects/wt/novel-s80/proto/thp-heap/tools/s80/thp-ub-ab.sh:23-24
+  If the caller exports `MALLOC_CONF`, the D arm inherits it and no longer tests jemalloc defaults; if the caller exports `LD_PRELOAD`, the G arm can still preload a library instead of testing glibc. `ub.sh`'s `env` invocation preserves unspecified variables, so explicitly unset allocator settings that an arm does not intend to use; the steady and perf runners have the same issue.

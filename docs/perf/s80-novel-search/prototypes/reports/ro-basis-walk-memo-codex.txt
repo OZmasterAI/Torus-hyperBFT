@@ -1,0 +1,1 @@
+The memo caches the resting-order sum only within a call and preserves the existing iteration and saturating-sum order. I found no correctness issues in the changed code.

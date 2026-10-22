@@ -1,0 +1,1 @@
+The hand-off preserves the durable-read fallback and refuses logical-only map misses, while publishing plans before their logical height. The targeted consensus and economics tests pass.

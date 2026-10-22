@@ -1,0 +1,7 @@
+The resident-slot and borrowed-delta paths appear consistent, but the opt-in path changes the documented meaning of the end-resident duration metric by excluding deferred cleanup.
+
+Review comment:
+
+- [P2] Include deferred drops in the end-resident duration — /home/oz/projects/wt/novel-s80/proto/end-resident-gate/crates/torus-bridge/src/native_executor.rs:5291-5291
+  With `TORUS_S80_ER_GATE` enabled, this timer is observed before the slot is sent and before `drop(leftovers)`, so it excludes the deferred `Retired` values and frozen-set cleanup. The documented metric contract in `crates/torus-telemetry/src/lib.rs:715-717` includes batch-result drops, making the reported duration understate worker time and gate-on/off comparisons misleading. Record the total after cleanup or expose a separate slot-ready metric.
+exit=0

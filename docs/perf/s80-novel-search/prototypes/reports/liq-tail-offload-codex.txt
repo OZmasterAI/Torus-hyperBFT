@@ -1,0 +1,6 @@
+With pre-evaluation enabled, reads for candidates beyond the action cutoff can latch fatal local faults even though the serial liquidation loop would never read those accounts.
+
+Review comment:
+
+- [P2] Avoid evaluating candidates past the action cap — /home/oz/projects/wt/novel-s80/proto/liq-tail-offload/crates/torus-bridge/src/liquidation_step.rs:590-590
+  When the loop reaches `act`, later candidates are not valued on the serial path, but this eager collection still calls `liq_view` for the whole scan window. A tail candidate can latch a local read failure in `ctx.reader_fault` (for example via `AccountReader::mark`), which `take_fatal_error` treats as fatal, making the block fail because of an account the loop never needed to read. Avoid recording faults from discarded pre-values or restrict pre-evaluation to candidates whose results will be consumed.
