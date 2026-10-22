@@ -1403,8 +1403,48 @@ pub fn batch_verify_native_actions_cached_with_sort_hashes(
     )
 }
 
-/// s80 keyed-local-trust-key (prototype; no node caller yet): the exec verify
-/// pass keyed by the SHA-256 local trust key
+/// s80 keyed-local-trust-key: the outcome of the memo verify pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalKeyMemoVerify {
+    /// Resolved senders, exactly as [`batch_verify_native_actions_cached_with_sort_hashes`].
+    pub senders: Vec<Option<Address>>,
+    /// Each action's anti-MEV sort hash `keccak256(C)`.
+    pub sort_hashes: Vec<B256>,
+    /// EIP-712 actions whose sender and sort hash came from the memo.
+    pub hits: usize,
+    /// Hits whose memoized sort hash was re-derived from the executed bytes
+    /// and compared (every `check_every`-th hit, the first hit included).
+    pub checked: usize,
+    /// Checked hits whose memoized sort hash differed. One mismatch voids the
+    /// memo for the whole block: every hit's sort hash is recomputed and its
+    /// sender recovered, so the block runs exactly as on a cold node.
+    pub mismatches: usize,
+}
+
+/// Default of `TORUS_S80_LOCAL_TRUST_KEY_CHECK_EVERY`: every 32nd memo hit
+/// (the first of each block included) has its sort hash re-derived.
+pub const LOCAL_TRUST_CHECK_EVERY_DEFAULT: usize = 32;
+
+/// Pure parse of `TORUS_S80_LOCAL_TRUST_KEY_CHECK_EVERY`: a decimal count
+/// (`0` = no check, `1` = check every hit); unset, empty or invalid keeps
+/// [`LOCAL_TRUST_CHECK_EVERY_DEFAULT`].
+pub fn parse_local_trust_check_every(raw: Option<String>) -> usize {
+    raw.as_deref()
+        .map(str::trim)
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(LOCAL_TRUST_CHECK_EVERY_DEFAULT)
+}
+
+/// `TORUS_S80_LOCAL_TRUST_KEY_CHECK_EVERY` read once per process.
+pub fn local_trust_check_every() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        parse_local_trust_check_every(std::env::var("TORUS_S80_LOCAL_TRUST_KEY_CHECK_EVERY").ok())
+    })
+}
+
+/// s80 keyed-local-trust-key (node arm behind `TORUS_S80_LOCAL_TRUST_KEY`):
+/// the exec verify pass keyed by the SHA-256 local trust key
 /// ([`crate::local_trust_key`]) with the sort hash memoized in the cache
 /// value. `memo_lookup(key)` returns `(sender, keccak256(C))` that THIS node
 /// seeded after verifying the byte-identical `(C, nonce, sig)`
@@ -1413,40 +1453,80 @@ pub fn batch_verify_native_actions_cached_with_sort_hashes(
 /// computed here and the sender resolves exactly as in
 /// [`batch_verify_native_actions_cached_with_sort_hashes`] (phase 1 recover,
 /// phase 2 sessions). Same outputs as that function when the memo was seeded
-/// from verified actions. The pre-pass is always sequential (it ignores
-/// `TORUS_EXEC_PARALLEL_KEYS`); the lookup sees one key per EIP-712 action,
-/// in input order.
+/// from verified actions.
+///
+/// Release-mode guard: every `TORUS_S80_LOCAL_TRUST_KEY_CHECK_EVERY`-th hit
+/// (default 32, first hit of the block included) is re-hashed; a mismatch
+/// voids the memo for the block (see [`LocalKeyMemoVerify::mismatches`]).
+/// With `TORUS_EXEC_PARALLEL_KEYS=1` the key hashing and the miss hashing run
+/// on the verify pool (same rule as the keccak path); the lookups stay on this
+/// thread, one per EIP-712 action, in input order.
 pub fn batch_verify_native_actions_local_key_memo(
     actions: &[SignedNativeAction],
     timestamp: u64,
     session_lookup: impl Fn(&[u8; 32]) -> Option<crate::SessionData>,
     memo_lookup: impl Fn(&B256) -> Option<(Address, B256)>,
-) -> (Vec<Option<Address>>, Vec<B256>) {
+) -> LocalKeyMemoVerify {
     let mode = verify_mode();
     let pool = if matches!(mode, VerifyMode::Pool(_)) {
         live_verify_pool()
     } else {
         None
     };
-    local_key_memo_impl(actions, timestamp, session_lookup, memo_lookup, mode, pool)
+    local_key_memo_impl(
+        actions,
+        timestamp,
+        session_lookup,
+        memo_lookup,
+        mode,
+        pool,
+        exec_parallel_keys(),
+        local_trust_check_every(),
+    )
 }
 
 /// [`batch_verify_native_actions_local_key_memo`] with an explicit
-/// [`VerifyMode`] (an ephemeral pool for `Pool(n)`; tests and benches).
+/// [`VerifyMode`] (an ephemeral pool for `Pool(n)`), parallel-keys switch and
+/// check interval (tests and benches).
 pub fn batch_verify_native_actions_local_key_memo_with_mode(
     actions: &[SignedNativeAction],
     timestamp: u64,
     session_lookup: impl Fn(&[u8; 32]) -> Option<crate::SessionData>,
     memo_lookup: impl Fn(&B256) -> Option<(Address, B256)>,
     mode: VerifyMode,
-) -> (Vec<Option<Address>>, Vec<B256>) {
+    parallel_keys: bool,
+    check_every: usize,
+) -> LocalKeyMemoVerify {
     let pool = match mode {
         VerifyMode::Pool(n) => rayon::ThreadPoolBuilder::new().num_threads(n).build().ok(),
         _ => None,
     };
-    local_key_memo_impl(actions, timestamp, session_lookup, memo_lookup, mode, pool.as_ref())
+    local_key_memo_impl(
+        actions,
+        timestamp,
+        session_lookup,
+        memo_lookup,
+        mode,
+        pool.as_ref(),
+        parallel_keys,
+        check_every,
+    )
 }
 
+/// Runs `f` on the verify pool phase 1 uses (the dedicated pool for
+/// `Pool(_)`, else the global one).
+fn on_verify_pool<R: Send>(
+    mode: VerifyMode,
+    dedicated: Option<&rayon::ThreadPool>,
+    f: impl FnOnce() -> R + Send,
+) -> R {
+    match (mode, dedicated) {
+        (VerifyMode::Pool(_), Some(pool)) => pool.install(f),
+        _ => f(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn local_key_memo_impl(
     actions: &[SignedNativeAction],
     timestamp: u64,
@@ -1454,20 +1534,75 @@ fn local_key_memo_impl(
     memo_lookup: impl Fn(&B256) -> Option<(Address, B256)>,
     mode: VerifyMode,
     dedicated: Option<&rayon::ThreadPool>,
-) -> (Vec<Option<Address>>, Vec<B256>) {
-    let mut scratch = Vec::new();
-    let mut sort_hashes = Vec::with_capacity(actions.len());
-    let cache_hits: Vec<Option<Address>> = actions
-        .iter()
-        .map(|action| {
-            let (hit, sort) =
-                crate::local_trust_lookup_with_scratch(action, &mut scratch, &memo_lookup);
-            sort_hashes.push(sort);
-            hit
-        })
-        .collect();
+    parallel_keys: bool,
+    check_every: usize,
+) -> LocalKeyMemoVerify {
+    let (mut hits, mut sort_hashes): (Vec<Option<(Address, B256)>>, Vec<B256>) =
+        if use_parallel_keys(parallel_keys, mode, actions.len()) {
+            use rayon::prelude::*;
+            // Keys hashed order-preserving on the pool, one scratch per split.
+            let keys: Vec<Option<B256>> = on_verify_pool(mode, dedicated, || {
+                actions
+                    .par_iter()
+                    .map_init(Vec::<u8>::new, |buf, a| crate::local_trust_key_with_scratch(a, buf))
+                    .collect()
+            });
+            // Lookups on this thread, in input order (none for a session action).
+            let hits: Vec<Option<(Address, B256)>> =
+                keys.iter().map(|k| k.as_ref().and_then(&memo_lookup)).collect();
+            // keccak256(C) only for misses and session actions, on the pool.
+            let sorts: Vec<B256> = on_verify_pool(mode, dedicated, || {
+                actions
+                    .par_iter()
+                    .zip(hits.par_iter())
+                    .map_init(Vec::<u8>::new, |buf, (a, hit)| match hit {
+                        Some((_, sort)) => *sort,
+                        None => {
+                            buf.clear();
+                            a.action.append_canonical_bytes(buf);
+                            keccak256(&buf[..])
+                        }
+                    })
+                    .collect()
+            });
+            (hits, sorts)
+        } else {
+            let mut scratch = Vec::new();
+            let mut sorts = Vec::with_capacity(actions.len());
+            let hits = actions
+                .iter()
+                .map(|action| {
+                    let (hit, sort) =
+                        crate::local_trust_lookup_with_scratch(action, &mut scratch, &memo_lookup);
+                    sorts.push(sort);
+                    hit.map(|sender| (sender, sort))
+                })
+                .collect();
+            (hits, sorts)
+        };
+    // Release-mode guard: re-derive every `check_every`-th hit's sort hash.
+    let (mut n_hits, mut checked, mut mismatches) = (0usize, 0usize, 0usize);
+    for (action, hit) in actions.iter().zip(&hits) {
+        let Some((_, memo_sort)) = hit else { continue };
+        if check_every > 0 && n_hits % check_every == 0 {
+            checked += 1;
+            if keccak256(action.action.canonical_bytes()) != *memo_sort {
+                mismatches += 1;
+            }
+        }
+        n_hits += 1;
+    }
+    if mismatches > 0 {
+        // The memo is not trusted for this block: a cold node's path.
+        for (i, hit) in hits.iter_mut().enumerate() {
+            if hit.take().is_some() {
+                sort_hashes[i] = keccak256(actions[i].action.canonical_bytes());
+            }
+        }
+    }
+    let cache_hits: Vec<Option<Address>> = hits.iter().map(|h| h.map(|(s, _)| s)).collect();
     let senders = verify_phases(actions, timestamp, session_lookup, &cache_hits, mode, dedicated);
-    (senders, sort_hashes)
+    LocalKeyMemoVerify { senders, sort_hashes, hits: n_hits, checked, mismatches }
 }
 
 /// One action's `(sort hash if wanted, trust-cache key)`. Without
@@ -3904,6 +4039,10 @@ mod tests {
     #[test]
     fn local_key_memo_path_matches_keccak_path_senders_and_sort_hashes() {
         let (block, keccak_cache, memo, sessions) = memo_fixture();
+        // Twice the fixture (30 actions): over PARALLEL_KEYS_MIN_ACTIONS, so
+        // the parallel-keys pre-pass really runs for Default / Pool(2).
+        let block: Vec<SignedNativeAction> = block.iter().chain(block.iter()).cloned().collect();
+        assert!(block.len() >= super::PARALLEL_KEYS_MIN_ACTIONS);
         let truth: Vec<Option<Address>> = block
             .iter()
             .map(|a| match &a.signature {
@@ -3911,37 +4050,158 @@ mod tests {
                 ActionSignature::Session { .. } => Some(Address::from([0x11; 20])),
             })
             .collect();
-        assert!(truth.iter().filter(|s| s.is_none()).count() == 1, "one broken signature");
+        assert_eq!(truth.iter().filter(|s| s.is_none()).count(), 2, "one broken signature per copy");
         let sort_truth: Vec<B256> = block
             .iter()
             .map(|a| alloy_primitives::keccak256(a.action.canonical_bytes()))
             .collect();
+        let eip712 = block.iter().filter(|a| crate::local_trust_key(a).is_some()).count();
         for mode in [VerifyMode::Serial, VerifyMode::Default, VerifyMode::Pool(2)] {
-            let pool = match mode {
-                VerifyMode::Pool(n) => rayon::ThreadPoolBuilder::new().num_threads(n).build().ok(),
-                _ => None,
-            };
-            let today = batch_verify_impl_keyed(
-                &block,
-                TEST_NONCE,
-                |pk| sessions.get(pk).cloned(),
-                |k| keccak_cache.get(k).copied(),
-                mode,
-                pool.as_ref(),
-                false,
-                true,
-            );
-            let memo_path = batch_verify_native_actions_local_key_memo_with_mode(
-                &block,
-                TEST_NONCE,
-                |pk| sessions.get(pk).cloned(),
-                |k| memo.get(k).copied(),
-                mode,
-            );
-            assert_eq!(memo_path, today, "{mode:?}");
-            assert_eq!(memo_path.0, truth, "{mode:?}: senders");
-            assert_eq!(memo_path.1, sort_truth, "{mode:?}: sort hashes");
+            for parallel_keys in [false, true] {
+                let pool = match mode {
+                    VerifyMode::Pool(n) => {
+                        rayon::ThreadPoolBuilder::new().num_threads(n).build().ok()
+                    }
+                    _ => None,
+                };
+                let today = batch_verify_impl_keyed(
+                    &block,
+                    TEST_NONCE,
+                    |pk| sessions.get(pk).cloned(),
+                    |k| keccak_cache.get(k).copied(),
+                    mode,
+                    pool.as_ref(),
+                    parallel_keys,
+                    true,
+                );
+                let seen = std::sync::Mutex::new(Vec::new());
+                let memo_path = batch_verify_native_actions_local_key_memo_with_mode(
+                    &block,
+                    TEST_NONCE,
+                    |pk| sessions.get(pk).cloned(),
+                    |k| {
+                        seen.lock().unwrap().push(*k);
+                        memo.get(k).copied()
+                    },
+                    mode,
+                    parallel_keys,
+                    1,
+                );
+                let tag = format!("{mode:?} parallel_keys={parallel_keys}");
+                assert_eq!((memo_path.senders.clone(), memo_path.sort_hashes.clone()), today, "{tag}");
+                assert_eq!(memo_path.senders, truth, "{tag}: senders");
+                assert_eq!(memo_path.sort_hashes, sort_truth, "{tag}: sort hashes");
+                // Warm EIP-712 actions hit (the 2 cold ones of each copy miss);
+                // check_every = 1 re-derives every hit and finds no mismatch.
+                assert_eq!(memo_path.hits, eip712 - 4, "{tag}: hits");
+                assert_eq!((memo_path.checked, memo_path.mismatches), (eip712 - 4, 0), "{tag}");
+                let want_keys: Vec<B256> = block.iter().filter_map(crate::local_trust_key).collect();
+                assert_eq!(*seen.lock().unwrap(), want_keys, "{tag}: lookups in input order");
+            }
         }
+    }
+
+    /// Review issue 3 (release-mode guard): a memo entry whose sort hash (and
+    /// sender) are wrong is caught when its hit is sampled, and then the
+    /// whole block runs the cold path (ground truth). An unsampled poisoned
+    /// hit is NOT caught: the check is a sample, not a proof.
+    #[test]
+    fn local_key_memo_check_voids_a_poisoned_memo_for_the_block() {
+        let (block, _keccak_cache, memo, sessions) = memo_fixture();
+        let block: Vec<SignedNativeAction> = block.iter().chain(block.iter()).cloned().collect();
+        let cold = batch_verify_impl_keyed(
+            &block,
+            TEST_NONCE,
+            |pk| sessions.get(pk).cloned(),
+            |_| None,
+            VerifyMode::Serial,
+            None,
+            false,
+            true,
+        );
+        // Input positions of the memo hits, in order.
+        let hit_pos: Vec<usize> = block
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| crate::local_trust_key(a).is_some_and(|k| memo.contains_key(&k)))
+            .map(|(i, _)| i)
+            .collect();
+        let poison = |pos: usize| {
+            let mut m = memo.clone();
+            let k = crate::local_trust_key(&block[pos]).unwrap();
+            m.insert(k, (Address::repeat_byte(0xEE), B256::repeat_byte(0xEE)));
+            m
+        };
+        for (mode, parallel_keys) in
+            [(VerifyMode::Serial, false), (VerifyMode::Pool(2), true), (VerifyMode::Default, true)]
+        {
+            let tag = format!("{mode:?} parallel_keys={parallel_keys}");
+            // The first hit is always sampled (check_every 32 and 1).
+            let first = poison(hit_pos[0]);
+            for check_every in [1usize, 32] {
+                let got = batch_verify_native_actions_local_key_memo_with_mode(
+                    &block,
+                    TEST_NONCE,
+                    |pk| sessions.get(pk).cloned(),
+                    |k| first.get(k).copied(),
+                    mode,
+                    parallel_keys,
+                    check_every,
+                );
+                assert_eq!((got.senders.clone(), got.sort_hashes.clone()), cold, "{tag} every {check_every}");
+                // The doubled block holds the poisoned action twice (hit
+                // ordinals 0 and 12): every-hit checking finds both.
+                let want = if check_every == 1 { 2 } else { 1 };
+                assert_eq!(got.mismatches, want, "{tag} every {check_every}");
+            }
+            // The second hit is sampled only with check_every 1.
+            let second = poison(hit_pos[1]);
+            let got = batch_verify_native_actions_local_key_memo_with_mode(
+                &block,
+                TEST_NONCE,
+                |pk| sessions.get(pk).cloned(),
+                |k| second.get(k).copied(),
+                mode,
+                parallel_keys,
+                1,
+            );
+            assert_eq!((got.senders, got.sort_hashes), cold, "{tag}: every hit checked");
+            let got = batch_verify_native_actions_local_key_memo_with_mode(
+                &block,
+                TEST_NONCE,
+                |pk| sessions.get(pk).cloned(),
+                |k| second.get(k).copied(),
+                mode,
+                parallel_keys,
+                32,
+            );
+            assert_eq!((got.checked, got.mismatches), (1, 0), "{tag}: unsampled");
+            assert_eq!(got.sort_hashes[hit_pos[1]], B256::repeat_byte(0xEE), "{tag}: unsampled");
+            // check_every 0 disables the guard.
+            let got = batch_verify_native_actions_local_key_memo_with_mode(
+                &block,
+                TEST_NONCE,
+                |pk| sessions.get(pk).cloned(),
+                |k| first.get(k).copied(),
+                mode,
+                parallel_keys,
+                0,
+            );
+            assert_eq!((got.checked, got.mismatches), (0, 0), "{tag}: off");
+        }
+    }
+
+    #[test]
+    fn parse_local_trust_check_every_default_zero_and_counts() {
+        use super::{parse_local_trust_check_every as p, LOCAL_TRUST_CHECK_EVERY_DEFAULT as D};
+        assert_eq!(D, 32);
+        assert_eq!(p(None), D);
+        assert_eq!(p(Some(String::new())), D);
+        assert_eq!(p(Some("x".into())), D);
+        assert_eq!(p(Some("-1".into())), D);
+        assert_eq!(p(Some("0".into())), 0);
+        assert_eq!(p(Some(" 1 ".into())), 1);
+        assert_eq!(p(Some("64".into())), 64);
     }
 
     /// The memo contract: a hit is reused verbatim (sender AND sort hash:
@@ -3957,16 +4217,20 @@ mod tests {
             .map(|(i, k)| (*k, (Address::from([0xC0 + i as u8; 20]), B256::from([0xD0 + i as u8; 32]))))
             .collect();
         let seen = std::cell::RefCell::new(Vec::new());
-        let (senders, sorts) = batch_verify_native_actions_local_key_memo_with_mode(
-            &block,
-            TEST_NONCE,
-            |pk| sessions.get(pk).cloned(),
-            |k| {
-                seen.borrow_mut().push(*k);
-                sentinel.get(k).copied()
-            },
-            VerifyMode::Serial,
-        );
+        // check_every 0: the sentinels are not keccak(C), the guard would void them.
+        let LocalKeyMemoVerify { senders, sort_hashes: sorts, .. } =
+            batch_verify_native_actions_local_key_memo_with_mode(
+                &block,
+                TEST_NONCE,
+                |pk| sessions.get(pk).cloned(),
+                |k| {
+                    seen.borrow_mut().push(*k);
+                    sentinel.get(k).copied()
+                },
+                VerifyMode::Serial,
+                false,
+                0,
+            );
         let want_keys: Vec<B256> = block.iter().filter_map(crate::local_trust_key).collect();
         assert_eq!(*seen.borrow(), want_keys, "one lookup per EIP-712 action, in order");
         for (i, a) in block.iter().enumerate() {
@@ -3991,6 +4255,8 @@ mod tests {
             |pk| sessions.get(pk).cloned(),
             |k| wrong.get(k).copied(),
             VerifyMode::Serial,
+            false,
+            1,
         );
         let today = batch_verify_impl_keyed(
             &block,
@@ -4002,6 +4268,7 @@ mod tests {
             false,
             true,
         );
-        assert_eq!(got, today);
+        assert_eq!((got.senders, got.sort_hashes), today);
+        assert_eq!(got.hits, 0);
     }
 }

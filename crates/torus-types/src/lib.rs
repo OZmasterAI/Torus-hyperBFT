@@ -1485,7 +1485,7 @@ pub fn sort_hash_and_verified_cache_key_with_scratch(
     (sort_hash, Some(hasher.finalize()))
 }
 
-// ---- s80 keyed-local-trust-key (prototype, not wired into the node) ----
+// ---- s80 keyed-local-trust-key (node arm behind TORUS_S80_LOCAL_TRUST_KEY, default off) ----
 //
 // The trust-cache key is node-local (never on the wire or in state), so its
 // hash function is free. These are the SHA-256 forms of the trust key: the
@@ -1568,6 +1568,25 @@ pub fn local_trust_lookup_with_scratch(
         }
     }
     (None, alloy_primitives::keccak256(&data[..c_len]))
+}
+
+/// Pure parse of `TORUS_S80_LOCAL_TRUST_KEY`: only `"1"` (after trim)
+/// requests the SHA-256 local trust key; unset, empty or anything else keeps
+/// today's keccak trust key (exact 29bfc705 behaviour).
+pub fn parse_s80_local_trust_key(raw: Option<String>) -> bool {
+    raw.as_deref().map(str::trim) == Some("1")
+}
+
+/// `TORUS_S80_LOCAL_TRUST_KEY=1` read once per process.
+pub fn s80_local_trust_key_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_s80_local_trust_key(std::env::var("TORUS_S80_LOCAL_TRUST_KEY").ok()))
+}
+
+/// The node uses the SHA-256 local trust key only when it is requested AND
+/// the CPU has SHA-NI (without it SHA-256 is slower than keccak-asm).
+pub fn s80_local_trust_key_enabled() -> bool {
+    s80_local_trust_key_requested() && sha256_hw_accelerated()
 }
 
 /// Whether `sha2` takes its SHA-NI path on this CPU (the same CPUID test as

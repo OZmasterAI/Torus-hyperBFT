@@ -5153,7 +5153,46 @@ impl ExecutionContext {
             // Section 92 step 8e: the same pass returns each action's anti-MEV
             // sort hash (keccak of its canonical bytes), absorbed once with the
             // trust-cache key; the sort below takes it instead of re-hashing.
-            let (resolved_senders, verify_sort_hashes) = if has_native {
+            // s80 keyed-local-trust-key (TORUS_S80_LOCAL_TRUST_KEY, default
+            // off): with the trust-cache read on and the mempool's SHA-256 local
+            // cache on, the pass looks up `(sender, keccak256(C))` by the local
+            // key and needs no Keccak for a hit; a sampled re-hash of the memoized
+            // sort hash voids the memo for the block on a mismatch.
+            let local_trust = if has_native && self.exec_trust_cache {
+                self.mempool.as_ref().filter(|m| m.local_trust_enabled())
+            } else {
+                None
+            };
+            let (resolved_senders, verify_sort_hashes) = if let Some(m) = local_trust {
+                let out = torus_types::eip712::batch_verify_native_actions_local_key_memo(
+                    &torus_block.native_actions,
+                    block_ms,
+                    |pubkey| {
+                        let session = overlay.get_session(pubkey);
+                        #[cfg(test)]
+                        let session = if self.test_replay_fault == Some(ReplayFault::SessionRead) {
+                            Err(injected_fault("session read"))
+                        } else {
+                            session
+                        };
+                        session.unwrap_or_else(|e| {
+                            let _ = session_fault.set(e);
+                            None
+                        })
+                    },
+                    |key| m.local_trusted(key),
+                );
+                if out.mismatches > 0 {
+                    tracing::error!(
+                        height = torus_block.header.height,
+                        mismatches = out.mismatches,
+                        checked = out.checked,
+                        hits = out.hits,
+                        "s80 local trust memo: memoized sort hash differs from keccak(C); block ran uncached"
+                    );
+                }
+                (out.senders, out.sort_hashes)
+            } else if has_native {
                 torus_types::eip712::batch_verify_native_actions_cached_with_sort_hashes(
                     &torus_block.native_actions,
                     block_ms,
@@ -18472,6 +18511,98 @@ mod crash_recovery_tests {
             amount,
             "executed exactly once, correct debit"
         );
+    }
+
+    /// s80 keyed-local-trust-key (TORUS_S80_LOCAL_TRUST_KEY): a block with
+    /// two senders and a same-sender tie executes to the identical state with
+    /// (a) no mempool, (b) the keccak trust-cache warm, (c) the SHA-256 local
+    /// memo warm. (d) A POISONED memo (bogus sender AND sort hash on the
+    /// block's first hit, which the release-mode guard always samples) is
+    /// caught and the block runs uncached: the real senders are debited, the
+    /// bogus one never. (e) With `--exec-trust-cache` off the memo is never
+    /// read, even poisoned.
+    #[test]
+    fn local_trust_memo_execution_state_identical_and_poison_caught() {
+        let amount = U256::from(FixedPoint::ONE.raw() as u128);
+        let k1 = k256::ecdsa::SigningKey::from_slice(&[41u8; 32]).unwrap();
+        let k2 = k256::ecdsa::SigningKey::from_slice(&[42u8; 32]).unwrap();
+        let block_actions: Vec<SignedNativeAction> = vec![
+            torus_types::eip712::sign_native_action(
+                NativeAction::TransferToPerp { amount },
+                NONCE_BASE + 501,
+                &k1,
+            ),
+            torus_types::eip712::sign_native_action(
+                NativeAction::TransferToPerp { amount: amount * U256::from(2u8) },
+                NONCE_BASE + 502,
+                &k2,
+            ),
+            torus_types::eip712::sign_native_action(
+                NativeAction::TransferToPerp { amount: amount * U256::from(3u8) },
+                NONCE_BASE + 503,
+                &k1,
+            ),
+        ];
+        let senders: Vec<Address> =
+            block_actions.iter().map(|a| a.recover_sender().unwrap()).collect();
+        let start = amount * U256::from(10u8);
+        let bogus = Address::from([0xCE; 20]);
+        // (exec_trust_cache, mempool setup) -> balances of k1, k2, bogus.
+        let run = |trust: bool, mempool: Option<Arc<Mempool>>, db: StateDb, config: ChainConfig| {
+            let ctx = make_exec_ctx_with_mempool(&config, &db, mempool, trust);
+            fund_evm_balance(&db, senders[0], start);
+            fund_evm_balance(&db, senders[1], start);
+            ctx.execute_committed_block(&make_block(1, block_actions.clone()), vec![]);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            (
+                read_evm_balance(&db, senders[0]),
+                read_evm_balance(&db, senders[1]),
+                read_evm_balance(&db, bogus),
+            )
+        };
+        let seeded = |db: &StateDb, poison_first: bool| {
+            let m = Mempool::new(db.clone(), torus_mempool::MempoolConfig::default())
+                .with_local_trust_key(true);
+            for (i, a) in block_actions.iter().enumerate() {
+                let key = torus_types::local_trust_key(a).unwrap();
+                let sort = alloy_primitives::keccak256(a.action.canonical_bytes());
+                if poison_first && i == 0 {
+                    m.cache_local_trust(key, bogus, B256::repeat_byte(0xEE));
+                } else {
+                    m.cache_local_trust(key, senders[i], sort);
+                }
+                assert!(m.local_trusted(&key).is_some(), "precondition: warm memo");
+            }
+            Arc::new(m)
+        };
+        let want = (start - amount * U256::from(4u8), start - amount * U256::from(2u8), U256::ZERO);
+
+        let (config, db) = make_test_config_and_db();
+        assert_eq!(run(false, None, db, config), want, "(a) cold");
+
+        let (config, db) = make_test_config_and_db();
+        // Forced off: this arm is today's keccak trust-cache even when the
+        // suite runs with TORUS_S80_LOCAL_TRUST_KEY=1.
+        let keccak_warm = Arc::new(
+            Mempool::new(db.clone(), torus_mempool::MempoolConfig::default())
+                .with_local_trust_key(false),
+        );
+        for (a, s) in block_actions.iter().zip(&senders) {
+            keccak_warm.cache_verified_sender(torus_types::verified_cache_key(a).unwrap(), *s);
+        }
+        assert_eq!(run(true, Some(keccak_warm), db, config), want, "(b) keccak warm");
+
+        let (config, db) = make_test_config_and_db();
+        let local_warm = seeded(&db, false);
+        assert_eq!(run(true, Some(local_warm), db, config), want, "(c) local memo warm");
+
+        let (config, db) = make_test_config_and_db();
+        let poisoned = seeded(&db, true);
+        assert_eq!(run(true, Some(poisoned), db, config), want, "(d) poisoned memo caught");
+
+        let (config, db) = make_test_config_and_db();
+        let poisoned = seeded(&db, true);
+        assert_eq!(run(false, Some(poisoned), db, config), want, "(e) trust cache off");
     }
 
     /// T6: with `--exec-trust-cache` OFF (the default), the cache is never consulted

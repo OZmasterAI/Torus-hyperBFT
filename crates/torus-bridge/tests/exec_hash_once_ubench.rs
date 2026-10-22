@@ -159,20 +159,28 @@ fn exec_hash_once_ubench_new_path() {
 // lookup) + `sort_native_actions_indexed_with_sort_hashes`.
 // Arm `sha256`: `batch_verify_native_actions_local_key_memo` (encode C,
 // SHA-256(C||nonce||v||r||s), lookup -> (sender, keccak(C)); keccak only on a
-// miss) + the same sort with the memoized hashes.
+// miss and on every 32nd hit, the release-mode guard; the node's live entry
+// point, so `TORUS_S80_LOCAL_TRUST_KEY_CHECK_EVERY` and
+// `TORUS_EXEC_PARALLEL_KEYS` apply) + the same sort with the memoized hashes.
 //
 // Block shape (bench CL21): 60 actions = 37 PlaceOrderBatch x 400 + 23
 // CancelAllOrders. `tie_pct` = share of the places whose (category, sender)
 // sort key ties with another place (pairs of places from one sender).
 //
-// Arm `sha256-tieonly` (the no-memo alternative): SHA-256 key -> sender only;
-// keccak(C) is computed on E for the actions whose (category, sender) ties
-// with another action (only there can the hash change the order).
+// Arm `sha256-tieonly` (the rejected no-memo alternative): SHA-256 key ->
+// sender only; keccak(C) is computed on E for the actions whose (category,
+// sender) ties with another action (only there can the hash change the
+// order). Its other sort hashes are ZERO placeholders, which the sort's
+// debug_assert rejects: release-only (review issue 1), never in the
+// correctness test.
 // ============================================================================
 
 use std::sync::RwLock;
 use torus_bridge::native_executor::{classify_action, IndexedActions};
-use torus_types::eip712::batch_verify_native_actions_local_key_memo;
+use torus_types::eip712::{
+    batch_verify_native_actions_local_key_memo, batch_verify_native_actions_local_key_memo_with_mode,
+    VerifyMode,
+};
 
 const BENCH_PLACES: usize = 37;
 const BENCH_CANCELS: usize = 23;
@@ -233,11 +241,11 @@ fn bench_block(tie_pct: usize, salt: u64) -> Vec<SignedNativeAction> {
             &keys[signer],
         ));
     }
-    for i in 0..BENCH_CANCELS {
+    for (i, key) in keys.iter().enumerate().take(BENCH_CANCELS) {
         actions.push(sign_native_action(
             NativeAction::CancelAllOrders { market_id: Some((i * 13 % 300) as u64) },
             NOW + salt * 1000 + 500 + i as u64,
-            &keys[i],
+            key,
         ));
     }
     // Deterministic Fisher-Yates (the proposer's order is arbitrary).
@@ -306,20 +314,29 @@ fn e_path(
             |_| None,
             |k| caches.keccak.read().unwrap().get(k).copied(),
         ),
-        TrustKeyArm::Sha256 => batch_verify_native_actions_local_key_memo(
-            actions,
-            NOW,
-            |_| None,
-            |k| caches.memo.read().unwrap().get(k).copied(),
-        ),
+        TrustKeyArm::Sha256 => {
+            let out = batch_verify_native_actions_local_key_memo(
+                actions,
+                NOW,
+                |_| None,
+                |k| caches.memo.read().unwrap().get(k).copied(),
+            );
+            assert_eq!(out.mismatches, 0, "memo seeded from the same actions");
+            (out.senders, out.sort_hashes)
+        }
         TrustKeyArm::Sha256TieOnly => {
             // A hit carries no sort hash (ZERO placeholder); a miss hashes C.
-            let (senders, mut hashes) = batch_verify_native_actions_local_key_memo(
+            // The guard is off (check_every 0): it would void the placeholders.
+            let out = batch_verify_native_actions_local_key_memo_with_mode(
                 actions,
                 NOW,
                 |_| None,
                 |k| caches.local.read().unwrap().get(k).map(|s| (*s, B256::ZERO)),
+                VerifyMode::Default,
+                false,
+                0,
             );
+            let (senders, mut hashes) = (out.senders, out.sort_hashes);
             // keccak(C) only where (category, sender) ties: elsewhere the
             // hash cannot change the order.
             let mut groups: HashMap<(u8, Address), u32> = HashMap::with_capacity(actions.len());
@@ -373,12 +390,8 @@ fn trust_key_memo_arm_matches_keccak_arm_on_bench_blocks() {
         assert_eq!(h_s, h_k, "tie {tie_pct}%: sort hashes");
         assert_eq!(order_of(&sorted_s.0), order_of(&sorted_k.0), "tie {tie_pct}%: pre-EVM");
         assert_eq!(order_of(&sorted_s.1), order_of(&sorted_k.1), "tie {tie_pct}%: post-EVM");
-        // The tie-only arm: same senders and lists (its non-tie hashes are
-        // placeholders by design).
-        let (s_t, _, sorted_t, _, _) = e_path(TrustKeyArm::Sha256TieOnly, &actions, &caches);
-        assert_eq!(s_t, s_k, "tie {tie_pct}%: tie-only senders");
-        assert_eq!(order_of(&sorted_t.0), order_of(&sorted_k.0), "tie {tie_pct}%: tie-only pre");
-        assert_eq!(order_of(&sorted_t.1), order_of(&sorted_k.1), "tie {tie_pct}%: tie-only post");
+        // The tie-only arm (ZERO placeholders) is release-only: see
+        // `tie_only_arm_matches_in_release` and review issue 1.
         // Uncached ground truth.
         let fresh: Vec<(Address, NativeAction)> = actions
             .iter()
@@ -395,6 +408,36 @@ fn trust_key_memo_arm_matches_keccak_arm_on_bench_blocks() {
             .filter(|s| senders_post.iter().filter(|t| t == s).count() > 1)
             .count();
         assert_eq!(tied, 2 * tie_pairs(tie_pct), "tie {tie_pct}%: tied places");
+    }
+}
+
+/// The rejected tie-only arm sorts with ZERO placeholder hashes, which the
+/// sort's `debug_assert_eq!` (every hash == keccak(C)) rejects: in a dev or
+/// test profile build it panics (review issue 1: the old correctness test
+/// ran it and failed under plain `cargo nextest run`). Compiled only with
+/// debug assertions; it documents why the arm is release-only.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "is not keccak(canonical_bytes)")]
+fn tie_only_zero_placeholders_trip_the_sort_debug_assert() {
+    let actions = bench_block(0, 0);
+    let caches = seed_caches(&actions, 0);
+    let _ = e_path(TrustKeyArm::Sha256TieOnly, &actions, &caches);
+}
+
+/// The tie-only arm's senders and sorted lists equal the keccak arm's
+/// (release builds only: in debug its placeholders trip the debug_assert).
+#[cfg(not(debug_assertions))]
+#[test]
+fn tie_only_arm_matches_in_release() {
+    for tie_pct in [0usize, 20, 50] {
+        let actions = bench_block(tie_pct, tie_pct as u64);
+        let caches = seed_caches(&actions, 1_000);
+        let (s_k, _, sorted_k, _, _) = e_path(TrustKeyArm::Keccak, &actions, &caches);
+        let (s_t, _, sorted_t, _, _) = e_path(TrustKeyArm::Sha256TieOnly, &actions, &caches);
+        assert_eq!(s_t, s_k, "tie {tie_pct}%: tie-only senders");
+        assert_eq!(order_of(&sorted_t.0), order_of(&sorted_k.0), "tie {tie_pct}%: tie-only pre");
+        assert_eq!(order_of(&sorted_t.1), order_of(&sorted_k.1), "tie {tie_pct}%: tie-only post");
     }
 }
 
@@ -451,6 +494,13 @@ fn trust_key_ubench_bench_block() {
                 Keccak, Sha256TieOnly, Sha256TieOnly, Keccak, Keccak, Sha256TieOnly, // ABBA tie-only
             ]
         }
+    };
+    // The tie-only arm needs release (ZERO placeholders vs the sort's debug_assert).
+    let order: Vec<TrustKeyArm> = if cfg!(debug_assertions) {
+        println!("debug build: tie-only arm skipped (release-only)");
+        order.into_iter().filter(|a| *a != TrustKeyArm::Sha256TieOnly).collect()
+    } else {
+        order
     };
     let (k_mbs, s_mbs) = hash_throughput();
     println!(

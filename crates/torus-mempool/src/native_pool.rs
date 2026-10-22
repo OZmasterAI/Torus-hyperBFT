@@ -260,6 +260,10 @@ pub(crate) struct NativePoolEntry {
     /// commit-time restash is a lookup, not a canonical re-encode + keccak of
     /// every committed action on the consensus thread (~30 ms per commit).
     pub restash_key: Option<B256>,
+    /// s80 keyed-local-trust-key: `(local trust key, keccak256(C))`, stored at
+    /// insert under the same rule as `restash_key` (locally verified,
+    /// cacheable) and only while the local trust cache is on; restashed with it.
+    pub local_restash: Option<(B256, B256)>,
 }
 
 /// Native action pool with per-sender tracking, dedup, and size limits.
@@ -368,6 +372,23 @@ impl NativePool {
         out
     }
 
+    /// s80 keyed-local-trust-key: [`Self::verified_restash_keys`] for the
+    /// local trust cache: `(local key, sender, keccak256(C))` per committed
+    /// hash still pooled with a stored `local_restash`.
+    pub fn verified_local_restash(&self, hashes: &[B256]) -> Vec<(B256, Address, B256)> {
+        let mut out = Vec::new();
+        for h in hashes {
+            if let Some(key) = self.hash_index.get(h).and_then(|keys| keys.first()) {
+                if let Some(entry) = self.entries.get(key) {
+                    if let Some((local, sort_hash)) = entry.local_restash {
+                        out.push((local, entry.sender, sort_hash));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Insert a native action with a known sender.
     ///
     /// Checks: dedup by (sender, action_hash), per-sender pool cap, total pool cap.
@@ -410,6 +431,19 @@ impl NativePool {
         sender: Address,
         action: SignedNativeAction,
         restash_key: Option<B256>,
+    ) -> Result<B256, MempoolError> {
+        self.insert_with_restash_keys(sender, action, restash_key, None)
+    }
+
+    /// [`Self::insert_with_restash_key`] that also stores the s80 local trust
+    /// restash pair (`Some` only for a locally verified, cacheable action
+    /// while the local trust cache is on).
+    pub fn insert_with_restash_keys(
+        &mut self,
+        sender: Address,
+        action: SignedNativeAction,
+        restash_key: Option<B256>,
+        local_restash: Option<(B256, B256)>,
     ) -> Result<B256, MempoolError> {
         let action_hash = compute_action_hash(&action);
         let priority = priority_class(&action.action);
@@ -490,6 +524,7 @@ impl NativePool {
                 priority,
                 encoded_len,
                 restash_key,
+                local_restash,
             },
         );
         self.priority_count += usize::from(priority != PRIO_NORMAL);

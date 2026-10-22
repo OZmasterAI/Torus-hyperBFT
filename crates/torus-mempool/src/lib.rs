@@ -264,6 +264,16 @@ pub struct Mempool {
     /// fork. DO NOT unify the two keys. MISS => full recover + slash. See
     /// `docs/plans/double-verify-trust-cache-impl.md`.
     verified_senders: RwLock<FifoCache<B256, Address>>,
+    /// s80 keyed-local-trust-key (`TORUS_S80_LOCAL_TRUST_KEY=1` on a SHA-NI
+    /// CPU; `None` = off, exact 29bfc705 behaviour): the second exec
+    /// trust-cache, keyed by `torus_types::local_trust_key` (SHA-256 of the
+    /// same preimage as `verified_cache_key`, same session exclusion) and
+    /// holding `(sender, keccak256(C))`, both derived in ONE call from the
+    /// same action at the same two seed points as `verified_senders`
+    /// (verified insert, commit-time restash). The exec thread then needs no
+    /// Keccak for a hit; a sampled re-hash guards the memoized sort hash
+    /// (`TORUS_S80_LOCAL_TRUST_KEY_CHECK_EVERY`).
+    local_trust: Option<RwLock<FifoCache<B256, (Address, B256)>>>,
     /// s65 item B: `(time, native actions committed)` per commit over the last
     /// [`rate_limit::ADMISSION_RATE_WINDOW_MS`] — the rate the admission limit
     /// follows.
@@ -299,6 +309,13 @@ impl Mempool {
         // Every native-action body the mempool sees is mirrored to the DA
         // store durably (decoupled from the nonce gate).
         let verified_cap = config.verified_sender_cache_cap;
+        let local_trust_on = torus_types::s80_local_trust_key_enabled();
+        tracing::info!(
+            requested = torus_types::s80_local_trust_key_requested(),
+            sha_ni = torus_types::sha256_hw_accelerated(),
+            check_every = torus_types::eip712::local_trust_check_every(),
+            "TORUS_S80_LOCAL_TRUST_KEY on={local_trust_on}"
+        );
         let initial_base_fee = config.initial_base_fee;
         let initial_evm_gas_limit = config.block_gas_limit;
         Self {
@@ -327,6 +344,7 @@ impl Mempool {
             native_gossip_enabled: std::sync::atomic::AtomicBool::new(false),
             metrics: std::sync::OnceLock::new(),
             verified_senders: RwLock::new(FifoCache::new(verified_cap)),
+            local_trust: local_trust_on.then(|| RwLock::new(FifoCache::new(verified_cap))),
             native_commit_log: std::sync::Mutex::new(std::collections::VecDeque::new()),
             exec_backlog: exec_backlog::ExecBacklog::default(),
             addr_limiter: std::sync::OnceLock::new(),
@@ -598,6 +616,93 @@ impl Mempool {
             }
         }
         result
+    }
+
+    /// s80 keyed-local-trust-key: turn the SHA-256 local trust cache on or
+    /// off (empty) regardless of the env flag. Before the mempool is shared;
+    /// tests and benches.
+    pub fn with_local_trust_key(mut self, on: bool) -> Self {
+        let cap = self.config.verified_sender_cache_cap;
+        self.local_trust = on.then(|| RwLock::new(FifoCache::new(cap)));
+        self
+    }
+
+    /// Whether the SHA-256 local trust cache is on (the exec thread then
+    /// reads [`Self::local_trusted`] instead of [`Self::verified_sender`]).
+    pub fn local_trust_enabled(&self) -> bool {
+        self.local_trust.is_some()
+    }
+
+    /// Exec read of the local trust cache: `(sender, keccak256(C))` seeded by
+    /// this node's verified ingress for the byte-identical `(C, nonce, sig)`.
+    /// `None` on a miss or with the cache off. Same hit/miss counters as
+    /// [`Self::verified_sender`].
+    pub fn local_trusted(&self, key: &B256) -> Option<(Address, B256)> {
+        let cache = self.local_trust.as_ref()?;
+        let result = cache.read().ok().and_then(|c| c.get(key).copied());
+        if let Some(m) = self.metrics.get() {
+            if result.is_some() {
+                m.verified_sender_cache_hits.inc();
+            } else {
+                m.verified_sender_cache_misses.inc();
+            }
+        }
+        result
+    }
+
+    /// Seed the local trust cache. `key`, `sender` and `sort_hash` come from
+    /// one locally verified action (`local_trust_seed`), never from a peer.
+    /// Public like [`Self::cache_verified_sender`] so tests can seed and
+    /// poison it; only the verified insert and the restash call it.
+    pub fn cache_local_trust(&self, key: B256, sender: Address, sort_hash: B256) {
+        let Some(cache) = self.local_trust.as_ref() else { return };
+        let evicted = match cache.write() {
+            Ok(mut c) => c.insert(key, (sender, sort_hash)),
+            Err(_) => return,
+        };
+        if evicted > 0 {
+            if let Some(m) = self.metrics.get() {
+                m.verified_sender_cache_evictions.inc_by(evicted);
+            }
+        }
+    }
+
+    /// The keccak trust-cache key (`verified_cache_key`) and, with the s80
+    /// local trust cache on, keccak256(C) forked from the SAME sponge pass
+    /// (`sort_hash_and_verified_cache_key_with_scratch`, the function the
+    /// exec keccak path uses), so the memo adds no Keccak at ingress.
+    fn trust_keys(&self, action: &SignedNativeAction) -> (Option<B256>, Option<B256>) {
+        if self.local_trust.is_none() {
+            return (torus_types::verified_cache_key(action), None);
+        }
+        let (sort_hash, key) =
+            torus_types::sort_hash_and_verified_cache_key_with_scratch(action, &mut Vec::new());
+        (key, key.map(|_| sort_hash))
+    }
+
+    /// `(local key, keccak256(C))` for an action this node verified
+    /// (`cache_key` is `Some` exactly then, see `submit_native_action_inner`)
+    /// while the local cache is on. `local_sort` is keccak256(C) of this same
+    /// action from `trust_keys`; without it both come from one call here.
+    fn local_trust_seed(
+        &self,
+        action: &SignedNativeAction,
+        cache_key: Option<B256>,
+        local_sort: Option<B256>,
+    ) -> Option<(B256, B256)> {
+        if self.local_trust.is_none() || cache_key.is_none() {
+            return None;
+        }
+        let mut scratch = Vec::new();
+        match local_sort {
+            Some(sort_hash) => torus_types::local_trust_key_with_scratch(action, &mut scratch)
+                .map(|k| (k, sort_hash)),
+            None => {
+                let (sort_hash, key) =
+                    torus_types::sort_hash_and_local_trust_key_with_scratch(action, &mut scratch);
+                key.map(|k| (k, sort_hash))
+            }
+        }
     }
 
     /// Enable or disable native action gossip at runtime.
@@ -1300,8 +1405,9 @@ impl Mempool {
     ) -> Result<(), MempoolError> {
         self.mirror_to_da(&action);
         // `None` for session actions. Computed once: it is both the dedup
-        // lookup below and the key the pool insert seeds (s77).
-        let cache_key = torus_types::verified_cache_key(&action);
+        // lookup below and the key the pool insert seeds (s77). With the s80
+        // local trust cache on, the same sponge pass also yields keccak(C).
+        let (cache_key, local_sort) = self.trust_keys(&action);
         let verified_sender = match &action.signature {
             torus_types::ActionSignature::Eip712(_) => {
                 // T2.1 fast-path: dedup against the verified-sender trust
@@ -1335,7 +1441,7 @@ impl Mempool {
         }
         // This node re-derived the sender from the signature above -> locally
         // verified, so the entry may seed the exec trust-cache.
-        self.admit_gossip(claimed_sender, action, cache_key)
+        self.admit_gossip(claimed_sender, action, cache_key, local_sort)
     }
 
     pub fn add_native_action_from_gossip_trusted(
@@ -1352,7 +1458,7 @@ impl Mempool {
         self.mirror_to_da(&action);
         // Sender is CLAIMED by the peer and NOT re-derived here -> not locally
         // verified; must never be short-circuited at exec.
-        self.admit_gossip(sender, action, None)
+        self.admit_gossip(sender, action, None, None)
     }
 
     /// Shared gossip admission: nonce-window gate + batch-size guard + pool insert
@@ -1368,6 +1474,7 @@ impl Mempool {
         sender: alloy_primitives::Address,
         action: SignedNativeAction,
         cache_key: Option<B256>,
+        local_sort: Option<B256>,
     ) -> Result<(), MempoolError> {
         // G1 defensive layer (O2): an oversize/empty batch must never enter
         // the POOL (an honest node must never SELECT it into a proposal). It
@@ -1394,7 +1501,7 @@ impl Mempool {
                 "nonce too far in future".into(),
             ));
         }
-        let result = self.submit_native_action_inner(sender, action, cache_key);
+        let result = self.submit_native_action_inner(sender, action, cache_key, local_sort);
         if let (Err(MempoolError::UnfundedSender { .. }), Some(m)) = (&result, self.metrics.get()) {
             m.native_gossip_admit_rejects
                 .get_or_create(&vec![("reason".into(), "unfunded".into())])
@@ -1441,8 +1548,8 @@ impl Mempool {
         sender: alloy_primitives::Address,
         action: SignedNativeAction,
     ) -> Result<(), MempoolError> {
-        let cache_key = torus_types::verified_cache_key(&action);
-        self.submit_native_action_inner(sender, action, cache_key)
+        let (cache_key, local_sort) = self.trust_keys(&action);
+        self.submit_native_action_inner(sender, action, cache_key, local_sort)
     }
 
     /// Native insert with explicit provenance. `cache_key` is `Some` only when
@@ -1450,11 +1557,15 @@ impl Mempool {
     /// or gossip-RECOVER): it is that action's `verified_cache_key`, which seeds
     /// the exec trust-cache. It is `None` for non-EIP-712 (session) actions and for
     /// gossip-TRUSTED admits, which are never short-circuited at exec.
+    ///
+    /// `local_sort` (s80) is keccak256(C) from the same sponge pass as
+    /// `cache_key` (`trust_keys`), `None` when the local trust cache is off.
     fn submit_native_action_inner(
         &self,
         sender: alloy_primitives::Address,
         action: SignedNativeAction,
         cache_key: Option<B256>,
+        local_sort: Option<B256>,
     ) -> Result<(), MempoolError> {
         // A registered validator's duty actions (and its oracle signer's
         // price submissions) skip item A and are not counted by item B (the
@@ -1467,6 +1578,8 @@ impl Mempool {
         // validator or its registered hot signer may pool one, at most
         // ORACLE_PENDING_PER_VALIDATOR per validator (own address + signer).
         // Every insert path (RPC, presigned, gossip recover/trusted) ends here.
+        // s80: outside the pool lock, before the action moves into the pool.
+        let local_seed = self.local_trust_seed(&action, cache_key, local_sort);
         let oracle_accounts = if crate::native_pool::is_oracle_submission(&action.action) {
             match self.oracle_reporter(&sender) {
                 Some(accounts) => Some(accounts),
@@ -1501,7 +1614,7 @@ impl Mempool {
                     self.record_oracle_dropped("replaced_by_newer", 1);
                 }
             }
-            let result = pool.insert_with_restash_key(sender, action, cache_key);
+            let result = pool.insert_with_restash_keys(sender, action, cache_key, local_seed);
             self.publish_native_pool_size(&pool);
             // A full pool refuses an oracle submission only when no normal
             // entry or cancel is left to evict (oracle submissions never
@@ -1522,6 +1635,9 @@ impl Mempool {
         // never pollutes the cache.
         if let Some(key) = cache_key {
             self.cache_verified_sender(key, sender);
+        }
+        if let Some((key, sort_hash)) = local_seed {
+            self.cache_local_trust(key, sender, sort_hash);
         }
         tracing::debug!(%sender, "native action added to mempool");
         Ok(())
@@ -2154,12 +2270,20 @@ impl Mempool {
     /// already held — no extra locking). The gauge is updated here under the
     /// same lock; callers must not republish this snapshot after it is released.
     pub fn remove_committed_native(&self, hashes: &[B256]) -> usize {
-        let restash = {
+        let (restash, local_restash) = {
             let pool = self.native.read().unwrap();
-            pool.verified_restash_keys(hashes)
+            let local = if self.local_trust.is_some() {
+                pool.verified_local_restash(hashes)
+            } else {
+                Vec::new()
+            };
+            (pool.verified_restash_keys(hashes), local)
         };
         for (key, sender) in restash {
             self.cache_verified_sender(key, sender);
+        }
+        for (key, sender, sort_hash) in local_restash {
+            self.cache_local_trust(key, sender, sort_hash);
         }
         let mut pool = self.native.write().unwrap();
         pool.remove_committed(hashes);
@@ -3448,6 +3572,99 @@ mod tests {
             None,
             "gossip-trusted must NOT seed the trust-cache (verified_locally=false)"
         );
+    }
+
+    /// s80 keyed-local-trust-key (review issue 3): the local trust cache is
+    /// seeded through every path that seeds the keccak trust-cache, and only
+    /// those, with exactly `(recover_sender, keccak256(C))` under
+    /// `local_trust_key`: presigned ingress, the public verified submit,
+    /// gossip-recover, the commit-time restash after the entry was churned
+    /// out; never gossip-trusted. Off (the test default: env unset) it stays
+    /// empty and the keccak cache is unchanged.
+    #[test]
+    fn local_trust_seeded_on_every_verified_path_with_ground_truth() {
+        fn truth(a: &SignedNativeAction) -> (B256, (Address, B256)) {
+            (
+                torus_types::local_trust_key(a).expect("eip712"),
+                (
+                    a.recover_sender().unwrap(),
+                    alloy_primitives::keccak256(a.action.canonical_bytes()),
+                ),
+            )
+        }
+        let k = k256::ecdsa::SigningKey::from_slice(
+            &alloy_primitives::hex::decode(
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let base = now_ms();
+        let batch = |n: u64| {
+            torus_types::NativeAction::PlaceOrderBatch(
+                (0..n)
+                    .map(|j| torus_types::PlaceOrderParams {
+                        market_id: j % 3,
+                        is_buy: j % 2 == 0,
+                        price: torus_types::FixedPoint::from_raw(1_000_000 + j as i128),
+                        quantity: torus_types::FixedPoint::from_raw(10 + j as i128),
+                        order_type: torus_types::OrderType::Limit,
+                        time_in_force: torus_types::TimeInForce::GTC,
+                        reduce_only: false,
+                        client_order_id: None,
+                    })
+                    .collect(),
+            )
+        };
+        for on in [false, true] {
+            let (_dir, state) = setup();
+            let config = MempoolConfig { verified_sender_cache_cap: 4, ..MempoolConfig::default() };
+            let pool = Mempool::new(state, config);
+            // Off unless TORUS_S80_LOCAL_TRUST_KEY=1 on a SHA-NI CPU.
+            assert_eq!(pool.local_trust_enabled(), torus_types::s80_local_trust_key_enabled());
+            let pool = pool.with_local_trust_key(on);
+            assert_eq!(pool.local_trust_enabled(), on);
+            let sign = |i: u64, action: torus_types::NativeAction| {
+                torus_types::eip712::sign_native_action(action, base + i, &k)
+            };
+            let expect = |a: &SignedNativeAction, seeded: bool, what: &str| {
+                let (key, val) = truth(a);
+                let want = (on && seeded).then_some(val);
+                assert_eq!(pool.local_trusted(&key), want, "on={on}: {what}");
+                // The keccak trust-cache is the same with the flag on or off.
+                let kk = torus_types::verified_cache_key(a).unwrap();
+                assert_eq!(pool.verified_sender(&kk), seeded.then_some(val.0), "on={on}: {what} keccak");
+            };
+            // (a) presigned ingress.
+            let a1 = sign(1, batch(3));
+            pool.add_native_action_presigned(a1.recover_sender().unwrap(), a1.clone()).unwrap();
+            expect(&a1, true, "presigned");
+            // (b) the public verified submit.
+            let a2 = sign(2, batch(7));
+            pool.submit_native_action(a2.recover_sender().unwrap(), a2.clone()).unwrap();
+            expect(&a2, true, "submit_native_action");
+            // (c) gossip recover.
+            let a3 = sign(3, torus_types::NativeAction::CancelAllOrders { market_id: Some(2) });
+            pool.add_native_action_from_gossip(a3.recover_sender().unwrap(), a3.clone()).unwrap();
+            expect(&a3, true, "gossip recover");
+            // (d) gossip trusted: never.
+            let a4 = sign(4, batch(2));
+            pool.add_native_action_from_gossip_trusted(a4.recover_sender().unwrap(), a4.clone())
+                .unwrap();
+            expect(&a4, false, "gossip trusted");
+            // (e) restash: churn a1 out of both caches (cap 4), commit it.
+            for i in 0..6u64 {
+                let o = sign(100 + i, torus_types::NativeAction::ClaimRewards);
+                pool.add_native_action_presigned(o.recover_sender().unwrap(), o).unwrap();
+            }
+            let (key1, _) = truth(&a1);
+            assert_eq!(pool.local_trusted(&key1), None, "on={on}: churned out");
+            let hash1 = torus_types::compute_action_hash(&a1);
+            let hash4 = torus_types::compute_action_hash(&a4);
+            pool.remove_committed_native(&[hash1, hash4]);
+            expect(&a1, true, "restash");
+            expect(&a4, false, "trusted entry is not restashed");
+        }
     }
 
     #[test]

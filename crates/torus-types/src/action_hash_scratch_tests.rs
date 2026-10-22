@@ -936,14 +936,43 @@ fn local_trust_key_commits_each_signature_field_and_the_body() {
     }
 }
 
+/// Review issue 4: the old test re-implemented `sha256_hw_accelerated` and
+/// compared the two (a tautology). This one checks what matters for the key:
+/// the SHA-256 backend `sha2` dispatches to on THIS CPU (SHA-NI here; which
+/// backend runs is only evidenced by throughput, see the report) returns the
+/// FIPS 180-2 answers, on short input and on input long enough to run the
+/// block loop many times, through the same `sha2::Sha256::digest` the trust
+/// key uses.
 #[test]
-fn sha256_backend_report_is_consistent_with_cpuid() {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        let cpuid = std::arch::is_x86_feature_detected!("sha")
-            && std::arch::is_x86_feature_detected!("sse2")
-            && std::arch::is_x86_feature_detected!("ssse3")
-            && std::arch::is_x86_feature_detected!("sse4.1");
-        assert_eq!(sha256_hw_accelerated(), cpuid);
-    }
+fn sha256_known_answers_on_this_cpus_backend() {
+    use sha2::Digest;
+    let kat = |data: &[u8]| B256::from_slice(&sha2::Sha256::digest(data));
+    assert_eq!(
+        kat(b""),
+        alloy_primitives::b256!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    );
+    assert_eq!(
+        kat(b"abc"),
+        alloy_primitives::b256!("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    );
+    assert_eq!(
+        kat(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+        alloy_primitives::b256!("248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+    );
+    assert_eq!(
+        kat(&vec![b'a'; 1_000_000]),
+        alloy_primitives::b256!("cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0")
+    );
+    // `sha256_hw_accelerated` only reports CPUID; it never changes a key.
+    let _ = sha256_hw_accelerated();
+}
+
+#[test]
+fn parse_s80_local_trust_key_only_one_enables() {
+    assert!(!parse_s80_local_trust_key(None));
+    assert!(!parse_s80_local_trust_key(Some(String::new())));
+    assert!(!parse_s80_local_trust_key(Some("0".into())));
+    assert!(!parse_s80_local_trust_key(Some("true".into())));
+    assert!(parse_s80_local_trust_key(Some("1".into())));
+    assert!(parse_s80_local_trust_key(Some(" 1\n".into())));
 }
