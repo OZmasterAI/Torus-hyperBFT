@@ -265,6 +265,11 @@ fn rpc_only_node_catches_up_and_follows_through_one_bootstrap_peer() {
     // ...and follows, twice: V0 executes blocks beyond both nodes' previous
     // heights (so a stalled chain fails here), then R reaches that new height.
     let mut prev = target;
+    // PROBE (not committed): freeze the chain.
+    for p in [v0.child.id(), v1.child.id()] {
+        Command::new("kill").args(["-STOP", &p.to_string()]).status().unwrap();
+    }
+    std::thread::sleep(Duration::from_secs(2));
     for round in 0..2 {
         prev = prev
             .max(v0.executed_height().unwrap_or(0))
