@@ -4724,6 +4724,8 @@ impl BorshDeserialize for OrderBook {
             instance: BookInstance::fresh(),
             log_drains: 0,
             saved_bbo: None,
+            order_events: None,
+            cancel_cause: OrderEventReason::User,
         };
 
         for _ in 0..order_count {
