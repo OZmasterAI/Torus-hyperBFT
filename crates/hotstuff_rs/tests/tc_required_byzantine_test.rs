@@ -804,7 +804,6 @@ struct PrecommitWindowLog {
 /// newer than the lock (the `safe_pc` lock clause), so n2 never votes for U again and no later view
 /// reaches the quorum: the window livelocks. Deterministic: n2's lock alone blocks every quorum.
 #[test]
-#[ignore = "RED (s138): the window livelocks (D1 at the Precommit stage); a fix changes the lock clause, a vote rule"]
 fn validator_set_update_survives_a_silent_leader_after_the_precommit_pc() {
     let mut cluster = Cluster::new();
     let down = 3;
