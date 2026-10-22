@@ -148,3 +148,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 proptest = "1"
 criterion = "0.5"
 tempfile = "3"
+
+[patch.crates-io]
+libp2p-swarm = { path = "diag-vendor/libp2p-swarm" }
