@@ -147,6 +147,7 @@ fn write_rows<T: StateBackend>(ctx: &NativeExecContext<T>, rng: &mut Lcg, h: u64
                     realized_pnl: FixedPoint::ZERO,
                     isolated_margin: FixedPoint::ZERO,
                     margin_type: MarginType::Cross,
+                    funding: None,
                 });
                 pm.put_position(&pos).unwrap();
             }
@@ -181,6 +182,7 @@ fn write_rows<T: StateBackend>(ctx: &NativeExecContext<T>, rng: &mut Lcg, h: u64
                     realized_pnl: FixedPoint::ZERO,
                     isolated_margin: FixedPoint::ZERO,
                     margin_type: MarginType::Cross,
+                    funding: None,
                 };
                 let mut row = borsh::to_vec(&p).unwrap();
                 row[1 + 20 + 8] = 2;

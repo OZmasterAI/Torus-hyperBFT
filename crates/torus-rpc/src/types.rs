@@ -254,6 +254,21 @@ pub fn dec_fp(v: FixedPoint) -> String {
     v.to_string()
 }
 
+/// Funding engine: a value scaled 1e18 (`torus_core::funding::INDEX_SCALE`)
+/// as a decimal string, trailing zeros trimmed (`-0.0000125`, `6`).
+pub fn dec_e18(v: i128) -> String {
+    let neg = v < 0;
+    let a = v.unsigned_abs();
+    let (int, frac) = (a / 1_000_000_000_000_000_000, a % 1_000_000_000_000_000_000);
+    let mut out = format!("{}{int}", if neg { "-" } else { "" });
+    if frac != 0 {
+        let f = format!("{frac:018}");
+        out.push('.');
+        out.push_str(f.trim_end_matches('0'));
+    }
+    out
+}
+
 // ============================================================================
 // Torus Native RPC Response Types
 // ============================================================================
@@ -289,6 +304,11 @@ pub struct RpcPosition {
     /// mark of this market crosses maintenance (docs/api/position.md).
     /// Isolated: the simplified `entry ∓ isolated margin / size` estimate.
     pub liquidation_price: Option<String>,
+    /// Funding engine: funding since the position opened, settled + pending
+    /// (positive = paid). Omitted for a position without funding state
+    /// (the feature off, or not touched since its market got a funding row).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub funding_since_open: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -427,6 +447,29 @@ pub struct RpcOpenInterest {
     pub market_id: String,
     pub long_oi: String,
     pub short_oi: String,
+}
+
+/// Funding engine (`torus_getFundingRate`): one market's funding state.
+/// Rates are per funding interval, decimal fractions (0.0001 = 0.01%).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcFundingRate {
+    pub market_id: String,
+    /// The market has a funding row (the feature ran for it).
+    pub active: bool,
+    /// The rate the current interval would pay now (its samples so far).
+    pub predicted_rate: String,
+    /// The rate of the last settlement.
+    pub last_rate: String,
+    /// Cumulative funding per unit of base (quote).
+    pub cum_index: String,
+    pub interval_secs: u64,
+    /// Block time the current interval settles at (first block at or after).
+    pub next_funding_time: u64,
+    /// Block time of the last settlement (0 = none yet).
+    pub last_funding_time: u64,
+    /// Premium samples in the current interval.
+    pub samples: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

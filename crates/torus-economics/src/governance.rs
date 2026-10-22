@@ -693,11 +693,21 @@ impl ProposalSnapshot {
 #[derive(Clone)]
 pub struct GovernanceManager<T: StateBackend = StateDb> {
     state: T,
+    /// Funding engine (P0.0 `funding_engine`): accept the funding keys
+    /// (`torus_types::FUNDING_PARAMS`). The executor sets it from the block's
+    /// feature bits before submitting or executing proposals; off (the
+    /// default), they are refused as on main (`ParameterNotModifiable`).
+    funding_keys: bool,
 }
 
 impl<T: StateBackend> GovernanceManager<T> {
     pub fn new(state: T) -> Self {
-        Self { state }
+        Self { state, funding_keys: false }
+    }
+
+    /// Funding engine: accept the funding keys from now on (see the field).
+    pub fn set_funding_keys(&mut self, on: bool) {
+        self.funding_keys = on;
     }
 
     pub fn state(&self) -> &T {
@@ -733,6 +743,26 @@ impl<T: StateBackend> GovernanceManager<T> {
     /// read (MM is half the IM, leverage is per market, no liquidation
     /// penalty by design), so a vote changed nothing; they are now refused
     /// as not modifiable.
+    /// [`Self::validate_param_change`], plus the funding keys while they are
+    /// accepted ([`Self::set_funding_keys`]): a decimal u64 in the key's
+    /// range (`torus_types::FUNDING_PARAMS`).
+    fn validate_param(&self, key: &str, value: &str) -> Result<()> {
+        if let Some((_, range)) = torus_types::funding_param(key).filter(|_| self.funding_keys) {
+            let v: u64 = value.parse().map_err(|_| EconomicsError::InvalidParameterValue {
+                key: key.to_string(),
+                reason: "must be a valid u64".to_string(),
+            })?;
+            if !range.contains(&v) {
+                return Err(EconomicsError::InvalidParameterValue {
+                    key: key.to_string(),
+                    reason: format!("must be between {} and {}", range.start(), range.end()),
+                });
+            }
+            return Ok(());
+        }
+        Self::validate_param_change(key, value)
+    }
+
     fn validate_param_change(key: &str, value: &str) -> Result<()> {
         match key {
             "voting_period_blocks" => {
@@ -940,7 +970,7 @@ impl<T: StateBackend> GovernanceManager<T> {
             ref new_value,
         }) = execution_payload
         {
-            Self::validate_param_change(param_key, new_value)?;
+            self.validate_param(param_key, new_value)?;
         }
 
         // An explicit (nonzero) listing id must not collide with a live market.
@@ -1383,7 +1413,7 @@ impl<T: StateBackend> GovernanceManager<T> {
                 new_value,
             } => {
                 // FIX 13: Validate parameter change at execution time (defense-in-depth).
-                Self::validate_param_change(param_key, new_value)?;
+                self.validate_param(param_key, new_value)?;
                 match Self::with_governance_param(params, param_key, new_value)? {
                     // s99: one write of the whole record governance reads.
                     Some(updated) => {

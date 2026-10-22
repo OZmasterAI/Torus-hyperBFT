@@ -128,14 +128,16 @@ impl UserState {
     /// row has a fixed size).
     fn footprint(&self) -> (usize, usize) {
         let (n, b, v) = (self.positions.len(), usize::from(self.balance.is_some()), usize::from(self.cum_volume.is_some()));
-        (n + b + v, n * (KEY + POSITION_V2_LEN) + b * (TRADER + BALANCE_LEN) + v * (CVLM_KEY + VOLUME_LEN))
+        // Funding engine: a v3 row (funding state) is longer than a v2 one.
+        let pos_bytes: usize = self.positions.iter().map(|p| KEY + p.encoded_len()).sum();
+        (n + b + v, pos_bytes + b * (TRADER + BALANCE_LEN) + v * (CVLM_KEY + VOLUME_LEN))
     }
 
     /// `t`'s rows of both CFs, as R holds them.
     fn raw(&self, t: &Address) -> RawRows {
         let mut out = RawRows::default();
         for p in &self.positions {
-            out.positions.insert([t.as_slice(), &p.market_id.to_be_bytes()].concat(), encode(p, POSITION_V2_LEN));
+            out.positions.insert([t.as_slice(), &p.market_id.to_be_bytes()].concat(), encode(p, p.encoded_len()));
         }
         if let Some(b) = &self.balance {
             out.balances.insert(t.to_vec(), encode(b, BALANCE_LEN));
@@ -238,13 +240,13 @@ fn decode(key: &[u8], value: &[u8]) -> Option<Position> {
         return None;
     }
     let p = Position::try_from_slice(value).ok()?;
-    // The decode reads exactly the row's bytes (version 2, every field fixed
-    // width) and every field but the two flags raw, so the row re-encodes
-    // to itself iff both flags hold 0 or 1.
-    let canonical = value.len() == POSITION_V2_LEN
+    // The decode reads exactly the row's bytes (version 2, or 3 with the
+    // funding tail; every field fixed width) and every field but the two
+    // flags raw, so the row re-encodes to itself iff both flags hold 0 or 1.
+    let canonical = value.len() == p.encoded_len()
         && value[IS_LONG_AT] == u8::from(p.is_long)
         && value[MARGIN_TYPE_AT] == p.margin_type as u8;
-    debug_assert_eq!(canonical, encode(&p, POSITION_V2_LEN) == value, "position re-encode check");
+    debug_assert_eq!(canonical, encode(&p, p.encoded_len()) == value, "position re-encode check");
     (canonical && p.trader.as_slice() == &key[..TRADER] && p.market_id.to_be_bytes() == key[TRADER..]).then_some(p)
 }
 
@@ -997,7 +999,7 @@ impl UsersMut<'_> {
         let users = &mut *self.users;
         users.dirty.positions.insert((t, m));
         if users.opaque_of(&t).is_some() {
-            let v = encode(&p, POSITION_V2_LEN);
+            let v = encode(&p, p.encoded_len());
             users.reload(
                 t,
                 &[(&position_key(&t, m), Some(&v))],
@@ -1170,7 +1172,7 @@ impl<'a> Row<'a> {
     fn value(self) -> Cow<'a, [u8]> {
         match self {
             Self::Raw(v) => Cow::Borrowed(v),
-            Self::Position(p) => Cow::Owned(encode(p, POSITION_V2_LEN)),
+            Self::Position(p) => Cow::Owned(encode(p, p.encoded_len())),
             Self::Balance(b) => Cow::Owned(encode(b, BALANCE_LEN)),
             Self::Volume(v) => Cow::Owned(v.raw().to_be_bytes().to_vec()),
         }
@@ -1180,7 +1182,7 @@ impl<'a> Row<'a> {
     fn len(self) -> usize {
         match self {
             Self::Raw(v) => v.len(),
-            Self::Position(_) => POSITION_V2_LEN,
+            Self::Position(p) => p.encoded_len(),
             Self::Balance(_) => BALANCE_LEN,
             Self::Volume(_) => VOLUME_LEN,
         }

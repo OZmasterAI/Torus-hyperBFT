@@ -3396,12 +3396,12 @@ impl OrderBook {
 impl OrderBook {
     /// Bid price levels ascending (the whole-book serializer's walk order),
     /// each with its FIFO queue (front = highest time priority).
-    pub fn bid_queues(&self) -> impl Iterator<Item = (&FixedPoint, &VecDeque<Order>)> {
+    pub fn bid_queues(&self) -> impl DoubleEndedIterator<Item = (&FixedPoint, &VecDeque<Order>)> {
         self.bids.iter()
     }
 
     /// Ask price levels ascending, each with its FIFO queue.
-    pub fn ask_queues(&self) -> impl Iterator<Item = (&FixedPoint, &VecDeque<Order>)> {
+    pub fn ask_queues(&self) -> impl DoubleEndedIterator<Item = (&FixedPoint, &VecDeque<Order>)> {
         self.asks.iter()
     }
 

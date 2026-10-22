@@ -38,6 +38,14 @@ pub enum Feature {
     /// in the built-in table nor in a checked-in genesis until the owner
     /// schedules it.
     SameBlockCoreWriter = 2,
+    /// The perp funding engine (docs/plans/funding-engine.md): from its
+    /// height the block-start step samples each listed market's premium,
+    /// settles hourly funding into a per-market cumulative index
+    /// (`CF_NATIVE_ORACLE` `fnd` rows), and every fill settles the
+    /// position's funding since its entry index in cash. Unscheduled: no
+    /// built-in row, not in [`DEFAULT_GENESIS_ACTIVATIONS`]. Id 2 is
+    /// item 7 T, id 4 trading fees (parallel branches).
+    FundingEngine = 3,
     /// TEST-ONLY (cargo feature `test-features`, enabled from
     /// torus-consensus's dev-dependencies; no node build reaches it): the P0.0
     /// integration tests' feature with a state-visible rule (the block pipeline
@@ -55,6 +63,7 @@ impl Feature {
         Feature::RunningStateHash,
         Feature::BookWindowCommit,
         Feature::SameBlockCoreWriter,
+        Feature::FundingEngine,
     ];
     /// Every feature compiled in, in id order (see above).
     #[cfg(feature = "test-features")]
@@ -62,6 +71,7 @@ impl Feature {
         Feature::RunningStateHash,
         Feature::BookWindowCommit,
         Feature::SameBlockCoreWriter,
+        Feature::FundingEngine,
         Feature::TestStateRule,
     ];
 
@@ -82,7 +92,8 @@ impl Feature {
         match self {
             Feature::RunningStateHash
             | Feature::BookWindowCommit
-            | Feature::SameBlockCoreWriter => false,
+            | Feature::SameBlockCoreWriter
+            | Feature::FundingEngine => false,
             #[cfg(feature = "test-features")]
             Feature::TestStateRule => true,
         }
@@ -94,6 +105,7 @@ impl Feature {
             Feature::RunningStateHash => "running_state_hash",
             Feature::BookWindowCommit => "book_window_commit",
             Feature::SameBlockCoreWriter => "same_block_core_writer",
+            Feature::FundingEngine => "funding_engine",
             #[cfg(feature = "test-features")]
             Feature::TestStateRule => "test_state_rule",
         }
@@ -285,10 +297,12 @@ mod tests {
         assert_eq!(Feature::BookWindowCommit.name(), "book_window_commit");
         assert_eq!(Feature::SameBlockCoreWriter.id(), 2);
         assert_eq!(Feature::SameBlockCoreWriter.name(), "same_block_core_writer");
-        assert_eq!(KNOWN_FEATURES, 0b111);
+        assert_eq!(Feature::FundingEngine.id(), 3);
+        assert_eq!(Feature::FundingEngine.name(), "funding_engine");
+        assert_eq!(KNOWN_FEATURES, 0b1111);
         assert_eq!(first_unknown_feature_in(0b11, 0b01), Some(1));
         assert_eq!(first_unknown_feature_in(0b01, 0b01), None);
-        assert_eq!(unknown_features(0b1101), 0b1000);
+        assert_eq!(unknown_features(0b1_0101), 0b1_0000);
         assert_eq!(first_unknown_feature(0b1), None);
         assert_eq!(first_unknown_feature(1 | (1 << 9) | (1 << 77)), Some(9));
         for f in Feature::ALL {
@@ -465,6 +479,22 @@ mod tests {
             }
         }
         assert!(scanned > 0, "found the checked-in genesis files");
+    }
+
+    /// Funding engine (s138): a known feature that no network and no new
+    /// genesis schedules (the owner activates it through P0.0).
+    #[test]
+    fn funding_engine_is_known_and_unscheduled() {
+        assert_ne!(KNOWN_FEATURES & Feature::FundingEngine.bit(), 0);
+        assert!(!Feature::FundingEngine.is_test_only());
+        assert!(DEFAULT_GENESIS_ACTIVATIONS.iter().all(|(f, _)| *f != Feature::FundingEngine));
+        for chain_id in [crate::eip712::TORUS_CHAIN_ID, 7779, 1] {
+            assert!(builtin_activations(chain_id).iter().all(|(f, _)| *f != Feature::FundingEngine));
+        }
+        let genesis: BTreeMap<_, _> = [(Feature::FundingEngine, 40)].into_iter().collect();
+        let s = ActivationSchedule::for_chain(crate::eip712::TORUS_CHAIN_ID, &genesis).unwrap();
+        assert_eq!(s.active_at(39), 0);
+        assert_eq!(s.active_at(40), Feature::FundingEngine.bit());
     }
 
     #[test]

@@ -18,7 +18,7 @@ use torus_core::error::CoreError;
 use torus_core::lockbox::{fp_to_u256, u256_to_fp, Lockbox};
 use torus_core::margin::{
     effective_max_leverage, market_margin_config, order_initial_margin, placement_need,
-    position_price, position_terms, AccountView, MarginTier, MarketMarginConfig,
+    position_price, position_terms_funded, AccountView, MarginTier, MarketMarginConfig,
 };
 use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::{
@@ -2101,7 +2101,7 @@ const ABS_GUARD: u128 = i128::MAX as u128;
 /// C6b (A-lite) / item 6 M1: `base` (a trader's sums over some rows) minus
 /// the terms of each changed row's position as it was (`.0`) plus its terms
 /// now (`.1`), valued with `marks` and `tiers`. Exact: the sums are integer
-/// sums of the same [`position_terms`] as `build`, the order does not matter
+/// sums of the same [`position_terms_funded`] as `build`, the order does not matter
 /// while nothing overflows, every step is checked, and the guard (Σ |term|
 /// <= `i128::MAX`, see [`PosSums::abs`]) proves `build` over the rows now
 /// cannot overflow either. `None` (the caller builds or drops): the guard
@@ -2133,7 +2133,8 @@ fn sums_with_changes<'t>(
             if mark.is_some() {
                 marked = step(marked)?;
             }
-            let t = position_terms(pos, mark, tiers(pos.market_id)).ok()?;
+            let index = marks.funding_of(pos.market_id)?;
+            let t = position_terms_funded(pos, mark, index, tiers(pos.market_id)).ok()?;
             for ((sum, a), x) in sums.iter_mut().zip(abs.iter_mut()).zip(t.parts()) {
                 let x = x.raw();
                 if add {
@@ -2159,6 +2160,7 @@ fn sums_with_changes<'t>(
 fn build_sums<'t>(
     ps: &[torus_core::position::Position],
     mark: impl Fn(MarketId) -> Option<FixedPoint>,
+    funding: impl Fn(MarketId) -> Result<Option<i128>, CoreError>,
     tiers: impl Fn(MarketId) -> Option<&'t [MarginTier]>,
 ) -> SumsResult {
     let marked = std::cell::Cell::new(0u32);
@@ -2173,7 +2175,7 @@ fn build_sums<'t>(
             *a = a.saturating_add(x.raw().unsigned_abs());
         }
     };
-    AccountView::build_with(&NativeBalance::default(), ps, mark, tiers, seen)
+    AccountView::build_with_funded(&NativeBalance::default(), ps, mark, funding, tiers, seen)
         .map(|v| PosSums {
             upnl: v.upnl,
             position_im: v.position_im,
@@ -2334,7 +2336,13 @@ impl SumsCarry<'_> {
                         None
                     })
                 };
-                let r = build_sums(now, mark, tiers);
+                let funding = |m: MarketId| {
+                    Ok(t.marks.funding_of(m).unwrap_or_else(|| {
+                        in_table.set(false);
+                        None
+                    }))
+                };
+                let r = build_sums(now, mark, funding, tiers);
                 return in_table.get().then_some(r);
             }
             sums_with_changes(base, changes, &t.marks, tiers)
@@ -2579,6 +2587,10 @@ pub(crate) struct BlockMarks {
     /// renewed mid-block when the block itself changes `margin_configs`
     /// (a governance params update, `NativeExecutor::renew_mark_version`).
     version: u64,
+    /// Funding engine: the block's funding index table (`ctx.positions`'),
+    /// held only so the version also changes when an index moves: the
+    /// position sums (keyed by the version) carry pending funding.
+    funding: Option<std::sync::Arc<torus_core::position::FundingIndices>>,
 }
 
 /// Item 6 C2: source of new mark versions (process-wide, so a rebuilt or
@@ -2620,7 +2632,7 @@ impl<'a> DenseTiers<'a> {
 impl BlockMarks {
     fn new(marks: HashMap<MarketId, Option<FixedPoint>>, version: u64) -> Self {
         let dense = dense_index(&marks, |m| *m);
-        Self { marks, dense, version }
+        Self { marks, dense, version, funding: None }
     }
 
     /// `marks.get(m)`, through the dense index when there is one.
@@ -2629,6 +2641,17 @@ impl BlockMarks {
             return self.marks.get(&m).copied();
         }
         self.dense.get(m as usize).copied().flatten()
+    }
+
+    /// Funding engine: `m`'s index as the table decides it: `Some(None)`
+    /// without funding (feature off), `Some(Some(i))` from the block's index
+    /// table; `None` = not in the table (the caller reads its row, or does
+    /// not cache).
+    fn funding_of(&self, m: MarketId) -> Option<Option<i128>> {
+        match &self.funding {
+            None => Some(None),
+            Some(t) => t.get(&m).map(|i| Some(*i)),
+        }
     }
 
     /// The per-read mark rule ([`usable_mark`]) for each of `markets`; the
@@ -2763,6 +2786,25 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
             self.note_fault("first mark oracle read", &e);
             false
         })
+    }
+
+    /// Funding engine: `market_id`'s index for valuation: the block's table
+    /// (through the mark table, which holds it), else its row
+    /// ([`PositionManager::funding_index`]; no read while funding is off),
+    /// which also marks the valuation as outside the table (`in_table`).
+    fn funding(&self, market_id: MarketId, in_table: &std::cell::Cell<bool>) -> Result<Option<i128>, CoreError> {
+        if let Some(index) = self.marks.and_then(|t| t.funding_of(market_id)) {
+            return Ok(index);
+        }
+        if self.marks.is_some() {
+            in_table.set(false);
+        }
+        // R02: a failed read is recorded on the reader fault channel (the
+        // block fail-stops) and reads "no funding" meanwhile, as `mark`.
+        Ok(self.positions.funding_index(market_id).unwrap_or_else(|e| {
+            self.note_fault("funding index read", &e);
+            None
+        }))
     }
 
     fn tiers(&self, market_id: MarketId) -> Option<&'a [MarginTier]> {
@@ -2930,7 +2972,7 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
     /// entry or the block's memo, [`BlockSums::base`]) minus the terms of
     /// each row the block changed under its prefix as R holds it, plus the
     /// terms of the row now ([`torus_state::StateBackend::resident_changes`]).
-    /// Exact: the sums are integer sums of the same [`position_terms`] as
+    /// Exact: the sums are integer sums of the same [`position_terms_funded`] as
     /// `build`, the order does not matter while nothing overflows, every
     /// step is checked, and the guard (Σ |term| <= `i128::MAX`, see
     /// [`PosSums::abs`]) proves `build` over the rows now cannot overflow
@@ -3011,7 +3053,7 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
                 self.mark(m)
             }
         };
-        (build_sums(ps, mark, |m| self.tiers(m)), in_table.get())
+        (build_sums(ps, mark, |m| self.funding(m, &in_table), |m| self.tiers(m)), in_table.get())
     }
 
     /// F1: signed position in `market_id` and the price it is valued at
@@ -11798,7 +11840,9 @@ impl NativeExecutor {
                         MarginType::Cross,
                     ) {
                         Ok(effect) => {
-                            if let Some(pnl) = effect.closed_pnl {
+                            // Funding engine: the cash change (realized PnL
+                            // less the funding settled), as every path.
+                            if let Some(pnl) = effect.cash() {
                                 pnl_events.push((side, *trader, pnl, 2 * k + s));
                             }
                             *slot = effect;
@@ -11876,7 +11920,9 @@ impl NativeExecutor {
             price,
             MarginType::Cross,
         )?;
-        if let Some(pnl) = effect.closed_pnl {
+        // Funding engine: the cash change (realized PnL less the funding
+        // settled at this fill; `None` = no balance write, as before).
+        if let Some(pnl) = effect.cash() {
             let mut bal = bal_cache.load(positions, typed, trader)?;
             bal.available += pnl;
             bal_cache.set(trader, bal);
@@ -15591,6 +15637,10 @@ impl NativeExecutor {
             }
         };
 
+        // Funding engine: governance takes the funding keys only while the
+        // block runs the feature (off: refused exactly as before).
+        let funding_keys = ctx.feature_active(torus_types::Feature::FundingEngine);
+        ctx.governance.set_funding_keys(funding_keys);
         match ctx.governance.submit_proposal(
             *sender,
             proposal.title.clone(),
@@ -15921,6 +15971,9 @@ impl NativeExecutor {
         match Self::oracle_inputs(ctx) {
             Ok((markets, stakes)) => {
                 let results = Self::aggregate_oracle_prices(ctx, &markets, &stakes);
+                // Funding engine: on the fresh marks, before the mark table
+                // (its version covers the block's funding index table).
+                Self::begin_block_funding(ctx, &markets);
                 Self::fill_block_marks(ctx, &markets);
                 results
             }
@@ -15953,6 +16006,61 @@ impl NativeExecutor {
             })
             .collect();
         Ok((markets, stakes))
+    }
+
+    /// Funding engine (docs/plans/funding-engine.md, P0.0 `funding_engine`):
+    /// the block-start step, inside [`Self::begin_block_oracle`] after the
+    /// aggregation (the block's marks are final) and before any action. Bit
+    /// off: returns at once, no read. Bit on: per market of `listed`, its
+    /// `fnd` row is created / settled / sampled ([`torus_core::funding::step`];
+    /// a sample walks the in-memory book up to the impact notional) and the
+    /// block's index table is installed on `ctx.positions`, which every fill
+    /// path settles against. O(markets): no position or balance is read.
+    /// A local fault latches `fatal_error`.
+    pub fn begin_block_funding<T: StateBackend>(ctx: &mut NativeExecContext<T>, listed: &[MarketId]) {
+        ctx.positions.set_funding(None);
+        if !ctx.feature_active(torus_types::Feature::FundingEngine) {
+            return;
+        }
+        match Self::funding_step(ctx, listed) {
+            Ok(table) => ctx.positions.set_funding(Some(std::sync::Arc::new(table))),
+            // R02: every error here is a local fault (a failed read, an
+            // undecodable row) and fail-stops; without a table no fill of
+            // the block settles funding, and the block is never committed.
+            Err(e) => {
+                if ctx.fatal_error.is_none() {
+                    ctx.fatal_error = Some(format!("funding step: {e}"));
+                }
+            }
+        }
+    }
+
+    /// [`Self::begin_block_funding`]'s work: every listed market's row
+    /// stepped (written when changed), and the block's index table.
+    fn funding_step<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        listed: &[MarketId],
+    ) -> Result<torus_core::position::FundingIndices, CoreError> {
+        use torus_core::funding;
+        let params = funding::FundingParams::read(&ctx.state)?;
+        let mut table = torus_core::position::FundingIndices::default();
+        for &m in listed {
+            let row = funding::read_row(&ctx.state, m)?;
+            let mark = usable_mark(&ctx.oracle, m, ctx.timestamp)?;
+            let book = ctx.order_books.get(&m);
+            let step = funding::step(row, ctx.timestamp, &params, mark, || match book {
+                Some(b) => funding::book_impact_prices(b, params.impact_notional),
+                None => (None, None),
+            });
+            if step.changed {
+                funding::write_row(&ctx.state, m, &step.row)?;
+            }
+            if let Some(rate) = step.settled {
+                tracing::debug!(market = m, rate, index = step.row.cum_index, height = ctx.block_height, "funding settled");
+            }
+            table.insert(m, step.row.cum_index);
+        }
+        Ok(table)
     }
 
     /// Item 6 C2: the end of [`Self::begin_block_oracle`] (after the
@@ -15991,11 +16099,15 @@ impl NativeExecutor {
                 return;
             }
         };
+        // Funding engine: an index change is a valuation change too.
+        let funding = ctx.positions.funding_table().cloned();
         let version = match prev {
-            Some(p) if p.marks.marks == marks && p.configs == ctx.margin_configs => p.marks.version,
+            Some(p) if p.marks.marks == marks && p.marks.funding == funding && p.configs == ctx.margin_configs => {
+                p.marks.version
+            }
             _ => MARK_VERSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
         };
-        ctx.block_marks = Some(BlockMarks::new(marks, version));
+        ctx.block_marks = Some(BlockMarks { funding, ..BlockMarks::new(marks, version) });
         if let Some(sums) = ctx.sums.as_mut() {
             sums.start(Some(version));
         }
@@ -16145,6 +16257,8 @@ impl NativeExecutor {
         ctx: &mut NativeExecContext<T>,
     ) -> Vec<NativeActionResult> {
         use torus_economics::governance::ProposalOutcome;
+        let funding_keys = ctx.feature_active(torus_types::Feature::FundingEngine);
+        ctx.governance.set_funding_keys(funding_keys);
         match ctx.governance.process_pending_proposals(ctx.block_height) {
             Ok(outcomes) => {
                 // Pre-testnet P1: the live-state side of executed market
@@ -16916,6 +17030,7 @@ mod maker_accounts_tests {
                             realized_pnl: FixedPoint::ZERO,
                             isolated_margin: FixedPoint::ZERO,
                             margin_type: if rng.below(40) == 0 { MarginType::Isolated } else { MarginType::Cross },
+                            funding: None,
                         })
                         .unwrap();
                 }

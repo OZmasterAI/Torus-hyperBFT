@@ -51,6 +51,7 @@ fn cross_margin_multiple_positions_offset() {
         realized_pnl: FixedPoint::ZERO,
         isolated_margin: FixedPoint::ZERO,
         margin_type: MarginType::Cross,
+        funding: None,
     })
     .unwrap();
 
@@ -64,6 +65,7 @@ fn cross_margin_multiple_positions_offset() {
         realized_pnl: FixedPoint::ZERO,
         isolated_margin: FixedPoint::ZERO,
         margin_type: MarginType::Cross,
+        funding: None,
     })
     .unwrap();
 
@@ -96,6 +98,7 @@ fn cross_margin_with_loss() {
         realized_pnl: FixedPoint::ZERO,
         isolated_margin: FixedPoint::ZERO,
         margin_type: MarginType::Cross,
+        funding: None,
     })
     .unwrap();
 
@@ -120,6 +123,7 @@ fn isolated_positions_independent() {
         realized_pnl: FixedPoint::ZERO,
         isolated_margin: fp(5_000),
         margin_type: MarginType::Isolated,
+        funding: None,
     };
 
     let pos_underwater = Position {
@@ -132,6 +136,7 @@ fn isolated_positions_independent() {
         realized_pnl: FixedPoint::ZERO,
         isolated_margin: fp(1_000),
         margin_type: MarginType::Isolated,
+        funding: None,
     };
 
     let config1 = MarketMarginConfig::new(1, 20);
@@ -443,6 +448,7 @@ fn unrealized_pnl_long() {
         realized_pnl: FixedPoint::ZERO,
         isolated_margin: FixedPoint::ZERO,
         margin_type: MarginType::Cross,
+        funding: None,
     };
 
     assert_eq!(pos.unrealized_pnl(fp(52_000)), fp(4_000));
@@ -461,6 +467,7 @@ fn unrealized_pnl_short() {
         realized_pnl: FixedPoint::ZERO,
         isolated_margin: FixedPoint::ZERO,
         margin_type: MarginType::Cross,
+        funding: None,
     };
 
     assert_eq!(pos.unrealized_pnl(fp(48_000)), fp(6_000));
@@ -478,6 +485,7 @@ fn cross(market_id: u64, is_long: bool, size: i64, entry: i64) -> Position {
         realized_pnl: FixedPoint::ZERO,
         isolated_margin: FixedPoint::ZERO,
         margin_type: MarginType::Cross,
+        funding: None,
     }
 }
 

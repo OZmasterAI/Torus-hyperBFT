@@ -251,6 +251,11 @@ pub trait TorusApi {
     #[method(name = "getMarkPrice")]
     async fn get_mark_price(&self, market_id: String) -> RpcResult<RpcMarkPrice>;
 
+    /// Funding engine (docs/plans/funding-engine.md): the market's funding
+    /// state (`active: false` and zeros before its funding row exists).
+    #[method(name = "getFundingRate")]
+    async fn get_funding_rate(&self, market_id: String) -> RpcResult<RpcFundingRate>;
+
     #[method(name = "getUserTrades")]
     async fn get_user_trades(
         &self,
@@ -1284,11 +1289,16 @@ impl TorusApiServer for RpcState {
                     torus_core::position::MarginType::Isolated => "isolated",
                 };
 
-                // Unrealized PnL at the usable oracle price; 0 without one
-                // (valued at entry, as the margin math does).
-                let unrealized = self
-                    .usable_oracle_price(mid)
-                    .map_or(FixedPoint::ZERO, |op| p.unrealized_pnl(op.price));
+                // Funding engine: the market's index (pending funding).
+                let index = torus_core::funding::read_index(&self.state, mid)
+                    .map_err(|e| RpcError::Internal(e.to_string()))
+                    .map_err(ErrorObjectOwned::from)?;
+                // Unrealized PnL at the usable oracle price (0 without one:
+                // valued at entry, as the margin math does), less pending
+                // funding, which needs no price (Codex P1 s138).
+                let unrealized = self.usable_oracle_price(mid).map_or(FixedPoint::ZERO, |op| p.unrealized_pnl(op.price))
+                    - p.funding_owed(index);
+                let funding_since_open = p.funding.map(|_| dec_fp(p.funding_since_open(index)));
 
                 let liquidation_price = match p.margin_type {
                     // R23: the account-wide threshold the liquidation step
@@ -1336,6 +1346,7 @@ impl TorusApiServer for RpcState {
                     margin: dec_fp(p.isolated_margin),
                     margin_mode: margin_mode.to_string(),
                     liquidation_price: liquidation_price.map(dec_fp),
+                    funding_since_open,
                 }))
             }
         }
@@ -2288,6 +2299,27 @@ impl TorusApiServer for RpcState {
             market_id,
             long_oi: dec_fp(long_oi),
             short_oi: dec_fp(short_oi),
+        })
+    }
+
+    async fn get_funding_rate(&self, market_id: String) -> RpcResult<RpcFundingRate> {
+        use torus_core::funding::{read_row, FundingParams, FundingRow};
+        let mid = parse_u64(&market_id).map_err(ErrorObjectOwned::from)?;
+        let internal = |e: torus_core::error::CoreError| ErrorObjectOwned::from(RpcError::Internal(e.to_string()));
+        let params = FundingParams::read(&self.state).map_err(internal)?;
+        let row = read_row(&self.state, mid).map_err(internal)?;
+        let active = row.is_some();
+        let r = row.unwrap_or_else(|| FundingRow::new(0, &params));
+        Ok(RpcFundingRate {
+            market_id,
+            active,
+            predicted_rate: dec_e18(r.predicted_rate(&params)),
+            last_rate: dec_e18(r.last_rate),
+            cum_index: dec_e18(r.cum_index),
+            interval_secs: params.interval_secs,
+            next_funding_time: if active { r.next_funding_time(&params) } else { 0 },
+            last_funding_time: r.last_settle_ts,
+            samples: r.samples,
         })
     }
 

@@ -112,6 +112,7 @@ fn market_caches() -> (Vec<PositionCache>, usize) {
                     realized_pnl: FixedPoint::ZERO,
                     isolated_margin: FixedPoint::ZERO,
                     margin_type: MarginType::Cross,
+                    funding: None,
                 });
                 total += 1;
             }
@@ -204,6 +205,7 @@ fn block_runs<T: torus_state::StateBackend>(
                         realized_pnl: FixedPoint::from_raw((i % 777) as i128),
                         isolated_margin: FixedPoint::ZERO,
                         margin_type: MarginType::Cross,
+                        funding: None,
                     });
                 }
             }

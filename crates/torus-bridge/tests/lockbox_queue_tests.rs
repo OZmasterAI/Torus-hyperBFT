@@ -397,6 +397,7 @@ fn queued_withdraw_respects_account_transfer_margin() {
                 realized_pnl: FixedPoint::ZERO,
                 isolated_margin: FixedPoint::ZERO,
                 margin_type: MarginType::Cross,
+                funding: None,
             })
             .unwrap();
         assert_eq!(evm_block(&db, 1, vec![withdraw(ALICE, wei(amount), 0)]), vec![true]);
