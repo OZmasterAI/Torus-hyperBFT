@@ -16049,8 +16049,8 @@ impl NativeExecutor {
     /// [`Self::fill_block_marks`]) and returns the memo's results — no
     /// prune, collect, median or mark reads. Otherwise the full step (prune,
     /// aggregate, fill), then records a new memo when R is attached, nothing
-    /// faulted and the block's own layer did not write an aggregate row
-    /// before the step.
+    /// faulted and the block's own layer did not write an aggregate or
+    /// submission row before the step.
     fn begin_block_oracle_memo<T: StateBackend>(ctx: &mut NativeExecContext<T>) -> Vec<NativeActionResult> {
         use torus_state::cf::{CF_NATIVE_ORACLE, ORACLE_SUBMISSION_PREFIX};
         let memo = ctx.oracle_memo.take();
@@ -16107,14 +16107,20 @@ impl NativeExecutor {
             ctx.oracle_memo = Some(m);
             return results;
         }
-        let agg_pre_touched = ctx.state.layer_touches(CF_NATIVE_ORACLE, b"agg");
+        // No memo after a block whose own layer wrote oracle rows before the
+        // step: an `agg` row would not be the step's own, and a submission
+        // written there is the pattern of a feed before every step (the µbench
+        // default; the node writes none before the step), where the next
+        // block's step always misses and the record is pure cost.
+        let pre_touched = ctx.state.layer_touches(CF_NATIVE_ORACLE, b"agg")
+            || ctx.state.layer_touches(CF_NATIVE_ORACLE, ORACLE_SUBMISSION_PREFIX);
         if let Err(e) = ctx.oracle.prune_submissions(now) {
             ctx.fatal_error = Some(format!("oracle block-start step: {e}"));
             return Vec::new();
         }
         let results = Self::aggregate_oracle_prices(ctx, &markets, &stakes);
         Self::fill_block_marks(ctx, &markets);
-        if ctx.oracle_memo_slot && !agg_pre_touched && ctx.fatal_error.is_none() {
+        if ctx.oracle_memo_slot && !pre_touched && ctx.fatal_error.is_none() {
             ctx.oracle_memo = Self::record_oracle_memo(ctx, markets, stakes, &results);
         }
         results
