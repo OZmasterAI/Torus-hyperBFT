@@ -21033,6 +21033,257 @@ mod crash_recovery_tests {
         assert!(load_commit_manifest(&cdb, 5).is_none());
     }
 
+    // ---- dead-leader skip x commit durability ([claude-review] P1 on 48e44257): the leader
+    // evidence of a committed height must be durable whenever its manifest or its header is ----
+
+    /// A node layout (manifest in its own consensus DB) with dead-leader skip ON (K = 3):
+    /// heights 1..=4 durable and applied. Returns `(config, state DB, consensus DB, mempool)`.
+    fn dls_node() -> (ChainConfig, StateDb, StateDb, Arc<Mempool>) {
+        let (config, state_db) = dls_fixture();
+        let cdb = make_test_consensus_db();
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 4);
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        (config, state_db, cdb, mempool)
+    }
+
+    fn dls_node_boot(
+        config: &ChainConfig,
+        state_db: &StateDb,
+        cdb: &StateDb,
+        mempool: &Arc<Mempool>,
+    ) -> TorusApp {
+        let app = TorusApp::try_new_with_manifest_db(
+            state_db.clone(),
+            cdb.clone(),
+            config,
+            None,
+            Some(mempool.clone()),
+            None,
+        )
+        .unwrap();
+        assert!(
+            app.leader_skip_config
+                .dead_leader_skip(&make_block(5, vec![]).header)
+                .is_some(),
+            "fixture: dead-leader skip on"
+        );
+        app
+    }
+
+    /// Commit height 5 (compact datum, bodies in the DA store) on `app`; returns the committed
+    /// block and the dispatched message.
+    fn dls_commit_5(
+        app: &mut TorusApp,
+        mempool: &Arc<Mempool>,
+    ) -> (hotstuff_rs::types::block::Block, CommittedBlockMsg) {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+        app.replace_exec_tx(tx);
+        let a5 = vec![sign_claim_rewards(5)];
+        mempool.mirror_native_to_da(&a5).unwrap();
+        let c5 = committed_compact_block(&make_block(5, a5));
+        app.exec_next_height = Some(5);
+        app.on_committed_block(&c5, c5.hash);
+        let msg = rx.try_recv().expect("height 5 dispatched");
+        (c5, msg)
+    }
+
+    /// Execute the dispatched `msg` as the exec thread does (after its ticket); returns
+    /// `(exec_failed, applied height)`.
+    fn dls_execute_msg(
+        config: &ChainConfig,
+        state_db: &StateDb,
+        msg: CommittedBlockMsg,
+    ) -> (bool, Option<u64>) {
+        let durable = msg.settled_durable();
+        let ctx = make_exec_ctx(config, state_db);
+        ctx.execute_committed_block_with(&msg.torus_block, msg.pending_slashes, durable);
+        let failed = ctx.exec_failed.load(Ordering::SeqCst);
+        drop(ctx);
+        (failed, read_native_applied_height(state_db))
+    }
+
+    /// Power loss before the state DB's WAL sync loses everything height 5 wrote there since
+    /// (its header + body batch and anything else the commit put in the state DB, the leader
+    /// evidence included); the consensus DB keeps the manifest and hotstuff's delivered height,
+    /// so hotstuff never re-delivers 5.
+    fn dls_lose_unsynced_state_rows_of_5(state_db: &StateDb) {
+        let key = 5u64.to_be_bytes();
+        state_db.delete_cf_raw(CF_BLOCK_HEADERS, &key).unwrap();
+        state_db.delete_cf_raw(CF_BLOCK_BODIES, &key).unwrap();
+        state_db
+            .delete_cf_raw(CF_CONSENSUS_META, &crate::leader_skip::leader_qc_key(5))
+            .unwrap();
+    }
+
+    /// [claude-review] P1 RED-first: with K = 3 a power loss keeps height 5's manifest (consensus
+    /// DB, the WAL of hotstuff's delivered height) but loses its unsynced state-DB rows. Boot
+    /// parks 5 from the manifest and heals its body; execution must then find 5's leader
+    /// evidence (it is in the manifest) and apply 5. RED on 48e44257: the evidence was a
+    /// separate state-DB put, lost with the header; execution fail-stopped (applied stays 4) on
+    /// every restart, since hotstuff counts 5 as delivered and never re-delivers it.
+    #[test]
+    fn dead_leader_evidence_survives_a_power_loss_that_keeps_the_manifest() {
+        let (config, state_db, cdb, mempool) = dls_node();
+        let mut app = dls_node_boot(&config, &state_db, &cdb, &mempool);
+        // Hold the pruner: the manifest stays until a state-WAL sync (none comes).
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        app.commit_persist = Some(CommitPersistWriter::spawn(
+            state_db.clone(),
+            ManifestPruner::detached(held_tx),
+            None,
+            app.header_hook.clone(),
+        ));
+        let (_c5, msg) = dls_commit_5(&mut app, &mempool);
+        assert!(msg.settled_durable().body, "the off-thread write landed");
+        assert_eq!(
+            held_rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(5)
+        );
+        assert!(load_commit_manifest(&cdb, 5).is_some());
+        drop(msg);
+
+        dls_lose_unsynced_state_rows_of_5(&state_db);
+        drop(app);
+
+        let mut app = dls_node_boot(&config, &state_db, &cdb, &mempool);
+        assert_eq!(app.exec_next_height, Some(5), "parked from the manifest");
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+        app.replace_exec_tx(tx);
+        app.drain_exec_queue();
+        let msg = rx.try_recv().expect("heals from the manifest + DA bodies");
+        assert_eq!(msg.torus_block.header.height, 5);
+        let (failed, applied) = dls_execute_msg(&config, &state_db, msg);
+        assert!(
+            !failed,
+            "the healed height fail-stopped: its leader evidence was lost with the state rows"
+        );
+        assert_eq!(applied, Some(5));
+        assert_eq!(dls_evidence_rows(&state_db), 0, "the evidence row goes with 5");
+        drop(app);
+    }
+
+    /// The other half: once height 5's header + body write is durable (state-WAL sync) its
+    /// manifest goes; a crash before 5 executes must still leave 5's evidence durable, so the
+    /// boot replay (from the durable header + body) executes 5. Guards the evidence in the
+    /// header batch: without it, the replay fail-stops.
+    #[test]
+    fn dead_leader_evidence_survives_with_the_header_after_the_manifest_prune() {
+        let (config, state_db, cdb, mempool) = dls_node();
+        let mut app = dls_node_boot(&config, &state_db, &cdb, &mempool);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        app.commit_persist = Some(CommitPersistWriter::spawn(
+            state_db.clone(),
+            ManifestPruner::detached(held_tx),
+            None,
+            app.header_hook.clone(),
+        ));
+        let (_c5, msg) = dls_commit_5(&mut app, &mempool);
+        assert!(msg.settled_durable().header && msg.settled_durable().body);
+        assert_eq!(
+            held_rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(5)
+        );
+        drop(msg);
+        // The prune pass: state-WAL sync (header + body durable), then the manifest goes.
+        manifest_prune_pass(&state_db, &cdb, &[5]).unwrap();
+        assert!(load_commit_manifest(&cdb, 5).is_none());
+        // Crash before 5 executes. The boot replay executes it from the durable rows.
+        drop(app);
+        let app = dls_node_boot(&config, &state_db, &cdb, &mempool);
+        assert!(
+            !app.exec_failed.load(Ordering::SeqCst),
+            "the boot replay of 5 fail-stopped: no durable leader evidence beside its header"
+        );
+        assert_eq!(read_native_applied_height(&state_db), Some(5));
+        assert_eq!(dls_evidence_rows(&state_db), 0);
+        drop(app);
+    }
+
+    /// [claude-review] P1 RED-first, the kill (no power loss) between the commit hook's writes:
+    /// the manifest landed, the leader evidence and the header + body did not. Hotstuff re-feeds
+    /// 5 after the restart, but the boot drain may run first: in both orders 5 must apply. RED
+    /// on 48e44257 for drain-first (the evidence was a second, separate put).
+    #[test]
+    fn dead_leader_kill_after_the_manifest_heals_in_either_order() {
+        for redeliver_first in [false, true] {
+            let (config, state_db, cdb, mempool) = dls_node();
+            let mut app = dls_node_boot(&config, &state_db, &cdb, &mempool);
+            // The header + body write never lands (the kill).
+            app.commit_persist = Some(CommitPersistWriter::held());
+            let (c5, msg) = dls_commit_5(&mut app, &mempool);
+            drop(msg);
+            // ... and nothing after the manifest put did.
+            state_db
+                .delete_cf_raw(CF_CONSENSUS_META, &crate::leader_skip::leader_qc_key(5))
+                .unwrap();
+            drop(app);
+            assert!(load_commit_manifest(&cdb, 5).is_some());
+
+            let mut app = dls_node_boot(&config, &state_db, &cdb, &mempool);
+            assert_eq!(app.exec_next_height, Some(5), "parked from the manifest");
+            let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+            app.replace_exec_tx(tx);
+            if redeliver_first {
+                app.on_committed_block(&c5, c5.hash);
+            }
+            app.drain_exec_queue();
+            let msg = rx.try_recv().expect("height 5 reaches execution");
+            assert_eq!(msg.torus_block.header.height, 5);
+            let (failed, applied) = dls_execute_msg(&config, &state_db, msg);
+            assert!(
+                !failed,
+                "redeliver_first={redeliver_first}: height 5 fail-stopped (no leader evidence)"
+            );
+            assert_eq!(applied, Some(5), "redeliver_first={redeliver_first}");
+            drop(app);
+        }
+    }
+
+    /// [claude-review] (T5.3 regression) RED-first: with dead-leader skip ON the commit hook
+    /// still writes nothing to the state DB, so it does not wait behind a state-DB write in
+    /// flight. RED on 48e44257: the evidence put queued behind it (1,476 ms of a 1,484 ms
+    /// held write).
+    #[test]
+    fn dead_leader_commit_hook_does_not_wait_behind_a_state_db_write() {
+        let (config, state_db) = dls_fixture();
+        let (mut app, _rx, _mempool) = app_with_recording_exec(&config, &state_db);
+        assert!(app
+            .leader_skip_config
+            .dead_leader_skip(&make_block(7, vec![]).header)
+            .is_some());
+        let (hook, left) = measure_commit_hook_during_state_write(&mut app, &state_db, None);
+        assert!(
+            hook < left * 0.25,
+            "K = 3: the commit hook took {:.1} ms while the held state-DB write had {:.1} ms \
+             left: it waited behind it",
+            hook * 1e3,
+            left * 1e3
+        );
+    }
+
+    /// The same with the dispatch in the hook (the leader evidence goes with the off-thread
+    /// header + body write).
+    #[test]
+    fn dead_leader_commit_dispatch_does_not_wait_behind_a_state_db_write() {
+        let (config, state_db) = dls_fixture();
+        let (mut app, _rx, mempool) = app_with_recording_exec(&config, &state_db);
+        let (hook, left) =
+            measure_commit_hook_during_state_write(&mut app, &state_db, Some(&mempool));
+        assert!(
+            hook < left * 0.25,
+            "K = 3: commit + dispatch took {:.1} ms while the held state-DB write had {:.1} ms \
+             left: it waited behind it",
+            hook * 1e3,
+            left * 1e3
+        );
+    }
+
     /// T5.3: a recording [`HeaderPersistedHook`]: each call's height and
     /// whether its `CF_BLOCK_HEADERS` row was readable at the call.
     #[allow(clippy::type_complexity)]
