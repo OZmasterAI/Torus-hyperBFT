@@ -203,6 +203,12 @@ before TC phase C, since F2 checks leader(view).
   resets after one success). Owner s134: b1 first; a2 kept as a possible upgrade, decided after the one-down bench.
 - **Parameters (Q2): genesis parameters** with defaults K = 3 and j cap = 6, range-checked at genesis validation
   (later governance-adjustable). Not chosen: hard-coded constants (each change needs a release + P0.0 activation).
+- **Default (owner s138): off.** A genesis without `consensus.leader_miss_threshold` gets K = 0: no exclusion row,
+  plan or validator-set update is ever written (`DEFAULT_LEADER_MISS_THRESHOLD = 0`; the j cap default stays 6,
+  inert with K = 0). Supersedes the s134 default K = 3. Reason: §8 finding 4 (at 2:2:1 with the stake-1 validator
+  down no validator-set update commits, so b1 with K = 3 halts that chain at its first exclusion; bench 9o runs
+  exactly 2/2/1 with val2 killed). The testnet genesis sets K = 3 explicitly, and only with >= 4 validators;
+  bench 9p sets `DL_K=3`. The 2:2:1 limitation stays open (finding 4 options).
 - **Jailing (Q6): not part of b1.** b1 only removes leader slots; voting power and quorum math are unchanged.
   Jailing (removing voting power, HyperBFT / Cosmos style) is a separate design, to land **before mainnet or as a
   testnet upgrade so it can be tested live** (via P0.0 activation if after genesis), together with the staking /
@@ -331,7 +337,8 @@ prototype so they run deterministically), restored after.
 ### Phase 4 (bench) prerequisites
 
 - The f407d49c vote rule merged (else roughly one exclusion in three livelocks the window at 4 equal stakes).
-- Finding 4 decided: the planned 2:2:1 `KILL_NO_RESTART=val2` cell halts at the first exclusion update. A 4-equal
+- Finding 4 decided (owner s138: b1 off by default; on only by an explicit genesis K, with >= 4 validators): the
+  planned 2:2:1 `KILL_NO_RESTART=val2` cell (9o) runs with b1 off; with K set it halts at the first exclusion update. A 4-equal
   (or 2/2/1/1) one-down cell works with the vote rule.
 - Then: kill-to-exclusion time (expected 1-2 epochs after the 3rd miss), blocks/s before and after.
 

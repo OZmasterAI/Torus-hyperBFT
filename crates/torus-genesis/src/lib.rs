@@ -156,7 +156,7 @@ pub struct ConsensusConfig {
     pub book_window_commit: bool,
     /// Dead-leader skip (docs/plans/dead-leader-skip.md, b1): K, the run of missed leader slots
     /// that gets a validator excluded from leading at the next epoch plan. 0 = off; else
-    /// 2..=64. Absent = 3. CHAIN-WIDE.
+    /// 2..=64. Absent = 0 (off, owner s138). CHAIN-WIDE.
     #[serde(default = "default_leader_miss_threshold")]
     pub leader_miss_threshold: u32,
     /// Dead-leader skip: cap of the exclusion count j (re-admission floor `L * 2^j`), 0..=10.

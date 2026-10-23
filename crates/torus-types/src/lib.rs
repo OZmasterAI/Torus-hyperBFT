@@ -1897,8 +1897,11 @@ pub struct ChainConfig {
     pub leader_exclusion_cap: u32,
 }
 
-/// Dead-leader skip: default K (owner s134).
-pub const DEFAULT_LEADER_MISS_THRESHOLD: u32 = 3;
+/// Dead-leader skip: default K = 0, off (owner s138; was 3, s134). A genesis turns b1 on only by
+/// setting `consensus.leader_miss_threshold` explicitly, and only with >= 4 validators: at 2:2:1
+/// with the stake-1 validator down no validator-set update commits (docs/plans/dead-leader-skip.md
+/// §8 finding 4).
+pub const DEFAULT_LEADER_MISS_THRESHOLD: u32 = 0;
 /// Dead-leader skip: default j cap (owner s134).
 pub const DEFAULT_LEADER_EXCLUSION_CAP: u32 = 6;
 /// Dead-leader skip: valid K when on (0 = off is valid too). 1 would exclude a validator for one

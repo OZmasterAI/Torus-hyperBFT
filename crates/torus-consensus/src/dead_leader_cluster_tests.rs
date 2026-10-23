@@ -44,7 +44,7 @@ use crate::{ChannelNetwork, GenesisConfig};
 
 /// Epoch length in heights (a multiple of the test EVM interval).
 const L: u64 = 10;
-/// K, the genesis default.
+/// K = 3, set explicitly (the genesis default is 0 = off since owner s138).
 const K: u32 = 3;
 const WAIT: Duration = Duration::from_secs(240);
 const POLL: Duration = Duration::from_millis(10);
@@ -754,7 +754,9 @@ fn dl_cluster_one_down_at_rotation_position_3() {
 /// locked on the update block and refuse its re-proposal (its justify is below the lock). Any
 /// validator-set update wedges this shape (`leader_exclusion_multi_node_test`
 /// `power_update_wedges_2_2_1_with_the_stake_one_validator_down`); b1 emits one exactly while a
-/// validator is down. Owner decision needed (docs/plans/dead-leader-skip.md §8).
+/// validator is down. Owner decision s138: b1 is off by default (absent K = 0), a genesis sets
+/// K only with >= 4 validators; this shape stays a known limitation (docs/plans/dead-leader-skip.md
+/// §7a, §8 finding 4).
 #[test]
 #[ignore = "RED: a validator-set update cannot commit at 2:2:1 with the stake-1 validator down (docs/plans/dead-leader-skip.md §8)"]
 fn dl_cluster_2_2_1_stake_one_down_is_excluded() {

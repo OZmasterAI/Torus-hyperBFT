@@ -496,7 +496,7 @@
 #                run-cell.sh knob, never EXTRA_ENV.
 #   DL_K=K  DL_JCAP=J  dead-leader skip genesis parameters (branch
 #                feat/dead-leader-p3): consensus.leader_miss_threshold = K (0 =
-#                off, else 2..=64; node default 3) and
+#                off, else 2..=64; node default 0 = off, owner s138) and
 #                consensus.leader_exclusion_cap = J (0..=10; node default 6),
 #                each written into the cell genesis ONLY when set (unset = the
 #                field absent, the genesis byte-identical). Genesis inputs (the
@@ -1585,7 +1585,7 @@ WT_COMMIT=$(git -C "$WT" rev-parse HEAD)
 WT_DIRTY=$(git -C "$WT" status --porcelain --untracked-files=no | wc -l)
 log "worktree commit=$WT_COMMIT dirty_files=$WT_DIRTY"
 [ "$N_VALIDATORS" = 3 ] || log "4-validator devnet: N_VALIDATORS=4 (val0..val3; rpc ${RPCS[*]}; metrics ${METS[*]}; keys $ORACLE_KEYS)"
-[ -z "$DL_K$DL_JCAP" ] || log "dead-leader skip genesis knobs: DL_K='${DL_K:-unset (node default 3)}' DL_JCAP='${DL_JCAP:-unset (node default 6)}' (torus-node knows them: leader_miss_threshold found in $SRC_NODE)"
+[ -z "$DL_K$DL_JCAP" ] || log "dead-leader skip genesis knobs: DL_K='${DL_K:-unset (node default 0 = off)}' DL_JCAP='${DL_JCAP:-unset (node default 6)}' (torus-node knows them: leader_miss_threshold found in $SRC_NODE)"
 
 # ---------------------------------------------------------------- 1. stage binary
 mkdir -p "$(dirname "$DST_NODE")"
