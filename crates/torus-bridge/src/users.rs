@@ -1295,6 +1295,41 @@ impl Users {
     }
 }
 
+/// Item 6 Phase 5 step 2 r2 (plan revisit: the drain encoding moves to the
+/// flush worker): a block's drain taken at its freeze by
+/// [`Users::capture_dirty`], serialized by [`Self::encode`] on another
+/// thread. RED stub: the capture still serializes.
+#[derive(Debug)]
+pub(crate) struct DrainCapture {
+    rows: DirtyRows,
+}
+
+impl DrainCapture {
+    /// Rows the encode emits (one per dirty key).
+    pub(crate) fn rows(&self) -> usize {
+        self.rows.positions.len() + self.rows.balances.len()
+    }
+
+    /// The drain's rows, as [`Users::drain_dirty`] returns them.
+    pub(crate) fn encode(self) -> DirtyRows {
+        self.rows
+    }
+}
+
+impl Users {
+    /// Item 6 Phase 5 step 2 r2: the exec thread's half of the drain.
+    pub(crate) fn capture_dirty(&mut self) -> DrainCapture {
+        DrainCapture { rows: self.drain_dirty() }
+    }
+
+    /// Item 6 Phase 5 step 2 r2 (tests): the step 2 drain, serialized on
+    /// the calling thread (the reference of the deferred encode).
+    #[cfg(test)]
+    pub(crate) fn drain_dirty_reference(&mut self) -> DirtyRows {
+        self.drain_dirty()
+    }
+}
+
 impl UsersMut<'_> {
     /// `p`'s row (key `p.trader ‖ p.market_id`) = `p`. Phase 5 step 2: one
     /// record lookup, one dirty-set lookup.

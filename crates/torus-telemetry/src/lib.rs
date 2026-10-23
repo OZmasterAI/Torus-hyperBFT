@@ -750,6 +750,17 @@ pub struct Metrics {
     /// Item 6 Phase 5 step 2: rows of positions and balances the drains
     /// serialized from the in-place `Users` (writes and tombstones).
     pub exec_users_drained_rows: Counter,
+    /// Item 6 Phase 5 step 2 r2: a block's drained rows serialized (the
+    /// drain's encode job: sort, Borsh, the frozen set's two maps), on
+    /// whichever thread first reads them (pipelined: the flush worker), per
+    /// job.
+    pub exec_users_drain_encode_seconds: Histogram,
+    /// Item 6 Phase 5 step 2 r2: drain encode jobs that ran on the thread
+    /// that froze the block (the execution thread: the serial flush always,
+    /// a pipelined block only if E read its rows before any other thread).
+    pub exec_users_drain_encode_inline: Counter,
+    /// Item 6 Phase 5 step 2 r2: drain encode jobs run (any thread).
+    pub exec_users_drain_encodes: Counter,
     /// Item 6 Phase 5 step 2 (Task 2.3 guard, owner s128): rows of positions
     /// or balances found in an EVM block's journal (an EVM tx scope wrote a
     /// typed CF the in-place `Users` never sees). Should stay 0; the guard
@@ -2739,6 +2750,24 @@ impl Metrics {
             "Item 6 Phase 5: position / balance rows serialized from the in-place Users (writes and tombstones)",
             exec_users_drained_rows.clone(),
         );
+        let exec_users_drain_encode_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 16));
+        registry.register(
+            "torus_exec_users_drain_encode_seconds",
+            "Item 6 Phase 5 r2: a block's drained Users rows serialized into its change set (sort, Borsh, maps), on the first thread that reads them",
+            exec_users_drain_encode_seconds.clone(),
+        );
+        let exec_users_drain_encode_inline = Counter::default();
+        registry.register(
+            "torus_exec_users_drain_encode_inline",
+            "Item 6 Phase 5 r2: drain encode jobs run on the thread that froze the block (the execution thread)",
+            exec_users_drain_encode_inline.clone(),
+        );
+        let exec_users_drain_encodes = Counter::default();
+        registry.register(
+            "torus_exec_users_drain_encodes",
+            "Item 6 Phase 5 r2: drain encode jobs run (any thread)",
+            exec_users_drain_encodes.clone(),
+        );
         let exec_evm_scope_typed_writes = Counter::default();
         registry.register(
             "torus_exec_evm_scope_typed_writes",
@@ -3588,6 +3617,9 @@ impl Metrics {
             exec_end_resident_users_seconds,
             exec_users_drain_seconds,
             exec_users_drained_rows,
+            exec_users_drain_encode_seconds,
+            exec_users_drain_encode_inline,
+            exec_users_drain_encodes,
             exec_evm_scope_typed_writes,
             exec_end_resident_wait_seconds,
             exec_cancel_all,

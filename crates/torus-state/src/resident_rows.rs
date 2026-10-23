@@ -65,6 +65,11 @@ pub type ResidentRow<'a> = (Cow<'a, [u8]>, Cow<'a, [u8]>);
 /// tombstone), key-sorted ([`ResidentSource::drain`]).
 pub type SourceRows = Vec<(Vec<u8>, Option<Vec<u8>>)>;
 
+/// Item 6 Phase 5 step 2 r2: a drain taken at the freeze and serialized
+/// when the job runs ([`ResidentSource::drain_deferred`]): the rows
+/// [`ResidentSource::drain`] would have returned at the call.
+pub type SourceDrain = Box<dyn FnOnce() -> [SourceRows; SOURCE_SLOTS] + Send>;
+
 /// An ordered run of [`ResidentRow`]s.
 pub type ResidentRowIter<'a> = Box<dyn Iterator<Item = ResidentRow<'a>> + 'a>;
 
@@ -132,6 +137,17 @@ pub trait ResidentSource: Send + Sync {
     /// are emptied. Called once per block, at its freeze or flush.
     fn drain(&self) -> [SourceRows; SOURCE_SLOTS] {
         Default::default()
+    }
+
+    /// Item 6 Phase 5 step 2 r2 (plan revisit: the drain encoding moves to
+    /// the flush worker): [`Self::drain`] in two halves. The call takes the
+    /// block's changed rows (the dirty sets are emptied, the rows read as
+    /// they are now); the returned job serializes them, on whichever thread
+    /// runs it, and returns exactly what `drain` would have returned at the
+    /// call. Default: drains at the call.
+    fn drain_deferred(&self) -> SourceDrain {
+        let rows = self.drain();
+        Box::new(move || rows)
     }
 }
 

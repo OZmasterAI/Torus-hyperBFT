@@ -59,7 +59,9 @@ pub use pruner::{
     dir_size_bytes, read_pruned_up_to, read_trades_pruned_height, PrunerConfig, StatePruner,
 };
 pub use read_view::ReadView;
-pub use resident_rows::{ResidentChange, ResidentDelta, ResidentRow, ResidentRowIter, ResidentRows, ResidentSource};
+pub use resident_rows::{
+    ResidentChange, ResidentDelta, ResidentRow, ResidentRowIter, ResidentRows, ResidentSource, SourceDrain, SourceRows,
+};
 pub use retention::RetentionStats;
 pub use erasure::ErasureParams;
 pub use shard_store::{

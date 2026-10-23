@@ -1040,3 +1040,290 @@ fn build_with_source_holds_three_cfs_raw_and_the_source() {
 fn resident_slot_is_source(cf: &str) -> bool {
     cf == CF_NATIVE_POSITIONS || cf == CF_NATIVE_BALANCES
 }
+
+/// Item 6 Phase 5 step 2 r2: an in-place source of R's positions (slot 0)
+/// and balances (slot 1), as the node's record set: a write goes in at once
+/// and marks its key dirty; [`ResidentSource::drain_deferred`] takes the
+/// dirty rows at the call and hands them out when the returned job runs,
+/// logging the job's thread.
+#[derive(Debug, Default)]
+struct InPlaceSource {
+    cfs: std::sync::Mutex<[BTreeMap<Vec<u8>, Vec<u8>>; 2]>,
+    dirty: std::sync::Mutex<[BTreeSet<Vec<u8>>; 2]>,
+    jobs: Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>,
+}
+
+impl InPlaceSource {
+    fn from_backend<B: StateBackend>(backend: &B) -> Self {
+        let cfs = [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES]
+            .map(|cf| backend.iterate_cf(cf, None).unwrap().into_iter().collect());
+        Self { cfs: std::sync::Mutex::new(cfs), ..Self::default() }
+    }
+
+    fn jobs(&self) -> Vec<std::thread::ThreadId> {
+        self.jobs.lock().unwrap().clone()
+    }
+}
+
+impl ResidentSource for InPlaceSource {
+    fn get(&self, slot: usize, key: &[u8]) -> Option<Vec<u8>> {
+        self.cfs.lock().unwrap()[slot].get(key).cloned()
+    }
+
+    fn range<'a>(&'a self, slot: usize, start: &[u8], prefix: &[u8]) -> ResidentRowIter<'a> {
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = self.cfs.lock().unwrap()[slot]
+            .range::<[u8], _>((std::ops::Bound::Included(start), std::ops::Bound::Unbounded))
+            .take_while(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        Box::new(rows.into_iter().map(|(k, v)| (Cow::Owned(k), Cow::Owned(v))))
+    }
+
+    fn in_place(&self) -> bool {
+        true
+    }
+
+    fn put_row(&self, slot: usize, key: &[u8], value: Option<&[u8]>) {
+        let mut cfs = self.cfs.lock().unwrap();
+        match value {
+            Some(v) => cfs[slot].insert(key.to_vec(), v.to_vec()),
+            None => cfs[slot].remove(key),
+        };
+        self.dirty.lock().unwrap()[slot].insert(key.to_vec());
+    }
+
+    fn dirty_keys(&self, slot: usize) -> Vec<Vec<u8>> {
+        self.dirty.lock().unwrap()[slot].iter().cloned().collect()
+    }
+
+    fn touches(&self, slot: usize, prefix: &[u8]) -> bool {
+        self.dirty.lock().unwrap()[slot]
+            .range::<[u8], _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
+            .next()
+            .is_some_and(|k| k.starts_with(prefix))
+    }
+
+    fn drain_deferred(&self) -> super::SourceDrain {
+        let dirty = std::mem::take(&mut *self.dirty.lock().unwrap());
+        let cfs = self.cfs.lock().unwrap();
+        let taken: [super::SourceRows; 2] =
+            [0usize, 1].map(|s| dirty[s].iter().map(|k| (k.clone(), cfs[s].get(k).cloned())).collect());
+        let jobs = self.jobs.clone();
+        Box::new(move || {
+            jobs.lock().unwrap().push(std::thread::current().id());
+            taken
+        })
+    }
+
+    fn drain(&self) -> [super::SourceRows; 2] {
+        self.drain_deferred()()
+    }
+}
+
+/// One block's writes for the r2 tests: positions and balances (writes,
+/// rewrites, deletes, a delete of an absent key) and rows of CFs outside
+/// the source (R's raw CFs and one outside R).
+fn r2_block(ov: &NativeStateOverlay) {
+    for t in 1..=6u8 {
+        ov.put_cf_raw(CF_NATIVE_POSITIONS, &pos_key(t, 1), &[b'n', t]).unwrap();
+        ov.put_cf_raw(CF_NATIVE_POSITIONS, &pos_key(t, 2), &[b'm', t, t]).unwrap();
+        ov.put_cf_raw(CF_NATIVE_BALANCES, &[t; 20], &[b'B', t]).unwrap();
+    }
+    ov.put_cf_raw(CF_NATIVE_POSITIONS, &pos_key(2, 2), b"rewritten").unwrap();
+    ov.delete_cf_raw(CF_NATIVE_POSITIONS, &pos_key(3, 1)).unwrap();
+    ov.delete_cf_raw(CF_NATIVE_POSITIONS, &pos_key(9, 9)).unwrap();
+    ov.delete_cf_raw(CF_NATIVE_BALANCES, &[4; 20]).unwrap();
+    ov.put_cf_raw(CF_NATIVE_LIQUIDATION, &[7; 3], b"liq").unwrap();
+    ov.put_cf_raw(CF_NATIVE_ORACLE, &[8; 5], b"orc").unwrap();
+    ov.put_cf_raw(CF_NATIVE_ORDERS, &[9; 6], b"ord").unwrap();
+}
+
+/// The r2 tests' DB: base rows of every CF they write.
+fn r2_db() -> (StateDb, tempfile::TempDir) {
+    let (db, dir) = temp_db();
+    for t in 1..=4u8 {
+        db.put_cf_raw(CF_NATIVE_POSITIONS, &pos_key(t, 1), &[b'p', t]).unwrap();
+        db.put_cf_raw(CF_NATIVE_BALANCES, &[t; 20], &[b'b', t]).unwrap();
+        db.put_cf_raw(CF_NATIVE_LIQUIDATION, &[t; 3], b"base").unwrap();
+    }
+    (db, dir)
+}
+
+/// Every CF's rows of a DB (the flush comparison).
+fn db_dump(db: &StateDb) -> Vec<(String, Vec<(Vec<u8>, Vec<u8>)>)> {
+    crate::cf::ALL_CF_NAMES
+        .iter()
+        .map(|cf| (cf.to_string(), StateBackend::iterate_cf(db, cf, None).unwrap()))
+        .collect()
+}
+
+/// Item 6 Phase 5 step 2 r2 (plan revisit: "the drain encoding moves to the
+/// flush worker"): with an in-place source attached, `freeze` takes the
+/// source's rows of the block but does not run the drain job: the frozen
+/// set's positions and balances stay pending, and nothing that reads only
+/// other CFs (the parent-layer reads of the next block, the EVM-account
+/// list, R's raw delta, a lookup of another CF) runs it. The first reader
+/// of the two CFs runs it, on its own thread (here a stand-in for the flush
+/// worker's digest), exactly once; every later read is served from it.
+#[test]
+fn freeze_leaves_the_in_place_drain_to_its_first_reader() {
+    let (db, _dir) = r2_db();
+    let source = Arc::new(InPlaceSource::from_backend(&db));
+    let mut ov = NativeStateOverlay::new(db.clone());
+    let r = ResidentRows::build_with_source(&ov, source.clone()).unwrap();
+    ov.attach_resident(Arc::new(r));
+    r2_block(&ov);
+    assert_eq!(ov.pending_rows(CF_NATIVE_POSITIONS), 0, "written through to the source");
+    let frozen = ov.freeze(1);
+    assert!(source.jobs().is_empty(), "freeze ran the drain job: {:?}", source.jobs());
+    assert!(frozen.typed_pending(), "the typed rows are serialized later");
+    // Readers of other CFs only.
+    let next = NativeStateOverlay::with_parent(db.clone(), Some(frozen.clone()));
+    assert_eq!(next.get_cf_raw(CF_NATIVE_ORDERS, &[9; 6]).unwrap().as_deref(), Some(&b"ord"[..]));
+    assert_eq!(next.get_cf_raw(CF_NATIVE_LIQUIDATION, &[7; 3]).unwrap().as_deref(), Some(&b"liq"[..]));
+    assert_eq!(next.iterate_cf(CF_NATIVE_ORACLE, None).unwrap().len(), 1);
+    assert_eq!(frozen.lookup_row(CF_NATIVE_ORDERS, &[9; 6]), Some(Some(b"ord".to_vec())));
+    assert!(frozen.dirty_evm_accounts().is_empty());
+    let raw = frozen.resident_delta_raw();
+    assert!(raw.keys(CF_NATIVE_LIQUIDATION).count() == 1 && raw.keys(CF_NATIVE_POSITIONS).count() == 0);
+    assert!(source.jobs().is_empty(), "a reader of another CF ran the drain job: {:?}", source.jobs());
+    assert!(frozen.typed_pending());
+    // The first reader of the two CFs, on another thread (the flush worker).
+    let worker = {
+        let frozen = frozen.clone();
+        std::thread::spawn(move || {
+            let n = frozen.rows(CF_NATIVE_POSITIONS).len();
+            (std::thread::current().id(), n)
+        })
+        .join()
+        .unwrap()
+    };
+    assert_eq!(source.jobs(), vec![worker.0], "the job ran once, on the first reader's thread");
+    assert_eq!(worker.1, 13, "positions rows: 12 written, 1 deleted present, 1 absent deleted (once each)");
+    assert!(!frozen.typed_pending());
+    // Later reads (this thread, the next block's parent reads) reuse it.
+    assert_eq!(frozen.rows(CF_NATIVE_BALANCES).len(), 6);
+    assert_eq!(next.get_cf_raw(CF_NATIVE_POSITIONS, &pos_key(2, 2)).unwrap().as_deref(), Some(&b"rewritten"[..]));
+    assert_eq!(source.jobs().len(), 1, "exactly once");
+}
+
+/// Item 6 Phase 5 step 2 r2: a frozen set whose positions and balances are
+/// serialized later answers every reader exactly as the same block frozen
+/// with every row pending (the Phase 4 / serial shape): each CF's rows, the
+/// byte measure, the entry count, `touches_only`, the ingress slice, R's
+/// delta, point lookups, the next block's parent-layer reads, the
+/// checkpoint layer merge, and the flush (DB rows, applied marker and
+/// running hash, on two DBs). Each case starts from a fresh frozen set, so
+/// every accessor is also the one that runs the job.
+#[test]
+fn deferred_typed_rows_read_as_eager_rows() {
+    let (db, _dir) = r2_db();
+    crate::running_hash::configure_activation(&db, Some(1)).unwrap();
+    let eager = {
+        let ov = NativeStateOverlay::new(db.clone());
+        r2_block(&ov);
+        ov.freeze(1)
+    };
+    assert!(!eager.typed_pending());
+    let deferred = || {
+        let source = Arc::new(InPlaceSource::from_backend(&db));
+        let mut ov = NativeStateOverlay::new(db.clone());
+        let r = ResidentRows::build_with_source(&ov, source.clone()).unwrap();
+        ov.attach_resident(Arc::new(r));
+        r2_block(&ov);
+        let frozen = ov.freeze(1);
+        (frozen, source)
+    };
+    let cases: Vec<(&str, Box<dyn Fn(&crate::backend::FrozenPending) -> String>)> = vec![
+        ("rows", Box::new(|f| format!("{:?}", crate::cf::ALL_CF_NAMES.iter().map(|cf| f.rows(cf)).collect::<Vec<_>>()))),
+        ("state_bytes", Box::new(|f| f.state_bytes().to_string())),
+        ("entry_count", Box::new(|f| f.entry_count().to_string())),
+        (
+            "touches_only",
+            Box::new(|f| {
+                format!(
+                    "{} {} {}",
+                    f.touches_only(&[CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES]),
+                    f.touches_only(&[CF_NATIVE_LIQUIDATION, CF_NATIVE_ORACLE, CF_NATIVE_ORDERS]),
+                    f.touches_only(&crate::cf::ALL_CF_NAMES),
+                )
+            }),
+        ),
+        (
+            "slice",
+            Box::new(|f| {
+                let s = f.slice(&crate::read_view::INGRESS_CFS);
+                format!("{} {:?}", s.state_bytes(), crate::cf::ALL_CF_NAMES.iter().map(|cf| s.rows(cf)).collect::<Vec<_>>())
+            }),
+        ),
+        ("resident_delta", Box::new(|f| format!("{:?}", f.resident_delta()))),
+        (
+            "lookup_row",
+            Box::new(|f| {
+                let keys = [pos_key(2, 2), pos_key(3, 1), pos_key(9, 9), pos_key(4, 1), vec![4; 20], vec![1; 20]];
+                format!("{:?}", keys.iter().map(|k| (f.lookup_row(CF_NATIVE_POSITIONS, k), f.lookup_row(CF_NATIVE_BALANCES, k))).collect::<Vec<_>>())
+            }),
+        ),
+    ];
+    for (name, read) in &cases {
+        let (frozen, source) = deferred();
+        assert!(frozen.typed_pending(), "{name}: pending before the read");
+        assert_eq!(read(&frozen), read(&eager), "{name}: deferred != eager");
+        assert_eq!(source.jobs().len(), 1, "{name}: the read ran the job once");
+    }
+    // The next block's parent-layer reads.
+    {
+        let (frozen, source) = deferred();
+        let (a, b) = (
+            NativeStateOverlay::with_parent(db.clone(), Some(frozen)),
+            NativeStateOverlay::with_parent(db.clone(), Some(eager.clone())),
+        );
+        for cf in [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_ORDERS] {
+            assert_eq!(a.iterate_cf(cf, None).unwrap(), b.iterate_cf(cf, None).unwrap(), "{cf}: parent reads");
+            for k in [pos_key(2, 2), pos_key(3, 1), pos_key(9, 9), vec![4; 20], vec![5; 20]] {
+                assert_eq!(a.get_cf_raw(cf, &k).unwrap(), b.get_cf_raw(cf, &k).unwrap(), "{cf} {k:?}");
+            }
+        }
+        assert_eq!(source.jobs().len(), 1, "parent reads ran the job once");
+    }
+    // The checkpoint layer merge (over an earlier block's layer).
+    {
+        let (frozen, source) = deferred();
+        let base = {
+            let ov = NativeStateOverlay::new(db.clone());
+            ov.put_cf_raw(CF_NATIVE_POSITIONS, &pos_key(9, 9), b"older").unwrap();
+            ov.put_cf_raw(CF_NATIVE_BALANCES, &[6; 20], b"older").unwrap();
+            ov.freeze(0)
+        };
+        let merged = |f: &crate::backend::FrozenPending| {
+            let mut layer = CheckpointLayer::new();
+            layer.merge(&base);
+            layer.merge(f);
+            let keys = [pos_key(2, 2), pos_key(3, 1), pos_key(9, 9), vec![4; 20], vec![6; 20], vec![7; 3]];
+            let rows: Vec<_> = [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION]
+                .iter()
+                .flat_map(|cf| keys.iter().map(move |k| (*cf, k.clone())))
+                .map(|(cf, k)| layer.lookup_row(cf, &k))
+                .collect();
+            (layer.bytes(), rows)
+        };
+        assert_eq!(merged(&frozen), merged(&eager), "checkpoint layer merge");
+        assert_eq!(source.jobs().len(), 1, "the merge ran the job once");
+    }
+    // The flush on two DBs (rows, the applied marker, the running hash).
+    {
+        let (frozen, source) = deferred();
+        let flushed = |f: &crate::backend::FrozenPending| {
+            let (db2, dir) = r2_db();
+            crate::running_hash::configure_activation(&db2, Some(1)).unwrap();
+            f.flush_on_worker(None, &db2, Some(1), None, None, None).unwrap();
+            let out = (db_dump(&db2), crate::running_hash::read_running_hash(&db2));
+            drop(dir);
+            out
+        };
+        let (a, b) = (flushed(&frozen), flushed(&eager));
+        assert!(a.1.is_some(), "the chain started at height 1");
+        assert_eq!(a, b, "flush: DB rows and running hash");
+        assert_eq!(source.jobs().len(), 1, "the flush ran the job once");
+    }
+}

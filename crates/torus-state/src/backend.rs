@@ -1106,6 +1106,13 @@ impl FrozenPending {
         self.height
     }
 
+    /// Item 6 Phase 5 step 2 r2: the set's rows of an in-place source's CFs
+    /// (positions, balances) are taken but not serialized yet (the first
+    /// reader of those CFs serializes them). Not built yet (RED stub).
+    pub fn typed_pending(&self) -> bool {
+        false
+    }
+
     /// Item 6 Phase 3 (s114): count this set against `stats` until it is
     /// freed (a no-op if already tracked). Its bytes count from when it is
     /// merged into a layer ([`crate::CheckpointLayer::merge`]): no walk here.

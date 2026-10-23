@@ -36919,6 +36919,9 @@ mod crash_recovery_tests {
         bbo_rows: usize,
         /// Step 2: rows drained in place by the reference / typed node.
         drained: (u64, u64),
+        /// Step 2 r2: the typed node's drain encode jobs, all and those run
+        /// on the thread that froze the block (the execution thread).
+        encoded: (u64, u64),
     }
 
     /// After block `h` on both nodes (both idle): the write sets of the
@@ -37070,6 +37073,10 @@ mod crash_recovery_tests {
                 a.metrics.exec_users_drained_rows.get(),
                 b.metrics.exec_users_drained_rows.get(),
             ),
+            encoded: (
+                b.metrics.exec_users_drain_encodes.get(),
+                b.metrics.exec_users_drain_encode_inline.get(),
+            ),
         })
     }
 
@@ -37124,6 +37131,18 @@ mod crash_recovery_tests {
             // reference node never did.
             assert_eq!(s.drained.0, 0, "{cfg:?}: the reference node drained rows: {s:?}");
             assert!(s.drained.1 >= n, "{cfg:?}: the typed node drained in place: {s:?}");
+            // Step 2 r2: the drains were serialized by encode jobs; a serial
+            // block's on the execution thread (its flush), a pipelined
+            // block's on the first other thread that read its rows (the
+            // flush worker's digest / flush): E reads them first only at a
+            // checkpoint close or a serial barrier.
+            let (jobs, inline) = s.encoded;
+            assert!(jobs >= n / 2, "{cfg:?}: drain encode jobs: {s:?}");
+            if cfg.pipelined {
+                assert!(inline * 2 < jobs, "{cfg:?}: pipelined drains encoded off the execution thread: {s:?}");
+            } else {
+                assert_eq!(inline, jobs, "{cfg:?}: serial drains encode at the flush: {s:?}");
+            }
             assert!(
                 s.fills >= n as usize && s.liquidations >= 3 && s.bbo_rows >= 1,
                 "{cfg:?}: {s:?}"

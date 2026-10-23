@@ -3628,3 +3628,75 @@ fn pending_typed_write_outside_a_tx_scope_is_caught() {
 }
 
 
+
+/// Item 6 Phase 5 step 2 r2: a drained record set's sums carry, as text
+/// (each reported trader with its changes and positions now, in call order).
+fn r2_carry_of(u: &mut Users) -> Vec<String> {
+    let mut out = Vec::new();
+    u.report_in_place(&mut |t: &Address, report| {
+        out.push(format!("{t:?} {:?}", report.map(|(c, p, _)| (c.to_vec(), p.to_vec()))));
+    });
+    out
+}
+
+/// Item 6 Phase 5 step 2 r2 (plan revisit: the drain encoding moves to the
+/// flush worker). `capture_dirty` (the execution thread, at the freeze)
+/// empties the dirty sets and reads each dirty key's row once, serializing
+/// none of them on that thread; `DrainCapture::encode`, run on another
+/// thread, returns byte for byte the rows the step 2 exec-thread drain
+/// (`drain_dirty_reference`) returns for the same record set and the same
+/// mutations, and both leave the same sums carry (`report_in_place`, with a
+/// second drain before the carry is taken now and then) and the same record
+/// set. Random mutations of every shape: typed calls, raw and irregular
+/// rows, rows under no trader, opaque traders turning regular and back.
+#[test]
+fn drain_capture_encodes_off_thread_byte_identical() {
+    let (mut compared, mut carried, mut raw_rows) = (0usize, 0usize, 0usize);
+    for seed in 1..=6u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let mut rng = Lcg(seed * 0x517C_C1B7);
+        for _ in 0..4 {
+            let o = NativeStateOverlay::new(db.clone());
+            random_block_over(&o, &mut rng, &step2_traders());
+            random_balance_block_over(&o, &mut rng, &step2_traders());
+            o.flush(&db).unwrap();
+        }
+        let rows = ResidentRows::build(&db).unwrap();
+        let (mut reference, mut deferred) = (Users::build(&rows), Users::build(&rows));
+        let traders = step2_traders();
+        for round in 0..6 {
+            let tag = format!("seed {seed} round {round}");
+            for _ in 0..80 {
+                let t = traders[rng.below(traders.len() as u64) as usize];
+                let op = p5_random_op(&mut rng, t);
+                assert_eq!(op.on_users(&mut reference), op.on_users(&mut deferred), "{tag}: {op:?}");
+            }
+            let want = reference.drain_dirty_reference();
+            let before = Users::drain_sources();
+            let capture = deferred.capture_dirty();
+            assert_eq!(Users::drain_sources(), before, "{tag}: the capture serialized rows on the freezing thread");
+            assert_eq!(deferred.dirty_keys(), 0, "{tag}: the capture empties the dirty sets");
+            let n = capture.rows();
+            let (got, sources) = std::thread::spawn(move || (capture.encode(), Users::drain_sources()))
+                .join()
+                .unwrap();
+            assert_eq!(got, want, "{tag}: deferred encode != exec-thread drain");
+            assert_eq!(n, want.positions.len() + want.balances.len(), "{tag}: one row per dirty key");
+            let present = want.positions.iter().chain(want.balances.iter()).filter(|(_, v)| v.is_some()).count();
+            assert_eq!(sources.0 + sources.1, present, "{tag}: every present row serialized on the worker");
+            raw_rows += sources.1;
+            compared += n;
+            // Now and then a second drain before the carry is taken.
+            if round % 3 != 1 {
+                let (a, b) = (r2_carry_of(&mut reference), r2_carry_of(&mut deferred));
+                assert_eq!(a, b, "{tag}: sums carry");
+                carried += a.len();
+            }
+            assert!(reference.same_as(&deferred), "{tag}: record sets");
+            assert!(deferred.self_consistent(), "{tag}: self-consistent");
+        }
+    }
+    println!("P5 r2 deferred drain: rows {compared}, carried traders {carried}, raw rows {raw_rows}");
+    assert!(compared > 1_500 && carried > 100 && raw_rows > 0, "non-vacuous: {compared} {carried} {raw_rows}");
+}
