@@ -3890,6 +3890,11 @@ impl ExecutionContext {
             m.publish_read_view(None);
         }
         self.exec_applied.store(applied, Ordering::SeqCst);
+        // Epoch plan hand-off: a fresh W starts at the durable marker; the
+        // map is empty after a restart, so consensus reads the DB as before.
+        if let Some(h) = &self.plan_handoff {
+            h.set_logical(applied);
+        }
         *self.last_job.lock().unwrap() = None;
         self.last_job_books_deferred.store(false, Ordering::SeqCst);
         tracing::info!(
@@ -4272,6 +4277,11 @@ impl ExecutionContext {
             return true;
         };
         self.exec_applied.store(height, Ordering::SeqCst);
+        // Epoch plan hand-off: the logical height, after any rows this block
+        // wrote were published (`publish_plan` runs before the hand-off).
+        if let Some(h) = &self.plan_handoff {
+            h.set_logical(height);
+        }
         *self.last_job.lock().unwrap() = Some(pending);
         self.last_job_books_deferred
             .store(books_deferred, Ordering::SeqCst);
@@ -6559,6 +6569,29 @@ impl ExecutionContext {
             ctx.stash_resident(&mut resident_books);
             drop(resident_books);
 
+            // Epoch plan hand-off (`TORUS_EPOCH_PLAN_HANDOFF`): a boundary
+            // wrote the rows for `height + L` (member plan, exclusion plan)
+            // into this block's overlay, and every fatal-error check of the
+            // block is behind us; read them back for consensus. A read error
+            // only loses the shortcut: consensus keeps the durable rule.
+            let plan_publish = match &self.plan_handoff {
+                Some(_) if EpochManager::is_epoch_boundary(height, self.epoch_length) => {
+                    let boundary = height.saturating_add(self.epoch_length);
+                    match crate::plan_handoff::read_boundary_rows(&overlay, boundary) {
+                        Ok(rows) => rows.map(|r| (boundary, r)),
+                        Err(e) => {
+                            tracing::warn!(
+                                %e,
+                                height,
+                                "epoch plan hand-off: plan read failed — consensus keeps the durable rule"
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+
             let flush_timer = std::time::Instant::now();
             for (sender, nonce) in &consumed_nonces {
                 let nonce_key = torus_state::cf::native_nonce_key(sender, *nonce);
@@ -6686,6 +6719,16 @@ impl ExecutionContext {
                     resident_delta =
                         torus_bridge::native_executor::BlockDelta::Frozen(frozen.clone());
                 }
+                // Epoch plan hand-off: the rows go in BEFORE the hand-off
+                // publishes this height (consensus reads the height, then
+                // the map); a failed hand-off takes them back out.
+                let published = match (&self.plan_handoff, plan_publish) {
+                    (Some(h), Some((boundary, rows))) => {
+                        h.publish_plan(height, self.epoch_length, boundary, rows);
+                        Some(boundary)
+                    }
+                    _ => None,
+                };
                 if !self.pipeline_handoff(crate::exec_pipeline::Job::Flush {
                     height,
                     pending: frozen,
@@ -6699,6 +6742,9 @@ impl ExecutionContext {
                     // Digest into the window). `None` for a native block.
                     evm: evm_job.take(),
                 }) {
+                    if let (Some(h), Some(boundary)) = (&self.plan_handoff, published) {
+                        h.retract_plan(boundary);
+                    }
                     return;
                 }
                 // 8k L3.1: this block's skipped books join the window's debt
@@ -6856,6 +6902,11 @@ impl ExecutionContext {
             {
                 self.test_path("serial.flush");
                 self.test_complete(crate::exec_pipeline::CompleteSite::ESerialFlush, height);
+            }
+            // Epoch plan hand-off: a serial boundary's rows are durable now;
+            // the map mirrors the DB rows (and prunes as the DB did).
+            if let (Some(h), Some((boundary, rows))) = (&self.plan_handoff, plan_publish) {
+                h.publish_plan(height, self.epoch_length, boundary, rows);
             }
             } // end serial flush
 
@@ -9978,40 +10029,111 @@ impl TorusApp {
         hasher.finalize().into()
     }
 
-    /// The epoch plan stored for boundary `height` by the execution of the
-    /// previous boundary (consensus bug (b) guard + read, shared by the
-    /// validator-set updates and the item 7 EVM values). `Err` = this node's
-    /// execution has not applied the previous boundary yet (or a read
-    /// failed): refuse and retry, never guess.
-    fn epoch_plan(&self, height: u64) -> Result<Option<EpochRotationPlan>, EpochPlanNotReady> {
+    /// Where boundary `height`'s plan rows are read (consensus bug (b)
+    /// guard, shared by the validator-set updates, the item 7 EVM values and
+    /// the routing prediction). `Ok(Some(rows))`: the epoch plan hand-off
+    /// (`TORUS_EPOCH_PLAN_HANDOFF`): execution LOGICALLY applied
+    /// `height - L` and published the rows it wrote (byte for byte the rows
+    /// its flush or checkpoint writes). `Ok(None)`: the DB, the durable
+    /// marker reached `height - L`. `Err` = not ready (or a read failed):
+    /// refuse and retry, never guess; a logical-only readiness without the
+    /// rows in memory is not ready (never "no change", bug-b2 class).
+    /// `quiet`: no log (the routing prediction polls).
+    fn boundary_plan_source(
+        &self,
+        height: u64,
+        quiet: bool,
+    ) -> Result<Option<Arc<crate::plan_handoff::BoundaryRows>>, EpochPlanNotReady> {
         // R02: a read error refuses the boundary for now (liveness only),
         // never "applied = 0".
         let applied = match self.applied_height() {
             Ok(applied) => applied.unwrap_or(0),
             Err(e) => {
-                tracing::error!(
-                    %e,
-                    height,
-                    "epoch boundary: applied-height marker read failed — validator-set plan not ready"
-                );
+                if !quiet {
+                    tracing::error!(
+                        %e,
+                        height,
+                        "epoch boundary: applied-height marker read failed — validator-set plan not ready"
+                    );
+                }
                 return Err(EpochPlanNotReady);
             }
         };
         let needed = height.saturating_sub(self.epoch_length);
-        if applied < needed {
-            tracing::warn!(
-                height,
-                applied,
-                needed,
-                "epoch boundary: execution has not applied the previous boundary yet — \
-                 validator-set plan not ready, refusing this boundary block for now"
-            );
-            return Err(EpochPlanNotReady);
+        let Some(handoff) = &self.plan_handoff else {
+            if applied < needed {
+                if !quiet {
+                    tracing::warn!(
+                        height,
+                        applied,
+                        needed,
+                        "epoch boundary: execution has not applied the previous boundary yet — \
+                         validator-set plan not ready, refusing this boundary block for now"
+                    );
+                }
+                return Err(EpochPlanNotReady);
+            }
+            return Ok(None);
+        };
+        match handoff.source(height, needed, applied) {
+            crate::plan_handoff::PlanSource::Memory(rows) => Ok(Some(rows)),
+            crate::plan_handoff::PlanSource::Db => Ok(None),
+            crate::plan_handoff::PlanSource::NotReady { logical } => {
+                if quiet {
+                    return Err(EpochPlanNotReady);
+                }
+                if logical < needed {
+                    tracing::warn!(
+                        height,
+                        applied,
+                        logical,
+                        needed,
+                        "epoch boundary: execution has not applied the previous boundary yet — \
+                         validator-set plan not ready, refusing this boundary block for now"
+                    );
+                } else {
+                    tracing::warn!(
+                        height,
+                        applied,
+                        logical,
+                        needed,
+                        "epoch boundary: execution applied the previous boundary but its plan rows \
+                         are not in the hand-off and not durable yet — refusing this boundary block for now"
+                    );
+                }
+                Err(EpochPlanNotReady)
+            }
         }
-        self.staking.epoch_rotation_plan(height).map_err(|e| {
-            tracing::error!(%e, height, "failed to read the epoch rotation plan");
-            EpochPlanNotReady
-        })
+    }
+
+    /// The epoch plan stored for boundary `height` by the execution of the
+    /// previous boundary, from [`Self::boundary_plan_source`]. `Err` = this
+    /// node's execution has not applied the previous boundary yet (or a
+    /// read failed): refuse and retry, never guess.
+    fn epoch_plan(&self, height: u64) -> Result<Option<EpochRotationPlan>, EpochPlanNotReady> {
+        let rows = self.boundary_plan_source(height, false)?;
+        self.epoch_plan_from(height, rows.as_deref())
+    }
+
+    /// The plan for `height` from the hand-off's `rows` (decoded as the DB
+    /// read does), or from the DB (`None`).
+    fn epoch_plan_from(
+        &self,
+        height: u64,
+        rows: Option<&crate::plan_handoff::BoundaryRows>,
+    ) -> Result<Option<EpochRotationPlan>, EpochPlanNotReady> {
+        match rows {
+            Some(rows) => torus_economics::decode_epoch_rotation_plan(&rows.plan)
+                .map(Some)
+                .map_err(|e| {
+                    tracing::error!(%e, height, "failed to decode the handed-off epoch plan");
+                    EpochPlanNotReady
+                }),
+            None => self.staking.epoch_rotation_plan(height).map_err(|e| {
+                tracing::error!(%e, height, "failed to read the epoch rotation plan");
+                EpochPlanNotReady
+            }),
+        }
     }
 
     /// Item 7 step 1: the plan's EVM values for block `height` (`None` off a
@@ -10050,12 +10172,21 @@ impl TorusApp {
                 return Ok(cached_result.clone());
             }
         }
-        let plan = self.epoch_plan(height)?;
+        // Both rows from one source: the hand-off, or the DB once durable.
+        let rows = self.boundary_plan_source(height, false)?;
+        let plan = self.epoch_plan_from(height, rows.as_deref())?;
         // Dead-leader skip (A4): the exclusion plan the same execution wrote next to `plan`.
-        let exclusions = match torus_economics::leader_stats::leader_exclusion_plan(
-            self.staking.state(),
-            height,
-        ) {
+        let exclusions = match rows.as_deref() {
+            Some(rows) => rows
+                .lx_plan
+                .as_deref()
+                .map(torus_economics::leader_stats::decode_leader_exclusion_plan)
+                .transpose(),
+            None => {
+                torus_economics::leader_stats::leader_exclusion_plan(self.staking.state(), height)
+            }
+        };
+        let exclusions = match exclusions {
             Ok(lx) => lx.filter(|lx| !lx.exclude.is_empty() || !lx.readmit.is_empty()),
             Err(e) => {
                 tracing::error!(%e, height, "failed to read the leader exclusion plan");
@@ -11595,11 +11726,18 @@ impl TorusApp {
         if self.leader_state.upcoming_boundary() == Some(boundary) {
             return;
         }
-        let needed = boundary.saturating_sub(self.epoch_length);
-        if !matches!(self.applied_height(), Ok(applied) if applied.unwrap_or(0) >= needed) {
+        // As `epoch_plan` (the hand-off first, the DB only once durable), quietly: not ready =
+        // keep predicting from the committed values.
+        let Ok(rows) = self.boundary_plan_source(boundary, true) else {
             return;
-        }
-        if let Ok(plan) = self.staking.epoch_rotation_plan(boundary) {
+        };
+        let plan = match rows.as_deref() {
+            Some(rows) => torus_economics::decode_epoch_rotation_plan(&rows.plan)
+                .map(Some)
+                .map_err(drop),
+            None => self.staking.epoch_rotation_plan(boundary).map_err(drop),
+        };
+        if let Ok(plan) = plan {
             let v = plan.map(|p| p.evm).unwrap_or_default().resolve(header);
             self.leader_state
                 .set_upcoming(boundary, v.block_interval, v.big_block_interval);
@@ -47193,16 +47331,18 @@ mod crash_recovery_tests {
 
     // ---- epoch plan hand-off (TORUS_EPOCH_PLAN_HANDOFF; s80 prototype 62373d5d) ----
 
-    /// The exclusion delta of a validator-set update (hotstuff key order), to
-    /// compare two updates.
-    fn update_shape(
-        u: &Option<ValidatorSetUpdates>,
-    ) -> Option<(
+    /// A validator-set update as (inserts, deletes, leader excludes, leader
+    /// readmits), each in key order.
+    type UpdateShape = (
         Vec<(VerifyingKey, Power)>,
         Vec<VerifyingKey>,
         Vec<VerifyingKey>,
         Vec<VerifyingKey>,
-    )> {
+    );
+
+    /// The parts of a validator-set update (key order), to compare two
+    /// updates.
+    fn update_shape(u: &Option<ValidatorSetUpdates>) -> Option<UpdateShape> {
         u.as_ref().map(|u| {
             let mut inserts: Vec<_> = u.inserts().map(|(k, p)| (*k, *p)).collect();
             inserts.sort_by_key(|(k, _)| k.to_bytes());
@@ -47253,18 +47393,28 @@ mod crash_recovery_tests {
         }
         app.plan_handoff = Some(handoff.clone());
         assert_eq!(handoff.logical(), 3);
-        assert_eq!(app.epoch_plan(8), Err(EpochPlanNotReady), "(b) neither ready");
+        assert_eq!(
+            app.epoch_plan(8),
+            Err(EpochPlanNotReady),
+            "(b) neither ready"
+        );
 
         gate.hold_checkpoints();
         dispatch_and_execute(&ctx, &db, &blocks[3]);
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
-        o0_wait("checkpoint 4 parked", || gate.parked_checkpoint() == Some(4));
+        o0_wait("checkpoint 4 parked", || {
+            gate.parked_checkpoint() == Some(4)
+        });
         assert!(
             read_native_applied_height(&db).unwrap_or(0) < 4,
             "boundary 4 is not durable"
         );
         assert_eq!(handoff.logical(), 4, "execution handed 4 to W");
-        assert_eq!(handoff.boundaries(), vec![8], "boundary 4 published plan(8)");
+        assert_eq!(
+            handoff.boundaries(),
+            vec![8],
+            "boundary 4 published plan(8)"
+        );
         // Execution runs on (5..=7) while the checkpoint is parked.
         for b in &blocks[4..] {
             dispatch_and_execute(&ctx, &db, b);
@@ -47289,7 +47439,11 @@ mod crash_recovery_tests {
         let miss = Arc::new(PlanHandoff::default());
         miss.set_logical(7);
         app.plan_handoff = Some(miss);
-        assert_eq!(app.epoch_plan(8), Err(EpochPlanNotReady), "map miss: never no change");
+        assert_eq!(
+            app.epoch_plan(8),
+            Err(EpochPlanNotReady),
+            "map miss: never no change"
+        );
         assert_eq!(app.boundary_evm(8), Err(EpochPlanNotReady));
         assert!(app.epoch_validator_set_updates(8).is_err());
 
@@ -47320,7 +47474,9 @@ mod crash_recovery_tests {
             .expect("the plan row for 8 is durable");
         assert_eq!(*mem_rows, db_rows, "the hand-off bytes are the rows'");
         assert_eq!(
-            StakingManager::new(db.clone()).epoch_rotation_plan(8).unwrap(),
+            StakingManager::new(db.clone())
+                .epoch_rotation_plan(8)
+                .unwrap(),
             Some(mem.clone())
         );
         drop(ctx);
@@ -47329,8 +47485,14 @@ mod crash_recovery_tests {
         for handoff in [Some(Arc::new(PlanHandoff::default())), None] {
             let mut fresh = TorusApp::new(db.clone(), &config, None, None, None);
             fresh.plan_handoff = handoff;
-            assert_eq!(fresh.epoch_plan(8), Ok(Some(mem.clone())), "(c) restart: DB path");
-            let db_updates = fresh.epoch_validator_set_updates(8).expect("durable: ready");
+            assert_eq!(
+                fresh.epoch_plan(8),
+                Ok(Some(mem.clone())),
+                "(c) restart: DB path"
+            );
+            let db_updates = fresh
+                .epoch_validator_set_updates(8)
+                .expect("durable: ready");
             assert_eq!(update_shape(&db_updates), update_shape(&mem_updates));
         }
     }
@@ -47352,8 +47514,14 @@ mod crash_recovery_tests {
         let (config, db) = dls_fixture();
         // Boundary 4's execution, not durable: its rows sit in its overlay.
         let overlay = NativeStateOverlay::new(db.clone());
-        EpochManager::execute_planned_rotation(&StakingManager::new(overlay.clone()), 4, 4, 4, None)
-            .unwrap();
+        EpochManager::execute_planned_rotation(
+            &StakingManager::new(overlay.clone()),
+            4,
+            4,
+            4,
+            None,
+        )
+        .unwrap();
         put_leader_exclusion_plan(
             &overlay,
             &LeaderExclusionPlan {
@@ -47372,7 +47540,10 @@ mod crash_recovery_tests {
             .expect("boundary 4 wrote the plan for 8");
         assert!(rows.lx_plan.is_some(), "and the exclusion plan");
         write_native_applied_height(&db, 3);
-        assert_eq!(crate::plan_handoff::read_boundary_rows(&db, 8).unwrap(), None);
+        assert_eq!(
+            crate::plan_handoff::read_boundary_rows(&db, 8).unwrap(),
+            None
+        );
 
         let handoff = Arc::new(PlanHandoff::default());
         handoff.publish_plan(4, 4, 8, rows.clone());
@@ -47399,8 +47570,14 @@ mod crash_recovery_tests {
         for handoff in [Some(Arc::new(PlanHandoff::default())), None] {
             let mut fresh = TorusApp::new(db.clone(), &config, None, None, None);
             fresh.plan_handoff = handoff;
-            let durable = fresh.epoch_validator_set_updates(8).expect("durable: ready");
-            assert_eq!(update_shape(&durable), update_shape(&mem), "DB path = memory path");
+            let durable = fresh
+                .epoch_validator_set_updates(8)
+                .expect("durable: ready");
+            assert_eq!(
+                update_shape(&durable),
+                update_shape(&mem),
+                "DB path = memory path"
+            );
         }
     }
 

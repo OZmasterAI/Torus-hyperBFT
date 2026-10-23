@@ -121,7 +121,13 @@ impl PlanHandoff {
     /// `executed - L` are deleted by this execution, entries at or below
     /// `executed - L` are dropped; the entry for `executed` itself is kept
     /// (consensus may re-read it until `executed + L` executes).
-    pub fn publish_plan(&self, executed: u64, epoch_length: u64, boundary: u64, rows: BoundaryRows) {
+    pub fn publish_plan(
+        &self,
+        executed: u64,
+        epoch_length: u64,
+        boundary: u64,
+        rows: BoundaryRows,
+    ) {
         let floor = executed.saturating_sub(epoch_length);
         let mut plans = self.plans.lock().unwrap();
         plans.retain(|&b, _| b > floor);
@@ -210,10 +216,7 @@ mod tests {
         };
         h.publish_plan(1200, 100, 1300, r.clone());
         h.set_logical(1242);
-        assert_eq!(
-            h.source(1300, 1200, 1100),
-            PlanSource::Memory(Arc::new(r))
-        );
+        assert_eq!(h.source(1300, 1200, 1100), PlanSource::Memory(Arc::new(r)));
     }
 
     /// (b) neither the durable marker nor the logical height reached
