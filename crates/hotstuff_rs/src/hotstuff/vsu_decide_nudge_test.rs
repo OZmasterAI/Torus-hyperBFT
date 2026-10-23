@@ -274,3 +274,66 @@ fn commit_nudge_from_a_non_leader_is_still_dropped() {
     assert!(votes.is_empty(), "a nudge from a validator that leads vp + 3 in neither set is dropped: {} votes", votes.len());
 }
 
+/// Found by the full hotstuff_rs run with the nudge fix (`late_joiner_crosses_its_own_join`
+/// aborted on the steady-state debug assert): a replica in the window holds the phase-blind
+/// collector pair (CVS and PVS collectors). The pacemaker's AdvanceView path marks the update
+/// decided (`advance_highest_pc_from_remote` on another aggregator's Decide PC) without touching
+/// HotStuff's collectors, so an old-set quorum of late Decide votes still completes the PVS
+/// collector, and the decided branch only debug-asserted the PC's correctness: a debug build
+/// aborts, a release build acts on a Decide PC without a new-set quorum (the S430 hole). The PC
+/// must be checked (and dropped) whenever the PVS collector is still there.
+#[test]
+fn old_set_decide_pc_collected_after_a_remote_decide_is_dropped() {
+    use crate::types::crypto_primitives::Keypair;
+    use crate::types::data_types::Power;
+
+    let keys = signing_keys(&[1, 2, 3, 4, 5]);
+    let old_keys = &keys[..4];
+    let old_set = validator_set(old_keys);
+    let joiner = keys[4].verifying_key();
+    let mut updates = ValidatorSetUpdates::new();
+    updates.insert(joiner, Power::new(1));
+    let mut new_set = old_set.clone();
+    new_set.apply_updates(&updates);
+
+    let vote = |key: &SigningKey, view: u64, block: CryptoHash, phase: Phase| {
+        (key.clone(), PhaseVote::new(&Keypair::new(key.clone()), CHAIN_ID, ViewNumber::new(view), block, phase))
+    };
+    let a = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(), CryptoHash::new([10; 32]), Data::new(vec![]));
+    let qc_a = generic_pc(ViewNumber::new(1), a.hash, old_keys, &old_set);
+    let u = Block::new(BlockHeight::new(1), qc_a.clone(), CryptoHash::new([11; 32]), Data::new(vec![]));
+    let (mut tree, _) = steady_block_tree(&old_set);
+    tree.insert(&a, None, None).unwrap();
+    tree.update(&qc_a, &None).unwrap();
+    tree.insert(&u, None, Some(&updates)).unwrap();
+    for (view, phase) in [(2, Phase::Prepare), (3, Phase::Precommit), (4, Phase::Commit)] {
+        let votes: Vec<_> = old_keys.iter().map(|k| vote(k, view, u.hash, phase)).collect();
+        let pc = certify(view, &votes, &old_set);
+        tree.update(&pc, &None).unwrap();
+    }
+    let state = tree.validator_set_state().unwrap();
+    assert!(!state.update_decided() && state.committed_validator_set() == &new_set, "fixture: U committed, undecided");
+
+    // The replica is in the Decide view 5 with the window's collector pair.
+    let local = keys[0].clone();
+    let (mut hotstuff, _events) = hotstuff_at_with_events(ViewNumber::new(5), local, state);
+
+    // Another aggregator's Decide PC (a new-set quorum: four of five) arrives by AdvanceView.
+    let decide_votes: Vec<_> = old_keys.iter().map(|k| vote(k, 5, u.hash, Phase::Decide)).collect();
+    let remote_decide = certify(5, &decide_votes, &new_set);
+    tree.advance_highest_pc_from_remote(&remote_decide, &None).unwrap();
+    assert!(tree.validator_set_state().unwrap().update_decided(), "fixture: the remote Decide PC decides U");
+
+    // Three late Decide votes of old-set members: an old-set quorum, not a new-set one.
+    for (key, vote) in decide_votes.into_iter().take(3) {
+        hotstuff
+            .on_receive_msg(HotStuffMessage::PhaseVote(vote), &key.verifying_key(), &mut tree, &mut TreeApp)
+            .expect("processing a vote must not error");
+    }
+    let highest = tree.highest_pc().unwrap();
+    assert_eq!(
+        (highest.phase, highest.view.int(), highest.signatures.len()),
+        (Phase::Decide, 5, remote_decide.signatures.len()),
+        "the highest PC stays the new-set Decide PC"
+    );
+}
