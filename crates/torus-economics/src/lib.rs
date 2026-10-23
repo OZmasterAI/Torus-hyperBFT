@@ -15,6 +15,7 @@ pub mod epoch;
 pub mod epoch_plan;
 pub mod error;
 pub mod governance;
+pub mod leader_stats;
 pub mod queries;
 pub mod rewards;
 pub mod staking;

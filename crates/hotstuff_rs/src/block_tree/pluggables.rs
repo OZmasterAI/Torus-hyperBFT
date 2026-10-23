@@ -18,7 +18,10 @@ use crate::{
     },
 };
 
-use super::variables::{self, concat};
+use super::{
+    update_records::{validator_set_update_record_key, ValidatorSetUpdateRecord},
+    variables::{self, concat},
+};
 
 pub trait KVStore: KVGet + Clone + Send + 'static {
     type WriteBatch: WriteBatch;
@@ -226,17 +229,16 @@ pub trait KVGet {
     /* ↓↓↓ Committed Validator Set ↓↓↓ */
 
     fn committed_validator_set(&self) -> Result<ValidatorSet, KVGetError> {
-        let committed_validator_set_bytes = ValidatorSetBytes::deserialize(
-            &mut &*self.get(&variables::COMMITTED_VALIDATOR_SET).ok_or(
+        let committed_validator_set_bytes =
+            ValidatorSetBytes::decode(&self.get(&variables::COMMITTED_VALIDATOR_SET).ok_or(
                 KVGetError::ValueExpectedButNotFound {
                     key: Key::CommittedValidatorSet,
                 },
-            )?,
-        )
-        .map_err(|err| KVGetError::DeserializeValueError {
-            key: Key::CommittedValidatorSet,
-            source: err,
-        })?;
+            )?)
+            .map_err(|err| KVGetError::DeserializeValueError {
+                key: Key::CommittedValidatorSet,
+                source: err,
+            })?;
         ValidatorSet::try_from(committed_validator_set_bytes).map_err(|err| {
             KVGetError::Ed25519DalekError {
                 key: Key::CommittedValidatorSet,
@@ -366,17 +368,16 @@ pub trait KVGet {
     /* ↓↓↓ Previous Validator Set ↓↓↓ */
 
     fn previous_validator_set(&self) -> Result<ValidatorSet, KVGetError> {
-        let previous_validator_set_bytes = ValidatorSetBytes::deserialize(
-            &mut &*self.get(&variables::PREVIOUS_VALIDATOR_SET).ok_or(
+        let previous_validator_set_bytes =
+            ValidatorSetBytes::decode(&self.get(&variables::PREVIOUS_VALIDATOR_SET).ok_or(
                 KVGetError::ValueExpectedButNotFound {
                     key: Key::CommittedValidatorSet,
                 },
-            )?,
-        )
-        .map_err(|err| KVGetError::DeserializeValueError {
-            key: Key::CommittedValidatorSet,
-            source: err,
-        })?;
+            )?)
+            .map_err(|err| KVGetError::DeserializeValueError {
+                key: Key::CommittedValidatorSet,
+                source: err,
+            })?;
         ValidatorSet::try_from(previous_validator_set_bytes).map_err(|err| {
             KVGetError::Ed25519DalekError {
                 key: Key::CommittedValidatorSet,
@@ -408,6 +409,25 @@ pub trait KVGet {
             Some(bytes) => ViewNumber::deserialize(&mut &*bytes)
                 .map(Some)
                 .map_err(|err| KVGetError::DeserializeValueError { key: Key::ValidatorSetUpdateView, source: err }),
+            None => Ok(None),
+        }
+    }
+
+    /* ↓↓↓ Validator Set Update Records ↓↓↓ */
+
+    /// The [`ValidatorSetUpdateRecord`] of the validator-set update committed at `height`, if this
+    /// replica committed it on its Commit PC (s138 option 1).
+    fn validator_set_update_record(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<ValidatorSetUpdateRecord>, KVGetError> {
+        match self.get(&validator_set_update_record_key(height)) {
+            Some(bytes) => ValidatorSetUpdateRecord::deserialize(&mut &*bytes)
+                .map(Some)
+                .map_err(|err| KVGetError::DeserializeValueError {
+                    key: Key::ValidatorSetUpdateRecord { height },
+                    source: err,
+                }),
             None => Ok(None),
         }
     }
@@ -514,6 +534,7 @@ pub enum Key {
     HighestViewPhaseVoted,
     ValidatorSetUpdateView,
     ConsensusDbFormat,
+    ValidatorSetUpdateRecord { height: BlockHeight },
 }
 
 impl Display for Key {
@@ -546,6 +567,9 @@ impl Display for Key {
             Key::HighestViewPhaseVoted => write!(f, "Highest View Phase-Voted"),
             Key::ValidatorSetUpdateView => write!(f, "Validator Set Update View"),
             Key::ConsensusDbFormat => write!(f, "Consensus DB Format"),
+            Key::ValidatorSetUpdateRecord { height } => {
+                write!(f, "Validator Set Update Record at height {}", height.int())
+            }
         }
     }
 }

@@ -182,12 +182,23 @@ pub const VALIDATOR_SET_UPDATE_VIEW: [u8; 1] = [24];
 /// in the same batch as the committed validator set. Absent: written by a build before TC-required
 /// phase C (untagged signatures, unsigned tips), which this build cannot read or verify.
 pub const CONSENSUS_DB_FORMAT: [u8; 1] = [25];
+/// s138 option 1 (docs/plans/vset-membership-sync-remainder.md): `VALIDATOR_SET_UPDATE_RECORDS ++
+/// height(U)` (borsh [`BlockHeight`](crate::types::data_types::BlockHeight)) ->
+/// [`ValidatorSetUpdateRecord`](super::update_records::ValidatorSetUpdateRecord) for each
+/// validator-set update U this replica committed on U's Commit PC. Written in the commit's write
+/// batch; never pruned (sync from genesis needs every record). Additive: a store without the key
+/// (older binary, or an update crossed by its Decide PC) serves block sync as before.
+pub const VALIDATOR_SET_UPDATE_RECORDS: [u8; 1] = [26];
 
 /// The [`CONSENSUS_DB_FORMAT`] this build writes and the only one it reads. 1: TC-required phase C
 /// (docs/plans/tc-required-and-tip-signing.md): domain-tagged signatures, leader-signed proposals
-/// and headers, signed local tips. Stores have no in-place migration: a store of another format is
-/// refused at boot (torus-node `open_node_dbs`), and the data dir must be started fresh.
-pub const CONSENSUS_DB_FORMAT_VERSION: u32 = 1;
+/// and headers, signed local tips. 2: dead-leader skip (docs/plans/dead-leader-skip.md): stored
+/// validator sets may carry a leader-excluded set after the legacy bytes (a format-1 build's
+/// borsh `deserialize` would drop it without error and pick other leaders), a pending update with
+/// exclusions has its own status tag, and commit manifests may carry the leader evidence
+/// envelope. Stores have no in-place migration: a store of another format is refused at boot
+/// (torus-node `open_node_dbs`), and the data dir must be started fresh.
+pub const CONSENSUS_DB_FORMAT_VERSION: u32 = 2;
 
 // Fields of Block
 pub const BLOCK_HEIGHT: [u8; 1] = [0];

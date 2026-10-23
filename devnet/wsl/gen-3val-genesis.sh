@@ -70,7 +70,7 @@
 #   DL_K=K  DL_JCAP=J  dead-leader skip genesis parameters (branch
 #               feat/dead-leader-p3, docs/plans/dead-leader-skip.md):
 #               .consensus.leader_miss_threshold = K (0 = off, else 2..=64;
-#               node default 3) and .consensus.leader_exclusion_cap = J
+#               node default 0 = off, owner s138) and .consensus.leader_exclusion_cap = J
 #               (0..=10; node default 6). Each written ONLY when given (unset
 #               or empty = the field stays absent, OUT byte-identical). A
 #               binary without the fields ignores them (the genesis loader
@@ -298,7 +298,7 @@ jq -r '
      then "  book_window_commit = on (L6.1)" else empty end),
     "  book_mode  = \(.consensus.book_mode // "absent (classic)")",
     (if .consensus.leader_miss_threshold != null or .consensus.leader_exclusion_cap != null
-     then "  dead_leader = leader_miss_threshold \(.consensus.leader_miss_threshold // "absent (node default 3)") leader_exclusion_cap \(.consensus.leader_exclusion_cap // "absent (node default 6)")"
+     then "  dead_leader = leader_miss_threshold \(.consensus.leader_miss_threshold // "absent (node default 0 = off)") leader_exclusion_cap \(.consensus.leader_exclusion_cap // "absent (node default 6)")"
      else empty end),
     "  chain_id   = \(.chain_id)",
     "  validators = \(.validators|length)  (\([.validators[].address] | join(" ")) )",

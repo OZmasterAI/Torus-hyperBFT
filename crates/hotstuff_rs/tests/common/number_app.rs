@@ -92,6 +92,13 @@ pub enum NumberAppTransaction {
     /// s84: a transaction that always fails its validity check (a forged
     /// signature, say). The app skips it at execution.
     Invalid,
+
+    /// Dead-leader skip: add the validator to the leader-excluded set (an exclusion-only
+    /// validator-set update, as the Torus app emits from its epoch plan).
+    ExcludeLeader(VerifyingKeyBytes),
+
+    /// Dead-leader skip: remove the validator from the leader-excluded set.
+    ReadmitLeader(VerifyingKeyBytes),
 }
 
 // The key in the app state where the "number" is stored.
@@ -396,6 +403,16 @@ impl NumberApp {
                 NumberAppTransaction::Invalid => {
                     skipped.push(*id);
                     continue;
+                }
+                NumberAppTransaction::ExcludeLeader(validator) => {
+                    validator_set_updates
+                        .get_or_insert(ValidatorSetUpdates::new())
+                        .exclude_leader(VerifyingKey::from_bytes(validator).unwrap());
+                }
+                NumberAppTransaction::ReadmitLeader(validator) => {
+                    validator_set_updates
+                        .get_or_insert(ValidatorSetUpdates::new())
+                        .readmit_leader(VerifyingKey::from_bytes(validator).unwrap());
                 }
             }
             // Record that this transaction has now been applied so any later

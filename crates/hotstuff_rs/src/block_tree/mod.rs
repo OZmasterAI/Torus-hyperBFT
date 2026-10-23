@@ -66,6 +66,11 @@ pub mod variables;
 
 pub mod pluggables;
 
+pub mod update_records;
+
+#[cfg(test)]
+mod update_records_test;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Floor for [`set_block_tree_retention`]: retention windows smaller than this

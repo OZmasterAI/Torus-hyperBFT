@@ -65,6 +65,9 @@ pub enum GenesisError {
     /// pick the value.
     #[error("duplicate genesis key: {0}")]
     DuplicateKey(String),
+    /// A `consensus` parameter out of its range (dead-leader skip K / j cap).
+    #[error("invalid consensus section: {0}")]
+    InvalidConsensus(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +154,23 @@ pub struct ConsensusConfig {
     /// (needs the hash; an explicit other height refuses). Absent = off.
     #[serde(default)]
     pub book_window_commit: bool,
+    /// Dead-leader skip (docs/plans/dead-leader-skip.md, b1): K, the run of missed leader slots
+    /// that gets a validator excluded from leading at the next epoch plan. 0 = off; else
+    /// 2..=64. Absent = 0 (off, owner s138). CHAIN-WIDE.
+    #[serde(default = "default_leader_miss_threshold")]
+    pub leader_miss_threshold: u32,
+    /// Dead-leader skip: cap of the exclusion count j (re-admission floor `L * 2^j`), 0..=10.
+    /// Absent = 6. CHAIN-WIDE.
+    #[serde(default = "default_leader_exclusion_cap")]
+    pub leader_exclusion_cap: u32,
+}
+
+fn default_leader_miss_threshold() -> u32 {
+    torus_types::DEFAULT_LEADER_MISS_THRESHOLD
+}
+
+fn default_leader_exclusion_cap() -> u32 {
+    torus_types::DEFAULT_LEADER_EXCLUSION_CAP
 }
 
 fn default_chain_id() -> u64 {
@@ -440,6 +460,11 @@ impl Genesis {
         }
         genesis.check_keys_and_hex()?;
         genesis.activation_schedule()?;
+        torus_types::DeadLeaderParams::check(
+            genesis.consensus.leader_miss_threshold,
+            genesis.consensus.leader_exclusion_cap,
+        )
+        .map_err(GenesisError::InvalidConsensus)?;
         Ok(genesis)
     }
 
@@ -860,6 +885,8 @@ impl Genesis {
             exec_trust_cache: false,
             activations,
             book_mode: self.consensus.book_mode,
+            leader_miss_threshold: self.consensus.leader_miss_threshold,
+            leader_exclusion_cap: self.consensus.leader_exclusion_cap,
         }
     }
 
@@ -1556,6 +1583,49 @@ mod tests {
         keys.sort();
         expected.sort();
         assert_eq!(keys, expected, "the hotstuff genesis set");
+    }
+
+    /// Dead-leader skip (owner s134): K and the j cap are genesis parameters, defaults 0 (off,
+    /// owner s138) and 6 when absent, mapped to the chain config; out-of-range values refuse the genesis
+    /// (K: 0 = off or 2..=64; cap: 0..=10).
+    #[test]
+    fn genesis_dead_leader_params_default_and_range_check() {
+        let genesis = Genesis::from_json(&sample_genesis_json()).unwrap();
+        assert!(
+            !sample_genesis_json().contains("leader_miss_threshold"),
+            "fixture: K absent"
+        );
+        assert_eq!(
+            genesis.consensus.leader_miss_threshold, 0,
+            "absent K: off (owner s138)"
+        );
+        assert_eq!(genesis.consensus.leader_exclusion_cap, 6);
+        let config = genesis.chain_config();
+        assert_eq!(
+            (config.leader_miss_threshold, config.leader_exclusion_cap),
+            (0, 6)
+        );
+        assert!(config.validate().is_ok());
+
+        let with = |k: serde_json::Value, cap: serde_json::Value| {
+            let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+            json["consensus"]["leader_miss_threshold"] = k;
+            json["consensus"]["leader_exclusion_cap"] = cap;
+            Genesis::from_json(&json.to_string())
+        };
+        for (k, cap) in [(0, 6), (2, 0), (3, 6), (64, 10)] {
+            let g = with(k.into(), cap.into()).unwrap_or_else(|e| panic!("K {k} cap {cap}: {e}"));
+            assert_eq!(g.chain_config().leader_miss_threshold, k);
+            assert_eq!(g.chain_config().leader_exclusion_cap, cap);
+        }
+        for (k, cap) in [(1, 6), (65, 6), (3, 11), (1000, 6)] {
+            let err = with(k.into(), cap.into()).expect_err(&format!("K {k} cap {cap} accepted"));
+            assert!(matches!(err, GenesisError::InvalidConsensus(_)), "{err}");
+        }
+        assert!(
+            with((-1).into(), 6.into()).is_err(),
+            "a negative K is no u32"
+        );
     }
 
     #[test]

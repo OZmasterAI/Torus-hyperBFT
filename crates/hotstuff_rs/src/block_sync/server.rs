@@ -120,15 +120,17 @@ impl<N: Network + 'static, K: KVStore> BlockSyncServer<N, K> {
                 .publish(&self.event_publisher);
 
                 // Get, from the block tree, the blocks and the PC that will be used to form the Block Sync Response.
+                // s138 option 1: a batch that reaches a validator-set update this server
+                // committed on its Commit PC ends at the update, with that PC as the terminal PC
+                // (`BlockTreeSnapshot::sync_response`).
                 let bt_snapshot = self.block_tree_camera.snapshot();
-                let blocks_res = bt_snapshot.blocks_from_height_to_newest(
+                let response = bt_snapshot.sync_response(
                     start_height,
                     effective_sync_limit(limit, self.config.request_limit),
                 );
-                let highest_pc_res = bt_snapshot.highest_pc();
 
-                match (blocks_res, highest_pc_res) {
-                    (Ok(blocks), Ok(highest_pc)) => {
+                match response {
+                    Ok((blocks, highest_pc)) => {
                         // If there are blocks and a highest PC to return, send a Block Sync Response.
                         self.sender.send(
                             origin,

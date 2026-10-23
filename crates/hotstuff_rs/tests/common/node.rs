@@ -62,6 +62,9 @@ const DEFAULT_EPOCH_LENGTH: u32 = 50;
 /// 1. Submit a `NumberAppTransaction` to the node ([`submit_transaction`](Self::submit_transaction)).
 /// 2. Query the state of the replica and/or the app (e.g., [`number`](Self::number),
 /// [`verifying_key`](Self::verifying_key), [`committed_validator_set`](Self::committed_validator_set)).
+/// Process-unique transaction ids, shared by every `Node` (see [`Node::submit_transaction`]).
+static NEXT_TX_ID: AtomicU64 = AtomicU64::new(1);
+
 pub(crate) struct Node {
     verifying_key: VerifyingKeyBytes,
     tx_queue: Arc<Mutex<Vec<QueuedTransaction>>>,
@@ -339,11 +342,20 @@ impl Node {
     /// `Data`, letting `NumberApp` apply each logical transaction exactly once —
     /// even if the same transaction is re-proposed after an orphaned proposal.
     pub(crate) fn submit_transaction(&mut self, txn: NumberAppTransaction) -> u64 {
-        static NEXT_TX_ID: AtomicU64 = AtomicU64::new(1);
         let id = NEXT_TX_ID.fetch_add(1, Ordering::Relaxed);
         let tx: QueuedTransaction = (id, txn);
         self.tx_queue.lock().unwrap().push(tx);
         id
+    }
+
+    /// s138: push `txns` to the node's queue under one lock, so the node's next proposal carries
+    /// all of them (one validator-set update for several validator-set transactions).
+    #[allow(dead_code)]
+    pub(crate) fn submit_transactions(&mut self, txns: Vec<NumberAppTransaction>) {
+        let mut queue = self.tx_queue.lock().unwrap();
+        for txn in txns {
+            queue.push((NEXT_TX_ID.fetch_add(1, Ordering::Relaxed), txn));
+        }
     }
 
     /// Query the number in the node's local app state.
@@ -509,6 +521,8 @@ fn receive_proposal_handler(
                     NumberAppTransaction::SetValidator(_, _) => String::from("Set Validator"),
                     NumberAppTransaction::DeleteValidator(_) => String::from("Delete Validator"),
                     NumberAppTransaction::Invalid => String::from("Invalid"),
+                    NumberAppTransaction::ExcludeLeader(_) => String::from("Exclude Leader"),
+                    NumberAppTransaction::ReadmitLeader(_) => String::from("Readmit Leader"),
                 })
                 .collect();
             all.join(", ")

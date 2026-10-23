@@ -720,6 +720,8 @@ impl CommittedBlockMsg {
 /// go back with it (the DA body GC's restore source then).
 struct PersistJob {
     block: TorusBlock,
+    /// Dead-leader skip: the block's leader evidence, written in the header's batch.
+    evidence: Option<crate::leader_skip::LeaderEvidence>,
     ticket: PersistTicket,
 }
 
@@ -785,6 +787,7 @@ impl CommitPersistWriter {
                     let durable = persist_committed_block_durably_timed(
                         &state_db,
                         &job.block,
+                        job.evidence.as_ref(),
                         metrics.as_deref(),
                         false,
                     );
@@ -866,11 +869,17 @@ impl CommitPersistWriter {
         ));
     }
 
-    /// Queue `block`'s header + body write; the ticket fills once it returned.
-    fn submit(&self, block: TorusBlock) -> PersistTicket {
+    /// Queue `block`'s header + body write (with its leader `evidence` row, if any); the
+    /// ticket fills once it returned.
+    fn submit(
+        &self,
+        block: TorusBlock,
+        evidence: Option<crate::leader_skip::LeaderEvidence>,
+    ) -> PersistTicket {
         let ticket = PersistTicket::default();
         let job = PersistJob {
             block,
+            evidence,
             ticket: ticket.clone(),
         };
         if let Some(tx) = &self.tx {
@@ -1348,7 +1357,16 @@ pub type EvmForward = Arc<dyn Fn([u8; 32], Vec<u8>) + Send + Sync>;
 /// Shared consensus state for leader discovery by non-consensus components (RPC).
 pub struct LeaderState {
     view: AtomicU64,
+    /// The hint set: members and powers from execution ([`Self::sync_validators`]), leader
+    /// exclusions from `committed`.
     validators: RwLock<hotstuff_rs::types::validator_set::ValidatorSet>,
+    /// Dead-leader skip: a copy of the committed hotstuff validator set (seeded at boot,
+    /// then every committed update applied), kept apart from the hint set because execution's
+    /// membership can lag or lead it. The hint set excludes exactly its members that this set
+    /// excludes; members this set lacks keep their hint exclusion state until it catches up.
+    /// `None` until seeded: committed deltas then go to the hint set directly.
+    /// Lock order: `committed` before `validators`.
+    committed: RwLock<Option<hotstuff_rs::types::validator_set::ValidatorSet>>,
     /// `(view, leader)` as last observed from the pacemaker's own `StartView`
     /// event — the REAL view (not the committed_height+1 heuristic, which goes
     /// stale during timeout churn) and the REAL selection (reputation-aware
@@ -1370,6 +1388,7 @@ impl LeaderState {
         Self {
             view: AtomicU64::new(1),
             validators: RwLock::new(hotstuff_rs::types::validator_set::ValidatorSet::new()),
+            committed: RwLock::new(None),
             observed_leader: RwLock::new(None),
             tip: RwLock::new((0, 0)),
             evm_block_interval: AtomicU64::new(0),
@@ -1399,6 +1418,10 @@ impl LeaderState {
         }
     }
 
+    /// Replace the hint set's members and powers with `vs`. Dead-leader skip: the leader
+    /// exclusions of members that stay are kept, then every member the committed set knows
+    /// takes its exclusion from it ([`Self::reconcile_leader_exclusions`]), so a member synced
+    /// after its committed exclusion arrives excluded.
     fn sync_validators(&self, vs: &torus_types::ValidatorSet) {
         let mut hs_vs = hotstuff_rs::types::validator_set::ValidatorSet::new();
         for v in &vs.validators {
@@ -1406,7 +1429,73 @@ impl LeaderState {
                 hs_vs.put(&vk, Power::new(v.power));
             }
         }
-        *self.validators.write().unwrap() = hs_vs;
+        let committed = self.committed.read().unwrap();
+        let mut current = self.validators.write().unwrap();
+        for vk in current.leader_excluded() {
+            hs_vs.exclude_leader(vk);
+        }
+        if let Some(committed) = committed.as_ref() {
+            Self::reconcile_leader_exclusions(&mut hs_vs, committed);
+        }
+        *current = hs_vs;
+    }
+
+    /// Dead-leader skip: every member of `hints` that `committed` contains is leader-excluded
+    /// exactly when `committed` excludes it; the others keep their state.
+    fn reconcile_leader_exclusions(
+        hints: &mut hotstuff_rs::types::validator_set::ValidatorSet,
+        committed: &hotstuff_rs::types::validator_set::ValidatorSet,
+    ) {
+        let members: Vec<VerifyingKey> = hints.validators().copied().collect();
+        for vk in &members {
+            if !committed.contains(vk) {
+                continue;
+            }
+            if committed.is_leader_excluded(vk) {
+                hints.exclude_leader(vk);
+            } else {
+                hints.readmit_leader(vk);
+            }
+        }
+    }
+
+    /// Dead-leader skip: apply a committed validator-set update (hotstuff's
+    /// `UpdateValidatorSet` event) to the committed copy and take the hint set's exclusions from
+    /// it. Before seeding, only the exclusion delta, straight to the hint set.
+    /// The hint powers and members still come from [`Self::sync_validators`].
+    pub fn apply_leader_exclusion_updates(
+        &self,
+        updates: &hotstuff_rs::types::update_sets::ValidatorSetUpdates,
+    ) {
+        let mut committed = self.committed.write().unwrap();
+        let mut vs = self.validators.write().unwrap();
+        match committed.as_mut() {
+            Some(committed) => {
+                committed.apply_updates(updates);
+                Self::reconcile_leader_exclusions(&mut vs, committed);
+            }
+            None => {
+                for vk in updates.leader_readmits() {
+                    vs.readmit_leader(vk);
+                }
+                for vk in updates.leader_excludes() {
+                    vs.exclude_leader(vk);
+                }
+            }
+        }
+    }
+
+    /// Dead-leader skip: at boot, keep a copy of the committed hotstuff validator set (later
+    /// committed updates are applied to it) and take the hint set's exclusions from it. A
+    /// member the hints lack yet gets its exclusion when [`Self::sync_validators`] adds it.
+    pub fn seed_leader_exclusions(
+        &self,
+        committed: &hotstuff_rs::types::validator_set::ValidatorSet,
+    ) {
+        let mut seeded = self.committed.write().unwrap();
+        let mut vs = self.validators.write().unwrap();
+        Self::reconcile_leader_exclusions(&mut vs, committed);
+        *seeded = Some(committed.clone());
     }
 
     pub fn current_view(&self) -> u64 {
@@ -1577,6 +1666,8 @@ impl LeaderState {
 
 struct ExecutionContext {
     state_db: StateDb,
+    /// Dead-leader skip (A1): the activation hook's config and the installed leader-set cache.
+    leader_skip: crate::leader_skip::LeaderSkipExec,
     validator: BlockValidator,
     evm_executor: EvmExecutor,
     epoch_length: u64,
@@ -2288,7 +2379,7 @@ impl Drop for ObserveOnDrop {
 /// same batch.
 #[cfg(test)]
 fn persist_committed_block_durably(state_db: &StateDb, block: &TorusBlock) -> DurableRows {
-    persist_committed_block_durably_timed(state_db, block, None, true)
+    persist_committed_block_durably_timed(state_db, block, None, None, true)
 }
 
 /// [`persist_committed_block_durably`] with the consensus-thread timers
@@ -2300,9 +2391,14 @@ fn persist_committed_block_durably(state_db: &StateDb, block: &TorusBlock) -> Du
 /// pre-T5.3 layout), so its row is deleted in the same batch as the body.
 /// With the manifest in the consensus DB the caller hands the height to the
 /// [`ManifestPruner`], which deletes the row only after a state-WAL sync.
+///
+/// `evidence` (dead-leader skip on): the block's leader evidence row goes into the same
+/// batch, so a durable header implies durable evidence. The manifest carries it until then
+/// ([`crate::leader_skip::manifest_value`]), and it goes only after this batch is synced.
 fn persist_committed_block_durably_timed(
     state_db: &StateDb,
     block: &TorusBlock,
+    evidence: Option<&crate::leader_skip::LeaderEvidence>,
     metrics: Option<&torus_telemetry::Metrics>,
     prune_manifest_in_batch: bool,
 ) -> DurableRows {
@@ -2324,6 +2420,19 @@ fn persist_committed_block_durably_timed(
             tracing::error!(%e, height = block.header.height, "FIX1a: header CF missing");
         }
         (_, None) => {}
+    }
+    if let Some(evidence) = evidence {
+        match state_db.cf_handle(CF_CONSENSUS_META) {
+            Ok(cf) => crate::leader_skip::put_leader_evidence(
+                &mut batch,
+                cf,
+                block.header.height,
+                evidence,
+            ),
+            Err(e) => {
+                tracing::error!(%e, height = block.header.height, "leader evidence: meta CF missing");
+            }
+        }
     }
 
     let encode_timer = std::time::Instant::now();
@@ -2439,6 +2548,10 @@ fn sync_committed_wal(state_db: &StateDb, enabled: bool) -> bool {
 /// consensus DB the row also shares a WAL with the HotStuff app-fed height,
 /// advanced after this callback returns, so the row cannot be lost while that
 /// advance survives (before T5.3 they sat in different WALs).
+///
+/// Dead-leader skip on: the value is the datum inside the leader evidence
+/// envelope ([`crate::leader_skip::manifest_value`]); readers split it
+/// ([`crate::leader_skip::split_manifest`]). Off: the datum verbatim.
 fn persist_commit_manifest(manifest_db: &StateDb, height: u64, datum_bytes: &[u8]) {
     if let Err(e) = manifest_db.put_cf_raw(CF_COMMIT_MANIFEST, &height.to_be_bytes(), datum_bytes) {
         tracing::error!(
@@ -2728,11 +2841,20 @@ fn load_commit_manifest(manifest_db: &StateDb, height: u64) -> Option<Vec<u8>> {
 /// needed). Only when NO manifest exists (legacy pre-fix DBs) does this fall back
 /// to `ExecSource::Durable`, which can heal solely from a local durable body.
 fn recovery_exec_source(manifest_db: &StateDb, height: u64) -> ExecSource {
-    if let Some(datum) = load_commit_manifest(manifest_db, height) {
-        if let Ok(full) = bincode::deserialize::<TorusBlock>(&datum) {
+    if let Some(value) = load_commit_manifest(manifest_db, height) {
+        // Dead-leader skip: the datum behind the leader evidence envelope (the evidence is
+        // read at dispatch, `TorusApp::take_leader_evidence`).
+        let datum = match crate::leader_skip::split_manifest(&value) {
+            Ok((_, datum)) => datum,
+            Err(e) => {
+                tracing::error!(%e, height, "crash recovery: commit manifest envelope undecodable");
+                &[]
+            }
+        };
+        if let Ok(full) = bincode::deserialize::<TorusBlock>(datum) {
             return ExecSource::Ready(full);
         }
-        if let Ok(compact) = bincode::deserialize::<CompactBlock>(&datum) {
+        if let Ok(compact) = bincode::deserialize::<CompactBlock>(datum) {
             return ExecSource::Compact(compact);
         }
         tracing::error!(
@@ -3508,6 +3630,46 @@ fn check_timestamp_drift(ts: u64, local_now: u64) -> Result<(), String> {
     if ts > local_now.saturating_add(MAX_BLOCK_TIMESTAMP_DRIFT_SECS) {
         return Err(format!(
             "timestamp {ts} > local clock {local_now} + {MAX_BLOCK_TIMESTAMP_DRIFT_SECS}s"
+        ));
+    }
+    Ok(())
+}
+
+/// Pre-testnet P0 (review M2): max seconds a proposal's header timestamp may
+/// run behind this node's clock before it refuses to VOTE for it (pre-vote
+/// only, see [`check_timestamp_lag`]).
+pub(crate) const MAX_BLOCK_TIMESTAMP_LAG_SECS: u64 = 30;
+
+/// Whether [`check_timestamp_lag`] applies to a pre-vote check: always,
+/// except for a block hotstuff asks about through `check_reproposal_data`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LagBound {
+    Apply,
+    Exempt,
+}
+
+/// Pre-testnet P0 (review M2, `docs/plans/oracle-aggregation.md` decision
+/// 5): the lower half of the local-clock timestamp rule. A replica refuses
+/// to vote for a proposal whose timestamp is more than
+/// [`MAX_BLOCK_TIMESTAMP_LAG_SECS`] behind its clock, so a byzantine leader
+/// cannot propose `ts = parent.ts` after a stall and make an old oracle
+/// aggregate look fresh (CometBFT PBTS-style). Same placement as
+/// [`check_timestamp_drift`]: pre-vote ONLY (bodies are validated before the
+/// vote since 973cc74 / e89eaaa, which is what M2 waited for). A certified
+/// block is accepted at insertion, on block sync, at execution and in crash
+/// replay however old it is (catch-up never reads the local clock), so it
+/// cannot wedge the chain. An honest proposer passes: it uses `max(now,
+/// parent.ts)`, and a proposal delivered later than the bound gets no vote,
+/// the view times out and the next leader proposes with a fresh clock.
+/// Review M2 (s138): except a block consensus may force a leader to propose
+/// again unchanged (hotstuff's `check_reproposal_data`: certified, last
+/// voted by this replica, or an authenticated TC re-proposal), whose
+/// timestamp is fixed by its hash: exempt ([`LagBound::Exempt`]), else a
+/// stall longer than the bound would make it unvotable forever.
+fn check_timestamp_lag(ts: u64, local_now: u64) -> Result<(), String> {
+    if ts.saturating_add(MAX_BLOCK_TIMESTAMP_LAG_SECS) < local_now {
+        return Err(format!(
+            "timestamp {ts} + {MAX_BLOCK_TIMESTAMP_LAG_SECS}s < local clock {local_now}"
         ));
     }
     Ok(())
@@ -5078,6 +5240,39 @@ impl ExecutionContext {
             inflight,
         );
 
+        // Dead-leader skip (docs/plans/dead-leader-skip.md, A1): this block's leader-statistics
+        // rows, from the evidence row the commit path wrote for its justify QC (node-local,
+        // read from the DB) and the leader rows of its pre-state (through the overlay: the
+        // pipelined parent's rows may not be durable yet). They ride the block's own flush
+        // (the native overlay, or the marker set of a block without a native phase), with the
+        // delete of the evidence row. A missing row is never guessed: fail-stop.
+        let leader_params = self.leader_skip.params(&torus_block.header);
+        let mut leader_rows = match leader_params {
+            None => Vec::new(),
+            Some(_) => match crate::leader_skip::block_leader_rows(
+                &overlay,
+                &self.state_db,
+                height,
+                self.epoch_length,
+                &self.leader_skip.cache,
+            ) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::error!(
+                        height,
+                        %e,
+                        "FATAL: dead-leader skip: leader statistics of this block cannot be \
+                         computed — halting execution pipeline (fail-stop)"
+                    );
+                    self.exec_failed.store(true, Ordering::SeqCst);
+                    if fold_header {
+                        persist_block_header(&self.state_db, torus_block);
+                    }
+                    return;
+                }
+            },
+        };
+
         // ---- EVM execution ----
         // PROFILER (s470): time the whole EVM section (validate + commit bundle +
         // block metadata) so it is attributed rather than sitting in the block
@@ -5557,6 +5752,18 @@ impl ExecutionContext {
             // session owner); `None` marks an invalid signature. Reused below so we
             // never recover the same action twice.
             overlay.set_hash_extras(hash_extras.take().unwrap_or_default());
+            // Dead-leader skip (A1): before the native context reads them (the boundary's
+            // A2 / A3 plan reads this block's attribution).
+            for (key, value) in &leader_rows {
+                let put = match value {
+                    Some(v) => overlay.put_cf_raw(CF_CONSENSUS_META, key, v),
+                    None => overlay.delete_cf_raw(CF_CONSENSUS_META, key),
+                };
+                if let Err(e) = put {
+                    self.fail_stop_on_fault(torus_block, fold_header, "leader statistics rows", &e);
+                    return;
+                }
+            }
             // D12: no nonce this block can consume lies in the pruned range
             // (the window check rejects anything below the cutoff), so the
             // deletes and the nonce puts below never touch the same key.
@@ -5944,6 +6151,7 @@ impl ExecutionContext {
             }
             ctx.metrics = self.metrics.clone();
             ctx.evm_fee_window = fee_window;
+            ctx.leader_skip = leader_params;
             ctx.evm_gas = evm_gas;
             // P0.0 phase 2: execution gates features on the committed header's bits,
             // never this node's schedule (crash replay runs the stored header).
@@ -6852,11 +7060,12 @@ impl ExecutionContext {
                 // batch on W (a direct put here would land before batch(N−1) and be
                 // overwritten by it), and must be visible through the next overlay's
                 // parent layer (design §2.1 step 10).
-                let pending = Arc::new(
-                    torus_state::FrozenPending::marker_only(height)
-                        .with_deletes(torus_state::cf::CF_NATIVE_NONCES, &expired_nonces)
-                        .with_hash_extras(hash_extras.take().unwrap_or_default()),
-                );
+                let mut pending = torus_state::FrozenPending::marker_only(height)
+                    .with_deletes(torus_state::cf::CF_NATIVE_NONCES, &expired_nonces)
+                    .with_hash_extras(hash_extras.take().unwrap_or_default());
+                // Dead-leader skip (A1): the block's leader rows ride its marker set.
+                pending.put_rows(CF_CONSENSUS_META, std::mem::take(&mut leader_rows));
+                let pending = Arc::new(pending);
                 // Item 7 option 0 (task 3.3, plan F2, decision 11): a
                 // fast-path EVM block without a native phase executed no tx
                 // (its section failed, or every tx was skipped). Its Marker
@@ -6911,12 +7120,12 @@ impl ExecutionContext {
                         }
                     }
                 }
-                if !self.flush_marker_only(
-                    prefix,
-                    torus_state::FrozenPending::marker_only(height)
-                        .with_deletes(torus_state::cf::CF_NATIVE_NONCES, &expired_nonces)
-                        .with_hash_extras(hash_extras.take().unwrap_or_default()),
-                ) {
+                let mut pending = torus_state::FrozenPending::marker_only(height)
+                    .with_deletes(torus_state::cf::CF_NATIVE_NONCES, &expired_nonces)
+                    .with_hash_extras(hash_extras.take().unwrap_or_default());
+                // Dead-leader skip (A1): the block's leader rows ride its marker set.
+                pending.put_rows(CF_CONSENSUS_META, std::mem::take(&mut leader_rows));
+                if !self.flush_marker_only(prefix, pending) {
                     // As the native flush failure: the header did not land
                     // with the batch; keep the pre-fold contract.
                     if fold_header {
@@ -7329,6 +7538,13 @@ pub struct TorusApp {
     da_gc_inline: bool,
     /// The worker died (or could not spawn) and that was logged.
     da_gc_dead_logged: bool,
+    /// Dead-leader skip: the chain config whose [`ChainConfig::dead_leader_skip`] hook decides,
+    /// per committed header, whether the commit path carries the block's leader evidence.
+    leader_skip_config: ChainConfig,
+    /// Dead-leader skip: the leader evidence of committed heights not yet dispatched (the
+    /// commit hook's, already durable in their manifests), taken by their header + body
+    /// batch ([`Self::take_leader_evidence`]).
+    leader_evidence: std::collections::BTreeMap<u64, crate::leader_skip::LeaderEvidence>,
     /// A DA body GC pass at least this long (ns) logs one warn line with its
     /// phases and counts `torus_da_gc_slow_passes` (`TORUS_DA_GC_SLOW_MS`,
     /// default [`crate::da_gc::DA_GC_SLOW_PASS_MS`]; read in
@@ -8078,6 +8294,12 @@ pub(crate) struct AppOptions {
     /// Test-only: hold the execution thread before a height.
     #[cfg(test)]
     pub(crate) exec_hold: Option<Arc<ExecHold>>,
+    /// Test-only: never prune a commit manifest (the state DB's WAL is never synced as far as
+    /// the manifests know), so a simulated power loss can drop the state-DB rows of every
+    /// unexecuted height and leave each one parked on its manifest
+    /// (`dead_leader_cluster_tests`).
+    #[cfg(test)]
+    pub(crate) keep_manifests: bool,
 }
 
 impl Default for AppOptions {
@@ -8086,6 +8308,8 @@ impl Default for AppOptions {
             known_features: torus_types::KNOWN_FEATURES,
             #[cfg(test)]
             exec_hold: None,
+            #[cfg(test)]
+            keep_manifests: false,
         }
     }
 }
@@ -8296,6 +8520,7 @@ impl TorusApp {
         let genesis_header = torus_bridge::genesis_parent_header_for(config);
         let mut exec_ctx = ExecutionContext {
             state_db: state_db.clone(),
+            leader_skip: crate::leader_skip::LeaderSkipExec::new(config),
             validator: exec_validator,
             evm_executor: EvmExecutor::new(config.chain_id),
             epoch_length: config.epoch_length,
@@ -8609,6 +8834,15 @@ impl TorusApp {
         }
 
         let commit_persist = (!manifest_in_state_db).then(|| {
+            #[cfg(test)]
+            if options.keep_manifests {
+                return CommitPersistWriter::spawn(
+                    state_db.clone(),
+                    ManifestPruner::detached(std::sync::mpsc::channel().0),
+                    metrics.clone(),
+                    header_hook.clone(),
+                );
+            }
             CommitPersistWriter::spawn(
                 state_db.clone(),
                 ManifestPruner::spawn(
@@ -8673,6 +8907,8 @@ impl TorusApp {
             da_gc_worker: None,
             da_gc_inline: false,
             da_gc_dead_logged: false,
+            leader_skip_config: config.clone(),
+            leader_evidence: std::collections::BTreeMap::new(),
             da_gc_slow_pass_nanos: Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::da_gc::DA_GC_SLOW_PASS_MS * 1_000_000,
             )),
@@ -9300,6 +9536,10 @@ impl TorusApp {
             )
             .expect("a one-feature schedule"),
             book_mode: Default::default(),
+            // Dead-leader skip off: these fixtures execute blocks without hotstuff
+            // justify evidence (tests that need it turn it on).
+            leader_miss_threshold: 0,
+            leader_exclusion_cap: torus_types::DEFAULT_LEADER_EXCLUSION_CAP,
         };
         let mut seed = [0u8; 32];
         seed[..8].copy_from_slice(&id.to_le_bytes());
@@ -9788,7 +10028,18 @@ impl TorusApp {
             }
         }
         let plan = self.epoch_plan(height)?;
-        let updates = match plan {
+        // Dead-leader skip (A4): the exclusion plan the same execution wrote next to `plan`.
+        let exclusions = match torus_economics::leader_stats::leader_exclusion_plan(
+            self.staking.state(),
+            height,
+        ) {
+            Ok(lx) => lx.filter(|lx| !lx.exclude.is_empty() || !lx.readmit.is_empty()),
+            Err(e) => {
+                tracing::error!(%e, height, "failed to read the leader exclusion plan");
+                return Err(EpochPlanNotReady);
+            }
+        };
+        let mut updates = match plan {
             Some(plan) if plan.changed => {
                 let mut updates = ValidatorSetUpdates::new();
                 for m in &plan.members {
@@ -9816,6 +10067,26 @@ impl TorusApp {
             }
             _ => None,
         };
+        if let Some(lx) = exclusions {
+            let delta = updates.get_or_insert_with(ValidatorSetUpdates::new);
+            for pk in &lx.exclude {
+                if let Ok(vk) = VerifyingKey::from_bytes(pk) {
+                    delta.exclude_leader(vk);
+                }
+            }
+            for pk in &lx.readmit {
+                if let Ok(vk) = VerifyingKey::from_bytes(pk) {
+                    delta.readmit_leader(vk);
+                }
+            }
+            tracing::info!(
+                height,
+                exclude = lx.exclude.len(),
+                readmit = lx.readmit.len(),
+                excluded = lx.excluded.len(),
+                "epoch boundary: leader exclusion delta from the execution plan"
+            );
+        }
         self.cached_vs_updates = Some((height, updates.clone()));
         Ok(updates)
     }
@@ -10328,11 +10599,28 @@ impl TorusApp {
             Ok(updates) => updates,
             // Bug (b): retry once execution applied the previous boundary
             // (never blacklists a sync peer, never votes on a guess).
-            Err(EpochPlanNotReady) => return ValidateBlockResponse::MissingData,
+            Err(EpochPlanNotReady) => {
+                self.drain_parked_for_the_plan();
+                return ValidateBlockResponse::MissingData;
+            }
         };
         ValidateBlockResponse::Valid {
             app_state_updates: None,
             validator_set_updates,
+        }
+    }
+
+    /// s138: a boundary block is neither validated nor built before this node's execution
+    /// applied the previous boundary (bug (b), [`Self::epoch_plan`]). After a power loss the
+    /// heights that get it there can be parked on their commit manifests (FIX 1b / FIX 6), which
+    /// drain only with the next commit (or the rank-2 reconcile tick, off by default); when that
+    /// commit needs this node's vote on this very boundary block, nothing ever drains them
+    /// (`dl_cluster_power_loss_parked_plan_source_drains_for_the_boundary`). Dispatch what is
+    /// parked now. Local dispatch state only, as the reconcile tick; a no-op when nothing is
+    /// parked, so the steady-state dispatch cadence is unchanged.
+    fn drain_parked_for_the_plan(&mut self) {
+        if !self.deferred_exec.is_empty() && !self.is_exec_failed() {
+            self.drain_exec_queue();
         }
     }
 }
@@ -10349,10 +10637,35 @@ impl TorusApp {
     /// presence-only DA read. No wait and no network pull here:
     /// `validate_block` (run right after on the same body) and its retries
     /// hand misses to the recovery worker.
+    /// Review M2 (s138): [`Self::check_proposal_data`] for a block hotstuff
+    /// may force a leader to propose again unchanged (its
+    /// `check_reproposal_data`: certified, last voted by this replica, or an
+    /// authenticated TC re-proposal). Every rule but the timestamp LOWER
+    /// bound applies: the block's timestamp is fixed by its hash and an
+    /// honest replica judged it within the bound when it was new, so after a
+    /// stall longer than [`MAX_BLOCK_TIMESTAMP_LAG_SECS`] the bound would
+    /// refuse it forever. The ahead bound stays (time only helps it).
+    fn check_reproposal_proposal_data(
+        &mut self,
+        block: &Block,
+        parent: impl FnOnce(&CryptoHash) -> ParentHeader,
+    ) -> BlockDataCheck {
+        self.check_proposal_data_with(block, parent, LagBound::Exempt)
+    }
+
     fn check_proposal_data(
         &mut self,
         block: &Block,
         parent: impl FnOnce(&CryptoHash) -> ParentHeader,
+    ) -> BlockDataCheck {
+        self.check_proposal_data_with(block, parent, LagBound::Apply)
+    }
+
+    fn check_proposal_data_with(
+        &mut self,
+        block: &Block,
+        parent: impl FnOnce(&CryptoHash) -> ParentHeader,
+        lag: LagBound,
     ) -> BlockDataCheck {
         // T1.5 FAIL-STOP: refuse to vote for blocks this node will never execute.
         if self.is_exec_failed() {
@@ -10400,6 +10713,13 @@ impl TorusApp {
             |h| self.boundary_evm(h),
         );
         if link != BlockDataCheck::Held {
+            // A boundary block waits on this node's plan (`boundary_evm`): see
+            // `drain_parked_for_the_plan`.
+            if link == BlockDataCheck::Missing
+                && EpochManager::is_epoch_boundary(header.height, self.epoch_length)
+            {
+                self.drain_parked_for_the_plan();
+            }
             if torus_types::features::first_unknown_feature_in(header.features, self.known_features)
                 .is_some()
             {
@@ -10416,8 +10736,14 @@ impl TorusApp {
             return link;
         }
         // T0b (rebase s87): refuse to vote for a block too far ahead of this
-        // node's clock. Vote-time only: `validate_block` never applies it.
-        if let Err(reason) = check_timestamp_drift(header.timestamp, self.local_now_secs()) {
+        // node's clock; pre-testnet P0 (review M2): or too far behind it.
+        // Vote-time only: `validate_block` never applies either.
+        let now = self.local_now_secs();
+        // Review M2 (s138): a re-proposal hotstuff vouches for skips the lower bound.
+        if let Err(reason) = check_timestamp_drift(header.timestamp, now).and_then(|()| match lag {
+            LagBound::Apply => check_timestamp_lag(header.timestamp, now),
+            LagBound::Exempt => Ok(()),
+        }) {
             tracing::warn!(height = header.height, %reason, "not voting -- block timestamp");
             return BlockDataCheck::Invalid;
         }
@@ -10497,6 +10823,7 @@ impl TorusApp {
         if EpochManager::is_epoch_boundary(next_height, self.epoch_length)
             && self.epoch_validator_set_updates(next_height).is_err()
         {
+            self.drain_parked_for_the_plan();
             return refused_proposal();
         }
         // Exec-ceiling Option A: wire the (previously dead) block_build_seconds —
@@ -10657,6 +10984,7 @@ impl TorusApp {
         drop(encode_span);
 
         let Ok(validator_set_updates) = self.epoch_validator_set_updates(height) else {
+            self.drain_parked_for_the_plan();
             return refused_proposal();
         };
 
@@ -10855,6 +11183,17 @@ impl App<RocksKVStore> for TorusApp {
         response.data.vec().is_empty()
     }
 
+    /// Review M2 (s138): the pre-vote check of a block hotstuff may force a
+    /// leader to propose again unchanged. See
+    /// [`TorusApp::check_reproposal_proposal_data`].
+    fn check_reproposal_data(
+        &mut self,
+        block: &Block,
+        block_tree: &AppBlockTreeView<'_, RocksKVStore>,
+    ) -> BlockDataCheck {
+        self.check_reproposal_proposal_data(block, |hash| tree_parent_header(block_tree, hash))
+    }
+
     /// Send committed block to the execution pipeline thread.
     fn on_committed_block(&mut self, block: &Block, _committed_hash: CryptoHash) {
         let _commit_span =
@@ -10983,10 +11322,30 @@ impl App<RocksKVStore> for TorusApp {
         // durable (`dispatch_to_exec`). Without this, a SIGKILL in the
         // commit->persist window strands the hole with no way to pull bodies
         // (`missing=0`, t12-r3-full h1165).
+        //
+        // Dead-leader skip (A1): the justify QC's evidence rides in the manifest value (the
+        // same write: a durable manifest implies durable evidence, so a height parked from
+        // its manifest after a crash or power loss executes), then in the block's header +
+        // body batch (`dispatch_to_exec`, from `leader_evidence`), which execution reads.
+        // Nothing here touches the state DB (T5.3). Feature off: the manifest is the datum
+        // verbatim, as before.
+        let evidence = self
+            .leader_skip_config
+            .dead_leader_skip(&header)
+            .map(|_| crate::leader_skip::LeaderEvidence::of(&block.justify));
         {
             let _manifest_span =
                 ObserveOnDrop::new(self.metrics.clone(), |m| &m.commit_manifest_seconds);
-            persist_commit_manifest(&self.manifest_db, height, datum_bytes);
+            // A refused value (a plain manifest from height 2^48 on, which could read back as
+            // an evidence envelope) is handled as a failed write: no manifest, recovery falls
+            // back to the durable body.
+            match crate::leader_skip::manifest_value(height, datum_bytes, evidence.as_ref()) {
+                Ok(value) => persist_commit_manifest(&self.manifest_db, height, &value),
+                Err(e) => tracing::error!(%e, height, "commit manifest not written"),
+            }
+        }
+        if let Some(evidence) = evidence {
+            self.leader_evidence.insert(height, evidence);
         }
 
         // Committed: these hashes leave the in-flight window. The mempool prunes
@@ -11666,6 +12025,36 @@ impl TorusApp {
         }
     }
 
+    /// Dead-leader skip: the leader evidence of the committed `header`'s height, for its
+    /// header and body batch: the commit hook's (in memory), else its manifest's (a height
+    /// parked at boot). `None` with the feature off, or when neither has it (a height whose
+    /// header is already durable, its evidence row with it). Drops the entries up to it.
+    fn take_leader_evidence(
+        &mut self,
+        header: &torus_types::TorusBlockHeader,
+    ) -> Option<crate::leader_skip::LeaderEvidence> {
+        let height = header.height;
+        let held = self.leader_evidence.remove(&height);
+        while self
+            .leader_evidence
+            .first_key_value()
+            .is_some_and(|(h, _)| *h < height)
+        {
+            self.leader_evidence.pop_first();
+        }
+        self.leader_skip_config.dead_leader_skip(header)?;
+        held.or_else(|| {
+            let value = load_commit_manifest(&self.manifest_db, height)?;
+            match crate::leader_skip::split_manifest(&value) {
+                Ok((evidence, _)) => evidence,
+                Err(e) => {
+                    tracing::error!(%e, height, "dead-leader skip: commit manifest evidence undecodable");
+                    None
+                }
+            }
+        })
+    }
+
     /// Regime-B. Send a fully-reconstructed committed block to the execution
     /// thread, in order. Carries the mempool bookkeeping that must happen once a
     /// block is actually executed (prune committed native hashes, pin the base
@@ -11719,15 +12108,17 @@ impl TorusApp {
             // `ManifestPruner` deletes it only after a state-WAL sync made the write
             // durable. The pre-T5.3 layout (manifest in the state DB) keeps the
             // synchronous write here, the manifest prune in its batch.
+            let evidence = self.take_leader_evidence(&torus_block.header);
             let (durable, ticket) = match &self.commit_persist {
                 Some(writer) => (
                     DurableRows::default(),
-                    Some(writer.submit(torus_block.clone())),
+                    Some(writer.submit(torus_block.clone(), evidence)),
                 ),
                 None => (
                     persist_committed_block_durably_timed(
                         &self.state_db,
                         &torus_block,
+                        evidence.as_ref(),
                         self.metrics.as_deref(),
                         self.manifest_in_state_db,
                     ),
@@ -12493,6 +12884,10 @@ mod exec_throttle_tests {
                 exec_trust_cache: false,
                 activations: Default::default(),
                 book_mode: Default::default(),
+                // Dead-leader skip off: these fixtures execute blocks without hotstuff
+                // justify evidence (tests that need it turn it on).
+                leader_miss_threshold: 0,
+                leader_exclusion_cap: torus_types::DEFAULT_LEADER_EXCLUSION_CAP,
             };
             (config, state_db)
         };
@@ -13769,6 +14164,202 @@ mod leader_state_tests {
         assert_eq!(ls.current_leader(), Some(vks[0]));
     }
 
+    /// Dead-leader skip phase 1 (docs/plans/dead-leader-skip.md §3 A4): the leader hints (the
+    /// boot fallback of `current_leader` and the EVM-height predictions) run `select_leader` over
+    /// the same leader-excluded set as the committed hotstuff validator set: seeded from it at
+    /// boot, updated by every committed exclusion delta, kept across `sync_validators`.
+    #[test]
+    fn leader_hints_skip_leader_excluded_validators() {
+        use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
+        let ls = LeaderState::new();
+        let (set, vks) = make_set(4);
+        ls.sync_validators(&set);
+        let x = vks[1];
+        let mut updates = ValidatorSetUpdates::new();
+        updates.exclude_leader(x);
+        ls.apply_leader_exclusion_updates(&updates);
+
+        // Boot fallback (no StartView observed): never the excluded validator.
+        let mut views_led_by_x_without_exclusion = 0;
+        for view in 1..200u64 {
+            ls.set_view(view);
+            assert_ne!(ls.current_leader(), Some(x), "view {view}");
+            let plain = {
+                let mut vs = hotstuff_rs::types::validator_set::ValidatorSet::new();
+                for vk in &vks {
+                    vs.put(vk, Power::new(1));
+                }
+                hotstuff_rs::pacemaker::select_leader(
+                    hotstuff_rs::types::data_types::ViewNumber::new(view),
+                    &vs,
+                )
+            };
+            views_led_by_x_without_exclusion += usize::from(plain == x);
+        }
+        assert!(views_led_by_x_without_exclusion > 0);
+
+        // EVM-height predictions: never the excluded validator.
+        ls.set_evm_block_interval(1);
+        for (view, hs_height) in [(200u64, 10u64), (201, 11), (202, 12), (203, 13)] {
+            ls.observe_start_view(view, plain_iwrr(&ls, view));
+            ls.observe_hotstuff_proposal(view, hs_height);
+            assert_ne!(ls.next_evm_leader(), Some(x), "view {view}");
+        }
+
+        // An epoch sync of the same members keeps the exclusion.
+        ls.sync_validators(&set);
+        assert!(ls.validators.read().unwrap().is_leader_excluded(&x));
+
+        // A committed re-admission brings it back.
+        let mut readmit = ValidatorSetUpdates::new();
+        readmit.readmit_leader(x);
+        ls.apply_leader_exclusion_updates(&readmit);
+        assert!(!ls.validators.read().unwrap().is_leader_excluded(&x));
+
+        // Boot seeding copies the committed set's exclusions (members only).
+        let mut committed = hotstuff_rs::types::validator_set::ValidatorSet::new();
+        for vk in &vks {
+            committed.put(vk, Power::new(1));
+        }
+        committed.exclude_leader(&vks[3]);
+        let fresh = LeaderState::new();
+        fresh.sync_validators(&set);
+        fresh.seed_leader_exclusions(&committed);
+        let hint_set = fresh.validators.read().unwrap();
+        assert_eq!(
+            hint_set.leader_excluded().copied().collect::<Vec<_>>(),
+            vec![vks[3]]
+        );
+    }
+
+    /// The committed hotstuff validator set `members` (power 1 each) with `excluded` leader
+    /// excluded.
+    fn committed_set(
+        members: &[VerifyingKey],
+        excluded: &[VerifyingKey],
+    ) -> hotstuff_rs::types::validator_set::ValidatorSet {
+        let mut vs = hotstuff_rs::types::validator_set::ValidatorSet::new();
+        for vk in members {
+            vs.put(vk, Power::new(1));
+        }
+        for vk in excluded {
+            assert!(vs.exclude_leader(vk));
+        }
+        vs
+    }
+
+    /// Asserts the hint set excludes exactly `excluded` and that neither the boot fallback nor
+    /// the EVM-height predictions select an excluded validator over many views.
+    fn assert_hints_exclude(ls: &LeaderState, excluded: &[VerifyingKey]) {
+        assert_eq!(
+            ls.validators
+                .read()
+                .unwrap()
+                .leader_excluded()
+                .copied()
+                .collect::<Vec<_>>(),
+            {
+                let mut want = excluded.to_vec();
+                want.sort_by_key(|vk| vk.to_bytes());
+                want
+            },
+            "hint exclusions"
+        );
+        for view in 1..100u64 {
+            let leader = plain_iwrr(ls, view);
+            assert!(
+                !excluded.contains(&leader),
+                "view {view} selects {leader:?}"
+            );
+        }
+    }
+
+    /// Codex torus review P2 (dead-leader skip phase 1): a restart with execution behind an
+    /// insert-and-exclude boundary seeds the committed five-member set (new member excluded)
+    /// into a four-member hint set. The exclusion must survive until membership catches up:
+    /// syncing the fifth member must not make the excluded validator a hinted leader.
+    #[test]
+    fn boot_seed_keeps_exclusion_of_member_the_hints_lack_yet() {
+        let ls = LeaderState::new();
+        let (four, _) = make_set(4);
+        let (five, vks) = make_set(5);
+        let x = vks[4];
+        ls.sync_validators(&four);
+        ls.seed_leader_exclusions(&committed_set(&vks, &[x]));
+        ls.sync_validators(&five);
+        assert_hints_exclude(&ls, &[x]);
+    }
+
+    /// The same divergence at run time: a committed insert-and-exclude delta reaching the hints
+    /// before execution syncs the new member must still exclude it once it is synced.
+    #[test]
+    fn committed_insert_and_exclude_before_hint_sync_keeps_exclusion() {
+        use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
+        let ls = LeaderState::new();
+        let (four, _) = make_set(4);
+        let (five, vks) = make_set(5);
+        let x = vks[4];
+        ls.sync_validators(&four);
+        ls.seed_leader_exclusions(&committed_set(&vks[..4], &[]));
+        let mut updates = ValidatorSetUpdates::new();
+        updates.insert(x, Power::new(1));
+        updates.exclude_leader(x);
+        ls.apply_leader_exclusion_updates(&updates);
+        assert_hints_exclude(&ls, &[]);
+        ls.sync_validators(&five);
+        assert_hints_exclude(&ls, &[x]);
+    }
+
+    /// A committed re-admission of a validator the hints lack yet: once synced it is eligible
+    /// (the committed set no longer excludes it).
+    #[test]
+    fn readmit_of_member_the_hints_lack_yet_is_not_excluded_after_sync() {
+        use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
+        let ls = LeaderState::new();
+        let (four, _) = make_set(4);
+        let (five, vks) = make_set(5);
+        let x = vks[4];
+        ls.sync_validators(&four);
+        ls.seed_leader_exclusions(&committed_set(&vks, &[x]));
+        let mut readmit = ValidatorSetUpdates::new();
+        readmit.readmit_leader(x);
+        ls.apply_leader_exclusion_updates(&readmit);
+        ls.sync_validators(&five);
+        assert_hints_exclude(&ls, &[]);
+    }
+
+    /// Removing an excluded member drops its exclusion, as hotstuff's `ValidatorSet::remove`
+    /// does: re-inserted later without an exclusion, it leads again. While the hints still list
+    /// it (execution behind the delete) it stays excluded there.
+    #[test]
+    fn removed_excluded_member_is_not_excluded_when_reinserted() {
+        use hotstuff_rs::types::update_sets::ValidatorSetUpdates;
+        let ls = LeaderState::new();
+        let (four, _) = make_set(4);
+        let (five, vks) = make_set(5);
+        let x = vks[4];
+        ls.sync_validators(&five);
+        ls.seed_leader_exclusions(&committed_set(&vks, &[x]));
+        assert_hints_exclude(&ls, &[x]);
+
+        let mut delete = ValidatorSetUpdates::new();
+        delete.delete(x);
+        ls.apply_leader_exclusion_updates(&delete);
+        assert_hints_exclude(&ls, &[x]);
+        ls.sync_validators(&four);
+        assert_hints_exclude(&ls, &[]);
+
+        let mut insert = ValidatorSetUpdates::new();
+        insert.insert(x, Power::new(1));
+        ls.apply_leader_exclusion_updates(&insert);
+        ls.sync_validators(&five);
+        assert_hints_exclude(&ls, &[]);
+        assert!(
+            (1..100u64).any(|view| plain_iwrr(&ls, view) == x),
+            "re-inserted member leads again"
+        );
+    }
+
     /// Item 7 step 1 (E12): EVM txs go to the leader of the next EVM height
     /// (`height % N == 0`), not the current-view leader. That height is
     /// proposed one view per block after the newest observed proposal.
@@ -14000,6 +14591,10 @@ mod crash_recovery_tests {
             // every `make_block` header and the genesis parent header.
             activations: rsh_at(1),
             book_mode: Default::default(),
+            // Dead-leader skip off: these fixtures execute blocks without hotstuff
+            // justify evidence (tests that need it turn it on).
+            leader_miss_threshold: 0,
+            leader_exclusion_cap: torus_types::DEFAULT_LEADER_EXCLUSION_CAP,
         };
         // P0.0 phase 3: what execution writes before block 1 (with it in
         // place, block 1 needs no pipeline barrier).
@@ -15731,6 +16326,433 @@ mod crash_recovery_tests {
         drop(ctx);
     }
 
+    // ---- dead-leader skip, phase 2 (docs/plans/dead-leader-skip.md: A1-A3 at execution,
+    // the exclusion delta at the boundary) ----
+
+    fn dls_vk(n: u8) -> VerifyingKey {
+        ed25519_dalek::SigningKey::from_bytes(&[n; 32]).verifying_key()
+    }
+
+    /// The fixture's installed set as hotstuff runs it, and each key's address.
+    fn dls_hs_set() -> (
+        hotstuff_rs::types::validator_set::ValidatorSet,
+        std::collections::HashMap<VerifyingKey, [u8; 20]>,
+    ) {
+        let mut set = hotstuff_rs::types::validator_set::ValidatorSet::new();
+        let mut map = std::collections::HashMap::new();
+        for n in 1..=4u8 {
+            set.put(&dls_vk(n), Power::new(100));
+            map.insert(dls_vk(n), [n; 20]);
+        }
+        (set, map)
+    }
+
+    /// The leader of `view` over the fixture's set (equal powers: position `view % 4`).
+    fn dls_leader(view: u64) -> VerifyingKey {
+        hotstuff_rs::pacemaker::select_leader(
+            hotstuff_rs::types::data_types::ViewNumber::new(view),
+            &dls_hs_set().0,
+        )
+    }
+
+    /// Dead-leader skip ON (K = 3, cap 6), epoch length 4, installed (genesis) set =
+    /// validators 1..=4 at equal power.
+    fn dls_fixture() -> (ChainConfig, StateDb) {
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 4;
+        config.leader_miss_threshold = 3;
+        let set = ValidatorSet {
+            validators: (1..=4u8)
+                .map(|n| torus_types::ValidatorInfo {
+                    address: Address::new([n; 20]),
+                    pubkey: torus_types::PublicKey(dls_vk(n).to_bytes()),
+                    power: 100,
+                    commission_bps: 0,
+                })
+                .collect(),
+            epoch: 0,
+        };
+        StakingManager::new(db.clone())
+            .record_genesis_epoch_set(&set)
+            .unwrap();
+        (config, db)
+    }
+
+    /// The fixture chain's justify QC of block `h`: block 1 on the genesis QC, block h >= 2
+    /// certifies the (h-1)-th view of 1.. that is not 3 mod 4. The owner of those slots
+    /// (`dls_leader(3)`) is dead: it never proposes and never signs.
+    fn dls_evidence(h: u64) -> crate::leader_skip::LeaderEvidence {
+        use crate::leader_skip::{LeaderEvidence, QC_GENERIC, QC_GENESIS};
+        if h == 1 {
+            return LeaderEvidence {
+                view: 0,
+                phase: QC_GENESIS,
+                signers: vec![],
+            };
+        }
+        let (set, _) = dls_hs_set();
+        let dead = dls_leader(3);
+        LeaderEvidence {
+            view: (1u64..)
+                .filter(|v| v % 4 != 3)
+                .nth((h - 2) as usize)
+                .unwrap(),
+            phase: QC_GENERIC,
+            signers: set.validators().map(|v| *v != dead).collect(),
+        }
+    }
+
+    /// The hashed leader-statistics and epoch-plan rows.
+    fn dls_rows(db: &StateDb) -> Vec<(Vec<u8>, Vec<u8>)> {
+        StateBackend::iterate_cf(db, CF_CONSENSUS_META, None)
+            .unwrap()
+            .into_iter()
+            .filter(|(k, _)| k.starts_with(b"leader_stats:") || k.starts_with(b"epoch_vset:"))
+            .collect()
+    }
+
+    fn dls_evidence_rows(db: &StateDb) -> usize {
+        StateBackend::iterate_cf(db, CF_CONSENSUS_META, None)
+            .unwrap()
+            .into_iter()
+            .filter(|(k, _)| k.starts_with(crate::leader_skip::LEADER_QC_PREFIX))
+            .count()
+    }
+
+    /// Execute heights `from..=to` live (evidence written at "commit", then executed).
+    fn dls_execute(ctx: &ExecutionContext, db: &StateDb, from: u64, to: u64) {
+        for h in from..=to {
+            crate::leader_skip::persist_leader_evidence(db, h, &dls_evidence(h)).unwrap();
+            ctx.execute_committed_block(&make_block(h, vec![]), vec![]);
+            assert!(
+                !ctx.exec_failed.load(Ordering::SeqCst),
+                "height {h} fail-stopped"
+            );
+        }
+    }
+
+    /// Commit heights `from..=to` without executing them (evidence + durable header/body), as a
+    /// crash before execution leaves them; the boot replay executes them.
+    fn dls_commit_only(db: &StateDb, from: u64, to: u64) {
+        for h in from..=to {
+            crate::leader_skip::persist_leader_evidence(db, h, &dls_evidence(h)).unwrap();
+            persist_block_for_test(db, &make_block(h, vec![]));
+        }
+    }
+
+    /// Determinism + A1/A2 end to end: the dead validator's slots (views 3, 7, 11) are missed in
+    /// blocks 4, 7 and 10; boundary 12 writes its exclusion for 16, boundary 16 installs it.
+    /// Serial execution, a full crash replay and a crash replay of the second half write
+    /// byte-identical hashed rows; every evidence row is deleted with its block.
+    #[test]
+    fn dead_leader_rows_identical_serial_and_crash_replay() {
+        let dead = dls_hs_set().1[&dls_leader(3)];
+
+        let (config, serial) = dls_fixture();
+        let ctx = make_exec_ctx(&config, &serial);
+        dls_execute(&ctx, &serial, 1, 16);
+        drop(ctx);
+
+        let (config, replayed) = dls_fixture();
+        dls_commit_only(&replayed, 1, 16);
+        let ctx = make_exec_ctx(&config, &replayed);
+        let (last, parked) = TorusApp::replay_committed(&replayed, &ctx);
+        assert_eq!((last.height, parked), (16, None));
+        drop(ctx);
+
+        let (config, half) = dls_fixture();
+        let ctx = make_exec_ctx(&config, &half);
+        dls_execute(&ctx, &half, 1, 8);
+        drop(ctx);
+        dls_commit_only(&half, 9, 16);
+        let ctx = make_exec_ctx(&config, &half);
+        let (last, _) = TorusApp::replay_committed(&half, &ctx);
+        assert_eq!(last.height, 16);
+        drop(ctx);
+
+        let rows = dls_rows(&serial);
+        assert_eq!(rows, dls_rows(&replayed), "full replay");
+        assert_eq!(rows, dls_rows(&half), "replay of 9..=16");
+        for db in [&serial, &replayed, &half] {
+            assert_eq!(
+                dls_evidence_rows(db),
+                0,
+                "evidence rows go with their block"
+            );
+            let installed: Vec<[u8; 20]> =
+                torus_economics::leader_stats::installed_leader_exclusions(db)
+                    .unwrap()
+                    .iter()
+                    .map(|m| m.address)
+                    .collect();
+            assert_eq!(installed, vec![dead], "excluded from 16 on");
+        }
+        let plan16 = torus_economics::leader_stats::leader_exclusion_plan(&serial, 16)
+            .unwrap()
+            .expect("written by boundary 12");
+        assert_eq!(plan16.exclude, vec![dls_leader(3).to_bytes()]);
+    }
+
+    /// Determinism, pipelined execution: with a flush worker the empty blocks take the fast
+    /// path, their leader rows riding the Marker set (read back by the next block through the
+    /// parent layer before W lands them); the rows equal the serial run's.
+    #[test]
+    fn dead_leader_rows_identical_serial_and_pipelined() {
+        let (config, serial) = dls_fixture();
+        let ctx = make_exec_ctx(&config, &serial);
+        dls_execute(&ctx, &serial, 1, 16);
+        drop(ctx);
+
+        let (config, piped) = dls_fixture();
+        let mut ctx = make_exec_ctx(&config, &piped);
+        ctx.attach_flush_worker(None);
+        for h in 1..=16 {
+            crate::leader_skip::persist_leader_evidence(&piped, h, &dls_evidence(h)).unwrap();
+            dispatch_and_execute(&ctx, &piped, &make_block(h, vec![]));
+            assert!(
+                !ctx.exec_failed.load(Ordering::SeqCst),
+                "height {h} fail-stopped"
+            );
+        }
+        let paths = ctx.test_paths.lock().unwrap().clone();
+        drop(ctx); // drains + joins W
+        assert!(
+            paths.get("block.pipelined").copied().unwrap_or(0) > 0,
+            "fixture must take the fast path: {paths:?}"
+        );
+        assert_eq!(dls_rows(&serial), dls_rows(&piped));
+        assert_eq!(dls_evidence_rows(&piped), 0);
+        assert_eq!(
+            torus_economics::leader_stats::installed_leader_exclusions(&piped)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// K is not reached by two misses: blocks 1..=8 miss the dead slot twice (views 3, 7): no
+    /// exclusion plan by boundary 8.
+    #[test]
+    fn dead_leader_two_misses_plan_nothing() {
+        let (config, db) = dls_fixture();
+        let ctx = make_exec_ctx(&config, &db);
+        dls_execute(&ctx, &db, 1, 8);
+        let dead = dls_hs_set().1[&dls_leader(3)];
+        let st = torus_economics::leader_stats::leader_stats(&db, &dead).unwrap();
+        assert_eq!(st.miss_run, 2);
+        assert_eq!(
+            torus_economics::leader_stats::leader_exclusion_plan(&db, 12).unwrap(),
+            None
+        );
+    }
+
+    /// With the feature on, a committed height without its evidence row is never guessed:
+    /// execution fail-stops before applying it. Off, the same block executes.
+    #[test]
+    fn dead_leader_missing_evidence_fail_stops() {
+        let (config, db) = dls_fixture();
+        let ctx = make_exec_ctx(&config, &db);
+        ctx.execute_committed_block(&make_block(1, vec![]), vec![]);
+        assert!(ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(read_native_applied_height(&db), None);
+
+        let (mut config, db) = dls_fixture();
+        config.leader_miss_threshold = 0;
+        let ctx = make_exec_ctx(&config, &db);
+        ctx.execute_committed_block(&make_block(1, vec![]), vec![]);
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(read_native_applied_height(&db), Some(1));
+        assert!(dls_rows(&db)
+            .iter()
+            .all(|(k, _)| !k.starts_with(b"leader_stats:")));
+    }
+
+    /// K = 0 (s136, on the TC set) and K absent (owner s138: off by default): over four epochs
+    /// (boundaries 4..=16) execution writes no
+    /// dead-leader row at all (no `leader_stats:`, no `leader_qc:`, no `epoch_vset:lx_*`), so the
+    /// state, its hash and the boundary updates (their exclusion delta comes only from an
+    /// `lx_plan` row) are those of the base. Control: K = 3 on the same chain writes the rows and
+    /// plans the exclusion.
+    #[test]
+    fn dead_leader_off_writes_no_row_across_epochs() {
+        let dl_rows = |db: &StateDb| -> Vec<Vec<u8>> {
+            StateBackend::iterate_cf(db, CF_CONSENSUS_META, None)
+                .unwrap()
+                .into_iter()
+                .map(|(k, _)| k)
+                .filter(|k| {
+                    k.starts_with(b"leader_stats:")
+                        || k.starts_with(crate::leader_skip::LEADER_QC_PREFIX)
+                        || k.starts_with(b"epoch_vset:lx_")
+                })
+                .collect()
+        };
+        // Owner s138: off by default. A chain config whose K is absent (a genesis without
+        // `consensus.leader_miss_threshold`) is K = 0, exactly like an explicit 0.
+        let absent_k = |config: &ChainConfig| -> ChainConfig {
+            let mut v = serde_json::to_value(config).unwrap();
+            v.as_object_mut()
+                .unwrap()
+                .remove("leader_miss_threshold")
+                .expect("K is serialized");
+            serde_json::from_value(v).unwrap()
+        };
+        for absent in [false, true] {
+            let tag = if absent { "K absent" } else { "K = 0" };
+            let (mut config, db) = dls_fixture();
+            if absent {
+                config = absent_k(&config);
+                assert_eq!(config.leader_miss_threshold, 0, "{tag}: off by default");
+            } else {
+                config.leader_miss_threshold = 0;
+            }
+            let ctx = make_exec_ctx(&config, &db);
+            for h in 1..=16 {
+                ctx.execute_committed_block(&make_block(h, vec![]), vec![]);
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{tag}: height {h}");
+            }
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&db), Some(16));
+            assert_eq!(dl_rows(&db), Vec::<Vec<u8>>::new(), "{tag}: no dead-leader row");
+            for h in [8, 12, 16, 20] {
+                assert_eq!(
+                    torus_economics::leader_stats::leader_exclusion_plan(&db, h).unwrap(),
+                    None,
+                    "{tag}: no exclusion plan for {h}"
+                );
+            }
+        }
+
+        let (config, on) = dls_fixture();
+        let ctx = make_exec_ctx(&config, &on);
+        dls_execute(&ctx, &on, 1, 16);
+        drop(ctx);
+        assert!(!dl_rows(&on).is_empty(), "control: K = 3 writes rows");
+        assert!(
+            torus_economics::leader_stats::leader_exclusion_plan(&on, 16)
+                .unwrap()
+                .is_some(),
+            "control: K = 3 plans the exclusion"
+        );
+    }
+
+    /// The commit path carries the justify QC's evidence in the height's manifest and writes
+    /// the evidence row in the block's header + body batch at dispatch (on); with the feature
+    /// off, the manifest is the datum verbatim (byte-identical to before) and there is no row.
+    /// Both manifest layouts: the state DB (synchronous dispatch write) and the consensus DB
+    /// (the commit-persist writer).
+    #[test]
+    fn dead_leader_commit_writes_the_evidence_row() {
+        for on in [true, false] {
+            for node_layout in [false, true] {
+                let (mut config, db) = dls_fixture();
+                if !on {
+                    config.leader_miss_threshold = 0;
+                }
+                let (mut app, rx) = if node_layout {
+                    let (app, rx, _mempool) = app_with_recording_exec(&config, &db);
+                    (app, rx)
+                } else {
+                    let mut app = TorusApp::new(db.clone(), &config, None, None, None);
+                    let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(64);
+                    app.replace_exec_tx(tx);
+                    (app, rx)
+                };
+                let commit = |app: &mut TorusApp, h: u64| {
+                    let datum = bincode::serialize(&make_block(h, vec![])).unwrap();
+                    let committed = Block::new(
+                        hotstuff_rs::types::data_types::BlockHeight::new(h),
+                        PhaseCertificate::genesis_pc(),
+                        CryptoHash::new(TorusApp::hash_datum(&datum)),
+                        Data::new(vec![Datum::new(datum.clone())]),
+                    );
+                    app.on_committed_block(&committed, committed.hash);
+                    datum
+                };
+                let tag = format!("on={on} node_layout={node_layout}");
+                // Height 2 first: it waits for 1, so its manifest stays.
+                app.exec_next_height = Some(1);
+                let datum2 = commit(&mut app, 2);
+                assert!(rx.try_recv().is_err(), "{tag}: 2 waits for 1");
+                let value = load_commit_manifest(&app.manifest_db, 2).expect("manifest of 2");
+                let (ev, inner) = crate::leader_skip::split_manifest(&value).unwrap();
+                if on {
+                    assert_eq!(ev, Some(dls_evidence(1)), "{tag}: genesis QC evidence");
+                    assert_eq!(inner, datum2.as_slice(), "{tag}");
+                } else {
+                    assert_eq!(value, datum2, "{tag}: off: the datum verbatim");
+                    assert_eq!((ev, inner), (None, datum2.as_slice()), "{tag}");
+                }
+                assert!(
+                    db.get_cf_raw(CF_CONSENSUS_META, &crate::leader_skip::leader_qc_key(2))
+                        .unwrap()
+                        .is_none(),
+                    "{tag}: no state-DB row at commit"
+                );
+                commit(&mut app, 1);
+                for want in [1u64, 2] {
+                    let msg = rx.try_recv().expect("dispatched in order");
+                    assert_eq!(msg.torus_block.header.height, want);
+                    assert!(msg.settled_durable().header, "{tag}");
+                    let row = db
+                        .get_cf_raw(CF_CONSENSUS_META, &crate::leader_skip::leader_qc_key(want))
+                        .unwrap();
+                    if on {
+                        let ev: crate::leader_skip::LeaderEvidence =
+                            borsh::from_slice(&row.expect("evidence row with the header")).unwrap();
+                        assert_eq!(ev, dls_evidence(1), "{tag} h{want}");
+                    } else {
+                        assert_eq!(row, None, "{tag}: off: no row");
+                    }
+                }
+                assert!(app.leader_evidence.is_empty(), "{tag}: taken at dispatch");
+            }
+        }
+    }
+
+    /// A4 (consensus side): the boundary's validator-set updates carry the exclusion delta of
+    /// the plan execution wrote for it (members unchanged: an exclusion-only update), and no
+    /// update without one (byte-identical to before).
+    #[test]
+    fn boundary_updates_carry_the_leader_exclusion_delta() {
+        let (config, db) = dls_fixture();
+        let mut app = TorusApp::new(db.clone(), &config, None, None, None);
+        EpochManager::execute_planned_rotation(&StakingManager::new(db.clone()), 4, 4, 4, None)
+            .unwrap();
+        write_native_applied_height(&db, 4);
+        assert!(matches!(app.epoch_validator_set_updates(8), Ok(None)));
+
+        torus_economics::leader_stats::put_leader_exclusion_plan(
+            &db,
+            &torus_economics::leader_stats::LeaderExclusionPlan {
+                boundary: 8,
+                excluded: vec![torus_economics::leader_stats::ExcludedMember {
+                    address: [2; 20],
+                    pubkey: dls_vk(2).to_bytes(),
+                }],
+                exclude: vec![dls_vk(2).to_bytes()],
+                readmit: vec![dls_vk(3).to_bytes()],
+            },
+        )
+        .unwrap();
+        app.cached_vs_updates = None;
+        let updates = match app.epoch_validator_set_updates(8) {
+            Ok(Some(u)) => u,
+            Ok(None) => panic!("expected the exclusion delta, got no update"),
+            Err(_) => panic!("expected the exclusion delta, got plan-not-ready"),
+        };
+        assert_eq!(updates.inserts().count(), 0);
+        assert_eq!(updates.deletes().count(), 0);
+        assert_eq!(
+            updates.leader_excludes().copied().collect::<Vec<_>>(),
+            vec![dls_vk(2)]
+        );
+        assert_eq!(
+            updates.leader_readmits().copied().collect::<Vec<_>>(),
+            vec![dls_vk(3)]
+        );
+    }
+
     /// PART 2 (P0 SAFETY, "commit means commit"): a SECOND, DIFFERENT block
     /// arriving at an already-applied height is a conflicting commit — it must
     /// latch the fail-stop, not be silently dropped by the `applied >= height`
@@ -17331,6 +18353,9 @@ mod crash_recovery_tests {
             torus_mempool::MempoolConfig::default(),
         ));
         let mut app = TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
+        // `make_block` time (1000 + height): inside the pre-vote timestamp
+        // window (pre-testnet P0, M2: at most 30 s behind the clock).
+        app.test_now_secs = Some(1_005);
         let hs_block = |datums: Vec<Vec<u8>>, data_hash: [u8; 32]| {
             Block::new(
                 BlockHeight::new(1),
@@ -17792,6 +18817,7 @@ mod crash_recovery_tests {
     ) -> ExecutionContext {
         ExecutionContext {
             state_db: state_db.clone(),
+            leader_skip: crate::leader_skip::LeaderSkipExec::new(config),
             validator: BlockValidator::new(
                 config.chain_id,
                 config.epoch_length,
@@ -18284,6 +19310,9 @@ mod crash_recovery_tests {
                 )
                 .unwrap();
             let mut app = TorusApp::new(state_db.clone(), &config, None, None, None);
+            // `make_block` time (1000 + height): inside the pre-vote timestamp
+            // window (pre-testnet P0, M2: at most 30 s behind the clock).
+            app.test_now_secs = Some(1_005);
             let ctx = make_exec_ctx(&config, &state_db);
             for h in 1..=3 {
                 ctx.execute_committed_block(&make_block(h, vec![]), vec![]);
@@ -19039,6 +20068,9 @@ mod crash_recovery_tests {
     fn vote_requires_the_header_to_link_to_its_parent() {
         let (config, state_db) = make_test_config_and_db();
         let mut app = TorusApp::new(state_db, &config, None, None, None);
+        // `make_block` time (1000 + height): inside the pre-vote timestamp
+        // window (pre-testnet P0, M2: at most 30 s behind the clock).
+        app.test_now_secs = Some(1_005);
         let no_lookup =
             |_: &CryptoHash| -> ParentHeader { panic!("genesis justify needs no lookup") };
 
@@ -21298,6 +22330,261 @@ mod crash_recovery_tests {
             assert!(after > before, "the pass synced the state WAL");
         }
         assert!(load_commit_manifest(&cdb, 5).is_none());
+    }
+
+    // ---- dead-leader skip x commit durability ([claude-review] P1 on 48e44257): the leader
+    // evidence of a committed height must be durable whenever its manifest or its header is ----
+
+    /// A node layout (manifest in its own consensus DB) with dead-leader skip ON (K = 3):
+    /// heights 1..=4 durable and applied. Returns `(config, state DB, consensus DB, mempool)`.
+    fn dls_node() -> (ChainConfig, StateDb, StateDb, Arc<Mempool>) {
+        let (config, state_db) = dls_fixture();
+        let cdb = make_test_consensus_db();
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        write_native_applied_height(&state_db, 4);
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        (config, state_db, cdb, mempool)
+    }
+
+    fn dls_node_boot(
+        config: &ChainConfig,
+        state_db: &StateDb,
+        cdb: &StateDb,
+        mempool: &Arc<Mempool>,
+    ) -> TorusApp {
+        let app = TorusApp::try_new_with_manifest_db(
+            state_db.clone(),
+            cdb.clone(),
+            config,
+            None,
+            Some(mempool.clone()),
+            None,
+        )
+        .unwrap();
+        assert!(
+            app.leader_skip_config
+                .dead_leader_skip(&make_block(5, vec![]).header)
+                .is_some(),
+            "fixture: dead-leader skip on"
+        );
+        app
+    }
+
+    /// Commit height 5 (compact datum, bodies in the DA store) on `app`; returns the committed
+    /// block and the dispatched message.
+    fn dls_commit_5(
+        app: &mut TorusApp,
+        mempool: &Arc<Mempool>,
+    ) -> (hotstuff_rs::types::block::Block, CommittedBlockMsg) {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+        app.replace_exec_tx(tx);
+        let a5 = vec![sign_claim_rewards(5)];
+        mempool.mirror_native_to_da(&a5).unwrap();
+        let c5 = committed_compact_block(&make_block(5, a5));
+        app.exec_next_height = Some(5);
+        app.on_committed_block(&c5, c5.hash);
+        let msg = rx.try_recv().expect("height 5 dispatched");
+        (c5, msg)
+    }
+
+    /// Execute the dispatched `msg` as the exec thread does (after its ticket); returns
+    /// `(exec_failed, applied height)`.
+    fn dls_execute_msg(
+        config: &ChainConfig,
+        state_db: &StateDb,
+        msg: CommittedBlockMsg,
+    ) -> (bool, Option<u64>) {
+        let durable = msg.settled_durable();
+        let ctx = make_exec_ctx(config, state_db);
+        ctx.execute_committed_block_with(&msg.torus_block, msg.pending_slashes, durable);
+        let failed = ctx.exec_failed.load(Ordering::SeqCst);
+        drop(ctx);
+        (failed, read_native_applied_height(state_db))
+    }
+
+    /// Power loss before the state DB's WAL sync loses everything height 5 wrote there since
+    /// (its header + body batch and anything else the commit put in the state DB, the leader
+    /// evidence included); the consensus DB keeps the manifest and hotstuff's delivered height,
+    /// so hotstuff never re-delivers 5.
+    fn dls_lose_unsynced_state_rows_of_5(state_db: &StateDb) {
+        let key = 5u64.to_be_bytes();
+        state_db.delete_cf_raw(CF_BLOCK_HEADERS, &key).unwrap();
+        state_db.delete_cf_raw(CF_BLOCK_BODIES, &key).unwrap();
+        state_db
+            .delete_cf_raw(CF_CONSENSUS_META, &crate::leader_skip::leader_qc_key(5))
+            .unwrap();
+    }
+
+    /// [claude-review] P1 RED-first: with K = 3 a power loss keeps height 5's manifest (consensus
+    /// DB, the WAL of hotstuff's delivered height) but loses its unsynced state-DB rows. Boot
+    /// parks 5 from the manifest and heals its body; execution must then find 5's leader
+    /// evidence (it is in the manifest) and apply 5. RED on 48e44257: the evidence was a
+    /// separate state-DB put, lost with the header; execution fail-stopped (applied stays 4) on
+    /// every restart, since hotstuff counts 5 as delivered and never re-delivers it.
+    #[test]
+    fn dead_leader_evidence_survives_a_power_loss_that_keeps_the_manifest() {
+        let (config, state_db, cdb, mempool) = dls_node();
+        let mut app = dls_node_boot(&config, &state_db, &cdb, &mempool);
+        // Hold the pruner: the manifest stays until a state-WAL sync (none comes).
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        app.commit_persist = Some(CommitPersistWriter::spawn(
+            state_db.clone(),
+            ManifestPruner::detached(held_tx),
+            None,
+            app.header_hook.clone(),
+        ));
+        let (_c5, msg) = dls_commit_5(&mut app, &mempool);
+        assert!(msg.settled_durable().body, "the off-thread write landed");
+        assert_eq!(
+            held_rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(5)
+        );
+        assert!(load_commit_manifest(&cdb, 5).is_some());
+        drop(msg);
+
+        dls_lose_unsynced_state_rows_of_5(&state_db);
+        drop(app);
+
+        let mut app = dls_node_boot(&config, &state_db, &cdb, &mempool);
+        assert_eq!(app.exec_next_height, Some(5), "parked from the manifest");
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+        app.replace_exec_tx(tx);
+        app.drain_exec_queue();
+        let msg = rx.try_recv().expect("heals from the manifest + DA bodies");
+        assert_eq!(msg.torus_block.header.height, 5);
+        let (failed, applied) = dls_execute_msg(&config, &state_db, msg);
+        assert!(
+            !failed,
+            "the healed height fail-stopped: its leader evidence was lost with the state rows"
+        );
+        assert_eq!(applied, Some(5));
+        assert_eq!(
+            dls_evidence_rows(&state_db),
+            0,
+            "the evidence row goes with 5"
+        );
+        drop(app);
+    }
+
+    /// The other half: once height 5's header + body write is durable (state-WAL sync) its
+    /// manifest goes; a crash before 5 executes must still leave 5's evidence durable, so the
+    /// boot replay (from the durable header + body) executes 5. Guards the evidence in the
+    /// header batch: without it, the replay fail-stops.
+    #[test]
+    fn dead_leader_evidence_survives_with_the_header_after_the_manifest_prune() {
+        let (config, state_db, cdb, mempool) = dls_node();
+        let mut app = dls_node_boot(&config, &state_db, &cdb, &mempool);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        app.commit_persist = Some(CommitPersistWriter::spawn(
+            state_db.clone(),
+            ManifestPruner::detached(held_tx),
+            None,
+            app.header_hook.clone(),
+        ));
+        let (_c5, msg) = dls_commit_5(&mut app, &mempool);
+        assert!(msg.settled_durable().header && msg.settled_durable().body);
+        assert_eq!(
+            held_rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(5)
+        );
+        drop(msg);
+        // The prune pass: state-WAL sync (header + body durable), then the manifest goes.
+        manifest_prune_pass(&state_db, &cdb, &[5]).unwrap();
+        assert!(load_commit_manifest(&cdb, 5).is_none());
+        // Crash before 5 executes. The boot replay executes it from the durable rows.
+        drop(app);
+        let app = dls_node_boot(&config, &state_db, &cdb, &mempool);
+        assert!(
+            !app.exec_failed.load(Ordering::SeqCst),
+            "the boot replay of 5 fail-stopped: no durable leader evidence beside its header"
+        );
+        assert_eq!(read_native_applied_height(&state_db), Some(5));
+        assert_eq!(dls_evidence_rows(&state_db), 0);
+        drop(app);
+    }
+
+    /// [claude-review] P1 RED-first, the kill (no power loss) between the commit hook's writes:
+    /// the manifest landed, the leader evidence and the header + body did not. Hotstuff re-feeds
+    /// 5 after the restart, but the boot drain may run first: in both orders 5 must apply. RED
+    /// on 48e44257 for drain-first (the evidence was a second, separate put).
+    #[test]
+    fn dead_leader_kill_after_the_manifest_heals_in_either_order() {
+        for redeliver_first in [false, true] {
+            let (config, state_db, cdb, mempool) = dls_node();
+            let mut app = dls_node_boot(&config, &state_db, &cdb, &mempool);
+            // The header + body write never lands (the kill).
+            app.commit_persist = Some(CommitPersistWriter::held());
+            let (c5, msg) = dls_commit_5(&mut app, &mempool);
+            drop(msg);
+            // ... and nothing after the manifest put did.
+            state_db
+                .delete_cf_raw(CF_CONSENSUS_META, &crate::leader_skip::leader_qc_key(5))
+                .unwrap();
+            drop(app);
+            assert!(load_commit_manifest(&cdb, 5).is_some());
+
+            let mut app = dls_node_boot(&config, &state_db, &cdb, &mempool);
+            assert_eq!(app.exec_next_height, Some(5), "parked from the manifest");
+            let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(4);
+            app.replace_exec_tx(tx);
+            if redeliver_first {
+                app.on_committed_block(&c5, c5.hash);
+            }
+            app.drain_exec_queue();
+            let msg = rx.try_recv().expect("height 5 reaches execution");
+            assert_eq!(msg.torus_block.header.height, 5);
+            let (failed, applied) = dls_execute_msg(&config, &state_db, msg);
+            assert!(
+                !failed,
+                "redeliver_first={redeliver_first}: height 5 fail-stopped (no leader evidence)"
+            );
+            assert_eq!(applied, Some(5), "redeliver_first={redeliver_first}");
+            drop(app);
+        }
+    }
+
+    /// [claude-review] (T5.3 regression) RED-first: with dead-leader skip ON the commit hook
+    /// still writes nothing to the state DB, so it does not wait behind a state-DB write in
+    /// flight. RED on 48e44257: the evidence put queued behind it (1,476 ms of a 1,484 ms
+    /// held write).
+    #[test]
+    fn dead_leader_commit_hook_does_not_wait_behind_a_state_db_write() {
+        let (config, state_db) = dls_fixture();
+        let (mut app, _rx, _mempool) = app_with_recording_exec(&config, &state_db);
+        assert!(app
+            .leader_skip_config
+            .dead_leader_skip(&make_block(7, vec![]).header)
+            .is_some());
+        let (hook, left) = measure_commit_hook_during_state_write(&mut app, &state_db, None);
+        assert!(
+            hook < left * 0.25,
+            "K = 3: the commit hook took {:.1} ms while the held state-DB write had {:.1} ms \
+             left: it waited behind it",
+            hook * 1e3,
+            left * 1e3
+        );
+    }
+
+    /// The same with the dispatch in the hook (the leader evidence goes with the off-thread
+    /// header + body write).
+    #[test]
+    fn dead_leader_commit_dispatch_does_not_wait_behind_a_state_db_write() {
+        let (config, state_db) = dls_fixture();
+        let (mut app, _rx, mempool) = app_with_recording_exec(&config, &state_db);
+        let (hook, left) =
+            measure_commit_hook_during_state_write(&mut app, &state_db, Some(&mempool));
+        assert!(
+            hook < left * 0.25,
+            "K = 3: commit + dispatch took {:.1} ms while the held state-DB write had {:.1} ms \
+             left: it waited behind it",
+            hook * 1e3,
+            left * 1e3
+        );
     }
 
     /// T5.3: a recording [`HeaderPersistedHook`]: each call's height and
@@ -26571,6 +27858,131 @@ mod crash_recovery_tests {
         );
     }
 
+    // ---- Pre-testnet P0 (review M2): block timestamp lower bound ----
+
+    #[test]
+    fn proposal_timestamp_lag_bound() {
+        assert!(check_timestamp_lag(1_000 - MAX_BLOCK_TIMESTAMP_LAG_SECS, 1_000).is_ok(), "lag 30");
+        assert!(check_timestamp_lag(1_000 - MAX_BLOCK_TIMESTAMP_LAG_SECS - 1, 1_000).is_err(), "lag 31");
+        assert!(check_timestamp_lag(1_000, 1_000).is_ok(), "on the clock");
+        assert!(check_timestamp_lag(2_000, 1_000).is_ok(), "ahead: the drift bound's business");
+        assert!(check_timestamp_lag(0, 0).is_ok(), "clock at 0");
+        assert!(check_timestamp_lag(0, 10).is_ok(), "no underflow below the bound");
+        assert!(check_timestamp_lag(0, u64::MAX).is_err(), "far behind");
+        assert!(check_timestamp_lag(u64::MAX, u64::MAX).is_ok(), "no overflow");
+    }
+
+    /// M2: a proposal more than MAX_BLOCK_TIMESTAMP_LAG_SECS behind the local
+    /// clock gets no vote (a byzantine leader cannot reuse an old timestamp
+    /// after a stall, so an old oracle aggregate is not age 0 in its block);
+    /// at the bound it votes, and a normal block passes.
+    #[test]
+    fn too_old_proposal_is_refused_before_the_vote() {
+        let parent = tip_2000();
+        let mut app = ts_app(2_040);
+        assert_eq!(pre_vote(&mut app, &parent, &child_of(&parent, 2_040)), BlockDataCheck::Held, "normal");
+        assert_eq!(pre_vote(&mut app, &parent, &child_of(&parent, 2_011)), BlockDataCheck::Held, "lag 29");
+        assert_eq!(pre_vote(&mut app, &parent, &child_of(&parent, 2_010)), BlockDataCheck::Held, "lag 30");
+        assert_eq!(pre_vote(&mut app, &parent, &child_of(&parent, 2_009)), BlockDataCheck::Invalid, "lag 31");
+        // The M2 case: a leader reuses the parent's timestamp after a stall.
+        assert_eq!(pre_vote(&mut app, &parent, &child_of(&parent, 2_000)), BlockDataCheck::Invalid, "ts = parent after a 40 s stall");
+    }
+
+    /// [`pre_vote`] on the re-proposal path (hotstuff's `check_reproposal_data`).
+    fn pre_vote_reproposal(app: &mut TorusApp, parent: &TorusBlock, block: &TorusBlock) -> BlockDataCheck {
+        let hs_parent = hs_block(parent, PhaseCertificate::genesis_pc());
+        let header = parent.header.clone();
+        app.check_reproposal_proposal_data(&hs_block(block, justify_for(&hs_parent)), move |_| {
+            ParentHeader::Header(Box::new(header))
+        })
+    }
+
+    /// Review M2: a block consensus may force a leader to propose again unchanged (certified, last
+    /// voted by this replica, or an authenticated TC re-proposal: hotstuff decides, and asks
+    /// `check_reproposal_data`) is voted however long the stall, so the bound cannot wedge the
+    /// chain; a FRESH proposal of the same block is still refused. Every other rule applies to the
+    /// re-proposal: the ahead bound and the parent link (ts >= parent).
+    #[test]
+    fn reproposal_after_a_long_stall_is_voted_fresh_proposal_still_refused() {
+        let parent = tip_2000();
+        let tip = child_of(&parent, 2_004);
+        for now in [2_035, 2_004 + 3_600, 9_999_999] {
+            let mut app = ts_app(now);
+            assert_eq!(pre_vote(&mut app, &parent, &tip), BlockDataCheck::Invalid, "fresh, now {now}");
+            assert_eq!(pre_vote_reproposal(&mut app, &parent, &tip), BlockDataCheck::Held, "re-proposal, now {now}");
+        }
+        let mut app = ts_app(2_010);
+        assert_eq!(
+            pre_vote_reproposal(&mut app, &parent, &child_of(&parent, 2_016)),
+            BlockDataCheck::Invalid,
+            "the ahead bound still applies"
+        );
+        assert_eq!(
+            pre_vote_reproposal(&mut app, &parent, &child_of(&parent, 1_999)),
+            BlockDataCheck::Invalid,
+            "the parent link still applies"
+        );
+        assert_eq!(pre_vote_reproposal(&mut app, &parent, &child_of(&parent, 2_010)), BlockDataCheck::Held);
+    }
+
+    /// First block (genesis justify): the lag bound applies too.
+    #[test]
+    fn proposal_timestamp_first_block_has_the_lag_bound() {
+        let mut app = ts_app(1_700_000_000);
+        let no_lookup = |_: &CryptoHash| -> ParentHeader { panic!("genesis justify") };
+        let mut b1 = make_block(1, vec![]);
+        b1.header.timestamp = 1_700_000_000 - MAX_BLOCK_TIMESTAMP_LAG_SECS;
+        assert_eq!(app.check_proposal_data(&hs_block(&b1, PhaseCertificate::genesis_pc()), no_lookup), BlockDataCheck::Held);
+        b1.header.timestamp -= 1;
+        assert_eq!(app.check_proposal_data(&hs_block(&b1, PhaseCertificate::genesis_pc()), no_lookup), BlockDataCheck::Invalid);
+    }
+
+    /// No wedge, catch-up and replay unaffected: an old block (certified
+    /// long ago, or delivered late) is accepted wherever it is inserted —
+    /// validate_block's link check, the datum path (also block sync) — and
+    /// executes on the live path and in crash replay. Only the vote reads
+    /// the local clock.
+    #[test]
+    fn old_block_is_accepted_at_insertion_sync_execution_and_replay() {
+        let parent = tip_2000();
+        let old = child_of(&parent, 2_000);
+        let mut app = ts_app(9_999_999);
+        assert_eq!(pre_vote(&mut app, &parent, &old), BlockDataCheck::Invalid, "no vote");
+        let hs_parent = hs_block(&parent, PhaseCertificate::genesis_pc());
+        let header = parent.header.clone();
+        assert_eq!(
+            check_parent_link(
+                &old.header,
+                &justify_for(&hs_parent),
+                &app.genesis_header,
+                &app.activations,
+                app.known_features,
+                move |_| ParentHeader::Header(Box::new(header)),
+                |_| Ok(None)
+            ),
+            BlockDataCheck::Held
+        );
+        let datum = encode_proposal_datum(&old, false);
+        assert!(matches!(
+            app.validate_datum(&datum, &data_hash_of(&datum)),
+            ValidateBlockResponse::Valid { .. }
+        ));
+        for replay in [false, true] {
+            let (config, db) = make_test_config_and_db();
+            let ctx = make_exec_ctx(&config, &db);
+            let mut b1 = make_block(1, vec![]);
+            b1.header.timestamp = 1; // far behind every clock
+            if replay {
+                persist_committed_block_durably(&db, &b1);
+                assert_eq!(TorusApp::replay_committed(&db, &ctx).1, None);
+            } else {
+                ctx.execute_committed_block(&b1, vec![]);
+            }
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "replay={replay}");
+            assert_eq!(read_native_applied_height(&db), Some(1), "replay={replay}");
+        }
+    }
+
     /// The proposer never emits a timestamp below its parent's, even when the
     /// parent's is ahead of the local clock (within drift), and the block it
     /// produces passes the pre-vote rule on a validator with the same clock.
@@ -27075,11 +28487,14 @@ mod crash_recovery_tests {
                 resp.data.clone(),
             )
         };
-        // The voters' clock runs an hour ahead: the proposals carry the real
+        // The voters' clock runs 25 s ahead: the proposals carry the real
         // clock, and under a loaded parallel run building an app took > 5 s,
         // so a clock pinned before it tripped the 5 s drift check (Invalid
-        // for the wrong reason). This test is about bits, not drift.
-        let clock = || unix_now_secs() + 3_600;
+        // for the wrong reason). This test is about bits, not drift. Not more
+        // than 30 s ahead (review M2: the 30 s lower bound would refuse a
+        // proposal stamped before the pinned clock), and a proposal stamped
+        // after the pin trips the ahead bound only if it comes > 30 s later.
+        let clock = || unix_now_secs() + 25;
         let mut from_1 = gated_app(clock(), rsh_at(1));
         assert_eq!(from_1.genesis_header.features, rsh, "genesis parent header");
         assert_eq!(from_1.last_header.features, rsh);
@@ -28277,7 +29692,10 @@ mod crash_recovery_tests {
     /// without a panic. RED before: off-cadence EVM txs were `Held`.
     #[test]
     fn evm_txs_off_the_cadence_are_refused_before_the_vote() {
-        let parent3 = make_block(3, vec![]);
+        // At `tip_2000`'s time, within the pre-vote timestamp window of the
+        // 2_010 clock (pre-testnet P0, M2: at most 30 s behind).
+        let mut parent3 = make_block(3, vec![]);
+        parent3.header.timestamp = 2_000;
         let parent4 = tip_2000();
         let mut app = ts_app(2_010);
         for compact in [false, true] {
@@ -28398,6 +29816,9 @@ mod crash_recovery_tests {
     /// default N, which the n11 branch moves to 11).
     fn lane_block(height: u64, m: u64) -> TorusBlock {
         let mut b = make_block(height, vec![]);
+        // `tip_2000`'s time: inside the pre-vote window of the tests' 2_010
+        // clock (pre-testnet P0, M2).
+        b.header.timestamp = 2_000;
         b.header.evm_block_interval = 5;
         b.header.evm_big_block_interval = m;
         b
@@ -33586,7 +35007,7 @@ mod crash_recovery_tests {
         );
         for b in &blocks {
             let h = b.header.height;
-            let rows = writer.submit(b.clone()).wait();
+            let rows = writer.submit(b.clone(), None).wait();
             assert_eq!(
                 rows,
                 DurableRows {
@@ -51089,3 +52510,8 @@ mod crash_recovery_tests {
 #[cfg(test)]
 #[path = "p00_cluster_tests.rs"]
 mod p00_cluster_tests;
+
+/// Dead-leader skip phase 3: the multi-node tests (docs/plans/dead-leader-skip.md §4).
+#[cfg(test)]
+#[path = "dead_leader_cluster_tests.rs"]
+mod dead_leader_cluster_tests;

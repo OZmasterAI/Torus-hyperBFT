@@ -748,7 +748,7 @@ docs/plans/dead-leader-skip.md section 8 finding 4 on feat/dead-leader-p3).
 ```
 # 9p smoke shape: 4 equal validators, val3 killed 30 s into a 120 s load, never restarted
 N_VALIDATORS=4 BENCH_RPCS=0,1,2 KILL_NO_RESTART=val3 KILL_NO_RESTART_AT_S=30 \
-  [DL_K=3 DL_JCAP=6] [HOTSTUFF_CPUS=2/6/10/14] \
+  DL_K=3 [DL_JCAP=6] [HOTSTUFF_CPUS=2/6/10/14] \
   tools/matched-bench/run-cell.sh <wt> dl4-smoke 10 120 20000
 ```
 
@@ -776,7 +776,8 @@ N_VALIDATORS=4 BENCH_RPCS=0,1,2 KILL_NO_RESTART=val3 KILL_NO_RESTART_AT_S=30 \
   i+16 are siblings) put each consensus thread on its own core:
   `2/6/10/14` (3 nodes: `2/6/10`).
 - **`DL_K=K` / `DL_JCAP=J`**: genesis `consensus.leader_miss_threshold`
-  (0 = off or 2..=64, node default 3) and `consensus.leader_exclusion_cap`
+  (0 = off or 2..=64, node default 0 = off since owner s138: **9p must set
+  `DL_K=3`**, else no exclusion ever happens) and `consensus.leader_exclusion_cap`
   (0..=10, default 6), written only when set (genesis-cache inputs). The
   genesis loader has no `deny_unknown_fields`, so a binary without the feature
   would ignore them silently: pre-flight refuses a torus-node that does not

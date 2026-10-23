@@ -110,8 +110,10 @@ pub fn check_consensus_db_format(found: Option<u32>, data_dir: &Path) -> Result<
     Err(format!(
         "refusing to start: the consensus DB {cdb} is {found}, and this build reads consensus \
          DB format {CONSENSUS_DB_FORMAT_VERSION} only (domain-tagged consensus signatures, \
-         leader-signed proposals and tips). Its stored certificates would fail every signature \
-         check and the chain would stall. There is no in-place migration: run this build on \
+         leader-signed proposals and tips; dead-leader skip: leader exclusions in the stored \
+         validator sets, leader evidence in commit manifests). Its stored certificates or \
+         validator sets would not read as this build expects, and the chain would stall or \
+         diverge. There is no in-place migration: run this build on \
          every node of the chain, each from a fresh data dir (remove {dir}); the genesis file \
          can stay the same.",
         cdb = cdb.display(),
@@ -981,6 +983,29 @@ mod tests {
         assert!(err.contains(&dir.path().display().to_string()), "{err}");
         let dbs = open_node_dbs_unchecked_for_test(dir.path());
         assert_eq!(dbs.kv_store().consensus_db_format().unwrap(), None, "refusal wrote the key");
+    }
+
+    /// Dead-leader skip (format 2): a store of format 1 (the TC-required base) is refused. A
+    /// format-1 build reads a stored validator set with borsh `deserialize`, which ignores the
+    /// trailing leader-excluded set (it would pick other leaders than its peers), and cannot
+    /// decode a pending update with exclusions; a format-2 build on a format-1 store would execute
+    /// committed heights that have no leader evidence and no `leader_stats:` history.
+    #[test]
+    fn consensus_db_of_format_1_is_refused() {
+        assert_eq!(CONSENSUS_DB_FORMAT_VERSION, 2, "dead-leader skip bumps the format");
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let dbs = open_node_dbs(dir.path()).unwrap();
+            init_chain(&dbs);
+            let mut kv = dbs.kv_store();
+            let mut wb = RocksWriteBatch::new();
+            wb.set(&CONSENSUS_DB_FORMAT, &1u32.to_le_bytes());
+            kv.write(wb);
+        }
+        let err = open_node_dbs(dir.path()).err().expect("must refuse");
+        assert!(err.contains("refusing to start"), "{err}");
+        assert!(err.contains("format 1"), "{err}");
+        assert!(err.contains("fresh data dir"), "{err}");
     }
 
     /// A consensus DB of another (newer) format is refused too.

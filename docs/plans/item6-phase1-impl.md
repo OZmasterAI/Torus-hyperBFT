@@ -780,7 +780,7 @@ Not merge blockers; each is tracked where it is defined. Status after the s96 me
 | governance storage errors don't halt the node | row 74 | before mainnet | owner call (halt like liquidation?) |
 | RPC 1/1 for undecodable rows, book StopLimit tick guard, RPC price <= 0 | rows 44-46 | soon | yes to all three (small) |
 | native root dropped from blocks in `02aa50c` (intended?) | 9.3 | before mainnet | decide whether blocks carry a native state root |
-| oracle review M2: lower bound on block timestamps | bench doc Open, `4a12020` | before mainnet (owner s131; was: before testnet) | not in the testnet genesis. Work kept on `wip/m2-timestamp-lower-bound`, see `docs/plans/oracle-aggregation.md` Decision 5 |
+| oracle review M2: lower bound on block timestamps | bench doc Open, `4a12020` | before the testnet genesis (owner s138; s131 had said before mainnet) | built on `fix/m2-timestamp-lower-bound`, see `docs/plans/oracle-aggregation.md` Decision 5 "As built (s138)" |
 | anti-spam D: no validator exemption for the per-IP limit | bench doc Open | before testnet | check whether validators hit it |
 | liquidation stress at full-node load | row 76 | before testnet | one ozarchy cell (larger walk or accounts near maintenance) |
 | slow first block after the load; 2.5 ms empty block with the feed live | rows 77-78 | Phase 2 | step 0 profile |

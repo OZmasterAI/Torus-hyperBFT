@@ -1186,28 +1186,45 @@ impl ViewInfo {
 /// walk survives as `select_leader_reference` in tests; `select_leader_closed_form_matches_reference`
 /// proves output equivalence exhaustively — the two are consensus-identical.
 ///
+/// ## Leader exclusion (dead-leader skip)
+///
+/// When the validator set's [leader-excluded](ValidatorSet#leader-exclusion) set is non-empty and
+/// the eligible (not excluded) power still reaches a quorum, the abstract array is built from the
+/// eligible validators only, at their own powers, and indexed by `view % eligible_power`.
+/// Otherwise (empty set, or eligible power below a quorum) it is built from all validators exactly
+/// as before. Voting power and quorums are not affected.
+///
 /// [Read more](super#leader-selection).
 pub fn select_leader(view: ViewNumber, validator_set: &ValidatorSet) -> VerifyingKey {
-    // Length of the abstract array.
-    let p_total = validator_set.total_power();
     // Total number of validators.
     let n = validator_set.len();
 
     assert!(
-        n > 0 && p_total.int() > 0,
+        n > 0 && validator_set.total_power().int() > 0,
         "select_leader: validator set must be non-empty with nonzero total power \
          (n={n}, total_power={})",
-        p_total.int()
+        validator_set.total_power().int()
     );
 
-    // Index in the abstract array.
-    let index = (view.int() % (p_total.int() as u64)) as u128;
+    // The rows of the abstract array: all validators, or only the eligible ones when the
+    // exclusion is active (eligible power >= quorum, which is > 0).
+    let skip_excluded = validator_set.leader_exclusion_active();
+    let in_rows = |v: &VerifyingKey| !skip_excluded || !validator_set.is_leader_excluded(v);
 
     // Validator powers in `validators()` order (the row order of the abstract array).
     let powers: Vec<u64> = validator_set
         .validators()
+        .filter(|v| in_rows(v))
         .map(|v| validator_set.power(v).unwrap().int())
         .collect();
+
+    // Length of the abstract array.
+    let p_total: u128 = powers.iter().map(|p| *p as u128).sum();
+
+    // Index in the abstract array. The length is a u128 (a sum of u64 powers): narrowing it to
+    // u64 made a length of 2^64 a zero divisor (Codex batch C P2). For every length below 2^64
+    // the index is the same as with the u64 modulo.
+    let index = view.int() as u128 % p_total;
 
     // Distinct positive power levels, ascending. For thresholds `t` in the segment
     // `(prev_level, level]` no validator power lies strictly between the bounds, so the
@@ -1232,7 +1249,7 @@ pub fn select_leader(view: ViewNumber, validator_set: &ValidatorSet) -> Verifyin
             let pos_in_row = ((index - cum) % members) as usize;
             let validator = validator_set
                 .validators()
-                .filter(|v| validator_set.power(v).unwrap().int() >= level)
+                .filter(|v| in_rows(v) && validator_set.power(v).unwrap().int() >= level)
                 .nth(pos_in_row)
                 .unwrap();
             return *validator;
@@ -1349,6 +1366,10 @@ pub fn select_leader_reputation_weighted(
         updates.insert(vk, Power::new(effective));
     }
     adjusted_vs.apply_updates(&updates);
+    // Dead-leader skip: keep the leader exclusions (the fallback then uses the adjusted powers).
+    for vk in validator_set.leader_excluded() {
+        adjusted_vs.exclude_leader(vk);
+    }
 
     select_leader(view, &adjusted_vs)
 }
@@ -1534,23 +1555,34 @@ fn select_leader_fairness_test() {
 /// The original entry-by-entry IWRR walk, kept as the semantic reference for
 /// `select_leader_closed_form_matches_reference`. O(view % total_power) — this
 /// was the S405 height-drag root cause and must never be used in production.
+///
+/// Dead-leader skip: the walk runs over the members that are not leader-excluded, at their own
+/// powers, unless their power is below a quorum of the whole set (computed here independently of
+/// `ValidatorSet::quorum`), in which case it runs over all members.
 #[cfg(test)]
 fn select_leader_reference(view: ViewNumber, validator_set: &ValidatorSet) -> VerifyingKey {
-    let p_total = validator_set.total_power();
-    let n = validator_set.len();
-    let index = view.int() % (p_total.int() as u64);
-    let p_max = validator_set
-        .validators_and_powers()
+    let all = validator_set.validators_and_powers();
+    let total: u128 = all.iter().map(|(_, p)| p.int() as u128).sum();
+    let eligible_power: u128 = all
         .iter()
-        .map(|(_, power)| power.int())
-        .max()
-        .unwrap();
+        .filter(|(v, _)| !validator_set.is_leader_excluded(v))
+        .map(|(_, p)| p.int() as u128)
+        .sum();
+    let quorum = total * 2 / 3 + 1;
+    let members: Vec<(VerifyingKey, u64)> = all
+        .into_iter()
+        .filter(|(v, _)| eligible_power < quorum || !validator_set.is_leader_excluded(v))
+        .map(|(v, p)| (v, p.int()))
+        .collect();
+
+    let p_total: u64 = members.iter().map(|(_, p)| *p).sum();
+    let index = view.int() % p_total;
+    let p_max = members.iter().map(|(_, p)| *p).max().unwrap();
 
     let mut counter = 0;
     for threshold in 1..=p_max {
-        for k in 0..=(n - 1) {
-            let validator = validator_set.validators().nth(k).unwrap();
-            if validator_set.power(validator).unwrap().int() >= threshold {
+        for (validator, power) in &members {
+            if *power >= threshold {
                 if counter == index {
                     return *validator;
                 }
@@ -2312,3 +2344,7 @@ mod prev_view_collector_test;
 #[cfg(test)]
 #[path = "cross_chain_timeout_test.rs"]
 mod cross_chain_timeout_test;
+
+#[cfg(test)]
+#[path = "leader_exclusion_test.rs"]
+mod leader_exclusion_test;
