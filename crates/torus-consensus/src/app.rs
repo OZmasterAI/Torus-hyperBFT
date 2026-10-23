@@ -1863,6 +1863,13 @@ struct ExecutionContext {
     /// test-only `test-reference-paths` feature (this crate's dev-dependency).
     #[cfg(test)]
     test_reference_paths: bool,
+    /// Item 6 Phase 5 step 2 (tests): stand-in for the parallel settle's
+    /// work gate: `true` forces the parallel settle on odd heights and the
+    /// sequential loop on even ones (torus-bridge's `test_parallel_settle`),
+    /// so a test stream of a few fills per block runs both. Default off (the
+    /// production gate).
+    #[cfg(test)]
+    test_parallel_settle_odd_heights: bool,
     /// Test-only crash injection (consensus bug (c)): return right after the
     /// EVM section, where a hard crash before the native flush would stop.
     #[cfg(test)]
@@ -6239,6 +6246,9 @@ impl ExecutionContext {
             {
                 ctx.test_cancel_all_full_scan = self.test_reference_paths;
                 ctx.test_flush_per_row = self.test_reference_paths;
+                ctx.test_parallel_settle = self
+                    .test_parallel_settle_odd_heights
+                    .then_some(torus_block.header.height % 2 == 1);
             }
             // Item 6 C2: the slot's previous mark table / configs decide the
             // version of this block's table (filled by begin_block_oracle).
@@ -8731,6 +8741,8 @@ impl TorusApp {
             test_no_resident_rows: false,
             #[cfg(test)]
             test_reference_paths: false,
+            #[cfg(test)]
+            test_parallel_settle_odd_heights: false,
             #[cfg(test)]
             test_crash_after_evm_section: false,
             #[cfg(test)]
@@ -19114,6 +19126,8 @@ mod crash_recovery_tests {
             test_no_resident_rows: false,
             #[cfg(test)]
             test_reference_paths: false,
+            #[cfg(test)]
+            test_parallel_settle_odd_heights: false,
             #[cfg(test)]
             test_crash_after_evm_section: false,
             #[cfg(test)]
@@ -36810,6 +36824,10 @@ mod crash_recovery_tests {
                 P5Ckpt::Never => Some(ckpt_never()),
             };
             ctx.test_block_probe = self.probe.clone();
+            // Step 2: the parallel (streamed) settle on odd heights, so the
+            // in-place flush takes pass B's per-market runs (the stream's
+            // few fills never reach the Auto gate).
+            ctx.test_parallel_settle_odd_heights = true;
             p5_configure(&mut ctx, self.path);
             if self.cfg.pipelined && attach {
                 ctx.attach_flush_worker(None);

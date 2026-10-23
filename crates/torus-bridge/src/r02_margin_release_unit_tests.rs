@@ -178,7 +178,6 @@ fn settle_ioc(parallel: bool, fault: bool) -> (bool, Rows, Option<String>, usize
             &mut bal_cache,
             &mut pos_cache,
             &mut vol_cache,
-            None,
             1,
         );
         assert_eq!(

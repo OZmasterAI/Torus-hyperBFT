@@ -865,7 +865,7 @@ impl Before {
     /// The row's bytes, as R held them.
     fn bytes(&self) -> Option<Vec<u8>> {
         match self {
-            Self::Typed(p) => p.as_ref().map(|p| encode(p, POSITION_V2_LEN)),
+            Self::Typed(p) => p.as_ref().map(|p| encode(p, p.encoded_len())),
             Self::Raw(v) => v.clone(),
         }
     }
@@ -1071,7 +1071,7 @@ impl Users {
                     let key = position_key(t, *m);
                     let value = match opaque {
                         Some(r) => r.positions.get(key.as_slice()).cloned(),
-                        None => rec.and_then(|u| find(&u.positions, *m)).map(|p| encode(p, POSITION_V2_LEN)),
+                        None => rec.and_then(|u| find(&u.positions, *m)).map(|p| encode(p, p.encoded_len())),
                     };
                     #[cfg(test)]
                     if value.is_some() {

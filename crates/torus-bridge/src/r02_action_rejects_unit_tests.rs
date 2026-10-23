@@ -166,7 +166,6 @@ fn settle_closing_taker(
             &mut bal_cache,
             &mut pos_cache,
             &mut vol_cache,
-            None,
             1,
         );
     } else {
@@ -401,7 +400,6 @@ fn settle_two_markets(workers: Option<usize>, precedence: bool) -> (Option<Strin
             &mut bal_cache,
             &mut pos_cache,
             &mut vol_cache,
-            None,
             w,
         ),
         None => NativeExecutor::settle_market_results_sequential(

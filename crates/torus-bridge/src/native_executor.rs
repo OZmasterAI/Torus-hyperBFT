@@ -6829,6 +6829,13 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// overlay writes are compared against. Default off.
     #[cfg(any(test, feature = "test-reference-paths"))]
     pub test_flush_per_row: bool,
+    /// Item 6 Phase 5 step 2 (tests): stand-in for the settle's work gate
+    /// (`SettleMode::Auto`): `Some(p)` runs every `execute_batch` as
+    /// `SettleMode::Force { parallel: p }`, so a test stream of a few fills
+    /// per block reaches the parallel (and 8k L2.1 streamed) settle and its
+    /// per-market caches. Default `None` (the production gate).
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    pub test_parallel_settle: Option<bool>,
     /// Test-only fault injection: the parallel cancel-all book pass's job
     /// panics (contained) when it reaches this market's book, before
     /// touching it. Exercises the fail-stop exit. Default `None`.
@@ -7367,6 +7374,8 @@ impl<T: StateBackend> NativeExecContext<T> {
             test_cancel_all_full_scan: false,
             #[cfg(any(test, feature = "test-reference-paths"))]
             test_flush_per_row: false,
+            #[cfg(any(test, feature = "test-reference-paths"))]
+            test_parallel_settle: None,
             #[cfg(test)]
             test_cancel_all_panic_market: None,
             #[cfg(test)]
@@ -10034,6 +10043,14 @@ impl NativeExecutor {
         let probe = SETTLE_STREAM_PROBE.with(std::cell::Cell::get);
         // C3: the parallel settle's gate over the call's fills (monotone:
         // once a partial sum passes it, the total does too).
+        #[cfg(any(test, feature = "test-reference-paths"))]
+        let settle_mode = match (settle_mode, ctx.test_parallel_settle) {
+            (SettleMode::Auto, Some(parallel)) => SettleMode::Force {
+                parallel,
+                workers: None,
+            },
+            (mode, _) => mode,
+        };
         let settle_gate = |total_fills: usize| match settle_mode {
             SettleMode::Force { parallel, .. } => parallel,
             // L3-ENG: with the engine on, the (byte-identical) C3 parallel

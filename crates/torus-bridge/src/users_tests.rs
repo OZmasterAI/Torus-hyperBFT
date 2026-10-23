@@ -2778,6 +2778,9 @@ impl P5Node2 {
     /// An empty DB set up by `fixture`, the holder on the reference path or
     /// in place.
     fn with(reference: bool, fixture: impl FnOnce(&StateDb)) -> Self {
+        // Owner s138: fixtures from before the never-marked rule (test-only
+        // seam, process-wide; this binary does not test the rule).
+        torus_core::oracle::test_treat_unmarked_as_marked();
         let dir = tempfile::tempdir().unwrap();
         let db = StateDb::open(dir.path()).unwrap();
         fixture(&db);
@@ -3064,6 +3067,11 @@ fn rejected_action_leaves_users_untouched() {
             &rj_market_row(2 * FixedPoint::SCALE, 2 * FixedPoint::SCALE),
         )
         .unwrap();
+        // Pre-testnet P0 (main d78ea41b): orders need a listed market
+        // (placeholder rows: tick / lot 1, as the old implicit book).
+        for m in 2..=4u64 {
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), b"listed").unwrap();
+        }
         // Market 3's last aggregated price: its band (default +-50%).
         let agg = [
             p5_fp(105).raw().to_be_bytes().as_slice(),
@@ -3118,7 +3126,7 @@ fn rejected_action_leaves_users_untouched() {
                 }
                 (ok, (id_rest, id_poor))
             });
-            assert!(run.out.0.iter().all(|x| *x), "{mode:?}: setup");
+            assert!(run.out.0.iter().all(|x| *x), "{mode:?}: setup {:?}", run.out.0.iter().enumerate().filter(|(_, x)| !**x).map(|(i, _)| i).collect::<Vec<_>>());
             ids = run.out.1;
         }
         let (id_rest, id_poor) = ids;
@@ -3459,7 +3467,7 @@ impl ColdProbe {
         if slot == POSITIONS && key.len() == KEY {
             let (t, m) = (Address::from_slice(&key[..TRADER]), market_of(key));
             if let Some(p) = TypedRows::position(&*self.users, &t, m) {
-                assert_eq!(p.map(|p| encode(&p, POSITION_V2_LEN)).as_deref(), value, "typed read of {key:02x?}");
+                assert_eq!(p.map(|p| encode(&p, p.encoded_len())).as_deref(), value, "typed read of {key:02x?}");
             }
         }
         let mut s = self.stats.lock().unwrap();
