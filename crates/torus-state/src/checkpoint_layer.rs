@@ -221,18 +221,13 @@ impl CheckpointLayer {
     /// end-of-block merge folds [`LayerPart::Main`] into L, hands it back,
     /// then folds [`LayerPart::Deferred`] into the part split off it).
     pub fn merge_part(&mut self, frozen: &FrozenPending, part: LayerPart) {
-        let src = frozen.pending_state();
         let mut seen = 0usize;
-        for (i, ((dst, bytes), cfp)) in self
-            .state
-            .cfs
-            .iter_mut()
-            .zip(self.bytes.iter_mut())
-            .zip(src.cfs.iter())
-            .enumerate()
-        {
+        for (i, (dst, bytes)) in self.state.cfs.iter_mut().zip(self.bytes.iter_mut()).enumerate() {
             if part.holds(i) {
-                seen += merge_cf(dst, bytes, cfp);
+                // Phase 5 r2: the CF's rows where the frozen set holds them
+                // (its typed part for positions / balances, serialized here
+                // if no reader did yet).
+                seen += merge_cf(dst, bytes, frozen.cf_at(i));
             }
         }
         self.top = Some(self.top.map_or(frozen.height(), |t| t.max(frozen.height())));

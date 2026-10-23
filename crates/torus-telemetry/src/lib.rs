@@ -4,7 +4,7 @@ pub mod view_metrics;
 pub use view_metrics::ViewMetricsRecorder;
 
 use prometheus_client::encoding::text::encode;
-use prometheus_client::metrics::counter::Counter;
+pub use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 pub use prometheus_client::metrics::gauge::Gauge;
 pub use prometheus_client::metrics::histogram::Histogram;

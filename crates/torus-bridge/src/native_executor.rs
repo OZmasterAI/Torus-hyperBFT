@@ -5427,6 +5427,11 @@ pub fn begin_resident(
     };
     if let Some(m) = metrics {
         set_resident_gauges(m, &rows, block.users.as_deref().map(|u| u.read()).as_deref());
+        // Phase 5 step 2 r2: the drain encode jobs observe these (set once
+        // per record set; the jobs run on the flush worker).
+        if let Some(u) = block.users.as_deref() {
+            u.set_encode_metrics(m);
+        }
     }
     debug_assert!(rows.has_source(), "R reads positions and balances from its record set");
     overlay.attach_resident(rows);

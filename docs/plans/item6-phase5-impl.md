@@ -9,6 +9,11 @@ shows a fix that needs in-memory state, (2) the profile after item 7 option 0 an
 starts with the bounded rework: the drain encoding moves to the flush worker (0.130 of the +0.143 ms per 1k fills),
 then step 2 is re-A/B'd under the queue's exec-path merge rule (exec-thread CPU per fill, blocks/s, p50 / p99).
 
+**Status s140: REVISITED** (bench 9m, section 126 on `docs/perf-s138-chain`: cache flush + overlay writes 16.9% std /
+16.3% deep of exec-thread cycles, n = 1, over the 15% threshold). Step 2 rebased onto main `077fe56e` with the bounded
+rework (the drain encoding off the exec thread) on `feat/item6-phase5-step2-r2`; not merged, waiting on its re-A/B
+(section "Step 2 r2" below).
+
 Status (before s128): PLAN, nothing built. Gate 3 met (section 65, s119); step 0 measured (section 81, s66); scope decided (owner
 s127): **build steps 1, 2, 3 and 7**; step 4 deferred, steps 5 and 6 decided later (section 1 "Scope (owner s127)").
 Section 7 decided (owner s122: 1 a, 2 a, 3 a, 4 a, 5 b, 6 a, 7 a, 8 a, 9 build for the gain).
@@ -526,6 +531,59 @@ Task 2.3 RED `18d93dfc`, code `781bbeba`; Task 2.4 test and this note in the las
   serial and engine-forced. `phase5_differential_long_random_10k` (parallel settle forced on odd heights, 16 aliased
   traders): all 12 configurations, no divergence, 3,530 s (debug; rerun by 18c after a VPS reboot cut the first run).
   The finding on the reference merge goes to the roadmap's pre-testnet list (first: can such rows exist at all?).
+
+### Step 2 r2 (s140): rebased onto main, drain encoding off the exec thread
+
+Branch `feat/item6-phase5-step2-r2` on main `077fe56e` (`b17dab16` + docs). Not merged; the re-A/B decides.
+
+**Rebase (port commit after the step 2 commits).** Step 2's design still fits main; what changed under it:
+- 8k L2.2 (default on) keeps pass B's per-market position caches as runs (`pos_runs`), the same shape as step 2's plan
+  list. The in-place flush (`execute_batch_phases`, `native_executor.rs:10405`) takes the runs and the batch cache
+  straight into `Users` when L2.2's `runs_disjoint` proves them disjoint, else it runs the reference
+  `flush_with_runs` through the write-through. Main refuses aliased position rows on load (`73e8068d`), so step 2's
+  aliased-rows RED / fix (`091f0d3e`, `a12cd88b`, `keys_in_market`) are dropped.
+- 8k L2.1 (streamed settle, default on) ends in the same caches; nothing else to port.
+- Trading fees: `waive_unpaid_fees` and the treasury credit stay between the position and the balance flush; `cfee`
+  rows are raw rows of the balances CF and go through the write-through after the users lock is released.
+- Funding engine: v3 position rows; the drain and the before-images encode with `Position::encoded_len`.
+- Item 7 option 0 absorbs the EVM journal into the block overlay (`absorb_evm`, `backend.rs:2482`): the Task 2.3
+  guard counts the journal's typed rows just before it (`app.rs:5497`); the freeze's fold folds any such row into
+  `Users`.
+- Delist settlement and the funding writers write through the overlay: covered by the write-through (decision 3 a).
+- Row 8 / step 2 note: still holds. `EndResidentJob::run` (`native_executor.rs:5717`) takes the sums carry from the
+  drain's before-images (`Users::report_in_place`, `users.rs:1327`; r2 sorts the carry there, on the worker).
+- Test seams: `test_parallel_settle` / `test_parallel_settle_odd_heights` (from `091f0d3e`, without the aliased
+  seeding): the differential forces the parallel (streamed) settle on odd heights.
+
+**Drain encoding off the exec thread (risk 3's fallback).**
+- `Users::capture_dirty` (`users.rs:1042`, the exec thread, at the freeze, under the users write lock): empties the
+  dirty sets and reads each dirty key's row once, as a cloned value (an opaque trader's / a row under no trader as
+  bytes). No sort, no Borsh, no key / value allocation per row, no `BTreeMap` build. The carry moves as in step 2.
+- `DrainCapture::encode` (`users.rs:1445`): sorts by `(trader, market)`, encodes, merges with the raw runs: the same
+  rows as step 2's exec-thread drain (kept as the test reference `Users::drain_dirty_reference`).
+- `ResidentSource::drain_deferred` (torus-state) returns the encode as a job; `NativeStateOverlay::freeze`
+  (`backend.rs:2272`) puts it in the frozen set's `TypedPart` (`backend.rs:1093`): a `OnceLock` that the first reader
+  of positions / balances fills. Readers of other CFs (the next block's parent reads of nonces, oracle, markets, ...)
+  never run it. Pipelined, the first reader is the flush worker's digest or flush (`digest_on_worker`,
+  `flush_on_worker_after_batch`: the typed part is one more layer, disjoint CFs, under W's sidecar). E reads it first
+  only at a checkpoint close (`layer.merge(current)`), with a byte cap set, or at an R rebuild. The serial flush
+  encodes inline, as before.
+- Metrics: `torus_exec_users_drain_seconds` now times the capture only; new `torus_exec_users_drain_encode_seconds`
+  (per job, on the thread that ran it), `torus_exec_users_drain_encodes`, `torus_exec_users_drain_encode_inline`
+  (jobs that ran on the freezing thread).
+- No consensus change: rows, `h_n`, the native root and every CF are those of step 2 (tests below).
+
+**Tests.** RED `d2e3851c`, GREEN in the next commit:
+- `freeze_leaves_the_in_place_drain_to_its_first_reader` (torus-state): freeze runs no job; other-CF readers do not
+  run it; the first typed reader runs it once, on its own thread.
+- `deferred_typed_rows_read_as_eager_rows` (torus-state): every reader (rows, bytes, entry count, `touches_only`,
+  ingress slice, resident delta, lookups, parent reads, checkpoint merge, flush rows + marker + running hash) equals
+  the eager set; each runs the job once.
+- `drain_capture_encodes_off_thread_byte_identical` (torus-bridge): random mutations of every shape; the capture
+  serializes nothing on its thread; the encode on another thread equals the step 2 drain byte for byte; same carry
+  and record set.
+- Phase 5 differential (torus-consensus, 12 configurations, typed vs reference path): rows, `h_n` and dumps equal;
+  serial drains encode inline; pipelined drains mostly off the exec thread (`inline * 2 < jobs`).
 
 ### Step 3: book rows from a dirty set (Classic)
 

@@ -52,7 +52,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use alloy_primitives::map::{HashMap, HashSet};
 use std::ops::Bound;
@@ -1017,18 +1017,105 @@ impl Users {
     /// without draining.
     #[cfg(test)]
     pub(crate) fn dirty_preview(&self) -> DirtyRows {
-        let mut d = self.dirty.clone();
-        let mut ts: Vec<(Address, TraderDirty)> = std::mem::take(&mut d.traders).into_iter().collect();
-        self.drained_rows(&mut ts, &d.raw)
+        self.capture_from(self.dirty.clone()).0.encode()
     }
 
     /// Phase 5 step 1: every dirty key's row as the record set holds it now
     /// (a regular trader's encoded from its record, an opaque trader's and a
     /// row under no trader as bytes; absent: a tombstone), per CF in key
-    /// order; the dirty sets are left empty. Step 2: walks the dirty traders
-    /// in address order, each record read once; the positions keys' rows at
-    /// the block start move to the sums carry (`end_resident`).
+    /// order; the dirty sets are left empty. Step 2: the positions keys'
+    /// rows at the block start move to the sums carry (`end_resident`).
+    /// Step 2 r2: [`Self::capture_dirty`] and [`DrainCapture::encode`] on
+    /// the calling thread (tests; the node drains through [`SharedUsers`]).
+    #[cfg(test)]
     pub(crate) fn drain_dirty(&mut self) -> DirtyRows {
+        self.capture_dirty().encode()
+    }
+
+    /// Item 6 Phase 5 step 2 r2 (plan revisit: the drain encoding moves to
+    /// the flush worker): the execution thread's half of the drain, at the
+    /// block's freeze. Empties the dirty sets and reads each dirty key's row
+    /// once, as it is now: a regular trader's from its record (cloned
+    /// values), an opaque trader's and a row under no trader as bytes;
+    /// nothing is sorted or serialized here. The positions keys' rows at the
+    /// block start move to the sums carry, as in step 2.
+    pub(crate) fn capture_dirty(&mut self) -> DrainCapture {
+        let dirty = std::mem::take(&mut self.dirty);
+        let (capture, typed, raw_traders) = self.capture_from(dirty);
+        let carry = &mut self.carry;
+        carry.raw_traders.extend(raw_traders);
+        if carry.traders.is_empty() {
+            carry.traders = typed;
+        } else {
+            // A second drain before `end_resident` took the carry (never in
+            // the node's sequence): each key keeps its first row.
+            let mut all: BTreeMap<Address, Vec<(MarketId, Before)>> = std::mem::take(&mut carry.traders).into_iter().collect();
+            for (t, ps) in typed {
+                let have = all.entry(t).or_default();
+                for (m, b) in ps {
+                    if !have.iter().any(|(x, _)| *x == m) {
+                        have.push((m, b));
+                    }
+                }
+            }
+            carry.traders = all.into_iter().collect();
+        }
+        capture
+    }
+
+    /// [`Self::capture_dirty`] of the dirty sets `d`: the capture, the
+    /// carry's traders (with their changed markets' block-start rows; any
+    /// order) and the traders of `d`'s raw positions keys.
+    #[allow(clippy::type_complexity)]
+    fn capture_from(&self, d: Dirty) -> (DrainCapture, Vec<(Address, Vec<(MarketId, Before)>)>, Vec<Address>) {
+        let Dirty { traders, raw, keys } = d;
+        let mut cap = DrainCapture {
+            positions: Vec::with_capacity(keys),
+            balances: Vec::new(),
+            volumes: Vec::new(),
+            raw: [Vec::new(), Vec::new()],
+        };
+        let mut typed = Vec::with_capacity(traders.len());
+        for (t, d) in traders {
+            let opaque = self.opaque_of(&t);
+            let rec = if opaque.is_some() { None } else { self.map.get(&t) };
+            for (m, _) in &d.positions {
+                let row = match opaque {
+                    Some(r) => Captured::Raw(r.positions.get(position_key(&t, *m).as_slice()).cloned()),
+                    None => Captured::Typed(rec.and_then(|u| find(&u.positions, *m)).cloned()),
+                };
+                cap.positions.push((t, *m, row));
+            }
+            if d.balance {
+                let row = match opaque {
+                    Some(r) => Captured::Raw(r.balances.get(t.as_slice()).cloned()),
+                    None => Captured::Typed(rec.and_then(|u| u.balance.clone())),
+                };
+                cap.balances.push((t, row));
+            }
+            if d.volume {
+                let row = match opaque {
+                    Some(r) => Captured::Raw(r.balances.get(cum_volume_key(&t).as_slice()).cloned()),
+                    None => Captured::Typed(rec.and_then(|u| u.cum_volume)),
+                };
+                cap.volumes.push((t, row));
+            }
+            if !d.positions.is_empty() {
+                typed.push((t, d.positions));
+            }
+        }
+        for slot in [POSITIONS, BALANCES] {
+            cap.raw[slot] = raw[slot].keys().map(|k| (k.clone(), self.row(slot, k).map(|r| r.value().into_owned()))).collect();
+        }
+        let raw_traders = raw[POSITIONS].keys().filter(|k| k.len() >= TRADER).map(|k| Address::from_slice(&k[..TRADER])).collect();
+        (cap, typed, raw_traders)
+    }
+
+    /// Item 6 Phase 5 step 2 r2 (tests): the step 2 drain, serialized on the
+    /// calling thread while walking the record set (the reference of the
+    /// deferred encode).
+    #[cfg(test)]
+    pub(crate) fn drain_dirty_reference(&mut self) -> DirtyRows {
         let Dirty { traders, raw, .. } = std::mem::take(&mut self.dirty);
         let mut ts: Vec<(Address, TraderDirty)> = traders.into_iter().collect();
         let rows = self.drained_rows(&mut ts, &raw);
@@ -1057,6 +1144,7 @@ impl Users {
 
     /// The rows of the dirty traders `ts` (sorted here, and each one's
     /// markets) and of the raw keys `raw`, per CF in key order.
+    #[cfg(test)]
     fn drained_rows(&self, ts: &mut [(Address, TraderDirty)], raw: &[BTreeMap<Vec<u8>, Option<Vec<u8>>>; 2]) -> DirtyRows {
         ts.sort_unstable_by_key(|(t, _)| *t);
         let mut pos: Vec<DirtyRow> = Vec::with_capacity(ts.iter().map(|(_, d)| d.positions.len()).sum());
@@ -1237,7 +1325,14 @@ impl Users {
     /// has a record, is dropped: the record was re-decoded or has rows the
     /// carry cannot value).
     pub(crate) fn report_in_place(&mut self, seen: &mut Seen<'_>) {
-        let Carry { traders, raw_traders } = std::mem::take(&mut self.carry);
+        let Carry { mut traders, raw_traders } = std::mem::take(&mut self.carry);
+        // Step 2 r2: the capture leaves the carry unsorted (sorted here, on
+        // the `end_resident` worker): traders by address, each one's
+        // markets ascending.
+        traders.sort_unstable_by_key(|(t, _)| *t);
+        for (_, ps) in &mut traders {
+            ps.sort_unstable_by_key(|(m, _)| *m);
+        }
         let mut raw_only: Vec<Address> =
             raw_traders.iter().filter(|t| traders.binary_search_by_key(*t, |(x, _)| *x).is_err()).copied().collect();
         raw_only.sort_unstable();
@@ -1295,38 +1390,83 @@ impl Users {
     }
 }
 
+/// Item 6 Phase 5 step 2 r2: one captured row: a regular trader's value
+/// (`None`: no row, a tombstone) or raw bytes (an opaque trader's).
+#[derive(Debug)]
+enum Captured<T> {
+    Typed(Option<T>),
+    Raw(Option<Vec<u8>>),
+}
+
+impl<T> Captured<T> {
+    /// The row's bytes (`None`: a tombstone), `enc` serializing a value.
+    #[inline]
+    fn bytes(self, enc: impl FnOnce(&T) -> Vec<u8>) -> Option<Vec<u8>> {
+        let (v, raw) = match self {
+            Self::Typed(v) => (v.as_ref().map(enc), false),
+            Self::Raw(v) => (v, true),
+        };
+        #[cfg(test)]
+        if v.is_some() {
+            count_drained(raw);
+        }
+        let _ = raw;
+        v
+    }
+}
+
 /// Item 6 Phase 5 step 2 r2 (plan revisit: the drain encoding moves to the
-/// flush worker): a block's drain taken at its freeze by
-/// [`Users::capture_dirty`], serialized by [`Self::encode`] on another
-/// thread. RED stub: the capture still serializes.
+/// flush worker, bench section 91.4): a block's drain taken at its freeze by
+/// [`Users::capture_dirty`] (the execution thread: one record read per dirty
+/// trader, values cloned) and serialized by [`Self::encode`] on whichever
+/// thread reads the frozen set's positions and balances first (pipelined:
+/// the flush worker). Owns everything it needs: no lock of the record set.
 #[derive(Debug)]
 pub(crate) struct DrainCapture {
-    rows: DirtyRows,
+    /// Dirty positions keys (any order) and their rows now.
+    positions: Vec<(Address, MarketId, Captured<Position>)>,
+    /// Dirty balance rows and `cvlm` rows, per trader (any order).
+    balances: Vec<(Address, Captured<NativeBalance>)>,
+    volumes: Vec<(Address, Captured<FixedPoint>)>,
+    /// Dirty keys under no trader shape, per slot, key-sorted, as bytes.
+    raw: [Vec<DirtyRow>; 2],
 }
 
 impl DrainCapture {
     /// Rows the encode emits (one per dirty key).
     pub(crate) fn rows(&self) -> usize {
-        self.rows.positions.len() + self.rows.balances.len()
+        self.positions.len() + self.balances.len() + self.volumes.len() + self.raw.iter().map(Vec::len).sum::<usize>()
     }
 
-    /// The drain's rows, as [`Users::drain_dirty`] returns them.
+    /// The drain's rows, per CF in key order, each dirty key once: exactly
+    /// what step 2's exec-thread drain emitted for the same record set
+    /// (`Users::drain_dirty_reference`, the r2 test). Fixed-size keys sort
+    /// as `(trader, market)` (a positions key is `t ‖ m` big-endian).
     pub(crate) fn encode(self) -> DirtyRows {
-        self.rows
-    }
-}
-
-impl Users {
-    /// Item 6 Phase 5 step 2 r2: the exec thread's half of the drain.
-    pub(crate) fn capture_dirty(&mut self) -> DrainCapture {
-        DrainCapture { rows: self.drain_dirty() }
-    }
-
-    /// Item 6 Phase 5 step 2 r2 (tests): the step 2 drain, serialized on
-    /// the calling thread (the reference of the deferred encode).
-    #[cfg(test)]
-    pub(crate) fn drain_dirty_reference(&mut self) -> DirtyRows {
-        self.drain_dirty()
+        let DrainCapture { mut positions, mut balances, mut volumes, raw: [raw_pos, raw_bal] } = self;
+        positions.sort_unstable_by_key(|(t, m, _)| (*t, *m));
+        balances.sort_unstable_by_key(|(t, _)| *t);
+        volumes.sort_unstable_by_key(|(t, _)| *t);
+        let pos: Vec<DirtyRow> = positions
+            .into_iter()
+            .map(|(t, m, row)| (position_key(&t, m).to_vec(), row.bytes(|p| encode(p, p.encoded_len()))))
+            .collect();
+        let bal: Vec<DirtyRow> =
+            balances.into_iter().map(|(t, row)| (t.to_vec(), row.bytes(|b| encode(b, BALANCE_LEN)))).collect();
+        let vol: Vec<DirtyRow> = volumes
+            .into_iter()
+            .map(|(t, row)| (cum_volume_key(&t).to_vec(), row.bytes(|v| v.raw().to_be_bytes().to_vec())))
+            .collect();
+        #[cfg(test)]
+        for (_, v) in raw_pos.iter().chain(raw_bal.iter()) {
+            if v.is_some() {
+                count_drained(true);
+            }
+        }
+        DirtyRows {
+            positions: merge_runs(vec![pos, raw_pos], |(k, _)| k.as_slice()),
+            balances: merge_runs(vec![bal, vol, raw_bal], |(k, _)| k.as_slice()),
+        }
     }
 }
 
@@ -1500,14 +1640,32 @@ pub(crate) struct SharedUsers {
     users: RwLock<Users>,
     in_place: bool,
     /// The last drain's rows and nanoseconds, taken by `end_resident` (the
-    /// drain metrics and the holder's count).
+    /// drain metrics and the holder's count). Step 2 r2: the capture's time
+    /// (the execution thread's half).
     drained: AtomicU64,
     drain_ns: AtomicU64,
+    /// Step 2 r2: the encode jobs' metrics (set by `begin_resident`; the
+    /// jobs run on the frozen set's first reader, the flush worker).
+    encode_metrics: Arc<OnceLock<EncodeMetrics>>,
+}
+
+/// Item 6 Phase 5 step 2 r2: what a drain encode job observes.
+#[derive(Debug)]
+struct EncodeMetrics {
+    seconds: torus_telemetry::Histogram,
+    jobs: torus_telemetry::Counter,
+    inline: torus_telemetry::Counter,
 }
 
 impl SharedUsers {
     pub(crate) fn new(users: Users, in_place: bool) -> Self {
-        Self { users: RwLock::new(users), in_place, drained: AtomicU64::new(0), drain_ns: AtomicU64::new(0) }
+        Self {
+            users: RwLock::new(users),
+            in_place,
+            drained: AtomicU64::new(0),
+            drain_ns: AtomicU64::new(0),
+            encode_metrics: Arc::default(),
+        }
     }
 
     /// Read access (a panic under the write lock poisons it: the block
@@ -1532,6 +1690,15 @@ impl SharedUsers {
     #[inline]
     pub(crate) fn in_place(&self) -> bool {
         self.in_place
+    }
+
+    /// Step 2 r2: the drain encode jobs' metrics, from `m` (first call wins).
+    pub(crate) fn set_encode_metrics(&self, m: &torus_telemetry::Metrics) {
+        let _ = self.encode_metrics.set(EncodeMetrics {
+            seconds: m.exec_users_drain_encode_seconds.clone(),
+            jobs: m.exec_users_drain_encodes.clone(),
+            inline: m.exec_users_drain_encode_inline.clone(),
+        });
     }
 
     /// The last drain's rows and seconds since the last call (0 after).
@@ -1673,12 +1840,33 @@ impl ResidentSource for SharedUsers {
     }
 
     fn drain(&self) -> [SourceRows; SOURCE_SLOTS] {
+        self.drain_deferred()()
+    }
+
+    /// Step 2 r2 (plan revisit: the drain encoding moves to the flush
+    /// worker): the capture under the write lock now (the dirty sets
+    /// emptied, each dirty row read once), the encode in the returned job
+    /// (no lock: it owns the capture). The drain timer covers the capture;
+    /// the job observes its own time and whether it ran on this thread.
+    fn drain_deferred(&self) -> torus_state::SourceDrain {
         let timer = std::time::Instant::now();
-        let rows = self.write().drain_dirty();
-        let n = (rows.positions.len() + rows.balances.len()) as u64;
-        self.drained.fetch_add(n, Ordering::Relaxed);
+        let capture = self.write().capture_dirty();
+        self.drained.fetch_add(capture.rows() as u64, Ordering::Relaxed);
         self.drain_ns.fetch_add(timer.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        [rows.positions, rows.balances]
+        let metrics = self.encode_metrics.clone();
+        let freezer = std::thread::current().id();
+        Box::new(move || {
+            let timer = std::time::Instant::now();
+            let rows = capture.encode();
+            if let Some(m) = metrics.get() {
+                m.seconds.observe(timer.elapsed().as_secs_f64());
+                m.jobs.inc();
+                if std::thread::current().id() == freezer {
+                    m.inline.inc();
+                }
+            }
+            [rows.positions, rows.balances]
+        })
     }
 }
 

@@ -192,11 +192,13 @@ impl ReadView {
     }
 
     /// The layers, newest first.
-    fn lower(&self) -> Vec<Option<&PendingState>> {
+    /// Item 6 Phase 5 r2: per CF `id` (a frozen set's positions and
+    /// balances may sit in its typed part, [`FrozenPending::state_for`]).
+    fn lower(&self, id: CfId) -> Vec<Option<&PendingState>> {
         self.layers
             .blocks
             .iter()
-            .map(|b| Some(b.pending_state()))
+            .map(|b| Some(b.state_for(id)))
             .chain(std::iter::once(
                 self.layers.inflight.as_deref().map(|c| c.pending_state()),
             ))
@@ -207,7 +209,7 @@ impl ReadView {
 impl StateBackend for ReadView {
     fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
         if let Some(id) = self.layered(cf) {
-            for layer in self.lower().into_iter().flatten() {
+            for layer in self.lower(id).into_iter().flatten() {
                 if let Some(hit) = layer.lookup(id, key) {
                     return Ok(hit.map(<[u8]>::to_vec));
                 }
@@ -238,7 +240,7 @@ impl StateBackend for ReadView {
             return Ok(db_entries);
         };
         let p = prefix.unwrap_or(&[]);
-        let lower = self.lower();
+        let lower = self.lower(id);
         if !lower.iter().flatten().any(|s| s.touches(id, p)) {
             return Ok(db_entries);
         }
@@ -272,12 +274,12 @@ impl StateBackend for ReadView {
                 rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
             )
             .map(|item| item.map_err(StateError::from));
-        merge_from(&PendingState::new(), &self.lower(), id, start, limit, dbi)
+        merge_from(&PendingState::new(), &self.lower(id), id, start, limit, dbi)
     }
 
     fn get_cf_len(&self, cf: &str, key: &[u8]) -> Result<Option<usize>, StateError> {
         if let Some(id) = self.layered(cf) {
-            for layer in self.lower().into_iter().flatten() {
+            for layer in self.lower(id).into_iter().flatten() {
                 if let Some(hit) = layer.lookup(id, key) {
                     return Ok(hit.map(<[u8]>::len));
                 }
@@ -310,7 +312,7 @@ impl StateBackend for ReadView {
                 rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
             )
             .map(|item| item.map_err(StateError::from));
-        merge_from(&PendingState::new(), &self.lower(), id, start, limit, dbi).map(|rows| {
+        merge_from(&PendingState::new(), &self.lower(id), id, start, limit, dbi).map(|rows| {
             rows.into_iter()
                 .take_while(|(k, _)| k.starts_with(prefix))
                 .collect()
@@ -321,7 +323,7 @@ impl StateBackend for ReadView {
         let Some(id) = self.layered(cf) else {
             return StateBackend::prefix_exists(&self.db, cf, prefix);
         };
-        let lower = self.lower();
+        let lower = self.lower(id);
         let live = |key: &[u8]| -> bool {
             match lower.iter().flatten().find_map(|s| s.lookup(id, key)) {
                 Some(hit) => hit.is_some(),

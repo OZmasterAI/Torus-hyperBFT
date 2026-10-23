@@ -1068,13 +1068,65 @@ impl Drop for OutOfBatchRecorder {
 ///   layered read of an already-durable set returns the same bytes the DB does,
 ///   so the layering is timing-independent.
 ///
-/// Read-only after construction: `Sync` by construction (no interior mutability).
+/// Read-only after construction, but for [`TypedPart`] (Item 6 Phase 5
+/// step 2 r2): an in-place source's rows of the block, serialized once by
+/// their first reader behind a `OnceLock` (`Sync`).
 pub struct FrozenPending {
     height: u64,
     state: PendingState,
+    /// Item 6 Phase 5 step 2 r2: the in-place source's rows of the block
+    /// (positions, balances), taken at the freeze and serialized by their
+    /// first reader (pipelined: the flush worker's digest / flush). `state`
+    /// holds no key of those CFs then. `None`: every row is in `state`.
+    typed: Option<Box<TypedPart>>,
     /// Item 6 Phase 3 (s114): this set's share of the exec context's
     /// retention gauges, once attached ([`FrozenPending::track`]).
     tracked: OnceLock<crate::retention::Tracked>,
+}
+
+/// Item 6 Phase 5 step 2 r2 (plan revisit: the drain encoding moves to the
+/// flush worker): a frozen set's rows of the in-place source's CFs, taken
+/// at the freeze ([`ResidentSource::drain_deferred`]) and serialized on
+/// first use, by whichever thread reads them first; every other reader
+/// waits for that one (`OnceLock`) and then shares the result. The job runs
+/// no lock of the overlay or the source (it owns what the freeze took).
+struct TypedPart {
+    rows: OnceLock<PendingState>,
+    job: std::sync::Mutex<Option<crate::resident_rows::SourceDrain>>,
+}
+
+impl TypedPart {
+    fn new(job: crate::resident_rows::SourceDrain) -> Self {
+        Self {
+            rows: OnceLock::new(),
+            job: std::sync::Mutex::new(Some(job)),
+        }
+    }
+
+    /// The rows (only the source's CFs filled), serialized now if no reader
+    /// did yet.
+    fn get(&self) -> &PendingState {
+        self.rows.get_or_init(|| {
+            let job = self
+                .job
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .expect("item 6 Phase 5: a frozen set's drain job runs once (an earlier run panicked)");
+            let mut state = PendingState::new();
+            for (cf, rows) in RESIDENT_CFS.iter().zip(job()) {
+                state.put_rows(intern_cf(cf).expect("resident CF is registered"), rows);
+            }
+            state
+        })
+    }
+}
+
+/// Item 6 Phase 5 step 2 r2: CF `id` is one of an in-place source's CFs
+/// (R's slots below [`SOURCE_SLOTS`]: positions, balances).
+#[inline]
+fn is_source_cf(id: CfId) -> bool {
+    resident_slot_of(id).is_some_and(|s| s < SOURCE_SLOTS)
 }
 
 /// R's CFs' writes and tombstones in `state`, key-sorted ([`ResidentDelta`]).
@@ -1096,9 +1148,66 @@ fn resident_delta_from(state: &PendingState, first: usize) -> ResidentDelta {
 }
 
 impl FrozenPending {
-    /// The frozen pending set (crate-internal: the checkpoint layer merges it).
-    pub(crate) fn pending_state(&self) -> &PendingState {
-        &self.state
+    /// The pending set holding CF `id`'s rows (crate-internal: per-CF
+    /// readers, the checkpoint layer merge, the ingress view). Phase 5 r2:
+    /// for an in-place source's CF with deferred rows, the typed part
+    /// (serialized here if no reader did yet); else the set's own.
+    #[inline]
+    pub(crate) fn state_for(&self, id: CfId) -> &PendingState {
+        match &self.typed {
+            Some(t) if is_source_cf(id) => t.get(),
+            _ => &self.state,
+        }
+    }
+
+    /// CF slot `i`'s rows (as [`Self::state_for`]; the checkpoint layer
+    /// merge walks the slots).
+    #[inline]
+    pub(crate) fn cf_at(&self, i: usize) -> &CfPending {
+        let id = CfId(i as u8);
+        self.state_for(id).cf(id)
+    }
+
+    /// The set's pending sets: its own, then the typed part (serialized
+    /// here if no reader did yet). Disjoint CFs.
+    fn parts(&self) -> impl Iterator<Item = &PendingState> {
+        std::iter::once(&self.state).chain(self.typed.as_deref().map(TypedPart::get))
+    }
+
+    /// Item 6 Phase 5 step 2 r2: serialize the typed part now if no reader
+    /// did yet (no-op otherwise). The flush worker calls it first thing for
+    /// each block, so later readers find the rows ready.
+    pub fn finish_typed(&self) {
+        if let Some(t) = &self.typed {
+            t.get();
+        }
+    }
+
+    /// Item 6 Phase 5 step 2 r2 (`&mut self` writers): the typed part's rows
+    /// moved into the set's own maps (serialized first if needed).
+    fn settle_typed(&mut self) {
+        if let Some(t) = self.typed.take() {
+            t.get();
+            let rows = t.rows.into_inner().expect("serialized above");
+            for (dst, src) in self.state.cfs.iter_mut().zip(rows.cfs) {
+                if !src.is_empty() {
+                    debug_assert!(dst.is_empty(), "the typed part's CFs are not in the set's own maps");
+                    *dst = src;
+                }
+            }
+        }
+    }
+
+    /// R's CFs' rows from slot `first` on, key-sorted (the slots below empty).
+    fn resident_delta_parts(&self, first: usize) -> ResidentDelta {
+        let mut delta = ResidentDelta::default();
+        for (slot, cf) in RESIDENT_CFS.iter().enumerate().skip(first) {
+            let id = intern_cf(cf).expect("resident CF is registered");
+            delta.cfs[slot] = cf_stream(self.state_for(id).cf(id))
+                .map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec)))
+                .collect();
+        }
+        delta
     }
 
     /// The block height whose post-state this set completes.
@@ -1108,9 +1217,9 @@ impl FrozenPending {
 
     /// Item 6 Phase 5 step 2 r2: the set's rows of an in-place source's CFs
     /// (positions, balances) are taken but not serialized yet (the first
-    /// reader of those CFs serializes them). Not built yet (RED stub).
+    /// reader of those CFs serializes them).
     pub fn typed_pending(&self) -> bool {
-        false
+        self.typed.as_ref().is_some_and(|t| t.rows.get().is_none())
     }
 
     /// Item 6 Phase 3 (s114): count this set against `stats` until it is
@@ -1139,9 +1248,8 @@ impl FrozenPending {
     /// extras excluded, as the layer excludes them). Merging this set into a
     /// layer grows it by at most this much (the byte cap's estimate).
     pub fn state_bytes(&self) -> usize {
-        self.state
-            .cfs
-            .iter()
+        self.parts()
+            .flat_map(|s| s.cfs.iter())
             .map(|c| {
                 c.writes
                     .iter()
@@ -1160,13 +1268,14 @@ impl FrozenPending {
     pub fn slice(&self, cfs: &[&str]) -> FrozenPending {
         let mut state = PendingState::new();
         for id in cfs.iter().filter_map(|cf| intern_cf(cf)) {
-            let (dst, src) = (&mut state.cfs[id.0 as usize], self.state.cf(id));
+            let (dst, src) = (&mut state.cfs[id.0 as usize], self.state_for(id).cf(id));
             dst.writes.clone_from(&src.writes);
             dst.deletes.clone_from(&src.deletes);
         }
         let out = FrozenPending {
             height: self.height,
             state,
+            typed: None,
             tracked: OnceLock::new(),
         };
         if let Some(t) = self.tracked.get() {
@@ -1184,11 +1293,12 @@ impl FrozenPending {
     /// (hash extras excluded).
     pub fn touches_only(&self, cfs: &[&str]) -> bool {
         let keep: Vec<CfId> = cfs.iter().filter_map(|cf| intern_cf(cf)).collect();
-        self.state
-            .cfs
-            .iter()
-            .enumerate()
-            .all(|(i, c)| c.is_empty() || keep.contains(&CfId(i as u8)))
+        self.parts().all(|s| {
+            s.cfs
+                .iter()
+                .enumerate()
+                .all(|(i, c)| c.is_empty() || keep.contains(&CfId(i as u8)))
+        })
     }
 
     /// Item 6 cut 5: the frozen block's own writes and tombstones of R's
@@ -1197,14 +1307,14 @@ impl FrozenPending {
     /// here unchanged; only its journal and checkpoints are cleared). Lets
     /// the end-of-block upkeep take it off the execution thread.
     pub fn resident_delta(&self) -> ResidentDelta {
-        resident_delta_of(&self.state)
+        self.resident_delta_parts(0)
     }
 
     /// Item 6 Phase 5 step 2: [`Self::resident_delta`] of R's raw CFs only
     /// (liquidation, oracle, markets): an in-place source already holds the
     /// block's positions and balances, so `end_resident` copies none of them.
     pub fn resident_delta_raw(&self) -> ResidentDelta {
-        resident_delta_from(&self.state, SOURCE_SLOTS)
+        self.resident_delta_parts(SOURCE_SLOTS)
     }
 
     /// A 1-key frozen set holding only the native applied-height marker
@@ -1223,6 +1333,7 @@ impl FrozenPending {
         Self {
             height,
             state,
+            typed: None,
             tracked: OnceLock::new(),
         }
     }
@@ -1242,6 +1353,9 @@ impl FrozenPending {
             return self;
         }
         let id = intern_cf(cf).expect("with_deletes: CF is registered");
+        if is_source_cf(id) {
+            self.settle_typed();
+        }
         let cfp = self.state.cf_mut(id);
         for key in keys {
             cfp.writes.remove(key.as_slice());
@@ -1262,6 +1376,9 @@ impl FrozenPending {
         rows: impl IntoIterator<Item = (Vec<u8>, Option<Vec<u8>>)>,
     ) {
         let id = intern_cf(cf).expect("put_rows: CF is registered");
+        if is_source_cf(id) {
+            self.settle_typed();
+        }
         self.state.put_rows(id, rows);
     }
 
@@ -1271,7 +1388,7 @@ impl FrozenPending {
     #[cfg(any(test, feature = "test-reference-paths"))]
     pub fn rows(&self, cf: &str) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
         intern_cf(cf).map_or_else(Vec::new, |id| {
-            cf_stream(self.state.cf(id))
+            cf_stream(self.state_for(id).cf(id))
                 .map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec)))
                 .collect()
         })
@@ -1282,14 +1399,13 @@ impl FrozenPending {
     /// (or an unregistered CF). Hash extras excluded.
     pub fn lookup_row(&self, cf: &str, key: &[u8]) -> Option<Option<Vec<u8>>> {
         let id = intern_cf(cf)?;
-        self.state.lookup(id, key).map(|v| v.map(<[u8]>::to_vec))
+        self.state_for(id).lookup(id, key).map(|v| v.map(<[u8]>::to_vec))
     }
 
     /// Number of pending writes + tombstones in this set.
     pub fn entry_count(&self) -> usize {
-        self.state
-            .cfs
-            .iter()
+        self.parts()
+            .flat_map(|s| s.cfs.iter())
             .map(|c| c.writes.len() + c.deletes.len())
             .sum()
     }
@@ -1327,10 +1443,11 @@ impl FrozenPending {
         trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
         member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
     ) -> Result<NativeFlushStats, StateError> {
+        let typed: Vec<&PendingState> = self.parts().skip(1).collect();
         flush_pending_after_batch(
             prefix,
             &self.state,
-            None,
+            &typed,
             target,
             applied_height,
             trie_cache,
@@ -1408,10 +1525,17 @@ impl FrozenPending {
         member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
         memo: Option<&mut crate::running_hash::ChainMemo>,
     ) -> Result<NativeFlushStats, StateError> {
+        // Phase 5 r2: the typed part, then the sidecar's sets (the sidecar
+        // last: it wins per key, as before).
+        let sides: Vec<&PendingState> = self
+            .parts()
+            .skip(1)
+            .chain(sidecar.into_iter().flat_map(FrozenPending::parts))
+            .collect();
         flush_pending_after_batch(
             prefix,
             &self.state,
-            sidecar.map(|s| &s.state),
+            &sides,
             target,
             applied_height,
             trie_cache,
@@ -1445,8 +1569,9 @@ impl FrozenPending {
             ChainStep::Start | ChainStep::Continue(_) => {
                 let mut layers: Vec<&PendingState> = Vec::with_capacity(3);
                 layers.extend(self.state.hash_extras.as_deref());
-                layers.push(&self.state);
-                layers.extend(sidecar.map(|s| &s.state));
+                // Phase 5 r2: the typed part (disjoint CFs), then the sidecar.
+                layers.extend(self.parts());
+                layers.extend(sidecar.into_iter().flat_map(FrozenPending::parts));
                 let books =
                     crate::running_hash::books_hashed_for(target, memo.book_window(), height);
                 let (digest, capture, secs) = block_digest(&layers, books);
@@ -1666,7 +1791,7 @@ impl NativeStateOverlay {
     #[inline]
     fn lower(&self, id: CfId) -> Result<[Option<&PendingState>; 3], StateError> {
         Ok([
-            self.parent_for_reads().map(|p| &p.state),
+            self.parent_for_reads().map(|p| p.state_for(id)),
             self.layer_for(id)?,
             self.inflight_for_reads().map(|c| c.pending_state()),
         ])
@@ -1737,7 +1862,7 @@ impl NativeStateOverlay {
     ) -> Result<Option<Option<&[u8]>>, StateError> {
         if let Some(hit) = self
             .parent_for_reads()
-            .and_then(|p| p.state.lookup(id, key))
+            .and_then(|p| p.state_for(id).lookup(id, key))
         {
             #[cfg(feature = "test-probes")]
             self.probe_point::<LEN>(id, key, crate::probes::Layer::Parent, hit);
@@ -2140,8 +2265,10 @@ impl NativeStateOverlay {
     ///
     /// Item 6 Phase 5 step 2: with an in-place source, the block's rows of
     /// positions and balances are drained from it into the frozen set here
-    /// (each changed key once, serialized once), after its pending rows of
-    /// those CFs (if any) were folded into it.
+    /// (each changed key once), after its pending rows of those CFs (if any)
+    /// were folded into it. Step 2 r2: taken here, serialized by the frozen
+    /// set's first reader of those CFs ([`TypedPart`]; pipelined: the flush
+    /// worker), not on this thread.
     pub fn freeze(&self, height: u64) -> Arc<FrozenPending> {
         let mut guard = self.pending.write().unwrap();
         self.fold_in_place_locked(&mut guard, true);
@@ -2150,10 +2277,17 @@ impl NativeStateOverlay {
         state.journal_log.clear();
         state.checkpoints.clear();
         state.frozen = false;
-        self.drain_in_place_into(&mut state);
+        // Phase 5 step 2 r2 (plan revisit): the source's rows of the block
+        // are taken here (its dirty sets emptied, each row read once) and
+        // serialized by the set's first reader of the two CFs, off this
+        // thread when pipelined (the flush worker), see [`TypedPart`].
+        let typed = self
+            .in_place_source()
+            .map(|source| Box::new(TypedPart::new(source.drain_deferred())));
         Arc::new(FrozenPending {
             height,
             state,
+            typed,
             tracked: OnceLock::new(),
         })
     }
@@ -2595,7 +2729,7 @@ impl NativeStateOverlay {
         flush_pending_after_batch(
             prefix,
             &state,
-            drained.as_ref(),
+            drained.as_ref().as_slice(),
             target,
             applied_height,
             trie_cache,
@@ -2611,18 +2745,24 @@ impl NativeStateOverlay {
 /// keys of the merged [`PendingState::native_dirty_ref`] maps: a CF's writes and
 /// deletes are disjoint by invariant, and a sidecar key already in the main set is
 /// counted once.
-fn native_dirty_counts(state: &PendingState, sidecar: Option<&PendingState>) -> [usize; 7] {
+fn native_dirty_counts(state: &PendingState, sidecars: &[&PendingState]) -> [usize; 7] {
     let mut counts = [0usize; 7];
     for (idx, cfp) in state.cfs.iter().enumerate() {
         let Some(tag) = crate::native_trie::cf_tag(CfId(idx as u8).name()) else {
             continue;
         };
         let mut n = cfp.writes.len() + cfp.deletes.len();
-        if let Some(side) = sidecar {
+        // Each sidecar's keys in neither the main set nor an earlier sidecar
+        // (Phase 5 r2: the typed part and W's sidecar; disjoint CFs).
+        for (i, side) in sidecars.iter().enumerate() {
             let sp = &side.cfs[idx];
-            let in_main = |k: &Vec<u8>| cfp.writes.contains_key(k) || cfp.deletes.contains(k);
-            n += sp.writes.keys().filter(|k| !in_main(k)).count();
-            n += sp.deletes.iter().filter(|k| !in_main(k)).count();
+            let earlier = |k: &Vec<u8>| {
+                std::iter::once(cfp)
+                    .chain(sidecars[..i].iter().map(|e| &e.cfs[idx]))
+                    .any(|c| c.writes.contains_key(k) || c.deletes.contains(k))
+            };
+            n += sp.writes.keys().filter(|k| !earlier(k)).count();
+            n += sp.deletes.iter().filter(|k| !earlier(k)).count();
         }
         if let Some(slot) = counts.get_mut(tag as usize) {
             *slot += n;
@@ -2690,7 +2830,7 @@ fn flush_pending_with_native_trie_stats(
     flush_pending_after_batch(
         WriteBatch::default(),
         state,
-        sidecar,
+        sidecar.as_slice(),
         target,
         applied_height,
         trie_cache,
@@ -2716,7 +2856,7 @@ pub(crate) fn flush_checkpoint_batch(
     flush_pending_after_batch(
         prefix,
         state,
-        side,
+        side.as_slice(),
         target,
         Some(height),
         trie_cache,
@@ -2732,7 +2872,7 @@ pub(crate) fn flush_checkpoint_batch(
 fn flush_pending_after_batch(
     prefix: WriteBatch,
     state: &PendingState,
-    sidecar: Option<&PendingState>,
+    sidecars: &[&PendingState],
     target: &StateDb,
     applied_height: Option<u64>,
     trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
@@ -2786,7 +2926,7 @@ fn flush_pending_after_batch(
             let mut layers: Vec<&PendingState> = Vec::with_capacity(3);
             layers.extend(state.hash_extras.as_deref());
             layers.push(state);
-            layers.extend(sidecar);
+            layers.extend(sidecars.iter().copied());
             let entries: usize = layers
                 .iter()
                 .flat_map(|l| l.cfs.iter())
@@ -2806,7 +2946,7 @@ fn flush_pending_after_batch(
         // Deferred book save: the sidecar (worker-side book writes) joins the
         // SAME atomic batch, appended after the main set (last-wins on the — in
         // practice disjoint — key sets).
-        if let Some(side) = sidecar {
+        for side in sidecars {
             side.append_to_batch(raw, &mut batch)?;
         }
 
@@ -2820,7 +2960,7 @@ fn flush_pending_after_batch(
             // Deferred book save: the sidecar's root-CF entries enter the ROOT
             // computation exactly as if the exec thread had written them into its
             // overlay (same canonical (tag, key) order — BTreeMap merge).
-            if let Some(side) = sidecar {
+            for side in sidecars {
                 dirty.extend(side.native_dirty_ref());
             }
             dirty
@@ -2871,7 +3011,7 @@ fn flush_pending_after_batch(
                     }
                 }
             }
-            None => stats.dirty_entries_by_cf = native_dirty_counts(state, sidecar),
+            None => stats.dirty_entries_by_cf = native_dirty_counts(state, sidecars),
         }
         let has_native_writes = stats.dirty_entries_by_cf.iter().any(|&n| n > 0);
         let trie_result = if !has_native_writes {
@@ -3019,14 +3159,14 @@ fn flush_pending_after_batch(
         // s89 fix B: the batch is durable; if it pruned oracle submissions,
         // compact their range off this thread (node-local, never fails here).
         if state.deletes_oracle_submissions()
-            || sidecar.is_some_and(PendingState::deletes_oracle_submissions)
+            || sidecars.iter().any(|s| s.deletes_oracle_submissions())
         {
             target.compact_pruned_submissions_in_background();
         }
         // s99 (c): count the deleted book rows per market; a market that
         // reaches the threshold gets its span compacted off this thread.
         for (cf, prefix_len) in crate::cf::READER_SCANNED_CFS {
-            for layer in std::iter::once(&*state).chain(sidecar) {
+            for layer in std::iter::once(&*state).chain(sidecars.iter().copied()) {
                 for (prefix, n, first, last) in layer.delete_groups(cf, prefix_len) {
                     target.note_scanned_deletes(cf, prefix, n, first, last);
                 }
