@@ -374,6 +374,32 @@ fn exclusion_keeps_voting_power_and_quorum() {
     assert_eq!(vs.leader_eligible_power().int(), 4);
 }
 
+/// Codex batch C P2: the abstract array's length is a u128 (powers are u64, their sum is not).
+/// Narrowing it to u64 for the modulo made a valid set panic with a zero divisor: powers
+/// `[u64::MAX - 1, 2, 1]` (total 2^64 + 2), and excluding the stake-1 validator leaves an
+/// eligible power of exactly 2^64. Also a set whose total power is exactly 2^64. Every view must
+/// select a member of the array.
+#[test]
+fn select_leader_takes_an_array_length_above_u64() {
+    let mut rng = StdRng::seed_from_u64(12);
+    let (base, keys) = build(&mut rng, &[u64::MAX - 1, 2, 1]);
+    let mut vs = base.clone();
+    vs.exclude_leader(&keys[2]);
+    assert!(vs.leader_exclusion_active(), "fixture: eligible power 2^64 reaches a quorum");
+    assert_eq!(eligible_power(&vs), 1u128 << 64, "fixture");
+    for view in [0, 1, 2, 3, u64::MAX - 2, u64::MAX - 1, u64::MAX] {
+        let leader = select_leader(ViewNumber::new(view), &vs);
+        assert!(leader == keys[0] || leader == keys[1], "view {view}: the excluded validator leads");
+        let _ = select_leader(ViewNumber::new(view), &base);
+    }
+
+    let (exact, _) = build(&mut rng, &[1u64 << 63, 1u64 << 63]);
+    assert_eq!(exact.total_power().int(), 1u128 << 64, "fixture");
+    for view in [0, 1, u64::MAX] {
+        let _ = select_leader(ViewNumber::new(view), &exact);
+    }
+}
+
 /// B3 reputation weighting (off by default) keeps the exclusions: the adjusted set it builds must
 /// carry them, or turning it on would bring excluded leaders back.
 #[test]
