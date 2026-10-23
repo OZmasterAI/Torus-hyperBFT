@@ -145,7 +145,7 @@ fn decide_nudge_from_the_leader_the_update_installs_is_voted_on() {
             tree
         })
         .collect();
-    let mut deliver = |trees: &mut Vec<BlockTreeSingleton<MemKV>>, only: &[usize], view: u64, msg: HotStuffMessage, origin: VerifyingKey| {
+    let deliver = |trees: &mut Vec<BlockTreeSingleton<MemKV>>, only: &[usize], view: u64, msg: HotStuffMessage, origin: VerifyingKey| {
         let mut votes = Vec::new();
         for &i in only {
             let cast = run(&mut trees[i], &live[i], view, msg.clone(), &origin);
@@ -273,3 +273,4 @@ fn commit_nudge_from_a_non_leader_is_still_dropped() {
     let votes = cast(vp + 3, nudge(vp + 3, &commit), impostor);
     assert!(votes.is_empty(), "a nudge from a validator that leads vp + 3 in neither set is dropped: {} votes", votes.len());
 }
+
