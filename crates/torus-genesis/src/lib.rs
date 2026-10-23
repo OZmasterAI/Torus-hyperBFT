@@ -1585,18 +1585,25 @@ mod tests {
         assert_eq!(keys, expected, "the hotstuff genesis set");
     }
 
-    /// Dead-leader skip (owner s134): K and the j cap are genesis parameters, defaults 3 and 6
-    /// when absent, mapped to the chain config; out-of-range values refuse the genesis
+    /// Dead-leader skip (owner s134): K and the j cap are genesis parameters, defaults 0 (off,
+    /// owner s138) and 6 when absent, mapped to the chain config; out-of-range values refuse the genesis
     /// (K: 0 = off or 2..=64; cap: 0..=10).
     #[test]
     fn genesis_dead_leader_params_default_and_range_check() {
         let genesis = Genesis::from_json(&sample_genesis_json()).unwrap();
-        assert_eq!(genesis.consensus.leader_miss_threshold, 3);
+        assert!(
+            !sample_genesis_json().contains("leader_miss_threshold"),
+            "fixture: K absent"
+        );
+        assert_eq!(
+            genesis.consensus.leader_miss_threshold, 0,
+            "absent K: off (owner s138)"
+        );
         assert_eq!(genesis.consensus.leader_exclusion_cap, 6);
         let config = genesis.chain_config();
         assert_eq!(
             (config.leader_miss_threshold, config.leader_exclusion_cap),
-            (3, 6)
+            (0, 6)
         );
         assert!(config.validate().is_ok());
 

@@ -16567,7 +16567,8 @@ mod crash_recovery_tests {
             .all(|(k, _)| !k.starts_with(b"leader_stats:")));
     }
 
-    /// K = 0 (s136, on the TC set): over four epochs (boundaries 4..=16) execution writes no
+    /// K = 0 (s136, on the TC set) and K absent (owner s138: off by default): over four epochs
+    /// (boundaries 4..=16) execution writes no
     /// dead-leader row at all (no `leader_stats:`, no `leader_qc:`, no `epoch_vset:lx_*`), so the
     /// state, its hash and the boundary updates (their exclusion delta comes only from an
     /// `lx_plan` row) are those of the base. Control: K = 3 on the same chain writes the rows and
@@ -16586,22 +16587,40 @@ mod crash_recovery_tests {
                 })
                 .collect()
         };
-        let (mut config, db) = dls_fixture();
-        config.leader_miss_threshold = 0;
-        let ctx = make_exec_ctx(&config, &db);
-        for h in 1..=16 {
-            ctx.execute_committed_block(&make_block(h, vec![]), vec![]);
-            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "K = 0: height {h}");
-        }
-        drop(ctx);
-        assert_eq!(read_native_applied_height(&db), Some(16));
-        assert_eq!(dl_rows(&db), Vec::<Vec<u8>>::new(), "K = 0: no dead-leader row");
-        for h in [8, 12, 16, 20] {
-            assert_eq!(
-                torus_economics::leader_stats::leader_exclusion_plan(&db, h).unwrap(),
-                None,
-                "K = 0: no exclusion plan for {h}"
-            );
+        // Owner s138: off by default. A chain config whose K is absent (a genesis without
+        // `consensus.leader_miss_threshold`) is K = 0, exactly like an explicit 0.
+        let absent_k = |config: &ChainConfig| -> ChainConfig {
+            let mut v = serde_json::to_value(config).unwrap();
+            v.as_object_mut()
+                .unwrap()
+                .remove("leader_miss_threshold")
+                .expect("K is serialized");
+            serde_json::from_value(v).unwrap()
+        };
+        for absent in [false, true] {
+            let tag = if absent { "K absent" } else { "K = 0" };
+            let (mut config, db) = dls_fixture();
+            if absent {
+                config = absent_k(&config);
+                assert_eq!(config.leader_miss_threshold, 0, "{tag}: off by default");
+            } else {
+                config.leader_miss_threshold = 0;
+            }
+            let ctx = make_exec_ctx(&config, &db);
+            for h in 1..=16 {
+                ctx.execute_committed_block(&make_block(h, vec![]), vec![]);
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{tag}: height {h}");
+            }
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&db), Some(16));
+            assert_eq!(dl_rows(&db), Vec::<Vec<u8>>::new(), "{tag}: no dead-leader row");
+            for h in [8, 12, 16, 20] {
+                assert_eq!(
+                    torus_economics::leader_stats::leader_exclusion_plan(&db, h).unwrap(),
+                    None,
+                    "{tag}: no exclusion plan for {h}"
+                );
+            }
         }
 
         let (config, on) = dls_fixture();

@@ -2172,8 +2172,8 @@ mod tests {
         let mut config: ChainConfig = serde_json::from_value(json).unwrap();
         assert_eq!(
             (config.leader_miss_threshold, config.leader_exclusion_cap),
-            (DEFAULT_LEADER_MISS_THRESHOLD, DEFAULT_LEADER_EXCLUSION_CAP),
-            "absent: the defaults"
+            (0, 6),
+            "absent: K = 0 (off, owner s138), j cap 6"
         );
         let header = TorusBlockHeader {
             height: 1,
@@ -2198,6 +2198,12 @@ mod tests {
             features: 0,
             sig_attestation: [0; 64],
         };
+        assert_eq!(
+            config.dead_leader_skip(&header),
+            None,
+            "absent K: off by default"
+        );
+        config.leader_miss_threshold = 3;
         assert_eq!(
             config.dead_leader_skip(&header),
             Some(DeadLeaderParams {
