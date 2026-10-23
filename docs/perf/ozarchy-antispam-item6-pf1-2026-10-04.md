@@ -20219,6 +20219,325 @@ Background lines, both shapes (count per node val0 / val1 / val2; whole log; `de
     `deep_logcount_table.py`, `deep_logcount2_table.py`, `deep_noise_md.py` -> `deep_logcount_table.txt`,
     `deep_logcount2_table.txt`, `deep_noise_rows.md`.
 
+## 126. Steps 9n, 9o, 9m on main `9083b278` (batch B): deep-book capacity re-run (D = 1M accounts + 1M pre-loaded resting orders vs S = standard, n = 2 incl. w1), TC-required phase D one-down (before = pre-TC main `896240d4` vs after = `9083b278`, both `ORACLE_FEED=seed`, stakes 2 / 2 / 1, U all up / K `KILL_NO_RESTART=val2` at bench+120 s, round-matched, n = 3 per arm), Q8 exec-thread profile (profiling build of `9083b278`, std and deep, n = 1 each, 300 s), Classic, hash + attestation + L6.1 + L2.1 + fail-stop on, 15 s checkpoints (chain bench-s138-chain, run dir ozarchy-s138-run, archy, 2026-10-23)
+
+**9n: the deep-book slowdown of section 93 is gone.**
+* Matched/s: deep / std 0.955 (247,334 vs 259,102; -11,767 ± 8,237, -15.5 sd). Section 93: 0.857.
+* Native blocks/s: 21.9 vs 22.6 (93: 3.0 vs 13.3).
+* Commit-interval p50 / p99: 12.5 / 463 vs 11.9 / 464 ms (93: 240 / 1,416 vs 15 / 774).
+* `save_books`: 1.27 vs 0.59 ms per block, x2.1 (93: 76.7 vs 4.0, x19).
+* Checkpoint settle wait: 0.23 vs 0.20 ms (93: 24.7 vs 1.5).
+* RSS during the load, per node: mean 4.4-5.2 GB, peak 5.3-6.7 GB, HWM <= 6.8 GB (93: 6.6-7.8 / 8.1-9.2 GB).
+* Restarts were not measured. This driver has no restart probe.
+
+**9o: one-down passes, all-up does not.**
+* One down (post-kill window): blocks/s 1.513 vs 1.438, +5.2% (+0.075 ± 0.121). The CI floor is -3.2%, inside the
+  -5% bar.
+  * Matched/s: +1.9% (+2,211 ± 1,094).
+  * Timeout views: 43.5 vs 43.2 per minute (val1). Every val2-led view still runs to its timeout.
+  * TC wait (StartView -> Propose, leader): 38.3 vs 37.2 ms, +1.1 ± 0.6 ms. That is 0.2% of the ~457 ms post-kill view.
+* All up: matched/s -3.3% (267,382 vs 276,539; -9,156 ± 1,857, -11.4 sd).
+  * Blocks/s: -4.0% (not resolved).
+  * Commit p50: +10% (+244 ± 190 ms).
+  * The cost is on the exec side: engine ms per 1k fills 2.72 vs 2.54 (+7%), chain ms 98 vs 90 per block.
+  * Consensus timing does not move (U propose delay 16.5 vs 16.0 ms, not resolved).
+* **Attribution:** `9083b278` is not "pre-TC + the TC set". Besides the TC set it carries:
+  * batch 12;
+  * chain-id `2da29bec`;
+  * TC tip rule `cffdbcc9`;
+  * batch A `d595f77e`;
+  * product batch `8964bd4d` (resident position records even with the bits off);
+  * batch B.
+
+  The all-up -3.3% cannot be laid on the TC set. The arms also use different bench-throughput binaries (before
+  `db1fd9d3`, after `265fe336`).
+
+**9m: yes. The cache flush + overlay writes are still >= ~15% of exec-thread CPU.**
+* Stack union: 16.9% (std) and 16.3% (deep) of exec-thread user cycles.
+  * Cache flush (`PositionCache::flush_with_runs`, today's `flush_all` path): 16.4% / 15.7%.
+  * Overlay writes outside the flush: 0.6% in both shapes.
+* The `cache_flush` timer agrees: 5.39 / 5.28 ms of 31.4 / 32.2 ms exec on-CPU per block. That is 17.2% / 16.4% of
+  on-CPU and 14.0% / 13.3% of exec block wall.
+* Per the queue rule, item 6 Phase 5 is revisited. The result sits near the threshold, and it rests on n = 1 and one
+  60 s window per shape.
+
+Question (bench queue 9n, 9o, 9m, owner GO s138):
+* 9n (gates the testnet launch): is section 93's deep-book slowdown gone on today's main?
+* 9o: TC phase D, before / after. Pass = all-up within noise and one-down blocks/s within -5%.
+* 9m: are `flush_all` + overlay writes still >= ~15% of exec-thread CPU? Yes -> item 6 Phase 5 is revisited; no ->
+  it stays parked.
+
+### 126.1 Setup
+
+* Binaries (node md5 checked on 3 nodes in every cell, `campaign.log` CHECK OK + `summary.json`):
+  * after / 9n: main `9083b278`, node `be973e9db49c72f76e8a7e99c5c95c7f`, bench `265fe336`;
+  * before: pre-TC main `896240d4`, node `4719fce155ca0586037ce3da4f6ece0e`, bench `db1fd9d3` (9k2 stage);
+  * P (9m): `9083b278` profiling build (mold, frame pointers, line tables), node `aa492ada1699e22a45c105b806d608ba`.
+  * `summary.json` `commit` reads `9083b278` in every cell, the bU / bK cells included: it records the tools worktree
+    (`wt/bq-9083b278`), not the node.
+* Config, all items: Classic, `STATE_HASH_ACTIVATION=1` + attestation, L6.1, L2.1 and fail-stop on (startup lines
+  checked on val0..val2 in every cell), `TORUS_CHECKPOINT_INTERVAL_MS=15000`. Load: 300 markets, rate 76,000, 5,000
+  senders, batch 400, `MAX_IN_FLIGHT` 4, commit tail.
+* 9n shapes:
+  * D: 1M-account genesis (`bulk_count` 1,000,000) + 1M pre-loaded resting orders. `preload.json`: 1,000,000
+    placed / accepted / resting on all 3 nodes, 0 failures, 23.2 s.
+  * S: the standard 100k genesis.
+  * Each shape runs w1 + r1, both 600 s. w1 is the warm-up gate cell, but it has the same shape and length, so it
+    is counted (n = 2).
+* 9o:
+  * Stakes 2 / 2 / 1, `ORACLE_FEED=seed` in both arms, `BENCH_RPCS=0,1`, 600 s.
+  * Order: w1 (bU); r1 bU aU aK bK; r2 aK bK bU aU; r3 bK aK aU bU; then r3-bK-rerun.
+  * Windows (pre-kill / post-kill) follow section 125.1: the `norestart_windows` rule, with U split at a virtual kill
+    at bench+120 s.
+  * Sources: matched/s and blocks/s from val0; timeout views from val1. Commit p50 / p99 is the order age at commit
+    (`torus_order_age_commit_seconds`), mean of val0 / val1.
+  * TC wait = `torus_view_propose_delay_seconds` (StartView -> Propose, leader;
+    `torus-telemetry/src/view_metrics.rs` `propose`). It is windowed from `metrics-1hz`, mean of val0 / val1. No
+    INFO log line carries enter_view or TC events.
+* 9m:
+  * w1 + r1-P per shape, 300 s.
+  * Perf sidecar on val1 at `perf_event_paranoid=2`, with call graphs. W1 = 60 s `cycles:u` on the whole process;
+    W2 = 60 s `cycles:u` on the exec thread (tid from `exec-tid.txt`).
+  * The shares below are from W2.
+* Statistics: arm mean ± 95% t CI, step ± Welch 95% CI, (sd) = step / pooled sd. 9n has n = 2 per shape (df ~1), so
+  its CIs are wide.
+
+### 126.2 Validity
+
+* 22 cells. 21 are rc 0, ACCEPT / AGREE / PASS, md5 ok.
+  * The node logs have 0 `panicked`, `STATE HASH MISMATCH`, `diverged`, `hash-unverified`, ` ERROR ` or `FATAL`
+    lines.
+  * The only pattern hit is the fail-stop startup line, one per node.
+* **Excluded: 9o r3-bK.** rc 2, `CELL FAIL`, dissemination REJECT (AGREE, liveness PASS).
+  * Survivor-to-survivor body fetch fell back to sync: at kill+8.8 s on val0, and at kill+11.4 s on val1
+    ("exhausted", proposer val0).
+  * val0 also logged 21 `native-da OUTBOUND FAILURE` lines to val2.
+  * This is section 125's finding 1, on the before binary.
+  * Its rerun r3-bK-rerun is clean (rc 0, ACCEPT) and takes its place in bK. r3-bK stays in the table and in a
+    sensitivity row (bK n = 4).
+* No other CELL-FLAG or CELL FAIL in `campaign.log`. 9l was skipped by design (126.6).
+* Log flood: the bK survivors logged 1,460-1,901 `send_queue_full` lines per node (r3-bK val0: 490 MB of log). aK
+  logged 6-7 and the U arms 0. This is the batch B log-flood fix at work.
+
+### 126.3 9n: deep-book capacity (n = 2 per shape: w1 + r1, 600 s)
+
+| cell | matched/s | native blk/s | fills / blk | exec block_ms | save_books ms / blk | ckpt settle wait ms | engine ms / 1k fills | commit interval p50 / p99 ms | timeouts | RSS load mean / max MB (val0 / val1 / val2) | HWM MB |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| D w1 | 248,056 | 21.68 | 11,168 | 43.66 | 1.28 | 0.24 | 3.15 | 12.9 / 458 | 3 | 4,424 / 4,400 / 5,200; 5,317 / 5,428 / 6,722 | 5,501 / 5,582 / 6,846 |
+| D r1 | 246,613 | 22.16 | 10,852 | 42.16 | 1.25 | 0.23 | 3.14 | 12.1 / 468 | 1 | 4,400 / 4,530 / 5,205; 5,270 / 5,471 / 6,434 | 5,710 / 5,979 / 6,822 |
+| S w1 | 259,345 | 22.69 | 11,173 | 40.27 | 0.60 | 0.20 | 2.98 | 12.3 / 460 | 2 | 2,919 / 2,905 / 3,756; 4,064 / 4,306 / 4,856 | 4,345 / 4,607 / 5,150 |
+| S r1 | 258,858 | 22.58 | 11,210 | 39.74 | 0.59 | 0.19 | 2.92 | 11.5 / 467 | 1 | 3,116 / 2,999 / 3,824; 4,205 / 3,950 / 4,811 | 4,509 / 4,179 / 5,106 |
+
+* Phase columns are the mean of 3 nodes.
+* Commit interval is from `buckets.csv` (`torus_commit_interval_seconds_bucket`, load window, mean of 3 nodes).
+* RSS is from `mem-samples.txt` (~5 s samples, load window). Swap is 0 on every node.
+
+| metric | 93 S | 93 M | 93 M / S | 126 S | 126 D | 126 D / S | D - S [CI] (sd) |
+|---|---|---|---|---|---|---|---|
+| matched/s | 256,224 | 219,484 | 0.857 | 259,102 | 247,334 | **0.955** | -11,767 ± 8,237 (-15.5) |
+| native blocks/s | 13.33 | 2.98 | 0.223 | 22.64 | 21.92 | 0.968 | -0.72 ± 2.91 (-2.9), not resolved |
+| exec block_ms | 70.9 | 322.1 | 4.55 | 40.01 | 42.91 | 1.073 | +2.90 ± 8.46 (+3.7), not resolved |
+| save_books ms / blk | 4.04 | 76.72 | 19.0 | 0.59 | 1.27 | 2.13 | +0.67 ± 0.17 (+42) |
+| ckpt settle wait ms / blk | 1.45 | 24.67 (val0) | 17.0 | 0.20 | 0.23 | 1.21 | +0.04 ± 0.03 (+5.7) |
+| engine ms / 1k fills | 2.89 | 2.56 | 0.89 | 2.95 | 3.15 | 1.066 | +0.19 ± 0.37 (+6.4), not resolved |
+| commit interval p50 / p99 ms | 14.6 / 774 | 240.2 / 1,416 | 16.4 / 1.83 | 11.9 / 463.5 | 12.5 / 462.9 | 1.05 / 1.00 | not resolved (+1.1 / -0.1 sd) |
+| RSS load mean (node mean) MB | 3,465-4,393 | 6,562-7,754 | ~1.9 | 3,253 | 4,693 | 1.44 | +1,440 ± 696 |
+| RSS peak / HWM per node MB | 4,838-5,861 / <= 6,070 | 8,121-9,215 / <= 9,328 | | 3,950-4,856 / <= 5,150 | 5,270-6,722 / <= 6,846 | 1.36 | |
+| restarts SIGTERM / SIGKILL | - | 3.0 / 3.5 s | | not measured | not measured | | |
+
+* **Sized:** the +2.9 ms exec block_ms decomposes into:
+  * engine +0.19 ms per 1k fills x ~11.0k fills, ~2.1 ms;
+  * `save_books` +0.67 ms;
+  * settle wait +0.04 ms;
+  * total ~2.8 ms.
+
+  The exec thread is busy 0.957 (D r1 val1) vs 0.918 (S r1), so ~7% more exec time per block costs ~4.5% matched/s.
+* The big-block regime is gone: fills per block are equal (11.0k vs 11.2k; 93: 71.6k vs 18.5k).
+* Independent check: 9m's profiling-build cells (300 s, same shapes) give deep / std 0.961 (246,369 vs 256,368).
+* Drift: D 248.1k -> 246.6k, S 259.3k -> 258.9k (w1 -> r1). The step is 15 sd of the within-shape spread.
+
+### 126.4 9o: TC phase D, before (b, `896240d4`) vs after (a, `9083b278`)
+
+Per cell (run order; `9o_windows.txt`, `9o_viewwin.txt`):
+
+| cell | arm | rc / verdict | matched/s whole | pre-kill | post-kill | blk/s pre | blk/s post | timeouts / min val1 post | TC wait ms post | commit p50 / p99 ms post |
+|---|---|---|---|---|---|---|---|---|---|---|
+| w1 (unscored) | bU | 0 / ACCEPT | 277,301 | 282,155 | 276,098 | 14.90 | 15.57 | 0.5 | - | 2,295 / 9,674 |
+| r1 | bU | 0 / ACCEPT | 276,031 | 280,888 | 274,822 | 14.81 | 15.29 | 0.75 | 15.7 | 2,336 / 9,702 |
+| r1 | aU | 0 / ACCEPT | 266,595 | 269,769 | 265,806 | 14.35 | 15.19 | 0.25 | 15.9 | 2,537 / 9,684 |
+| r1 | aK | 0 / ACCEPT | 147,789 | 253,957 | 121,357 | 15.08 | 1.529 | 43.57 | 38.7 | 3,122 / 40,334 |
+| r1 | bK | 0 / ACCEPT | 147,855 | 264,499 | 118,814 | 16.70 | 1.436 | 43.20 | 37.2 | 3,140 / 40,348 |
+| r2 | aK | 0 / ACCEPT | 147,878 | 258,235 | 120,403 | 15.42 | 1.552 | 43.44 | 38.1 | 3,132 / 40,334 |
+| r2 | bK | 0 / ACCEPT | 147,432 | 265,331 | 118,080 | 17.18 | 1.440 | 43.07 | 37.5 | 3,167 / 40,404 |
+| r2 | bU | 0 / ACCEPT | 277,552 | 280,693 | 276,772 | 15.28 | 14.88 | 0.62 | 16.5 | 2,490 / 9,761 |
+| r2 | aU | 0 / ACCEPT | 267,560 | 270,821 | 266,749 | 14.46 | 14.27 | 1.12 | 16.9 | 2,723 / 9,795 |
+| r3 | bK | **2 / REJECT (excluded)** | 144,495 | 261,925 | 115,320 | 17.09 | 1.398 | 42.11 | 37.6 | 3,153 / 55,389 |
+| r3 | aK | 0 / ACCEPT | 146,829 | 250,694 | 120,755 | 15.89 | 1.459 | 43.57 | 38.2 | 3,059 / 40,338 |
+| r3 | aU | 0 / ACCEPT | 267,992 | 270,121 | 267,462 | 13.92 | 14.61 | 0.37 | 16.8 | 2,614 / 9,752 |
+| r3 | bU | 0 / ACCEPT | 276,032 | 282,474 | 274,428 | 15.21 | 15.52 | 0.5 | 15.9 | 2,325 / 9,706 |
+| r3-rerun | bK | 0 / ACCEPT | 147,703 | 263,039 | 118,989 | 17.48 | 1.438 | 43.32 | 37.1 | 3,147 / 40,343 |
+
+Arm means and steps (n = 3 per arm; bK = r1, r2, r3-rerun; ± = 95% CI; `9o_stats.txt`, `9o_propose_stats.txt`):
+
+| metric | window | bU | aU | aU - bU [CI] | % | (sd) | bK | aK | aK - bK [CI] | % | (sd) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| matched/s | whole | 276,539 ± 2,181 | 267,382 ± 1,778 | **-9,156 ± 1,857** | -3.3% | -11.4 | 147,663 ± 532 | 147,499 ± 1,444 | -165 ± 1,326 | -0.1% | -0.4 |
+| matched/s | pre-kill | 281,352 | 270,237 | -11,115 ± 2,020 | -4.0% | -14.1 | 264,290 | 254,295 | -9,994 ± 8,873 | -3.8% | -3.6 |
+| matched/s | post-kill | 275,341 ± 3,118 | 266,673 ± 2,064 | **-8,668 ± 2,599** | -3.1% | -8.1 | 118,628 ± 1,199 | 120,838 ± 1,199 | **+2,211 ± 1,094** | +1.9% | +4.6 |
+| blocks/s | whole | 15.20 | 14.60 | -0.60 ± 0.77 | -4.0% | -1.9 | 4.564 | 4.300 | -0.264 ± 0.167 | -5.8% | -3.7 |
+| blocks/s | pre-kill | 15.10 | 14.24 | -0.86 ± 0.62 | -5.7% | -3.2 | 17.12 | 15.46 | -1.66 ± 0.91 | -9.7% | -4.1 |
+| blocks/s | post-kill | 15.23 ± 0.80 | 14.69 ± 1.15 | -0.54 ± 0.96 | -3.5% | -1.4 | 1.438 ± 0.005 | 1.513 ± 0.121 | **+0.075 ± 0.121** | +5.2% | +2.2 |
+| timeout views / min, val1 | post-kill | 0.62 | 0.58 | not resolved | | -0.1 | 43.20 | 43.53 | +0.33 ± 0.26 | +0.8% | +3.3 |
+| TC wait (propose delay) ms | post-kill | 16.00 | 16.50 | +0.50 ± 1.17 | | +1.0 | 37.23 | 38.30 | +1.07 ± 0.63 | +2.9% | +4.1 |
+| view duration ms | post-kill | 65.8 | 68.2 | +2.4 ± 4.4 | | +1.3 | 458.0 | 457.0 | -1.1 ± 8.2 | | -0.3 |
+| commit p50 ms | post-kill | 2,384 | 2,624 | +241 ± 210 | +10.1% | +2.6 | 3,151 | 3,104 | -47 ± 91 | -1.5% | -1.6 |
+| commit p99 ms | post-kill | 9,723 | 9,744 | +21 ± 116 | +0.2% | +0.5 | 40,365 | 40,335 | -30 ± 84 | -0.1% | -1.2 |
+
+* Sensitivity, bK with the flagged r3-bK (n = 4): post-kill blocks/s 1.428 -> 1.513 (+6.0%, +0.085 ± 0.111);
+  post-kill matched/s +2.6%. Same verdict.
+* Post-kill commit p99 sits at ~40.3 s in every clean K cell, both arms. That is section 125's bucket-edge artefact
+  (40.96 s edge). r3-bK's 55.4 s is its fallback freeze.
+* Exec side, U cells (val0):
+  * engine ms per 1k fills: bU 2.54 / 2.52 / 2.57 vs aU 2.72 / 2.72 / 2.72;
+  * chain ms: 90.5 / 91.5 / 87.8 vs 95.7 / 98.8 / 99.4;
+  * fills per block: equal (28.4-30.1k vs 29.2-30.2k);
+  * `save_books`: 1.30-1.39 vs 1.36-1.45 ms.
+
+  +7% exec time per fill on an exec-bound chain covers the -3.3% matched/s.
+* K pre-kill blocks/s is above U in both arms (17.1 / 15.5 vs 15.1 / 14.2). This is the in-flight watch RPC
+  confound of section 125.6: K watches val1, U watches val2.
+* Drift: no trend in any arm.
+  * bU 276.0k / 277.6k / 276.0k;
+  * aU 266.6k / 267.6k / 268.0k;
+  * aK 147.8k / 147.9k / 146.8k;
+  * bK 147.9k / 147.4k / (144.5k flagged) / 147.7k.
+* Cross-check with section 125 (std, feed off); values are 9k vs bK:
+  * U whole: 277,283 vs bU 276,539 (seed -0.3%);
+  * K post-kill matched/s: 115,870 vs 118,628;
+  * K post-kill blocks/s: 1.398 vs 1.438;
+  * val1 timeouts: 42.32 vs 43.20 per minute.
+
+  Consistent.
+
+### 126.5 9m: exec-thread profile (W2, 60 s, `cycles:u`, val1; `9m-{std,deep}-w2-{self,children}.txt`, `9m_union.txt`)
+
+Cells (matched/s, all ACCEPT): std w1 257,860, r1-P 254,877; deep w1 247,866, r1-P 244,872. W2 sample periods:
+std 141.2 G, deep 146.4 G cycles.
+
+Top self-time on the exec thread (% of its user cycles):
+
+| function | std | deep |
+|---|---|---|
+| `__KeccakF1600` | 6.22 | 5.91 |
+| `AccountReader::get_position` | 5.17 | 4.92 |
+| `NativeExecutor::execute_batch_phases` | 4.90 | 5.02 |
+| `NativeExecutor::prepare_one` | 4.45 | 4.26 |
+| `NativeExecutor::settle_pass_b_market` | 4.01 | 3.74 |
+| `PositionCache::flush_with_runs` | 2.69 | 2.69 |
+| `Vec::spec_extend` (`flush_with_runs` dirty-key filter_map) | 2.62 | 2.58 |
+| `BTreeMap<Vec<u8>, Vec<u8>>::insert` | 2.47 | 2.30 |
+| `foldhash::hash_bytes_long` | 2.27 | 2.01 |
+| `__divti3` | 1.95 | 1.88 |
+| `NativeExecutor::stitch_outcome` | 1.85 | 1.78 |
+| `OrderBook::add_open_order_counts` | 1.80 | 2.18 |
+| `AccountReader::pos_sums` | 1.58 | 1.82 |
+| `OrderBook::encode_classic_with_capacity` | < 0.92 | 1.91 |
+
+Inclusive (the stack contains the item):
+
+| item | std | deep |
+|---|---|---|
+| cache flush (`flush_all` / `flush_with_runs`) | **16.35%** | **15.72%** |
+| overlay writes (`put_cf_raw*`, `delete_cf_raw*`, `merge_disjoint`) | 6.98% | 6.67% |
+| **union: flush + overlay writes** | **16.94%** | **16.30%** |
+| of it, overlay writes outside the flush | 0.59% | 0.58% |
+| `put_position` / `put_cf_raw_owned` | 7.66 / 6.41% | 7.23 / 6.12% |
+| `prepare_one` | 18.18% | 17.60% |
+| `match_settle_streamed` (L2.1) | 15.43% | 14.59% |
+| `liquidation_pass` | 12.55% | 12.63% |
+| `settle_pass_b_market` | 9.83% | 9.23% |
+| `save_order_books` | 1.69% | 3.70% |
+| timer `cache_flush` ms / blk; exec on-CPU ms / blk (val1) | 5.39; 31.39 (17.2%) | 5.28; 32.25 (16.4%) |
+
+* Section 81 (Q8, `e3d11cb9`, big-block regime) had `flush_all` at 11% of exec. `put_cf_raw*`, borsh, `BTreeMap` and
+  `merge_disjoint` were 3.5-5.6% each.
+* Today's share is higher because the blocks are small (~11k fills, ~31 ms exec on-CPU) while the flush costs
+  ~5.3 ms per block. Nearly all overlay writes now run inside the flush.
+* The deep shape raises `save_order_books` (1.7 -> 3.7%) and `encode_classic`. Nothing else moves by more than
+  0.5 pp.
+
+### 126.6 Seed mode (9o) and 9l
+
+* **9o seed-mode decision.**
+  * Batch A (`d595f77e`, in `9083b278`) rejects orders on never-marked markets. A feed-off smoke of the after binary
+    placed nothing: `ozarchy-s138-9o-smk-a-smoke-s0.attempt1-feedoff-failed` has matched/s 0.0. So both arms run
+    `ORACLE_FEED=seed`.
+  * Cost on the before binary, one smoke each: seed 226,853 matched/s, 13.5 blk/s (`ozarchy-s138-9o-smoke-s0`) vs
+    feed off 230,449, 14.3 (`ozarchy-s138-9o-smk-b-smoke-s0`). That is -1.6%; single runs, not resolved.
+  * The feed-off "before" driver (`ozarchy-s138-9o-campaign.sh`) was kept but not launched.
+* **9l held.**
+  * It needs the frozen 9j2 harness: main `0f8eedb3` + `fix/attest-hole-wait` `1aa2fd0a` (`harness-9l.json`).
+  * The std re-smoke of RA `53a6d83c` failed check j9chk2. The binary logs no `TORUS_SETTLE_STREAMED` startup line,
+    so the L2.1 `on=false` line is missing. Its warm-up cell was ACCEPT / AGREE (273,213).
+  * RB `29bfc705` passed (274,516).
+  * The chain skipped 9l ("9L SKIPPED (L9=no)").
+  * 18c decision (after the chain): for RA `53a6d83c` only, the missing line counts as L2.1 off (no L2.1 code;
+    section 120's A ran the same way); RB must still print `on=false`. L2.1 code present-but-off is part of the gap
+    9l measures, not a confound. Running hash OFF to be confirmed from startup lines on both arms. Queue order:
+    9p -> 9q -> 9l.
+
+### 126.7 Verdict
+
+* **9n (gates testnet): the deep-book slowdown is gone on `9083b278` (high confidence on the direction, medium on the
+  size).**
+  * At 1M resting orders the chain stays in the small-block regime (21.9 blocks/s).
+  * Deep costs 4.5% matched/s (15 sd, but n = 2, CI ± 8.2k).
+  * `save_books` is 1.3 ms per block (x2.1 vs std, down from x19).
+  * Memory is lower than in 93: peak <= 6.7 GB RSS, HWM <= 6.8 GB.
+  * Not covered: restart times with the books in state. The gate needs them if the owner keeps that criterion.
+* **9o: one-down blocks/s within -5%: PASS (medium-high confidence; n = 3, +5.2%, CI floor -3.2%).**
+* **9o: all-up within noise: FAIL (high confidence that the step is real: -3.3%, -11 sd, no drift).**
+  * The all-up loss is exec-side (+7% engine ms per fill). Its cause lies in `896240d4..9083b278`.
+  * Nothing shows the TC set causes it: consensus timing (propose delay, view time) is flat in U.
+  * With one node down, the TC path is neutral: +1 ms TC wait on a ~457 ms view, and timeout views stay at ~43.5 per
+    minute. The dead leader's views still cost the full timeout; that is 9p's job.
+* **9m: flush + overlay writes = 16.3-16.9% of exec-thread user cycles, >= ~15%, so item 6 Phase 5 is revisited
+  (medium confidence).** n = 1 per shape and one 60 s window. The cache-flush timer gives 16.4-17.2% of exec on-CPU
+  and 13.3-14.0% of block wall. Both measures sit close to the threshold.
+
+### 126.8 Limits and next
+
+* 9n: n = 2 per shape with w1 counted, and restarts were not measured.
+  * Next: one D cell with the section 93.5 restart probe (cold / SIGTERM / SIGKILL with 1M orders), ~25 min.
+  * Optional: r2 per shape to tighten the 4.5%.
+* 9o all-up: bisect the +7% engine ms per fill over `896240d4..9083b278` with U-only cells (std, 300 s, n = 2 per
+  binary), ~1.5-2 h.
+  * Candidates: product batch `8964bd4d` (resident position records), batch A `d595f77e`, batch B.
+  * Alternative: an A/B of `9083b278` vs `9083b278` without the TC set, if 18c can build it.
+* 9m: if Phase 5 work starts, re-profile with 2-3 W2 windows per cell at n = 2, to put a CI on the 16-17%.
+* The smoke and 9o seed-mode numbers are single cells.
+
+### 126.9 Data
+
+* 9n cells: `~/bench-results-matched/ozarchy-s138-9n-{deep-w1,deep-r1-D,std-w1,std-r1-S}` (`summary.json`,
+  `buckets.csv`, `mem-samples.txt`, `preload.json`, `node-life.txt`, `log-summary.json`) and their `.campaign.log` /
+  `.cell.rc`.
+* 9o cells: `~/bench-results-matched/ozarchy-s138-9o-{w1,r1-bU,r1-aU,r1-aK,r1-bK,r2-aK,r2-bK,r2-bU,r2-aU,r3-bK,r3-aK,r3-aU,r3-bU,r3-bK-rerun}`
+  (`summary.json`, `sampler.csv`, `buckets.csv`, `metrics-1hz.txt.gz`, `metrics-{before,after}-val*.txt`,
+  `kill-norestart.json`, `log-summary.json`, `val<i>.log.gz`). Smokes: `ozarchy-s138-9o-smoke-s0`,
+  `ozarchy-s138-9o-smk-b-smoke-s0`, `ozarchy-s138-9o-smk-a-smoke-s0{,.attempt1-feedoff-failed}`.
+* 9m cells: `~/bench-results-matched/ozarchy-s138-9m-{std,deep}-{w1,r1-P}`. The r1-P cells add `perf.data` (W1),
+  `perf-w2.data` (W2), `exec-tid.txt`, `perf-sidecar.log` and `prof-*`.
+* Campaign: `ozarchy-s138-run/`:
+  * `handoff.json`, `harness-9l.json`, `campaign.log`, `campaign.done` (exit=0);
+  * `ozarchy-s138-{9n-deep,9n-std,9o,9m-std,9m-deep}/cells.tsv`, `ozarchy-s138-9o/rerun-queue.tsv`.
+* Drivers: `ozarchy-s138-tools/drivers/` (`ozarchy-s138-9o-seed-campaign.sh`, `ozarchy-s138-9{n,m}-{std,deep}-campaign.sh`).
+* Analysis: `ozarchy-s138-tools/analyst/`:
+  * 9n: `n_cells.py` -> `9n_cells.txt`; `n_mem.py` -> `9n_mem.txt`; `9n_stats.txt`.
+  * 9o: `o_windows.py` (copy of 9k2 `std_windows.py`) -> `9o_windows.{json,txt}`; `o_stats.py` -> `9o_stats.txt`;
+    `o_viewwin.py` -> `9o_viewwin.txt`; `9o_view_metrics.txt`; `9o_propose_stats.txt`.
+  * 9m: `9m-{std,deep}-w2-{self,children}.txt` (`perf report`); `m_union.py` -> `9m_union.txt`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
