@@ -210,8 +210,9 @@ fn decide_nudge_from_the_leader_the_update_installs_is_voted_on() {
         decide_votes.iter().filter(|(_, v)| v.phase == Phase::Decide && v.block == u.hash).count(),
         others.len(),
         "the replicas without Commit(U) must vote Decide on the nudge of the leader U installs \
-         (x = old leader of view {}); votes: {decide_votes:?}",
-        vp + 3
+         (x = old leader of view {}); vote phases: {:?}",
+        vp + 3,
+        decide_votes.iter().map(|(_, v)| v.phase).collect::<Vec<_>>()
     );
     for &i in &others {
         assert!(
@@ -270,5 +271,5 @@ fn commit_nudge_from_a_non_leader_is_still_dropped() {
         .find(|k| *k != p && *k != select_leader(ViewNumber::new(vp + 3), &new_set))
         .expect("a live validator that leads vp + 3 in neither set");
     let votes = cast(vp + 3, nudge(vp + 3, &commit), impostor);
-    assert!(votes.is_empty(), "a nudge from a validator that leads vp + 3 in neither set is dropped: {votes:?}");
+    assert!(votes.is_empty(), "a nudge from a validator that leads vp + 3 in neither set is dropped: {} votes", votes.len());
 }
