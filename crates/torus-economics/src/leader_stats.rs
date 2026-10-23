@@ -169,6 +169,18 @@ pub fn leader_exclusion_plan<T: StateBackend>(
     get(state, &lx_plan_key(boundary))
 }
 
+/// Epoch plan hand-off (`TORUS_EPOCH_PLAN_HANDOFF`): the `CF_CONSENSUS_META` key of the
+/// exclusion plan for `boundary` (execution reads its own row back to hand it to consensus).
+pub fn leader_exclusion_plan_key(boundary: u64) -> Vec<u8> {
+    lx_plan_key(boundary)
+}
+
+/// Epoch plan hand-off: decode an exclusion plan row's bytes exactly as
+/// [`leader_exclusion_plan`] does.
+pub fn decode_leader_exclusion_plan(bytes: &[u8]) -> Result<LeaderExclusionPlan> {
+    decode(bytes)
+}
+
 /// Store `plan` (the plan for its boundary).
 pub fn put_leader_exclusion_plan<T: StateBackend>(
     state: &T,
@@ -553,6 +565,32 @@ mod tests {
             *view += 1;
             exec(mgr, h, &ok(1, *view));
         }
+    }
+
+    /// Epoch plan hand-off: the public key / decode accessors read the exclusion plan row
+    /// exactly as `leader_exclusion_plan` does.
+    #[test]
+    fn exclusion_plan_key_and_decode_match_leader_exclusion_plan() {
+        let (_d, mgr) = setup(&[100, 100, 100, 100]);
+        let p = LeaderExclusionPlan {
+            boundary: 8,
+            excluded: vec![ExcludedMember {
+                address: addr(4),
+                pubkey: pk(4),
+            }],
+            exclude: vec![pk(4)],
+            readmit: vec![pk(3)],
+        };
+        put_leader_exclusion_plan(mgr.state(), &p).unwrap();
+        assert_eq!(leader_exclusion_plan_key(8), lx_plan_key(8));
+        let bytes = mgr
+            .state()
+            .get_cf_raw(CF_CONSENSUS_META, &leader_exclusion_plan_key(8))
+            .unwrap()
+            .expect("exclusion plan row for 8");
+        assert_eq!(decode_leader_exclusion_plan(&bytes).unwrap(), p);
+        assert_eq!(plan(&mgr, 8), Some(p));
+        assert!(decode_leader_exclusion_plan(&bytes[..bytes.len() - 1]).is_err());
     }
 
     /// The rows are consensus state: hashed by the running hash.

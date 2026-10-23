@@ -177,6 +177,19 @@ fn plan_key(boundary: u64) -> Vec<u8> {
     key
 }
 
+/// Epoch plan hand-off (`TORUS_EPOCH_PLAN_HANDOFF`): the `CF_CONSENSUS_META`
+/// key of the plan for `boundary` (execution reads its own row back to hand it
+/// to consensus).
+pub fn epoch_plan_key(boundary: u64) -> Vec<u8> {
+    plan_key(boundary)
+}
+
+/// Epoch plan hand-off: decode a plan row's bytes exactly as
+/// [`StakingManager::epoch_rotation_plan`] does.
+pub fn decode_epoch_rotation_plan(bytes: &[u8]) -> Result<EpochRotationPlan> {
+    decode(bytes)
+}
+
 fn members_to_set(members: &[PlanMember], epoch: u64) -> ValidatorSet {
     ValidatorSet {
         validators: members
@@ -485,6 +498,28 @@ mod tests {
 
     fn keys(plan: &EpochRotationPlan) -> Vec<[u8; 32]> {
         plan.members.iter().map(|m| m.pubkey).collect()
+    }
+
+    /// Epoch plan hand-off: the public key / decode accessors read the row
+    /// exactly as `epoch_rotation_plan` does.
+    #[test]
+    fn plan_key_and_decode_match_epoch_rotation_plan() {
+        let (_d, mgr) = setup();
+        for n in 1..=4 {
+            put(&mgr, n, 100, ValidatorStatus::Active);
+        }
+        EpochManager::execute_planned_rotation(&mgr, 4, 4, 4, None).unwrap();
+        assert_eq!(epoch_plan_key(8), plan_key(8));
+        let bytes = mgr
+            .state()
+            .get_cf_raw(CF_CONSENSUS_META, &epoch_plan_key(8))
+            .unwrap()
+            .expect("plan row for 8");
+        assert_eq!(
+            Some(decode_epoch_rotation_plan(&bytes).unwrap()),
+            mgr.epoch_rotation_plan(8).unwrap()
+        );
+        assert!(decode_epoch_rotation_plan(&bytes[..bytes.len() - 1]).is_err());
     }
 
     /// The plan rows are consensus state: hashed by the running state hash.
