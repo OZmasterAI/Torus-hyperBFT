@@ -17,6 +17,7 @@ pub mod genesis;
 pub mod kv_store;
 pub mod leader_skip;
 pub mod network;
+pub mod plan_handoff;
 pub mod shard_recovery;
 pub mod slashing;
 pub mod state_hash;

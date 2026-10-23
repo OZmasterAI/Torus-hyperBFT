@@ -24,8 +24,8 @@ pub mod types;
 pub use dev_pool::DevPool;
 pub use epoch::EpochManager;
 pub use epoch_plan::{
-    add_epoch_evm_gas, epoch_evm_gas, next_base_fees, EpochRotationPlan, PlanEvm, PlanMember,
-    EPOCH_VSET_PREFIX, EVM_EPOCH_GAS_KEY,
+    add_epoch_evm_gas, decode_epoch_rotation_plan, epoch_evm_gas, epoch_plan_key, next_base_fees,
+    EpochRotationPlan, PlanEvm, PlanMember, EPOCH_VSET_PREFIX, EVM_EPOCH_GAS_KEY,
 };
 pub use error::EconomicsError;
 pub use governance::{GovernanceManager, GovernanceParams};
