@@ -55,6 +55,10 @@ fake /proc (DRIVER_PROC). Pinned:
 16. in-line (DEFER_SCANS=0; owner rule after Codex round 4 on d6647299): each cell runs exactly the pre-end-pass
    driver's (0f2ca85b^) steps, in its order, with the same inputs, and the end pass does nothing
    (InlineSequenceTest: both bodies from one spec, run against tracing fakes, the traces compared).
+17. node count (s138 bench 9p, a 4-validator devnet): the spec's harness env N_VALIDATORS (3 or 4, default 3, the
+   same on every arm) sets NODES, METS (9161..9160+N) and every per-node loop of the body (hardscan, dusamp,
+   ckptsamp, fdsum, dumeas, savelog, soakchk, stopwin), and the soak sampler takes every port it is given; a 3-node
+   driver is the same text as before (FourValidatorTest).
 """
 
 import glob
@@ -382,7 +386,7 @@ FUNC_SUBST = {
     # not a mid-cell node death once crash-kill.sh norestart logged the marker for exactly that pid
     "watch_nodes": (
         '            fi\n            if ! kill -0 "$p" 2>/dev/null; then\n',
-        '            fi\n'
+        "            fi\n"
         "            # run-cell.sh KILL_NO_RESTART: this exact pid's death is expected once crash-kill.sh norestart"
         " logged its marker\n"
         '            if ! kill -0 "$p" 2>/dev/null && grep -qF "kill-no-restart: SIGKILL val$i pid $p "'
@@ -1747,14 +1751,18 @@ class WatchNodesTest(FakeHostBase):
         hp, _ = self.harness()
         runlog = os.path.join(self.cell, "run.log")
         with open(runlog, "a") as f:
-            f.write("kill-no-restart: SIGKILL val2 pid %d (no restart; height=600 committed=602)\n" % pids[2])
+            f.write(
+                "kill-no-restart: SIGKILL val2 pid %d (no restart; height=600 committed=602)\n"
+                % pids[2]
+            )
         stop = (
             '(sleep 2.5; for p in %d %d; do echo "stopping pid $p"; done >> %s; echo stopped. >> %s) &'
             % (pids[0], pids[1], shlex.quote(runlog), shlex.quote(runlog))
         )
         r = self.lib(
             self.drv,
-            '%s\nwatch_nodes %s %d; echo "WN=$?"' % (stop, shlex.quote(self.cell), hp.pid),
+            '%s\nwatch_nodes %s %d; echo "WN=$?"'
+            % (stop, shlex.quote(self.cell), hp.pid),
             env=self.env(),
         )
         self.assertIn("WN=0", r.stdout, r.stdout + r.stderr)
@@ -1766,7 +1774,10 @@ class WatchNodesTest(FakeHostBase):
         pids = self.nodes(die=1)
         hp, _ = self.harness()
         with open(os.path.join(self.cell, "run.log"), "a") as f:
-            f.write("kill-no-restart: SIGKILL val2 pid %d (no restart; height=600 committed=602)\n" % pids[2])
+            f.write(
+                "kill-no-restart: SIGKILL val2 pid %d (no restart; height=600 committed=602)\n"
+                % pids[2]
+            )
         r = self.lib(
             self.drv,
             'watch_nodes %s %d; echo "WN=$?"' % (shlex.quote(self.cell), hp.pid),
@@ -2339,7 +2350,9 @@ class SamplerCheckTest(Base):
         self.assertIn("CHECK OK %s hardscan done" % LB, r.stdout)
 
 
-SOAK_MD5 = "f147d7c657b2d71f9bc2934825845695"  # the s58rl / p4soak10 hand drivers' soak-sampler.py
+# the s58rl / p4soak10 hand drivers' soak-sampler.py (f147d7c6), s138 + every port it is given and one host-1hz
+# column group per node pid (4 with N_VALIDATORS=4; 3 nodes: the same output)
+SOAK_MD5 = "c66f90b8c375f9aa02a1d9ae5b4fc6b2"
 HOST_1HZ_HEADER = "\t".join(
     ["ts", "Dirty_kB", "Writeback_kB", "MemAvailable_kB", "Cached_kB"]
     + [
@@ -4539,6 +4552,219 @@ class InlineSequenceTest(FakeHostBase):
         )
         self.assertIn(" OVERWRITE=1 DEFER_REPORT_SCANS=1 ", t[t.index("> cell") + 3])
         self.assertEqual(new["rows"], old["rows"])
+
+
+# ---------------------------------------------------------------- node count from N_VALIDATORS (s138 bench 9p)
+
+# the body's per-node functions: each must cover every node of a 4-validator driver
+PER_NODE_FUNCS = ("hardscan", "dusamp", "ckptsamp", "dumeas", "savelog")
+
+
+class FourValidatorTest(Base):
+    """make-driver.py derives the node count from the spec's harness env N_VALIDATORS (default 3): bench 9p's
+    launcher hand-patched NODES=4 and METS (+9164) into the generated drivers, and the val0..val2 loops (hardscan,
+    the samplers, savelog, dumeas, fdsum, soakchk) still skipped val3"""
+
+    def gen4(self, name="d4", **over):
+        spec = minimal_spec(self.tmp, harness_env={"N_VALIDATORS": "4"}, **over)
+        return spec, self.generate(self.write_spec(spec, name + ".json"), name + ".sh")
+
+    def spec_error(self, spec, needle):
+        out = os.path.join(self.tmp, "bad.sh")
+        r = subprocess.run(
+            [sys.executable, "-I", GEN, self.write_spec(spec, "bad.json"), "-o", out],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(needle, r.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_config_n4(self):
+        _, drv = self.gen4()
+        text = open(drv).read()
+        self.assertRegex(text, r"(?m)^NODES=4$")
+        self.assertRegex(text, r"(?m)^METS=\(9161 9162 9163 9164\) ")
+        self.assertNotIn("@@", text)
+        r = subprocess.run(["bash", "-n", drv], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.lib(drv, 'echo "$NODES ${#METS[@]} ${METS[3]}"')
+        self.assertEqual(r.stdout.strip(), "4 4 9164", r.stdout + r.stderr)
+
+    def test_default_and_explicit_3(self):
+        for name, over in (("d3", {}), ("e3", {"harness_env": {"N_VALIDATORS": "3"}})):
+            drv = self.generate(
+                self.write_spec(minimal_spec(self.tmp, **over), name + ".json"),
+                name + ".sh",
+            )
+            text = open(drv).read()
+            self.assertRegex(text, r"(?m)^NODES=3$")
+            self.assertRegex(text, r"(?m)^METS=\(9161 9162 9163\) ")
+            self.assertNotIn("9164", text)
+            self.assertNotIn("@@", text)
+            for fn in PER_NODE_FUNCS:
+                self.assertRegex(func_text(text, fn), r"for [vi] in 0 1 2; do", fn)
+        # explicit 3 = the default, apart from the spec echo in the header and run-cell.sh's env (AHENV)
+        cut = "# >>> GENERATED CONFIG"
+        a, b = (
+            [
+                ln
+                for ln in t[t.index(cut) :].splitlines()
+                if not ln.startswith("AHENV[")
+            ]
+            for t in (
+                open(os.path.join(self.tmp, n)).read() for n in ("d3.sh", "e3.sh")
+            )
+        )
+        self.assertEqual(a, b)
+
+    def test_per_node_loops_cover_val3(self):
+        _, drv = self.gen4()
+        text = open(drv).read()
+        for fn in PER_NODE_FUNCS:
+            body = func_text(text, fn)
+            self.assertRegex(body, r"for [vi] in 0 1 2 3; do", fn)
+            self.assertNotRegex(body, r"for [vi] in 0 1 2; do", fn)
+        self.assertIn("all 4 node pids alive", func_text(text, "stopwin"))
+        soak = func_text(text, "soakchk")
+        self.assertIn("$(($2 * 4))", soak)
+        self.assertIn("(< 4 x $2)", soak)
+
+    def test_hardscan_val3(self):
+        spec, drv = self.gen4()
+        cell = os.path.join(spec["results_root"], LB)
+        os.makedirs(cell)
+        for v in range(4):
+            with gzip.open(os.path.join(cell, "val%d.log.gz" % v), "wt") as f:
+                f.write(
+                    "2026  INFO torus: fine\n"
+                    if v < 3
+                    else "2026 ERROR torus: FATAL boom\n"
+                )
+        r = self.lib(drv, "hardscan %s" % LB)
+        self.assertIn(
+            "HARD FINDING %s: val3 has 1 WARN/ERROR correctness lines" % LB,
+            r.stdout,
+            r.stderr,
+        )
+        self.assertIn("CHECK OK %s hardscan done" % LB, r.stdout)
+
+    def test_fdsum_val3(self):
+        spec, drv = self.gen4()
+        cell = os.path.join(spec["results_root"], LB)
+        os.makedirs(cell)
+        with open(os.path.join(cell, "node-nofile.txt"), "w") as f:
+            f.write(
+                "pid=1 Max open files            1048576              1048576              files\n"
+            )
+        with open(os.path.join(cell, "fds.txt"), "w") as f:
+            f.write("1700000000 100 200 300 400\n1700000005 110 210 - 16385\n")
+        r = self.lib(drv, 'fdsum %s; echo "FD=$?"' % LB)
+        self.assertIn(
+            "fds max/end val0 110/110 val1 210/210 val2 300/300 val3 16385/16385 (limit soft/hard 1048576/1048576)",
+            r.stdout,
+            r.stderr,
+        )
+        self.assertIn("FD=1", r.stdout)
+        with open(os.path.join(cell, "fds.txt"), "w") as f:
+            f.write("1700000000 100 200 300 16384\n")
+        r = self.lib(drv, 'fdsum %s; echo "FD=$?"' % LB)
+        self.assertIn("FD=0", r.stdout, r.stdout + r.stderr)
+
+    def test_dumeas_savelog_val3(self):
+        spec, drv = self.gen4()
+        cell = os.path.join(spec["results_root"], LB)
+        os.makedirs(cell)
+        for v in range(4):
+            d = os.path.join(spec["devnet_dir"], "data", "val%d" % v)
+            os.makedirs(d)
+            with open(os.path.join(d, "LOG"), "w") as f:
+                f.write("rocksdb log val%d\n" % v)
+        r = self.lib(drv, "savelog %s" % LB)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(
+            os.path.exists(os.path.join(cell, "rocksdb-LOG-val3.txt")), r.stdout
+        )
+        self.assertIn("saved RocksDB LOG for %s: 4 files" % LB, r.stdout)
+        du = open(os.path.join(cell, "data-du.txt")).read().splitlines()
+        self.assertEqual([ln.split()[0] for ln in du], ["val0", "val1", "val2", "val3"])
+
+    def test_soakchk_n4(self):
+        spec, drv = self.gen4()
+        cell = os.path.join(spec["results_root"], LB)
+        os.makedirs(cell)
+
+        def soak(scrapes):
+            with gzip.open(os.path.join(cell, "metrics-1hz.txt.gz"), "wt") as z:
+                for i in range(scrapes):
+                    z.write(
+                        "T 1700000%03d.000 val%d ok 0.0012\nx_total 1\n" % (i, i % 4)
+                    )
+            r = self.lib(drv, "soakchk %s 10" % LB)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            return r.stdout
+
+        self.assertIn(
+            "CHECK WARN %s: metrics-1hz has 39 ok scrapes (< 4 x 10)" % LB, soak(39)
+        )
+        self.assertNotIn("metrics-1hz has", soak(40))
+
+    def test_arms_must_agree_and_values(self):
+        spec = minimal_spec(self.tmp, harness_env={"N_VALIDATORS": "4"})
+        spec["arms"][1]["harness_env"] = {"N_VALIDATORS": "3"}
+        self.spec_error(spec, "N_VALIDATORS")
+        self.spec_error(
+            minimal_spec(self.tmp, harness_env={"N_VALIDATORS": "5"}), "N_VALIDATORS"
+        )
+        # set on every arm (none at the top level): the arms' value
+        spec = minimal_spec(self.tmp)
+        for a in spec["arms"]:
+            a["harness_env"] = {"N_VALIDATORS": "4"}
+        drv = self.generate(self.write_spec(spec, "arms4.json"), "arms4.sh")
+        self.assertRegex(open(drv).read(), r"(?m)^NODES=4$")
+        # on one arm only: the other arm runs 3 nodes, a SPEC ERROR
+        spec = minimal_spec(self.tmp)
+        spec["arms"][1]["harness_env"] = {"N_VALIDATORS": "4"}
+        self.spec_error(spec, "N_VALIDATORS")
+
+    def test_soak_sampler_takes_every_port(self):
+        cell = os.path.join(self.tmp, "soakcell")
+        os.makedirs(cell)
+        sl = [subprocess.Popen(["sleep", "2"]) for _ in range(4)]
+        # reap each sleep as it exits (a zombie keeps its /proc entry: the sampler would never see the pids gone)
+        for p in sl:
+            threading.Thread(target=p.wait, daemon=True).start()
+        with open(os.path.join(cell, "run.log"), "w") as f:
+            f.write("[00:00:00] node pids: %s\n" % " ".join(str(p.pid) for p in sl))
+        # closed ports: every scrape is an ERR line, one per port per second
+        r = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                os.path.join(HERE, "soak-sampler.py"),
+                cell,
+                "1",
+                "2",
+                "3",
+                "4",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        head = (
+            open(os.path.join(cell, "host-1hz.tsv")).readline().rstrip("\n").split("\t")
+        )
+        self.assertIn("val3_VmRSS", head)
+        rows = [
+            ln.split("\t")
+            for ln in open(os.path.join(cell, "host-1hz.tsv")).read().splitlines()[1:]
+        ]
+        self.assertTrue(rows)
+        self.assertTrue(all(len(x) == len(head) for x in rows), (head, rows))
+        txt = gzip.open(os.path.join(cell, "metrics-1hz.txt.gz"), "rt").read()
+        self.assertRegex(txt, r"(?m)^T [0-9.]+ val3 ERR ")
 
 
 if __name__ == "__main__":

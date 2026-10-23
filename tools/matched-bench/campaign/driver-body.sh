@@ -66,7 +66,7 @@ QUIET_SAMPLE_S=5        # quiet(): the CPU busy sample's length (MAX_BUSY_PCT)
 SMOKE=          # 1 = the smoke run (apply_smoke); the driver's own, never the caller's
 GENESIS_ROOT=   # run-cell.sh's MAINREPO = $TOOLS/../.. (preflight_genesis)
 DD=${DEVNET:-}          # the devnet data root (data/val<i>, run/pids, run/val<i>.log), the Job 4 helpers' name for it
-METS=(9161 9162 9163)   # the devnet nodes' metrics ports (run-cell.sh METS): memsamp, ckptsamp and SOAKPY scrape them
+METS=(@@METS@@)   # the devnet nodes' metrics ports (run-cell.sh METS): memsamp, ckptsamp and SOAKPY scrape them
 FD_STOP=16384           # samplers: a node that held more open fds in a cell stops the campaign after it (stop-fd)
 CRASHCELL=0             # restart cells are not a generator shape (CRASH_KILL_AT_S is a SPEC ERROR): watch_nodes' restart branch never runs
 # host checks: the sysctls each cell's sysctl.txt line records (the Job 4 set); the dirty limits are held to the
@@ -279,7 +279,7 @@ watch_nodes() { # from ozarchy-acc-campaign.sh; restart cells: val1 may be dead 
 stopwin() {
     local o=$1 hp=$2 f=$3 t0 t1 n=0
     t0=$(date '+%F %T.%3N')
-    echo "$t0 all 3 node pids alive at every 0.5 s check until the harness stop began (stopping pid seen; previous check <= ~0.6 s earlier)" >> "$f"
+    echo "$t0 all @@NODES@@ node pids alive at every 0.5 s check until the harness stop began (stopping pid seen; previous check <= ~0.6 s earlier)" >> "$f"
     until grep -q '^stopped\.$' "$o/run.log"; do sleep 0.2; n=$((n+1)); [ $n -gt 600 ] && { echo "no 'stopped.' line after 120 s" >> "$f"; return 0; }; done
     t1=$(date '+%F %T.%3N')
     echo "stop-3val window (contains its TERM + kill -9 of the node pids $(sed 's/.*node pids: //' <<< "$(grep -m1 '\] node pids: ' "$o/run.log")")): from <= $t0 to $t1 (local, CEST)" >> "$f"
@@ -294,7 +294,7 @@ memguard() { # unit: stop the cell unit if host MemAvailable < 6 GB (RAM headroo
 }
 hardscan() { # label: correctness evidence per validator log (WARN/ERROR level only) -> HARD FINDING lines. Recorded, never aborts.
     local label=$1 o=$R/$1 v n pat='STATE HASH MISMATCH|FATAL|panicked|could not be fully replayed|FAIL-STOP|fail-stop|conflicting blocks|replay stopped'
-    for v in 0 1 2; do
+    for v in @@NODE_IDX@@; do
         n=$(zcat "$o/val$v.log.gz" | sed 's/\x1b\[[0-9;]*m//g' | grep -E "$pat" | grep -cvE ' (INFO|DEBUG|TRACE) ')
         [ "$n" = 0 ] || echo "HARD FINDING $label: val$v has $n WARN/ERROR correctness lines: $(zcat "$o/val$v.log.gz" | sed 's/\x1b\[[0-9;]*m//g' | grep -E "$pat" | grep -vE ' (INFO|DEBUG|TRACE) ' | head -2 | cut -c1-300 | tr '\n' '|')"
     done
@@ -308,7 +308,7 @@ dusamp() { # o: every 2 s: epoch, du -sb of each validator data dir under $DD, M
     local o=$1 v line
     while :; do
         line="$(date +%s.%N)"
-        for v in 0 1 2; do line="$line $(du -sb "$DD/data/val$v" 2>/dev/null | cut -f1)"; done
+        for v in @@NODE_IDX@@; do line="$line $(du -sb "$DD/data/val$v" 2>/dev/null | cut -f1)"; done
         line="$line mem_avail_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo) shm_used_kb=$(df --output=used -k /dev/shm | tail -1 | tr -d ' ')"
         echo "$line" >> "$o/data-du-samples.txt"
         sleep 2
@@ -318,7 +318,7 @@ ckptsamp() { # o: every 2 s, each validator's /metrics: checkpoint family + reje
     # Header line per scrape: "T <epoch> val<i> ok|ERR". Before the nodes are up / after they stop, scrapes are ERR (tolerated).
     local o=$1 i m ts
     while :; do
-        for i in 0 1 2; do
+        for i in @@NODE_IDX@@; do
             ts=$(date +%s.%N)
             if m=$(curl -fsS -m 2 "http://127.0.0.1:${METS[$i]}/metrics" 2>/dev/null); then
                 echo "T $ts val$i ok"
@@ -375,14 +375,14 @@ fdsum() { # label -> "fds max/end val0 a/b val1 c/d val2 e/f (limit soft hard)";
     local o=$R/$1
     [ -s "$o/fds.txt" ] || { echo "fds: none recorded"; return 0; }
     awk -v lim="$(awk '{print $5"/"$6; exit}' "$o/node-nofile.txt" 2>/dev/null)" -v stop=$FD_STOP '
-        { for (i = 2; i <= 4; i++) if ($i != "-") { if ($i > m[i]) m[i] = $i; e[i] = $i } }
-        END { printf "fds max/end val0 %d/%d val1 %d/%d val2 %d/%d (limit soft/hard %s)\n", m[2], e[2], m[3], e[3], m[4], e[4], lim
-              exit (m[2] > stop || m[3] > stop || m[4] > stop) }' "$o/fds.txt"
+        { for (i = 2; i <= @@FD_LAST@@; i++) if ($i != "-") { if ($i > m[i]) m[i] = $i; e[i] = $i } }
+        END { printf "fds max/end @@FD_FMT@@ (limit soft/hard %s)\n", @@FD_ARGS@@, lim
+              exit (@@FD_STOPS@@) }' "$o/fds.txt"
 }
 dumeas() { # label: du -sb of each validator data dir, plus SST and WAL bytes and SST count (before the next CLEAN start)
     local label=$1 v d o=$R/$1/data-du.txt
     : > "$o"
-    for v in 0 1 2; do
+    for v in @@NODE_IDX@@; do
         d=$DD/data/val$v
         echo "val$v total_bytes $(du -sb "$d" | cut -f1) sst_bytes $(find "$d" -maxdepth 1 -name '*.sst' -printf '%s\n' | awk '{s+=$1} END{print s+0}') sst_files $(find "$d" -maxdepth 1 -name '*.sst' | wc -l) wal_bytes $(find "$d" -maxdepth 1 -name '*.log' -printf '%s\n' | awk '{s+=$1} END{print s+0}')" >> "$o"
     done
@@ -392,7 +392,7 @@ savelog() { # label: copy each validator's RocksDB LOG (+ LOG.old.* rotated duri
     # run-cell.sh runs launch-3val.sh with CLEAN=1 (data dirs wiped before every cell), so LOG is this cell's only.
     # A restart cell: LOG.old.* = val1's pre-kill open, LOG = the restarted process's open.
     local label=$1 v f b
-    for v in 0 1 2; do
+    for v in @@NODE_IDX@@; do
         if [ -s $DD/data/val$v/LOG ]; then
             cp -p $DD/data/val$v/LOG "$R/$label/rocksdb-LOG-val$v.txt"
         else
@@ -416,7 +416,7 @@ soakchk() { # label dur: sampler coverage, recorded, never fails (after the Job 
     n=$(zcat "$o/metrics-1hz.txt.gz" 2>/dev/null | grep -c '^T .* ok '); h=$(($(cat "$o/host-1hz.tsv" 2>/dev/null | wc -l) - 1))
     [ "$h" -ge 0 ] || h=0
     echo "CHECK SOAK $1: vmstat rows ${v:-0} (cell $2 s), mem samples ${m:-0}, smaps snapshots $s, fd rows $f, du rows $d, metrics ok scrapes ${k:-0}, metrics-1hz ok scrapes ${n:-0}, host-1hz rows $h"
-    [ "${n:-0}" -ge $(($2 * 3)) ] || echo "CHECK WARN $1: metrics-1hz has ${n:-0} ok scrapes (< 3 x $2)"
+    [ "${n:-0}" -ge $(($2 * @@NODES@@)) ] || echo "CHECK WARN $1: metrics-1hz has ${n:-0} ok scrapes (< @@NODES@@ x $2)"
     [ "$h" -ge "$2" ] || echo "CHECK WARN $1: host-1hz has $h rows (< $2)"
 }
 

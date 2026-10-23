@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ozarchy-p4soak10 1 Hz sidecar (run with python3 -I): soak-sampler.py OUT_DIR PORT0 PORT1 PORT2
+"""ozarchy-p4soak10 1 Hz sidecar (run with python3 -I): soak-sampler.py OUT_DIR PORT0 PORT1 PORT2 [PORT3 ...]
 
 Waits for the harness's "] node pids: " line in OUT_DIR/run.log (up to 900 s), then once per second (aligned to the
 wall-clock second) until every node pid is gone (or SIGTERM):
@@ -86,7 +86,7 @@ def proc(pid):
 
 
 def main():
-    o, ports = sys.argv[1], sys.argv[2:5]
+    o, ports = sys.argv[1], sys.argv[2:]  # one metrics port per node (4 with N_VALIDATORS=4)
     signal.signal(signal.SIGTERM, on_term)
     t0 = time.time()
     pids = None
@@ -116,7 +116,7 @@ def main():
         open(os.path.join(o, "host-1hz.tsv"), "w") as hf,
     ):
         hf.write("ts\tDirty_kB\tWriteback_kB\tMemAvailable_kB\tCached_kB")
-        for i in range(3):
+        for i in range(len(pids)):  # one column group per node pid, as each row
             hf.write("".join("\tval%d_%s" % (i, k) for k in pk))
         hf.write("\n")
         n = 0
