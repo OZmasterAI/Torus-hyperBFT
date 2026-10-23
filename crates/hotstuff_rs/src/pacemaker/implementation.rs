@@ -1221,8 +1221,10 @@ pub fn select_leader(view: ViewNumber, validator_set: &ValidatorSet) -> Verifyin
     // Length of the abstract array.
     let p_total: u128 = powers.iter().map(|p| *p as u128).sum();
 
-    // Index in the abstract array.
-    let index = (view.int() % (p_total as u64)) as u128;
+    // Index in the abstract array. The length is a u128 (a sum of u64 powers): narrowing it to
+    // u64 made a length of 2^64 a zero divisor (Codex batch C P2). For every length below 2^64
+    // the index is the same as with the u64 modulo.
+    let index = view.int() as u128 % p_total;
 
     // Distinct positive power levels, ascending. For thresholds `t` in the segment
     // `(prev_level, level]` no validator power lies strictly between the bounds, so the
