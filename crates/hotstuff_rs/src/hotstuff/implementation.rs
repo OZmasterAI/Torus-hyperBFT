@@ -1891,7 +1891,23 @@ impl<N: Network> HotStuff<N> {
                 // removed was silently discarding those PCs. Restore it for
                 // the transition window only; in steady state the sole CVS
                 // collector's PCs remain correct by construction.
-                if block_tree.validator_set_state()?.update_decided() {
+                // s140: "steady state" also needs the collector pair to be steady. The pacemaker's
+                // AdvanceView path can mark the update decided (`advance_highest_pc_from_remote` on
+                // another aggregator's Decide PC) while this pair still holds the window's PVS
+                // collector; an old-set quorum of late Decide votes then completes it. Such a PC
+                // is checked (and dropped, with the stale collector) like a window PC. The update
+                // is already decided, so dropping it costs no progress.
+                let validator_set_state = block_tree.validator_set_state()?;
+                if validator_set_state.update_decided()
+                    && self.phase_vote_collectors.has_pvs_collector()
+                {
+                    let _ = self
+                        .phase_vote_collectors
+                        .update_validator_sets(&validator_set_state);
+                    if !new_pc.is_correct(self.config.chain_id, block_tree)? {
+                        return Ok(());
+                    }
+                } else if validator_set_state.update_decided() {
                     debug_assert!(
                         new_pc.is_correct(self.config.chain_id, block_tree)?,
                         "locally-collected steady-state PC must be correct by construction"
