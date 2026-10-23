@@ -20538,6 +20538,255 @@ Inclusive (the stack contains the item):
     `o_viewwin.py` -> `9o_viewwin.txt`; `9o_view_metrics.txt`; `9o_propose_stats.txt`.
   * 9m: `9m-{std,deep}-w2-{self,children}.txt` (`perf report`); `m_union.py` -> `9m_union.txt`.
 
+## 127. Steps 9n (restart probe), 9q Part A, 9l step 1: deep-book cell D (1M accounts + 1M pre-loaded resting orders) on main `9083b278` + the section 93.5 restart probe, testnet config, `ORACLE_FEED=seed`, n = 1; epoch-plan hand-off A/B on main `b17dab16` (`TORUS_EPOCH_PLAN_HANDOFF` 0 / 1, deep CL21, 3 validators all up, ABBA, n = 2 per arm); binary gap RA `53a6d83c` vs RB `29bfc705` on the frozen 9j2 harness (Classic, hash off, no attestation, L3.1 on, L2.1 off, 15 s checkpoints), std and deep, round-matched, n = 3 per arm and shape; 300 s cells (9n 600 s) (chain bench-s139-chain, run dir ozarchy-s139-run, archy, 2026-10-23/24)
+
+**9n: RAM and the deep-book throughput still pass; restarts work but take 3x longer than in section 93.5.**
+* Restarts (ready = +5 commits): SIGTERM 11.3 s, SIGKILL 9.6 s (93.5: 3.0 / 3.5 s). Cold, all 3 nodes: 11.5 / 13.6
+  / 14.2 s (93.5: 7.5 / 8.1 / 8.7 s).
+  * After every restart: books visible (1,107,732 resting on all nodes), commits resume (20,100 -> 22,000), block
+    hash agrees at 21,798, the state digest equals the cell's end digest. Probe findings 0.
+  * Sized: every start spends 4.67-4.77 s between "databases opened" and the book-mode line. That is
+    `load_genesis` (P0.0 phase 4 genesis-digest binding) reading the 295 MB 1M-account genesis. The std smoke
+    takes 0.46-0.48 s for the same step. The SIGTERM restart then waits ~4 s for the next view: with 3 equal stakes
+    the chain halts while one node is down (val0 commits stop 9.4 s).
+* RSS during the load: mean 4.3-5.5 GB, peak 5.0-6.5 GB, HWM <= 6.85 GB, swap 0 (93: 8.1-9.2 GB). After the
+  restarts: 2.3-3.0 GB at ready.
+* Throughput D: 240,565 matched/s, 22.4 blocks/s, commit interval p50 / p99 11.9 / 468 ms. Section 126.3 D: 247,334,
+  21.9, 12.5 / 463. That is -2.7%, n = 1, and the feed mode differs (126: `ORACLE_FEED=1`).
+
+**9q Part A: PASS.** With the flag on: 0 "has not applied the previous boundary" WARNs (off: 10). Load-window
+timeouts fall from 29 to 0 (-100%). Matched/s -0.1% ± 1.4% (not resolved).
+
+**9l step 1: exec-thread CPU per fill does not resolve on either shape. Per the queue rule: recorded, stop; step 2
+(perf profile) is not triggered.** The matched/s gap is confirmed on both shapes: RB / RA 0.981 (std), 0.979
+(deep).
+
+Question (bench queue 9n, 9q, 9l; owner GO s138 / s140):
+* 9n (gates the testnet launch): restart times with 1M resting orders (cold / SIGTERM / SIGKILL), RSS, agreement
+  after the restarts, and that commits resume. Compare with section 93.5. D's throughput vs section 126.3.
+* 9q: pass = flag-on WARNs 0, timeouts -80% or more, matched/s within noise or better.
+* 9l: does exec-thread on-CPU per fill resolve (CI excludes 1) on either shape? If not, record it and stop.
+
+### 127.1 Setup
+
+* Binaries (node md5 checked on 3 nodes in every cell, `campaign.log` CHECK OK + `node-environ-trie.txt`):
+  * D: main `9083b278`, node `be973e9db49c72f76e8a7e99c5c95c7f`, bench `265fe336`;
+  * OFF / ON: main `b17dab16`, node `8649845df29e0ef35282813580649c3f`, bench `10680403`;
+  * RA: `53a6d83c`, node `43f04f6ab10b0d8da37073260d31e6ec`, bench `c4aa84fb`;
+  * RB: `29bfc705`, node `f4f2679f598ce0d9810eb796227561b8`, bench `fa8fd4bd`.
+* 9n and 9q run the testnet config: hash (`activation=Some(1)`) + attestation + L6.1 + L2.1 + fail-stop on, startup
+  lines checked on val0..val2 (configchk / q9chk). Both run seed mode; s138's 9n cells ran `ORACLE_FEED=1`.
+* 9n: one D cell (600 s, no warm-up; preload 1,000,000 orders in 24 s), then the restart probe on its data dirs
+  (`ozarchy-s139-tools/probe/post-restart-probe.sh`, a port of `ozarchy-8f-b/post-restart.sh` to the `9083b278`
+  tooling): cold start of all 3 nodes, SIGTERM val1, SIGKILL val1, 30 s apart. The chain is idle (after the load).
+* 9q: deep CL21 shape, order r1-OFF r1-ON r2-ON r2-OFF, data dirs wiped, no warm-up. Part B was not run (held with
+  9p).
+* 9l: frozen 9j2 harness (main `0f8eedb3` + `fix/attest-hole-wait` `1aa2fd0a`), R's env. Per shape: w1 (RA, warm-up
+  gate) + r1 RA RB, r2 RB RA, r3 RA RB.
+  * Startup lines, all 14 cells, val0..val2: `running state hash activation=None` (hash off) in both arms; no
+    attestation; RB prints `TORUS_SETTLE_STREAMED ... on=false`; RA prints no such line (`9l_startup_lines.txt`).
+  * 18c decision (section 126.6): RA has no L2.1 code, so its missing line counts as L2.1 off (RA only). L2.1
+    present-but-off in RB is part of the gap measured, not a confound.
+* Load (all items): 300 markets, rate 76,000, 5,000 senders, batch 400, `MAX_IN_FLIGHT` 4, commit tail.
+* Metrics as section 124.4: exec-thread on-CPU ms per 1k fills = `torus-execution` on-CPU / fills; CPU-s per 1M fills
+  = process user + sys / fills; both are load-window means of 3 nodes. Commit interval and order age at commit p50 /
+  p99 come from `buckets.csv`, load-window deltas, mean of 3 nodes.
+* Statistics:
+  * 9l: RB / RA = geomean of the 3 round ratios, 95% t CI (2 df). (sd) = Welch step / pooled sd.
+  * 9q: Welch step ± 95% CI (2 df), (sd) = step / pooled sd.
+
+### 127.2 Validity
+
+* 20 cells (9n 1, 9q 4, 9l 2 x 7): all rc 0, ACCEPT / AGREE / PASS, md5 ok, `panic_or_failstop_lines` 0.
+  * 9n and 9q `log-summary.json`: failures [], sync fallback 0, exhausted 0, DA outbound failures 0.
+  * 9n in-cell state attest: 63 / 63 heights equal.
+* No CELL-FLAG, no rerun ("RERUN PASS: nothing queued" in all four campaigns). `campaign.done` exit=0.
+* The probe's agreement check compares block hash + `stateRoot`. `stateRoot` is `0x00..00` on all nodes (native trie
+  maintenance off; also in the std smoke), so that leg checks nothing. Agreement rests on the block hash and the
+  state digest.
+* Smoke-only, not scored: `smoke/` (9n-probe-std, 9q-on, 9l-std-RA, 9l-deep-RA / RB) and
+  `ozarchy-s139-9q-smk-attempt1-checkfail` (checker pattern, fixed before the chain).
+
+### 127.3 9n: restart probe (`ozarchy-s139-9n-deep/probe/post.log`)
+
+| restart | exit | metrics / RPC up | ready (+5 commits) | books visible (1,107,732) | RSS at ready MB (HWM) |
+|---|---|---|---|---|---|
+| cold, all 3 (val0 / val1 / val2) | - | 9.9 / 11.5 / 13.7 s | 11.5 / 13.6 / 14.2 s | 14.3 / 14.3 / 14.4 s | 2,724 / 2,322 / 2,815 (3,586 / 4,242 / 4,184) |
+| SIGTERM val1 | 0.6 s | 5.0 s | 11.3 s | 11.4 s | 2,977 (3,632) |
+| SIGKILL val1 (replay 101 blocks) | 0.2 s | 8.6 s | 9.6 s | 9.7 s | 2,655 (3,565) |
+| section 93.5: SIGTERM / SIGKILL | 0.4 / 0.2 s | 0.9 / 2.9 s | 3.0 / 3.5 s | 3.1 / 3.6 s | 1,929 / 1,820 |
+
+* Cold times are upper bounds for val1 / val2, as in 93.5: the probe polls the nodes in turn.
+* Start phases (val logs, `9n_restart_phases.txt`):
+  * DB open: 0.09 s (SIGTERM), 1.47 s (SIGKILL, WAL recovery);
+  * genesis load: 4.67-4.77 s in all 5 starts (std smoke: 0.46-0.48 s);
+  * replay: 2.37 s for 101 blocks (SIGKILL only).
+  * SIGTERM: RPC up at +5.0 s; then no commit until +9.4 s after the stop. The chain halts with one of 3 equal
+    stakes down, and resumes ~4 s after val1 is back.
+* After the probe: heads 21,800 on all 3 nodes, block hash equal at 21,798 (POST AGREE). State digest `0d2fac71` on
+  all 3 nodes, equal to the cell end digest (POST DIGEST AGREE). Final heights 22,000, RSS 2.5-2.8 GB.
+
+| metric (D) | 93 M | 126 D (w1 / r1) | 127 D |
+|---|---|---|---|
+| matched/s | 219,484 | 248,056 / 246,613 | 240,565 |
+| blocks/s (total; native) | 2.98 native | 21.7 / 22.2; 21.7 / 22.2 | 22.4; 14.17 (8.24 empty) |
+| fills per native block | 71.6k | 11,168 / 10,852 | 16,883 |
+| exec block_ms | 322.1 | 43.66 / 42.16 | 62.83 |
+| save_books ms / blk (per 1k fills) | 76.7 | 1.28 / 1.25 (0.115) | 1.96 (0.116) |
+| ckpt settle wait ms / blk | 24.7 | 0.24 / 0.23 | 0.28 |
+| engine ms / 1k fills | 2.56 | 3.15 / 3.14 | 2.95 |
+| commit interval p50 / p99 ms | 240 / 1,416 | 12.9 / 458; 12.1 / 468 | 11.9 / 468 |
+| order age at commit p50 / p99 ms | | | 315 / 5,545 |
+| timeouts | | 3 / 1 | 3 |
+| RSS load mean / peak MB (val0 / val1 / val2) | 6,562-7,754 / 8,121-9,215 | 4,400-5,205 / 5,270-6,722 | 4,500 / 4,314 / 5,479; 5,739 / 5,040 / 6,458 |
+| HWM MB | <= 9,328 | <= 6,846 | 5,881 / 5,603 / 6,848 |
+
+* Seed mode leaves 8.24 empty blocks/s, while 126's feed-on cells had 0. So native blocks/s and fills per native
+  block do not compare across the two; total blocks/s does (22.4 vs 21.9).
+* `save_books` per 1k fills is unchanged (0.116 vs 0.115 ms). The higher per-block value comes from the bigger
+  native blocks.
+* Matched/s -2.7% vs 126 D (-6.6 sd of 126's w1 / r1 spread, but n = 1). Section 126.6's single-cell seed-mode cost
+  was -1.6%. Not attributable.
+
+### 127.4 9q Part A: epoch-plan hand-off (`TORUS_EPOCH_PLAN_HANDOFF`)
+
+Per cell (run order). WARN = "has not applied the previous boundary" lines. Timeouts =
+`torus_consensus_timeout_total_total`, after - before the load (whole node life in brackets):
+
+| cell | matched/s | blk/s (native) | fills / native blk | commit p50 / p99 ms | order age p50 / p99 ms | WARN val0 / 1 / 2 | timeouts val0 / 1 / 2 |
+|---|---|---|---|---|---|---|---|
+| r1-OFF | 242,910 | 18.6 (10.52) | 22,965 | 10.7 / 505 | 695 / 7,542 | 4 / 0 / 4 | 8 / 8 / 7 (9 / 8 / 7) |
+| r1-ON | 241,555 | 20.8 (13.36) | 17,937 | 13.1 / 482 | 371 / 6,276 | 0 / 0 / 0 | 0 / 0 / 0 (0 / 0 / 1) |
+| r2-ON | 242,711 | 18.5 (10.85) | 22,171 | 12.1 / 508 | 752 / 8,024 | 0 / 0 / 0 | 0 / 0 / 0 (0 / 0 / 1) |
+| r2-OFF | 241,898 | 20.0 (12.54) | 18,926 | 12.4 / 489 | 461 / 5,234 | 1 / 1 / 0 | 2 / 2 / 2 (3 / 2 / 2) |
+
+| metric | OFF | ON | ON - OFF [CI] | % | (sd) |
+|---|---|---|---|---|---|
+| WARNs, sum of 3 nodes per cell | 8, 2 | 0, 0 | | -100% | |
+| timeouts in the load window, sum per cell | 23, 6 | 0, 0 | | -100% | |
+| matched/s | 242,404 | 242,133 | -271 ± 3,305 | -0.1% | -0.35 |
+| blocks/s | 19.30 | 19.65 | +0.35 ± 5.79 | +1.8% | +0.26 |
+| commit p50 / p99 ms | 11.6 / 497 | 12.6 / 495 | not resolved | | +1.0 / -0.15 |
+| order age p50 / p99 ms | 578 / 6,388 | 562 / 7,150 | not resolved | | -0.07 / +0.53 |
+
+* ON's one whole-life timeout on val2 happened before the load (counter 1 before and after).
+* The cells fall into two regimes regardless of arm: 18.5-18.6 blocks/s with 22-23k fills per block (r1-OFF, r2-ON)
+  and 20.0-20.8 with 18-19k (r1-ON, r2-OFF). Hence the wide blocks/s and latency CIs.
+* Sized: the up to 23 timeouts per 300 s cell in OFF cost nothing measurable in matched/s. r1-OFF, with the most
+  timeouts, has the highest matched/s. The CI rules out a gain or a loss above ~1.4%.
+* Drift: 242.9k / 241.6k / 242.7k / 241.9k in run order. None.
+* Boundary stall seconds (queue column) are not measured by this harness.
+
+### 127.5 9l step 1: RA `53a6d83c` vs RB `29bfc705` (exec-path rule rows, section 91)
+
+Per cell (run order; node mean):
+
+| cell | matched/s | native blk/s | fills / blk | exec-thread ms / 1k fills | CPU-s / 1M fills | commit p50 / p99 ms | exec block_ms | timeouts |
+|---|---|---|---|---|---|---|---|---|
+| std w1 (RA, gate) | 270,275 | 15.48 | 16,524 | 2.512 | 22.60 | 13.4 / 655 | 56.3 | 0 |
+| std r1-RA | 273,221 | 17.08 | 15,068 | 2.530 | 22.69 | 13.7 / 579 | 52.0 | 0 |
+| std r1-RB | 266,479 | 21.65 | 11,748 | 2.544 | 23.43 | 11.8 / 470 | 41.9 | 1 |
+| std r2-RB | 267,289 | 20.90 | 12,197 | 2.546 | 23.48 | 12.6 / 476 | 43.8 | 2 |
+| std r2-RA | 272,877 | 15.40 | 16,707 | 2.455 | 22.19 | 13.3 / 686 | 55.5 | 0 |
+| std r3-RA | 270,943 | 15.85 | 16,056 | 2.484 | 22.36 | 13.7 / 666 | 54.1 | 0 |
+| std r3-RB | 267,419 | 21.74 | 11,747 | 2.542 | 23.41 | 11.7 / 472 | 41.9 | 1 |
+| deep w1 (RA, gate) | 267,029 | 15.32 | 16,398 | 2.593 | 23.49 | 13.5 / 693 | 58.5 | 2 |
+| deep r1-RA | 267,115 | 16.12 | 15,558 | 2.604 | 23.63 | 13.2 / 626 | 56.1 | 1 |
+| deep r1-RB | 261,457 | 17.32 | 14,090 | 2.546 | 23.95 | 14.7 / 501 | 50.4 | 6 |
+| deep r2-RB | 260,982 | 18.74 | 13,248 | 2.605 | 24.31 | 13.7 / 487 | 48.9 | 7 |
+| deep r2-RA | 267,882 | 14.89 | 16,889 | 2.571 | 23.30 | 13.3 / 715 | 59.5 | 2 |
+| deep r3-RA | 265,966 | 15.29 | 16,313 | 2.571 | 23.34 | 13.4 / 704 | 57.4 | 2 |
+| deep r3-RB | 261,424 | 21.12 | 11,812 | 2.630 | 24.24 | 11.1 / 478 | 44.1 | 1 |
+
+Arm means and RB / RA (n = 3 per arm, w1 not counted; `s139_cells.txt`):
+
+| metric | std RA | std RB | std RB / RA [CI] (sd) | deep RA | deep RB | deep RB / RA [CI] (sd) | 124 cross-campaign (deep / std) |
+|---|---|---|---|---|---|---|---|
+| matched/s | 272,347 | 267,062 | **0.981 [0.966, 0.995]** (-5.6) | 266,987 | 261,288 | **0.979 [0.968, 0.990]** (-8.1) | 0.983 / 0.970 |
+| **exec-thread on-CPU ms / 1k fills** | 2.490 | 2.544 | 1.022 [0.983, 1.062] (+2.0) | 2.582 | 2.593 | 1.004 [0.947, 1.066] (+0.3) | 1.053 / 1.087 |
+| CPU-s per 1M fills | 22.41 | 23.44 | **1.046 [1.015, 1.078]** (+5.6) | 23.42 | 24.16 | 1.032 [0.993, 1.072] (+4.0) | 1.023 / 1.048 |
+| native blocks/s | 16.11 | 21.43 | **1.331 [1.197, 1.481]** (+7.7) | 15.43 | 19.06 | 1.232 [0.899, 1.688] (+2.5) | 0.974 / 1.321 |
+| fills per native block | 15,944 | 11,897 | **0.747 [0.681, 0.819]** (-6.6) | 16,254 | 13,050 | 0.801 [0.605, 1.062] (-3.4) | |
+| commit p50 ms | 13.6 | 12.0 | 0.888 [0.770, 1.024] (-3.9) | 13.3 | 13.2 | 0.983 [0.672, 1.439] (-0.1) | |
+| commit p99 ms | 644 | 473 | **0.736 [0.596, 0.910]** (-4.2) | 682 | 489 | **0.718 [0.568, 0.907]** (-5.5) | |
+| exec block_ms | 53.8 | 42.5 | **0.790 [0.753, 0.830]** (-7.7) | 57.7 | 47.8 | 0.828 [0.680, 1.008] (-3.8) | |
+| engine ms / 1k fills | 2.90 | 3.01 | 1.039 [0.987, 1.094] (+3.2) | 3.01 | 3.06 | 1.015 [0.941, 1.095] (+1.0) | |
+
+* Per-round exec-thread ratios: std 1.006 / 1.037 / 1.023 (all > 1, CI still includes 1); deep 0.978 / 1.013 /
+  1.023.
+* Sized: if the exec thread were the limit, +2.2% exec CPU per fill (std) would explain the full -1.9% matched/s.
+  Deep's +0.4% explains about a fifth of its -2.1%. Exec-thread cores (on-CPU per fill x matched/s) are equal in
+  both arms: std 0.678 vs 0.679, deep 0.689 vs 0.678.
+  * Exec block wall per 1k fills from arm means, no CI: std 3.38 -> 3.58 ms (+5.9%), deep 3.55 -> 3.66 ms (+3.2%).
+    Wall per fill rises more than on-CPU per fill. Lead: per-block off-CPU time in RB's smaller, more frequent
+    blocks.
+* Process CPU per fill is +4.6% (std, resolved) / +3.2% (deep). That is +1.03 / +0.74 CPU-s per 1M fills, mostly
+  off the exec thread.
+* RB cuts fills per block and commit p99 on both shapes; std native blocks/s +33% (124: +32%).
+* The cross-campaign exec-thread lead of section 124 (+5.3% / +8.7%) does not reproduce side by side: +0.4% / +2.2%,
+  not resolved. Matched/s and CPU per fill do reproduce.
+* Drift: std RA 273.2k / 272.9k / 270.9k, RB 266.5k / 267.3k / 267.4k; deep RA 267.1k / 267.9k / 266.0k, RB
+  261.5k / 261.0k / 261.4k. None. In the std campaign the 1-minute host load at cell start was 15-22 (the previous
+  cell's tail; 13 s gaps), deep 2-3. It hits both arms alike.
+
+### 127.6 Verdict
+
+* **9n (testnet gate): RAM PASS, deep-book throughput PASS, restarts PASS on correctness but 3x slower than 93.5
+  (medium confidence; n = 1, idle-chain probe).**
+  * HWM <= 6.85 GB (93: 9.3 GB).
+  * Deep throughput holds: 22.4 blocks/s, commit p50 / p99 as 126, `save_books` per fill as 126.
+  * All three restart kinds recover with equal block hash and state digest, books visible, and commits resuming.
+  * Ready takes 11.3 s (SIGTERM) and 9.6 s (SIGKILL) vs 3.0 / 3.5 s. 4.7 s of every start is the genesis-file load
+    (295 MB at 1M accounts).
+  * The queue sets no restart-time bar. Whether ~10 s is acceptable is an owner call. On this 3-equal-stake devnet
+    it is also the chain outage per restart.
+* **9q Part A: PASS (high confidence on the WARN / timeout rows, medium on matched/s).** ON: 0 WARNs and 0 load
+  timeouts in both cells; OFF: 2-8 WARNs and 6-23 timeouts per cell. Matched/s -0.1% ± 1.4%. Part B is still open.
+* **9l step 1: not resolved; stop at step 1 per the queue rule (medium confidence).**
+  * Exec-thread on-CPU per 1k fills: RB / RA 1.022 [0.983, 1.062] std, 1.004 [0.947, 1.066] deep.
+  * The gap itself is real: matched/s 0.981 / 0.979, both resolved, consistent with 124.
+  * CPU per fill is +4.6% (std, resolved). RB makes smaller blocks (std fills per block -25%).
+  * The cause does not show as exec-thread CPU at n = 3. Step 2 (exec-thread perf) is not triggered.
+
+### 127.7 Limits and next
+
+* 9n: one D cell, no S cell in this run, seed mode vs 126's feed-on cells. Restarts ran on the idle chain after the
+  load, not under load.
+  * Next if the owner wants the restart time back: an 18c look at `load_genesis` cost at 1M accounts (parse + digest
+    on every start).
+  * A crash-kill restart under load at 1M is still not measured.
+* 9q: n = 2 per arm. The matched/s CI is ±1.4%. Boundary stall seconds are not measured. Part B (4 validators,
+  `DL_K=3`, flag off x1 / on x1) waits with 9p.
+* 9l: n = 3 per arm (2 df). The exec-thread CI half-width is ~4-6%, so a step of ~2% is below what this design can
+  resolve.
+  * If the owner still wants the -2% matched/s explained: a whole-process / off-CPU look at per-block cost in RB
+    (block cadence, fills per block). That is outside the queue's step 2, which profiles the exec thread only.
+  * Or a fresh campaign with n = 6 per arm and shape (per-round ratio sd 1.5% std, 2.4% deep, gives a CI half-width
+    of ~1.6% / ~2.5%): w1 + 12 cells per shape, ~3 h 40 min at this run's cell times (std ~6.4 min, deep ~10.6 min).
+
+### 127.8 Data
+
+* 9n cell: `~/bench-results-matched/ozarchy-s139-9n-deep-r1-D` (`summary.json`, `buckets.csv`, `mem-samples.txt`,
+  `preload.json`, `state-attest.json`, `log-summary.json`, `node-environ-trie.txt`) and its `.campaign.log` /
+  `.cell.rc`.
+  * Probe: `ozarchy-s139-run/ozarchy-s139-9n-deep/probe/` (`post.log`, `run/val{0,1,2}.log`,
+    `state-digest-val*.txt`, `digest-val*.out`).
+  * Std smoke probe: `ozarchy-s139-run/smoke/9n-probe-restart/`.
+* 9q cells: `~/bench-results-matched/ozarchy-s139-9q-{r1-OFF,r1-ON,r2-ON,r2-OFF}` (`summary.json`, `buckets.csv`,
+  `metrics-{before,after}-val*.txt`, `val*.log.gz`, `log-summary.json`).
+* 9l cells: `~/bench-results-matched/ozarchy-s139-9l-{std,deep}-{w1,r1-RA,r1-RB,r2-RB,r2-RA,r3-RA,r3-RB}` (same
+  files).
+* Campaign: `ozarchy-s139-run/`:
+  * `handoff.json`, `campaign.log`, `campaign.done` (exit=0);
+  * `ozarchy-s139-{9n-deep,9q,9l-std,9l-deep}/cells.tsv`;
+  * smokes in `smoke/`, `smoke{,2,3}.log`.
+* Tools: `ozarchy-s139-tools/` (`chain-s139.sh`, `drivers/`, `checks/9q-checks.sh`, `checks/9l-checks.sh`,
+  `probe/post-restart-probe.sh`).
+* Analysis: `ozarchy-s139-tools/analyst/`:
+  * `s139_cells.py` -> `s139_cells.txt` (all per-cell rows, 9q steps, 9l ratios);
+  * section 126's `n_cells.py` / `n_mem.py` -> `9n9q_cells.txt`, `9n_mem.txt`;
+  * `9n_restart_phases.txt`, `9l_startup_lines.txt`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
