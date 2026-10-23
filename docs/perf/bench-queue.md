@@ -1156,9 +1156,9 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    4.0 -> 76.7 ms per block. L3.1 / L3.3 / L6.1 target that save (sections 117, 120). Question: is the deep-book
    slowdown gone on today's main? Report RSS (peak / mean), restarts (SIGTERM / SIGKILL), matched/s, blocks/s, p50 /
    p99, `save_books` and checkpoint settle wait per block, vs the standard cell. Doc target: next results-doc section.
-9q. **[GO s140, after 9p] Epoch-plan hand-off A/B (`TORUS_EPOCH_PLAN_HANDOFF`, node-local, default off).** Branch
-   `fix/epoch-plan-logical-ready` `7879ef63` (or its merge commit on main once landed; one binary, both arms differ only
-   by the env flag). Problem: under load the leader of boundary H refuses "epoch boundary: execution has not applied the
+9q. **[GO s140, after 9p] Epoch-plan hand-off A/B (`TORUS_EPOCH_PLAN_HANDOFF`, node-local, default off).** LANDED on
+   main `b17dab16` (merge of `fix/epoch-plan-logical-ready` `7879ef63`): build and pin main `b17dab16`; one binary, both
+   arms differ only by the env flag. Problem: under load the leader of boundary H refuses "epoch boundary: execution has not applied the
    previous boundary yet" because readiness reads the durable applied marker (moves only when the checkpoint lands),
    though execution's logical height is already >= H-L; with n=3 each refusal costs a view timeout (s80 premise check:
    212/212 refusals in 9j2 deep cells had logical >= needed; deep CL21 3-4 refusals and 2-4 timeouts per node per 300 s).
