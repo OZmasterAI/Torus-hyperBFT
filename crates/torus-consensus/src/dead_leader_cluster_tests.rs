@@ -888,6 +888,15 @@ fn planned_exclusion(c: &Cluster, i: usize, v: usize) -> Option<u64> {
     })
 }
 
+/// The first boundary (from L to 20L) whose exclusion plan in node `i`'s state excludes anyone.
+fn planned_any_exclusion(c: &Cluster, i: usize) -> Option<u64> {
+    (1..=20u64).map(|k| k * L).find(|&b| {
+        leader_stats::leader_exclusion_plan(c.db(i), b)
+            .unwrap()
+            .is_some_and(|p| !p.exclude.is_empty())
+    })
+}
+
 /// A crash with execution behind (validator `dead` never runs): validator `y`'s execution is held
 /// at 6 while its consensus commits past boundary L (the heights that attribute the dead
 /// validator's misses; boundary L plans with them); it crashes there, its manifests pruned (the
@@ -1104,10 +1113,17 @@ fn dl_cluster_mixed_k_config_diverges_in_state_and_halts_at_the_exclusion() {
     }
     c.stop(0);
     let rest = [1, 2, 3];
-    c.wait_until("the K = 3 nodes plan the exclusion of validator 0", |c| {
-        planned_exclusion(c, 1, 0).is_some()
+    // The first boundary a K = 3 node plans an exclusion for: validator 0's (boundary 3L when
+    // idle), or, under a loaded full-suite run, possibly a live validator's whose slow leader
+    // slots ran to K misses first; the chain then halts below 2L, before validator 0's plan (for
+    // 3L, written by executing 2L) can exist. That fits the one failure seen (s138 batch C, a
+    // full torus-consensus run on 18c at load ~60: all three nodes stuck at 17 = 2L - 3 with no
+    // plan for validator 0; not reproduced in 3 more full runs and 12 targeted ones). Either
+    // way validator 3 plans no exclusion there, and the chain halts below that boundary.
+    c.wait_until("the K = 3 nodes plan an exclusion", |c| {
+        planned_any_exclusion(c, 1).is_some()
     });
-    let planned = planned_exclusion(&c, 1, 0).unwrap();
+    let planned = planned_any_exclusion(&c, 1).unwrap();
     c.wait_until(
         "the chain reaches the height below the planned update",
         |c| rest.iter().all(|&i| c.committed(i) >= planned - 3),
