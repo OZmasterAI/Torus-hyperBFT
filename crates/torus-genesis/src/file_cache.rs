@@ -93,7 +93,10 @@ impl DigestCacheEntry {
             .as_u64()
             .ok_or_else(|| format!("stored genesis digest cache: bad len {}", v["len"]))?;
         Ok(Some(DigestCacheEntry {
-            fingerprint: FileFingerprint { len, sha256: hash("sha256")? },
+            fingerprint: FileFingerprint {
+                len,
+                sha256: hash("sha256")?,
+            },
             digest: hash("digest")?,
         }))
     }
@@ -121,7 +124,7 @@ impl LoadedGenesis {
     /// The cache entry to store once the digest is bound: `Some` when it was
     /// computed (a cached one is already stored).
     pub fn cache_entry_to_store(&self) -> Option<DigestCacheEntry> {
-        (self.source == DigestSource::Computed).then(|| DigestCacheEntry {
+        (self.source == DigestSource::Computed).then_some(DigestCacheEntry {
             fingerprint: self.fingerprint,
             digest: self.digest.digest,
         })
@@ -135,12 +138,33 @@ pub fn load_genesis_file(
     path: &Path,
     cache: Option<(&DigestCacheEntry, &GenesisDigest)>,
 ) -> Result<LoadedGenesis, GenesisError> {
-    let _ = cache;
+    // One read: the bytes fingerprinted / digested are the bytes parsed.
     let text = std::fs::read_to_string(path)?;
-    let genesis = Genesis::from_json(&text)?;
-    let fingerprint = FileFingerprint::of(text.as_bytes());
-    let digest = GenesisDigest::of_json(&text)?;
-    Ok(LoadedGenesis { genesis, digest, fingerprint, source: DigestSource::Computed })
+    // The typed parse (needed for the chain config either way) runs beside
+    // the fingerprint and, on a miss, the full digest.
+    std::thread::scope(|scope| {
+        let typed = scope.spawn(|| Genesis::from_json(&text));
+        let fingerprint = FileFingerprint::of(text.as_bytes());
+        let cached = cache
+            .filter(|(entry, stored)| {
+                entry.fingerprint == fingerprint && entry.digest == stored.digest
+            })
+            .map(|(_, stored)| stored.clone());
+        let (digest, source) = match cached {
+            Some(stored) => (Ok(stored), DigestSource::Cached),
+            None => (GenesisDigest::of_json(&text), DigestSource::Computed),
+        };
+        // The typed parse's error first (it names the field), as before.
+        let genesis = typed
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p))?;
+        Ok(LoadedGenesis {
+            genesis,
+            digest: digest?,
+            fingerprint,
+            source,
+        })
+    })
 }
 
 #[cfg(test)]
@@ -172,7 +196,12 @@ mod tests {
     fn first_boot(text: &str) -> (DigestCacheEntry, GenesisDigest) {
         let (loaded, n) = load(text, None);
         assert_eq!((loaded.source, n), (DigestSource::Computed, 1));
-        (loaded.cache_entry_to_store().expect("a computed digest is stored"), loaded.digest)
+        (
+            loaded
+                .cache_entry_to_store()
+                .expect("a computed digest is stored"),
+            loaded.digest,
+        )
     }
 
     #[test]
@@ -187,7 +216,10 @@ mod tests {
         // handshake see the same value.
         assert_eq!(again.digest, GenesisDigest::of_json(DEVNET).unwrap());
         assert_eq!(again.cache_entry_to_store(), None, "nothing new to store");
-        assert_eq!(again.genesis.chain_name, "torus-devnet", "the typed genesis is still parsed");
+        assert_eq!(
+            again.genesis.chain_name, "torus-devnet",
+            "the typed genesis is still parsed"
+        );
     }
 
     #[test]
@@ -200,20 +232,30 @@ mod tests {
         ] {
             assert_ne!(text, DEVNET);
             let (loaded, n) = load(&text, Some((&entry, &stored)));
-            assert_eq!((loaded.source, n), (DigestSource::Computed, 1), "{text:.120}");
+            assert_eq!(
+                (loaded.source, n),
+                (DigestSource::Computed, 1),
+                "{text:.120}"
+            );
             assert_eq!(loaded.digest, GenesisDigest::of_json(&text).unwrap());
-            assert_ne!(loaded.digest.digest, stored.digest, "an edit changes the digest");
+            assert_ne!(
+                loaded.digest.digest, stored.digest,
+                "an edit changes the digest"
+            );
         }
     }
 
     #[test]
     fn a_reformatted_file_is_digested_again_and_keeps_its_digest() {
         let (entry, stored) = first_boot(DEVNET);
-        let compact = serde_json::to_string(&serde_json::from_str::<Value>(DEVNET).unwrap()).unwrap();
+        let compact =
+            serde_json::to_string(&serde_json::from_str::<Value>(DEVNET).unwrap()).unwrap();
         let (loaded, n) = load(&compact, Some((&entry, &stored)));
         assert_eq!((loaded.source, n), (DigestSource::Computed, 1));
         assert_eq!(loaded.digest, stored);
-        let new = loaded.cache_entry_to_store().expect("the new bytes get an entry");
+        let new = loaded
+            .cache_entry_to_store()
+            .expect("the new bytes get an entry");
         assert_eq!(new.fingerprint, FileFingerprint::of(compact.as_bytes()));
         let (again, n) = load(&compact, Some((&new, &stored)));
         assert_eq!((again.source, n), (DigestSource::Cached, 0));
@@ -235,7 +277,10 @@ mod tests {
         let bad = edit(|v| v["evm"]["block_interval"] = 0.into());
         let fp = FileFingerprint::of(bad.as_bytes());
         let digest = GenesisDigest::of_json(&bad).unwrap();
-        let entry = DigestCacheEntry { fingerprint: fp, digest: digest.digest };
+        let entry = DigestCacheEntry {
+            fingerprint: fp,
+            digest: digest.digest,
+        };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("genesis.json");
         std::fs::write(&path, &bad).unwrap();

@@ -288,9 +288,13 @@ pub fn read_genesis_digest_cache(state: &StateDb) -> Option<DigestCacheEntry> {
     })
 }
 
+/// Written after the digest it names (a crash in between leaves no entry or
+/// a stale one, both ignored), and only once the binding check passed.
 fn store_genesis_digest_cache(state: &StateDb, entry: &DigestCacheEntry) -> Result<(), String> {
-    let _ = (state, entry);
-    Ok(())
+    state
+        .put_cf_raw(CF_CONSENSUS_META, META_GENESIS_DIGEST_CACHE, &entry.encode())
+        .and_then(|()| state.sync_wal())
+        .map_err(|e| format!("store the genesis digest cache: {e}"))
 }
 
 /// Boot: read the `--genesis` file and digest it. A data dir whose stored
@@ -383,9 +387,14 @@ pub fn write_genesis_binding(
     new_cache: Option<&DigestCacheEntry>,
     plan: GenesisPlan,
 ) -> Result<GenesisBinding, String> {
-    let store_cache = || match new_cache {
-        Some(entry) => store_genesis_digest_cache(&dbs.state, entry),
-        None => Ok(()),
+    // Advisory: a failed write only costs the next boot a full digest.
+    let store_cache = || -> Result<(), String> {
+        if let Some(entry) = new_cache {
+            if let Err(e) = store_genesis_digest_cache(&dbs.state, entry) {
+                tracing::warn!("{e}; the next boot digests the genesis file in full");
+            }
+        }
+        Ok(())
     };
     match plan {
         GenesisPlan::Matched => {
