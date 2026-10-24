@@ -1149,8 +1149,14 @@ fn r2_db() -> (StateDb, tempfile::TempDir) {
     (db, dir)
 }
 
+/// One CF's name and rows (the flush comparison).
+type CfDump = (String, Vec<(Vec<u8>, Vec<u8>)>);
+
+/// A frozen-set reader of the r2 equivalence test, as comparable text.
+type FrozenRead = Box<dyn Fn(&crate::backend::FrozenPending) -> String>;
+
 /// Every CF's rows of a DB (the flush comparison).
-fn db_dump(db: &StateDb) -> Vec<(String, Vec<(Vec<u8>, Vec<u8>)>)> {
+fn db_dump(db: &StateDb) -> Vec<CfDump> {
     crate::cf::ALL_CF_NAMES
         .iter()
         .map(|cf| (cf.to_string(), StateBackend::iterate_cf(db, cf, None).unwrap()))
@@ -1234,7 +1240,7 @@ fn deferred_typed_rows_read_as_eager_rows() {
         let frozen = ov.freeze(1);
         (frozen, source)
     };
-    let cases: Vec<(&str, Box<dyn Fn(&crate::backend::FrozenPending) -> String>)> = vec![
+    let cases: Vec<(&str, FrozenRead)> = vec![
         ("rows", Box::new(|f| format!("{:?}", crate::cf::ALL_CF_NAMES.iter().map(|cf| f.rows(cf)).collect::<Vec<_>>()))),
         ("state_bytes", Box::new(|f| f.state_bytes().to_string())),
         ("entry_count", Box::new(|f| f.entry_count().to_string())),
@@ -1245,7 +1251,7 @@ fn deferred_typed_rows_read_as_eager_rows() {
                     "{} {} {}",
                     f.touches_only(&[CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES]),
                     f.touches_only(&[CF_NATIVE_LIQUIDATION, CF_NATIVE_ORACLE, CF_NATIVE_ORDERS]),
-                    f.touches_only(&crate::cf::ALL_CF_NAMES),
+                    f.touches_only(crate::cf::ALL_CF_NAMES),
                 )
             }),
         ),
