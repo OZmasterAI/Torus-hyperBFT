@@ -322,6 +322,17 @@ fn parse_address(s: &str) -> Result<Address, GenesisError> {
         .map_err(|_| GenesisError::InvalidAddress(s.to_string()))
 }
 
+/// s140 (owner): an `economics` address. Absent = the zero address (as
+/// before); present but malformed = a load error naming the field, never the
+/// zero address (fees and the governance treasury would go to 0x0).
+fn economics_address(field: &str, value: Option<&str>) -> Result<Address, GenesisError> {
+    match value {
+        None => Ok(Address::ZERO),
+        Some(s) => parse_address(s)
+            .map_err(|_| GenesisError::InvalidAddress(format!("economics.{field}: {s:?}"))),
+    }
+}
+
 fn parse_u256(s: &str) -> Result<U256, GenesisError> {
     let s = s.trim();
     if s.starts_with("0x") || s.starts_with("0X") {
@@ -539,6 +550,8 @@ impl Genesis {
     /// a bad genesis fails at load (the node refuses to start) and
     /// `initialize` never depends on HashMap iteration order.
     fn check_keys_and_hex(&self) -> Result<(), GenesisError> {
+        self.treasury_address()?;
+        self.dev_pool_address()?;
         check_unique_keys("evm_alloc address", self.evm_alloc.keys(), parse_address)?;
         for (addr_str, entry) in &self.evm_alloc {
             parse_u256(&entry.balance)?;
@@ -596,6 +609,24 @@ impl Genesis {
             }
         }
         Ok(())
+    }
+
+    /// `economics.treasury_address` (absent = the zero address; malformed =
+    /// an error, s140).
+    pub fn treasury_address(&self) -> Result<Address, GenesisError> {
+        economics_address(
+            "treasury_address",
+            self.economics.treasury_address.as_deref(),
+        )
+    }
+
+    /// `economics.dev_pool_address` (absent = the zero address; malformed =
+    /// an error, s140).
+    pub fn dev_pool_address(&self) -> Result<Address, GenesisError> {
+        economics_address(
+            "dev_pool_address",
+            self.economics.dev_pool_address.as_deref(),
+        )
     }
 
     /// Row 80 option D: fees are split by the built-in constants
@@ -822,12 +853,7 @@ impl Genesis {
         }
 
         // 7. Seed governance params
-        let treasury_address = self
-            .economics
-            .treasury_address
-            .as_deref()
-            .and_then(|s| parse_address(s).ok())
-            .unwrap_or(Address::ZERO);
+        let treasury_address = self.treasury_address()?;
         let gov = GovernanceManager::new(state_db.clone());
         gov.set_governance_params(&GovernanceParams::defaults(treasury_address))
             .map_err(|e| GenesisError::InvalidHex(format!("governance params: {e}")))?;
@@ -841,12 +867,16 @@ impl Genesis {
 
     /// Build a [`ChainConfig`] from the genesis parameters.
     ///
-    /// Panics on an activation schedule that does not merge; `from_json`
-    /// already refused such a genesis (the node does not start).
+    /// Panics on an activation schedule that does not merge or a malformed
+    /// economics address; `from_json` already refused such a genesis (the
+    /// node does not start).
     pub fn chain_config(&self) -> ChainConfig {
         let activations = self
             .activation_schedule()
             .unwrap_or_else(|e| panic!("genesis not loaded through from_json: {e}"));
+        let [treasury_address, dev_pool_address] =
+            [self.treasury_address(), self.dev_pool_address()]
+                .map(|a| a.unwrap_or_else(|e| panic!("genesis not loaded through from_json: {e}")));
         ChainConfig {
             chain_id: self.chain_id,
             chain_name: self.chain_name.clone(),
@@ -863,18 +893,8 @@ impl Genesis {
             fee_validator_bps: self.economics.fee_split.start.validator,
             fee_treasury_bps: self.economics.fee_split.start.treasury,
             fee_dev_pool_bps: self.economics.fee_split.start.dev_pool,
-            treasury_address: self
-                .economics
-                .treasury_address
-                .as_deref()
-                .and_then(|s| parse_address(s).ok())
-                .unwrap_or(Address::ZERO),
-            dev_pool_address: self
-                .economics
-                .dev_pool_address
-                .as_deref()
-                .and_then(|s| parse_address(s).ok())
-                .unwrap_or(Address::ZERO),
+            treasury_address,
+            dev_pool_address,
             timeout_base_ms: self.consensus.timeout_base_ms,
             backoff_factor: self.consensus.backoff_factor,
             backoff_cap: self.consensus.backoff_cap,
@@ -2232,7 +2252,9 @@ mod tests {
         assert_eq!(config.dev_pool_address, Address::ZERO);
         let dir = TempDir::new().unwrap();
         let db = StateDb::open(dir.path()).unwrap();
-        genesis.initialize(&db).expect("absent addresses initialize");
+        genesis
+            .initialize(&db)
+            .expect("absent addresses initialize");
         let params = GovernanceManager::new(db.clone())
             .get_governance_params()
             .unwrap();
