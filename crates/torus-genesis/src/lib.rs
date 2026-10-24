@@ -2188,4 +2188,78 @@ mod tests {
             "refused before any write"
         );
     }
+
+    /// s140 (owner): a present but malformed `economics.treasury_address` /
+    /// `dev_pool_address` refuses to load, naming the field, instead of
+    /// becoming the zero address (fees and the governance treasury would be
+    /// credited to 0x0).
+    #[test]
+    fn malformed_economics_address_is_refused_at_load() {
+        let base: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        for field in ["treasury_address", "dev_pool_address"] {
+            for bad in [
+                "FILL:treasury_address",
+                "",
+                "0x1234",
+                "0xzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ] {
+                let mut json = base.clone();
+                json["economics"][field] = bad.into();
+                let err = Genesis::from_json(&json.to_string())
+                    .expect_err(&format!("economics.{field} = {bad:?} must be refused"))
+                    .to_string();
+                assert!(err.contains("invalid address"), "{field} {bad:?}: {err}");
+                assert!(
+                    err.contains(&format!("economics.{field}")),
+                    "names the field: {err}"
+                );
+            }
+        }
+    }
+
+    /// s140: an ABSENT economics address keeps its meaning (the zero
+    /// address), so existing genesis files load as before.
+    #[test]
+    fn absent_economics_address_is_still_the_zero_address() {
+        let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        let economics = json["economics"].as_object_mut().unwrap();
+        economics.remove("treasury_address");
+        economics.remove("dev_pool_address");
+        let genesis = Genesis::from_json(&json.to_string()).expect("absent addresses load");
+        let config = genesis.chain_config();
+        assert_eq!(config.treasury_address, Address::ZERO);
+        assert_eq!(config.dev_pool_address, Address::ZERO);
+        let dir = TempDir::new().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        genesis.initialize(&db).expect("absent addresses initialize");
+        let params = GovernanceManager::new(db.clone())
+            .get_governance_params()
+            .unwrap();
+        assert_eq!(params.treasury_address, Address::ZERO);
+    }
+
+    /// s140: initialize() refuses a Genesis whose economics address was
+    /// made malformed after from_json, before any write.
+    #[test]
+    fn initialize_refuses_malformed_economics_address_before_any_write() {
+        let base = Genesis::from_json(&sample_genesis_json()).unwrap();
+        let mut bad_treasury = base.clone();
+        bad_treasury.economics.treasury_address = Some("FILL:treasury_address".into());
+        let mut bad_dev_pool = base;
+        bad_dev_pool.economics.dev_pool_address = Some("0x1234".into());
+        for (genesis, field) in [
+            (bad_treasury, "treasury_address"),
+            (bad_dev_pool, "dev_pool_address"),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let db = StateDb::open(dir.path()).unwrap();
+            let err = genesis.initialize(&db).unwrap_err().to_string();
+            assert!(err.contains(&format!("economics.{field}")), "{err}");
+            assert!(
+                db.all_accounts().unwrap().is_empty(),
+                "refused before any write"
+            );
+        }
+    }
 }

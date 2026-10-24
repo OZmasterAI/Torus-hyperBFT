@@ -2241,6 +2241,26 @@ mod tests {
         }
     }
 
+    /// s140 (owner): a malformed economics.treasury_address / dev_pool_address
+    /// refuses to start, naming the file and the field (it used to become the
+    /// zero address).
+    #[test]
+    fn node_refuses_genesis_with_malformed_economics_address() {
+        let base: serde_json::Value =
+            serde_json::from_str(include_str!("../../../devnet/genesis.json")).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("genesis.json");
+        for field in ["treasury_address", "dev_pool_address"] {
+            let mut json = base.clone();
+            json["economics"][field] = format!("FILL:{field}").into();
+            std::fs::write(&path, json.to_string()).unwrap();
+            let err = load_genesis(&path).expect_err("refused").to_string();
+            assert!(err.starts_with("refusing to start: genesis "), "{err}");
+            assert!(err.contains(&path.display().to_string()), "{err}");
+            assert!(err.contains(&format!("economics.{field}")), "{err}");
+        }
+    }
+
     /// Codex P2: a failed memtable flush must not skip the WAL sync, and the
     /// error must reach the caller.
     #[test]
