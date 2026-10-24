@@ -26,7 +26,7 @@ use hotstuff_rs::block_tree::pluggables::KVGet;
 use hotstuff_rs::block_tree::variables::{COMMITTED_VALIDATOR_SET, CONSENSUS_DB_FORMAT_VERSION};
 use torus_consensus::RocksKVStore;
 use torus_state::cf::{CF_ACCOUNTS, CF_BLOCK_HEADERS, CF_CONSENSUS_META, CF_STAKING_VALIDATORS};
-use torus_genesis::GenesisDigest;
+use torus_genesis::{DigestCacheEntry, GenesisDigest, LoadedGenesis};
 use torus_state::{consensus_db_path, NativeDaStore, StateBackend, StateDb};
 use torus_types::book_mode::{self, BookMode};
 
@@ -266,6 +266,44 @@ pub fn read_genesis_digest(state: &StateDb) -> Result<Option<GenesisDigest>, Str
         .transpose()
 }
 
+/// State-DB meta key (`cf_consensus_meta`, node-local, not hashed): the
+/// [`DigestCacheEntry`] of the genesis file bytes the stored digest was
+/// last computed from (s140, restart fast path; `torus_genesis::file_cache`).
+/// Advisory: used only when it names the stored digest; unreadable = absent.
+pub const META_GENESIS_DIGEST_CACHE: &[u8] = b"genesis_file_digest_cache";
+
+/// The stored digest cache entry; `None` when absent, of another build's
+/// form, or unreadable (warned: the file is then digested in full).
+pub fn read_genesis_digest_cache(state: &StateDb) -> Option<DigestCacheEntry> {
+    let bytes = match state.get_cf_raw(CF_CONSENSUS_META, META_GENESIS_DIGEST_CACHE) {
+        Ok(b) => b?,
+        Err(e) => {
+            tracing::warn!("read the genesis digest cache: {e}; digesting the genesis file in full");
+            return None;
+        }
+    };
+    DigestCacheEntry::decode(&bytes).unwrap_or_else(|e| {
+        tracing::warn!("{e}; digesting the genesis file in full");
+        None
+    })
+}
+
+fn store_genesis_digest_cache(state: &StateDb, entry: &DigestCacheEntry) -> Result<(), String> {
+    let _ = (state, entry);
+    Ok(())
+}
+
+/// Boot: read the `--genesis` file and digest it. A data dir whose stored
+/// digest cache entry names the stored digest and matches the file's bytes
+/// takes the stored digest (no full digest); any other file is digested.
+pub fn load_genesis_file(dbs: &NodeDbs, path: &Path) -> Result<LoadedGenesis, String> {
+    let stored = read_genesis_digest(&dbs.state)?;
+    let entry = read_genesis_digest_cache(&dbs.state);
+    let cache = entry.as_ref().zip(stored.as_ref());
+    torus_genesis::load_genesis_file(path, cache)
+        .map_err(|e| format!("refusing to start: genesis {}: {e}", path.display()))
+}
+
 fn store_genesis_digest(state: &StateDb, digest: &GenesisDigest) -> Result<(), String> {
     state
         .put_cf_raw(CF_CONSENSUS_META, META_GENESIS_DIGEST, &digest.encode())
@@ -336,16 +374,27 @@ pub fn check_genesis_binding(
 }
 
 /// Boot step 4, the writing half, after [`check_genesis_binding`] passed.
+/// `new_cache`: the digest cache entry to store for this file (s140), when
+/// its digest was computed (`LoadedGenesis::cache_entry_to_store`).
 pub fn write_genesis_binding(
     dbs: &NodeDbs,
     genesis: &torus_genesis::Genesis,
     file_digest: &GenesisDigest,
+    new_cache: Option<&DigestCacheEntry>,
     plan: GenesisPlan,
 ) -> Result<GenesisBinding, String> {
+    let store_cache = || match new_cache {
+        Some(entry) => store_genesis_digest_cache(&dbs.state, entry),
+        None => Ok(()),
+    };
     match plan {
-        GenesisPlan::Matched => Ok(GenesisBinding::Matched),
+        GenesisPlan::Matched => {
+            store_cache()?;
+            Ok(GenesisBinding::Matched)
+        }
         GenesisPlan::Legacy => {
             store_genesis_digest(&dbs.state, file_digest)?;
+            store_cache()?;
             Ok(GenesisBinding::Legacy)
         }
         GenesisPlan::Fresh => {
@@ -355,6 +404,7 @@ pub fn write_genesis_binding(
             // of phase 4, P2). Re-storing the same digest after a crash is a
             // no-op.
             store_genesis_digest(&dbs.state, file_digest)?;
+            store_cache()?;
             test_crash_point()?;
             apply_genesis_if_fresh(dbs, genesis)?;
             test_crash_point()?;
@@ -394,17 +444,20 @@ pub fn init_genesis(
     dbs: &NodeDbs,
     genesis: &torus_genesis::Genesis,
     file_digest: &GenesisDigest,
+    new_cache: Option<&DigestCacheEntry>,
     genesis_path: &Path,
     data_dir: &Path,
 ) -> Result<GenesisBinding, String> {
     let plan = check_genesis_binding(dbs, file_digest, genesis_path, data_dir)?;
-    write_genesis_binding(dbs, genesis, file_digest, plan)
+    write_genesis_binding(dbs, genesis, file_digest, new_cache, plan)
 }
 
 /// The `--genesis` file as boot step 4 reads it.
 pub struct GenesisFile<'a> {
     pub genesis: &'a torus_genesis::Genesis,
     pub digest: &'a GenesisDigest,
+    /// The digest cache entry to store (s140): `Some` when the digest was computed.
+    pub new_cache: Option<&'a DigestCacheEntry>,
     pub path: &'a Path,
 }
 
@@ -432,7 +485,9 @@ pub fn bind_genesis_and_retention(
     };
     enforce_history_retention(&dbs.state, retention, explicit, data_dir)?;
     match (file, plan) {
-        (Some(f), Some(plan)) => write_genesis_binding(dbs, f.genesis, f.digest, plan).map(Some),
+        (Some(f), Some(plan)) => {
+            write_genesis_binding(dbs, f.genesis, f.digest, f.new_cache, plan).map(Some)
+        }
         _ => Ok(None),
     }
 }
@@ -1404,7 +1459,7 @@ mod tests {
     fn boot(dir: &Path, text: &str) -> Result<GenesisBinding, String> {
         let dbs = open_node_dbs(dir).unwrap();
         let (g, d) = genesis_file(text);
-        init_genesis(&dbs, &g, &d, Path::new("/etc/torus/genesis.json"), dir)
+        init_genesis(&dbs, &g, &d, None, Path::new("/etc/torus/genesis.json"), dir)
     }
 
     fn stored(dir: &Path) -> Option<GenesisDigest> {
@@ -1511,7 +1566,7 @@ mod tests {
         let edited_text = devnet_with(|v| v["chain_name"] = "edited".into());
         let (edited, edited_digest) = genesis_file(&edited_text);
         let path = Path::new("/etc/torus/genesis.json");
-        let file = |g, d| Some(GenesisFile { genesis: g, digest: d, path });
+        let file = |g, d| Some(GenesisFile { genesis: g, digest: d, new_cache: None, path });
         let err = bind_genesis_and_retention(
             &dbs,
             file(&edited, &edited_digest),
@@ -1568,5 +1623,142 @@ mod tests {
         let dbs = open_node_dbs(dir.path()).unwrap();
         let err = check_no_genesis_file(&dbs, dir.path()).unwrap_err();
         assert!(err.contains("no --genesis was given"), "{err}");
+    }
+
+    // ---- s140: genesis digest cache (restart fast path) ----
+
+    /// One boot as `run` does it: the file is read through
+    /// [`load_genesis_file`] (stored digest cache), then bound. Returns the
+    /// binding and how the digest was obtained.
+    fn boot_file(
+        dir: &Path,
+        text: &str,
+    ) -> (Result<GenesisBinding, String>, torus_genesis::DigestSource) {
+        let path = dir.join("genesis-file.json");
+        std::fs::write(&path, text).unwrap();
+        let dbs = open_node_dbs(dir).unwrap();
+        let loaded = load_genesis_file(&dbs, &path).unwrap();
+        let entry = loaded.cache_entry_to_store();
+        let binding = bind_genesis_and_retention(
+            &dbs,
+            Some(GenesisFile {
+                genesis: &loaded.genesis,
+                digest: &loaded.digest,
+                new_cache: entry.as_ref(),
+                path: &path,
+            }),
+            None,
+            true,
+            dir,
+        )
+        .map(|b| b.expect("a genesis file binds"));
+        (binding, loaded.source)
+    }
+
+    fn stored_cache(dir: &Path) -> Option<DigestCacheEntry> {
+        read_genesis_digest_cache(&StateDb::open(dir).unwrap())
+    }
+
+    use torus_genesis::DigestSource::{Cached, Computed};
+
+    #[test]
+    fn a_restart_on_the_same_genesis_file_does_not_digest_it_again() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(boot_file(dir.path(), DEVNET_GENESIS), (Ok(GenesisBinding::Fresh), Computed));
+        let entry = stored_cache(dir.path()).expect("the fresh boot stored the cache entry");
+        assert_eq!(entry.digest, stored(dir.path()).unwrap().digest);
+        assert_eq!(boot_file(dir.path(), DEVNET_GENESIS), (Ok(GenesisBinding::Matched), Cached));
+        assert_eq!(boot_file(dir.path(), DEVNET_GENESIS), (Ok(GenesisBinding::Matched), Cached));
+        assert_eq!(stored_cache(dir.path()), Some(entry), "a cached boot rewrote the entry");
+    }
+
+    #[test]
+    fn a_changed_genesis_file_still_refuses_after_cached_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        boot_file(dir.path(), DEVNET_GENESIS).0.unwrap();
+        assert_eq!(boot_file(dir.path(), DEVNET_GENESIS).1, Cached);
+        let (digest, entry) = (stored(dir.path()), stored_cache(dir.path()));
+        let edited = devnet_with(|v| {
+            let t = v["consensus"]["timeout_base_ms"].as_u64().unwrap();
+            v["consensus"]["timeout_base_ms"] = (t + 1).into();
+        });
+        let (binding, source) = boot_file(dir.path(), &edited);
+        assert_eq!(source, Computed);
+        let err = binding.unwrap_err();
+        assert!(err.contains("changed: consensus.timeout_base_ms."), "{err}");
+        // Same length, one digit: also digested and refused.
+        let same_len = DEVNET_GENESIS.replacen("\"timeout_base_ms\": 1200", "\"timeout_base_ms\": 1300", 1);
+        assert_eq!(same_len.len(), DEVNET_GENESIS.len());
+        let (binding, source) = boot_file(dir.path(), &same_len);
+        assert_eq!(source, Computed);
+        assert!(binding.unwrap_err().contains("changed: consensus.timeout_base_ms."));
+        // A refused start writes nothing.
+        assert_eq!((stored(dir.path()), stored_cache(dir.path())), (digest, entry));
+        assert_eq!(boot_file(dir.path(), DEVNET_GENESIS), (Ok(GenesisBinding::Matched), Cached));
+    }
+
+    #[test]
+    fn a_reformatted_genesis_file_is_digested_once_then_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        boot_file(dir.path(), DEVNET_GENESIS).0.unwrap();
+        let v: serde_json::Value = serde_json::from_str(DEVNET_GENESIS).unwrap();
+        let compact = serde_json::to_string(&v).unwrap();
+        assert_eq!(boot_file(dir.path(), &compact), (Ok(GenesisBinding::Matched), Computed));
+        assert_eq!(boot_file(dir.path(), &compact), (Ok(GenesisBinding::Matched), Cached));
+        // Back to the original bytes: digested again (the entry names the compact file).
+        assert_eq!(boot_file(dir.path(), DEVNET_GENESIS), (Ok(GenesisBinding::Matched), Computed));
+    }
+
+    #[test]
+    fn a_legacy_dir_stores_the_cache_entry_with_its_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let dbs = open_node_dbs(dir.path()).unwrap();
+            assert!(apply_genesis_if_fresh(&dbs, &genesis()).unwrap());
+        }
+        assert_eq!(boot_file(dir.path(), DEVNET_GENESIS), (Ok(GenesisBinding::Legacy), Computed));
+        assert_eq!(boot_file(dir.path(), DEVNET_GENESIS), (Ok(GenesisBinding::Matched), Cached));
+    }
+
+    /// The entry is advisory: one that does not name the stored digest, or
+    /// cannot be read, is ignored (full digest), never a refusal and never
+    /// a substitute for the stored digest.
+    #[test]
+    fn a_stale_or_corrupt_cache_entry_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        boot_file(dir.path(), DEVNET_GENESIS).0.unwrap();
+        let mut entry = stored_cache(dir.path()).unwrap();
+        entry.digest = alloy_primitives::B256::repeat_byte(7);
+        for bytes in [entry.encode(), b"garbage".to_vec()] {
+            {
+                let db = StateDb::open(dir.path()).unwrap();
+                db.put_cf_raw(CF_CONSENSUS_META, META_GENESIS_DIGEST_CACHE, &bytes).unwrap();
+            }
+            assert_eq!(boot_file(dir.path(), DEVNET_GENESIS), (Ok(GenesisBinding::Matched), Computed));
+            // The full digest rewrote a usable entry.
+            assert_eq!(boot_file(dir.path(), DEVNET_GENESIS), (Ok(GenesisBinding::Matched), Cached));
+        }
+        // An entry without a stored digest (only a crashed write could leave
+        // one) is not used either.
+        {
+            let db = StateDb::open(dir.path()).unwrap();
+            db.delete_cf_raw(CF_CONSENSUS_META, META_GENESIS_DIGEST).unwrap();
+        }
+        assert_eq!(boot_file(dir.path(), DEVNET_GENESIS), (Ok(GenesisBinding::Legacy), Computed));
+    }
+
+    #[test]
+    fn a_crash_inside_the_fresh_boot_with_the_cache_keeps_the_binding() {
+        let edited = devnet_with(|v| v["chain_name"] = "edited".into());
+        for steps in 1..=2 {
+            let dir = tempfile::tempdir().unwrap();
+            CRASH_AFTER_STEPS.set(Some(steps));
+            assert_eq!(boot_file(dir.path(), DEVNET_GENESIS).0, Err("test crash".into()));
+            let (binding, source) = boot_file(dir.path(), &edited);
+            assert_eq!(source, Computed);
+            assert!(binding.unwrap_err().contains("changed: chain_name."), "{steps}");
+            boot_file(dir.path(), DEVNET_GENESIS).0.expect("the original file starts");
+            assert_eq!(boot_file(dir.path(), DEVNET_GENESIS), (Ok(GenesisBinding::Matched), Cached));
+        }
     }
 }

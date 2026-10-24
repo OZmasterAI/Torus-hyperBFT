@@ -220,9 +220,23 @@ impl Canon {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: [`GenesisDigest::of_json`] calls on this thread.
+    static FULL_DIGESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test seam: how many full digests this thread computed.
+#[cfg(test)]
+pub(crate) fn full_digest_count() -> usize {
+    FULL_DIGESTS.get()
+}
+
 impl GenesisDigest {
     /// Digest of a genesis file's text. `Err` when it is not JSON.
     pub fn of_json(json: &str) -> Result<Self, GenesisError> {
+        #[cfg(test)]
+        FULL_DIGESTS.set(FULL_DIGESTS.get() + 1);
         let raw: &RawValue = serde_json::from_str(json)?;
         Ok(Self::of_canon(&Canon::parse(raw)?))
     }
