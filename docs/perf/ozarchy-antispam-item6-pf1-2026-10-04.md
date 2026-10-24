@@ -20787,6 +20787,185 @@ Arm means and RB / RA (n = 3 per arm, w1 not counted; `s139_cells.txt`):
   * section 126's `n_cells.py` / `n_mem.py` -> `9n9q_cells.txt`, `9n_mem.txt`;
   * `9n_restart_phases.txt`, `9l_startup_lines.txt`.
 
+## 128. Bisect of 9o's all-up regression (section 126.4) along main's first parent `896240d4` -> `9083b278`: 8 binaries B0..B7, U (all up) only, stakes 2 / 2 / 1, `ORACLE_FEED=seed`, frozen `9083b278` harness genesis, hash + attestation + L6.1 + L2.1 + fail-stop on, Classic, 15 s checkpoints, w1 (B0, unscored) + r1 B0..B7 + r2 B7..B0, n = 2 per binary, 300 s cells (campaign bench-ozarchy-s140-bisect9o, run dir ozarchy-s140-bisect-run, archy, 2026-10-24)
+
+**The regression enters at B3 = `d595f77e` (batch A: price band C + genesis-digest handshake). High confidence.**
+* matched/s B2 -> B3: -13,451 ± 4,582 (-5.2%, -6.8 sd). Both rounds show it: r1 -14,788, r2 -12,114, with the two
+  cells in opposite run order.
+* Levels: B0-B2 258,804, B3-B5 248,772, B6-B7 248,757. B3 carries the whole B0 -> B7 gap (-10,032 of -9,890).
+* The product batch (B6, `8964bd4d`) adds exec cost per fill but no resolved matched/s loss.
+* Engine ms per 1k fills is not the driver: its +7% rise is spread over B3, B6 and B7. The marker that steps with
+  matched/s is process CPU per fill (+8.3% at B3, 11 sd), and most of that is off the exec thread.
+
+Question (s140): which code-changing first-parent point of main between `896240d4` and `9083b278` carries 126.4's U
+regression (matched/s -3.3%, -9,156 ± 1,857; engine ms per 1k fills 2.54 -> 2.72)? Suspects named before launch:
+`8964bd4d` (resident position records 112 -> 144 B) and `d595f77e`.
+
+### 128.1 Setup
+
+* Binaries (node md5 checked on 3 nodes in every cell, `campaign.log` CHECK OK; src / dst / expected md5 in each
+  cell's `.campaign.log`). Each arm runs its own `bench-throughput` built from the same commit:
+
+| arm | main point | node md5 | change |
+|---|---|---|---|
+| B0 | `896240d4` | `4719fce1` | pre-TC main, 9o before (baseline) |
+| B1 | `d3de0abb` | `d3d11d31` | TC-required set: hotstuff_rs, node, network |
+| B2 | `cc8c9c4a` | `6f64139c` | batch 12: hotstuff_rs only |
+| B3 | `d595f77e` | `c50171eb` | batch A: price band C + genesis-digest handshake; torus-bridge (63 files), rpc, network, core, node |
+| B4 | `2da29bec` | `fd3891cd` | chain-id bound certificates: hotstuff_rs only |
+| B5 | `cffdbcc9` | `8a6d404c` | TC tip rule: hotstuff_rs only |
+| B6 | `8964bd4d` | `1725eca9` | product batch: torus-core, evm, state, types, bridge, rpc (position records 112 -> 144 B) |
+| B7 | `9083b278` | `be973e9d` | batch B, 9o after |
+
+* Skipped points with no exec-path code: `71333e7e` (genesis chain-id check), `07961d0a` (4-validator harness),
+  `32db7ad9` (`health.py`).
+* Genesis: one frozen harness genesis from `wt/bq-9083b278` for every arm (md5 `0873b0f0`, 300 markets, 100,060
+  balances). 9o's before arm used the 9k2 stage instead.
+* Load: 300 markets, rate 76,000, 5,000 senders, batch 400, cloid 0%, commit tail (bench.log lines checked).
+* Each new binary (B1..B6) passed a 60 s smoke before the launch: ACCEPT / AGREE, 15 CHECK OK each.
+* Sources: matched/s, blk/s, chain ms, fills per native block from `summary.json` `headline`. Engine, settle, cache
+  flush and `save_books` come from val0's `phase_by_node` (ms per native block / fills per native block x 1000).
+  CPU per 1k fills = process user + sys per 1k fills (load window), mean of the 3 nodes.
+* Statistics: arm mean of r1 / r2. Pooled sd from the 8 r1 / r2 pairs (df 8). Step = difference of two arm means
+  ± 95% t CI (t = 2.306). (sd) = step / pooled sd. Group contrasts: B0-B2 (n = 6), B3-B5 (n = 6), B6-B7 (n = 4).
+  B3-B5 share all exec-path code; B4 and B5 change only hotstuff_rs.
+
+### 128.2 Validity
+
+* 17 cells (w1 + 16): all rc 0, ACCEPT / AGREE / liveness PASS, node md5 = the arm's staged md5 on 3 nodes.
+* No CELL-FLAG, no rerun ("RERUN PASS: nothing queued"); `cells.tsv` 17 rows, 0 bad; `campaign.done` exit=0
+  (03:23:26).
+* The same 5 pattern lines appear in every cell log: oracle-seed JSON with `"errors": 0`, and harness `grep: write
+  error: Broken pipe`. No panic or fail-stop lines.
+
+### 128.3 Per cell (run order; val0 unless noted)
+
+| # | cell | arm | matched/s | blk/s | engine ms / 1k fills | chain ms | fills / native blk | save_books ms | CPU ms / 1k fills (3 nodes) |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | w1 (unscored) | B0 | 261,434 | 16.9 | 2.407 | 80.3 | 27,338 | 1.19 | 24.03 |
+| 1 | r1-B0 | B0 | 256,444 | 16.0 | 2.383 | 80.1 | 27,614 | 1.19 | 24.04 |
+| 2 | r1-B1 | B1 | 257,352 | 16.2 | 2.414 | 81.7 | 27,629 | 1.19 | 24.16 |
+| 3 | r1-B2 | B2 | 260,184 | 15.9 | 2.457 | 86.1 | 29,048 | 1.23 | 24.03 |
+| 4 | r1-B3 | B3 | 245,396 | 15.9 | 2.491 | 84.7 | 28,048 | 1.23 | 25.76 |
+| 5 | r1-B4 | B4 | 248,032 | 16.2 | 2.471 | 79.9 | 26,562 | 1.15 | 25.80 |
+| 6 | r1-B5 | B5 | 251,350 | 16.1 | 2.491 | 85.4 | 28,171 | 1.23 | 25.91 |
+| 7 | r1-B6 | B6 | 247,817 | 16.6 | 2.546 | 82.0 | 26,315 | 1.18 | 26.42 |
+| 8 | r1-B7 | B7 | 246,783 | 15.5 | 2.566 | 85.4 | 27,423 | 1.24 | 26.41 |
+| 9 | r2-B7 | B7 | 251,066 | 15.9 | 2.572 | 90.0 | 28,576 | 1.30 | 26.49 |
+| 10 | r2-B6 | B6 | 249,361 | 14.8 | 2.533 | 90.7 | 29,510 | 1.34 | 26.54 |
+| 11 | r2-B5 | B5 | 254,624 | 15.9 | 2.499 | 84.9 | 28,037 | 1.23 | 25.99 |
+| 12 | r2-B4 | B4 | 245,970 | 16.4 | 2.479 | 80.5 | 26,598 | 1.18 | 26.08 |
+| 13 | r2-B3 | B3 | 247,261 | 16.0 | 2.512 | 85.5 | 27,894 | 1.27 | 26.35 |
+| 14 | r2-B2 | B2 | 259,374 | 16.5 | 2.416 | 81.5 | 27,820 | 1.19 | 24.09 |
+| 15 | r2-B1 | B1 | 258,282 | 16.4 | 2.419 | 80.1 | 27,267 | 1.17 | 23.94 |
+| 16 | r2-B0 | B0 | 261,186 | 16.6 | 2.418 | 80.4 | 27,265 | 1.20 | 23.99 |
+
+### 128.4 Arm means and steps (n = 2; ± = 95% CI, df 8; `tables.txt`)
+
+| metric | B0 | B1 | B2 | B3 | B4 | B5 | B6 | B7 | pooled sd |
+|---|---|---|---|---|---|---|---|---|---|
+| matched/s | 258,815 | 257,817 | 259,779 | 246,328 | 247,001 | 252,987 | 248,589 | 248,925 | 1,987 |
+| vs B0 | 1.000 | 0.996 | 1.004 | 0.952 | 0.954 | 0.977 | 0.960 | 0.962 | |
+| engine ms / 1k fills | 2.400 | 2.417 | 2.437 | 2.502 | 2.475 | 2.495 | 2.539 | 2.569 | 0.015 |
+| CPU ms / 1k fills | 24.01 | 24.05 | 24.06 | 26.05 | 25.94 | 25.95 | 26.48 | 26.45 | 0.18 |
+| settle ms / 1k fills | 0.979 | 0.973 | 0.967 | 1.023 | 1.010 | 1.006 | 1.057 | 1.072 | 0.008 |
+| cache flush ms / 1k fills | 0.482 | 0.472 | 0.466 | 0.500 | 0.498 | 0.487 | 0.502 | 0.504 | 0.005 |
+| blocks/s | 16.30 | 16.30 | 16.20 | 15.95 | 16.30 | 16.00 | 15.70 | 15.70 | 0.52 |
+| chain ms | 80.2 | 80.9 | 83.8 | 85.1 | 80.2 | 85.1 | 86.4 | 87.7 | 2.8 |
+| fills / native blk | 27,440 | 27,448 | 28,434 | 27,971 | 26,580 | 28,104 | 27,913 | 28,000 | 913 |
+| save_books ms | 1.195 | 1.180 | 1.210 | 1.250 | 1.165 | 1.230 | 1.260 | 1.270 | 0.046 |
+
+Adjacent steps, Bk - Bk-1 (sd):
+
+| metric | B1 | B2 | **B3** | B4 | B5 | B6 | B7 | 95% CI | B7 - B0 |
+|---|---|---|---|---|---|---|---|---|---|
+| matched/s | -998 (-0.5) | +1,962 (+1.0) | **-13,451 (-6.8)** | +672 (+0.3) | +5,986 (+3.0) | -4,398 (-2.2) | +336 (+0.2) | ± 4,582 | **-9,890 (-3.8%)** |
+| engine ms / 1k fills | +0.017 (+1.1) | +0.020 (+1.3) | **+0.065 (+4.3)** | -0.027 (-1.8) | +0.020 (+1.3) | **+0.044 (+2.9)** | +0.030 (+2.0) | ± 0.035 | +0.169 (+7.0%) |
+| CPU ms / 1k fills | +0.03 (+0.2) | +0.01 (+0.1) | **+1.99 (+11.2)** | -0.11 (-0.6) | +0.00 (+0.0) | **+0.53 (+3.0)** | -0.03 (-0.2) | ± 0.41 | +2.44 (+10.1%) |
+| settle ms / 1k fills | -0.006 (-0.8) | -0.006 (-0.8) | **+0.057 (+7.3)** | -0.013 (-1.7) | -0.004 (-0.5) | **+0.051 (+6.6)** | +0.015 (+2.0) | ± 0.018 | +0.093 (+9.5%) |
+| cache flush ms / 1k fills | -0.010 (-1.9) | -0.006 (-1.0) | **+0.034 (+6.3)** | -0.002 (-0.3) | -0.011 (-2.1) | **+0.015 (+2.8)** | +0.002 (+0.4) | ± 0.012 | +0.022 (+4.6%) |
+| blocks/s, chain ms, fills / blk, save_books | | | all within 1.8 sd | | | | | | not resolved |
+
+Group contrasts (matched/s): B3-B5 - B0-B2 = **-10,032 ± 2,646 (-8.7 sd)**; B6-B7 - B3-B5 = -15 ± 2,958.
+
+* Shares of the B0 -> B7 matched/s gap: B3 alone 136% (adjacent step), or 101% as levels. B5 recovers -61% and B6
+  takes back +44%. Both are hotstuff-only or level-neutral (next point).
+* Shares of the +0.169 engine ms / 1k fills: B1+B2 22%, **B3 38%**, B4+B5 -4%, **B6 26%**, B7 18%. The engine rise
+  that 126.4 reported (+7%) reproduces (+7.0%), but it does not follow matched/s: the B6 / B7 part (44%) comes with
+  no matched/s loss.
+* B5 (+5,986, 3.0 sd) changes hotstuff_rs only. Its consensus rows match B4 (view duration 59.6 vs 59.2 ms,
+  timeouts 2 vs 3.5, blocks/s 16.0 vs 16.3). With 7 steps tested, one at 3 sd is plausible noise. Not attributed.
+* Consensus timing is flat across all 8 binaries, as in 126.4: view duration 57.9-60.7 ms, timeouts 2-6.5 per cell (arm means),
+  every step within 1.9 sd.
+* Order age at commit p50: B3-B5 - B0-B2 = +286 ± 151 ms (+12%, 4.4 sd). That is the latency face of the same
+  step: with `MAX_IN_FLIGHT` 4 the load is closed-loop. Placed/s drops with matched/s (B2 -> B3 -18.8k, -6.8 sd).
+
+### 128.5 Mechanism sizing (B2 -> B3)
+
+* Exec thread: engine +0.065 ms / 1k fills (+2.7%), verify +0.009 (+4%), block ms per 1k fills +0.096 (+3.3%). The
+  exec thread is ~75% busy in both arms (busy fraction B2 0.769, B3 0.753), so the chain is not purely exec-bound.
+  Even if it were, +3.3% exec time per fill would cover at most about two thirds of the -5.2% step.
+* Whole process: CPU +1.99 ms per 1k fills (+8.3%, 11 sd). That is ~0.49 cores per node at 246k fills/s. The exec
+  thread's +0.096 is ~5% of it: ~95% of the added CPU is off the exec thread. Batch A touches rpc, network and
+  torus-bridge. Lead: per-order work on the admission / RPC side (price band C checks) or the handshake path. Not
+  measured here.
+* B6 (product batch): settle +0.051 ms / 1k fills (6.6 sd) and CPU +0.53 (3.0 sd). This fits the larger resident
+  position records. Its matched/s cost does not resolve: B6-B7 vs B3-B5 is -15 ± 2,958, so any loss is under ~1.2%.
+
+### 128.6 Cross-checks and drift
+
+* Reproduction of 126.4 (B0 = 9o bU binary, B7 = aU binary):
+
+| | 126.4 (600 s, n = 3) | 128 (300 s, n = 2) |
+|---|---|---|
+| matched/s before / after | 276,539 / 267,382 | 258,815 / 248,925 |
+| gap | -9,156 ± 1,857 (-3.3%) | -9,890 ± 4,582 (-3.8%) |
+| engine ms / 1k fills before / after | 2.54 / 2.72 (+7%) | 2.400 / 2.569 (+7.0%) |
+
+  The gap and the engine step reproduce. Absolute levels run 6.4% lower here (matched/s) and engine 5.5% lower.
+  Cell length, genesis and harness differ (128.1). Not attributed; it does not affect the within-campaign steps.
+* Drift: r2 - r1 by arm +4,742 / +930 / -810 / +1,864 / -2,062 / +3,273 / +1,544 / +4,283 (B0..B7), mean +1,720.
+  * No linear trend: B0 (positions 1 / 16) and B7 (8 / 9) both show +4.3-4.7k. A linear drift would cancel anyway,
+    since each arm's two positions sum to 17.
+  * r1-B0 (256,444) is the low B0 cell; w1 (261,434) and r2-B0 (261,186) agree. B0's mean understates its level by
+    ~2.5k at most, so the B0 -> B7 gap is if anything larger. The B0-B2 level (n = 6) does not depend on it.
+* Engine and CPU show no round effect worth a step (r2 - r1 means +0.004 and +0.12 ms / 1k fills, 0.2 and 0.7 sd).
+
+### 128.7 Verdict
+
+* **Regression point: B3 `d595f77e` (merge/s138-batch-a `e7d9d46a`). High confidence.**
+  * The step is 6.8 sd, appears in both rounds, and the level stays flat after it (B3-B5 248,772 vs B6-B7 248,757).
+  * Process CPU per fill steps there too (+8.3%, 11 sd).
+* **B6 `8964bd4d` (product batch): exec cost per fill up, throughput loss not resolved. Medium confidence.** Engine
+  +0.044, settle +0.051 ms / 1k fills, CPU +0.53 ms / 1k fills. matched/s within ±1.2%.
+* **126.4's reading needs a correction: "+7% engine per fill covers -3.3%" does not hold.** The engine rise is spread
+  over B3 / B6 / B7. At B3, engine explains under half of the step; the larger part is CPU off the exec thread.
+* B1, B2, B4 (consensus-only): no step. B5: +3.0 sd, unexplained, not attributed (low confidence either way).
+
+### 128.8 Limits and next
+
+* n = 2 per binary; step CI ± 4,582 (±1.8%). Steps under ~2% between adjacent binaries are not resolved.
+* B3 is a merge of the whole batch A branch. This run cannot split price band C from the genesis-digest handshake or
+  the other batch A commits.
+* Next, to confirm and localise:
+  1. ABBA B2 `cc8c9c4a` vs B3 `d595f77e`, n = 4 per arm, 300 s, same harness. w1 + 8 cells = ~71 min at this run's
+     7.9 min per cell. Expected: -13k ± ~3.4k (df 6).
+  2. Whole-process profile diff B2 vs B3 (9m-style W1 `cycles:u` on the whole process, not only the exec thread):
+     95% of the added CPU is off the exec thread.
+  3. If 1 confirms: bisect inside merge/s138-batch-a (`e7d9d46a`'s branch commits), led by the price band C commits.
+* Optional: B5 vs B6 ABBA n = 4 to bound the product batch's matched/s cost below 1.2%.
+
+### 128.9 Data
+
+* Cells: `~/bench-results-matched/ozarchy-s140-bisect9o-{w1,r1-B0..r1-B7,r2-B7..r2-B0}` (`summary.json`,
+  `agreement.jsonl`, `phase-val*.csv`, `val*.log.gz`, `log-summary.json`) and their `.campaign.log` / `.cell.rc`.
+* Campaign: `ozarchy-s140-bisect-run/` (`handoff.json`, `campaign.log`, `campaign.done` exit=0, `cells.tsv`,
+  `smk-B1..B6/`).
+* Stage: `ozarchy-s140-bisect-stage/` (`build/md5s.txt`); tools: `ozarchy-s140-bisect-tools/` (`bisect-cells.py`,
+  `drivers/ozarchy-s140-bisect9o-campaign.sh`, `specs/bisect-main.json`, `checks/`).
+* Analysis: `ozarchy-s140-bisect-analyst/analyst/`: `secondary.py` -> `secondary.txt` (per-arm sub-phases, consensus,
+  latency); `tables.py` -> `tables.txt` (cell table, means, steps, CIs, groups).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
