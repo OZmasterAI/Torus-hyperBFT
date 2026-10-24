@@ -33,16 +33,16 @@
     "dev_pool_address": "FILL:dev_pool_address",
     "fee_split": {
       "start": {
-        "burn": 1000,
-        "validator": 0,
-        "treasury": 4500,
-        "dev_pool": 4500
+        "burn": "FILL:fee_split",
+        "validator": "FILL:fee_split",
+        "treasury": "FILL:fee_split",
+        "dev_pool": 0
       },
       "end": {
-        "burn": 2500,
-        "validator": 2500,
-        "treasury": 2500,
-        "dev_pool": 2500
+        "burn": "FILL:fee_split",
+        "validator": "FILL:fee_split",
+        "treasury": "FILL:fee_split",
+        "dev_pool": 0
       },
       "transition_epochs": 1825
     },
@@ -96,6 +96,11 @@
       "note": "dev pool (same address as economics.dev_pool_address)"
     },
     {
+      "address": "FILL:gov_account_address",
+      "balance": "FILL:gov_account_balance",
+      "note": "owner governance account: delegates to a validator after launch, before the first proposal (testnet-genesis-draft.md)"
+    },
+    {
       "address": "FILL:faucet_address",
       "balance": "FILL:faucet_balance",
       "note": "testnet faucet (tools/faucet); drop the row if there is none"
@@ -113,12 +118,7 @@
     }
   ],
   "precompiles": {},
-  "permanent_stakes": [
-    {
-      "address": "FILL:governance_voter_address",
-      "amount": "FILL:governance_voter_amount"
-    }
-  ],
+  "permanent_stakes": [],
   "native_balances": [
     {
       "address": "0x746f7275732d6c697175696461746f722d766c74",

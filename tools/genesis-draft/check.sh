@@ -8,17 +8,23 @@
 #             explicit activations {running_state_hash: 1, book_window_commit: 1} and no
 #             other feature, Classic books, no reputation leader selection, evm.block_interval
 #             11, evm.chain_id == chain_id; dead-leader K = 0 at 3 validators, K = 3 / cap 6
-#             at 4 and 5; the variants differ only in validators and K.
+#             at 4 and 5; permanent_stakes [] (governance option B: a funded owner account
+#             delegates after launch); fee_split dev_pool 0 at start and end, the rest
+#             "FILL:fee_split"; the variants differ only in validators and K.
 # 2. refuse:  the node refuses every draft as checked in, and (on the 5-validator draft,
 #             which has every placeholder) each placeholder left alone while all the others
 #             are filled with dummy values (tools/genesis-draft/fill-dummy.py).
+#   2b. info: what this binary does (NOT part of PASS / FAIL) with (a) the fee split
+#             filled with dev pool 0 (fill-dummy.py --dev-zero), and (b) a malformed
+#             economics.treasury_address / dev_pool_address whose accounts[] row is valid.
 # 3. boot:    each draft filled with dummy devnet values starts N local validators (keys
 #             01..0N, attesting with their account keys) and all reach TARGET committed blocks.
 #             Every node started is killed on exit.
 #
 # Env: TORUS_NODE_BIN (default $CARGO_TARGET_DIR/release/torus-node), VARIANTS (default
 # "3 4 5"), TARGET (committed blocks per node, default 5), BOOT_TIMEOUT (s, default 180),
-# WORK (scratch dir, default a new mktemp -d), SKIP_REFUSE=1 (skip step 2), ATTEST_HEIGHT (default
+# WORK (scratch dir, default a new mktemp -d), SKIP_REFUSE=1 (skip steps 2 / 2b), SKIP_BOOT=1
+# (skip step 3), ATTEST_HEIGHT (default
 # 250; 0 = skip): also wait until every node is at this height and require each node to have
 # submitted >= 1 state hash attestation, with no hash mismatch and no hash-unverified node.
 # Localhost only; ports p2p 30461.., rpc 8661.., metrics 9171.. (clear of devnet/wsl).
@@ -100,8 +106,13 @@ for n in $VARIANTS; do
         and .consensus.leader_miss_threshold == $k
         and .consensus.leader_exclusion_cap == 6
         and .evm.block_interval == 11
-        and .evm.chain_id == .chain_id' "$(DRAFT "$n")" >/dev/null; then
-        echo "  ${n}val: ok (validators $n, K $want_k, activations hash + L6.1 from block 1)"
+        and .evm.chain_id == .chain_id
+        and .permanent_stakes == []
+        and ([.accounts[].address] | index("FILL:gov_account_address")) != null
+        and ([.economics.fee_split.start, .economics.fee_split.end]
+             | all(.dev_pool == 0 and .burn == "FILL:fee_split" and .validator == "FILL:fee_split"
+                   and .treasury == "FILL:fee_split"))' "$(DRAFT "$n")" >/dev/null; then
+        echo "  ${n}val: ok (validators $n, K $want_k, activations hash + L6.1 from block 1, no permanent stakes, dev_pool 0)"
     else
         echo "  ${n}val: FAIL shape"; fail=1
     fi
@@ -135,11 +146,35 @@ if [ "${SKIP_REFUSE:-0}" != 1 ]; then
         python3 -I "$FILL" "$(DRAFT 5)" "$WORK/leave-$key.json" --leave "$key"
         run_refused "only FILL:$key" "$WORK/leave-$key.json"
     done
+
+    # 2b. Informational: report, never fail.
+    echo "=== 2b. info (not part of the result) ==="
+    run_info() { # label genesis
+        local dd="$WORK/info/$1" log="$WORK/info/$1.log" rc=0
+        mkdir -p "$dd"
+        node_argv 0 "$2" "$dd"
+        # TERM first (exit 124, no shell "Killed" notice), KILL 5 s later (137).
+        timeout -k 5 20 "$BIN" "${NODE_ARGV[@]}" >"$log" 2>&1 || rc=$?
+        if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+            printf '  %-34s ACCEPTED (still running after 20 s, stopped)\n' "$1"
+        else
+            printf '  %-34s refused (exit %s): %s\n' "$1" "$rc" \
+                "$(grep -m1 -E 'refusing|Error|error|panicked' "$log" | sed -E 's/\x1b\[[0-9;]*m//g' | cut -c1-200)"
+        fi
+    }
+    python3 -I "$FILL" --dev-zero "$(DRAFT 5)" "$WORK/info-dev-zero.json"
+    run_info "fee_split with dev_pool 0" "$WORK/info-dev-zero.json"
+    python3 -I "$FILL" "$(DRAFT 5)" "$WORK/info-filled.json"
+    for field in treasury_address dev_pool_address; do
+        jq --arg f "$field" '.economics[$f] = "0x1234"' "$WORK/info-filled.json" > "$WORK/info-bad-$field.json"
+        run_info "economics.$field = 0x1234" "$WORK/info-bad-$field.json"
+    done
 fi
 
 # 3. Boot --------------------------------------------------------------------------------
-echo "=== 3. boot (TARGET=$TARGET committed blocks per node) ==="
+[ "${SKIP_BOOT:-0}" = 1 ] || echo "=== 3. boot (TARGET=$TARGET committed blocks per node) ==="
 for n in $VARIANTS; do
+    [ "${SKIP_BOOT:-0}" = 1 ] && break
     gen="$WORK/filled-${n}val.json"
     python3 -I "$FILL" "$(DRAFT "$n")" "$gen"
     run="$WORK/boot-${n}val"

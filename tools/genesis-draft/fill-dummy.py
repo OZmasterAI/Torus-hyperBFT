@@ -7,11 +7,19 @@ The draft (testnet/testnet-genesis-draft-{3,4,5}val.json) marks every value the
 owner decides right before launch as the string "FILL:<key>". This script
 replaces each one with an INSECURE devnet value (the deterministic devnet
 consensus keys 01..05, the bench validator account keys, made-up treasury /
-dev-pool / faucet addresses, one BTC-USD market), so the file can be loaded
-and booted by tools/genesis-draft/check.sh. Never use its output for a real
-network.
+dev-pool / governance / faucet addresses, one BTC-USD market), so the file can
+be loaded and booted by tools/genesis-draft/check.sh. Never use its output for
+a real network.
+
+"FILL:fee_split" (the open fee destination split; the draft writes dev_pool 0)
+is filled with the BUILT-IN split (FEE_SPLIT_BUILTIN), dev pool included: the
+loader on main refuses any other split (check_fee_split), so a dev share of 0
+cannot boot until the code changes. --dev-zero instead fills it with
+FEE_SPLIT_DEV_ZERO (dev pool 0, each side summing to 10000), which check.sh
+uses to show what this binary does with the owner's dev share.
 
 --leave KEY   keep "FILL:KEY" unfilled (check.sh proves the node refuses it).
+--dev-zero    fill "FILL:fee_split" with FEE_SPLIT_DEV_ZERO (keeps dev_pool 0).
 --list        print the placeholder keys of the draft, one per line, and exit.
 
 Exits 1 when the draft has a placeholder this script has no value for, or when
@@ -53,8 +61,9 @@ VALUES = {
     "dev_pool_balance": "500000000000000000000000000",
     "faucet_address": "0xf000000000000000000000000000000000000003",
     "faucet_balance": "1000000000000000000000000",
-    "governance_voter_address": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
-    "governance_voter_amount": "100000000000000000000000",
+    # 100k TRS: enough to delegate the 1,000 TRS min_proposal_stake after launch.
+    "gov_account_address": "0xf000000000000000000000000000000000000004",
+    "gov_account_balance": "100000000000000000000000",
     "liquidator_vault_seed": "1000000.0",
 }
 for i, (pubkey, address) in enumerate(zip(CONSENSUS_PUBKEYS, ACCOUNT_ADDRESSES, strict=True)):
@@ -73,6 +82,24 @@ MARKETS = [
         "initial_margin": "5.0",
     }
 ]
+
+# "FILL:fee_split" marks burn / validator / treasury of fee_split.start and .end.
+# The built-in split (torus_economics::types FEE_START_* / FEE_END_*), the only
+# one the loader on main accepts.
+FEE_SPLIT_BUILTIN = {
+    "start": {"burn": 1000, "validator": 0, "treasury": 4500, "dev_pool": 4500},
+    "end": {"burn": 2500, "validator": 2500, "treasury": 2500, "dev_pool": 2500},
+}
+# A dev-share-0 split that sums to 10000 (dummy numbers, NOT an owner decision:
+# the destination split is open).
+FEE_SPLIT_DEV_ZERO = {
+    "start": {"burn": 1000, "validator": 0, "treasury": 9000, "dev_pool": 0},
+    "end": {"burn": 2500, "validator": 2500, "treasury": 5000, "dev_pool": 0},
+}
+for side in FEE_SPLIT_BUILTIN.values():
+    assert sum(side.values()) == 10000
+for side in FEE_SPLIT_DEV_ZERO.values():
+    assert sum(side.values()) == 10000 and side["dev_pool"] == 0
 
 
 def placeholders(value, found):
@@ -102,6 +129,7 @@ def main(argv):
     args = argv[1:]
     leave = set()
     listing = False
+    dev_zero = False
     rest = []
     while args:
         a = args.pop(0)
@@ -109,6 +137,8 @@ def main(argv):
             leave.add(args.pop(0))
         elif a == "--list":
             listing = True
+        elif a == "--dev-zero":
+            dev_zero = True
         else:
             rest.append(a)
     with open(rest[0], encoding="utf-8") as f:
@@ -117,7 +147,7 @@ def main(argv):
     if listing:
         print("\n".join(sorted(keys)))
         return 0
-    unknown = sorted(keys - set(VALUES) - {"markets"} - leave)
+    unknown = sorted(keys - set(VALUES) - {"markets", "fee_split"} - leave)
     if unknown:
         print(f"fill-dummy: no dummy value for {unknown}", file=sys.stderr)
         return 1
@@ -125,6 +155,10 @@ def main(argv):
         isinstance(row.get("market_id"), str) for row in draft.get("markets", [])
     ):
         draft["markets"] = MARKETS
+    if "fee_split" in keys and "fee_split" not in leave:
+        split = FEE_SPLIT_DEV_ZERO if dev_zero else FEE_SPLIT_BUILTIN
+        for side, row in split.items():
+            draft["economics"]["fee_split"][side] = dict(row)
     out = fill(draft, leave)
     left = placeholders(out, set()) - leave
     if left:
