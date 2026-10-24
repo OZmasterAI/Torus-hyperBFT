@@ -510,7 +510,6 @@ fn header_after_decide_is_voted_on(advance_view_first: bool) {
         f.vp + 4,
         votes.iter().map(|v| v.phase).collect::<Vec<_>>()
     );
-    let _ = (&f.u, &f.new_set);
 }
 
 #[test]
