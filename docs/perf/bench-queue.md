@@ -1121,7 +1121,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    latency. Pass: all-up within noise; one-down blocks/s within -5%. Optional: WAN netem cell at 227 / 502 ms (trial
    net instead, owner s136). ~2 h (estimate).
    **Config (s136, batch 10 on main `2d2f3ed9`):** run as the testnet will: hash + attestation + L6.1 + L2.1 + fail-stop on. `gen-weighted-genesis.sh` (needed for 2/2/1 stakes) still defaults the hash OFF, so set `STATE_HASH_ACTIVATION` explicitly ON (hash from block 1; L6.1 follows it for Classic); L2.1 and fail-stop are on by default. Check the startup lines read `on=true`.
-9p. **[GO s140: batch C landed, build and pin main `a300c7f3`; dead-leader is OFF by default (K=0), so 9p MUST set DL_K=3; CONSENSUS_DB_FORMAT_VERSION 2, wipe data dirs; 4-validator harness on main `07961d0a`; smoke cell first] SHAPE CHANGED (owner s138): 4 validators, not 2/2/1.** At 2:2:1 with the stake-1 node down no validator-set update can commit (an update needs three consecutive live views; the dead node leads every third), so b1 would halt the chain at its first exclusion (`dead-leader-skip.md` section 8 finding 4). New shape: 4 nodes (1/1/1/1 or 2/2/1/1), one killed, at a MODERATE rate well below saturation (the question is recovery, not peak throughput; CPU starvation would mimic dead-leader timeouts). One short 4-node smoke cell first to check the rig keeps up. Before AND after arms both run in this 4-node shape (9k's 3-node cells are NOT its baseline); matched/s and p50/p99 are compared only inside 9p, never to the 3-node history. Original spec, superseded where it conflicts:** Dead-leader skip (b1) phase 4: before / after.** After dead-leader phases 1-3 land (rebased on
+9p. **[GO s140 (re-pinned): build and pin main `3c5d02ea` (batch C + epoch-plan hand-off + dead-leader post-exclusion freeze fix); the a300c7f3 DL_K=3 smoke froze ~30-35 s after the exclusion (fixed in `3c5d02ea`); dead-leader is OFF by default (K=0), so 9p MUST set DL_K=3; CONSENSUS_DB_FORMAT_VERSION 2, wipe data dirs; 4-node make-driver on main `70027095` (9k2-checks.sh configchk still val0-2: patch); smoke cell first] SHAPE CHANGED (owner s138): 4 validators, not 2/2/1.** At 2:2:1 with the stake-1 node down no validator-set update can commit (an update needs three consecutive live views; the dead node leads every third), so b1 would halt the chain at its first exclusion (`dead-leader-skip.md` section 8 finding 4). New shape: 4 nodes (1/1/1/1 or 2/2/1/1), one killed, at a MODERATE rate well below saturation (the question is recovery, not peak throughput; CPU starvation would mimic dead-leader timeouts). One short 4-node smoke cell first to check the rig keeps up. Before AND after arms both run in this 4-node shape (9k's 3-node cells are NOT its baseline); matched/s and p50/p99 are compared only inside 9p, never to the 3-node history. Original spec, superseded where it conflicts:** Dead-leader skip (b1) phase 4: before / after.** After dead-leader phases 1-3 land (rebased on
    the TC set) and after 9k. Design `docs/plans/dead-leader-skip.md` section 5: before = 9k's cells; after = the same
    cells on the branch, ABBA, 3 runs each; `VALIDATOR_STAKES=2,2,1`, `KILL_NO_RESTART=val2`,
    `KILL_NO_RESTART_AT_S=120`, `BENCH_RPCS=0,1`, feed off, 600 s, plus all-up. Report three windows (pre-kill / kill
@@ -1156,7 +1156,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    4.0 -> 76.7 ms per block. L3.1 / L3.3 / L6.1 target that save (sections 117, 120). Question: is the deep-book
    slowdown gone on today's main? Report RSS (peak / mean), restarts (SIGTERM / SIGKILL), matched/s, blocks/s, p50 /
    p99, `save_books` and checkpoint settle wait per block, vs the standard cell. Doc target: next results-doc section.
-9q. **[GO s140, after 9p] Epoch-plan hand-off A/B (`TORUS_EPOCH_PLAN_HANDOFF`, node-local, default off).** LANDED on
+9q. **[Part A DONE s139 (section 127: PASS, WARNs 10 -> 0, timeouts 29 -> 0, matched/s -0.1%); Part B GO with 9p on main `3c5d02ea`; flag goes default-on only after Part B passes] Epoch-plan hand-off A/B (`TORUS_EPOCH_PLAN_HANDOFF`, node-local, default off).** LANDED on
    main `b17dab16` (merge of `fix/epoch-plan-logical-ready` `7879ef63`): build and pin main `b17dab16`; one binary, both
    arms differ only by the env flag. Problem: under load the leader of boundary H refuses "epoch boundary: execution has not applied the
    previous boundary yet" because readiness reads the durable applied marker (moves only when the checkpoint lands),
@@ -1170,6 +1170,22 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
      exclusion update (state attest equal, no DISAGREE).
    * Pass (owner turns it on for testnet): flag-on WARNs = 0 and timeouts -80% or more vs off; matched/s within noise or
      better; Part B identical exclusion heights and no divergence. Doc target: the next results-doc section.
+9s. **[GO s140, after 9p + 9q Part B] Batch A all-up cost (section 128 follow-up).** Section 128 put the all-up
+   -3.8% matched/s at batch A `d595f77e` (B2 `cc8c9c4a` -> B3: -13,451 +- 4,582 matched/s, process CPU per fill +8.3%,
+   ~95% of it OFF the exec thread). (1) ABBA B2 vs B3, n = 4 per arm, std 2/2/1, seed, U only (~71 min); (2) if
+   confirmed, whole-process profile diff B2 vs B3 (perf, all threads; suspects: genesis-digest handshake, price-band C
+   checks on RPC / ingress / mempool threads); (3) only if the profile names nothing, bisect inside merge/s138-batch-a.
+   Doc target: the next results-doc section.
+9r. **[GO s140, after 9s] Item 6 Phase 5 step 2 r2 re-A/B.** A = main `077fe56e`, B = `feat/item6-phase5-step2-r2`
+   `14b2abe9`. q7 two-arm build, md5 on every node, same env on both arms. Shapes: std hsdb-300m (standard load s127,
+   `ORACLE_FEED=seed`) and deep (9n D). One A warm-up per shape, then ABBA n = 3, 600 s cells, fresh data dirs.
+   Took effect: on B `torus_exec_users_drain_encodes` > 0, `_encode_inline` / encodes < 0.05,
+   `torus_exec_evm_scope_typed_writes_total` = 0; none of these on A. Primary: exec-thread on-CPU ms per 1k fills,
+   native blocks/s, block p50 / p99. Also exec ms per 1k fills, CPU-s per 1M fills, matched/s, fills per block, the
+   cache_flush / drain / encode / flush-worker timers, timeouts per 1,000 blocks, RSS mean / max. Pass: no paired CI
+   for on-CPU, exec ms or CPU per fill above 1; blocks/s, p50 and p99 not worse; RSS within +10%. A gain claim needs
+   the on-CPU CI fully below 1. Builder note: B may come out level, not faster (in-place apply +0.175 ms / 1k fills in
+   section 91; main's own flush is cheaper now).
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
