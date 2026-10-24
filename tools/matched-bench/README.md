@@ -1076,8 +1076,8 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
   2 s), `mem-samples.txt` + `smaps/` (smaps_rollup, status and memory gauges every 5 s; val0's
   full smaps every 30 s), `node-nofile.txt` + `fds.txt` (open fds; 5 s), `vmstat-1hz.txt`,
   and the hand drivers' 1 Hz soak sidecar `python3 -I $TOOLS/soak-sampler.py <cell> 9161 9162
-  9163` (`tools/matched-bench/soak-sampler.py`, copied unchanged from the s58rl / p4soak10
-  tools): `metrics-1hz.txt.gz` (per node and second `T <epoch> val<i> ok <scrape_s>|ERR` + the
+  9163` (+ 9164 with `N_VALIDATORS=4`; `tools/matched-bench/soak-sampler.py`, the s58rl / p4soak10
+  tools' copy, since s138 scraping every port it is given): `metrics-1hz.txt.gz` (per node and second `T <epoch> val<i> ok <scrape_s>|ERR` + the
   /metrics lines without comments or buckets, except the slow-tail buckets le >= 0.128 of its
   latency families: per-second consensus drops and timeouts) and `host-1hz.tsv` (meminfo
   Dirty / Writeback / MemAvailable / Cached and per node RSS, context switches, CPU ticks). It
@@ -1086,7 +1086,7 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
   `PREFLIGHT FAIL ... soak-sampler.py missing`; also when it does not compile or lacks the
   slow-tail buckets). After the cell `rocksdb-LOG-val<i>.txt`, `data-du.txt`, a `[<label>] fds
   max/end ...` line and a `CHECK SOAK` coverage line, which adds `CHECK WARN <label>:
-  metrics-1hz has N ok scrapes (< 3 x dur)` / `host-1hz has N rows (< dur)` when the 1 Hz
+  metrics-1hz has N ok scrapes (< nodes x dur)` / `host-1hz has N rows (< dur)` when the 1 Hz
   sidecar fell short (recorded, never a failure, as in the hand drivers). A node that held
   more than 16384 open fds stops the campaign after its cell (`STOP`, `bad:stop-fd`).
   `DRIVER show`: `SAMPLERS on du mem metrics fd soak-1hz vmstat rocksdb-log fd_stop=16384` and
@@ -1166,7 +1166,11 @@ list. Optional: `comment`, `results_root` (`~/bench-results-matched`), `devnet_d
 arm r-1, as Job 4; `"fixed"`; or a list `["r1:A", "r1:B", ...]`), `warmup` (`{arm, tag,
 duration_s, gate}`, default baseline / `w1` / `duration_s` / `true`; `false` = none), `smoke` (`{arm,
 duration_s}`, default baseline / 60), `node_env` (node env for every arm), `harness_env`
-(run-cell.sh env for every cell, e.g. `BLOCK_CAP`, `MAX_IN_FLIGHT`, `ORACLE_FEED`),
+(run-cell.sh env for every cell, e.g. `BLOCK_CAP`, `MAX_IN_FLIGHT`, `ORACLE_FEED`; its
+`N_VALIDATORS` (`"3"` default or `"4"`, the same on every arm, else a SPEC ERROR) is also the
+driver's node count: `NODES`, `METS` 9161..9160+N, and every per-node sampler / scan / check
+loop (hardscan, du / ckpt / mem / fd samplers, fdsum, savelog, data-du, soakchk) covers val0..val<N-1>;
+a 3-node driver is the same text as before),
 `absent_env` (names that must be unset unless an arm sets them), `expect` (every arm),
 `analysis` (`{cmd, metric}` = `CELL_STEP_ANALYSIS_CMD` / `_METRIC`), `max_busy_pct` (10: before each
 cell `quiet()` waits for no build / node / bench process, then for a 5 s sample of `/proc/stat` below this

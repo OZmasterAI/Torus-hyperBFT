@@ -495,6 +495,21 @@ def validate(spec):
             }
         )
     labels = [a["label"] for a in p["arms"]]
+    # the devnet's validator count: run-cell.sh N_VALIDATORS (3 or 4, default 3) from the arm's harness env. NODES
+    # and the body's per-node loops are campaign-wide, so every arm (and with it the warm-up and smoke cells) must
+    # run the same count
+    nv = {a["label"]: a["henv"].get("N_VALIDATORS", "3") for a in p["arms"]}
+    for lb, v in nv.items():
+        need(
+            v in ("3", "4"),
+            "arm %s: N_VALIDATORS=%r: run-cell.sh runs 3 or 4 validators" % (lb, v),
+        )
+    need(
+        len(set(nv.values())) == 1,
+        "N_VALIDATORS differs between arms (%s): one node count per campaign (set it in the top-level harness_env)"
+        % ", ".join("%s=%s" % kv for kv in nv.items()),
+    )
+    p["nodes"] = int(next(iter(nv.values())))
     need(
         spec["baseline"] in labels,
         "baseline %r is not an arm (%s)" % (spec["baseline"], ", ".join(labels)),
@@ -628,7 +643,7 @@ def render(p, spec, spec_path):
         "MARKETS=%d" % p["markets"],
         "RATE=%d" % p["rate"],
         "MAX_BUSY_PCT=%s   # quiet(): CPU busy %% over a QUIET_SAMPLE_S sample must be below this" % p["max_busy_pct"],
-        "NODES=3",
+        "NODES=%d" % p["nodes"],
         "BASELINE=%s" % q(p["baseline"]),
         "declare -A BDIR BMD5 BBMD5 BWRAP",
     ]
@@ -709,7 +724,27 @@ def render(p, spec, spec_path):
         % q(" ".join(ck["per_cell"]))
     )
     L.append("# <<< GENERATED CONFIG")
-    return "\n".join(L) + "\n" + open(BODY).read()
+    return "\n".join(L) + "\n" + body_text(p["nodes"])
+
+
+def body_text(n):
+    """driver-body.sh for an n-node devnet: its @@NAME@@ tokens are the per-node literals (the metrics ports, the
+    val<i> loops, fdsum's columns, soakchk's expected scrapes). n = 3 gives the Job 4 drivers' text, byte for byte."""
+    idx = range(n)
+    col = range(2, n + 2)  # fds.txt: epoch, then one column per node
+    tok = {
+        "NODES": str(n),
+        "NODE_IDX": " ".join(str(i) for i in idx),
+        "METS": " ".join(str(9161 + i) for i in idx),
+        "FD_LAST": str(n + 1),
+        "FD_FMT": " ".join("val%d %%d/%%d" % i for i in idx),
+        "FD_ARGS": ", ".join("m[%d], e[%d]" % (c, c) for c in col),
+        "FD_STOPS": " || ".join("m[%d] > stop" % c for c in col),
+    }
+    body = open(BODY).read()
+    body = re.sub(r"@@([A-Z_]+)@@", lambda m: tok[m.group(1)], body)
+    assert "@@" not in body, "driver-body.sh: an unresolved @@ token"
+    return body
 
 
 def main():
