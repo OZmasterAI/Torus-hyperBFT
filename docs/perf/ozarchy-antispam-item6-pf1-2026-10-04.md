@@ -20966,6 +20966,271 @@ Group contrasts (matched/s): B3-B5 - B0-B2 = **-10,032 ± 2,646 (-8.7 sd)**; B6-
 * Analysis: `ozarchy-s140-bisect-analyst/analyst/`: `secondary.py` -> `secondary.txt` (per-arm sub-phases, consensus,
   latency); `tables.py` -> `tables.txt` (cell table, means, steps, CIs, groups).
 
+## 129. Steps 9p (dead-leader skip phase 4) and 9q Part B (epoch-plan hand-off in the kill shape) on main `3c5d02ea` (post-exclusion freeze fix): 4 validators, stakes 1 / 1 / 1 / 1, `ORACLE_FEED=seed`, rate 20,000, `BENCH_RPCS=0,1,2`, K = `KILL_NO_RESTART=val3` at bench+120 s, before = dead-leader off (no `leader_miss_threshold`) vs after = `DL_K=3`, U all up / K one down, ABBA x3, + 9q qOff / qOn (K shape, `DL_K=3`, `TORUS_EPOCH_PLAN_HANDOFF` unset / 1), hash + attestation + L6.1 + L2.1 + fail-stop on, Classic, 15 s checkpoints, 600 s cells (campaign bench-ozarchy-s140-9p, run dir ozarchy-s140-9p-run, archy, 2026-10-24/25)
+
+**9p: FAIL. The post-exclusion freeze is not fixed: 3 of 7 `DL_K=3` kill cells still freeze, for 35-154 s.**
+* The freeze shape is the one `3c5d02ea` targets. Right before the exclusion boundary H, val0 commits the
+  nudge-driven block alone. val1 / val2 commit it 5-15 s later, on a NewView. The views then fall out of step under
+  the stall backoff, and H commits only 35 / 154 / 154 s after its delta (smoke sA: 7.4 s).
+* In the 4 clean kill cells the exclusion works as designed:
+  * post-exclusion 21.7-22.5 blocks/s, 0.0-0.5 timeouts per minute;
+  * matched/s 244-245k (backlog drain);
+  * kill to the exclusion commit 59-94 s.
+  * Before (bK) never excludes: 2.03 blocks/s and 38.9 timeouts per minute for the 480 s after the kill.
+* All-up: aU vs bU matched/s +0.8% ± 1.3% (within noise); blocks/s -5.5% ± 5.6% (CI edge). Order age at commit p50
+  +59 ± 26 ms (+14%) is resolved. No false exclusion in any all-up cell.
+
+**9q Part B: PASS on WARNs, divergence and matched/s; the -80% timeout bar holds only outside the dead-leader
+window. n = 1 per arm.**
+* WARNs 10 -> 0. Timeouts outside the kill->exclusion window 6 / 6 / 6 -> 0 / 1 / 0 per node (-94%); whole run
+  59 / 58 / 59 -> 37 / 35 / 36 (-38%).
+* Whole-run timeouts are mostly dead-leader timeouts in the kill window. That window is 28 s shorter with the flag
+  on, because the kill fell earlier in the epoch phase (see 129.6), not because of the flag.
+* matched/s 224,858 -> 231,323 (+2.9%), within or above the clean aK spread.
+* Each cell: all 3 survivors log the same delta (height H, exclude=1, excluded=1) within 59 ms; state attestation
+  equal over 63 heights; AGREE.
+
+Question (bench queue 9p, 9q Part B; owner GO s140):
+* 9p: report three windows (pre-kill / kill -> exclusion / post-exclusion): blocks/s, matched/s, timeout views per
+  minute, order age p50 / p99, and kill-to-exclusion time and heights. Pass = post-exclusion blocks/s >= 90% of
+  all-up, all-up within noise, no new stalls.
+* 9q Part B: pass = flag-on WARNs 0, timeouts -80% or more vs off, matched/s within noise or better, identical
+  exclusion heights, no divergence.
+
+### 129.1 Setup
+
+* Binary (one for every arm): main `3c5d02ea` (merge of `fix/dl-post-exclusion-stall` `e2b44457`), plain release
+  `--locked`, worktree `wt/bq-3c5d02ea`. Staged `ozarchy-s140-9p-stage/c5`: node `295f6bfb`, bench-throughput
+  `d1952ee4`, tx-flood `dd59d50d`. Node md5 = the staged md5 on all 4 nodes in every cell (`campaign.log` CHECK OK).
+* Harness: `tools/matched-bench` frozen at `3c5d02ea` (make-driver 4-node support `70027095`: `NODES=4`, `METS`
+  9161-9164, val0..3 samplers). Base genesis `testnet/genesis-weighted-full.json` regenerated with the staged
+  bench-throughput (1M bulk accounts at offset 60), md5 `a644d0a7`. Data dirs fresh per cell (DB format v2).
+* Arms (all `N_VALIDATORS=4`, `VALIDATOR_STAKES=1,1,1,1`):
+
+| arm | dead-leader | kill | node env | n |
+|---|---|---|---|---|
+| bU | off (genesis `leader_miss_threshold` absent = K 0) | none | - | 3 (+ w1 unscored) |
+| aU | `DL_K=3` | none | - | 3 |
+| bK | off | val3 SIGKILL at bench+120 s, never restarted | - | 3 |
+| aK | `DL_K=3` | as bK | - | 3 scored (+ 2 reruns) |
+| qOff | `DL_K=3` | as bK | `TORUS_EPOCH_PLAN_HANDOFF` unset | 1 |
+| qOn | `DL_K=3` | as bK | `TORUS_EPOCH_PLAN_HANDOFF=1` | 1 |
+
+* Order: w1 (bU), r1 bU aU aK bK, r2 aK bK bU aU, r3 bK aK aU bU, r1-qOff, r1-qOn, then the driver's rerun pass
+  (r2-aK-rerun, r3-aK-rerun). 600 s load, 300 markets, 5,000 senders, in-flight cap 4, batch 400, rate 20,000
+  actions/s nominal. The cap limits what is actually submitted.
+* Config, checked after the campaign on val0..3 of every cell (`checks/9p-checks.sh` `configchk4`,
+  `handoffchk4`). All 17 pass:
+  * fail-stop on=true, L2.1 on=true, L6.1 on=Some, hash activation=Some, attestation enabled;
+  * the hand-off line on=true in qOn only, on=false everywhere else;
+  * run.log genesis `consensus.leader_miss_threshold=3` on the a / q arms, `absent` on the b arms.
+* The campaign driver had no checks file and no run.log expectation, so the report scans ran in the end pass
+  (`end_pass=1`, 227 s after the last cell). Idle between cells: 5-6 s.
+* Windows (val0; `analyst/cells9p.py`):
+  * K cells: pre = load start..kill. kill->excl = kill..the first `on_commit_block fired height=H` (hotstuff commit
+    of the exclusion boundary H, survivor log). post = that commit..load end.
+  * bK: kill..load end (no exclusion).
+  * U: 0-120 s, 120-190 s, 190 s..end.
+  * blocks/s and matched/s are `torus_blocks_committed_total` / `torus_orders_matched_total` rates from
+    `sampler.csv`. Order age is order age at commit (`torus_order_age_commit_seconds` histogram deltas, linear
+    inside a bucket).
+* Note: `dl_window.py` (run.log "dead-leader window") calls the exclusion "committed" at the first sampler row where
+  `torus_block_height + torus_exec_queue_depth >= H`. That is execution of H, which runs ahead of the hotstuff
+  commit by up to the freeze length: 0.3 s in clean cells, 7.4 s in smoke sA, 153 s in r2-aK. This section uses
+  the log commit.
+
+### 129.2 Smokes and validity
+
+* Smokes (120 s, kill at bench+30 s; `smk-after/`, `smk-before/`):
+  * sA (`DL_K=3`): ACCEPT / AGREE / liveness PASS. Delta at H 3500 +66.6 s, hotstuff commit of 3500 +74.0 s.
+    * Post-exclusion (dl_window): 11.96 / 12.08 / 12.04 blocks/s, 4.8 timeouts per minute. s138 smkA on
+      `a300c7f3`: 0.0 / 0.087 / 0.087 blocks/s and 10.4 / 5.2 / 5.2 per minute, with a 30-35 s freeze.
+    * Not clean, though: views 3545-3546 time out, and 3500 commits 7.4 s after val0 executed it (129.5).
+  * sB (off): ACCEPT, no exclusion, kill window 2.15 blocks/s, 38.1 timeouts per minute.
+  * s0 (campaign driver, 60 s bU): ACCEPT; its end pass ran.
+  * The smoke cut-off was "no gap > ~5 s"; sA's 7.4 s gap was over it. I launched anyway: it is 4-5x shorter than
+    s138's freeze, and the campaign measures exactly this.
+* 17 campaign cells. 14 are rc 0, ACCEPT / AGREE / liveness PASS. 3 are rc 2 REJECT ("drain not established",
+  "liveness failed"): r2-aK, r3-aK, r2-aK-rerun.
+  * All three are binary failures: AGREE, state attestation equal, dissemination clean, md5 ok, 0 HARD FINDING
+    lines. Recorded, not rerun further.
+  * The driver's rerun pass ran r2-aK-rerun (bad again: same 152 s freeze) and r3-aK-rerun (clean).
+  * `cells.tsv` 17 rows, 3 bad. `campaign.done` exit=0 (00:35:27).
+* r2-aK and r2-aK-rerun: 11,297 / 11,577 mempool nonce-expired evictions on each survivor (the freeze); 0 in every
+  other cell.
+* Foreign CPU: this rig has no per-process sampler for foreign processes.
+  * Residual (vmstat us+sy - node ticks - bench): 1.0-1.8 cores on average in every cell, max over 5 s 3.9-5.5
+    cores. It tracks node load (~7.5% of node cores, i.e. kernel I/O work), with no outlier cell.
+  * The system journal shows only snapper's hourly cleanup (:16) and the NetworkManager dispatcher. No builds
+    (HOST before: builds none, analysis none).
+  * No cell was rerun under the FOREIGN rule. Its 0.1-core bar is below this measure's resolution.
+* CPU headroom at 20,000:
+  * All-up: nodes use 22.9-23.2 cores and bench 1.1, of 32 (vmstat busy ~26). In smoke sA's first 30 s the 1-s
+    vmstat idle went down to 5%.
+  * Kill cells, load-window average: nodes 13.5-14.4 cores in bK and the two 154 s freeze cells, 18.5-20.1 in the
+    other DL kill cells.
+  * So the all-up and pre-kill windows run near saturation. The kill and post-exclusion windows do not.
+
+### 129.3 Per cell (run order; val0)
+
+| # | cell | verdict | matched/s | blk/s | blk/s pre / kill->excl / post | tmo/min pre / k->x / post | order age p50 / p99 ms pre; k->x; post | H | kill->delta / ->commit s | blocks kill->H |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | w1 (bU, unscored) | ACCEPT | 200,378 | 25.1 | 17.97 / 25.49 / 27.15 | 1.0 / 0.0 / 0.1 | 990 / 9,401; 308 / 1,239; 368 / 1,220 | | | |
+| 1 | r1-bU | ACCEPT | 201,807 | 23.5 | 17.23 / 21.83 / 25.55 | 1.0 / 0.0 / 0.0 | 1,018 / 9,515; 378 / 2,153; 346 / 1,500 | | | |
+| 2 | r1-aU | ACCEPT | 204,268 | 22.3 | 14.65 / 16.91 / 25.45 | 1.5 / 4.3 / 0.0 | 2,378 / 9,882; 1,311 / 9,489; 385 / 2,432 | | | |
+| 3 | r1-aK | ACCEPT | 225,694 | 17.8 | 15.03 / 2.34 / 22.34 | 1.0 / 38.3 / 0.3 | 2,033 / 9,848; 2,468 / 36,071; 310 / 8,250 | 5000 | 93.7 / 94.0 | 179 |
+| 4 | r1-bK | ACCEPT | 171,958 | 4.7 | 15.12 / 2.06 / - | 0.5 / 39.0 / - | 1,849 / 9,705; 2,338 / 20,425 | none | | |
+| 5 | r2-aK | **REJECT** (154 s freeze) | 160,717 | 11.1 | 15.94 / 0.80 / 20.97 | 1.0 / 17.0 / 0.3 | 1,860 / 9,833; 3,143 / 38,556; 374 / 7,467 | 5200 | 106.6 / 265.2 | 207 |
+| 6 | r2-bK | ACCEPT | 171,484 | 4.8 | 16.32 / 1.95 / - | 1.5 / 38.8 / - | 1,489 / 9,695; 2,352 / 20,424 | none | | |
+| 7 | r2-bU | ACCEPT | 204,199 | 22.6 | 14.79 / 17.91 / 25.61 | 1.0 / 0.9 / 0.0 | 2,054 / 9,802; 669 / 4,977; 335 / 2,260 | | | |
+| 8 | r2-aU | ACCEPT | 206,128 | 22.1 | 14.29 / 19.33 / 24.85 | 1.0 / 0.9 / 0.0 | 2,164 / 9,810; 949 / 4,782; 367 / 2,186 | | | |
+| 9 | r3-bK | ACCEPT | 171,309 | 4.5 | 14.22 / 2.07 / - | 2.0 / 39.0 / - | 1,956 / 9,724; 2,343 / 20,476 | none | | |
+| 10 | r3-aK | **REJECT** (36 s freeze) | 214,644 | 16.2 | 15.59 / 1.33 / 20.93 | 1.0 / 28.4 / 0.3 | 1,499 / 9,742; 2,480 / 37,070; 357 / 33,417 | 5100 | 77.1 / 114.6 | 152 |
+| 11 | r3-aU | ACCEPT | 204,668 | 21.1 | 14.11 / 16.69 / 23.83 | 2.0 / 1.7 / 0.0 | 2,943 / 9,962; 1,536 / 9,677; 346 / 4,491 | | | |
+| 12 | r3-bU | ACCEPT | 204,074 | 23.2 | 14.45 / 19.54 / 26.38 | 1.0 / 0.9 / 0.1 | 1,791 / 9,727; 552 / 4,523; 350 / 1,254 | | | |
+| 13 | r1-qOff | ACCEPT | 224,858 | 18.1 | 15.06 / 2.32 / 22.47 | 1.5 / 36.6 / 0.5 | 1,759 / 9,703; 2,836 / 37,274; 334 / 8,761 | 5100 | 79.3 / 86.7 | 152 |
+| 14 | r1-qOn | ACCEPT | 231,323 | 18.9 | 15.47 / 2.90 / 22.12 | 0.0 / 37.6 / 0.0 | 1,750 / 9,675; 2,434 / 38,505; 321 / 8,225 | 5000 | 57.3 / 58.8 | 113 |
+| 15 | r2-aK-rerun | **REJECT** (154 s freeze) | 165,600 | 11.8 | 15.18 / 0.94 / 20.44 | 1.0 / 14.3 / 0.5 | 2,219 / 9,900; 2,579 / 38,226; 425 / 25,839 | 5000 | 76.3 / 235.0 | 169 |
+| 16 | r3-aK-rerun | ACCEPT | 227,303 | 17.3 | 13.71 / 2.00 / 21.71 | 1.5 / 38.1 / 0.3 | 2,267 / 9,832; 2,273 / 20,203; 303 / 8,135 | 4800 | 85.5 / 85.8 | 166 |
+
+* blk/s = the summary headline (load window); "blocks kill->H" = H - val0's committed height at the kill.
+* Drift: U cells climb within the cell (0-120 s 14-18 blocks/s, 190 s..end 24-27), the same in every round. Arm
+  means by round: bU 201.8 / 204.2 / 204.1k, aU 204.3 / 206.1 / 204.7k. No trend across the run order.
+
+### 129.4 Arm means (± = 95% CI, t on n - 1; `analyst/arms9p.txt`)
+
+| metric | bU (n 3) | aU (n 3) | aU - bU | bK (n 3) | DL kill, all 7 | DL kill, clean 4 |
+|---|---|---|---|---|---|---|
+| matched/s (load) | 203,360 ± 3,344 | 205,021 ± 2,432 | +1,661 ± 2,668 (+0.8%) | 171,584 ± 834 | 207,163 ± 28,221 | 227,295 (224,858-231,323) |
+| blocks/s (load) | 23.1 ± 1.1 | 21.8 ± 1.6 | -1.3 ± 1.3 (-5.5%) | 4.7 ± 0.4 | 15.9 ± 2.9 | 18.0 (17.3-18.9) |
+| order age p50 ms (load) | 410 ± 40 | 469 ± 10 | +59 ± 26 (+14%) | 2,150 ± 207 | 557 ± 130 | |
+| order age p99 ms (load) | 7,575 ± 1,841 | 8,761 ± 1,312 | not resolved | 20,330 ± 76 | 22,775 ± 5,438 | |
+| timeouts val0 (whole run) | 4.3 ± 5.2 | 7.7 ± 8.0 | not resolved | 339 ± 13 | 59.7 ± 11.2 | |
+
+Windows (K cells, val0):
+
+| window | metric | bK (n 3) | DL kill, all 7 | DL kill, clean 4 (r1-aK, r3-aK-rerun, qOff, qOn) |
+|---|---|---|---|---|
+| pre-kill | blocks/s | 15.22 ± 2.62 | 15.14 ± 0.66 | 14.82 |
+| | matched/s | 214,797 ± 4,925 | 214,358 ± 2,635 | 214,370 |
+| | timeouts/min | 1.3 | 1.0 | 1.0 |
+| | order age p50 / p99 ms | 1,765 / 9,708 | 1,912 / 9,790 | 1,952 / 9,764 |
+| kill -> exclusion (bK: kill -> end) | blocks/s | 2.03 ± 0.17 | 1.80 ± 0.73 | 2.39 |
+| | matched/s | 160,832 ± 754 | 124,851 ± 44,603 | 160,714 |
+| | timeouts/min | 38.9 ± 0.2 | 30.0 ± 9.7 | 37.7 |
+| | order age p50 / p99 ms | 2,344 / 20,442 | 2,602 / 35,129 | 2,503 / 33,013 |
+| post-exclusion | blocks/s | - | 21.57 ± 0.73 | 22.16 |
+| | matched/s | - | 245,704 ± 1,480 | 244,614 |
+| | timeouts/min | - | 0.31 ± 0.15 | 0.27 |
+| | order age p50 / p99 ms | - | 346 ± 40 / 14,299 ± 9,900 | 317 / 8,343 |
+
+* Kill to exclusion, DL kill cells: delta logged 57-107 s after the kill (113-207 blocks). Hotstuff commit of H:
+  58.8-94.0 s in clean cells; 114.6 / 235.0 / 265.2 s in freeze cells.
+* Post-exclusion blocks/s vs all-up, 7 DL kill cells:
+  * vs the all-up whole-run mean (22.47): 0.910-1.000, all >= 0.90.
+  * vs the 6 all-up cells over the same wall offsets: 0.772-0.882 (the U cells run 25.2-26.7 blocks/s there), all
+    < 0.90.
+  * Post-exclusion blocks carry the kill window's backlog: matched/s 245k vs 201k all-up at the same offsets (+22%),
+    fewer but fuller blocks. Raw blocks/s understates the recovery.
+
+### 129.5 The residual freeze (9p "no new stalls")
+
+* The liveness gate flags it (no commit for >= 30 s): r2-aK, all 3 survivors, 137-152 s; r3-aK, val0 35 s and
+  val2 30 s; r2-aK-rerun, all 3, 142-152 s. Every stall starts within 0-15 s of the exclusion delta.
+* Per cell, first commit of the block before H on val0 / val1 / val2 (s after the kill), then H:
+
+| cell (kill, UTC) | H | block | val0 | val1 | val2 | H commits (all) |
+|---|---|---|---|---|---|---|
+| r1-aK (19:36:52, clean) | 5000 | 4998 | 93.8 | 93.8 | 93.8 | 94.0-94.1 |
+| smoke sA (18:39:40) | 3500 | 3498 | 66.6 | 67.9 | 70.3 | 74.0-74.1 |
+| r3-aK (21:06:22) | 5100 | 5098 | 78.4 | 88.1 | 83.3 | 114.6-114.7 |
+| r2-aK-rerun (22:10:04) | 5000 | 4997 | 81.2 | 86.1 | 90.9 | 235.0 |
+| r2-aK (20:02:16) | 5200 | 5197 | 111.4 | 125.9 | 121.1 | 265.2 |
+
+* r2-aK in detail (UTC 2026-10-24):
+  * The delta is logged at 20:04:02.6-02.7. Nudges for views 5275 / 5276 reach all 3 nodes at 20:04:07.52, but
+    only val0 commits 5197 then.
+  * val2 and val1 commit 5197 on NewView 5277, at 20:04:17.2 / 22.0.
+  * val0 then runs alone through views 5278-5283 under the stall backoff (sampler steps 5 / 10 / 19 / 38 s), while
+    val1 / val2 trail one view behind (5277 -> 5282).
+  * They meet in view 5302 at +265 s and 5200 commits; the views then catch up (5302 -> 5398 by +275 s).
+* Same mechanism as the s140 freeze root cause (s138 smkA on `a300c7f3`): a Decide nudge whose effect only val0
+  applies. `3c5d02ea` removes it in 4 of 8 exclusions (with sA: 4 clean, 1 short, 3 long), not all.
+* bK has no stall in 3 of 3 cells.
+
+### 129.6 9q Part B (qOff vs qOn; n = 1 each)
+
+| metric | qOff | qOn | change |
+|---|---|---|---|
+| "has not applied the previous boundary" WARNs val0 / val1 / val2 | 6 / 4 / 0 (10) | 0 / 0 / 0 | -100% |
+| timeouts per node, whole run (metrics-after) | 59 / 58 / 59 | 37 / 35 / 36 | -38% |
+| timeouts per node outside kill -> exclusion (pre + post) | 6 / 6 / 6 | 0 / 1 / 0 | -94% |
+| timeouts per node, kill -> exclusion | 53 / 52 / 53 in 87 s | 37 / 34 / 36 in 59 s | dead-leader timeouts |
+| boundary commit gap H-1 -> H, val0, summed over the load window | 5.5 s over 96 boundaries, none > 1 s | 8.6 s over 99, one 1.8 s (4900, kill window) | not resolved |
+| matched/s (load) | 224,858 | 231,323 | +2.9% |
+| blocks/s (load) | 18.1 | 18.9 | +4.6% |
+| order age p50 / p99 ms (load) | 466 / 19,072 | 440 / 17,712 | |
+| post-exclusion blocks/s / matched/s | 22.47 / 244,374 | 22.12 / 245,208 | |
+| exclusion boundary H; val0 height at kill | 5100; 4948 | 5000; 4887 | |
+| kill -> delta / -> commit s | 79.3 / 86.7 | 57.3 / 58.8 | |
+| delta lines on val0 / val1 / val2 | H 5100, exclude 1, excluded 1, within 41 ms | H 5000, exclude 1, excluded 1, within 59 ms | identical per cell |
+| state attestation / agreement | 63 heights equal, AGREE, ACCEPT | 63 heights equal, AGREE, ACCEPT | no divergence |
+
+* qOff's WARN heights (4400, 5300, 5500, 6000, 6300) are never the exclusion boundary. The earlier H in qOn is phase
+  (the kill fell at 4887 vs 4948). In every DL kill cell, H is the first boundary whose plan height (H - 100) is
+  more than ~3 missed val3 turns after the kill: kill 4821 -> 5000, 4634 -> 4800, 4948 -> 5100, 4993 -> 5200.
+* "Boundary stall seconds" as measured (val0 commit gap H-1 -> H) does not see the refusals: in qOff no boundary gap
+  exceeds 1 s. A refusal costs a view timeout, which the timeout counts do see (pre + post 6 -> 0 per node).
+* No freeze in qOff or qOn: both are clean exclusions.
+
+### 129.7 Verdict
+
+* **9p: FAIL on "no new stalls". High confidence.**
+  * 3 of 7 `DL_K=3` kill cells (r2-aK, r3-aK, r2-aK-rerun) freeze 35-154 s before the exclusion commits: REJECT,
+    liveness FAIL. Smoke sA shows the same shape at 7.4 s. bK: 0 of 3.
+  * Same nudge-only-on-val0 shape as the s138 freeze. The `3c5d02ea` fix is incomplete.
+* **Post-exclusion blocks/s >= 90% of all-up: PASS against the all-up whole-run mean (0.91-1.00); FAIL against
+  all-up over the same wall offsets (0.77-0.88). Medium confidence.** Matched/s after the exclusion is 22% above
+  all-up, so the blocks are fuller. With the exclusion committed, the chain runs at full rate: 0.3 timeouts per
+  minute vs bK's 38.9.
+* **All-up aU vs bU: matched/s within noise (+0.8% ± 1.3%).** blocks/s -5.5% ± 5.6% is at the CI edge; order age p50
+  +14% (+59 ± 26 ms) is resolved. Not a stall. Possibly the dead-leader bookkeeping or more timeouts (7.7 vs 4.3, not
+  resolved). The all-up arms run near CPU saturation (129.2), so this is a lead.
+* **9q Part B: WARNs 10 -> 0, no divergence, matched/s +2.9%: PASS. Timeouts -80%: PASS outside the dead-leader
+  window (-94%), not on the whole run (-38%; kill-window dead-leader timeouts dominate and depend on kill phase).
+  Low-medium confidence (n = 1 per arm).** Neither cell froze. The flag does not touch the freeze path.
+
+### 129.8 Limits and next
+
+* n = 3 per 9p arm; the DL kill arm pools 7 cells (5 aK incl. reruns + qOff + qOn). Freeze rate 3 / 7 (with sA
+  4 / 8). The interval is wide (95% Wilson for 3 / 7: 16-75%).
+* The CPU headroom at 20,000 is thin in the all-up and pre-kill windows (all-up busy ~26 of 32 cores). A lower rate
+  would put the all-up comparison on firmer ground. The kill and post-exclusion windows are not CPU-bound.
+* Next:
+  1. 18c: the freeze cells' logs. r2-aK views 5272-5302 (UTC 20:04:02-20:06:41), r2-aK-rerun views around H 5000
+     (22:11:21-22:13:59), r3-aK H 5100 (21:07:39-21:08:16), smoke sA H 3500 (18:40:46-54). Question: why do
+     val1 / val2 not commit on the nudge that val0 commits on, after `e2b44457`?
+  2. After a fix: re-run aK only (n >= 6, ABBA with bK) plus a smoke; the U arms and bK from this section stay valid
+     for the same binary family.
+  3. 9q: the flag can go default-on on Part A + B's WARN / divergence evidence; for a timeout number that does not
+     depend on kill phase, use pre + post timeouts (this section) or repeat Part B n = 3.
+
+### 129.9 Data
+
+* Cells: `~/bench-results-matched/ozarchy-s140-9p-{w1,r1-bU,r1-aU,r1-aK,r1-bK,r2-aK,r2-bK,r2-bU,r2-aU,r3-bK,r3-aK,
+  r3-aU,r3-bU,r1-qOff,r1-qOn,r2-aK-rerun,r3-aK-rerun}`. Files: `summary.json`, `dl-window.json`, `sampler.csv`,
+  `buckets.csv`, `val*.log.gz`, `metrics-1hz.txt.gz`, `vmstat-1hz.txt`, `host-1hz.tsv`, plus their `.campaign.log`
+  / `.cell.rc`.
+* Smokes: `ozarchy-s140-9p-smkA-smoke-s0`, `ozarchy-s140-9p-smkB-smoke-s0`, `ozarchy-s140-9p-smoke-s0`.
+* Campaign: `ozarchy-s140-9p-run/` (`campaign.log`, `campaign.done` exit=0, `cells.tsv`, `rerun-queue.tsv`,
+  `smk-after/`, `smk-before/`, `smoke/`).
+* Stage: `ozarchy-s140-9p-stage/` (`build/build-c5.sh`, `build/md5s-c5.txt`). Tools: `ozarchy-s140-9p-tools/`
+  (`make-specs-9p.py`, `specs/`, `drivers/`, `checks/9p-checks.sh`, `gen-weighted-genesis.log`).
+* Analysis: `ozarchy-s140-9p-tools/analyst/`:
+  * `cells9p.py` -> `cells9p.txt` / `cells9p.json` (windows, gaps, WARNs, foreign CPU);
+  * `arms9p.py` -> `arms9p.txt` (means, CIs, offset-matched all-up);
+  * `posthoc-checks.sh` (configchk4 / handoffchk4 / genesis DL on all cells).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
