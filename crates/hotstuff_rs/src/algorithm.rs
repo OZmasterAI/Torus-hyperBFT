@@ -577,3 +577,7 @@ mod body_before_expiry_tests;
 #[cfg(test)]
 #[path = "rejoin_view_sync_tests.rs"]
 mod rejoin_view_sync_tests;
+
+#[cfg(test)]
+#[path = "vsu_advance_view_commit_tests.rs"]
+mod vsu_advance_view_commit_tests;
