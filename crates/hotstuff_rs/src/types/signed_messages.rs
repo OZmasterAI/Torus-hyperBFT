@@ -282,6 +282,13 @@ impl<CL: Collector> ActiveCollectorPair<CL> {
         None
     }
 
+    /// Whether this pair still holds a previous-validator-set collector, i.e. it was built (or last
+    /// updated) in a validator-set update window. Its certificates are not correct by construction
+    /// once the update is decided.
+    pub(crate) fn has_pvs_collector(&self) -> bool {
+        self.pvs_collector.is_some()
+    }
+
     /// Update the `ActiveCollectorPair`'s active validator sets given the latest current
     /// `validator_set_state`.
     ///

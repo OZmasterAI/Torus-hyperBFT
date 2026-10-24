@@ -1260,12 +1260,35 @@ impl<N: Network> HotStuff<N> {
 
             // MonadBFT B3: Use reputation-weighted leader selection.
             let reputation = block_tree.leader_reputation().ok();
-            if !is_proposer_with_reputation(
+            let mut is_sender_proposer = is_proposer_with_reputation(
                 origin,
                 check_view,
                 &validator_set_state,
                 reputation.as_ref(),
-            ) {
+            );
+
+            // s140 (bench 9p smoke): the Decide nudge of a validator-set update can come from a
+            // leader that only the update installs. When the update's Commit PC formed at a backup
+            // aggregator (the primary, the old leader of the next view, is down), that aggregator
+            // alone commits the update, and if the new set makes it the leader of the next view
+            // it nudges there with the Commit PC. The other replicas still hold the old committed
+            // set, so checked against it the nudge came from a non-proposer and was dropped: no
+            // Decide quorum, and a leader-exclusion update stalled the chain for ~36 s. Apply the
+            // nudge's Commit PC first (any validator's correct and safe PC is applied from a
+            // NewView too), then check the sender against the validator-set state it leaves.
+            if !is_sender_proposer {
+                if let HotStuffMessage::Nudge(nudge) = &msg {
+                    if self.apply_commit_justify(nudge, block_tree, app)? {
+                        is_sender_proposer = is_proposer_with_reputation(
+                            origin,
+                            check_view,
+                            &block_tree.validator_set_state()?,
+                            reputation.as_ref(),
+                        );
+                    }
+                }
+            }
+            if !is_sender_proposer {
                 return Ok(());
             }
 
@@ -1311,6 +1334,38 @@ impl<N: Network> HotStuff<N> {
                 self.on_receive_block_data_response(resp, origin, block_tree, app)
             }
         }
+    }
+
+    /// s140: apply the Commit PC of a `nudge` for the current view before its sender is checked
+    /// as the proposer (see `on_receive_msg`). Only a correct, safe Commit PC is applied, exactly
+    /// as a NewView's highest PC is (`on_receive_new_view`): update highestPC, lock, commit, then
+    /// the phase-vote collectors. Returns whether it was applied (the proposer check then runs
+    /// again on the validator-set state it left).
+    fn apply_commit_justify<K: KVStore>(
+        &mut self,
+        nudge: &Nudge,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<bool, HotStuffError> {
+        let justify = &nudge.justify;
+        if justify.phase != Phase::Commit
+            || nudge.view != self.view_info.view
+            || !justify.is_correct(self.config.chain_id, block_tree)?
+            || !safe_pc(justify, block_tree, self.config.chain_id)?
+        {
+            return Ok(false);
+        }
+        let update_result = block_tree
+            .update(justify, &self.event_publisher)
+            .unwrap_or(UpdateResult {
+                validator_set_updates: None,
+                committed_block_hashes: vec![],
+            });
+        self.process_update_result(update_result, block_tree, app);
+        let _ = self
+            .phase_vote_collectors
+            .update_validator_sets(&block_tree.validator_set_state()?);
+        Ok(true)
     }
 
     /// Send `vote` to its aggregator, `leader(vote.view + 1)` (FIX CONS-FIND-13:
@@ -1836,7 +1891,23 @@ impl<N: Network> HotStuff<N> {
                 // removed was silently discarding those PCs. Restore it for
                 // the transition window only; in steady state the sole CVS
                 // collector's PCs remain correct by construction.
-                if block_tree.validator_set_state()?.update_decided() {
+                // s140: "steady state" also needs the collector pair to be steady. The pacemaker's
+                // AdvanceView path can mark the update decided (`advance_highest_pc_from_remote` on
+                // another aggregator's Decide PC) while this pair still holds the window's PVS
+                // collector; an old-set quorum of late Decide votes then completes it. Such a PC
+                // is checked (and dropped, with the stale collector) like a window PC. The update
+                // is already decided, so dropping it costs no progress.
+                let validator_set_state = block_tree.validator_set_state()?;
+                if validator_set_state.update_decided()
+                    && self.phase_vote_collectors.has_pvs_collector()
+                {
+                    let _ = self
+                        .phase_vote_collectors
+                        .update_validator_sets(&validator_set_state);
+                    if !new_pc.is_correct(self.config.chain_id, block_tree)? {
+                        return Ok(());
+                    }
+                } else if validator_set_state.update_decided() {
                     debug_assert!(
                         new_pc.is_correct(self.config.chain_id, block_tree)?,
                         "locally-collected steady-state PC must be correct by construction"

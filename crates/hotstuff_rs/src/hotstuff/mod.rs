@@ -222,3 +222,6 @@ mod refused_proposal_test;
 
 #[cfg(test)]
 mod reproposal_lag_test;
+
+#[cfg(test)]
+mod vsu_decide_nudge_test;
