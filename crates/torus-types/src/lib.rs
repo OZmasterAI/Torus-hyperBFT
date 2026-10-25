@@ -1995,6 +1995,14 @@ impl FeeSchedule {
     /// Genesis check: `start` and `end` each sum to exactly 10_000 bps (so
     /// every share is in 0..=10_000). Any `transition_epochs` is valid.
     pub fn check(&self) -> Result<(), String> {
+        for (name, shares) in [("start", &self.start), ("end", &self.end)] {
+            let sum: u32 = shares.as_array().iter().map(|&b| u32::from(b)).sum();
+            if sum != 10_000 {
+                return Err(format!(
+                    "fee_split.{name} {shares:?} sums to {sum} bps, not 10000"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -2072,6 +2080,7 @@ impl ChainConfig {
             ));
         }
         DeadLeaderParams::check(self.leader_miss_threshold, self.leader_exclusion_cap)?;
+        self.fee_schedule.check()?;
         Ok(())
     }
 

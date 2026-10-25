@@ -1674,6 +1674,9 @@ struct ExecutionContext {
     max_validators: u32,
     treasury_address: Address,
     dev_pool_address: Address,
+    /// s140: the chain's gas-fee split (`ChainConfig::fee_schedule`), set on
+    /// every block's native context.
+    fee_schedule: torus_types::FeeSchedule,
     /// Item 7 step 1: the genesis parent header from the chain config (the
     /// same value as `TorusApp::genesis_header`): crash replay starts from
     /// it and execution links height 1 to it.
@@ -6172,6 +6175,8 @@ impl ExecutionContext {
             // P0.0 phase 2: execution gates features on the committed header's bits,
             // never this node's schedule (crash replay runs the stored header).
             ctx.features = torus_block.header.features;
+            // s140: fees split by the chain's genesis split.
+            ctx.fee_schedule = self.fee_schedule;
             // P0.0 phase 5: the test feature's state-visible rule (test builds only).
             #[cfg(test)]
             p00_cluster_tests::test_state_rule(&ctx);
@@ -8599,6 +8604,7 @@ impl TorusApp {
             max_validators: config.max_validators,
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
+            fee_schedule: config.fee_schedule,
             genesis_header: genesis_header.clone(),
             activations: config.activations.clone(),
             known_features: options.known_features,
@@ -18994,6 +19000,7 @@ mod crash_recovery_tests {
             max_validators: config.max_validators,
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
+            fee_schedule: config.fee_schedule,
             genesis_header: torus_bridge::genesis_parent_header_for(config),
             activations: config.activations.clone(),
             known_features: torus_types::KNOWN_FEATURES,
@@ -26229,12 +26236,13 @@ mod crash_recovery_tests {
         (blocks, key, Address::repeat_byte(0x77))
     }
 
+    /// [`run_fee_schedule_fixture`]'s DB, its CF dump and its running state hash.
+    type FeeFixtureRun = (StateDb, Vec<CfDump>, Option<(u64, [u8; 32])>);
+
     /// s140: run three blocks of one fee-paying EVM tx each through the live
     /// execution context built from `config` (treasury 0x7a.., dev pool
     /// 0xde..); returns the DB, its CF dump and the running state hash.
-    fn run_fee_schedule_fixture(
-        fee_schedule: Option<torus_types::FeeSchedule>,
-    ) -> (StateDb, Vec<CfDump>, Option<(u64, [u8; 32])>) {
+    fn run_fee_schedule_fixture(fee_schedule: Option<torus_types::FeeSchedule>) -> FeeFixtureRun {
         torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         let key = k256::ecdsa::SigningKey::from_slice(&[62u8; 32]).unwrap();
         let mut blocks: Vec<TorusBlock> = (1..=3).map(|h| make_block(h, vec![])).collect();

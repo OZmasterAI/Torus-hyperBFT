@@ -218,7 +218,10 @@ pub struct EconomicsConfig {
     pub treasury_address: Option<String>,
     #[serde(default)]
     pub dev_pool_address: Option<String>,
-    /// Must equal the built-in split; the loader refuses another value (row 80 option D).
+    /// The chain's gas-fee split (`ChainConfig::fee_schedule`, s140): start
+    /// and end each sum to 10_000 bps. Absent = the built-in split
+    /// ([`torus_types::BUILTIN_FEE_SCHEDULE`]).
+    #[serde(default)]
     pub fee_split: FeeSplitConfig,
     pub permanent_staking: PermanentStakingConfig,
     pub validator: ValidatorConstraints,
@@ -229,6 +232,24 @@ pub struct FeeSplitConfig {
     pub start: FeeSplit,
     pub end: FeeSplit,
     pub transition_epochs: u64,
+}
+
+impl Default for FeeSplitConfig {
+    /// The built-in split ([`torus_types::BUILTIN_FEE_SCHEDULE`]).
+    fn default() -> Self {
+        let b = torus_types::BUILTIN_FEE_SCHEDULE;
+        let shares = |s: torus_types::FeeShares| FeeSplit {
+            burn: s.burn.into(),
+            validator: s.validator.into(),
+            treasury: s.treasury.into(),
+            dev_pool: s.dev_pool.into(),
+        };
+        Self {
+            start: shares(b.start),
+            end: shares(b.end),
+            transition_epochs: b.transition_epochs,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -629,48 +650,39 @@ impl Genesis {
         )
     }
 
-    /// Row 80 option D: fees are split by the built-in constants
-    /// (`torus_economics::types` FEE_* and TRANSITION_EPOCHS), not by this
-    /// field, so a genesis that asks for another split is refused until the
-    /// field is wired in or made a governance setting.
-    fn check_fee_split(&self) -> Result<(), GenesisError> {
-        use torus_economics::types as t;
+    /// s140: the chain's gas-fee split from `economics.fee_split` (absent =
+    /// the built-in split): every share 0..=10_000 bps, start and end each
+    /// summing to exactly 10_000 ([`torus_types::FeeSchedule::check`]); any
+    /// `transition_epochs`. Was row 80 option D (s100): only the built-in
+    /// split loaded.
+    pub fn fee_schedule(&self) -> Result<torus_types::FeeSchedule, GenesisError> {
         let fs = &self.economics.fee_split;
-        let start = [
-            fs.start.burn,
-            fs.start.validator,
-            fs.start.treasury,
-            fs.start.dev_pool,
-        ];
-        let end = [
-            fs.end.burn,
-            fs.end.validator,
-            fs.end.treasury,
-            fs.end.dev_pool,
-        ];
-        let want_start = [
-            t::FEE_START_BURN_BPS,
-            t::FEE_START_VALIDATOR_BPS,
-            t::FEE_START_TREASURY_BPS,
-            t::FEE_START_DEV_POOL_BPS,
-        ]
-        .map(u32::from);
-        let want_end = [
-            t::FEE_END_BURN_BPS,
-            t::FEE_END_VALIDATOR_BPS,
-            t::FEE_END_TREASURY_BPS,
-            t::FEE_END_DEV_POOL_BPS,
-        ]
-        .map(u32::from);
-        if start != want_start || end != want_end || fs.transition_epochs != t::TRANSITION_EPOCHS {
-            return Err(GenesisError::InvalidFeeSplit(format!(
-                "start {start:?} end {end:?} over {} epochs; the chain splits fees by the built-in \
-                 start {want_start:?} end {want_end:?} over {} epochs (burn, validator, treasury, dev_pool bps)",
-                fs.transition_epochs,
-                t::TRANSITION_EPOCHS
-            )));
-        }
-        Ok(())
+        let shares = |end: &str, s: &FeeSplit| -> Result<torus_types::FeeShares, GenesisError> {
+            let bps = |field: &str, v: u32| {
+                u16::try_from(v).ok().filter(|v| *v <= 10_000).ok_or_else(|| {
+                    GenesisError::InvalidFeeSplit(format!(
+                        "fee_split.{end}.{field} {v} bps is over 10000"
+                    ))
+                })
+            };
+            Ok(torus_types::FeeShares {
+                burn: bps("burn", s.burn)?,
+                validator: bps("validator", s.validator)?,
+                treasury: bps("treasury", s.treasury)?,
+                dev_pool: bps("dev_pool", s.dev_pool)?,
+            })
+        };
+        let schedule = torus_types::FeeSchedule {
+            start: shares("start", &fs.start)?,
+            end: shares("end", &fs.end)?,
+            transition_epochs: fs.transition_epochs,
+        };
+        schedule.check().map_err(GenesisError::InvalidFeeSplit)?;
+        Ok(schedule)
+    }
+
+    fn check_fee_split(&self) -> Result<(), GenesisError> {
+        self.fee_schedule().map(|_| ())
     }
 
     /// Initialize the state database with genesis data. Returns the state root.
@@ -867,9 +879,9 @@ impl Genesis {
 
     /// Build a [`ChainConfig`] from the genesis parameters.
     ///
-    /// Panics on an activation schedule that does not merge or a malformed
-    /// economics address; `from_json` already refused such a genesis (the
-    /// node does not start).
+    /// Panics on an activation schedule that does not merge, a malformed
+    /// economics address or an invalid fee split; `from_json` already
+    /// refused such a genesis (the node does not start).
     pub fn chain_config(&self) -> ChainConfig {
         let activations = self
             .activation_schedule()
@@ -893,7 +905,9 @@ impl Genesis {
             fee_validator_bps: self.economics.fee_split.start.validator,
             fee_treasury_bps: self.economics.fee_split.start.treasury,
             fee_dev_pool_bps: self.economics.fee_split.start.dev_pool,
-            fee_schedule: Default::default(),
+            fee_schedule: self
+                .fee_schedule()
+                .unwrap_or_else(|e| panic!("genesis not loaded through from_json: {e}")),
             treasury_address,
             dev_pool_address,
             timeout_base_ms: self.consensus.timeout_base_ms,
