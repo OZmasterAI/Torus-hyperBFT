@@ -21460,6 +21460,9 @@ window's user CPU). B3 - B2, user ms per 1k fills:
   * Absolute matched/s runs 8% higher here in both arms, and CPU per fill is equal. Same binaries, spec and
     harness. Differences: section 128 ran after 8 other binaries' cells with in-line scans; this run had 5-7 s
     between cells (end pass). Not attributed. Within-campaign steps are not affected.
+  * **Absolute levels are not comparable to section 128; cause unconfirmed** (18c, msg 180). In-line scans taking
+    CPU on a host near saturation is plausible but unproven; only the B2 -> B3 step is the result. One in-line vs
+    end-pass cell on the same binary would settle it if a later campaign has a spare slot.
 * Drift: B2 positions 1 / 4 / 6 / 7 and B3 2 / 3 / 5 / 8 sum to 18 each, so a linear drift cancels.
   * B2 cells 278.8k / 281.3k / 281.0k (rerun) / 281.6k; B3 265.9k / 267.2k / 268.8k / 266.6k (rerun).
   * The first cell of each arm is its lowest, by ~1-2k. No trend beyond that.
@@ -21492,6 +21495,10 @@ window's user CPU). B3 - B2, user ms per 1k fills:
   foreign `quickshell` load of ~0.26 core (both arms alike).
 * The reruns ran in their own campaign, ~12 minutes after the main one, with no warm-up. The two original cells give
   the same verdict (130.6).
+  * **Deviation from "all cells of a step from one driver", accepted by 18c (msg 180):** r3-B2 and r4-B3 broke the
+    FOREIGN rule (the 15-minute desktop job, 130.2), and the generator's rerun queue only takes cells it flagged
+    itself, so the two reruns ran from a second driver (bench-ozarchy-s140-9s-rr-prof) with the same binaries, env
+    and shape. Kept as-is; no full rerun.
 * Next (main session decides; no bisect inside merge/s138-batch-a is needed: the profile names the code):
   1. Remove the per-action read from the intake. The predicate is monotonic: "once marked, always marked; the row
      is never deleted".
