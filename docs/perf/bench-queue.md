@@ -1185,12 +1185,21 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    phase, H 5000 vs 5100); matched/s 224,858 -> 231,323 (+2.9%); every survivor logged the same delta per cell,
    attestation equal over 63 heights, AGREE; neither cell froze. Boundary stall seconds (val0 commit gap H-1 -> H)
    not resolved (no gap > 1 s with the flag off).**
-9s. **[GO s140, after 9p + 9q Part B] Batch A all-up cost (section 128 follow-up).** Section 128 put the all-up
+9s. **[RAN s140, section 130: CONFIRMED, -4.8% matched/s; cause = the RPC intake's per-action `ever_marked` oracle-row read (price band C) on the ingress threads; fix + re-bench = main session decision] [GO s140, after 9p + 9q Part B] Batch A all-up cost (section 128 follow-up).** Section 128 put the all-up
    -3.8% matched/s at batch A `d595f77e` (B2 `cc8c9c4a` -> B3: -13,451 +- 4,582 matched/s, process CPU per fill +8.3%,
    ~95% of it OFF the exec thread). (1) ABBA B2 vs B3, n = 4 per arm, std 2/2/1, seed, U only (~71 min); (2) if
    confirmed, whole-process profile diff B2 vs B3 (perf, all threads; suspects: genesis-digest handshake, price-band C
    checks on RPC / ingress / mempool threads); (3) only if the profile names nothing, bisect inside merge/s138-batch-a.
    Doc target: the next results-doc section.
+   **Done s140 (bench-ozarchy-s140-9s + bench-ozarchy-s140-9s-rr-prof, B2 `cc8c9c4a` node `6f64139c` vs B3 `d595f77e`
+   node `c50171eb`, U only, 2/2/1, seed, 300 s, w1 + ABBA n = 4, 9 / 9 cells valid + 2 FOREIGN reruns (a 15-min desktop
+   job, omarchy-agent-u + quickshell, hit r3-B2 / r4-B3) + 4 profile cells; section 130):** matched/s 280,698 -> 267,150
+   (-13,549 +- 2,276, 0.952 [0.944, 0.960]); process CPU per 1k fills 24.04 -> 26.08 (+2.04 +- 0.25, +8.5%), exec thread
+   +0.048 (1.020 [1.004, 1.036]), hotstuff flat; commit p99 +8.5%. Profile: `torus-ingress-v` carries +1.88 of +1.89 ms per
+   1k fills, all RocksDB point-read plumbing (`ReadView::get_cf_raw` -> `DBImpl::GetImpl`, + sys); cause: batch A's
+   `validate_known_markets` calls `oracle::ever_marked` once per market per action (uncached). Genesis-digest handshake:
+   nothing measurable. Step (3) (bisect) not needed. Next (main session): cache the monotonic first-mark predicate at the
+   intake, re-bench ABBA n = 4.
 9r. **[GO s140, after 9s] Item 6 Phase 5 step 2 r2 re-A/B.** A = main `077fe56e`, B = `feat/item6-phase5-step2-r2`
    `14b2abe9`. q7 two-arm build, md5 on every node, same env on both arms. Shapes: std hsdb-300m (standard load s127,
    `ORACLE_FEED=seed`) and deep (9n D). One A warm-up per shape, then ABBA n = 3, 600 s cells, fresh data dirs.

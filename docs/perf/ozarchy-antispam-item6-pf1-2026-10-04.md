@@ -21231,6 +21231,306 @@ Windows (K cells, val0):
   * `arms9p.py` -> `arms9p.txt` (means, CIs, offset-matched all-up);
   * `posthoc-checks.sh` (configchk4 / handoffchk4 / genesis DL on all cells).
 
+## 130. Step 9s, batch A all-up cost (section 128 follow-up): B2 `cc8c9c4a` vs B3 `d595f77e`, U (all up) only, stakes 2 / 2 / 1, `ORACLE_FEED=seed`, frozen `9083b278` harness genesis, hash + attestation + L6.1 + L2.1 + fail-stop on, Classic, 15 s checkpoints, w1 (B2, unscored) + ABBA n = 4 (B2 B3 B3 B2 B3 B2 B2 B3) + 2 FOREIGN reruns, then 4 unscored profile cells (ABBA n = 2, perf `cycles:u` on all 3 nodes), 300 s cells (campaigns bench-ozarchy-s140-9s and bench-ozarchy-s140-9s-rr-prof, run dirs ozarchy-s140-9s-run, -rerun-run, -prof-run, archy, 2026-10-25)
+
+**Confirmed: batch A costs 4.8% matched/s all-up, and the cost is the RPC intake's new first-mark check.**
+* matched/s B2 -> B3: -13,549 ± 2,276 (0.952 [0.944, 0.960], -10.8 sd). All 4 rounds agree (-12.2k to -15.0k).
+* Process CPU per 1k fills: +2.04 ± 0.25 ms (+8.5%). Exec thread +0.048, hotstuff-algo flat: 98% of the added CPU
+  is off the exec thread.
+* The profile cells put it all on one thread group: the ingress verifiers `torus-ingress-v` take +1.88 of +1.89 ms
+  per 1k fills. Every other thread group moves less than 0.2 ms. The added ingress work is RocksDB point reads
+  (`ReadView::get_cf_raw` -> `DBImpl::GetImpl` / block cache / bloom filter, plus their syscalls).
+* Source: batch A's `validate_known_markets` (`crates/torus-rpc/src/torus.rs`, from `9b1d564c` price band C) calls
+  `torus_core::oracle::ever_marked` once per distinct market in every action. That is one uncached
+  `CF_NATIVE_ORACLE` read on the ingress thread. The genesis-digest handshake (network) shows no cost.
+
+Question (s140, bench queue 9s): does section 128's B2 -> B3 step (-13,451 ± 4,582 matched/s, process CPU per fill
++8.3%, ~95% off the exec thread) hold in a direct ABBA, and which threads and functions carry the added CPU?
+Suspects named before launch: the genesis-digest handshake, and price band C checks on RPC / ingress / mempool
+threads.
+
+### 130.1 Setup
+
+* Binaries: the section 128 stage, `ozarchy-s140-bisect-stage/{cc8c9c4a,d595f77e}/m/release`. md5 re-checked
+  against `build/md5s.txt` before the launch. Each arm uses its own `bench-throughput`:
+
+| arm | main point | node md5 | bench md5 | change |
+|---|---|---|---|---|
+| B2 | `cc8c9c4a` | `6f64139c` | `7bcd1e82` | batch 12 (hotstuff_rs only), baseline |
+| B3 | `d595f77e` | `c50171eb` | `6799fa44` | batch A (merge/s138-batch-a `e7d9d46a`): price band C first-mark rule + genesis-digest handshake |
+
+* Specs: `make-specs-9s.py` derives them from section 128's spec (`specs/base-bisect-main.json` = a copy of
+  `bisect-main.json`), keeping only B2 / B3. Harness env, node env, absent env, the bench.log expectations, host
+  checks and samplers are unchanged, and so are the harness worktree `wt/bq-9083b278` and the frozen generator
+  (`gen/`, identical to section 128's).
+  * Load: 300 markets, rate 76,000, 5,000 senders, batch 400, `MAX_IN_FLIGHT` 4, commit tail, `BENCH_RPCS=0,1`.
+  * Genesis: 300 markets, 100,060 balances, genesis-cache per run dir.
+* One difference from section 128: the campaign spec has no checks file and no run.log expectation, so the report
+  scans defer to the end pass (`end_pass=1`, bench queue pacing rule). Section 128 ran in-line (`end_pass=0`).
+  * Cells were 5-7 s apart (section 128: ~14 s).
+  * The startup config check (`configchk`: fail-stop on, L2.1 streamed on, L6.1, hash activation, attestation)
+    and the `drained=1 after` line ran in-line in both smokes. After the campaigns they ran on every cell
+    (`analyst/posthoc-checks.sh`).
+* Smokes, 60 s each, in-line checks: `smk-B2` 277,788 and `smk-B3` 272,504 matched/s, ACCEPT / AGREE / PASS, every
+  CHECK OK. The B3 smoke also tested the perf sidecar with short windows.
+* FOREIGN CPU sampler (new, `prof/foreign-sampler.py`): every 2 s it reads `/proc/*/stat`. Each process counts as
+  bench (cgroup `bench-*`), kernel thread or foreign, with CPU = utime + stime + cutime + cstime. systemd gets no
+  cutime: it reaps the units' main processes. The sampler runs beside the driver inside the campaign unit and costs
+  ~0.004 core. Rule: a foreign process averaging > 0.1 core, or a 2 s spike > 0.5 core, in a cell's load window
+  means the cell is rerun.
+* Profile cells (step 2, own campaign `9s-prof.json`, p1 B2 B3 / p2 B3 B2, same spec):
+  * `prof/perf-sidecar-9s.sh` runs beside the driver (`prof/run-with-perf.sh`).
+  * W1 = bench+60..120 s and W2 = bench+150..210 s, each `perf record -e cycles:u -F 499 --no-buildid-cache` on
+    the 3 node pids (all threads), flat (the release node has no frame pointers).
+  * Per-task snapshots (`/proc/<pid>/task/*/{stat,schedstat}`, all 3 nodes) at bench+5, each window's start and
+    end, and bench+290.
+  * Symbols come from `--symfs` trees with the staged binaries (`symfs-B2`, `symfs-B3`).
+  * `perf_event_paranoid` stayed 2, so there are no kernel events and no off-CPU data.
+  * A `--call-graph dwarf` window was tried in the B3 smoke. It wrote ~52 MB/s, and libdw unwound no callers, so
+    it was dropped.
+* Sources and definitions as in sections 128 and 127.5 (`analyst/abba9s.py`):
+  * matched/s, blk/s, native blk/s, fills per native block and chain ms: `summary.json` headline.
+  * Engine / settle / cache flush: val0 `phase_by_node`.
+  * CPU per 1k fills: process user + sys over the load window, mean of the 3 nodes. Exec / hotstuff: the
+    `torus-execution` / `hotstuff-algo` on-CPU time (`sched_by_node`). Off-exec = process - exec.
+  * Commit p50 / p99: `torus_commit_interval_seconds`, load-window delta, mean of 3 nodes. Order age:
+    `torus_order_age_commit_seconds`.
+* Statistics: n = 4 per arm (w1 not counted). Step = mean(B3) - mean(B2) ± Welch 95% CI (df ~4-6). (sd) = step /
+  pooled sd. Ratio CI = step CI / mean(B2). Paired per round (r1..r4): mean ± t(3) CI.
+
+### 130.2 Validity
+
+* Scored campaign: 9 cells (w1 + 8). All rc 0, ACCEPT / AGREE / liveness PASS, node md5 = the arm's staged md5
+  on 3 nodes.
+  * `cells.tsv` 9 rows, all ok. No CELL-FLAG, "RERUN PASS: nothing queued".
+  * End pass: 9 / 9 OK, 0 HARD FINDING. `campaign.done` exit=0 (02:17:37).
+  * Post-hoc: configchk OK and exactly 1 `drained=1 after` line on every cell.
+* **FOREIGN rule: 2 reruns.** The sampler found a desktop job that fires every 15 minutes (hh:00 / :15 / :30 / :45,
+  +6-12 s): `omarchy-agent-u` + `quickshell` (wayland session) at 1.5-2.4 cores for 2-6 s.
+  * It hit the last 2 s of r3-B2's load window (max 0.81 cores) and the last ~15 s of r4-B3's (max 2.40 cores).
+    Foreign average was 0.05-0.07 core in both.
+  * Every other cell: foreign average 0.04-0.06 core and 2 s max 0.21-0.43 core. The largest item in every cell
+    is this agent's own process (`claude`, 0.02-0.03 core).
+  * Reruns `ozarchy-s140-9s-rerun-{r3-B2,r4-B3}`: same spec and order, own campaign (the generator's rerun queue
+    is per driver). The launch was timed so both load windows sit between two quarter-hour bursts.
+  * Both reruns are clean: foreign average 0.046 / 0.029 core, 2 s max 0.43 / 0.12 core. rc 0, ACCEPT / AGREE /
+    PASS, md5 ok, configchk OK.
+  * Their values replace r3-B2 and r4-B3 in 130.4. The original 8 cells give the same answer (130.6).
+* Profile campaign: 4 cells, all rc 0, ACCEPT / AGREE / PASS, md5 ok, configchk OK. 8 / 8 perf windows rc 0 with
+  0 lost samples (26-27 MB each). Unscored.
+  * p2-B3 and p2-B2 ran after the 03:00 CEST -> 02:00 CET change. From then on `quickshell` used ~0.26 core
+    steadily (foreign average 0.34 core in both cells; still ~0.18 core after the campaign).
+  * The p2 cells would fail the FOREIGN rule. They are not scored and both arms carry the same load, so they
+    stay in the profile.
+  * **Host note: quickshell's steady load must be gone before the next archy campaign.**
+
+### 130.3 Per cell (run order; CPU = process user + sys per 1k fills, mean of 3 nodes)
+
+| # | cell | arm | matched/s | blk/s | native blk/s | commit p50 / p99 ms | CPU ms / 1k fills | exec-thread ms / 1k fills | off-exec ms / 1k fills | sys ms / 1k fills | engine ms / 1k fills | timeouts |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | w1 (unscored) | B2 | 278,304 | 16.1 | 9.76 | 13.0 / 742 | 24.10 | 2.393 | 21.71 | 1.85 | 2.548 | 0 |
+| 1 | r1-B2 | B2 | 278,849 | 15.8 | 9.71 | 12.9 / 734 | 24.05 | 2.403 | 21.65 | 1.79 | 2.575 | 2 |
+| 2 | r1-B3 | B3 | 265,918 | 14.8 | 8.83 | 12.9 / 812 | 26.10 | 2.411 | 23.69 | 2.27 | 2.600 | 8 |
+| 3 | r2-B3 | B3 | 267,237 | 15.0 | 9.10 | 13.1 / 808 | 26.14 | 2.430 | 23.71 | 2.26 | 2.610 | 4 |
+| 4 | r2-B2 | B2 | 281,262 | 16.1 | 9.94 | 13.5 / 735 | 23.82 | 2.343 | 21.47 | 1.81 | 2.495 | 1 |
+| 5 | r3-B3 | B3 | 268,837 | 15.1 | 9.14 | 13.2 / 815 | 25.92 | 2.406 | 23.52 | 2.21 | 2.572 | 6 |
+| 6 | r3-B2 (FOREIGN, replaced) | B2 | 279,593 | 15.9 | 9.97 | 13.6 / 737 | 24.08 | 2.372 | 21.71 | 1.89 | 2.554 | 1 |
+| 7 | r4-B2 | B2 | 281,637 | 15.5 | 9.55 | 13.6 / 736 | 24.21 | 2.378 | 21.83 | 1.89 | 2.540 | 4 |
+| 8 | r4-B3 (FOREIGN, replaced) | B3 | 269,176 | 14.7 | 9.02 | 13.1 / 805 | 25.64 | 2.394 | 23.25 | 2.18 | 2.539 | 5 |
+| 9 | rerun-r3-B2 | B2 | 281,046 | 14.7 | 9.13 | 14.3 / 785 | 24.08 | 2.373 | 21.71 | 1.81 | 2.522 | 8 |
+| 10 | rerun-r4-B3 | B3 | 266,607 | 15.3 | 9.33 | 12.7 / 808 | 26.14 | 2.441 | 23.70 | 2.26 | 2.618 | 4 |
+
+### 130.4 Arm means and B3 - B2 (n = 4 per arm, reruns in; ± = Welch 95% CI; `analyst/abba9s-final.txt`)
+
+Exec-path rule rows (section 91) first:
+
+| metric | B2 | B3 | B3 - B2 | B3 / B2 [CI] (sd) |
+|---|---|---|---|---|
+| matched/s | 280,698 | 267,150 | **-13,549 ± 2,276** | **0.952 [0.944, 0.960]** (-10.8) |
+| exec-thread on-CPU ms / 1k fills | 2.374 | 2.422 | +0.048 ± 0.038 | 1.020 [1.004, 1.036] (+2.3) |
+| CPU-s per 1M fills (process, user + sys) | 24.04 | 26.08 | **+2.04 ± 0.25** | **1.085 [1.074, 1.095]** (+14.9) |
+| native blocks/s | 9.58 | 9.10 | -0.48 ± 0.56 | 0.950 [0.892, 1.008] (-1.7) |
+| commit p50 ms | 13.6 | 13.0 | -0.6 ± 0.9 | 0.958 [0.888, 1.028] (-1.4) |
+| commit p99 ms | 748 | 811 | **+63 ± 40** | **1.085 [1.031, 1.138]** (+3.5) |
+| timeouts per 1,000 blocks | 0.82 | 1.21 | +0.39 ± 1.07 | not resolved |
+
+Where the CPU goes (ms per 1k fills, mean of 3 nodes):
+
+| metric | B2 | B3 | B3 - B2 | B3 / B2 [CI] (sd) |
+|---|---|---|---|---|
+| process user | 22.21 | 23.83 | **+1.61 ± 0.23** | 1.073 [1.062, 1.083] (+14.1) |
+| process sys | 1.83 | 2.25 | **+0.42 ± 0.07** | 1.232 [1.193, 1.271] (+11.7) |
+| off-exec (process - exec thread) | 21.67 | 23.65 | **+1.99 ± 0.22** | 1.092 [1.082, 1.102] (+16.2) |
+| hotstuff-algo on-CPU | 0.866 | 0.865 | -0.002 ± 0.006 | flat |
+| off-exec, off-hotstuff | 20.80 | 22.79 | **+1.99 ± 0.22** | 1.096 [1.085, 1.106] (+16.2) |
+| engine | 2.533 | 2.600 | +0.067 ± 0.054 | 1.027 [1.005, 1.048] (+2.4) |
+| settle | 1.005 | 1.055 | +0.049 ± 0.017 | 1.049 [1.032, 1.066] (+5.5) |
+| cache flush | 0.485 | 0.516 | +0.031 ± 0.009 | 1.063 [1.045, 1.082] (+6.2) |
+| exec-thread busy fraction (val0) | 0.861 | 0.843 | -0.018 ± 0.015 | |
+| node cores (process, per node) | 6.75 | 6.97 | +0.22 ± 0.09 | 1.032 |
+
+Other rows:
+* blk/s 15.53 / 15.05 (-0.47 ± 1.01).
+* Fills per native block 29,005 / 29,027 (+22 ± 1,734).
+* Chain ms 88.7 / 91.3 (+2.5 ± 6.9).
+* Order age at commit p50 2,353 / 2,637 ms (**+284 ± 153, +12%**); p99 9,659 / 9,764 ms (+105 ± 58).
+* Placed/s 371,928 / 353,200 (**-18,728 ± 2,798**, -5.0%).
+
+Paired per round (B3 - B2, r1..r4):
+* matched/s -12,931 / -14,025 / -12,209 / -15,030 (mean -13,549 ± 1,970).
+* CPU per 1k fills +2.05 / +2.32 / +1.84 / +1.93.
+
+### 130.5 Profile diff (step 2; 4 profile cells, 2 per arm; `analyst/prof9s.txt`)
+
+The profile cells' level matches the scored cells: B2 278,319 / 273,454 and B3 265,043 / 262,794 matched/s.
+Process CPU per 1k fills is B2 24.45 / 24.91 and B3 26.72 / 26.15. That is 0.1-0.9 ms per 1k fills above
+the scored cells (the perf windows and the sidecar).
+
+Per-thread CPU from the task snapshots, bench+5..290 s. Values are user + sys ms per 1k fills (process total over
+the 3 nodes / their fills, i.e. the per-node mean as in 130.4); cells are p1 / p2:
+
+| thread group | B2 | B3 | B3 - B2 | cells B2 | cells B3 |
+|---|---|---|---|---|---|
+| **`torus-ingress-v` (ingress verifiers, 16 per RPC node; val0 / val1 only)** | 5.037 | 6.920 | **+1.883** | 5.046 / 5.029 | 7.219 / 6.621 |
+| `torus-exec-pool` | 5.863 | 5.672 | -0.191 | 5.816 / 5.911 | 5.690 / 5.655 |
+| `torus-gossip-ve` | 3.565 | 3.644 | +0.079 | 3.537 / 3.593 | 3.644 / 3.644 |
+| `rpc-worker` | 1.675 | 1.737 | +0.062 | 1.661 / 1.689 | 1.732 / 1.742 |
+| `rocksdb:low` | 0.849 | 0.885 | +0.036 | | |
+| `torus-execution` | 2.434 | 2.458 | +0.024 | | |
+| `tokio-rt-worker` (network, incl. the handshake) | 2.016 | 2.021 | +0.005 | | |
+| `hotstuff-algo` | 0.874 | 0.865 | -0.009 | | |
+| all threads | 23.905 | 25.797 | +1.892 | | |
+
+* Ingress threads by user / sys:
+  * user: B2 4.66 / 4.66, B3 6.14 / 5.93 (~+1.37);
+  * sys: B2 0.38 / 0.37, B3 1.08 / 0.69 (~+0.51).
+* Ingress cores per RPC node: ~2.1 (B2) -> 2.6-3.0 (B3).
+* The sys rise matches 130.4's process sys +0.42: the extra reads make syscalls (page-cache / block reads).
+
+Functions (`perf cycles:u`, 499 Hz, all threads of the 3 nodes, W1 + W2 of both cells; samples scaled to each
+window's user CPU). B3 - B2, user ms per 1k fills:
+
+| thread / function | B2 | B3 | B3 - B2 |
+|---|---|---|---|
+| `torus-ingress-v`, all functions | 4.133 | 5.394 | **+1.261** |
+| ingress `<ReadView as StateBackend>::get_cf_raw` | 0.160 | 0.242 | +0.082 |
+| ingress `rocksdb::BlockBasedTable::Get` / `Version::Get` / `DBImpl::GetImpl` | 0.241 | 0.342 | +0.101 |
+| ingress `rocksdb::StatisticsImpl::recordTick`, `ShardedCache::Release`, `BlockIter::BinarySeek` / `ParseNextKey` / `FindKeyAfterBinarySeek`, filter / index / data block reads, `LRUHandleTable::FindPointer`, `TableCache::Get`, `perf_context` TLS, comparator, `GetContext::SaveValue` (16 items, each +0.009..+0.025) | | | ~+0.24 |
+| ingress libc (`malloc` / `free`, unresolved libc addresses `0x9b937`, `0x9d3bc`, ...) | | | ~+0.15 |
+| ingress kernel-entry samples (`[k]` skid at syscall boundaries) | | | ~+0.10 |
+| ingress `__KeccakF1600` (signature verify) | 0.813 | 0.840 | +0.026 |
+| `torus-execution` `FixedPoint::checked_mul` | 0.017 | 0.039 | +0.022 |
+| every other thread group | | | -0.20 (exec-pool -0.08, execution -0.09, ckpt-merge -0.07; rpc-worker +0.07) |
+
+* Every added ingress item is a RocksDB point read and its plumbing: `ReadView::get_cf_raw`, the RocksDB Get path
+  with block cache, bloom filter and statistics, allocation, and the syscalls under it. No new compute shows up on
+  the ingress threads: signature verify is +3%.
+* The code: batch A's `validate_known_markets` (`crates/torus-rpc/src/torus.rs`), from the price band C merge
+  `9b1d564c` (`79aaec7d` "refuse orders on a market that never had an oracle mark").
+  * It now calls `torus_core::oracle::ever_marked(state_db, market_id)` once per distinct market in every
+    `PlaceOrder` / `PlaceOrderBatch` action.
+  * Each call is one `CF_NATIVE_ORACLE` aggregate-price `get_cf_raw` plus a Borsh decode, uncached.
+  * The bench's 400-order batches span up to 300 markets, so that is up to ~300 RocksDB reads per batch, on the
+    ingress threads.
+  * The executor's twin check (`AccountReader::ever_marked`, cached per market within one executor pass) fits the small
+    exec-thread rise (+0.048, `checked_mul` +0.022 = the price band arithmetic).
+* The genesis-digest handshake (network, `tokio-rt-worker`) shows nothing: +0.005 ms per 1k fills.
+* Not measured: kernel stacks and off-CPU time (paranoid 2; neither was needed here), and callers (no frame
+  pointers). The attribution to `ever_marked` comes from the function names plus batch A's diff. The ingress threads
+  read no other new row: no other `get_cf_raw` / `StateBackend` read is added on the RPC intake between `cc8c9c4a` and
+  `d595f77e`.
+
+### 130.6 Cross-checks and drift
+
+* Original 8 cells (the two FOREIGN cells kept): matched/s -12,543 ± 2,586 (0.955 [0.946, 0.965], -8.8 sd).
+  * CPU per 1k fills +1.91 ± 0.36; off-exec +1.87 ± 0.33; exec +0.036 ± 0.040 (1.015 [0.999, 1.032]).
+  * The verdict does not change. The original cells resolve native blk/s (-0.77 ± 0.31) and commit p99 (+74 ± 7)
+    more tightly. With the reruns in, native blk/s no longer resolves: rerun-r3-B2 ran at 9.13 native blk/s vs
+    9.55-9.97 for the other B2 cells.
+* Section 128 vs 130 (B2 -> B3):
+
+| | 128 (bisect, n = 2) | 130 (ABBA, n = 4) |
+|---|---|---|
+| matched/s B2 / B3 | 259,779 / 246,328 | 280,698 / 267,150 |
+| step | -13,451 ± 4,582 (-5.2%) | -13,549 ± 2,276 (-4.8%) |
+| CPU ms / 1k fills B2 / B3 | 24.06 / 26.05 (+1.99) | 24.04 / 26.08 (+2.04) |
+| engine ms / 1k fills B2 / B3 | 2.437 / 2.502 (+0.065) | 2.533 / 2.600 (+0.067) |
+
+  * The step and the CPU per fill reproduce almost exactly.
+  * Absolute matched/s runs 8% higher here in both arms, and CPU per fill is equal. Same binaries, spec and
+    harness. Differences: section 128 ran after 8 other binaries' cells with in-line scans; this run had 5-7 s
+    between cells (end pass). Not attributed. Within-campaign steps are not affected.
+* Drift: B2 positions 1 / 4 / 6 / 7 and B3 2 / 3 / 5 / 8 sum to 18 each, so a linear drift cancels.
+  * B2 cells 278.8k / 281.3k / 281.0k (rerun) / 281.6k; B3 265.9k / 267.2k / 268.8k / 266.6k (rerun).
+  * The first cell of each arm is its lowest, by ~1-2k. No trend beyond that.
+* Warm-up: w1 (B2) 278,304 vs r1-B2 278,849.
+
+### 130.7 Verdict
+
+* **Batch A's all-up cost is confirmed: matched/s -4.8% (-13,549 ± 2,276, 10.8 sd), process CPU per fill +8.5%.
+  High confidence.**
+* **It is the RPC intake's first-mark check (price band C), on the ingress verifier threads.** One uncached RocksDB
+  oracle-row read per market per action in `validate_known_markets`. The ingress threads carry +1.88 of +1.89 ms
+  per 1k fills; nothing else moves more than 0.2 ms. High confidence on the thread and the read path; the call site
+  is inferred from the diff (no call graphs).
+* **The genesis-digest handshake costs nothing measurable** (network threads +0.005 ms per 1k fills).
+* Exec-path rule rows, B3 vs B2:
+  * exec-thread on-CPU per fill 1.020 [1.004, 1.036]: CI above 1 with the reruns in, not resolved without them
+    (1.015 [0.999, 1.032]);
+  * commit p99 +8.5% (CI above 1); native blocks/s and p50 not resolved.
+  * Read as a merge decision, batch A would fail the rule. It already landed; this is a cost to remove, not a merge
+    to undo.
+* Why intake CPU costs throughput:
+  * The load is closed-loop (`MAX_IN_FLIGHT` 4) and the ingress pool on the 2 RPC nodes sits on the admission
+    path.
+  * Placed/s drops 5.0% and order age at commit rises 12%: the same face as section 128's.
+  * The exec thread is less busy in B3 (0.843 vs 0.861): it waits for intake, not the other way round.
+
+### 130.8 Limits and next
+
+* Profile: flat (no callers), user-space only (paranoid 2), val0..val2 summed. The p2 profile cells ran with a
+  foreign `quickshell` load of ~0.26 core (both arms alike).
+* The reruns ran in their own campaign, ~12 minutes after the main one, with no warm-up. The two original cells give
+  the same verdict (130.6).
+* Next (main session decides; no bisect inside merge/s138-batch-a is needed: the profile names the code):
+  1. Remove the per-action read from the intake. The predicate is monotonic: "once marked, always marked; the row
+     is never deleted".
+     * Option (a): a node-local set of marked market ids. A miss falls through to the read; a hit skips it.
+     * Option (b): read the row from the in-memory oracle / mark cache the executor keeps, if the intake can reach
+       it.
+     * Either way, refusing early stays safe (a lagging view refuses, never accepts).
+  2. Re-bench it: an ABBA of main vs the fix, n = 4, this shape. Expected: matched/s back to the B2 level and
+     ingress CPU per 1k fills -1.9 ms.
+  3. Optional: the same check at the executor (`AccountReader::ever_marked`) costs +0.048 exec ms per 1k fills
+     (+2%, CI just above 1), under the exec-path rule. A per-block cache would cover it.
+* Host:
+  * archy runs a 15-minute desktop job (`omarchy-agent-u` + `quickshell`, 1.5-2.4 cores for 2-6 s at
+    hh:00 / :15 / :30 / :45 +6-12 s). Since the DST change `quickshell` also uses ~0.2-0.3 core steadily.
+  * Both break the FOREIGN rule. Stop or mask them before the next campaign, or schedule load windows between the
+    quarter hours.
+
+### 130.9 Data
+
+* Cells (`~/bench-results-matched/`), each with `summary.json`, `agreement.jsonl`, `phase-val*.csv`, `buckets.csv`,
+  `val*.log.gz` and `.campaign.log` / `.cell.rc`:
+  * `ozarchy-s140-9s-{w1,r1-B2,r1-B3,r2-B3,r2-B2,r3-B3,r3-B2,r4-B2,r4-B3}`;
+  * reruns `ozarchy-s140-9s-rerun-{r3-B2,r4-B3}`;
+  * profile cells `ozarchy-s140-9s-prof-{p1-B2,p1-B3,p2-B3,p2-B2}` (+ `perf-w{1,2}.data`, `perf-sidecar.log`,
+    `prof-tasks-*.txt`, `prof-stat-*`);
+  * smokes `ozarchy-s140-9s-smk-b{2,3}-smoke-s0`.
+* Campaigns: `ozarchy-s140-9s-run/` (`campaign.log`, `campaign.done` exit=0, `cells.tsv`, `foreign.txt`,
+  `smk-B2/`, `smk-B3/`), `ozarchy-s140-9s-rerun-run/` and `ozarchy-s140-9s-prof-run/` (same files +
+  `chain.done`).
+* Tools: `ozarchy-s140-9s-tools/`:
+  * `make-specs-9s.py`, `specs/`, `drivers/` (generated, frozen generator `gen/`), `checks/s140-checks.sh`;
+  * `prof/` (`foreign-sampler.py`, `run-with-sampler.sh`, `run-with-perf.sh`, `perf-sidecar-9s.sh`,
+    `chain-rerun-prof.sh`), `symfs-B2/`, `symfs-B3/`, `chain-rr-prof.log`.
+* Analysis: `ozarchy-s140-9s-tools/analyst/`:
+  * `abba9s.py` -> `abba9s.txt` (original 8) / `abba9s-final.txt` (reruns in);
+  * `foreign9s.py` -> `foreign9s.txt` / `foreign9s-prof.txt`;
+  * `posthoc-checks.sh` -> `posthoc-checks*.txt`;
+  * `prof9s.py --perf` -> `prof9s.txt` (`prof/` caches the perf report text per window).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
