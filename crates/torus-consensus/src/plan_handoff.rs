@@ -194,15 +194,25 @@ mod tests {
         }
     }
 
+    /// Default ON (s140, after bench 9q Parts A and B): unset, empty, `1` or
+    /// `true` = on; `0` or `false` = off; anything else = off with a
+    /// warning, as the other default-on consensus-timing flags
+    /// (`TORUS_EPOCH_FAST_PATH`, `TORUS_BOOK_COALESCE`): a typo in an
+    /// explicit value reads as the kill switch.
     #[test]
-    fn parse_default_off() {
-        assert!(!parse_plan_handoff(None), "unset: off");
-        assert!(!parse_plan_handoff(Some(String::new())), "empty: off");
-        assert!(!parse_plan_handoff(Some("0".into())), "0: off");
-        assert!(!parse_plan_handoff(Some("false".into())), "false: off");
-        assert!(!parse_plan_handoff(Some("yes".into())), "typo: off");
+    fn parse_default_on() {
+        assert!(parse_plan_handoff(None), "unset: on");
+        assert!(parse_plan_handoff(Some(String::new())), "empty: on");
+        assert!(parse_plan_handoff(Some(" ".into())), "blank: on");
         assert!(parse_plan_handoff(Some("1".into())), "1: on");
-        assert!(parse_plan_handoff(Some(" TRUE ".into())), "true: on");
+        assert!(parse_plan_handoff(Some("true".into())), "true: on");
+        assert!(parse_plan_handoff(Some(" TRUE ".into())), "TRUE: on");
+        assert!(!parse_plan_handoff(Some("0".into())), "0: off");
+        assert!(!parse_plan_handoff(Some(" 0 ".into())), "padded 0: off");
+        assert!(!parse_plan_handoff(Some("false".into())), "false: off");
+        assert!(!parse_plan_handoff(Some("FALSE".into())), "FALSE: off");
+        assert!(!parse_plan_handoff(Some("yes".into())), "typo: off");
+        assert!(!parse_plan_handoff(Some("2".into())), "unknown: off");
     }
 
     /// (a) durable lags, execution logically applied the previous boundary
