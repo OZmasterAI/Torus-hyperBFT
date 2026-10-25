@@ -893,6 +893,7 @@ impl Genesis {
             fee_validator_bps: self.economics.fee_split.start.validator,
             fee_treasury_bps: self.economics.fee_split.start.treasury,
             fee_dev_pool_bps: self.economics.fee_split.start.dev_pool,
+            fee_schedule: Default::default(),
             treasury_address,
             dev_pool_address,
             timeout_base_ms: self.consensus.timeout_base_ms,
@@ -1705,12 +1706,48 @@ mod tests {
         Genesis::from_json(&json.to_string()).unwrap();
     }
 
-    /// Row 80 option D (s100): fees are split by the built-in constants
-    /// (`torus_economics::types` FEE_*); the genesis `fee_split` is not wired
-    /// in, so the loader refuses any value that differs from them.
+    /// s140 (owner): `economics.fee_split` is the chain's fee split
+    /// (`ChainConfig::fee_schedule`): any split whose start and end each sum
+    /// to 10_000 bps loads, with any `transition_epochs`; a dev share of 0
+    /// is valid. Was row 80 option D (s100): only the built-in split loaded.
     #[test]
-    fn genesis_fee_split_must_match_the_built_in_split() {
-        assert!(Genesis::from_json(&sample_genesis_json()).is_ok());
+    fn genesis_fee_split_any_valid_split_reaches_the_chain_config() {
+        use torus_types::{FeeSchedule, FeeShares};
+        let base: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        let config = Genesis::from_json(&base.to_string()).unwrap().chain_config();
+        assert_eq!(config.fee_schedule, torus_types::BUILTIN_FEE_SCHEDULE);
+        let mut json = base.clone();
+        json["economics"]["fee_split"] = serde_json::json!({
+            "start": { "burn": 1000, "validator": 0, "treasury": 9000, "dev_pool": 0 },
+            "end": { "burn": 2000, "validator": 3000, "treasury": 5000, "dev_pool": 0 },
+            "transition_epochs": 365
+        });
+        let config = Genesis::from_json(&json.to_string()).unwrap().chain_config();
+        assert_eq!(
+            config.fee_schedule,
+            FeeSchedule {
+                start: FeeShares { burn: 1000, validator: 0, treasury: 9000, dev_pool: 0 },
+                end: FeeShares { burn: 2000, validator: 3000, treasury: 5000, dev_pool: 0 },
+                transition_epochs: 365,
+            }
+        );
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            (config.fee_burn_bps, config.fee_validator_bps, config.fee_treasury_bps, config.fee_dev_pool_bps),
+            (1000, 0, 9000, 0),
+            "the informational fields are the start shares"
+        );
+        json["economics"]["fee_split"]["transition_epochs"] = 0.into();
+        assert_eq!(
+            Genesis::from_json(&json.to_string()).unwrap().chain_config().fee_schedule.transition_epochs,
+            0
+        );
+    }
+
+    /// s140: a split whose start or end does not sum to exactly 10_000 bps
+    /// (or a share that does not fit) refuses to load.
+    #[test]
+    fn genesis_fee_split_must_sum_to_10000() {
         for (path, value) in [
             ("/economics/fee_split/start/burn", 2000),
             ("/economics/fee_split/start/validator", 1),
@@ -1720,21 +1757,53 @@ mod tests {
             ("/economics/fee_split/end/validator", 5000),
             ("/economics/fee_split/end/treasury", 2400),
             ("/economics/fee_split/end/dev_pool", 2600),
-            ("/economics/fee_split/transition_epochs", 365),
+            ("/economics/fee_split/start/burn", 10001),
+            // 65536 + 1000 would wrap a u16 back to the built-in 1000.
+            ("/economics/fee_split/start/burn", 66536),
         ] {
             let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
             *json.pointer_mut(path).unwrap() = value.into();
             let err = Genesis::from_json(&json.to_string()).unwrap_err();
             assert!(
                 matches!(err, GenesisError::InvalidFeeSplit(_)),
-                "{path}: {err}"
+                "{path}={value}: {err}"
             );
         }
+        // A share of 10_000 with the others 0 is valid.
+        let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        json["economics"]["fee_split"]["start"] =
+            serde_json::json!({ "burn": 10000, "validator": 0, "treasury": 0, "dev_pool": 0 });
+        Genesis::from_json(&json.to_string()).unwrap();
+    }
+
+    /// s140 determinism: a genesis without `economics.fee_split` (and one
+    /// with the built-in values, the sample) splits by the built-in schedule;
+    /// a dev share of 0 loads without a `dev_pool_address` (absent = the zero
+    /// address, as before s140; it is then never credited).
+    #[test]
+    fn genesis_without_fee_split_is_the_builtin_split() {
+        let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        json["economics"].as_object_mut().unwrap().remove("fee_split");
+        let config = Genesis::from_json(&json.to_string()).unwrap().chain_config();
+        assert_eq!(config.fee_schedule, torus_types::BUILTIN_FEE_SCHEDULE);
+        assert_eq!(
+            (config.fee_burn_bps, config.fee_validator_bps, config.fee_treasury_bps, config.fee_dev_pool_bps),
+            (1000, 0, 4500, 4500)
+        );
+        let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        json["economics"].as_object_mut().unwrap().remove("dev_pool_address");
+        json["economics"]["fee_split"]["start"] =
+            serde_json::json!({ "burn": 1000, "validator": 0, "treasury": 9000, "dev_pool": 0 });
+        json["economics"]["fee_split"]["end"] =
+            serde_json::json!({ "burn": 2500, "validator": 2500, "treasury": 5000, "dev_pool": 0 });
+        let config = Genesis::from_json(&json.to_string()).unwrap().chain_config();
+        assert_eq!(config.dev_pool_address, Address::ZERO);
+        assert!(!config.fee_schedule.pays_dev_pool());
     }
 
     /// The file loader (the node's path) applies the same check.
     #[test]
-    fn genesis_file_with_another_fee_split_is_refused() {
+    fn genesis_file_with_an_invalid_fee_split_is_refused() {
         let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
         json["economics"]["fee_split"]["start"]["burn"] = 2500.into();
         let dir = TempDir::new().unwrap();

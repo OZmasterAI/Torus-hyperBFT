@@ -111,6 +111,7 @@ fn chain_config(n: usize, run: &Run) -> ChainConfig {
         fee_validator_bps: 0,
         fee_treasury_bps: 4500,
         fee_dev_pool_bps: 4500,
+        fee_schedule: Default::default(),
         treasury_address: Address::ZERO,
         dev_pool_address: Address::ZERO,
         timeout_base_ms: 500,

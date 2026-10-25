@@ -1823,11 +1823,19 @@ pub struct ChainConfig {
     pub epoch_length: u64,
     pub max_validators: u32,
     pub min_stake: U256,
-    /// Fee split ratios in basis points (must sum to 10_000).
+    /// Fee split ratios in basis points (must sum to 10_000): the START shares
+    /// of [`Self::fee_schedule`], informational (execution splits by
+    /// `fee_schedule`).
     pub fee_burn_bps: u32,
     pub fee_validator_bps: u32,
     pub fee_treasury_bps: u32,
     pub fee_dev_pool_bps: u32,
+    /// s140: the block gas-fee split execution applies (genesis
+    /// `economics.fee_split`). CHAIN-WIDE, consensus-visible: every validator
+    /// of a chain must hold the same value. Absent = [`BUILTIN_FEE_SCHEDULE`]
+    /// (the split every chain used before s140).
+    #[serde(default)]
+    pub fee_schedule: FeeSchedule,
     /// Treasury address for fee distribution and governance withdrawals.
     #[serde(default)]
     pub treasury_address: Address,
@@ -1938,6 +1946,63 @@ impl DeadLeaderParams {
             ));
         }
         Ok(())
+    }
+}
+
+/// s140: one end of the block gas-fee split, in basis points of the block's
+/// fees (the four shares sum to 10_000).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeeShares {
+    pub burn: u16,
+    pub validator: u16,
+    pub treasury: u16,
+    pub dev_pool: u16,
+}
+
+impl FeeShares {
+    /// The four shares in genesis order (burn, validator, treasury, dev_pool).
+    pub const fn as_array(&self) -> [u16; 4] {
+        [self.burn, self.validator, self.treasury, self.dev_pool]
+    }
+}
+
+/// s140: the block gas-fee split: each share moves linearly from `start` to
+/// `end` over `transition_epochs` epochs (`torus_economics::lerp_bps`; 0 = the
+/// `end` split from epoch 0). Genesis `economics.fee_split`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeeSchedule {
+    pub start: FeeShares,
+    pub end: FeeShares,
+    pub transition_epochs: u64,
+}
+
+/// The split of every chain before s140 (`torus_economics::FEE_START_*`,
+/// `FEE_END_*`, `TRANSITION_EPOCHS` are this value): 10/0/45/45 to 25 each over
+/// 1825 epochs (burn, validator, treasury, dev_pool).
+pub const BUILTIN_FEE_SCHEDULE: FeeSchedule = FeeSchedule {
+    start: FeeShares { burn: 1000, validator: 0, treasury: 4500, dev_pool: 4500 },
+    end: FeeShares { burn: 2500, validator: 2500, treasury: 2500, dev_pool: 2500 },
+    transition_epochs: 1825,
+};
+
+impl Default for FeeSchedule {
+    fn default() -> Self {
+        BUILTIN_FEE_SCHEDULE
+    }
+}
+
+impl FeeSchedule {
+    /// Genesis check: `start` and `end` each sum to exactly 10_000 bps (so
+    /// every share is in 0..=10_000). Any `transition_epochs` is valid.
+    pub fn check(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Whether the dev pool is a destination of this split (a non-zero share
+    /// at `start` or `end`). When it is not, nothing is ever credited to the
+    /// dev pool: the rounding remainder is burned instead.
+    pub const fn pays_dev_pool(&self) -> bool {
+        self.start.dev_pool > 0 || self.end.dev_pool > 0
     }
 }
 
@@ -2102,6 +2167,63 @@ pub struct ValidatorSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// s140: a fee schedule is valid when start and end each sum to exactly
+    /// 10_000 bps; a zero dev share is valid; any transition length is.
+    #[test]
+    fn fee_schedule_check_needs_each_end_to_sum_to_10000() {
+        let shares = |b, v, t, d| FeeShares { burn: b, validator: v, treasury: t, dev_pool: d };
+        let ok = |start, end, transition_epochs| {
+            FeeSchedule { start, end, transition_epochs }.check()
+        };
+        assert!(BUILTIN_FEE_SCHEDULE.check().is_ok());
+        assert!(FeeSchedule::default() == BUILTIN_FEE_SCHEDULE);
+        assert!(ok(shares(1000, 0, 9000, 0), shares(2500, 2500, 5000, 0), 1825).is_ok());
+        assert!(ok(shares(10000, 0, 0, 0), shares(0, 0, 0, 10000), 0).is_ok());
+        assert!(ok(shares(0, 10000, 0, 0), shares(0, 10000, 0, 0), 7).is_ok());
+        for (start, end) in [
+            (shares(1000, 0, 9000, 1), shares(2500, 2500, 5000, 0)),
+            (shares(1000, 0, 8999, 0), shares(2500, 2500, 5000, 0)),
+            (shares(1000, 0, 9000, 0), shares(2500, 2500, 5000, 1)),
+            (shares(0, 0, 0, 0), shares(2500, 2500, 5000, 0)),
+            (shares(10000, 10000, 0, 0), shares(2500, 2500, 5000, 0)),
+            // u16 wrap must not make 65535 + 10001 "sum" to 10000.
+            (shares(65535, 10001, 0, 0), shares(2500, 2500, 5000, 0)),
+        ] {
+            let err = ok(start, end, 1825).expect_err(&format!("{start:?} {end:?}"));
+            assert!(err.contains("10000"), "{err}");
+        }
+        assert!(BUILTIN_FEE_SCHEDULE.pays_dev_pool());
+        assert!(!FeeSchedule {
+            start: shares(1000, 0, 9000, 0),
+            end: shares(2500, 2500, 5000, 0),
+            transition_epochs: 1825
+        }
+        .pays_dev_pool());
+    }
+
+    /// s140: a chain config without `fee_schedule` (every config before s140)
+    /// splits fees by the built-in schedule; a present one round-trips.
+    #[test]
+    fn chain_config_without_fee_schedule_is_the_builtin_split() {
+        let base = serde_json::json!({
+            "chain_id": 1, "chain_name": "t", "evm_gas_limit": 1, "base_fee_per_gas": 1,
+            "epoch_length": 10, "max_validators": 4, "min_stake": "0x0",
+            "fee_burn_bps": 1000, "fee_validator_bps": 0, "fee_treasury_bps": 4500,
+            "fee_dev_pool_bps": 4500,
+        });
+        let config: ChainConfig = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(config.fee_schedule, BUILTIN_FEE_SCHEDULE);
+        let mut custom = config.clone();
+        custom.fee_schedule.start.dev_pool = 0;
+        custom.fee_schedule.start.treasury = 9000;
+        let back: ChainConfig =
+            serde_json::from_str(&serde_json::to_string(&custom).unwrap()).unwrap();
+        assert_eq!(back.fee_schedule, custom.fee_schedule);
+        assert!(custom.validate().is_ok());
+        custom.fee_schedule.end.dev_pool = 1;
+        assert!(custom.validate().is_err(), "end sums to 10001");
+    }
 
     /// L6.1 under P0.0: `ChainConfig::book_window_activation` is the
     /// schedule's `book_window_commit` height (0 read as 1), whatever else is

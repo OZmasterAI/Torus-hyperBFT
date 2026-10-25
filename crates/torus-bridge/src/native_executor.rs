@@ -6495,6 +6495,10 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     pub proposer: Address,
     pub treasury_address: Address,
     pub dev_pool_address: Address,
+    /// s140: the chain's gas-fee split (`ChainConfig::fee_schedule`, genesis
+    /// `economics.fee_split`) [`NativeExecutor::distribute_fees`] applies.
+    /// Constructors set the built-in split; the live node sets the chain's.
+    pub fee_schedule: torus_economics::FeeSchedule,
 
     /// Accumulated native fees during this block.
     pub total_native_fees: u64,
@@ -7182,6 +7186,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             proposer,
             treasury_address,
             dev_pool_address,
+            fee_schedule: torus_economics::FeeSchedule::default(),
             total_native_fees: 0,
             trade_index: 0,
             defer_trades: false,
@@ -16626,8 +16631,9 @@ impl NativeExecutor {
         // FIX ECON-FIND-22: Removed dead FeeSplitter::split_fees call.
         // RewardDistributor::distribute_block_fees computes fee splits internally.
 
-        match RewardDistributor::distribute_block_fees(
+        match RewardDistributor::distribute_block_fees_with(
             &ctx.staking,
+            &ctx.fee_schedule,
             ctx.proposer,
             total_fees,
             ctx.epoch,
