@@ -29,7 +29,9 @@ use torus_types::{
 };
 
 pub mod digest;
+pub mod file_cache;
 pub use digest::GenesisDigest;
+pub use file_cache::{load_genesis_file, DigestCacheEntry, DigestSource, LoadedGenesis};
 
 // ---------------------------------------------------------------------------
 // Error

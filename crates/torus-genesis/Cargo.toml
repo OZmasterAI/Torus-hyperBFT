@@ -21,6 +21,8 @@ ed25519-dalek = { workspace = true }
 hotstuff_rs = { workspace = true }
 tracing = { workspace = true }
 sha3 = { workspace = true }
+# s140: SHA-256 fingerprint of the genesis file bytes (restart digest cache).
+sha2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
