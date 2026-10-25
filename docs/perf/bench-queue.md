@@ -1121,7 +1121,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    latency. Pass: all-up within noise; one-down blocks/s within -5%. Optional: WAN netem cell at 227 / 502 ms (trial
    net instead, owner s136). ~2 h (estimate).
    **Config (s136, batch 10 on main `2d2f3ed9`):** run as the testnet will: hash + attestation + L6.1 + L2.1 + fail-stop on. `gen-weighted-genesis.sh` (needed for 2/2/1 stakes) still defaults the hash OFF, so set `STATE_HASH_ACTIVATION` explicitly ON (hash from block 1; L6.1 follows it for Classic); L2.1 and fail-stop are on by default. Check the startup lines read `on=true`.
-9p. **[GO s140 (re-pinned): build and pin main `3c5d02ea` (batch C + epoch-plan hand-off + dead-leader post-exclusion freeze fix); the a300c7f3 DL_K=3 smoke froze ~30-35 s after the exclusion (fixed in `3c5d02ea`); dead-leader is OFF by default (K=0), so 9p MUST set DL_K=3; CONSENSUS_DB_FORMAT_VERSION 2, wipe data dirs; 4-node make-driver on main `70027095` (9k2-checks.sh configchk still val0-2: patch); smoke cell first] SHAPE CHANGED (owner s138): 4 validators, not 2/2/1.** At 2:2:1 with the stake-1 node down no validator-set update can commit (an update needs three consecutive live views; the dead node leads every third), so b1 would halt the chain at its first exclusion (`dead-leader-skip.md` section 8 finding 4). New shape: 4 nodes (1/1/1/1 or 2/2/1/1), one killed, at a MODERATE rate well below saturation (the question is recovery, not peak throughput; CPU starvation would mimic dead-leader timeouts). One short 4-node smoke cell first to check the rig keeps up. Before AND after arms both run in this 4-node shape (9k's 3-node cells are NOT its baseline); matched/s and p50/p99 are compared only inside 9p, never to the 3-node history. Original spec, superseded where it conflicts:** Dead-leader skip (b1) phase 4: before / after.** After dead-leader phases 1-3 land (rebased on
+9p. **[RAN s140 on `3c5d02ea`, section 129: FAIL (post-exclusion freeze persists in 3 of 7 DL_K=3 kill cells, 35-154 s); owner / 18c decision before a re-run] [GO s140 (re-pinned): build and pin main `3c5d02ea` (batch C + epoch-plan hand-off + dead-leader post-exclusion freeze fix); the a300c7f3 DL_K=3 smoke froze ~30-35 s after the exclusion (fixed in `3c5d02ea`); dead-leader is OFF by default (K=0), so 9p MUST set DL_K=3; CONSENSUS_DB_FORMAT_VERSION 2, wipe data dirs; 4-node make-driver on main `70027095` (9k2-checks.sh configchk still val0-2: patch); smoke cell first] SHAPE CHANGED (owner s138): 4 validators, not 2/2/1.** At 2:2:1 with the stake-1 node down no validator-set update can commit (an update needs three consecutive live views; the dead node leads every third), so b1 would halt the chain at its first exclusion (`dead-leader-skip.md` section 8 finding 4). New shape: 4 nodes (1/1/1/1 or 2/2/1/1), one killed, at a MODERATE rate well below saturation (the question is recovery, not peak throughput; CPU starvation would mimic dead-leader timeouts). One short 4-node smoke cell first to check the rig keeps up. Before AND after arms both run in this 4-node shape (9k's 3-node cells are NOT its baseline); matched/s and p50/p99 are compared only inside 9p, never to the 3-node history. Original spec, superseded where it conflicts:** Dead-leader skip (b1) phase 4: before / after.** After dead-leader phases 1-3 land (rebased on
    the TC set) and after 9k. Design `docs/plans/dead-leader-skip.md` section 5: before = 9k's cells; after = the same
    cells on the branch, ABBA, 3 runs each; `VALIDATOR_STAKES=2,2,1`, `KILL_NO_RESTART=val2`,
    `KILL_NO_RESTART_AT_S=120`, `BENCH_RPCS=0,1`, feed off, 600 s, plus all-up. Report three windows (pre-kill / kill
@@ -1129,6 +1129,15 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    kill-to-exclusion time (s and heights). Pass: post-exclusion blocks/s >= 90% of all-up; all-up within noise; no
    new stalls. Note: at 2/2/1 a dead stake-1 node is excludable (eligible 4 of 5 >= quorum 4). ~2 h of cells (estimate).
    **Config (s136, batch 10 on main `2d2f3ed9`):** run as the testnet will: hash + attestation + L6.1 + L2.1 + fail-stop on. `gen-weighted-genesis.sh` (needed for 2/2/1 stakes) still defaults the hash OFF, so set `STATE_HASH_ACTIVATION` explicitly ON (hash from block 1; L6.1 follows it for Classic); L2.1 and fail-stop are on by default. Check the startup lines read `on=true`.
+   **Done s140 (bench-ozarchy-s140-9p, main `3c5d02ea` node `295f6bfb`, 4 validators 1/1/1/1, rate 20,000, 600 s,
+   w1 + bU/aU/bK/aK x3 ABBA + aK reruns r2/r3, 17 cells incl. 9q B; section 129). FAIL on "no new stalls": 3 of 7
+   `DL_K=3` kill cells (r2-aK, r3-aK, r2-aK-rerun) freeze 35-154 s before the exclusion boundary commits (REJECT,
+   liveness FAIL; AGREE, attestation equal); same Decide-nudge-only-on-val0 shape as s138; smoke sA 7.4 s. Clean
+   exclusions: post-exclusion 21.7-22.5 blocks/s, 0-0.5 timeouts/min, kill -> exclusion commit 59-94 s (113-179
+   blocks); bK never excludes (2.03 blocks/s, 38.9 timeouts/min after the kill). Post-exclusion blocks/s vs all-up
+   0.91-1.00 (whole-run mean) / 0.77-0.88 (same wall offsets; blocks fuller, matched/s +22%). All-up aU vs bU
+   matched/s +0.8% ± 1.3% (noise), blocks/s -5.5% ± 5.6%, order age p50 +14%. Next: 18c on the freeze logs, then
+   aK-only re-run (n >= 6, ABBA with bK) after a fix.**
 9l. **[GO, owner s138] Binary gap: `53a6d83c` vs
    `29bfc705`, hash-off Classic.** Section 124 found R (hash off, `29bfc705`) below section 120's A (hash off,
    `53a6d83c`) across campaigns: matched/s 0.983 / 0.970 (deep / standard), exec-thread on-CPU per 1k fills 1.053 /
@@ -1156,7 +1165,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    4.0 -> 76.7 ms per block. L3.1 / L3.3 / L6.1 target that save (sections 117, 120). Question: is the deep-book
    slowdown gone on today's main? Report RSS (peak / mean), restarts (SIGTERM / SIGKILL), matched/s, blocks/s, p50 /
    p99, `save_books` and checkpoint settle wait per block, vs the standard cell. Doc target: next results-doc section.
-9q. **[Part A DONE s139 (section 127: PASS, WARNs 10 -> 0, timeouts 29 -> 0, matched/s -0.1%); Part B GO with 9p on main `3c5d02ea`; flag goes default-on only after Part B passes] Epoch-plan hand-off A/B (`TORUS_EPOCH_PLAN_HANDOFF`, node-local, default off).** LANDED on
+9q. **[Part A DONE s139 (section 127: PASS, WARNs 10 -> 0, timeouts 29 -> 0, matched/s -0.1%); Part B DONE s140 (section 129: WARNs 10 -> 0, no divergence, matched/s +2.9%; timeouts -94% outside the dead-leader window, -38% whole run; n = 1); flag goes default-on only after Part B passes] Epoch-plan hand-off A/B (`TORUS_EPOCH_PLAN_HANDOFF`, node-local, default off).** LANDED on
    main `b17dab16` (merge of `fix/epoch-plan-logical-ready` `7879ef63`): build and pin main `b17dab16`; one binary, both
    arms differ only by the env flag. Problem: under load the leader of boundary H refuses "epoch boundary: execution has not applied the
    previous boundary yet" because readiness reads the durable applied marker (moves only when the checkpoint lands),
@@ -1170,6 +1179,12 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
      exclusion update (state attest equal, no DISAGREE).
    * Pass (owner turns it on for testnet): flag-on WARNs = 0 and timeouts -80% or more vs off; matched/s within noise or
      better; Part B identical exclusion heights and no divergence. Doc target: the next results-doc section.
+   **Done s140, Part B (section 129, cells ozarchy-s140-9p-r1-qOff / r1-qOn, kill shape DL_K=3, n = 1 each):
+   WARNs 6/4/0 -> 0/0/0; timeouts per node outside the kill -> exclusion window 6/6/6 -> 0/1/0 (-94%), whole run
+   59/58/59 -> 37/35/36 (-38%, kill-window dead-leader timeouts dominate; the window is shorter in qOn by kill
+   phase, H 5000 vs 5100); matched/s 224,858 -> 231,323 (+2.9%); every survivor logged the same delta per cell,
+   attestation equal over 63 heights, AGREE; neither cell froze. Boundary stall seconds (val0 commit gap H-1 -> H)
+   not resolved (no gap > 1 s with the flag off).**
 9s. **[GO s140, after 9p + 9q Part B] Batch A all-up cost (section 128 follow-up).** Section 128 put the all-up
    -3.8% matched/s at batch A `d595f77e` (B2 `cc8c9c4a` -> B3: -13,451 +- 4,582 matched/s, process CPU per fill +8.3%,
    ~95% of it OFF the exec thread). (1) ABBA B2 vs B3, n = 4 per arm, std 2/2/1, seed, U only (~71 min); (2) if
