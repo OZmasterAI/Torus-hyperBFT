@@ -403,6 +403,9 @@ fn screen_payload(
 /// Row 44 (s94 B): a row that does not decode gets the executor's 1 / 1
 /// (`NativeExecutor::market_shape`).
 /// A batch is one signed action, so one bad order rejects all of it.
+/// Without a marked-market set (tests); the endpoints call
+/// [`validate_known_markets_with`].
+#[cfg(test)]
 pub(crate) fn validate_known_markets<S: StateBackend>(
     action: &torus_types::NativeAction,
     state_db: &S,
@@ -683,7 +686,9 @@ fn verify_one_action_with<S: StateBackend + Clone>(
     Ok((sender, action, hash))
 }
 
-/// JSON-ingress wrapper shared by the single-action endpoint and tests.
+/// JSON-ingress wrapper for tests (the endpoints pass the node's
+/// marked-market set to [`verify_one_action_with`]).
+#[cfg(test)]
 pub(crate) fn verify_one_action<S: StateBackend + Clone>(
     signed_action: &str,
     chain_id: u64,

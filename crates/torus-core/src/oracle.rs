@@ -249,6 +249,21 @@ pub fn test_treat_unmarked_as_marked_on_this_thread() {
     TEST_UNMARKED_ON_THREAD.with(|c| c.set(true));
 }
 
+/// Whether a test-only "unmarked counts as marked" switch is on for this
+/// thread (always `false` without the `test-unmarked-markets` feature).
+#[inline]
+fn test_unmarked_seam_on() -> bool {
+    #[cfg(feature = "test-unmarked-markets")]
+    {
+        TEST_UNMARKED_AS_MARKED.load(std::sync::atomic::Ordering::Relaxed)
+            || TEST_UNMARKED_ON_THREAD.with(std::cell::Cell::get)
+    }
+    #[cfg(not(feature = "test-unmarked-markets"))]
+    {
+        false
+    }
+}
+
 /// Owner s138: whether `market_id` has EVER had an oracle mark — its
 /// aggregate row exists with a price > 0 (fresh or stale: a stale one keeps
 /// the band's stale fallback). No row (never aggregated) is `Ok(false)`: the
@@ -257,10 +272,7 @@ pub fn test_treat_unmarked_as_marked_on_this_thread() {
 /// Only aggregation writes the row and nothing deletes it, so once `true`
 /// it stays `true`. `Err` is a local fault (read failed, row undecodable).
 pub fn ever_marked<S: StateBackend>(state: &S, market_id: MarketId) -> Result<bool, CoreError> {
-    #[cfg(feature = "test-unmarked-markets")]
-    if TEST_UNMARKED_AS_MARKED.load(std::sync::atomic::Ordering::Relaxed)
-        || TEST_UNMARKED_ON_THREAD.with(std::cell::Cell::get)
-    {
+    if test_unmarked_seam_on() {
         return Ok(true);
     }
     match state.get_cf_raw(CF_NATIVE_ORACLE, &aggregated_price_key(market_id))? {
@@ -316,16 +328,40 @@ impl MarkedMarkets {
     }
 
     /// Whether `market_id` is in the set (seen marked by this node).
-    pub fn contains(&self, _market_id: MarketId) -> bool {
-        false
+    pub fn contains(&self, market_id: MarketId) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if market_id < Self::DIRECT_IDS {
+            // Relaxed: the bit carries no other data; a reader that misses a
+            // concurrent insert just reads the state.
+            self.words[(market_id / 64) as usize].load(Relaxed) & (1u64 << (market_id % 64)) != 0
+        } else {
+            self.overflow.read().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&market_id)
+        }
+    }
+
+    fn insert(&self, market_id: MarketId) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if market_id < Self::DIRECT_IDS {
+            self.words[(market_id / 64) as usize].fetch_or(1u64 << (market_id % 64), Relaxed);
+        } else {
+            self.overflow.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(market_id);
+        }
     }
 
     /// [`ever_marked`] with the set in front: a market in the set answers
     /// `Ok(true)` without a read; otherwise the state is read and an
-    /// `Ok(true)` joins the set.
+    /// `Ok(true)` joins the set. `Ok(false)` and `Err` are not kept, and
+    /// neither is the test-only "unmarked counts as marked" answer.
     pub fn ever_marked<S: StateBackend>(&self, state: &S, market_id: MarketId) -> Result<bool, CoreError> {
+        if self.contains(market_id) {
+            return Ok(true);
+        }
         self.db_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        ever_marked(state, market_id)
+        let marked = ever_marked(state, market_id)?;
+        if marked && !test_unmarked_seam_on() {
+            self.insert(market_id);
+        }
+        Ok(marked)
     }
 
     /// State reads made by [`Self::ever_marked`] so far (misses).
