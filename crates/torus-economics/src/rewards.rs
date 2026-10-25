@@ -253,17 +253,22 @@ fn split_validator_reward<T: StateBackend>(
     Ok(())
 }
 
-/// Integer-only linear interpolation in basis points.
+/// Integer-only linear interpolation in basis points: `start` moved toward
+/// `end` by `|end - start| * numerator / denominator`, rounded down. In u128
+/// (s140: any genesis `transition_epochs`), so `delta * numerator` cannot
+/// overflow; the result equals the u64 one wherever that one did not overflow.
 pub fn lerp_bps(start: u16, end: u16, numerator: u64, denominator: u64) -> u16 {
     if denominator == 0 || numerator >= denominator {
         return end;
     }
+    // < delta (numerator < denominator), so it fits a u16.
+    let step = |delta: u16| {
+        (u128::from(delta) * u128::from(numerator) / u128::from(denominator)) as u16
+    };
     if start <= end {
-        let delta = (end - start) as u64;
-        start + ((delta * numerator) / denominator) as u16
+        start + step(end - start)
     } else {
-        let delta = (start - end) as u64;
-        start - ((delta * numerator) / denominator) as u16
+        start - step(start - end)
     }
 }
 
@@ -539,6 +544,25 @@ mod tests {
             ),
             2500
         );
+    }
+
+    /// s140 review: the genesis accepts any `transition_epochs`, so the
+    /// interpolation must not overflow for any epoch below it (u64
+    /// `delta * epoch` did past ~1.8e15 epochs).
+    #[test]
+    fn lerp_bps_any_transition_length_does_not_overflow() {
+        assert_eq!(lerp_bps(0, 10_000, u64::MAX - 1, u64::MAX), 9_999);
+        assert_eq!(lerp_bps(10_000, 0, u64::MAX - 1, u64::MAX), 1);
+        assert_eq!(lerp_bps(0, 10_000, u64::MAX / 2, u64::MAX), 4_999);
+        let s = FeeSchedule {
+            start: FeeShares { burn: 10_000, validator: 0, treasury: 0, dev_pool: 0 },
+            end: FeeShares { burn: 0, validator: 5_000, treasury: 5_000, dev_pool: 0 },
+            transition_epochs: u64::MAX,
+        };
+        let total = U256::from(1_000_003u64);
+        let r = FeeSplitter::split_fees_with(&s, total, u64::MAX - 1);
+        assert_eq!(r.burn + r.validators + r.treasury + r.dev_pool, total);
+        assert_eq!(r.treasury, total * U256::from(4_999u32) / U256::from(10_000u32));
     }
 
     #[test]
