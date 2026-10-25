@@ -330,6 +330,10 @@ pub struct RpcState {
     /// s139: the `l2Book` stream's feed (one publisher task while any
     /// `l2Book` subscription exists).
     pub(crate) book_feed: Arc<book_stream::BookFeed>,
+    /// Perf s140 (section 130): the markets this node has seen marked, in
+    /// front of the submit intake's first-mark check (one oracle read per
+    /// market, not per action). Grow-only: a first mark is never undone.
+    pub(crate) marked_markets: Arc<torus_core::oracle::MarkedMarkets>,
 }
 
 /// JSON-RPC server combining eth, net, and web3 namespaces.
@@ -419,6 +423,7 @@ impl RpcServer {
                     book_stream::L2_CHANNEL_CAP,
                     book_stream::L2_POLL,
                 )),
+                marked_markets: Arc::new(torus_core::oracle::MarkedMarkets::new()),
             },
             ip_limiter: None,
             max_subs_per_conn: ip_limit::DEFAULT_MAX_SUBS_PER_CONN,
@@ -1910,6 +1915,17 @@ mod tests {
     /// yet); else they are in the DB (interval 0). Returns per item
     /// `Ok(())` (accepted) or the error.
     async fn submit_against_block_rows(in_view: bool) -> Vec<Result<(), String>> {
+        submit_against_block_rows_counted(in_view).await.0
+    }
+
+    /// [`submit_against_block_rows`] plus the server's marked-market set
+    /// after the three submits (perf s140).
+    async fn submit_against_block_rows_counted(
+        in_view: bool,
+    ) -> (
+        Vec<Result<(), String>>,
+        Arc<torus_core::oracle::MarkedMarkets>,
+    ) {
         use jsonrpsee::core::client::ClientT;
         use torus_types::{ActionSignature, FixedPoint, NativeAction, PlaceOrderParams};
         let (_dir, state, mempool, executor) = setup();
@@ -1958,7 +1974,19 @@ mod tests {
         let encode = |a: &torus_types::SignedNativeAction| {
             format!("0x{}", hex::encode(serde_json::to_vec(a).unwrap()))
         };
-        let (handle, addr) = start_server(state, mempool, executor).await;
+        let server = RpcServer::new(
+            state,
+            mempool,
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        let marked = server.state().marked_markets.clone();
+        let (handle, addr) = server
+            .start("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
         let client = jsonrpsee::http_client::HttpClientBuilder::default()
             .build(format!("http://{addr}"))
             .unwrap();
@@ -1987,7 +2015,23 @@ mod tests {
             (_, e) => Err(e.unwrap_or_default()),
         }));
         handle.stop().unwrap();
-        out
+        (out, marked)
+    }
+
+    /// Perf s140 (section 130): both submit endpoints check the first mark
+    /// through the server's marked-market set, so three orders on market 1
+    /// (single endpoint, then a batch of two) read its oracle row once, with
+    /// the rows in the DB or in the published ingress view.
+    #[tokio::test]
+    async fn rpc_submit_reads_a_marked_market_once() {
+        for in_view in [false, true] {
+            let (out, marked) = submit_against_block_rows_counted(in_view).await;
+            assert_eq!(out.len(), 3, "in_view={in_view}");
+            assert_eq!(out[0], Ok(()), "in_view={in_view}");
+            assert_eq!(out[2], Ok(()), "in_view={in_view}");
+            assert!(marked.contains(1), "in_view={in_view}");
+            assert_eq!(marked.db_reads(), 1, "in_view={in_view}: one oracle read for three orders");
+        }
     }
 
     /// Item 6 Phase 3 step 2 follow-up (owner s112): RPC submit verification

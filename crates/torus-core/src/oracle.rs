@@ -272,6 +272,68 @@ pub fn ever_marked<S: StateBackend>(state: &S, market_id: MarketId) -> Result<bo
     }
 }
 
+/// Perf s140 (section 130): a node-local, grow-only set of the markets this
+/// node has seen marked ([`ever_marked`] `Ok(true)`), so the RPC intake's
+/// first-mark pre-check skips the `CF_NATIVE_ORACLE` point read for them.
+/// Safe without invalidation: only aggregation writes the aggregate row,
+/// always with a price > 0, and nothing deletes it, so a market once marked
+/// stays marked. Only positive answers are kept: a market not yet in the set
+/// (never marked, or marked since) is read from the state every time, and an
+/// `Err` is never cached. Node-local and advisory: the executor still
+/// decides in consensus (`FailureReason::MarketNeverMarked`) from block
+/// state; this set never feeds block execution.
+///
+/// Ids below [`MarkedMarkets::DIRECT_IDS`] live in a lock-free bitmap (one
+/// relaxed load per check); larger ids in a locked overflow set.
+pub struct MarkedMarkets {
+    words: Box<[std::sync::atomic::AtomicU64]>,
+    overflow: std::sync::RwLock<std::collections::HashSet<MarketId>>,
+    db_reads: std::sync::atomic::AtomicU64,
+}
+
+impl Default for MarkedMarkets {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for MarkedMarkets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MarkedMarkets").field("db_reads", &self.db_reads()).finish_non_exhaustive()
+    }
+}
+
+impl MarkedMarkets {
+    /// Market ids `< DIRECT_IDS` use the bitmap (8 KiB).
+    pub const DIRECT_IDS: MarketId = 1 << 16;
+
+    pub fn new() -> Self {
+        Self {
+            words: (0..Self::DIRECT_IDS / 64).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            overflow: std::sync::RwLock::new(std::collections::HashSet::new()),
+            db_reads: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Whether `market_id` is in the set (seen marked by this node).
+    pub fn contains(&self, _market_id: MarketId) -> bool {
+        false
+    }
+
+    /// [`ever_marked`] with the set in front: a market in the set answers
+    /// `Ok(true)` without a read; otherwise the state is read and an
+    /// `Ok(true)` joins the set.
+    pub fn ever_marked<S: StateBackend>(&self, state: &S, market_id: MarketId) -> Result<bool, CoreError> {
+        self.db_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ever_marked(state, market_id)
+    }
+
+    /// State reads made by [`Self::ever_marked`] so far (misses).
+    pub fn db_reads(&self) -> u64 {
+        self.db_reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 // ============================================================================
 // OracleManager
 // ============================================================================
