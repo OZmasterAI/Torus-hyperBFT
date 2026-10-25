@@ -1407,6 +1407,44 @@ impl<N: Network> HotStuff<N> {
         Ok(true)
     }
 
+    /// s140 r3 (bench 9p on 3c5d02ea: r2-aK, r3-aK, r2-aK-rerun froze 36-154 s at the leader
+    /// exclusion): the phase certificate of an AdvanceView, applied here before the pacemaker
+    /// handles the message (the algorithm loop calls this first).
+    ///
+    /// The Commit votes of an update's Commit view go to the old leader of the next view w + 1
+    /// and to the backup aggregator, the old leader of w + 2. With the old leader of w + 1 down,
+    /// only the backup forms the Commit PC and commits the update; every other replica learns
+    /// the PC from the backup's AdvanceView. The pacemaker applies that with
+    /// `advance_highest_pc_from_remote`, which moves the highest PC (and, for a Decide PC, marks
+    /// the update decided) but commits nothing, so those replicas entered w + 1 with the old
+    /// committed set. When the update makes one of them the leader of w + 1, it did not know it
+    /// (the old leader of w + 1 is the down validator) and did not nudge Decide; the backup does
+    /// not lead w + 1 (the nudge fix in `on_receive_msg` covers only the case where it does):
+    /// nobody nudged, and with every live vote needed the views drifted apart.
+    ///
+    /// A Commit or Decide PC on a block whose validator-set updates are still pending here is
+    /// therefore applied as a NewView's highest PC is ([`apply_update_justify`]
+    /// (Self::apply_update_justify): only a correct and safe PC, then `block_tree.update`), which
+    /// commits the block and its update. Anything else is left to the pacemaker. Returns whether
+    /// the PC was applied.
+    pub(crate) fn on_receive_advance_view_pc<K: KVStore>(
+        &mut self,
+        pc: &PhaseCertificate,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<bool, HotStuffError> {
+        if !(pc.phase.is_commit() || pc.phase.is_decide())
+            || !block_tree.contains(&pc.block)
+            || !matches!(
+                block_tree.validator_set_updates_status(&pc.block)?,
+                ValidatorSetUpdatesStatus::Pending(_)
+            )
+        {
+            return Ok(false);
+        }
+        self.apply_update_justify(pc, block_tree, app)
+    }
+
     /// Send `vote` to its aggregator, `leader(vote.view + 1)` (FIX CONS-FIND-13:
     /// reputation-weighted), and (s84 liveness) to the backup aggregator
     /// `leader(vote.view + 2)`, so a down next leader does not stop the block from

@@ -1175,6 +1175,35 @@ impl<K: KVStore> BlockTreeSingleton<K> {
             None => ViewNumber::new(0),
         })
     }
+
+    /// The commit frontier the pacemaker's S470 commit-lag term measures the highest PC against:
+    /// [`committed_qc_view`](Self::committed_qc_view), moved up by the views the highest PC lies
+    /// above the Generic QC that justifies its block when the highest PC is a phase certificate
+    /// of a validator-set update (Prepare, Precommit, Commit, Decide). Those certify the same
+    /// block as each other, so their views are not commit lag; the lag stays that of the Generic
+    /// QC frontier: `highest_pc.view - commit_lag_committed_view() = justify.view - committed`.
+    ///
+    /// s140 r3 (bench 9p r2-aK): counted as lag, the update's views made the replicas that had
+    /// the update's Commit PC but not its commit enter the next view with a 2^6 x 1.2 s = 76.8 s
+    /// deadline, while the replica that had committed it waited 4.8 s and timed out alone; with
+    /// every live vote needed, the views drifted apart for 154 s.
+    ///
+    /// The same consensus objects as `committed_qc_view` (the highest PC and its block's
+    /// justify), so honest replicas with the same frontiers derive the same value. A highest PC
+    /// whose block is not in the tree yet (body in flight) is taken as is.
+    pub fn commit_lag_committed_view(&self) -> Result<ViewNumber, BlockTreeError> {
+        let committed = self.committed_qc_view()?;
+        let highest_pc = self.highest_pc()?;
+        if highest_pc.phase.is_generic() || !self.contains(&highest_pc.block) {
+            return Ok(committed);
+        }
+        let generic_view = self.block_justify(&highest_pc.block)?.view;
+        Ok(ViewNumber::new(
+            committed
+                .int()
+                .saturating_add(highest_pc.view.int().saturating_sub(generic_view.int())),
+        ))
+    }
 }
 
 /// Errors that may be encountered when reading or writing to the [`BlockTreeSingleton`].

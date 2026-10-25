@@ -29,7 +29,10 @@ use crate::{
         receiving::{ProgressMessageReceiveError, ProgressMessageStub},
         sending::SenderHandle,
     },
-    pacemaker::implementation::{boot_view, Pacemaker, PacemakerConfiguration, ViewInfo},
+    pacemaker::{
+        implementation::{boot_view, Pacemaker, PacemakerConfiguration, ViewInfo},
+        messages::{AdvanceView, PacemakerMessage, ProgressCertificate},
+    },
     types::{
         data_types::{BufferSize, ChainID, ViewNumber},
         validator_set::ValidatorSetState,
@@ -384,6 +387,26 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                     }
                 }
                 ProgressMessage::PacemakerMessage(msg) => {
+                    // s140 r3: an AdvanceView's Commit / Decide PC on an update still pending
+                    // here commits the update before the pacemaker enters the next view (the
+                    // pacemaker alone only moves the highest PC; see
+                    // `HotStuff::on_receive_advance_view_pc`).
+                    if let PacemakerMessage::AdvanceView(AdvanceView {
+                        progress_certificate: ProgressCertificate::PhaseCertificate(pc),
+                    }) = &msg
+                    {
+                        if let Err(e) = self.hotstuff.on_receive_advance_view_pc(
+                            pc,
+                            &mut self.block_tree,
+                            &mut self.app,
+                        ) {
+                            log::error!(
+                                "HotStuff on_receive_advance_view_pc error: {:?} — the pacemaker \
+                                 still handles the message",
+                                e
+                            );
+                        }
+                    }
                     if let Err(e) =
                         self.pacemaker
                             .on_receive_msg(msg, &origin, &mut self.block_tree)
@@ -480,7 +503,7 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             Ok::<_, crate::block_tree::accessors::internal::BlockTreeError>((
                 self.block_tree.validator_set_state()?,
                 self.block_tree.highest_pc()?.view,
-                self.block_tree.committed_qc_view()?,
+                self.block_tree.commit_lag_committed_view()?,
             ))
         })();
         match frontier {
