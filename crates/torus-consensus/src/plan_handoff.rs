@@ -1,4 +1,5 @@
-//! Epoch plan hand-off (`TORUS_EPOCH_PLAN_HANDOFF`, node-local, default off;
+//! Epoch plan hand-off (`TORUS_EPOCH_PLAN_HANDOFF`, node-local, default on
+//! since s140 after bench 9q, perf sections 127.4 and 129;
 //! the s80 prototype `epoch-plan-logical-ready`, 62373d5d): execution's
 //! LOGICAL applied height and the boundary plan rows it wrote, handed to
 //! consensus in memory.
@@ -39,16 +40,17 @@ pub fn plan_handoff_enabled() -> bool {
     parse_plan_handoff(std::env::var(PLAN_HANDOFF_ENV).ok())
 }
 
-/// Pure parse: `1` / `true` = on; unset, empty, `0` or `false` = off;
-/// anything else = off with a warning (a typo never enables a
-/// consensus-timing change).
+/// Pure parse (default on since s140): unset, empty, `1` or `true` = on;
+/// `0` or `false` = off (the kill switch: the durable-only rule); anything
+/// else = off with a warning, as `TORUS_EPOCH_FAST_PATH` (a typo in an
+/// explicit value reads as the kill switch).
 pub fn parse_plan_handoff(raw: Option<String>) -> bool {
     let Some(raw) = raw else {
-        return false;
+        return true;
     };
     match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" => true,
-        "" | "0" | "false" => false,
+        "" | "1" | "true" => true,
+        "0" | "false" => false,
         other => {
             tracing::warn!(
                 value = other,
