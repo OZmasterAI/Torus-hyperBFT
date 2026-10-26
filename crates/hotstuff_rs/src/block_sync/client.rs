@@ -651,6 +651,11 @@ impl<N: Network> BlockSyncClient<N> {
         if advertise_block.chain_id != self.config.chain_id || !advertise_block.is_correct(origin) {
             return Ok(());
         }
+        // s140: a broadcast reaches its sender too. A session this replica serves itself returns
+        // only what it already holds, makes no progress and backs the next attempt off.
+        if *origin == self.config.me {
+            return Ok(());
+        }
         if !is_sync_server_address(origin, block_tree)? {
             return Ok(());
         }
