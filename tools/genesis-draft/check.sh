@@ -14,16 +14,18 @@
 # 2. refuse:  the node refuses every draft as checked in, and (on the 5-validator draft,
 #             which has every placeholder) each placeholder left alone while all the others
 #             are filled with dummy values (tools/genesis-draft/fill-dummy.py).
-#   2b. info: what this binary does (NOT part of PASS / FAIL) with (a) the fee split
-#             filled with dev pool 0 (fill-dummy.py --dev-zero), and (b) a malformed
-#             economics.treasury_address / dev_pool_address whose accounts[] row is valid.
-# 3. boot:    each draft filled with dummy devnet values starts N local validators (keys
-#             01..0N, attesting with their account keys) and all reach TARGET committed blocks.
+#             Also refused (main 4c445f94): the filled 5-validator draft with a malformed
+#             economics.treasury_address / dev_pool_address whose accounts[] row is valid, and
+#             with a fee split whose start or end does not total 10000 bps or has a share > 10000.
+# 3. boot:    each draft filled with dummy devnet values (FILL:fee_split = a dev-pool-0 split,
+#             fill-dummy.py FEE_SPLIT_DEV_ZERO, read by the loader's genesis fee-split path)
+#             starts N local validators (keys 01..0N, attesting with their account keys) and
+#             all reach TARGET committed blocks.
 #             Every node started is killed on exit.
 #
 # Env: TORUS_NODE_BIN (default $CARGO_TARGET_DIR/release/torus-node), VARIANTS (default
 # "3 4 5"), TARGET (committed blocks per node, default 5), BOOT_TIMEOUT (s, default 180),
-# WORK (scratch dir, default a new mktemp -d), SKIP_REFUSE=1 (skip steps 2 / 2b), SKIP_BOOT=1
+# WORK (scratch dir, default a new mktemp -d), SKIP_REFUSE=1 (skip step 2), SKIP_BOOT=1
 # (skip step 3), ATTEST_HEIGHT (default
 # 250; 0 = skip): also wait until every node is at this height and require each node to have
 # submitted >= 1 state hash attestation, with no hash mismatch and no hash-unverified node.
@@ -125,15 +127,18 @@ for n in $VARIANTS; do
 done
 
 # 2. Refusal -----------------------------------------------------------------------------
-# run_refused <label> <genesis>: the node must exit non-zero on its own (not by timeout).
+# run_refused <label> <genesis> [<ERE>]: the node must exit non-zero on its own (not by
+# timeout), and its log must match <ERE> when one is given (refused for that reason).
 run_refused() {
-    local label=$1 gen=$2 dd="$WORK/refuse/$1" log="$WORK/refuse/$1.log" rc=0
+    local label=$1 gen=$2 want=${3:-} dd="$WORK/refuse/$1" log="$WORK/refuse/$1.log" rc=0
     mkdir -p "$dd"
     node_argv 0 "$gen" "$dd"
     timeout -s KILL 60 "$BIN" "${NODE_ARGV[@]}" >"$log" 2>&1 || rc=$?
     local why
     why=$(grep -m1 -E 'refusing|Error|error|panicked' "$log" | sed -E 's/\x1b\[[0-9;]*m//g' | cut -c1-200)
-    if [ "$rc" != 0 ] && [ "$rc" != 137 ]; then
+    if [ "$rc" != 0 ] && [ "$rc" != 137 ] && [ -n "$want" ] && ! grep -qE -- "$want" "$log"; then
+        printf '  %-28s refused, WRONG REASON (exit %s; want /%s/): %s\n' "$label" "$rc" "$want" "$why"; fail=1
+    elif [ "$rc" != 0 ] && [ "$rc" != 137 ]; then
         printf '  %-28s refused (exit %s): %s\n' "$label" "$rc" "$why"
     else
         printf '  %-28s NOT REFUSED (exit %s)\n' "$label" "$rc"; fail=1
@@ -147,28 +152,18 @@ if [ "${SKIP_REFUSE:-0}" != 1 ]; then
         run_refused "only FILL:$key" "$WORK/leave-$key.json"
     done
 
-    # 2b. Informational: report, never fail.
-    echo "=== 2b. info (not part of the result) ==="
-    run_info() { # label genesis
-        local dd="$WORK/info/$1" log="$WORK/info/$1.log" rc=0
-        mkdir -p "$dd"
-        node_argv 0 "$2" "$dd"
-        # TERM first (exit 124, no shell "Killed" notice), KILL 5 s later (137).
-        timeout -k 5 20 "$BIN" "${NODE_ARGV[@]}" >"$log" 2>&1 || rc=$?
-        if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
-            printf '  %-34s ACCEPTED (still running after 20 s, stopped)\n' "$1"
-        else
-            printf '  %-34s refused (exit %s): %s\n' "$1" "$rc" \
-                "$(grep -m1 -E 'refusing|Error|error|panicked' "$log" | sed -E 's/\x1b\[[0-9;]*m//g' | cut -c1-200)"
-        fi
+    # Filled 5-validator draft with one bad economics value (main 4c445f94: load errors).
+    python3 -I "$FILL" "$(DRAFT 5)" "$WORK/filled-bad-base.json"
+    bad() { # label jq-filter want-ERE
+        jq "$2" "$WORK/filled-bad-base.json" > "$WORK/bad-$1.json"
+        run_refused "$1" "$WORK/bad-$1.json" "$3"
     }
-    python3 -I "$FILL" --dev-zero "$(DRAFT 5)" "$WORK/info-dev-zero.json"
-    run_info "fee_split with dev_pool 0" "$WORK/info-dev-zero.json"
-    python3 -I "$FILL" "$(DRAFT 5)" "$WORK/info-filled.json"
-    for field in treasury_address dev_pool_address; do
-        jq --arg f "$field" '.economics[$f] = "0x1234"' "$WORK/info-filled.json" > "$WORK/info-bad-$field.json"
-        run_info "economics.$field = 0x1234" "$WORK/info-bad-$field.json"
-    done
+    bad econ-treasury-0x1234 '.economics.treasury_address = "0x1234"' 'economics\.treasury_address'
+    bad econ-dev-pool-0x1234 '.economics.dev_pool_address = "0x1234"' 'economics\.dev_pool_address'
+    bad fee-start-sum-9999 '.economics.fee_split.start.treasury -= 1' 'invalid fee_split'
+    bad fee-end-sum-10001 '.economics.fee_split.end.burn += 1' 'invalid fee_split'
+    bad fee-share-10001 '.economics.fee_split.start = {burn: 10001, validator: 0, treasury: 0, dev_pool: 0}' \
+        'invalid fee_split'
 fi
 
 # 3. Boot --------------------------------------------------------------------------------
@@ -177,6 +172,9 @@ for n in $VARIANTS; do
     [ "${SKIP_BOOT:-0}" = 1 ] && break
     gen="$WORK/filled-${n}val.json"
     python3 -I "$FILL" "$(DRAFT "$n")" "$gen"
+    echo "  ${n}val fee_split: $(jq -c '.economics.fee_split' "$gen")"
+    jq -e '[.economics.fee_split.start, .economics.fee_split.end] | all(.dev_pool == 0)' "$gen" >/dev/null \
+        || { echo "  ${n}val: FAIL filled fee_split has a dev share"; fail=1; }
     run="$WORK/boot-${n}val"
     mkdir -p "$run"
     for i in $(seq 0 $((n - 1))); do

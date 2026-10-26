@@ -11,15 +11,14 @@ dev-pool / governance / faucet addresses, one BTC-USD market), so the file can
 be loaded and booted by tools/genesis-draft/check.sh. Never use its output for
 a real network.
 
-"FILL:fee_split" (the open fee destination split; the draft writes dev_pool 0)
-is filled with the BUILT-IN split (FEE_SPLIT_BUILTIN), dev pool included: the
-loader on main refuses any other split (check_fee_split), so a dev share of 0
-cannot boot until the code changes. --dev-zero instead fills it with
-FEE_SPLIT_DEV_ZERO (dev pool 0, each side summing to 10000), which check.sh
-uses to show what this binary does with the owner's dev share.
+"FILL:fee_split" (the open burn / validator / treasury shares; the draft writes
+dev_pool 0 at start and end) is filled with FEE_SPLIT_DEV_ZERO, a DUMMY split
+with the dev pool at 0 (burn / validator / treasury / dev_pool: start
+1000/0/9000/0 -> end 2500/2500/5000/0). The loader reads economics.fee_split
+since main 4c445f94, so the boot runs the real genesis fee-split path with the
+owner's dev share of 0. The numbers are NOT an owner decision.
 
 --leave KEY   keep "FILL:KEY" unfilled (check.sh proves the node refuses it).
---dev-zero    fill "FILL:fee_split" with FEE_SPLIT_DEV_ZERO (keeps dev_pool 0).
 --list        print the placeholder keys of the draft, one per line, and exit.
 
 Exits 1 when the draft has a placeholder this script has no value for, or when
@@ -66,7 +65,9 @@ VALUES = {
     "gov_account_balance": "100000000000000000000000",
     "liquidator_vault_seed": "1000000.0",
 }
-for i, (pubkey, address) in enumerate(zip(CONSENSUS_PUBKEYS, ACCOUNT_ADDRESSES, strict=True)):
+for i, (pubkey, address) in enumerate(
+    zip(CONSENSUS_PUBKEYS, ACCOUNT_ADDRESSES, strict=True)
+):
     VALUES[f"validator{i}_address"] = address
     VALUES[f"validator{i}_pubkey"] = pubkey
     VALUES[f"validator{i}_stake"] = STAKE
@@ -84,20 +85,12 @@ MARKETS = [
 ]
 
 # "FILL:fee_split" marks burn / validator / treasury of fee_split.start and .end.
-# The built-in split (torus_economics::types FEE_START_* / FEE_END_*), the only
-# one the loader on main accepts.
-FEE_SPLIT_BUILTIN = {
-    "start": {"burn": 1000, "validator": 0, "treasury": 4500, "dev_pool": 4500},
-    "end": {"burn": 2500, "validator": 2500, "treasury": 2500, "dev_pool": 2500},
-}
-# A dev-share-0 split that sums to 10000 (dummy numbers, NOT an owner decision:
-# the destination split is open).
+# A dev-share-0 split, each side summing to 10000 bps as the loader requires
+# (dummy numbers, NOT an owner decision: the destination split is open).
 FEE_SPLIT_DEV_ZERO = {
     "start": {"burn": 1000, "validator": 0, "treasury": 9000, "dev_pool": 0},
     "end": {"burn": 2500, "validator": 2500, "treasury": 5000, "dev_pool": 0},
 }
-for side in FEE_SPLIT_BUILTIN.values():
-    assert sum(side.values()) == 10000
 for side in FEE_SPLIT_DEV_ZERO.values():
     assert sum(side.values()) == 10000 and side["dev_pool"] == 0
 
@@ -129,7 +122,6 @@ def main(argv):
     args = argv[1:]
     leave = set()
     listing = False
-    dev_zero = False
     rest = []
     while args:
         a = args.pop(0)
@@ -137,8 +129,6 @@ def main(argv):
             leave.add(args.pop(0))
         elif a == "--list":
             listing = True
-        elif a == "--dev-zero":
-            dev_zero = True
         else:
             rest.append(a)
     with open(rest[0], encoding="utf-8") as f:
@@ -156,8 +146,7 @@ def main(argv):
     ):
         draft["markets"] = MARKETS
     if "fee_split" in keys and "fee_split" not in leave:
-        split = FEE_SPLIT_DEV_ZERO if dev_zero else FEE_SPLIT_BUILTIN
-        for side, row in split.items():
+        for side, row in FEE_SPLIT_DEV_ZERO.items():
             draft["economics"]["fee_split"][side] = dict(row)
     out = fill(draft, leave)
     left = placeholders(out, set()) - leave
