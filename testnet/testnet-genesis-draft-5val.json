@@ -1,0 +1,135 @@
+{
+  "chain_id": "FILL:chain_id",
+  "chain_name": "torus-testnet",
+  "timestamp": "FILL:timestamp",
+  "consensus": {
+    "protocol": "hotstuff",
+    "epoch_length": 100,
+    "timeout_base_ms": 1200,
+    "timeout_max_ms": 30000,
+    "backoff_factor": 2,
+    "backoff_cap": 8,
+    "commit_lag_backoff_cap": 0,
+    "reputation_leader_selection": false,
+    "book_mode": "classic",
+    "activations": {
+      "running_state_hash": 1,
+      "book_window_commit": 1
+    },
+    "leader_miss_threshold": 3,
+    "leader_exclusion_cap": 6
+  },
+  "evm": {
+    "spec_id": "cancun",
+    "gas_limit": 3000000,
+    "base_fee_initial": 1000000000,
+    "chain_id": "FILL:chain_id",
+    "block_interval": 11,
+    "big_block_interval": 0,
+    "big_gas_limit": 10000000
+  },
+  "economics": {
+    "treasury_address": "FILL:treasury_address",
+    "dev_pool_address": "FILL:dev_pool_address",
+    "fee_split": {
+      "start": {
+        "burn": "FILL:fee_split",
+        "validator": "FILL:fee_split",
+        "treasury": "FILL:fee_split",
+        "dev_pool": 0
+      },
+      "end": {
+        "burn": "FILL:fee_split",
+        "validator": "FILL:fee_split",
+        "treasury": "FILL:fee_split",
+        "dev_pool": 0
+      },
+      "transition_epochs": 1825
+    },
+    "permanent_staking": {
+      "annual_rate_bps": 500,
+      "governance_multiplier_bps": 15000
+    },
+    "validator": {
+      "min_self_delegation": "10000000000000000000000",
+      "max_validators": 21,
+      "unbonding_period_blocks": 604800,
+      "max_commission_bps": 5000,
+      "max_commission_change_bps": 100
+    }
+  },
+  "validators": [
+    {
+      "address": "FILL:validator0_address",
+      "pubkey": "FILL:validator0_pubkey",
+      "stake": "FILL:validator0_stake",
+      "commission_bps": 500
+    },
+    {
+      "address": "FILL:validator1_address",
+      "pubkey": "FILL:validator1_pubkey",
+      "stake": "FILL:validator1_stake",
+      "commission_bps": 500
+    },
+    {
+      "address": "FILL:validator2_address",
+      "pubkey": "FILL:validator2_pubkey",
+      "stake": "FILL:validator2_stake",
+      "commission_bps": 500
+    },
+    {
+      "address": "FILL:validator3_address",
+      "pubkey": "FILL:validator3_pubkey",
+      "stake": "FILL:validator3_stake",
+      "commission_bps": 500
+    },
+    {
+      "address": "FILL:validator4_address",
+      "pubkey": "FILL:validator4_pubkey",
+      "stake": "FILL:validator4_stake",
+      "commission_bps": 500
+    }
+  ],
+  "accounts": [
+    {
+      "address": "FILL:treasury_address",
+      "balance": "FILL:treasury_balance",
+      "note": "treasury (same address as economics.treasury_address)"
+    },
+    {
+      "address": "FILL:dev_pool_address",
+      "balance": "FILL:dev_pool_balance",
+      "note": "dev pool (same address as economics.dev_pool_address)"
+    },
+    {
+      "address": "FILL:gov_account_address",
+      "balance": "FILL:gov_account_balance",
+      "note": "owner governance account: delegates to a validator after launch, before the first proposal (testnet-genesis-draft.md)"
+    },
+    {
+      "address": "FILL:faucet_address",
+      "balance": "FILL:faucet_balance",
+      "note": "testnet faucet (tools/faucet); drop the row if there is none"
+    }
+  ],
+  "evm_alloc": {},
+  "markets": [
+    {
+      "market_id": "FILL:markets",
+      "base_asset": "FILL:markets",
+      "quote_asset": "FILL:markets",
+      "lot_size": "FILL:markets",
+      "tick_size": "FILL:markets",
+      "initial_margin": "FILL:markets"
+    }
+  ],
+  "precompiles": {},
+  "permanent_stakes": [],
+  "native_balances": [
+    {
+      "address": "0x746f7275732d6c697175696461746f722d766c74",
+      "available": "FILL:liquidator_vault_seed",
+      "note": "liquidator vault (torus_core::liquidation::LIQUIDATOR_VAULT = b\"torus-liquidator-vlt\")"
+    }
+  ]
+}
