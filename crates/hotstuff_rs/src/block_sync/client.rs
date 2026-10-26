@@ -1108,6 +1108,9 @@ impl<N: Network> BlockSyncClient<N> {
 
 pub(crate) struct BlockSyncClientConfiguration {
     pub(crate) chain_id: ChainID,
+    /// This replica's own key. Its own advertisements (a broadcast reaches its sender too) never
+    /// make it a sync server of itself: a session it serves itself cannot make progress.
+    pub(crate) me: VerifyingKey,
     pub(crate) request_limit: u32,
     pub(crate) response_timeout: Duration,
     pub(crate) blacklist_expiry_time: Duration,
@@ -1797,6 +1800,8 @@ mod fatal_violation_wiring_tests {
     use super::{
         BlockSyncClient, BlockSyncClientConfiguration, BlockSyncClientError, PendingSyncSession,
     };
+    use crate::block_sync::messages::BlockSyncAdvertiseMessage;
+    use crate::types::crypto_primitives::Keypair;
     use crate::app::{
         App, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest,
         ValidateBlockResponse,
@@ -1912,6 +1917,7 @@ mod fatal_violation_wiring_tests {
         let (_wr_tx, wr_rx) = mpsc::channel();
         let config = BlockSyncClientConfiguration {
             chain_id: CHAIN_ID,
+            me: SigningKey::from_bytes(&[200u8; 32]).verifying_key(),
             request_limit: 32,
             response_timeout: Duration::from_secs(1),
             blacklist_expiry_time: Duration::from_secs(1),
@@ -1925,6 +1931,52 @@ mod fatal_violation_wiring_tests {
             ValidatorSetUpdateHandle::new(NullNetwork),
             None,
         )
+    }
+
+    /// s140 (T11 `laggard_crosses_a_disjoint_replacement`, 1 in 5 runs): a broadcast reaches its
+    /// sender too, so a replica received its own AdvertiseBlock and, as a member of its own
+    /// committed set, registered itself as a sync server. The laggard's 60 s timeout trigger then
+    /// picked itself (1 in 6 there), the session served its own two speculative blocks and "made
+    /// no progress", and the futile backoff put the next attempt past the catch-up window: it
+    /// never crossed the update. A replica's own advertisement must never register it.
+    #[test]
+    fn own_advertisement_does_not_register_a_sync_server() {
+        let me = SigningKey::from_bytes(&[200u8; 32]);
+        let other = SigningKey::from_bytes(&[1u8; 32]);
+        let mut set = ValidatorSet::new();
+        set.put(&me.verifying_key(), Power::new(1));
+        set.put(&other.verifying_key(), Power::new(1));
+        let vss = ValidatorSetState::new(set.clone(), set, None, true);
+        let mut block_tree = BlockTreeSingleton::new(MemKV::default());
+        block_tree
+            .initialize(&AppStateUpdates::new(), &vss)
+            .expect("block tree init");
+
+        let mut cli = client();
+        assert_eq!(cli.config.me, me.verifying_key(), "precondition: client() is `me`");
+        for key in [&me, &other] {
+            let BlockSyncAdvertiseMessage::AdvertiseBlock(advertise) =
+                BlockSyncAdvertiseMessage::advertise_block(
+                    &Keypair::new(key.clone()),
+                    CHAIN_ID,
+                    BlockHeight::new(4),
+                )
+            else {
+                unreachable!("advertise_block builds an AdvertiseBlock")
+            };
+            cli.on_receive_advertise_block(advertise, &key.verifying_key(), &block_tree)
+                .expect("advertise handled");
+        }
+
+        let servers = &cli.block_sync_client_state.available_sync_servers;
+        assert!(
+            servers.contains_key(&other.verifying_key()),
+            "control: another validator's advertisement registers it"
+        );
+        assert!(
+            !servers.contains_key(&me.verifying_key()),
+            "a replica must not register itself as its own sync server"
+        );
     }
 
     /// A synced block whose hash differs from the block we already COMMITTED at
@@ -2158,6 +2210,7 @@ mod fatal_violation_wiring_tests {
         let (wr_tx, wr_rx) = mpsc::channel();
         let config = BlockSyncClientConfiguration {
             chain_id: CHAIN_ID,
+            me: SigningKey::from_bytes(&[200u8; 32]).verifying_key(),
             request_limit: 32,
             response_timeout: Duration::from_secs(1),
             blacklist_expiry_time: Duration::from_secs(1),
@@ -2548,6 +2601,7 @@ mod membership_change_sync_tests {
         let mut client = BlockSyncClient::new(
             BlockSyncClientConfiguration {
                 chain_id: CHAIN_ID,
+                me: SigningKey::from_bytes(&[200u8; 32]).verifying_key(),
                 request_limit: 32,
                 response_timeout: Duration::from_secs(1),
                 blacklist_expiry_time: Duration::from_secs(60),

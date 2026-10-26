@@ -122,6 +122,7 @@ pub(super) fn new_algorithm(
         },
         BlockSyncClientConfiguration {
             chain_id: chain,
+            me: keys[0].verifying_key(),
             request_limit: 32,
             response_timeout: Duration::from_secs(1),
             blacklist_expiry_time: Duration::from_secs(60),
