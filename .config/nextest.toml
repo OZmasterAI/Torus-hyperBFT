@@ -39,3 +39,29 @@ threads-required = 4
 [[profile.ci.overrides]]
 filter = "test(/p00_cluster_tests/)"
 threads-required = 4
+
+# s140: the dead-leader cluster tests run four in-process validators each (real TorusApps, 1 s
+# views), like the P0.0 cluster tests above: give each the room of 4 threads. 20-40 s alone,
+# 2-3 min at load ~100, and a missed scenario (a live validator's slots ran to K misses) starts
+# a fresh cluster up to 3 times: a 20 min cap.
+[[profile.default.overrides]]
+filter = "test(/dead_leader_cluster_tests/)"
+threads-required = 4
+slow-timeout = { period = "120s", terminate-after = 10 }
+
+[[profile.ci.overrides]]
+filter = "test(/dead_leader_cluster_tests/)"
+threads-required = 4
+slow-timeout = { period = "120s", terminate-after = 10 }
+
+# s140: execution-only tests that take minutes alone (l61: 150-200 s, the running-hash
+# determinism runs: 300-370 s) were killed at the 10 min cap under a loaded full gate on 18c
+# (load 50-185); at load 100-365 the l31 / l61 / o0 crash-recovery runs were all still going at
+# 400-520 s. No cluster and no wall-clock assert in them: only the cap moves, to 20 min.
+[[profile.default.overrides]]
+filter = "package(torus-consensus) & (test(/crash_recovery_tests::(l31|l61|o0)_/) | test(running_hash_write_set_determinism))"
+slow-timeout = { period = "120s", terminate-after = 10 }
+
+[[profile.ci.overrides]]
+filter = "package(torus-consensus) & (test(/crash_recovery_tests::(l31|l61|o0)_/) | test(running_hash_write_set_determinism))"
+slow-timeout = { period = "120s", terminate-after = 10 }
