@@ -1200,7 +1200,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    `validate_known_markets` calls `oracle::ever_marked` once per market per action (uncached). Genesis-digest handshake:
    nothing measurable. Step (3) (bisect) not needed. Next (main session): cache the monotonic first-mark predicate at the
    intake, re-bench ABBA n = 4.
-9r. **[GO s140, after 9s] Item 6 Phase 5 step 2 r2 re-A/B.** A = main `077fe56e`, B = `feat/item6-phase5-step2-r2`
+9r. **[RAN s140, section 131: FAILS the exec-path rule on both shapes: exec-thread on-CPU per fill +33% std / +25% deep, native blk/s -58% / -60%, the exec thread's cache_flush x2.3; do not merge; next = main session decision] [GO s140, after 9s] Item 6 Phase 5 step 2 r2 re-A/B.** A = main `077fe56e`, B = `feat/item6-phase5-step2-r2`
    `14b2abe9`. q7 two-arm build, md5 on every node, same env on both arms. Shapes: std hsdb-300m (standard load s127,
    `ORACLE_FEED=seed`) and deep (9n D). One A warm-up per shape, then ABBA n = 3, 600 s cells, fresh data dirs.
    Took effect: on B `torus_exec_users_drain_encodes` > 0, `_encode_inline` / encodes < 0.05,
@@ -1210,6 +1210,16 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    for on-CPU, exec ms or CPU per fill above 1; blocks/s, p50 and p99 not worse; RSS within +10%. A gain claim needs
    the on-CPU CI fully below 1. Builder note: B may come out level, not faster (in-place apply +0.175 ms / 1k fills in
    section 91; main's own flush is cheaper now).
+   **Done s140 (bench-ozarchy-s140-9r + FOREIGN reruns bench-ozarchy-s140-9r-rr, A `077fe56e` node `8649845d` vs B
+   `14b2abe9` node `be6a0d7a`, std 2/2/1 seed + deep 9n D, 600 s, w1 / w2 + ABBA n = 3 per shape, 14 / 14 cells valid,
+   6 FOREIGN reruns (the 15-min agents-usage desktop job, now at :07 / :22 / :37 / :52), all clean; section 131):**
+   took effect on every B cell (drain encodes 2,735-4,489 per node, inline / encodes <= 0.009, EVM-scope typed writes
+   0), none on A. Paired B / A [95% CI]: exec-thread on-CPU per 1k fills std 1.328 [1.293, 1.364] / deep 1.253
+   [1.175, 1.335]; native blk/s 0.422 / 0.399; block p50 x10.7 / x2.3 (deep CI spans 1); p99 1.66 / 2.18; exec ms per
+   1k fills 1.198 / 1.148; CPU-s per 1M fills 1.033 [1.018, 1.049] / 0.988 (n.r.); matched/s 0.940 [0.922, 0.959] /
+   0.981 (n.r.); RSS mean +27% / +13%. Cause: the exec thread's cache flush 0.53 -> 1.21 ms per 1k fills (x2.26 std,
+   x2.33 deep) outweighs the encode moved to the flush worker (0.28 ms per 1k fills, 13-19 ms per job); exec busy
+   0.88 -> 0.99, so blocks grow 2.2-2.4x. Fails every primary row; no gain claim.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 

@@ -21538,6 +21538,228 @@ window's user CPU). B3 - B2, user ms per 1k fills:
   * `posthoc-checks.sh` -> `posthoc-checks*.txt`;
   * `prof9s.py --perf` -> `prof9s.txt` (`prof/` caches the perf report text per window).
 
+## 131. Step 9r, item 6 Phase 5 step 2 r2 re-A/B: A = main `077fe56e` vs B = `feat/item6-phase5-step2-r2` `14b2abe9`, std (hsdb-300m, stakes 2 / 2 / 1, `BENCH_RPCS=0,1`, `ORACLE_FEED=seed`) and deep (9n D: 1M accounts + 1M pre-loaded orders, equal stakes, seed), hash + attestation + L6.1 + L2.1 + fail-stop on, Classic, 15 s checkpoints, w1 (SA) + ABBA n = 3 std, w2 (DA) + ABBA n = 3 deep, + 6 FOREIGN reruns, 600 s cells (campaigns bench-ozarchy-s140-9r and bench-ozarchy-s140-9r-rr, run dirs ozarchy-s140-9r-run and -rerun-run, archy, 2026-10-25/26)
+
+**r2 fails the exec-path merge rule on both shapes. Do not merge.**
+* Exec-thread on-CPU per 1k fills, B / A: std **1.328 [1.293, 1.364]**, deep **1.253 [1.175, 1.335]**.
+* Native blocks/s: std **0.422 [0.398, 0.447]**, deep **0.399 [0.208, 0.765]**. Block p99: std 1.66, deep 2.18 (both
+  CIs above 1). Block p50: std x10.7 (CI above 1), deep x2.3 (CI spans 1).
+* matched/s: std **-6.0%** (0.940 [0.922, 0.959]); deep -1.9% (CI spans 1).
+* The added exec-thread work is the engine's cache flush: 0.53 -> 1.21 ms per 1k fills (x2.26 std, x2.33 deep),
+  ~0.67-0.69 of the +0.68-0.81 ms on-CPU rise. The encode that r2 moved to the flush worker (0.28 ms per 1k fills)
+  is smaller than that.
+* With the exec thread at 99% busy (A 88%), blocks grow 2.2-2.4x and the native block rate falls ~60% (section 91's
+  mechanism).
+
+Question (s140, bench queue 9r): does r2 (step 2 ported onto main, plus the drain encode moved off the exec thread to
+the frozen set's first reader) pass the section 91 exec-path rule against main on both shapes? Builder note: B may
+come out level, not faster.
+
+### 131.1 Setup
+
+* Binaries: q7 two-arm build (`ozarchy-s140-9r-tools/build/build-9r.sh`). Detached worktrees `wt/bq-077fe56e` and
+  `wt/bq-14b2abe9` (B's merge-base with main = `077fe56e`). `cargo build --release --locked`, each package alone,
+  `CARGO_INCREMENTAL=0`, own target dir per arm, rustc 1.98.1, under the build lock. Staged in
+  `ozarchy-s140-9r-stage/{A,B}/release`, md5s in `build/md5s.txt`:
+
+| arm | commit | node md5 | bench md5 | change |
+|---|---|---|---|---|
+| A (SA, DA) | main `077fe56e` | `8649845d` | `10680403` | baseline (node md5 = `b17dab16`'s from section 127: docs-only commits since) |
+| B (SB, DB) | `14b2abe9` | `be6a0d7a` | `96628318` | Phase 5 step 2 ported onto main (`9b242588`) + r2 drain-encode move (`0e06276c`, `14b2abe9`); no flag |
+
+* One driver for all 14 scored cells (`specs/9r.json`, `make-specs-9r.py`, generator frozen from main `b738520d`
+  `tools/matched-bench`). The generator has no per-shape switch, so each shape is a pair of arms with per-arm env:
+  * std (SA, SB): section 130's spec (`ozarchy-s140-9s-tools/specs/9s.json`): 300 markets, rate 76,000, the standard
+    harness env, `VALIDATOR_STAKES=2,2,1`, `BENCH_RPCS=0,1`.
+  * deep (DA, DB): 9n's spec (`ozarchy-s139-tools/specs/9n-probe-deep.json`): the same + `BULK_COUNT=1000000`,
+    `PRELOAD=1000000`, `TORUS_SETTLE_STREAMED=1`; equal stakes, default RPCs. `make-specs-9r.py` asserts that the
+    two specs differ only in these keys.
+  * `TORUS_STATE_HASH_FAILSTOP=1` is named on every arm: run-cell.sh exports it itself with `STATE_HASH_ATTEST=1`
+    (the first SA smoke failed the absent check on it).
+  * Harness `wt/bq-077fe56e`; tools and genesis inputs frozen in `ozarchy-s140-9r-tools` (identical to `077fe56e`'s).
+* Cells: w1 (SA, gated warm-up), r1 SA SB, r2 SB SA, r3 SA SB, w2 (DA, unscored), r1 DA DB, r2 DB DA, r3 DA DB.
+  600 s, fresh data dirs, genesis cache per run dir.
+* The main spec has no checks file and no run.log expectation, so report scans ran in the end pass (`end_pass=1`).
+  Cells were 5-6 s apart.
+  * Took effect, per-arm expectations on `metrics-after-val<n>.txt` (in-line, do not force the scans in-line):
+    B: `torus_exec_users_drain_encodes_total` > 0 and `torus_exec_evm_scope_typed_writes_total 0` on 3 nodes;
+    A: no r2 metric family.
+  * `configchk` (fail-stop, L2.1, L6.1, hash activation, attestation), `tookchk` (B: encodes > 0, inline / encodes
+    < 0.05, EVM-scope writes 0; A: none) and `drained=1 after` ran in-line in the 4 smokes (`9r-smk-{sa,sb,da,db}`,
+    90 / 90 / 120 / 120 s) and post hoc on every cell (`analyst/posthoc-checks-9r.sh`).
+* FOREIGN sampler (`prof/foreign-sampler.py`, section 130) beside the driver. Rule: foreign average > 0.1 core or a
+  2 s interval > 0.5 core in a load window = rerun.
+* Definitions (`analyst/abba9r.py`): sections 94 / 127.5 / 130.
+  * exec-thread on-CPU: `sched_by_node` `torus-execution`, load window, per 1k fills, mean of 3 nodes.
+  * exec ms per 1k fills: `phase_by_node` block_ms / fills per native block.
+  * CPU-s per 1M fills: process user + sys, load window.
+  * block p50 / p99: `torus_commit_interval_seconds`, load-window delta, mean of 3 nodes.
+  * timers (cache_flush, drain, encode, flush worker): `metrics-1hz.txt.gz` load-window delta of the
+    `_seconds_sum`, ms per 1k fills.
+  * RSS: `host-1hz.tsv` VmRSS in the load window (mean of per-node means; max of all nodes).
+  * timeouts per 1,000 blocks: val0 consensus timeouts / val0 committed blocks.
+* Statistics: paired B / A per round (r1..r3), geomean, 95% t CI (2 df), as section 94.
+
+### 131.2 Validity
+
+* Main campaign: 14 / 14 cells rc 0, ACCEPT / AGREE / PASS, node md5 = the arm's staged md5 on 3 nodes.
+  * `cells.tsv` 14 rows, 0 bad. No CELL-FLAG, "RERUN PASS: nothing queued", 0 CHECK FAIL (229 CHECK OK).
+  * End pass 14 / 14 OK, 0 HARD FINDING. `campaign.done` exit=0 (00:00:52).
+  * Post hoc: configchk OK, 1 `drained=1 after` line and tookchk OK on every cell.
+* Took effect on every B cell: drain encodes 2,735-4,489 per node, inline / encodes 0.0007-0.009, EVM-scope typed
+  writes 0. No A cell exports the r2 metrics.
+* **FOREIGN rule: 6 scored cells rerun** (r2-SA, r3-SA, r3-SB, r1-DA, r1-DB, r2-DB), plus both unscored warm-ups.
+  * The source is quickshell's agents-usage refresh (`omarchy-agent-usage-update`, a 900 s Qt timer, not aligned to
+    the wall clock): 1.5-2.5 cores for 2-6 s. On this run it fired at :07:2x / :22:2x / :37:2x / :52:2x (section 130
+    saw :00 / :15 / :30 / :45). A 600 s window misses it only when it starts in the first ~280 s after a burst.
+  * The flagged cells' foreign average was 0.049-0.056 core, the same as the clean cells (0.040-0.043). Only the 2 s
+    max broke the rule (1.95-2.50 cores).
+  * w1 also had a burst from a desktop session (max2s 78 cores from reaped children; average 0.51 core). Unscored.
+  * Reruns: 6 single-cell drivers (`specs/9r-rerun-*.json`, the 9r spec with one arm and one cell), run in sequence by
+    `rerun-chain-9r.sh` in one unit (bench-ozarchy-s140-9r-rr). Each launch was timed so its load window started 25-207
+    s after a burst. 1-11 min idle between rerun cells.
+  * All 6 reruns clean: foreign average 0.050-0.053 core, 2 s max 0.26-0.36 core. rc 0, ACCEPT / AGREE / PASS, md5 ok,
+    configchk / tookchk / drained OK, 0 CHECK FAIL. They replace the flagged cells in 131.4.
+  * **Deviation, as in section 130 (accepted by 18c, msg 180): the reruns came from a second driver.**
+  * Smokes: 4 / 4 green (SA 265,835, SB 236,034, DA 247,209, DB 233,731 matched/s). The first SA smoke attempt failed
+    two driver checks (the `TORUS_STATE_HASH_FAILSTOP` absent check, and tookchk reading the arm's first letter
+    instead of its second). Fixed and rerun; that attempt is kept as `*-attempt1-checkfail`.
+
+### 131.3 Per cell (run order; reruns in place of the flagged cells; mean of 3 nodes unless noted)
+
+| cell | arm | matched/s | native blk/s | fills / native blk | block p50 / p99 ms | exec on-CPU ms / 1k fills | exec ms / 1k fills | CPU-s / 1M | cache_flush ms / 1k | flush worker ms / 1k | exec busy (val0) | timeouts | RSS mean / max MB |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 (unscored) | SA | 268,180 | 8.690 | 30,675 | 13.5 / 856 | 2.448 | 3.236 | 26.62 | 0.525 | 0.532 | 0.870 | 9 | 4,027 / 6,744 |
+| r1-SA | SA | 267,263 | 8.606 | 30,929 | 14.0 / 895 | 2.504 | 3.313 | 26.86 | 0.536 | 0.512 | 0.879 | 11 | 3,976 / 6,965 |
+| r1-SB | SB | 253,495 | 3.663 | 68,064 | 132.8 / 1,467 | 3.284 | 3.925 | 27.57 | 1.195 | 0.714 | 0.995 | 12 | 5,158 / 8,096 |
+| r2-SB | SB | 250,217 | 3.663 | 67,347 | 144.7 / 1,447 | 3.312 | 3.954 | 27.88 | 1.219 | 0.732 | 0.994 | 2 | 5,156 / 8,314 |
+| rerun-r2-SA | SA | 267,980 | 8.919 | 29,953 | 13.7 / 850 | 2.478 | 3.280 | 26.85 | 0.531 | 0.512 | 0.882 | 5 | 4,023 / 7,096 |
+| rerun-r3-SA | SA | 266,023 | 8.444 | 31,263 | 13.4 / 873 | 2.467 | 3.274 | 26.88 | 0.532 | 0.518 | 0.872 | 10 | 4,107 / 6,862 |
+| rerun-r3-SB | SB | 249,622 | 3.622 | 67,746 | 163.7 / 1,435 | 3.297 | 3.937 | 27.82 | 1.201 | 0.729 | 0.993 | 1 | 5,082 / 7,306 |
+| w2 (unscored) | DA | 238,371 | 14.179 | 16,653 | 12.7 / 470 | 2.790 | 3.782 | 29.18 | 0.523 | 0.921 | 0.900 | 2 | 4,691 / 6,563 |
+| rerun-r1-DA | DA | 237,254 | 12.869 | 18,309 | 11.3 / 480 | 2.712 | 3.660 | 28.97 | 0.518 | 0.954 | 0.865 | 5 | 4,787 / 6,800 |
+| rerun-r1-DB | DB | 234,967 | 4.599 | 50,663 | 38.5 / 1,126 | 3.385 | 4.192 | 28.36 | 1.208 | 0.932 | 0.974 | 2 | 5,301 / 7,138 |
+| rerun-r2-DB | DB | 231,566 | 6.183 | 37,224 | 15.3 / 923 | 3.423 | 4.195 | 28.55 | 1.217 | 1.047 | 0.969 | 14 | 5,343 / 7,005 |
+| r2-DA | DA | 239,708 | 11.488 | 20,732 | 12.2 / 499 | 2.659 | 3.556 | 28.35 | 0.525 | 0.867 | 0.852 | 6 | 4,902 / 6,661 |
+| r3-DA | DA | 239,973 | 13.990 | 17,110 | 12.5 / 473 | 2.770 | 3.759 | 28.98 | 0.520 | 0.893 | 0.901 | 3 | 4,728 / 7,051 |
+| r3-DB | DB | 236,574 | 4.624 | 50,164 | 37.9 / 1,133 | 3.387 | 4.206 | 28.35 | 1.216 | 0.919 | 0.992 | 1 | 5,632 / 7,954 |
+
+The 6 replaced originals (`analyst/abba9r.txt`): r2-SA 267,100, r3-SA 265,438, r3-SB 251,308, r1-DA 238,705, r1-DB
+232,893, r2-DB 235,067 matched/s; exec on-CPU 2.476 / 2.502 / 3.277 / 2.686 / 3.447 / 3.381.
+
+### 131.4 Arm means and paired B / A (n = 3 per arm, reruns in; `analyst/abba9r-final.txt`)
+
+Exec-path rule rows (section 91) first. B / A = geomean of per-round ratios [95% CI, 2 df]:
+
+| metric | std A | std B | std B / A [CI] | deep A | deep B | deep B / A [CI] |
+|---|---|---|---|---|---|---|
+| **exec-thread on-CPU ms / 1k fills** | 2.483 | 3.298 | **1.328 [1.293, 1.364]** | 2.713 | 3.398 | **1.253 [1.175, 1.335]** |
+| **native blocks/s** | 8.656 | 3.649 | **0.422 [0.398, 0.447]** | 12.782 | 5.135 | **0.399 [0.208, 0.765]** |
+| **block p50 ms** | 13.7 | 147.1 | **10.72 [7.83, 14.68]** | 12.0 | 30.5 | 2.35 [0.60, 9.12] |
+| **block p99 ms** | 873 | 1,450 | **1.661 [1.578, 1.749]** | 484 | 1,060 | **2.181 [1.527, 3.117]** |
+| exec ms / 1k fills (block_ms / fills) | 3.289 | 3.939 | **1.198 [1.171, 1.225]** | 3.658 | 4.198 | **1.148 [1.075, 1.226]** |
+| CPU-s per 1M fills | 26.86 | 27.75 | **1.033 [1.018, 1.049]** | 28.77 | 28.42 | 0.988 [0.948, 1.029] |
+| matched/s | 267,089 | 251,112 | **0.940 [0.922, 0.959]** | 238,978 | 234,369 | 0.981 [0.949, 1.014] |
+| fills / native block | 30,715 | 67,719 | 2.205 [2.106, 2.309] | 18,717 | 46,017 | 2.442 [1.255, 4.752] |
+| timeouts / 1,000 blocks | 1.02 | 2.08 | n.r. [0.07, 23.7] (pooled 26 vs 15) | 0.38 | 1.02 | n.r. [0.30, 11.7] (pooled 14 vs 17) |
+| RSS mean MB | 4,035 | 5,132 | **1.272 [1.197, 1.352]** | 4,806 | 5,425 | **1.129 [1.003, 1.270]** |
+| RSS max MB | 6,974 | 7,905 | 1.132 [0.992, 1.291] | 6,837 | 7,366 | 1.076 [0.972, 1.191] |
+
+Timers (ms per 1k fills, mean of 3 nodes; drain and encode exist only on B):
+
+| timer | std A | std B | std B / A [CI] | deep A | deep B | deep B / A [CI] |
+|---|---|---|---|---|---|---|
+| engine (`engine_ms_per_1k_fills`) | 2.707 | 3.360 | 1.241 [1.211, 1.272] | 2.907 | 3.470 | 1.194 [1.112, 1.282] |
+| **cache_flush** (exec thread, inside engine) | 0.533 | 1.205 | **2.261 [2.178, 2.348]** | 0.521 | 1.214 | **2.329 [2.305, 2.354]** |
+| drain (in-place dirty-set capture, exec thread) | - | 0.143 | | - | 0.144 | |
+| drain encode (flush worker; ms per job) | - | 0.277 (19.1) | | - | 0.278 (13.0) | |
+| flush worker | 0.514 | 0.725 | 1.410 [1.367, 1.454] | 0.905 | 0.966 | 1.067 [0.811, 1.405] |
+| flush worker checkpoint | 0.369 | 0.310 | 0.838 [0.791, 0.889] | 0.702 | 0.536 | 0.761 [0.501, 1.155] |
+| hotstuff-algo on-CPU | 0.866 | 0.745 | 0.860 [0.842, 0.879] | 1.007 | 0.812 | 0.807 [0.676, 0.963] |
+| exec-thread busy fraction (val0) | 0.878 | 0.994 | 1.133 | 0.873 | 0.978 | 1.121 |
+
+### 131.5 Mechanism
+
+* The exec thread does more work per fill in B: +0.81 ms per 1k fills on-CPU (std), +0.68 (deep).
+* Almost all of it is in the engine's cache-flush sub-phase: +0.67 (std) / +0.69 (deep) ms per 1k fills. It is the
+  same size on both shapes, so it scales with fills, not with book depth.
+* r2's drain capture (`torus_exec_users_drain_seconds`, exec thread) is 0.14 ms per 1k fills. Whether that timer
+  falls inside the cache-flush window was not checked. Either way ~0.53 ms per 1k fills of the cache-flush rise is
+  not named by any r2 timer: the in-place apply / write-through of step 2 is the candidate (section 91 put the
+  in-place apply at +0.175 ms per 1k fills against an older main).
+* The encode moved to the flush worker is 0.28 ms per 1k fills (13-19 ms per job, 0.2-0.9% inline). The flush
+  worker grows +0.21 (std) / +0.06 (deep), which is less than that: its checkpoint part shrinks (bigger, fewer
+  blocks).
+* Exec thread at 97-99% busy (A 85-88%): blocks grow 2.2-2.4x (30.7k -> 67.7k fills std), native blocks/s falls
+  ~60%, commit p50 / p99 rise. Bigger blocks also amortize per-block work: hotstuff-algo per fill -14% / -19%, so
+  process CPU per fill only rises +3.3% (std) and is flat on deep.
+* RSS mean +1.1 GB std / +0.6 GB deep: larger blocks in flight plus the frozen sets' typed parts held until the
+  first reader encodes them. Not attributed further.
+
+### 131.6 Cross-checks and drift
+
+* The original 14 cells (the 6 FOREIGN cells kept) give the same verdict: exec on-CPU 1.320 [1.282, 1.359] std,
+  1.259 [1.182, 1.341] deep; native blk/s 0.421 / 0.387; matched/s 0.944 [0.928, 0.960] / 0.981 [0.968, 0.993].
+* Every round agrees: exec on-CPU B / A 1.31 / 1.34 / 1.34 std, 1.25 / 1.29 / 1.22 deep. Cache flush 2.23-2.30 /
+  2.32-2.34.
+* Drift: A cells 265.4k-268.0k std, 237.3k-240.0k deep; B 249.6k-253.5k, 231.6k-236.6k. No trend in run order;
+  reruns sit inside their arm's range (rerun-r2-SA 267,980, rerun-r3-SA 266,023 vs r1-SA 267,263).
+* Warm-ups: w1 268,180 vs r1-SA 267,263; w2 238,371 vs r2-DA 239,708 / r3-DA 239,973.
+* Deep native blk/s and p50 are noisy on both arms (seed mode: section 127 saw ~8 empty blk/s), hence the wide deep
+  CIs. The on-CPU and cache-flush rows are tight on both shapes.
+* Level vs earlier sections: std A 267k matches section 130's B3 (`d595f77e`) 267k; deep A 239k matches 9n
+  (section 127) 240.6k.
+
+### 131.7 Verdict
+
+| criterion (pass rule) | std | deep |
+|---|---|---|
+| exec-thread on-CPU per fill: CI not above 1 | **FAIL** 1.328 [1.293, 1.364] | **FAIL** 1.253 [1.175, 1.335] |
+| exec ms per 1k fills: CI not above 1 | **FAIL** 1.198 | **FAIL** 1.148 |
+| CPU-s per 1M fills: CI not above 1 | **FAIL** 1.033 [1.018, 1.049] | pass 0.988 [0.948, 1.029] |
+| native blocks/s not worse | **FAIL** 0.422 | **FAIL** 0.399 |
+| block p50 not worse | **FAIL** x10.7 | pass (n.r., x2.3 [0.60, 9.12]) |
+| block p99 not worse | **FAIL** 1.661 | **FAIL** 2.181 |
+| RSS within +10% | **FAIL** mean +27% (max +13%, n.r.) | **FAIL** mean +13% [1.003, 1.270] (max +8%, n.r.) |
+| gain claim (on-CPU CI fully below 1) | no | no |
+
+* **r2 does not pass and must not merge.** High confidence: the on-CPU rise is > 40 pooled sd on std, every round agrees,
+  and the original cells give the same answer.
+* Moving the drain encode off the exec thread works as built (took effect, < 1% inline), but the exec thread now
+  spends more than twice as long in its cache flush. That costs more than the encode saved.
+
+### 131.8 Limits and next
+
+* No profile: the +0.53 ms per 1k fills of cache flush that no r2 timer names is inferred from the timer layout, not
+  measured. One perf `cycles:u` pair (section 130's sidecar, exec thread only, std, 2 cells) would name it.
+* The reruns came from a second driver with 1-11 min idle gaps (131.2). They agree with the cells they replace.
+* The deep shape's p50 and blocks/s CIs are wide (seed-mode empty blocks); its on-CPU row is not.
+* Next (main session / 18c decide):
+  1. Profile the exec thread's cache flush on B vs A (std, n = 1 pair) to name the doubled work.
+  2. If it is step 2's in-place apply or write-through, step 2 itself (not r2's encode move) fails on today's main.
+     Re-check section 91's +0.175 ms per 1k fills against `077fe56e` before more r-rounds.
+* Host: the quickshell agents-usage job still runs every 900 s (now :07 / :22 / :37 / :52, drifting). With 600 s cells
+  it hit 7 of 14 load windows. Disable the `omarchy.agents` plugin (owner action), or time cells, before the next
+  archy campaign.
+
+### 131.9 Data
+
+* Cells (`~/bench-results-matched/`), each with `summary.json`, `agreement.jsonl`, `phase-val*.csv`, `buckets.csv`,
+  `metrics-{before,after}-val*.txt`, `metrics-1hz.txt.gz`, `host-1hz.tsv`, `val*.log.gz`, `.campaign.log` / `.cell.rc`:
+  * `ozarchy-s140-9r-{w1,r1-SA,r1-SB,r2-SB,r2-SA,r3-SA,r3-SB,w2-DA,r1-DA,r1-DB,r2-DB,r2-DA,r3-DA,r3-DB}`;
+  * reruns `ozarchy-s140-9r-rerun-{r2-SA,r3-SA,r3-SB,r1-DA,r1-DB,r2-DB}`;
+  * smokes `ozarchy-s140-9r-smk-{sa,sb,da,db}-smoke-s0` (+ `ozarchy-s140-9r-smk-sa-smoke-s0-attempt1-checkfail`).
+* Campaigns: `ozarchy-s140-9r-run/` (`campaign.log`, `campaign.done` exit=0, `cells.tsv`, `foreign.txt`,
+  `smk-{SA,SB,DA,DB}/`, `smoke-chain.log`), `ozarchy-s140-9r-rerun-run/` (`chain.log`, `rerun-chain.done`, one dir
+  per rerun with its `campaign.log`, `cells.tsv`, `foreign.txt`).
+* Stage: `ozarchy-s140-9r-stage/{A,B}/release`, `build/md5s.txt`, `build/build-9r.log`.
+* Tools: `ozarchy-s140-9r-tools/`: `make-specs-9r.py`, `make-specs-9r-rerun.py`, `specs/`, `drivers/` (generated),
+  `checks/9r-checks.sh` (configchk, tookchk), `prof/` (foreign sampler), `smoke-chain-9r.sh`, `rerun-chain-9r.sh`,
+  `build/build-9r.sh`, frozen `tools/` + genesis inputs.
+* Analysis: `ozarchy-s140-9r-tools/analyst/`: `abba9r.py` -> `abba9r.txt` (original cells) / `abba9r-final.txt`
+  (reruns in); `foreign9r.txt`, `foreign9r-rerun.txt` (section 130's `foreign9s.py`); `posthoc-checks-9r.sh` ->
+  `posthoc-checks-9r{,-rerun}.txt`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
