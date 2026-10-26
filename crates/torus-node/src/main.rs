@@ -458,6 +458,7 @@ fn default_chain_config() -> ChainConfig {
         fee_validator_bps: 0,
         fee_treasury_bps: 4500,
         fee_dev_pool_bps: 4500,
+        fee_schedule: Default::default(),
         treasury_address: Address::ZERO,
         dev_pool_address: Address::ZERO,
         timeout_base_ms: 1200,
@@ -2255,6 +2256,26 @@ mod tests {
             assert!(err.contains(&path.display().to_string()), "{err}");
             assert!(err.contains("duplicate"), "{err}");
             assert!(err.contains(&addr), "names {addr}: {err}");
+        }
+    }
+
+    /// s140 (owner): a malformed economics.treasury_address / dev_pool_address
+    /// refuses to start, naming the file and the field (it used to become the
+    /// zero address).
+    #[test]
+    fn node_refuses_genesis_with_malformed_economics_address() {
+        let base: serde_json::Value =
+            serde_json::from_str(include_str!("../../../devnet/genesis.json")).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("genesis.json");
+        for field in ["treasury_address", "dev_pool_address"] {
+            let mut json = base.clone();
+            json["economics"][field] = format!("FILL:{field}").into();
+            std::fs::write(&path, json.to_string()).unwrap();
+            let err = load_genesis(&path).expect_err("refused").to_string();
+            assert!(err.starts_with("refusing to start: genesis "), "{err}");
+            assert!(err.contains(&path.display().to_string()), "{err}");
+            assert!(err.contains(&format!("economics.{field}")), "{err}");
         }
     }
 

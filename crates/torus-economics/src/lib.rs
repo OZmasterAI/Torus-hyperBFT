@@ -31,5 +31,6 @@ pub use error::EconomicsError;
 pub use governance::{GovernanceManager, GovernanceParams};
 pub use queries::*;
 pub use rewards::{lerp_bps, FeeSplitter, RewardDistributor};
+pub use torus_types::{FeeSchedule, FeeShares, BUILTIN_FEE_SCHEDULE};
 pub use staking::StakingManager;
 pub use types::*;
