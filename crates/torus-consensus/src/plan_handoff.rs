@@ -1,4 +1,5 @@
-//! Epoch plan hand-off (`TORUS_EPOCH_PLAN_HANDOFF`, node-local, default off;
+//! Epoch plan hand-off (`TORUS_EPOCH_PLAN_HANDOFF`, node-local, default on
+//! since s140 after bench 9q, perf sections 127.4 and 129;
 //! the s80 prototype `epoch-plan-logical-ready`, 62373d5d): execution's
 //! LOGICAL applied height and the boundary plan rows it wrote, handed to
 //! consensus in memory.
@@ -39,16 +40,17 @@ pub fn plan_handoff_enabled() -> bool {
     parse_plan_handoff(std::env::var(PLAN_HANDOFF_ENV).ok())
 }
 
-/// Pure parse: `1` / `true` = on; unset, empty, `0` or `false` = off;
-/// anything else = off with a warning (a typo never enables a
-/// consensus-timing change).
+/// Pure parse (default on since s140): unset, empty, `1` or `true` = on;
+/// `0` or `false` = off (the kill switch: the durable-only rule); anything
+/// else = off with a warning, as `TORUS_EPOCH_FAST_PATH` (a typo in an
+/// explicit value reads as the kill switch).
 pub fn parse_plan_handoff(raw: Option<String>) -> bool {
     let Some(raw) = raw else {
-        return false;
+        return true;
     };
     match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" => true,
-        "" | "0" | "false" => false,
+        "" | "1" | "true" => true,
+        "0" | "false" => false,
         other => {
             tracing::warn!(
                 value = other,
@@ -194,15 +196,25 @@ mod tests {
         }
     }
 
+    /// Default ON (s140, after bench 9q Parts A and B): unset, empty, `1` or
+    /// `true` = on; `0` or `false` = off; anything else = off with a
+    /// warning, as the other default-on consensus-timing flags
+    /// (`TORUS_EPOCH_FAST_PATH`, `TORUS_BOOK_COALESCE`): a typo in an
+    /// explicit value reads as the kill switch.
     #[test]
-    fn parse_default_off() {
-        assert!(!parse_plan_handoff(None), "unset: off");
-        assert!(!parse_plan_handoff(Some(String::new())), "empty: off");
-        assert!(!parse_plan_handoff(Some("0".into())), "0: off");
-        assert!(!parse_plan_handoff(Some("false".into())), "false: off");
-        assert!(!parse_plan_handoff(Some("yes".into())), "typo: off");
+    fn parse_default_on() {
+        assert!(parse_plan_handoff(None), "unset: on");
+        assert!(parse_plan_handoff(Some(String::new())), "empty: on");
+        assert!(parse_plan_handoff(Some(" ".into())), "blank: on");
         assert!(parse_plan_handoff(Some("1".into())), "1: on");
-        assert!(parse_plan_handoff(Some(" TRUE ".into())), "true: on");
+        assert!(parse_plan_handoff(Some("true".into())), "true: on");
+        assert!(parse_plan_handoff(Some(" TRUE ".into())), "TRUE: on");
+        assert!(!parse_plan_handoff(Some("0".into())), "0: off");
+        assert!(!parse_plan_handoff(Some(" 0 ".into())), "padded 0: off");
+        assert!(!parse_plan_handoff(Some("false".into())), "false: off");
+        assert!(!parse_plan_handoff(Some("FALSE".into())), "FALSE: off");
+        assert!(!parse_plan_handoff(Some("yes".into())), "typo: off");
+        assert!(!parse_plan_handoff(Some("2".into())), "unknown: off");
     }
 
     /// (a) durable lags, execution logically applied the previous boundary

@@ -1960,8 +1960,8 @@ struct ExecutionContext {
     /// State, roots and the running hash are identical; only timing changes.
     /// No effect without W.
     epoch_fast_path: bool,
-    /// Epoch plan hand-off (`TORUS_EPOCH_PLAN_HANDOFF=1`, node-local, default
-    /// off, read once at construction; [`crate::plan_handoff`]): shared with
+    /// Epoch plan hand-off (`TORUS_EPOCH_PLAN_HANDOFF`, node-local, default
+    /// on since s140, `0` = off, read once at construction; [`crate::plan_handoff`]): shared with
     /// the app. A boundary publishes the plan rows it wrote, then each
     /// hand-off publishes the logical height (`exec_applied`). `None` = the
     /// durable-only rule.
@@ -7512,7 +7512,7 @@ pub struct TorusApp {
     epoch_length: u64,
     last_validator_set: ValidatorSet,
     cached_vs_updates: Option<(u64, Option<ValidatorSetUpdates>)>,
-    /// Epoch plan hand-off (`TORUS_EPOCH_PLAN_HANDOFF=1`): the execution
+    /// Epoch plan hand-off (`TORUS_EPOCH_PLAN_HANDOFF`, default on): the execution
     /// context's hand-off; boundary readiness is then `max(durable, logical)`
     /// with the plan rows read from it first ([`Self::boundary_plan_source`]).
     /// `None` = the durable marker + DB rule.
@@ -8567,7 +8567,8 @@ impl TorusApp {
         let header_hook: HeaderHookSlot = Default::default();
         let state_hash = Arc::new(crate::state_hash::StateHashMonitor::new());
         // Epoch plan hand-off: shared with the exec thread
-        // (`TORUS_EPOCH_PLAN_HANDOFF=1`; off = `None`, the durable-only rule).
+        // (`TORUS_EPOCH_PLAN_HANDOFF`, default on; `0` = `None`, the durable-only
+        // rule).
         let plan_handoff_on = crate::plan_handoff::plan_handoff_enabled();
         tracing::info!(
             on = plan_handoff_on,
