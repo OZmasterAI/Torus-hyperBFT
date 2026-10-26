@@ -21760,6 +21760,257 @@ Timers (ms per 1k fills, mean of 3 nodes; drain and encode exist only on B):
   (reruns in); `foreign9r.txt`, `foreign9r-rerun.txt` (section 130's `foreign9s.py`); `posthoc-checks-9r.sh` ->
   `posthoc-checks-9r{,-rerun}.txt`.
 
+## 132. Step 9p re-run (dead-leader skip phase 4) on main `5e82fb49` (freeze fix #2 `9d28eb48` + `TORUS_EPOCH_PLAN_HANDOFF` default on): 4 validators, stakes 1 / 1 / 1 / 1, `ORACLE_FEED=seed`, rate 14,000, `BENCH_RPCS=0,1,2`, K = `KILL_NO_RESTART=val3` at bench+120 s, aK (`DL_K=3`) vs bK (dead-leader off), ABBA n = 6, + all-up aU (`DL_K=3`) n = 3 interleaved, hash + attestation + L6.1 + L2.1 + fail-stop on, Classic, 15 s checkpoints, 600 s cells (campaign bench-ozarchy-s140-9p2 + FOREIGN reruns bench-ozarchy-s140-9p2-rr / -rr2, run dirs ozarchy-s140-9p2-run, -rerun-run, -rerun2-run, archy, 2026-10-26)
+
+**9p re-run: PASS on both criteria. No freeze in 10 of 10 `DL_K=3` kill cells. The second freeze fix (`9d28eb48`)
+holds.**
+* No per-survivor commit gap reaches 5 s in any aK cell, before or after the exclusion. Largest gap: 2.6 s, any
+  window (9p on `3c5d02ea`: 3 of 7 froze 35-154 s; its smoke sA had 7.4 s).
+* All 3 survivors commit the exclusion boundary H within 0.20 s of each other. 9p's freeze cells had 5-15 s here.
+* Kill -> hotstuff commit of H: 58.6-99.8 s (119-189 blocks) in the 6 scored cells.
+* Post-exclusion vs all-up over the same wall offsets: blocks/s **0.966 ± 0.027** (0.929-1.004), all >= 0.90.
+  * 9p had 0.77-0.88 on this measure. The aU reference is itself spread: rerun-r1-aU runs 24.5-25.3 blocks/s over
+    those offsets, the other two 21.7-22.6.
+  * Post-exclusion matched/s is 21% above all-up at the same offsets (backlog drain).
+* Exclusion, attestation, agreement: every aK cell logs one identical delta on val0 / val1 / val2 (exclude=1,
+  excluded=1, H 4900-5200). State attestation equal in all 28 load cells, AGREE everywhere, 0 HARD FINDING.
+* bK (dead-leader off) never excludes and never freezes (0 of 11): 1.99 blocks/s and 38.9 timeouts per minute after
+  the kill.
+* CPU: lowering the rate from 20,000 to 14,000 did NOT lower the load. The in-flight cap sets it (~1,070-1,170
+  submitted actions/s in both 9p and here). All-up still uses 26 of 32 cores (132.2).
+
+Question (bench queue 9p re-run, 18c msg 186): after the second freeze fix (`9d28eb48`, `fix/dl-freeze-r3`
+`d2581fba`: an AdvanceView's Commit / Decide PC commits a pending update), does a `DL_K=3` kill cell still freeze
+around the exclusion? Pass = no pre-exclusion or post-exclusion freeze in any aK cell (no per-node commit gap > 5 s),
+and post-exclusion blocks/s >= 90% of all-up at the same wall offsets.
+
+### 132.1 Setup
+
+* Binary (one for every arm): main `5e82fb49` (merges `9d28eb48` freeze fix #2 + n > 4 Decide-justify fix,
+  `12c51b3c` hand-off default on, `b738520d` genesis restart digest), plain release `--locked`, `CARGO_INCREMENTAL=0`,
+  own target dir, worktree `wt/bq-5e82fb49` (detached). Staged `ozarchy-s140-9p2-stage/c6`: node `ebf779cf`,
+  bench-throughput `fd0a44d8`, tx-flood `dd59d50d` (`build/build-c6.sh`, `build/md5s-c6.txt`).
+* Harness: `tools/matched-bench` of `5e82fb49` (no change under `tools/`, `testnet/`, `devnet/` since `3c5d02ea`,
+  section 129). Base genesis `testnet/genesis-weighted-full.json` regenerated in the new worktree with the staged
+  bench-throughput: 100,000 bulk accounts, md5 `4ef906cc`, byte-identical to the 9p one. Each campaign's first cell
+  rebuilds it (`FORCE=1`); the cell genesis (`DL_K=3`) has md5 `dcb24a4c`, the same as 9p's aK cells.
+  * Correction to 129.1: the 9p cells also ran on the 100,000-account genesis (summary.json `.genesis.bulk_count`
+    100000; w1's FORCE=1 rebuild replaced the 1M file before the first load), not on 1M accounts.
+* `TORUS_EPOCH_PLAN_HANDOFF` is unset in every arm (spec `absent_env`, node env checked on all 4 nodes). On
+  `5e82fb49` it defaults on: every node logs `epoch plan hand-off (TORUS_EPOCH_PLAN_HANDOFF) ... on=true`
+  (`checks/9p2-checks.sh` `handoffchk4`).
+* Arms (all `N_VALIDATORS=4`, `VALIDATOR_STAKES=1,1,1,1`):
+
+| arm | dead-leader | kill | n |
+|---|---|---|---|
+| aK | `DL_K=3` | val3 SIGKILL at bench+120 s, never restarted | 6 |
+| bK | off (genesis `leader_miss_threshold` absent = K 0) | as aK | 6 |
+| aU | `DL_K=3` | none | 3 (+ w1 unscored) |
+
+* Order: w1 (aU), r1 aK bK, r2 bK aK, r1-aU, r3 aK bK, r4 bK aK, r2-aU, r5 aK bK, r6 bK aK, r3-aU (the driver's
+  rerun pass found nothing queued), then the FOREIGN reruns (132.2). 600 s load, 300 markets, 5,000 senders, in-flight cap 4, batch 400, rate 14,000 actions/s (9p: 20,000,
+  near CPU saturation pre-kill).
+* One detached driver (`drivers/ozarchy-s140-9p2-campaign.sh`, generated from `specs/9p2.json`), no checks file and
+  no run.log expectation, so the report scans ran in the end pass (`end_pass=1`). The FOREIGN sampler
+  (`prof/foreign-sampler.py` via `prof/run-with-sampler.sh`, as 9r) ran beside it -> `ozarchy-s140-9p2-run/foreign.txt`.
+* Windows (val0; `analyst/cells9p2.py`, from 129's `cells9p.py`): as 129.1. Commit gaps per survivor
+  (`analyst/gaps9p2.py`): the hotstuff commit times (`on_commit_block fired height=`, first sight per height), each
+  gap counted in the window where it ends, the kill -> exclusion window of each survivor ending at its own commit of
+  H. Freeze = any gap > 5 s. (129's gap columns split at the earliest survivor's commit of H and so missed a gap
+  that ends at a later survivor's commit; with this split smoke sA of 129 shows its 7.4 s gap in kill -> exclusion.)
+
+### 132.2 Smokes and validity
+
+* Smokes (120 s, kill at bench+30 s; `ozarchy-s140-9p2-run/smk-after/`, `smk-before/`), checks in-line:
+  * sA (`DL_K=3`): ACCEPT / AGREE / liveness PASS, attestation equal. Delta at H 3500 +75.2 s; hotstuff commit of
+    3500 at +76.8 / 76.9 / 76.8 s on val0 / val1 / val2. Max commit gap per survivor 2.0 s (kill -> exclusion),
+    1.2 s after it. Post-exclusion 17.88 blocks/s, 0.0 timeouts per minute (dl_window). **No freeze.**
+    * 9p's sA (`3c5d02ea`) re-read with this section's per-node split: 7.4 / 6.2 / 3.7 s, ending at H.
+  * sB (off): REJECT on dissemination only (each survivor: exhausted=1, sync_fallback=1: body fetches aimed at the
+    dead val3). AGREE, liveness PASS, attestation equal, every check OK. The warm-up gate stops on any rc 2. Per the
+    kill-cell rule this is logged, not a failure. No exclusion; 1.90 blocks/s and 37.8 timeouts per minute after the
+    kill.
+* Config, checked after the campaign on val0..3 of all 28 load cells (`analyst/posthoc-checks*.txt`), all pass:
+  * fail-stop on=true, L2.1 on=true, L6.1 on=Some, hash activation=Some, attestation enabled;
+  * hand-off on=true (default, env unset);
+  * genesis `consensus.leader_miss_threshold=3` on aK / aU, `absent` on bK;
+  * one `drained=1 after` per cell.
+  * The "has not applied the previous boundary" WARN fires 0 times in all 28 cells (9p: 0-21 per node with the
+    hand-off off).
+* Main campaign (`ozarchy-s140-9p2-run`): 16 cells, all rc 0, ACCEPT / AGREE / PASS, `cells.tsv` 16 rows, 0 bad, no
+  rerun queued, `campaign.done` exit=0 (08:06:30). Idle between cells 5-6 s. End pass 203 s, 0 failed.
+  * The driver's "grep: write error: Broken pipe" lines in the end pass are the harness's: 9p and 9r have them too.
+* FOREIGN rule (`analyst/foreign9p2.txt`: foreign avg > 0.1 core or any 2 s > 0.5 core in the load window):
+  * 10 of 15 scored cells broke it: r1-bK, r2-bK, r2-aK, r1-aU, r3-bK, r4-aK, r2-aU, r5-aK, r5-bK, r3-aU.
+  * 9 of them coincide with the quickshell agents-usage job, 0.5-2.4 cores for a few s at M0 + k x 900 + 2-3 s (still 9r's M0).
+  * r3-bK: 0.507 core, a claude session.
+* FOREIGN reruns (second driver as in 9r, 18c msg 180): `rerun-chain-9p2.sh`, unit bench-ozarchy-s140-9p2-rr, run
+  dir `ozarchy-s140-9p2-rerun-run`. One single-cell driver per cell (`specs/9p2-rerun-*.json` = `9p2.json`'s arm),
+  each timed so that its load window sits between two bursts (load start at burst phase 30 s, so ~2 min idle before
+  each). All 10 rc 0 except rerun-r1-bK:
+  * rerun-r1-bK: rc 2, REJECT on dissemination only (as smoke sB), AGREE, PASS, FOREIGN ok. Its driver's own rerun
+    pass then ran rerun-r1-bK-rerun at once, untimed (ACCEPT, but FOREIGN: quickshell burst). Scored: rerun-r1-bK.
+  * rerun-r2-aK: FOREIGN again, 0.80 core for 2 s at load+19 s (pre-kill) from a claude session. A second rerun
+    (`rerun2-chain-9p2.sh`, unit bench-ozarchy-s140-9p2-rr2, `ozarchy-s140-9p2-rerun2-run`) broke it too: 1.03 cores
+    at load+350 s (post-exclusion), quickshell outside its 900 s phase. I stopped there. Scored: rerun-r2-aK, whose
+    blip lies in the pre-kill window, 100 s before the kill. Its freeze verdict matches the other two r2-aK runs.
+  * The other 8 reruns: FOREIGN ok (max 2 s foreign 0.17-0.46 core).
+* Scored set (FOREIGN-clean, except rerun-r2-aK as above):
+  * aK: r1, rerun-r2, r3, rerun-r4, rerun-r5, r6;
+  * bK: rerun-r1, rerun-r2, rerun-r3, r4, rerun-r5, r6;
+  * aU: rerun-r1, rerun-r2, rerun-r3.
+  * The 15 originals give the same verdicts and means within their CIs (`analyst/arms9p2.txt`, "ORIGINALS").
+* CPU (cells9p2 estimate from vmstat and node ticks, load-window average):
+  * all-up: nodes 23.1-23.4 cores, bench 1.1, vmstat busy ~26 of 32 (9p at 20,000: the same);
+  * aK: nodes 19.7-20.4 cores; bK: 13.6-13.8.
+  * The rate knob is not binding. Submitted 1,070-1,080 actions/s all-up and 1,166 in kill cells, in both 9p (20,000)
+    and here (14,000); placed/s 274k vs 278k.
+
+### 132.3 Per cell (run order; val0; `analyst/cells9p2.txt`)
+
+| # | cell | verdict | matched/s | blk/s | blk/s pre / kill->excl / post | tmo/min pre / k->x / post | order age p50 / p99 ms pre; k->x; post | H | kill->delta / ->commit s | blocks kill->H | FOREIGN |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | w1 (aU, unscored) | ACCEPT | 207,244 | 22.6 | 15.40 / 19.54 / 25.17 | 0.5 / 0.0 / 0.3 | 1,998 / 9,768; 414 / 4,284; 365 / 2,075 | | | | ok |
+| 1 | r1-aK | ACCEPT | 228,213 | 17.8 | 16.13 / 1.94 / 22.41 | 0.0 / 38.2 / 0.2 | 2,155 / 9,764; 2,460 / 36,451; 306 / 8,622 | 5100 | 98.1 / 99.8 | 189 | ok |
+| 2 | r1-bK | ACCEPT | 172,222 | 4.6 | 14.84 / 2.04 / - | 0.0 / 38.8 / - | 2,205 / 9,821; 2,292 / 22,402 | none | | | rerun |
+| 3 | r2-bK | ACCEPT | 171,864 | 4.7 | 15.85 / 1.95 / - | 0.0 / 39.0 / - | 1,572 / 9,597; 2,303 / 20,442 | none | | | rerun |
+| 4 | r2-aK | ACCEPT | 232,119 | 18.0 | 15.38 / 1.97 / 22.49 | 0.0 / 38.0 / 0.2 | 2,440 / 9,913; 2,471 / 37,742; 303 / 8,244 | 5000 | 90.3 / 90.7 | 131 | rerun |
+| 5 | r1-aU | ACCEPT | 207,940 | 21.6 | 15.37 / 15.39 / 24.53 | 0.0 / 0.0 / 0.0 | 2,199 / 9,777; 1,365 / 9,508; 411 / 3,619 | | | | rerun |
+| 6 | r3-aK | ACCEPT | 234,062 | 18.6 | 15.63 / 1.95 / 21.94 | 0.0 / 36.6 / 0.0 | 2,580 / 9,812; 3,771 / 38,307; 329 / 7,578 | 5000 | 63.1 / 63.4 | 119 | ok |
+| 7 | r3-bK | ACCEPT | 171,813 | 4.8 | 15.78 / 2.04 / - | 0.0 / 38.8 / - | 1,772 / 9,782; 2,304 / 20,451 | none | | | rerun |
+| 8 | r4-bK | ACCEPT | 172,198 | 4.6 | 14.92 / 2.06 / - | 0.0 / 39.0 / - | 1,541 / 9,663; 2,288 / 20,391 | none | | | ok |
+| 9 | r4-aK | ACCEPT | 233,859 | 19.3 | 15.85 / 1.87 / 22.86 | 0.0 / 38.1 / 0.0 | 2,316 / 9,878; 2,641 / 38,476; 357 / 6,769 | 5100 | 61.5 / 63.0 | 118 | rerun |
+| 10 | r2-aU | ACCEPT | 208,980 | 20.4 | 14.26 / 16.81 / 22.78 | 0.5 / 0.0 / 0.1 | 2,275 / 9,833; 1,556 / 9,589; 420 / 4,097 | | | | rerun |
+| 11 | r5-aK | ACCEPT | 234,860 | 19.4 | 16.53 / 1.90 / 22.64 | 0.0 / 37.6 / 0.0 | 1,412 / 9,511; 3,163 / 36,809; 304 / 5,377 | 5200 | 57.1 / 58.6 | 112 | rerun |
+| 12 | r5-bK | ACCEPT | 171,709 | 4.6 | 15.08 / 1.94 / - | 1.5 / 38.8 / - | 2,573 / 9,965; 2,348 / 22,969 | none | | | rerun |
+| 13 | r6-bK | ACCEPT | 171,414 | 4.7 | 15.68 / 1.95 / - | 0.0 / 38.8 / - | 2,718 / 9,927; 2,357 / 23,634 | none | | | ok |
+| 14 | r6-aK | ACCEPT | 234,786 | 18.9 | 15.66 / 1.86 / 22.62 | 0.0 / 38.3 / 0.0 | 2,397 / 9,854; 3,465 / 38,109; 282 / 6,927 | 5100 | 67.5 / 69.0 | 129 | ok |
+| 15 | r3-aU | ACCEPT | 210,193 | 22.6 | 16.08 / 18.34 / 25.24 | 0.0 / 0.0 / 0.0 | 1,952 / 9,705; 765 / 7,730; 391 / 2,130 | | | | rerun |
+| 16 | rerun-r1-bK | REJECT (dissemination only) | 171,820 | 4.7 | 15.43 / 1.97 / - | 0.0 / 38.8 / - | 2,057 / 9,831; 2,340 / 21,055 | none | | | ok |
+| 17 | rerun-r1-bK-rerun (driver, untimed) | ACCEPT | 172,570 | 4.5 | 14.07 / 2.08 / - | 0.0 / 38.9 / - | 2,613 / 9,977; 2,335 / 23,837 | none | | | broke |
+| 18 | rerun-r2-bK | ACCEPT | 171,811 | 4.7 | 15.89 / 1.94 / - | 0.0 / 38.8 / - | 1,432 / 9,724; 2,309 / 20,430 | none | | | ok |
+| 19 | rerun-r2-aK | ACCEPT | 235,752 | 19.3 | 14.27 / 3.31 / 22.89 | 0.0 / 36.6 / 0.1 | 1,967 / 9,808; 2,793 / 38,779; 278 / 7,129 | 5000 | 57.1 / 58.6 | 131 | 0.80 core 2 s, pre-kill |
+| 20 | rerun-r1-aU | ACCEPT | 208,826 | 21.9 | 15.15 / 15.71 / 24.93 | 0.0 / 0.9 / 0.0 | 2,342 / 9,935; 1,127 / 9,035; 426 / 2,276 | | | | ok |
+| 21 | rerun-r3-bK | ACCEPT | 173,148 | 4.7 | 15.40 / 2.04 / - | 0.0 / 38.8 / - | 2,175 / 9,827; 2,312 / 21,741 | none | | | ok |
+| 22 | rerun-r4-aK | ACCEPT | 232,204 | 17.6 | 15.22 / 2.51 / 21.62 | 0.0 / 38.6 / 0.0 | 2,028 / 9,802; 2,458 / 37,363; 313 / 8,285 | 4900 | 87.1 / 87.4 | 167 | ok |
+| 23 | rerun-r2-aU | ACCEPT | 209,576 | 20.4 | 15.05 / 18.60 / 22.21 | 0.0 / 0.0 / 0.1 | 2,001 / 9,797; 539 / 5,010; 367 / 2,281 | | | | ok |
+| 24 | rerun-r5-aK | ACCEPT | 234,252 | 18.7 | 15.79 / 2.05 / 22.19 | 0.0 / 37.8 / 0.0 | 2,155 / 9,717; 3,978 / 38,509; 334 / 6,043 | 5000 | 63.4 / 64.9 | 121 | ok |
+| 25 | rerun-r5-bK | ACCEPT | 171,901 | 4.8 | 16.23 / 1.94 / - | 0.0 / 38.9 / - | 2,136 / 9,747; 2,311 / 22,482 | none | | | ok |
+| 26 | rerun-r3-aU | ACCEPT | 210,424 | 20.1 | 15.43 / 16.76 / 22.02 | 0.0 / 0.0 / 0.3 | 2,284 / 9,898; 843 / 8,813; 401 / 4,052 | | | | ok |
+| 27 | rerun2-r2-aK | ACCEPT | 232,677 | 17.3 | 15.04 / 2.43 / 21.00 | 0.5 / 37.8 / 0.1 | 2,131 / 9,774; 2,595 / 38,125; 363 / 9,068 | 5000 | 80.2 / 81.8 | 131 | 1.03 cores 2 s, post |
+
+* Windows as 129.1. U cells: pre 0-120 s, k->x 120-190 s, post 190 s..end. blk/s = summary headline (load window).
+  "->commit" = the earliest survivor's hotstuff commit of H.
+* Drift: no trend across run order (aK matched/s 228-236k in every round; bK 171.4-173.1k; aU 207.9-210.4k).
+  Within-cell climb in U cells as in 129 (pre ~15 blocks/s, post 22-25).
+
+### 132.4 Arm means (scored, n = 6 / 6 / 3; ± = 95% CI, t on n - 1; `analyst/arms9p2.txt`)
+
+| metric | aK (n 6) | bK (n 6) | aU (n 3) |
+|---|---|---|---|
+| matched/s (load) | 233,211 ± 2,845 | 172,049 ± 624 | 209,608 ± 1,986 |
+| blocks/s (load) | 18.5 ± 0.7 | 4.7 ± 0.1 | 20.8 ± 2.4 |
+| order age p50 / p99 ms (load) | 426 ± 59 / 18,392 ± 424 | 2,230 ± 160 / 20,363 ± 58 | 485 ± 100 / 8,660 ± 1,101 |
+| timeouts val0 (whole run) | 48.0 ± 10.7 | 338 ± 6 | 3.0 ± 2.5 |
+
+Windows (K cells, val0):
+
+| window | metric | aK (n 6) | bK (n 6) |
+|---|---|---|---|
+| pre-kill | blocks/s | 15.45 ± 0.68 | 15.59 ± 0.47 |
+| | matched/s | 219,102 ± 1,870 | 219,828 ± 2,138 |
+| | timeouts/min | 0.0 | 0.0 |
+| | order age p50 / p99 ms | 2,214 / 9,793 | 2,010 / 9,786 |
+| kill -> exclusion (bK: kill -> end) | blocks/s | 2.27 ± 0.59 | 1.99 ± 0.06 |
+| | matched/s | 160,655 ± 2,689 | 160,146 ± 595 |
+| | timeouts/min | 37.7 ± 0.9 | 38.9 ± 0.1 |
+| | order age p50 / p99 ms | 3,154 / 37,920 | 2,320 / 21,622 |
+| post-exclusion | blocks/s | 22.28 ± 0.48 | - |
+| | matched/s | 250,476 ± 804 | - |
+| | timeouts/min | 0.05 ± 0.08 | - |
+| | order age p50 / p99 ms | 307 ± 24 / 7,430 ± 989 | - |
+
+* Kill to exclusion (scored aK): delta logged 57.1-98.1 s after the kill (72.7 ± 16.9). Hotstuff commit of H 58.6-99.8 s
+  (73.9 ± 16.9), 112-189 blocks; H = the first boundary more than ~3 missed val3 turns past the kill, as in 129.6.
+* Post-exclusion blocks/s vs the 3 scored aU cells over the same wall offsets (aU per cell at those offsets: 24.5-25.3
+  / 22.2-22.6 / 21.7-22.2):
+
+| aK cell | post window (s from load start) | post blk/s | aU same offsets | ratio | matched/s vs aU |
+|---|---|---|---|---|---|
+| r1-aK | 220-602 | 22.41 | 23.35 | 0.960 | +21.1% |
+| rerun-r2-aK | 179-603 | 22.89 | 22.79 | 1.004 | +21.6% |
+| r3-aK | 184-603 | 21.94 | 22.96 | 0.956 | +21.1% |
+| rerun-r4-aK | 208-603 | 21.62 | 23.28 | 0.929 | +21.7% |
+| rerun-r5-aK | 185-603 | 22.19 | 23.00 | 0.965 | +21.2% |
+| r6-aK | 189-603 | 22.62 | 23.03 | 0.982 | +22.1% |
+| **mean** | | | | **0.966 ± 0.027** | |
+
+* The 4 unscored aK runs give 0.904-0.998 (rerun2-r2-aK 0.904: its quickshell burst falls in the post window). Against
+  the aU whole-run mean (20.80): 1.01-1.10.
+
+### 132.5 Freeze check (per-survivor commit gaps; `analyst/gaps9p2.txt`, `gaps9p2-rerun.txt`)
+
+| set | cells | freezes (gap > 5 s) | max gap pre-kill | max gap kill -> H | max gap after H | H commit spread over survivors |
+|---|---|---|---|---|---|---|
+| aK, all runs | 10 (6 main + 4 reruns) | **0** | 1.9 s | 2.6 s | 1.7 s | 0.05-0.20 s |
+| bK, all runs | 11 | 0 | 4.7 s (r5-bK, val0) | 2.4 s | - | - |
+| aU, all runs (+ w1) | 7 | 0 | whole load: 4.0 s (rerun-r3-aU) | | | |
+| smoke sA | 1 | 0 | 1.3 s | 2.0 s | 1.2 s | 0.11 s |
+
+* Liveness gate (>= 30 s without a commit): no stall in any cell.
+* The largest gaps are not at the exclusion:
+  * r5-bK 4.7 / 4.6 / 3.6 s, pre-kill (a FOREIGN cell; its rerun's pre-kill max is 1.6 s);
+  * rerun-r3-aU 3.8 / 4.0 / 3.6 s at load+427 s, height 11638, not a boundary. One shared pause, under 5 s.
+* Around H (± 30 s of each survivor's commit of H) the max gap is 1.4-2.6 s in every aK run. Every 4th view's dead
+  leader costs one view timeout until H commits (~1.9 s gaps, 37.7 timeouts per minute), then none.
+* No 9p freeze shape left: val1 / val2 commit the block before H with val0, not 5-15 s later.
+
+### 132.6 Verdict
+
+* **No pre-exclusion or post-exclusion freeze in any aK cell: PASS. High confidence for this rig.**
+  * 0 of 10 `DL_K=3` kill runs (+ smoke sA). Max per-survivor commit gap 2.6 s. The 3 survivors commit H within
+    0.2 s of each other.
+  * On `3c5d02ea`: 3 of 7 froze 35-154 s, plus a 7.4 s smoke. 95% Wilson upper bound on the freeze rate here:
+    0 / 10 -> 28% (with 9p's 3 / 7 -> 16-75%).
+* **Post-exclusion blocks/s >= 90% of all-up at the same wall offsets: PASS. Medium-high confidence.** Scored
+  0.966 ± 0.027, min 0.929; 9 of 10 aK runs are >= 0.92 (the 10th, 0.904, is a FOREIGN-hit run). Post-exclusion
+  matched/s +21% over all-up (backlog drain), 0.05 timeouts per minute.
+* bK: as 9p (no exclusion, 1.99 blocks/s, 38.9 timeouts per minute for 480 s).
+* No divergence: identical deltas, attestation equal, AGREE in all 28 load cells; 0 hand-off WARNs.
+
+### 132.7 Limits and next
+
+* n = 6 scored aK, 10 aK runs in all; the freeze rate is bounded at <= 28% (95%), not proven zero.
+* The rate cut did not unload the rig: the in-flight cap sets the load (132.2). All-up and pre-kill still run at ~26
+  of 32 cores. To test the freeze path well below saturation, lower `MAX_IN_FLIGHT` or the sender count, not `RATE`.
+* FOREIGN: 10 of 15 originals, 2 of 11 reruns and the second r2-aK rerun broke the rule. Besides the 900 s quickshell job, quickshell and
+  claude sessions burst off-phase. Here a blip changes no freeze verdict and moves post blk/s by <= ~0.05 (rerun2).
+  For long series: mask the job or put the load generator on an isolated cpuset.
+* Not covered: a second kill after the exclusion, readmission of val3 (no restart in this shape), and stakes other
+  than 1/1/1/1.
+
+### 132.8 Data
+
+* Cells: `~/bench-results-matched/ozarchy-s140-9p2-{w1,r1-aK,r1-bK,r2-bK,r2-aK,r1-aU,r3-aK,r3-bK,r4-bK,r4-aK,r2-aU,
+  r5-aK,r5-bK,r6-bK,r6-aK,r3-aU}`, `ozarchy-s140-9p2-rerun-{r1-bK,r1-bK-rerun,r2-bK,r2-aK,r1-aU,r3-bK,r4-aK,r2-aU,
+  r5-aK,r5-bK,r3-aU}`, `ozarchy-s140-9p2-rerun2-r2-aK`. Files as in 129.9 (`summary.json`, `dl-window.json`,
+  `sampler.csv`, `buckets.csv`, `val*.log.gz`, ...).
+* Smokes: `ozarchy-s140-9p2-smkA-smoke-s0`, `ozarchy-s140-9p2-smkB-smoke-s0`.
+* Campaigns: `ozarchy-s140-9p2-run/` (`campaign.log`, `campaign.done` exit=0, `campaign.unit.done`, `cells.tsv`,
+  `foreign.txt`, `genesis-cache/`, `smk-after/`, `smk-before/`); `ozarchy-s140-9p2-rerun-run/` (`rerun-chain.log`,
+  `rerun-chain.done`, one dir per cell with its `campaign.log` and `foreign.txt`); `ozarchy-s140-9p2-rerun2-run/`.
+* Stage: `ozarchy-s140-9p2-stage/` (`build/build-c6.sh`, `build/build-c6.log`, `build/md5s-c6.txt`).
+* Tools: `ozarchy-s140-9p2-tools/` (`make-specs-9p2.py`, `make-specs-9p2-rerun.py`, `rerun-chain-9p2.sh`,
+  `rerun2-chain-9p2.sh`, `specs/`, `drivers/`, `checks/9p2-checks.sh`, `prof/` (foreign sampler),
+  `gen-weighted-genesis.log`).
+* Analysis: `ozarchy-s140-9p2-tools/analyst/`:
+  * `gaps9p2.py` -> `gaps9p2.txt`, `gaps9p2-rerun.txt` (freeze check);
+  * `cells9p2.py` -> `cells9p2.txt` / `.json` (windows, timeouts, order age, WARNs, CPU);
+  * `arms9p2.py` -> `arms9p2.txt` (means, CIs, offset-matched all-up);
+  * `foreign9p2.py` -> `foreign9p2.txt`, `foreign9p2-rerun.txt`;
+  * `deltas9p2.txt` (delta lines per survivor);
+  * `posthoc-checks.sh` -> `posthoc-checks.txt`, `posthoc-checks-rerun.txt`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
