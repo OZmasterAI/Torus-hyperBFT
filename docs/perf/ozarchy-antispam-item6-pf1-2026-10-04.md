@@ -22011,6 +22011,233 @@ Windows (K cells, val0):
   * `deltas9p2.txt` (delta lines per survivor);
   * `posthoc-checks.sh` -> `posthoc-checks.txt`, `posthoc-checks-rerun.txt`.
 
+## 133. Step 9s re-bench, batch A fix (section 130 follow-up): A = main `b738520d` vs B = `perf/ever-marked-cache` `f0bd74ba`, U (all up) only, stakes 2 / 2 / 1, `ORACLE_FEED=seed`, frozen `9083b278` harness genesis, hash + attestation + L6.1 + L2.1 + fail-stop on, Classic, 15 s checkpoints, w1 (A, unscored) + ABBA n = 4 (A B B A B A A B), 300 s cells, load windows timed between the 15-minute desktop bursts (campaign bench-ozarchy-s140-9s2, run dir ozarchy-s140-9s2-run, archy, 2026-10-26)
+
+**The fix works: B recovers section 130's batch A cost. The ingress CPU it added is gone, and matched/s rises
+3.8%.**
+* matched/s A -> B: +10,235 ± 3,891 (1.038 [1.024, 1.053], +4.8 sd). All 4 rounds agree (+6.4k to +14.2k).
+* Process CPU per 1k fills: -1.45 ± 0.44 ms (-5.6%). Exec thread flat (+0.003), hotstuff-algo flat: all of the
+  saving is off the exec thread.
+* The ingress verifiers `torus-ingress-v` drop -1.61 ± 0.18 ms per 1k fills (-24%, -20.5 sd): 6.64 -> 5.03. B's
+  5.03 equals section 130's B2 (5.04, profile cells): the intake is back to its pre-batch-A cost. Every other
+  thread group moves less than 0.15 ms.
+* Exec-path rule (section 91): met. Exec-thread on-CPU per fill 1.001 [0.982, 1.020] and CPU per fill 0.944
+  [0.928, 0.961]: neither CI above 1. Commit p50 +0.9 ms (13.6 vs 12.8; section 130's B2 had 13.6), p99 and native
+  blk/s not resolved.
+* All 9 cells clean on the first run: 0 FOREIGN reruns, 0 CELL-FLAG. The burst timing waited once (346 s, before
+  r4-A) and kept every load window clear of the 15-minute desktop job.
+
+Question (s140, bench queue 9s, 18c msg 186): does the intake fix (the first-mark check keeps markets known marked:
+one oracle read per market instead of one per action) undo section 130's B2 -> B3 step? Expected before launch:
+matched/s ~+4.8% and `torus-ingress-v` ~-1.9 ms CPU per 1k fills.
+
+### 133.1 Setup
+
+* Binaries: fresh release builds (`build/build-9s2.sh`, as section 128's `build-bisect.sh`: one detached worktree
+  and one fresh target dir per arm, `--locked`, `CARGO_INCREMENTAL=0`, under the shared build lock), staged in
+  `ozarchy-s140-9s2-stage/{A,B}/release`. md5 checked against `build/md5s.txt` after the copy and by the driver's
+  preflight. Each arm uses its own `bench-throughput`:
+
+| arm | commit | node md5 | bench md5 | change |
+|---|---|---|---|---|
+| A | main `b738520d` | `c3bdea73` | `765a8348` | base (Merge perf/genesis-restart-digest `36a953c4`) |
+| B | `perf/ever-marked-cache` `f0bd74ba` | `bab591cf` | `880704e3` | A + RED test `7585e4bd` + fix: the intake's first-mark check keeps markets known marked (`crates/torus-rpc`, `crates/torus-core/src/oracle.rs`) |
+
+* Specs: `make-specs-9s2.py` derives them from section 130's base (`specs/base-bisect-main.json`, unchanged). Harness
+  env, node env, absent env, bench.log expectations, host checks, samplers, the harness worktree `wt/bq-9083b278`
+  and the frozen generator (`gen/`, identical to section 130's) are unchanged; only the two binaries differ.
+  * Load: 300 markets, rate 76,000, 5,000 senders, batch 400, `MAX_IN_FLIGHT` 4, commit tail, `BENCH_RPCS=0,1`.
+  * Genesis: 300 markets, 100,060 balances, genesis-cache per run dir. Main's harness changes since `9083b278`
+    are 4-validator plumbing and comments only (3-validator cells unchanged); `b738520d`'s genesis-restart digest
+    change touches only a restart, and both smokes started on the frozen genesis.
+* Differences from section 130:
+  * **Burst timing (new).** The campaign spec has a checks file (`checks/s140-9s2-checks.sh`) with two per-cell
+    functions: `configchk` (section 130 ran it post hoc) and `burstwait` (pacing, never fails). `burstwait`
+    (`prof/burstwait.py`) runs after each cell and waits, when needed, so that the next cell's predicted load
+    window misses the 15-minute desktop job (`omarchy-agent-u` + `quickshell`). Burst phase: 2 s intervals with
+    >= 0.25 core of those two processes, clustered, each cluster's start mod 900 s votes (seeded from 9p2's
+    `foreign.txt` of the same morning and a pre-launch sample: hh:07:21 / :22:21 / :37:21 / :52:21, 14 of 15
+    clusters). D (wait end -> next t_bench0) is measured per cell, the median is used, margin >= 12 s. Each cell
+    logs one `BURSTWAIT` line; `burstwait-state.tsv` keeps waits and predictions.
+  * A checks file keeps the report scans in-line (`end_pass=0`), as section 128; section 130 deferred them to the
+    end pass. The `drained=1 after` run.log expectation is in-line too.
+  * Per-thread CPU on every scored cell without perf: `prof/run-campaign-9s2.sh` (beside the driver, with the
+    foreign sampler) snapshots `/proc/<pid>/task/*/{stat,schedstat}` of the 3 nodes at bench+5 and bench+290 s
+    (section 130 took these only in its profile cells). Groups: ingress `torus-ingress-v`, network
+    `torus-gossip-ve`, rpc `rpc-worker` + `rpc-runtime`, tokio `tokio-rt-worker`, hotstuff `hotstuff-*`, exec
+    `torus-execution` + `torus-exec-pool`, rocksdb `rocksdb:*`, other.
+* Smokes, 60 s each, every check in-line: `smk-a` 266,878 and `smk-b` 280,966 matched/s, ACCEPT / AGREE / PASS,
+  every CHECK OK (configchk included); both `BURSTWAIT` lines computed (dry, no sleep in a smoke).
+* FOREIGN rule as section 130 (`prof/foreign-sampler.py`, `analyst/foreign9s.py`): foreign average > 0.1 core or a
+  2 s spike > 0.5 core in a load window -> rerun.
+* Sources and definitions as section 130 (`analyst/abba9s2.py`, from `abba9s.py`), plus the thread groups: ms per
+  1k fills between the two task snapshots, mean of the 3 nodes.
+* Statistics: n = 4 per arm (w1 not counted). Step = mean(B) - mean(A) ± Welch 95% CI. Paired per round (r1..r4):
+  mean ± t(3) CI.
+
+### 133.2 Validity
+
+* Scored campaign: 9 cells (w1 + 8). All rc 0, ACCEPT / AGREE / liveness PASS, node md5 = the arm's staged md5 on 3
+  nodes (re-checked from each cell's `node-environ-trie.txt`).
+  * `cells.tsv` 9 rows, all ok. No CELL-FLAG, "RERUN PASS: nothing queued". `campaign.done` exit=0 (13:06:42).
+  * In-line, every cell: configchk OK, exactly 1 `drained=1 after` line, hardscan done with 0 HARD FINDING, no
+    CHECK FAIL / WARN (127 CHECK OK lines).
+* **FOREIGN rule: 0 reruns** (`analyst/foreign9s2.txt`). Foreign average 0.048-0.053 core, 2 s max 0.22-0.37 core
+  in every load window. The largest items: this agent's `claude` (~0.02 core) and a steady `quickshell` (~0.01 core).
+* Burst timing (`BURSTWAIT` lines, `burstwait-state.tsv`): bursts came at 11:52:22, 12:07:21, 12:22:26, 12:37:22
+  and 12:52:21, on the predicted phase.
+  * The nearest burst to each scored window: 29-126 s before its start or after its end (r3-B's window ended 29 s
+    before the 12:37:22 burst).
+  * One wait: 346 s after r3-A. Without it, r4-A's window would have ended at about 12:52:20, on the 12:52:21
+    burst. Every other gap
+    between cells was 13-15 s (in-line scans + quiet check).
+  * D (wait end -> next t_bench0) was 109-117 s. Predicted vs actual window start: within 8 s from r1-B on (r1-A:
+    21 s early, the 130 s default before the first measurement).
+  * Wall time 76 min for 9 cells (~7.6 min per cell + the one wait).
+
+### 133.3 Per cell (run order; CPU = process user + sys per 1k fills, mean of 3 nodes; ingress = `torus-ingress-v`)
+
+| # | cell | arm | matched/s | blk/s | native blk/s | commit p50 / p99 ms | CPU ms / 1k fills | exec-thread ms / 1k fills | off-exec ms / 1k fills | sys ms / 1k fills | ingress ms / 1k fills | timeouts |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | w1 (unscored) | A | 266,458 | 15.3 | 9.22 | 13.2 / 810 | 26.22 | 2.435 | 23.79 | 2.21 | 6.64 | 5 |
+| 1 | r1-A | A | 265,535 | 15.4 | 9.25 | 12.4 / 804 | 26.17 | 2.450 | 23.72 | 2.20 | 6.64 | 2 |
+| 2 | r1-B | B | 273,812 | 15.3 | 9.36 | 13.6 / 764 | 25.03 | 2.455 | 22.58 | 1.93 | 5.16 | 3 |
+| 3 | r2-B | B | 275,060 | 15.6 | 9.37 | 13.7 / 752 | 24.85 | 2.455 | 22.40 | 1.83 | 5.00 | 1 |
+| 4 | r2-A | A | 268,675 | 15.0 | 8.98 | 13.1 / 815 | 25.98 | 2.400 | 23.58 | 2.19 | 6.62 | 4 |
+| 5 | r3-B | B | 279,547 | 15.3 | 9.52 | 13.5 / 765 | 24.41 | 2.415 | 21.99 | 1.77 | 4.90 | 2 |
+| 6 | r3-A | A | 265,366 | 15.3 | 9.21 | 12.8 / 806 | 26.28 | 2.428 | 23.85 | 2.21 | 6.66 | 1 |
+| 7 | r4-A | A | 265,428 | 15.4 | 9.27 | 12.7 / 797 | 26.20 | 2.434 | 23.76 | 2.22 | 6.64 | 2 |
+| 8 | r4-B | B | 277,527 | 14.8 | 9.08 | 13.8 / 821 | 24.52 | 2.398 | 22.12 | 1.82 | 5.06 | 4 |
+
+### 133.4 Arm means and B - A (n = 4 per arm; ± = Welch 95% CI; `analyst/abba9s2.txt`)
+
+Exec-path rule rows (section 91) first:
+
+| metric | A | B | B - A | B / A [CI] (sd) |
+|---|---|---|---|---|
+| matched/s | 266,251 | 276,486 | **+10,235 ± 3,891** | 1.038 [1.024, 1.053] (+4.8) |
+| exec-thread on-CPU ms / 1k fills | 2.428 | 2.430 | +0.003 ± 0.046 | 1.001 [0.982, 1.020] (+0.1) |
+| CPU-s per 1M fills (process, user + sys) | 26.16 | 24.70 | **-1.45 ± 0.44** | 0.944 [0.928, 0.961] (-6.5) |
+| native blocks/s | 9.177 | 9.334 | +0.157 ± 0.295 | 1.017 [0.985, 1.049] (+1.0) |
+| commit p50 ms | 12.8 | 13.6 | **+0.9 ± 0.4** | 1.069 [1.036, 1.103] (+4.0) |
+| commit p99 ms | 805 | 776 | -30 ± 51 | 0.963 [0.900, 1.026] (-1.3) |
+| timeouts per 1,000 blocks | 0.49 | 0.55 | +0.06 ± 0.52 | not resolved |
+
+Where the CPU goes (ms per 1k fills, mean of 3 nodes):
+
+| metric | A | B | B - A | B / A [CI] (sd) |
+|---|---|---|---|---|
+| process user | 23.95 | 22.87 | **-1.08 ± 0.36** | 0.955 [0.940, 0.970] (-5.9) |
+| process sys | 2.207 | 1.838 | **-0.369 ± 0.108** | 0.833 [0.784, 0.882] (-7.7) |
+| off-exec (process - exec thread) | 23.73 | 22.27 | **-1.46 ± 0.40** | 0.939 [0.922, 0.956] (-7.1) |
+| hotstuff-algo on-CPU | 0.867 | 0.873 | +0.007 ± 0.014 | 1.008 [0.992, 1.023] (+1.0) |
+| engine | 2.619 | 2.595 | -0.024 ± 0.061 | 0.991 [0.967, 1.014] (-0.7) |
+| settle | 1.097 | 1.067 | **-0.029 ± 0.023** | 0.973 [0.952, 0.994] (-2.3) |
+| cache flush | 0.517 | 0.503 | -0.015 ± 0.016 | 0.972 [0.941, 1.002] (-1.7) |
+| exec-thread busy fraction (val0) | 0.850 | 0.871 | **+0.021 ± 0.017** | 1.025 [1.006, 1.045] (+2.9) |
+| node cores (process, per node) | 6.97 | 6.83 | **-0.14 ± 0.04** | 0.980 [0.975, 0.985] (-7.2) |
+
+Per thread group (`/proc` task snapshots at bench+5 and bench+290 s, utime + stime, ms per 1k fills, mean of 3
+nodes):
+
+| thread group (bench+5..290 s) | A | B | B - A | B / A [CI] (sd) |
+|---|---|---|---|---|
+| ingress `torus-ingress-v` | 6.640 | 5.034 | **-1.606 ± 0.176** | 0.758 [0.732, 0.785] (-20.5) |
+| network `torus-gossip-ve` | 3.583 | 3.530 | **-0.053 ± 0.031** | 0.985 [0.977, 0.994] (-3.3) |
+| rpc `rpc-worker` + `rpc-runtime` | 1.704 | 1.654 | **-0.049 ± 0.022** | 0.971 [0.958, 0.984] (-4.2) |
+| tokio `tokio-rt-worker` | 1.979 | 1.973 | -0.006 ± 0.039 | 0.997 [0.977, 1.017] (-0.3) |
+| hotstuff `hotstuff-*` | 0.875 | 0.883 | +0.008 ± 0.012 | 1.009 [0.995, 1.023] (+1.2) |
+| exec `torus-execution` + `torus-exec-pool` | 8.404 | 8.544 | +0.139 ± 0.166 | 1.017 [0.997, 1.036] (+1.5) |
+| rocksdb `rocksdb:*` | 1.192 | 1.192 | 0.000 ± 0.052 | 1.000 [0.956, 1.043] (0.0) |
+| other | 1.244 | 1.227 | -0.017 ± 0.034 | 0.986 [0.959, 1.014] (-0.9) |
+| all threads | 25.621 | 24.036 | **-1.585 ± 0.416** | 0.938 [0.922, 0.954] (-6.9) |
+
+
+Other rows:
+* blk/s 15.28 / 15.25 (-0.03 ± 0.53). Fills per native block 28,853 / 29,446 (+593 ± 1,121). Chain ms 91.7 / 92.2.
+* Order age at commit p50 2,541 / 2,314 ms (**-228 ± 186, -9%**); p99 9,698 / 9,667 ms (-31 ± 87).
+* Placed/s 351,709 / 365,986 (**+14,277 ± 4,971**, +4.1%).
+
+Paired per round (B - A, r1..r4):
+* matched/s +8,276 / +6,384 / +14,181 / +12,100 (mean +10,235 ± 5,641).
+* CPU per 1k fills -1.14 / -1.13 / -1.87 / -1.68 (mean -1.45 ± 0.61).
+* Ingress per 1k fills -1.47 / -1.62 / -1.76 / -1.57 (mean -1.61 ± 0.19).
+
+### 133.5 Against section 130 (cross-campaign: levels only, not a step)
+
+| | 130 B2 `cc8c9c4a` | 130 B3 `d595f77e` | 133 A `b738520d` | 133 B `f0bd74ba` |
+|---|---|---|---|---|
+| matched/s | 280,698 | 267,150 | 266,251 | 276,486 |
+| CPU ms / 1k fills | 24.04 | 26.08 | 26.16 | 24.70 |
+| ingress ms / 1k fills (130: profile cells) | 5.04 | 6.92 | 6.64 | 5.03 |
+| exec + exec-pool ms / 1k fills (130: profile cells) | 8.30 | 8.13 | 8.40 | 8.54 |
+| commit p50 / p99 ms | 13.6 / 748 | 13.0 / 811 | 12.8 / 805 | 13.6 / 776 |
+
+* A sits at section 130's B3 level and B's intake at B2's. Main between `d595f77e` and `b738520d` carries batch C,
+  the dead-leader and epoch-plan work and the genesis-restart digest, so B is not expected to equal B2.
+* The step is smaller than section 130's (matched/s +3.8% vs B2/B3 +5.1%; CPU -1.45 vs +2.04; ingress -1.61 vs
+  +1.88). The ingress level explains part of it: A's ingress is 0.28 below B3's, B's equals B2's. The 130 ingress
+  values come from perf-profile cells, these from plain cells, so 0.28 is not attributed.
+  * Section 130's matched/s ratio (1.051) lies inside B / A's CI [1.024, 1.053]; its CPU step (2.04) lies outside
+    B's [-1.90, -1.01].
+* B's process CPU per fill is +0.66 ms above B2's, but not in ingress. Over the same bench+5..290 s span the
+  thread snapshots differ by only +0.13 (B 24.04 vs 130's B2 profile cells 23.91), +0.24 of it on the exec group,
+  every other group within ±0.05. Not attributed: main moved, 130's thread values come from perf cells, and the
+  scans ran in-line here and at the end pass in 130 (section 130.6 flagged that as a possible level effect).
+* B's commit p50 (13.6) equals B2's. 130 had p50 lower in the slower arm (B3 13.0) too: more throughput, slightly
+  fuller blocks.
+
+### 133.6 Cross-checks and drift
+
+* Drift: A positions 1 / 4 / 6 / 7 and B 2 / 3 / 5 / 8 sum to 18 each.
+  * A cells 265.5k / 268.7k / 265.4k / 265.4k: flat.
+  * B cells 273.8k / 275.1k / 279.5k / 277.5k: the first two are the lowest, by ~3-5k. Section 130 also had each
+    arm's first cell lowest. The ABBA order cancels a linear drift; no trend beyond that.
+* Warm-up: w1 (A) 266,458 vs r1-A 265,535.
+* The 346 s idle before r4-A left no mark: r4-A 265,428 vs the other A cells 265.4k-268.7k.
+* Smokes (60 s) pointed the same way: ingress 5.66 -> 4.13, matched/s 266,878 -> 280,966.
+
+### 133.7 Verdict
+
+* **The intake cache removes batch A's ingress cost. High confidence.** `torus-ingress-v` -1.61 ± 0.18 ms per 1k
+  fills (-24%), back to section 130's B2 level. Process CPU per fill -5.6%, all off the exec thread.
+* **matched/s +3.8% (+10,235 ± 3,891, 4.8 sd).** It recovers most of section 130's -4.8%; full recovery (1.051) is
+  inside the CI.
+* **Exec-path rule met:** exec-thread on-CPU per fill flat (1.001 [0.982, 1.020]), CPU per fill 0.944 [0.928,
+  0.961]. Commit p50 +0.9 ms (1.069 [1.036, 1.103]) at +3.8% throughput, back to B2's 13.6 ms; p99 -30 ± 51 (not
+  resolved).
+* Placed/s +4.1% and order age at commit p50 -9%: section 130's intake face, reversed.
+* A profile was not needed: the ingress drop shows plainly in the plain-cell thread snapshots.
+
+### 133.8 Limits and next
+
+* Thread groups come from two `/proc` snapshots per cell (bench+5 and bench+290 s), not from perf. No function
+  view; the ingress attribution is by thread name only.
+* Report scans ran in-line (the checks file needs it), unlike section 130's end pass. Within-campaign steps are
+  unaffected; absolute levels are not compared across the two (133.5).
+* Burst timing is new: a per-cell campaign check (`burstwait`) used as pacing. It cannot fail and is no validity
+  check. It handles only the scheduled 15-minute job; off-schedule bursts are still caught by the FOREIGN rule.
+* Next (main session decides): merge `perf/ever-marked-cache`. Section 130.8 item 3 stays open: the fix changes
+  only the RPC intake, so both arms here keep the executor's `AccountReader::ever_marked` check (+0.048 exec ms per
+  1k fills in 130), and this run says nothing about it.
+
+### 133.9 Data
+
+* Cells (`~/bench-results-matched/`), each with `summary.json`, `agreement.jsonl`, `phase-val*.csv`, `buckets.csv`,
+  `val*.log.gz`, `prof-tasks-load-{0,1}.txt` + `prof-load-{0,1}.ts` and `.campaign.log` / `.cell.rc`:
+  * `ozarchy-s140-9s2-{w1,r1-A,r1-B,r2-B,r2-A,r3-B,r3-A,r4-A,r4-B}`;
+  * smokes `ozarchy-s140-9s2-smk-{a,b}-smoke-s0`.
+* Campaign: `ozarchy-s140-9s2-run/` (`campaign.log`, `campaign.done` exit=0, `cells.tsv`, `foreign.txt`,
+  `burstwait-state.tsv`, `genesis-cache/`, `smk-A/`, `smk-B/`, `smokes.log`).
+* Binaries: `ozarchy-s140-9s2-stage/{A,B}/release`, `build/md5s.txt`, `build/build-9s2.log`.
+* Tools: `ozarchy-s140-9s2-tools/`:
+  * `build/build-9s2.sh`, `make-specs-9s2.py`, `specs/`, `drivers/` (generated, frozen generator `gen/`),
+    `checks/s140-9s2-checks.sh`;
+  * `prof/` (`burstwait.py`, `run-campaign-9s2.sh`, `foreign-sampler.py`, `phase/foreign-phase.txt` = the
+    pre-launch phase sample).
+* Analysis: `ozarchy-s140-9s2-tools/analyst/`: `abba9s2.py` -> `abba9s2.txt`, `tables9s2.md`; `foreign9s.py` ->
+  `foreign9s2.txt`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

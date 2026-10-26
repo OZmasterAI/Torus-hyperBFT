@@ -1208,6 +1208,13 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    `validate_known_markets` calls `oracle::ever_marked` once per market per action (uncached). Genesis-digest handshake:
    nothing measurable. Step (3) (bisect) not needed. Next (main session): cache the monotonic first-mark predicate at the
    intake, re-bench ABBA n = 4.
+   **Done s140, re-bench of the fix (bench-ozarchy-s140-9s2, A = main `b738520d` node `c3bdea73` vs B =
+   `perf/ever-marked-cache` `f0bd74ba` node `bab591cf`, same shape and harness, w1 + ABBA n = 4, 9 / 9 cells valid, 0
+   FOREIGN reruns: load windows timed between the 15-min desktop bursts by a per-cell `burstwait` check, one 346 s wait;
+   section 133):** matched/s 266,251 -> 276,486 (+10,235 +- 3,891, 1.038 [1.024, 1.053]); process CPU per 1k fills 26.16
+   -> 24.70 (-1.45 +- 0.44, -5.6%), exec thread flat (1.001 [0.982, 1.020]); `torus-ingress-v` 6.64 -> 5.03 ms per 1k
+   fills (-1.61 +- 0.18, back to 130's B2 5.04); commit p50 +0.9 ms (12.8 -> 13.6, B2's level), p99 not resolved.
+   Exec-path rule met. Next (main session): merge `perf/ever-marked-cache`.
 9r. **[RAN s140, section 131: FAILS the exec-path rule on both shapes: exec-thread on-CPU per fill +33% std / +25% deep, native blk/s -58% / -60%, the exec thread's cache_flush x2.3; do not merge; next = main session decision] [GO s140, after 9s] Item 6 Phase 5 step 2 r2 re-A/B.** A = main `077fe56e`, B = `feat/item6-phase5-step2-r2`
    `14b2abe9`. q7 two-arm build, md5 on every node, same env on both arms. Shapes: std hsdb-300m (standard load s127,
    `ORACLE_FEED=seed`) and deep (9n D). One A warm-up per shape, then ABBA n = 3, 600 s cells, fresh data dirs.
