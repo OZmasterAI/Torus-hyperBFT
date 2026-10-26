@@ -403,9 +403,26 @@ fn screen_payload(
 /// Row 44 (s94 B): a row that does not decode gets the executor's 1 / 1
 /// (`NativeExecutor::market_shape`).
 /// A batch is one signed action, so one bad order rejects all of it.
+/// Without a marked-market set (tests); the endpoints call
+/// [`validate_known_markets_with`].
+#[cfg(test)]
 pub(crate) fn validate_known_markets<S: StateBackend>(
     action: &torus_types::NativeAction,
     state_db: &S,
+) -> Result<(), String> {
+    validate_known_markets_with(action, state_db, None)
+}
+
+/// [`validate_known_markets`] with the node's set of markets known marked
+/// (perf s140, section 130): `Some` answers the first-mark check of a market
+/// in the set without the `CF_NATIVE_ORACLE` read (a market's first mark is
+/// never undone); `None` reads the state every time. Only the first-mark
+/// check uses it: the listing, delist and tick / lot rows can change, so
+/// they are read as before.
+pub(crate) fn validate_known_markets_with<S: StateBackend>(
+    action: &torus_types::NativeAction,
+    state_db: &S,
+    marked_markets: Option<&torus_core::oracle::MarkedMarkets>,
 ) -> Result<(), String> {
     // `(tick, lot)` of a listed market (item 6 M1: the decoder the executor
     // creates books with); `(ONE, ONE)` when the row does not decode as a
@@ -440,7 +457,11 @@ pub(crate) fn validate_known_markets<S: StateBackend>(
     // row with a price > 0). The row is never deleted, so a node whose view
     // lags can only refuse early, never accept what consensus refuses.
     let marked = |mid: u64| -> Result<bool, String> {
-        torus_core::oracle::ever_marked(state_db, mid).map_err(|e| format!("oracle lookup failed: {e}"))
+        match marked_markets {
+            Some(set) => set.ever_marked(state_db, mid),
+            None => torus_core::oracle::ever_marked(state_db, mid),
+        }
+        .map_err(|e| format!("oracle lookup failed: {e}"))
     };
     let first_mark_rule = |mid: u64, is_marked: bool| {
         if is_marked {
@@ -625,11 +646,15 @@ fn check_tick_lot(
 /// band (oracle mark, band parameter) rows of blocks not yet checkpointed are
 /// read from the published view, as the mempool's own checks read them;
 /// interval 0 (no view) reads the DB as before.
+///
+/// `marked_markets`: the node's set of markets known marked
+/// ([`RpcState::marked_markets`]; `None` reads every first-mark check).
 fn verify_one_action_with<S: StateBackend + Clone>(
     decode: DecodeFn,
     signed_action: &str,
     chain_id: u64,
     state_db: &S,
+    marked_markets: Option<&torus_core::oracle::MarkedMarkets>,
     current_time_ms: u64,
     action_bytes: &mut Vec<u8>,
 ) -> Result<
@@ -643,7 +668,7 @@ fn verify_one_action_with<S: StateBackend + Clone>(
     let bytes = parse_bytes(signed_action).map_err(|e| format!("invalid hex: {e}"))?;
     let action = decode(&bytes)?;
     torus_mempool::rate_limit::validate_batch_size(&action.action)?;
-    validate_known_markets(&action.action, state_db)?;
+    validate_known_markets_with(&action.action, state_db, marked_markets)?;
     check_price_band(&action.action, state_db, current_time_ms / 1_000)?;
     let sender = action
         .validate_with_sessions(current_time_ms, chain_id, |pubkey| {
@@ -661,7 +686,9 @@ fn verify_one_action_with<S: StateBackend + Clone>(
     Ok((sender, action, hash))
 }
 
-/// JSON-ingress wrapper shared by the single-action endpoint and tests.
+/// JSON-ingress wrapper for tests (the endpoints pass the node's
+/// marked-market set to [`verify_one_action_with`]).
+#[cfg(test)]
 pub(crate) fn verify_one_action<S: StateBackend + Clone>(
     signed_action: &str,
     chain_id: u64,
@@ -680,6 +707,7 @@ pub(crate) fn verify_one_action<S: StateBackend + Clone>(
         signed_action,
         chain_id,
         state_db,
+        None,
         current_time_ms,
         &mut Vec::new(),
     )
@@ -884,6 +912,7 @@ impl RpcState {
         // Item 6 Phase 3 step 2 follow-up: the published ingress view (the
         // DB alone at interval 0), fetched once per batch.
         let state_db = self.mempool.ingress_state();
+        let marked_markets = self.marked_markets.clone();
         let chain_id = self.chain_id;
         let verify_t0 = std::time::Instant::now();
         let (verified, verify_cpu) = tokio::task::spawn_blocking(move || {
@@ -909,6 +938,7 @@ impl RpcState {
                             &signed_action,
                             chain_id,
                             &state_db,
+                            Some(&*marked_markets),
                             current_time_ms,
                             action_bytes,
                         )
@@ -1872,14 +1902,23 @@ impl TorusApiServer for RpcState {
         // canonical bytes are no longer needed for the forward payload.)
         // Item 6 Phase 3 step 2 follow-up: the published ingress view.
         let state_db = self.mempool.ingress_state();
+        let marked_markets = self.marked_markets.clone();
         let chain_id = self.chain_id;
         let (sender, action, hash) = tokio::task::spawn_blocking(move || {
             let current_time_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock before epoch")
                 .as_millis() as u64;
-            verify_one_action(&signed_action, chain_id, &state_db, current_time_ms)
-                .map_err(RpcError::InvalidParams)
+            verify_one_action_with(
+                decode_action_json,
+                &signed_action,
+                chain_id,
+                &state_db,
+                Some(&*marked_markets),
+                current_time_ms,
+                &mut Vec::new(),
+            )
+            .map_err(RpcError::InvalidParams)
         })
         .await
         .map_err(|e| ErrorObjectOwned::from(RpcError::Internal(format!("spawn_blocking: {e}"))))?
@@ -3088,6 +3127,7 @@ mod ack_scratch_tests {
                     &payload,
                     torus_types::eip712::TORUS_CHAIN_ID,
                     &state,
+                    None,
                     NOW,
                     &mut scratch,
                 )
@@ -3175,6 +3215,7 @@ mod ack_scratch_tests {
                             &payload,
                             torus_types::eip712::TORUS_CHAIN_ID,
                             &state,
+                            None,
                             NOW,
                             scratch,
                         )
@@ -3789,6 +3830,87 @@ mod first_mark_ingress_tests {
         let r = verify_one_action(&sign(order(4)), torus_types::eip712::TORUS_CHAIN_ID, &state, NOW);
         assert!(r.is_ok(), "{:?}", r.err());
     }
+
+    /// Perf s140 (section 130): with the node's marked-market set, a marked
+    /// market's oracle row is read once over many actions (singles and
+    /// batches); an unmarked one is read and refused every time, with the
+    /// executor's text, and passes from the first check after its mark.
+    #[test]
+    fn the_marked_set_reads_a_marked_market_once_and_keeps_the_rule() {
+        let (_d, state) = db();
+        for m in 1..=3 {
+            list(&state, m);
+        }
+        mark(&state, 1, 100, NOW / 1_000);
+        mark(&state, 3, 100, 1); // stale at NOW: still marked
+        let set = torus_core::oracle::MarkedMarkets::new();
+        let check = |a: NativeAction| validate_known_markets_with(&a, &state, Some(&set));
+        for _ in 0..100 {
+            check(NativeAction::PlaceOrder(order(1))).unwrap();
+            check(NativeAction::PlaceOrderBatch(vec![order(1), order(3), order(1)])).unwrap();
+        }
+        assert_eq!(set.db_reads(), 2, "markets 1 and 3: one oracle read each for 200 actions");
+
+        let want = torus_types::market_never_marked_reason(2);
+        for _ in 0..3 {
+            assert_eq!(check(NativeAction::PlaceOrder(order(2))).unwrap_err(), want);
+            let batch = vec![order(1), order(3), order(2)];
+            assert_eq!(check(NativeAction::PlaceOrderBatch(batch)).unwrap_err(), want);
+        }
+        assert_eq!(set.db_reads(), 2 + 6, "an unmarked market is read on every check");
+        assert!(!set.contains(2));
+        check(NativeAction::CancelAllOrders { market_id: Some(2) }).unwrap();
+
+        mark(&state, 2, 100, NOW / 1_000);
+        check(NativeAction::PlaceOrder(order(2))).unwrap();
+        check(NativeAction::PlaceOrderBatch(vec![order(1), order(2), order(3)])).unwrap();
+        assert_eq!(set.db_reads(), 9, "seen at the first check after its mark, then kept");
+        assert!(set.contains(2));
+    }
+
+    /// Perf s140: the set only stands in for the first-mark read. Delist and
+    /// relist of a marked market answer as without it, and an unlisted
+    /// market is still refused as unknown.
+    #[test]
+    fn the_marked_set_leaves_delist_relist_and_listing_to_the_state() {
+        let (_d, state) = db();
+        list(&state, 5);
+        mark(&state, 5, 100, NOW / 1_000);
+        let set = torus_core::oracle::MarkedMarkets::new();
+        let check = |p: PlaceOrderParams| validate_known_markets_with(&NativeAction::PlaceOrder(p), &state, Some(&set));
+        check(order(5)).unwrap();
+        assert!(set.contains(5));
+
+        let delisted = torus_types::market_delisted_key(5);
+        state.put_cf_raw(CF_NATIVE_MARKETS, &delisted, &100u64.to_be_bytes()).unwrap();
+        assert_eq!(check(order(5)).unwrap_err(), torus_types::market_delisted_reason(5));
+        check(PlaceOrderParams { reduce_only: true, ..order(5) }).unwrap();
+        state.delete_cf_raw(CF_NATIVE_MARKETS, &delisted).unwrap();
+        check(order(5)).unwrap();
+
+        state.delete_cf_raw(CF_NATIVE_MARKETS, &5u64.to_be_bytes()).unwrap();
+        assert_eq!(check(order(5)).unwrap_err(), "unknown market_id 5");
+        assert_eq!(set.db_reads(), 1, "market 5's oracle row read once");
+    }
+
+    /// The test-only "unmarked counts as marked" seam is never cached: a
+    /// thread with it on must not open a market for the other threads
+    /// sharing the set.
+    #[test]
+    fn the_test_seam_never_enters_the_marked_set() {
+        let (_d, state) = db();
+        list(&state, 6);
+        let set = torus_core::oracle::MarkedMarkets::new();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                torus_core::oracle::test_treat_unmarked_as_marked_on_this_thread();
+                validate_known_markets_with(&NativeAction::PlaceOrder(order(6)), &state, Some(&set)).unwrap();
+            });
+        });
+        assert!(!set.contains(6));
+        let e = validate_known_markets_with(&NativeAction::PlaceOrder(order(6)), &state, Some(&set)).unwrap_err();
+        assert_eq!(e, torus_types::market_never_marked_reason(6));
+    }
 }
 
 #[cfg(test)]
@@ -4257,6 +4379,7 @@ mod shed_peek_tests {
                     &p,
                     torus_types::eip712::TORUS_CHAIN_ID,
                     &state,
+                    None,
                     1_000_000,
                     &mut Vec::new(),
                 );
@@ -4379,6 +4502,7 @@ mod shed_peek_tests {
                     &p,
                     torus_types::eip712::TORUS_CHAIN_ID,
                     &state,
+                    None,
                     1_000_000,
                     &mut Vec::new(),
                 )

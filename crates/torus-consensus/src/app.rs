@@ -1674,6 +1674,9 @@ struct ExecutionContext {
     max_validators: u32,
     treasury_address: Address,
     dev_pool_address: Address,
+    /// s140: the chain's gas-fee split (`ChainConfig::fee_schedule`), set on
+    /// every block's native context.
+    fee_schedule: torus_types::FeeSchedule,
     /// Item 7 step 1: the genesis parent header from the chain config (the
     /// same value as `TorusApp::genesis_header`): crash replay starts from
     /// it and execution links height 1 to it.
@@ -1960,8 +1963,8 @@ struct ExecutionContext {
     /// State, roots and the running hash are identical; only timing changes.
     /// No effect without W.
     epoch_fast_path: bool,
-    /// Epoch plan hand-off (`TORUS_EPOCH_PLAN_HANDOFF=1`, node-local, default
-    /// off, read once at construction; [`crate::plan_handoff`]): shared with
+    /// Epoch plan hand-off (`TORUS_EPOCH_PLAN_HANDOFF`, node-local, default
+    /// on since s140, `0` = off, read once at construction; [`crate::plan_handoff`]): shared with
     /// the app. A boundary publishes the plan rows it wrote, then each
     /// hand-off publishes the logical height (`exec_applied`). `None` = the
     /// durable-only rule.
@@ -6172,6 +6175,8 @@ impl ExecutionContext {
             // P0.0 phase 2: execution gates features on the committed header's bits,
             // never this node's schedule (crash replay runs the stored header).
             ctx.features = torus_block.header.features;
+            // s140: fees split by the chain's genesis split.
+            ctx.fee_schedule = self.fee_schedule;
             // P0.0 phase 5: the test feature's state-visible rule (test builds only).
             #[cfg(test)]
             p00_cluster_tests::test_state_rule(&ctx);
@@ -7512,7 +7517,7 @@ pub struct TorusApp {
     epoch_length: u64,
     last_validator_set: ValidatorSet,
     cached_vs_updates: Option<(u64, Option<ValidatorSetUpdates>)>,
-    /// Epoch plan hand-off (`TORUS_EPOCH_PLAN_HANDOFF=1`): the execution
+    /// Epoch plan hand-off (`TORUS_EPOCH_PLAN_HANDOFF`, default on): the execution
     /// context's hand-off; boundary readiness is then `max(durable, logical)`
     /// with the plan rows read from it first ([`Self::boundary_plan_source`]).
     /// `None` = the durable marker + DB rule.
@@ -8567,7 +8572,8 @@ impl TorusApp {
         let header_hook: HeaderHookSlot = Default::default();
         let state_hash = Arc::new(crate::state_hash::StateHashMonitor::new());
         // Epoch plan hand-off: shared with the exec thread
-        // (`TORUS_EPOCH_PLAN_HANDOFF=1`; off = `None`, the durable-only rule).
+        // (`TORUS_EPOCH_PLAN_HANDOFF`, default on; `0` = `None`, the durable-only
+        // rule).
         let plan_handoff_on = crate::plan_handoff::plan_handoff_enabled();
         tracing::info!(
             on = plan_handoff_on,
@@ -8599,6 +8605,7 @@ impl TorusApp {
             max_validators: config.max_validators,
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
+            fee_schedule: config.fee_schedule,
             genesis_header: genesis_header.clone(),
             activations: config.activations.clone(),
             known_features: options.known_features,
@@ -9592,6 +9599,7 @@ impl TorusApp {
             fee_validator_bps: 0,
             fee_treasury_bps: 4500,
             fee_dev_pool_bps: 4500,
+            fee_schedule: Default::default(),
             treasury_address: Address::ZERO,
             dev_pool_address: Address::ZERO,
             timeout_base_ms: 500,
@@ -13035,6 +13043,7 @@ mod exec_throttle_tests {
                 fee_validator_bps: 0,
                 fee_treasury_bps: 4500,
                 fee_dev_pool_bps: 4500,
+                fee_schedule: Default::default(),
                 treasury_address: Address::ZERO,
                 dev_pool_address: Address::ZERO,
                 timeout_base_ms: 500,
@@ -14739,6 +14748,7 @@ mod crash_recovery_tests {
             fee_validator_bps: 0,
             fee_treasury_bps: 4500,
             fee_dev_pool_bps: 4500,
+            fee_schedule: Default::default(),
             treasury_address: Address::ZERO,
             dev_pool_address: Address::ZERO,
             timeout_base_ms: 500,
@@ -18991,6 +19001,7 @@ mod crash_recovery_tests {
             max_validators: config.max_validators,
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
+            fee_schedule: config.fee_schedule,
             genesis_header: torus_bridge::genesis_parent_header_for(config),
             activations: config.activations.clone(),
             known_features: torus_types::KNOWN_FEATURES,
@@ -26224,6 +26235,84 @@ mod crash_recovery_tests {
         blocks[0].header.evm_tx_count = 1;
         link_blocks(&mut blocks);
         (blocks, key, Address::repeat_byte(0x77))
+    }
+
+    /// [`run_fee_schedule_fixture`]'s DB, its CF dump and its running state hash.
+    type FeeFixtureRun = (StateDb, Vec<CfDump>, Option<(u64, [u8; 32])>);
+
+    /// s140: run three blocks of one fee-paying EVM tx each through the live
+    /// execution context built from `config` (treasury 0x7a.., dev pool
+    /// 0xde..); returns the DB, its CF dump and the running state hash.
+    fn run_fee_schedule_fixture(fee_schedule: Option<torus_types::FeeSchedule>) -> FeeFixtureRun {
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
+        let key = k256::ecdsa::SigningKey::from_slice(&[62u8; 32]).unwrap();
+        let mut blocks: Vec<TorusBlock> = (1..=3).map(|h| make_block(h, vec![])).collect();
+        for (i, b) in blocks.iter_mut().enumerate() {
+            b.evm_transactions = vec![signed_sstore_create(&key, i as u64)];
+            b.header.evm_tx_count = 1;
+        }
+        link_blocks(&mut blocks);
+        let (mut config, state_db) = make_test_config_and_db();
+        config.epoch_length = 4;
+        config.treasury_address = Address::repeat_byte(0x7a);
+        config.dev_pool_address = Address::repeat_byte(0xde);
+        if let Some(s) = fee_schedule {
+            config.fee_schedule = s;
+        }
+        let sender = {
+            let pubkey = key.verifying_key().to_encoded_point(false);
+            Address::from_slice(&alloy_primitives::keccak256(&pubkey.as_bytes()[1..])[12..])
+        };
+        fund_evm_balance(&state_db, sender, U256::from(1_000_000_000_000_000_000u128));
+        let ctx = make_exec_ctx(&config, &state_db);
+        for b in &blocks {
+            dispatch_and_execute(&ctx, &state_db, b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fixture must not fail-stop");
+        }
+        drop(ctx);
+        let dump = dump_all_cfs(&state_db);
+        let hash = torus_state::running_hash::read_running_hash(&state_db);
+        (state_db, dump, hash)
+    }
+
+    /// s140 determinism: execution splits block fees by the chain config's
+    /// `fee_schedule`. Absent (the default) and the built-in values written
+    /// out (what a genesis with the built-in `fee_split` yields) leave every
+    /// CF and the running state hash identical; a dev-share-0 schedule pays
+    /// the dev pool nothing and the treasury its 90% at epoch 0.
+    #[test]
+    fn exec_splits_block_fees_by_the_chain_fee_schedule() {
+        use torus_types::{FeeSchedule, FeeShares};
+        let balance = |db: &StateDb, a: Address| {
+            db.get_account(&a).unwrap().map(|i| i.balance).unwrap_or_default()
+        };
+        let (treasury, dev) = (Address::repeat_byte(0x7a), Address::repeat_byte(0xde));
+        let (db_default, dump_default, hash_default) = run_fee_schedule_fixture(None);
+        let written_out = FeeSchedule {
+            start: FeeShares { burn: 1000, validator: 0, treasury: 4500, dev_pool: 4500 },
+            end: FeeShares { burn: 2500, validator: 2500, treasury: 2500, dev_pool: 2500 },
+            transition_epochs: 1825,
+        };
+        let (_db_builtin, dump_builtin, hash_builtin) = run_fee_schedule_fixture(Some(written_out));
+        assert_dumps_equal(&dump_default, &dump_builtin, "built-in schedule written out");
+        assert_eq!(hash_default, hash_builtin);
+        assert!(hash_default.is_some());
+        let (t0, d0) = (balance(&db_default, treasury), balance(&db_default, dev));
+        assert!(t0 > U256::ZERO && d0 >= t0, "the built-in split pays both: {t0} {d0}");
+
+        let dev_zero = FeeSchedule {
+            start: FeeShares { burn: 1000, validator: 0, treasury: 9000, dev_pool: 0 },
+            end: FeeShares { burn: 2500, validator: 2500, treasury: 5000, dev_pool: 0 },
+            transition_epochs: 1825,
+        };
+        let (db_zero, _dump_zero, hash_zero) = run_fee_schedule_fixture(Some(dev_zero));
+        assert_eq!(db_zero.get_account(&dev).unwrap(), None, "the dev pool is never credited");
+        let t1 = balance(&db_zero, treasury);
+        // Per block: 90% vs 45% rounded down, and the built-in dev pool's
+        // 45% + dust: t1 is within 3 wei of t0 + d0 and at least 2 * t0.
+        assert!(t1 >= t0 * U256::from(2u8) && t1 <= t0 + d0, "{t1} vs {t0} + {d0}");
+        assert!(t0 + d0 - t1 <= U256::from(3u8), "{t1} vs {t0} + {d0}");
+        assert_ne!(hash_zero, hash_default, "the split is consensus-visible");
     }
 
     fn run_out_of_batch_fixture(restart_after: &[u64]) -> (StateDb, CapturedWrites) {

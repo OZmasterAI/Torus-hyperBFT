@@ -21,7 +21,6 @@ use tracing::{error, info, warn};
 
 use torus_consensus::{NativeDaFetcher, TorusApp};
 use torus_evm::EvmExecutor;
-use torus_genesis::Genesis;
 use torus_mempool::{Mempool, MempoolConfig};
 use torus_network::{LibP2PNetwork, NetworkConfig};
 use torus_rpc::{find_latest_height, BlockNotifier, HeadPublisher, RpcServer};
@@ -459,6 +458,7 @@ fn default_chain_config() -> ChainConfig {
         fee_validator_bps: 0,
         fee_treasury_bps: 4500,
         fee_dev_pool_bps: 4500,
+        fee_schedule: Default::default(),
         treasury_address: Address::ZERO,
         dev_pool_address: Address::ZERO,
         timeout_base_ms: 1200,
@@ -636,16 +636,6 @@ fn read_passphrase_stdin() -> String {
     buf.trim().to_string()
 }
 
-/// R19: load the genesis file; a malformed or ambiguous genesis refuses to
-/// start, naming the file.
-/// Also returns the file's digest (P0.0 phase 4, `torus_genesis::digest`).
-fn load_genesis(
-    path: &std::path::Path,
-) -> Result<(Genesis, torus_genesis::GenesisDigest), String> {
-    Genesis::from_file_with_digest(path)
-        .map_err(|e| format!("refusing to start: genesis {}: {e}", path.display()))
-}
-
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Validate pruning flags. History retention is on by default (s131): an
     // archive node needs --archive (or --retention-blocks 0).
@@ -727,7 +717,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // exists. Genesis initialization: only on first run (see
     // `node_dbs::genesis_applied`); P0.0 phase 4: the data dir is bound to the
     // genesis file's digest, a changed file refuses to start.
-    let genesis_file = cli.genesis.as_deref().map(load_genesis).transpose()?;
+    // R19: a malformed or ambiguous genesis refuses to start, naming the
+    // file. s140: a restart on the same file bytes takes the stored digest
+    // (`node_dbs::load_genesis_file`) instead of digesting the file again.
+    let genesis_file = cli
+        .genesis
+        .as_deref()
+        .map(|path| node_dbs::load_genesis_file(&dbs, path))
+        .transpose()?;
+    let genesis_cache_entry = genesis_file.as_ref().and_then(|g| g.cache_entry_to_store());
     // s131: the order-book storage mode is the genesis' (`consensus.book_mode`);
     // `TORUS_BOOK_ROWS` may only repeat it, and a DB marker naming another
     // mode refuses to start. Read-only, so it runs before genesis is applied
@@ -736,7 +734,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let book_rows_env = std::env::var(torus_types::book_mode::BOOK_ROWS_ENV).ok();
     let book_mode = node_dbs::node_book_mode(
         &dbs.state,
-        genesis_file.as_ref().map(|(genesis, _)| genesis.consensus.book_mode),
+        genesis_file.as_ref().map(|g| g.genesis.consensus.book_mode),
         book_rows_env.as_deref(),
     )?;
     let binding = node_dbs::bind_genesis_and_retention(
@@ -744,18 +742,23 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         genesis_file
             .as_ref()
             .zip(cli.genesis.as_deref())
-            .map(|((genesis, digest), path)| node_dbs::GenesisFile { genesis, digest, path }),
+            .map(|(g, path)| node_dbs::GenesisFile {
+                genesis: &g.genesis,
+                digest: &g.digest,
+                new_cache: genesis_cache_entry.as_ref(),
+                path,
+            }),
         retention,
         retention_is_explicit(&cli),
         &cli.data_dir,
     )?;
-    let mut chain_config = if let (Some((genesis, file_digest)), Some(genesis_path), Some(binding)) =
+    let mut chain_config = if let (Some(loaded), Some(genesis_path), Some(binding)) =
         (&genesis_file, &cli.genesis, binding)
     {
-        let mut config = genesis.chain_config();
+        let mut config = loaded.genesis.chain_config();
         config.book_mode = book_mode;
         info!(genesis = %genesis_path.display(), "genesis file");
-        let digest = file_digest.digest;
+        let digest = loaded.digest.digest;
         match binding {
             node_dbs::GenesisBinding::Fresh => {
                 info!(%digest, "genesis digest stored: this data dir is bound to the genesis file")
@@ -766,9 +769,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                  build with the genesis check); it is not verified against the genesis the dir \
                  was initialized with. Later boots refuse a changed genesis file"
             ),
-            node_dbs::GenesisBinding::Matched => {
-                info!(%digest, "genesis file matches the stored genesis digest")
-            }
+            node_dbs::GenesisBinding::Matched => match loaded.source {
+                torus_genesis::DigestSource::Computed => {
+                    info!(%digest, "genesis file matches the stored genesis digest")
+                }
+                torus_genesis::DigestSource::Cached => info!(
+                    %digest,
+                    file_sha256 = %loaded.fingerprint.sha256,
+                    "genesis file matches the stored genesis digest (the file's bytes are the ones \
+                     the digest was computed from: not digested again)"
+                ),
+            },
         }
 
         config
@@ -947,7 +958,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         // (the P0.0 phase 4 digest this data dir is bound to) at connect time
         // and refuse a mismatch. No `--genesis`: none (default chain config),
         // and every peer with a genesis file refuses this node.
-        genesis_digest: genesis_file.as_ref().map(|(_, digest)| digest.digest.0),
+        genesis_digest: genesis_file.as_ref().map(|g| g.digest.digest.0),
         ..NetworkConfig::default()
     };
 
@@ -2198,6 +2209,13 @@ mod tests {
     use clap::Parser;
     use torus_state::cf::CF_BLOCK_HEADERS;
 
+    /// Boot's genesis load ([`node_dbs::load_genesis_file`]) on a fresh data
+    /// dir next to `path`.
+    fn load_genesis(path: &std::path::Path) -> Result<torus_genesis::LoadedGenesis, String> {
+        let dbs = node_dbs::open_node_dbs(&path.with_extension("data")).unwrap();
+        node_dbs::load_genesis_file(&dbs, path)
+    }
+
     /// R19 follow-up (owner s112): a genesis with a duplicate validator or an
     /// address in both accounts[] and evm_alloc refuses to start, naming the
     /// file and the address.
@@ -2238,6 +2256,26 @@ mod tests {
             assert!(err.contains(&path.display().to_string()), "{err}");
             assert!(err.contains("duplicate"), "{err}");
             assert!(err.contains(&addr), "names {addr}: {err}");
+        }
+    }
+
+    /// s140 (owner): a malformed economics.treasury_address / dev_pool_address
+    /// refuses to start, naming the file and the field (it used to become the
+    /// zero address).
+    #[test]
+    fn node_refuses_genesis_with_malformed_economics_address() {
+        let base: serde_json::Value =
+            serde_json::from_str(include_str!("../../../devnet/genesis.json")).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("genesis.json");
+        for field in ["treasury_address", "dev_pool_address"] {
+            let mut json = base.clone();
+            json["economics"][field] = format!("FILL:{field}").into();
+            std::fs::write(&path, json.to_string()).unwrap();
+            let err = load_genesis(&path).expect_err("refused").to_string();
+            assert!(err.starts_with("refusing to start: genesis "), "{err}");
+            assert!(err.contains(&path.display().to_string()), "{err}");
+            assert!(err.contains(&format!("economics.{field}")), "{err}");
         }
     }
 

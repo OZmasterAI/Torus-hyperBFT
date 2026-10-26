@@ -1276,9 +1276,17 @@ impl<N: Network> HotStuff<N> {
             // Decide quorum, and a leader-exclusion update stalled the chain for ~36 s. Apply the
             // nudge's Commit PC first (any validator's correct and safe PC is applied from a
             // NewView too), then check the sender against the validator-set state it leaves.
+            //
+            // s140 follow-up: the same holds one step later. The first proposal after the update's
+            // Decide is justified by the Decide PC and comes from a leader of the new set. A
+            // replica that missed the Commit PC (no Decide nudge reached it; a Decide quorum
+            // forms without it once the live power exceeds the quorum by one vote, e.g. 7 equal
+            // stakes with one down) still holds the old set and dropped that proposal or header
+            // here. Its Decide justify is applied the same way when it is on an update still
+            // pending at this replica (that commits the update), then the check runs again.
             if !is_sender_proposer {
-                if let HotStuffMessage::Nudge(nudge) = &msg {
-                    if self.apply_commit_justify(nudge, block_tree, app)? {
+                if let Some(justify) = self.update_justify_to_apply(&msg, block_tree)? {
+                    if self.apply_update_justify(&justify, block_tree, app)? {
                         is_sender_proposer = is_proposer_with_reputation(
                             origin,
                             check_view,
@@ -1336,21 +1344,52 @@ impl<N: Network> HotStuff<N> {
         }
     }
 
-    /// s140: apply the Commit PC of a `nudge` for the current view before its sender is checked
-    /// as the proposer (see `on_receive_msg`). Only a correct, safe Commit PC is applied, exactly
-    /// as a NewView's highest PC is (`on_receive_new_view`): update highestPC, lock, commit, then
-    /// the phase-vote collectors. Returns whether it was applied (the proposer check then runs
-    /// again on the validator-set state it left).
-    fn apply_commit_justify<K: KVStore>(
+    /// s140: the certificate of a current-view message from a sender that is not the proposer in
+    /// this replica's validator-set state, that may install the set in which it is (see
+    /// `on_receive_msg`): a nudge's Commit PC, or the Decide PC justifying a proposal's or a
+    /// header's block when that PC is on a block whose validator-set updates are still pending
+    /// here (this replica missed the update's Commit PC). `None` for anything else.
+    fn update_justify_to_apply<K: KVStore>(
+        &self,
+        msg: &HotStuffMessage,
+        block_tree: &BlockTreeSingleton<K>,
+    ) -> Result<Option<PhaseCertificate>, HotStuffError> {
+        let current = self.view_info.view;
+        let decide = match msg {
+            HotStuffMessage::Nudge(nudge) => {
+                return Ok((nudge.view == current && nudge.justify.phase == Phase::Commit)
+                    .then(|| nudge.justify.clone()));
+            }
+            HotStuffMessage::Proposal(proposal) if proposal.view == current => &proposal.block.justify,
+            HotStuffMessage::ProposalHeader(header) if header.view == current => &header.justify,
+            _ => return Ok(None),
+        };
+        if !decide.phase.is_decide()
+            || !matches!(
+                block_tree.validator_set_updates_status(&decide.block)?,
+                ValidatorSetUpdatesStatus::Pending(_)
+            )
+        {
+            return Ok(None);
+        }
+        Ok(Some(decide.clone()))
+    }
+
+    /// s140: apply `justify` ([`update_justify_to_apply`](Self::update_justify_to_apply)) before
+    /// its message's sender is checked as the proposer. Only a correct, safe PC is applied,
+    /// exactly as a NewView's highest PC is (`on_receive_new_view`): update highestPC, lock,
+    /// commit, then the phase-vote collectors. Correctness is checked against the set the PC
+    /// belongs to (a Decide PC on a pending update: the post-update set, with old-set signers
+    /// above the old fault bound), so a forged or old-set certificate is not applied. Returns
+    /// whether it was applied (the proposer check then runs again on the validator-set state it
+    /// left).
+    fn apply_update_justify<K: KVStore>(
         &mut self,
-        nudge: &Nudge,
+        justify: &PhaseCertificate,
         block_tree: &mut BlockTreeSingleton<K>,
         app: &mut impl App<K>,
     ) -> Result<bool, HotStuffError> {
-        let justify = &nudge.justify;
-        if justify.phase != Phase::Commit
-            || nudge.view != self.view_info.view
-            || !justify.is_correct(self.config.chain_id, block_tree)?
+        if !justify.is_correct(self.config.chain_id, block_tree)?
             || !safe_pc(justify, block_tree, self.config.chain_id)?
         {
             return Ok(false);
@@ -1366,6 +1405,44 @@ impl<N: Network> HotStuff<N> {
             .phase_vote_collectors
             .update_validator_sets(&block_tree.validator_set_state()?);
         Ok(true)
+    }
+
+    /// s140 r3 (bench 9p on 3c5d02ea: r2-aK, r3-aK, r2-aK-rerun froze 36-154 s at the leader
+    /// exclusion): the phase certificate of an AdvanceView, applied here before the pacemaker
+    /// handles the message (the algorithm loop calls this first).
+    ///
+    /// The Commit votes of an update's Commit view go to the old leader of the next view w + 1
+    /// and to the backup aggregator, the old leader of w + 2. With the old leader of w + 1 down,
+    /// only the backup forms the Commit PC and commits the update; every other replica learns
+    /// the PC from the backup's AdvanceView. The pacemaker applies that with
+    /// `advance_highest_pc_from_remote`, which moves the highest PC (and, for a Decide PC, marks
+    /// the update decided) but commits nothing, so those replicas entered w + 1 with the old
+    /// committed set. When the update makes one of them the leader of w + 1, it did not know it
+    /// (the old leader of w + 1 is the down validator) and did not nudge Decide; the backup does
+    /// not lead w + 1 (the nudge fix in `on_receive_msg` covers only the case where it does):
+    /// nobody nudged, and with every live vote needed the views drifted apart.
+    ///
+    /// A Commit or Decide PC on a block whose validator-set updates are still pending here is
+    /// therefore applied as a NewView's highest PC is ([`apply_update_justify`]
+    /// (Self::apply_update_justify): only a correct and safe PC, then `block_tree.update`), which
+    /// commits the block and its update. Anything else is left to the pacemaker. Returns whether
+    /// the PC was applied.
+    pub(crate) fn on_receive_advance_view_pc<K: KVStore>(
+        &mut self,
+        pc: &PhaseCertificate,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<bool, HotStuffError> {
+        if !(pc.phase.is_commit() || pc.phase.is_decide())
+            || !block_tree.contains(&pc.block)
+            || !matches!(
+                block_tree.validator_set_updates_status(&pc.block)?,
+                ValidatorSetUpdatesStatus::Pending(_)
+            )
+        {
+            return Ok(false);
+        }
+        self.apply_update_justify(pc, block_tree, app)
     }
 
     /// Send `vote` to its aggregator, `leader(vote.view + 1)` (FIX CONS-FIND-13:

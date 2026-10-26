@@ -1,5 +1,14 @@
 # Implementation Plan: item 6 Phase 5 (full in-memory execution)
 
+**Status s140: PARKED again** (owner s140). Revisit trigger (2) fired: bench 9m (perf section 126) put `flush_all` +
+overlay at 16.9% / 16.3% of exec-thread cycles (std / deep). The bounded rework was built: step 2 rebased on main plus
+the drain encoding moved to the flush worker (`feat/item6-phase5-step2-r2` `14b2abe9`, not merged). It FAILED bench 9r
+(perf section 131, ABBA n = 3 vs main `077fe56e`): exec-thread on-CPU per 1k fills 1.328 [1.293, 1.364] std / 1.253
+[1.175, 1.335] deep, native blocks/s 0.422 / 0.399, block p99 1.66x / 2.18x, cache_flush per 1k fills x2.26 / x2.33
+(the moved encode saves -0.28 ms / 1k fills, the exec thread's flush more than doubles; ~0.53 ms / 1k fills of the rise
+is not named by any r2 timer, likely step 2's in-place apply / write-through, so step 2 itself probably fails on
+today's main). No profile pair was run (owner s140). A next revisit needs a different step-2 design, not this one.
+
 **Status s128: PARKED after step 1** (owner s128). Step 1 is on main (`d3cab057`). Step 2 (`feat/item6-phase5-step2`
 `1e51c8b9`, Codex torus-adversarial round 2 approve) failed its A/B (bench section 91): +5% exec-thread CPU per fill
 halves blocks/s and raises block p50 18 -> 92 ms, p99 +37%, RSS +19%; not merged. Step 3 is parked on

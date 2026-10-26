@@ -2,7 +2,8 @@
 //! genesis file it was initialized with. A 1-validator devnet runs a few
 //! blocks and stops; a restart with a changed consensus field refuses to
 //! start naming the field; a restart with the same genesis reformatted
-//! starts and keeps producing blocks.
+//! starts and keeps producing blocks; a further restart on the same bytes
+//! takes the stored digest (s140), and the changed file is still refused.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
@@ -213,12 +214,38 @@ fn changed_genesis_refuses_to_start_and_a_reformatted_one_starts() {
         serde_json::to_string(&g).unwrap(),
     );
     let mut node = Node::start(work.path(), &compact, "c");
-    node.wait_executed_above(h);
+    let h = node.wait_executed_above(h);
+    let log = node.log_text();
     assert!(
-        node.log_text()
-            .contains("genesis file matches the stored genesis digest"),
-        "{}",
+        log.contains("genesis file matches the stored genesis digest")
+            && !log.contains("not digested again"),
+        "new file bytes are digested in full:\n{}",
         node.tail()
     );
     node.stop();
+
+    // s140: a restart on the same bytes takes the stored digest (no full
+    // digest of the file) and continues the chain.
+    let mut node = Node::start(work.path(), &compact, "d");
+    node.wait_executed_above(h);
+    assert!(
+        node.log_text().contains(
+            "genesis file matches the stored genesis digest (the file's bytes are the ones \
+             the digest was computed from: not digested again)"
+        ),
+        "restart on unchanged bytes:\n{}",
+        node.tail()
+    );
+    node.stop();
+
+    // After a cached restart the edited file is still refused.
+    let mut node = Node::start(work.path(), &edited, "e");
+    let st = node.wait_exit();
+    let log = node.log_text();
+    assert_eq!(st.code(), Some(1), "changed genesis must refuse:\n{}", node.tail());
+    assert!(
+        log.contains("changed: consensus.timeout_base_ms."),
+        "refusal names the field:\n{}",
+        node.tail()
+    );
 }

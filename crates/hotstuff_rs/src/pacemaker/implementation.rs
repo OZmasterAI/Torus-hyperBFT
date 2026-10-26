@@ -131,7 +131,7 @@ impl<N: Network> Pacemaker<N> {
                 self.broadcast_timeout_vote(cur_view, &validator_set_state, block_tree)?;
 
                 // We extend the view timeout so that we will broadcast a `TimeoutVote` when this view times out again.
-                self.extend_view(block_tree.highest_pc()?.view, block_tree.committed_qc_view()?)?
+                self.extend_view(block_tree.highest_pc()?.view, block_tree.commit_lag_committed_view()?)?
 
             // 1.2. MonadBFT: broadcast TimeoutVote before advancing on normal view timeout.
             } else {
@@ -140,7 +140,7 @@ impl<N: Network> Pacemaker<N> {
                     cur_view + 1,
                     &validator_set_state,
                     block_tree.highest_pc()?.view,
-                    block_tree.committed_qc_view()?,
+                    block_tree.commit_lag_committed_view()?,
                 )?;
             }
 
@@ -438,7 +438,7 @@ impl<N: Network> Pacemaker<N> {
                             next_view,
                             &validator_set_state,
                             block_tree.highest_pc()?.view,
-                            block_tree.committed_qc_view()?,
+                            block_tree.commit_lag_committed_view()?,
                         )?
                     }
                 }
@@ -590,7 +590,7 @@ impl<N: Network> Pacemaker<N> {
                     next_view,
                     &validator_set_state,
                     block_tree.highest_pc()?.view,
-                    block_tree.committed_qc_view()?,
+                    block_tree.commit_lag_committed_view()?,
                 )?
             }
         }
@@ -602,7 +602,9 @@ impl<N: Network> Pacemaker<N> {
     ///
     /// `highest_qc_view` is the view of the block tree's Highest PC at entry
     /// time, and `committed_view` (S470) is the justify-view of the highest
-    /// committed block (see `BlockTreeSingleton::committed_qc_view`). Together they drive the
+    /// committed block (see `BlockTreeSingleton::committed_qc_view`); callers pass
+    /// `BlockTreeSingleton::commit_lag_committed_view`, which also discounts a
+    /// validator-set update's phase-PC views (s140 r3). Together they drive the
     /// Task A stall multiplier and the S470 commit-lag multiplier:
     /// consensus-visible state only, so every honest replica derives the
     /// identical (possibly backed-off) deadline for `next_view`.
