@@ -7,11 +7,66 @@ Owner decisions s134: trial-net `--archive` validator decided at trial net; no C
 Claude-reviewed items; archy go for 9g. Open: running state hash on or off (9g gives the data).
 **Status s136 (2026-10-22, main `9ea22dbd`):** decided: genesis book mode Classic (9j stage 2, perf doc section 124:
 CL21 beats mode 3 M15 on both shapes, ~40% more deep blocks/s); running state hash ON at genesis; checkpoints 15 s;
-L6.1 + L2.1 merge in batch 10; b1 / mode 3 / b0 PARKED (not dropped); dead-leader genesis defaults K = 3, j cap 6.
+L6.1 + L2.1 merge in batch 10; b1 / mode 3 / b0 PARKED (not dropped); dead-leader genesis defaults K = 3, j cap 6 (s140: superseded s138, K = 0 default, `68dd5907`).
 Owner s136: WAN items wait for the trial net; new benches paused. Open genesis questions:
 `docs/plans/testnet-genesis-checklist.md`.
+**Status s140 (2026-10-26, main `d56902fc`):** every s136 in-progress row is closed (outcomes below). Benches
+unpaused s138; 9p3 is the only open bench item. Decided s138-s140: dead-leader K = 0 default, testnet K = 3 only with
+>= 4 validators; jailing + `JailVote` gate pre-mainnet; item 7 T after genesis via P0.0; 9n gates the launch, ~10 s
+restart accepted; 9l closed; item 6 Phase 5 parked again; governance at launch option B; dev share 0 in the gas-fee
+split; testnet collateral test-USD; mainnet USDC via an external-chain bridge (P5); some markets in the genesis.
+Open: see "Still open (s140)" below.
+
+## In progress (s140)
+
+| item | branch | agent | state |
+|---|---|---|---|
+| 9p3 below-saturation dead-leader one-down | main `0261068b` | archy | GO s140 (bench queue): 9p2 shape (4 val 1/1/1/1, `DL_K=3`, val3 killed at 120 s) with a lower `MAX_IN_FLIGHT` (all-up ~12-16 of 32 cores); aK + bK ABBA n = 6 + aU n = 3. Running per the main session. Tightens the freeze bound (9p2: 0 of 10, <= 28% at 95%) |
+| Testnet genesis owner values | `testnet/testnet-genesis-draft-{3,4,5}val.json` (`d56902fc`) | owner | every deferred value is a `FILL:` string the node refuses; see "Still open (s140)" |
+
+## Landed s138-s140 (all on main `d56902fc`, each checked with `git merge-base --is-ancestor`)
+
+- TC-required set `d3de0abb` (batch 9 phases A+B+C, `CONSENSUS_DB_FORMAT` v1, tc-liveness fix `0937f178`, past-deadline
+  rebase, VSU window rule) -> batch 12 `cc8c9c4a` (D2 membership-change sync `9942394b`, lost-view timeout vote +
+  reflexive lock `8af2b949`) -> chain-id safety `2da29bec` (certificates bound to our chain) + genesis
+  `evm.chain_id` check `71333e7e` -> TC tip rule `cffdbcc9`.
+- Batch 10 `2d2f3ed9`: L6.1 + L2.1 on P0.0, s136 defaults.
+- Batch A `d595f77e`: price band C `9b1d564c` (code 18 before a market's first mark), genesis-digest handshake
+  `758a79f9`. Its all-up cost (9o -3.3%, bisect section 128, 9s section 130: -4.8%) fixed by the RPC intake
+  ever-marked cache `a35705da` (9s2, section 133: matched/s 1.038).
+- Batch B `9083b278`: deep all-up halt fix (refusal block), post-kill log-flood + body-fetch order fix, rpc-only
+  fetch cap 32.
+- Product batch `8964bd4d`: item 7 T (id 2), funding engine (id 3), trading fees (id 4), all unscheduled;
+  WebSocket `l2Book` / `orderUpdates`.
+- 4-validator bench harness `07961d0a` + make-driver `70027095`.
+- Batch C `a300c7f3`: stored Commit PC `e01a85cb`, M2 `e7b8f1e2`, sibling unlock `72d86da5`, dead-leader phases 1-3
+  `792bf404`, K = 0 default `68dd5907`.
+- Epoch-plan hand-off `b17dab16` (default off), default ON `5e82fb49` (9q PASS, sections 127 / 129).
+- Dead-leader freeze fixes `3c5d02ea` + `9d28eb48` (with the n > 4 Decide-justify fix); 9p2 PASS (section 132).
+- Genesis restart digest cache `b738520d` (295 MB genesis restart 14.4-17.8 s -> 1.9-3.0 s).
+- Genesis: malformed economics address refused + gas-fee split from `economics.fee_split` `4c445f94`.
+- Testnet genesis drafts (3 / 4 / 5 validators) + check tools + refreshed checklist `d56902fc`.
+- Item 6 Phase 5 parked again `0261068b` (r2 `14b2abe9`, not merged, failed 9r, section 131).
+- Benches (perf doc sections): 9k 125; 9n 126 / 127 PASS; 9o 126 (one-down PASS); 9m 126 (Phase 5 trigger fired);
+  9l 127 (not resolved, closed by the owner); 9q 127 / 129 PASS; 9s 130; 9r 131 FAIL; 9p 129 FAIL -> 9p2 132 PASS;
+  9s2 133.
+
+## Still open (s140, owner)
+
+- Validator count (3 / 4 / 5 draft), liquidator-vault seed, fee split values (burn / validators / treasury; dev pool
+  0 decided; destination idea: Hyperliquid-style vault / assistance fund), the market list (owner leans BTC / ETH /
+  SOL USD perps), chain id, genesis timestamp and accounts.
+- Testnet collateral: 1a relabel-only vs 2 a separate test-USDC token (needs code).
+- A shorter testnet voting period (governance parameters hard-coded 7-day / 33%; needs code).
+- Whether to defer the last rare stall to pre-mainnet; the item 7 T spill cap S = 16; deleting the scratch
+  branches.
+- Hosts: cachyoz and ubuntoz unreachable from 18c (cachyoz is a planned trial-net host).
+- Trial net, the WAN items, and a faucet / explorer after the genesis.
 
 ## In progress (s136)
+
+*(s140: all closed. Batch 9 -> TC set on main `d3de0abb` (tc-liveness fix); batch 10 -> `2d2f3ed9`; dead-leader
+phase 2 -> batch C `a300c7f3` (phases 1-3); 9k -> section 125; 9l -> section 127, closed by the owner.)*
 
 | item | branch | agent | state |
 |---|---|---|---|
@@ -175,6 +230,9 @@ sections 120-124.)*
     honest TCs.
   - Nothing requires a proposal after a timeout to carry a TC.
   - Note: `tip_vouched` (signer-set power fix) is only on wip/m2-timestamp-lower-bound, not on main.
+  *(s140: all four are on main with the TC set `d3de0abb`: signed tip views and leader-signed headers (phase C),
+  a header-path tip, nudge tips dropped, a proposal in v needs QC(v-1) or TC(v-1). M2 with its re-proposal
+  exemptions is on main in batch C `a300c7f3`.)*
 - From RH4: with TORUS_DA_GC_INLINE=1 the GC pass now also waits for the body write on the consensus thread, so
   inline-vs-worker bisects include the write wait (bench note, not a bug).
 - Port genesis_cache.py's BOOK_WINDOW_COMMIT keying (from perf/l61-window-books) to main; without it B/C-style arms
