@@ -243,12 +243,20 @@ fn exclusion_of_a_down_validator_commits_and_its_slots_stop_timing_out() {
     c.wait_for_commits(after + 2 * EPOCH_LENGTH as u64, "after the update");
     let to = c.max_view();
     // Copied out: an assert holding the log's lock would poison it for the network threads.
-    let lost: Vec<u64> = c.log.lock().unwrap().timeout_views.range(from..to).copied().collect();
+    let (lost, proposed): (Vec<u64>, BTreeSet<u64>) = {
+        let log = c.log.lock().unwrap();
+        (log.timeout_views.range(from..to).copied().collect(), log.headers.iter().map(|(_, v)| *v).collect())
+    };
     let x_slots: Vec<u64> = (from..to).filter(|v| c.leader(*v, &genesis) == x).collect();
     assert!(x_slots.len() >= 4, "fixture: the span holds x's old slots: {x_slots:?}");
+    // A view lost to x: one of its old slots that timed out with no proposal in it (x would lead
+    // it, and x is down). A live leader's view can still time out on a loaded host (s140: views
+    // 31 and 32, none of them x's, timed out on 18c), so views that are not x's old slots, and
+    // old slots a live validator proposed in, do not count.
+    let lost_to_x: Vec<u64> = x_slots.iter().copied().filter(|v| lost.contains(v) && !proposed.contains(v)).collect();
     assert!(
-        lost.len() * 4 < x_slots.len(),
-        "views timing out after the exclusion: {lost:?} (x's old slots {x_slots:?})"
+        lost_to_x.len() * 4 < x_slots.len(),
+        "x's old slots lost after the exclusion: {lost_to_x:?} (x's old slots {x_slots:?}, views timing out {lost:?})"
     );
     c.assert_no_tc_less_proposals();
 }
