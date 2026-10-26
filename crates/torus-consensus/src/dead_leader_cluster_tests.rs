@@ -1159,7 +1159,10 @@ fn dl_cluster_power_loss_keeps_the_leader_evidence_in_the_manifests() {
 /// next proposal is 2L, and the last height that PC commits is final. That is 2L - 2 when 2L - 2
 /// and 2L - 1 were certified in consecutive views (an idle host), lower when a view between them
 /// timed out (s140: stuck at 17 for 240 s on a loaded 18c). Either way the parked heights hold
-/// the plan source L and only the boundary drains them.
+/// the plan source L and only the boundary drains them, once `y`'s state DB holds every height
+/// that PC committed (s140: stopped at 16 while its PC on 19 had committed 18, the heights
+/// 17 and 18 then drained `y` without the boundary and the mutant without
+/// `drain_parked_for_the_plan` passed).
 #[test]
 fn dl_cluster_power_loss_parked_plan_source_drains_for_the_boundary() {
     let mut c = Cluster::new(&[1, 1, 1, 1]);
@@ -1172,7 +1175,10 @@ fn dl_cluster_power_loss_parked_plan_source_drains_for_the_boundary() {
     c.start(2, &off);
     c.start(y, &off.clone().held(&hold).keep_manifests());
     c.wait_until("y commits up to the boundary that needs its plan", |c| {
-        c.committed(y) >= 2 * L - 2 || (c.hs_highest_pc(y) >= 2 * L - 1 && c.committed(y) > L)
+        c.committed(y) >= 2 * L - 2
+            || (c.hs_highest_pc(y) >= 2 * L - 1
+                && c.committed(y) > L
+                && c.committed(y) >= c.hs_committed(y))
     });
     assert_eq!(c.applied(y), 5, "y executed up to the hold");
     let committed = c.committed(y);
