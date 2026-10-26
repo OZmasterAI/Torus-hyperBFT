@@ -2848,13 +2848,19 @@ fn flush_pending_after_batch(
             target.compact_pruned_submissions_in_background();
         }
         // s99 (c): count the deleted book rows per market; a market that
-        // reaches the threshold gets its span compacted off this thread.
-        for (cf, prefix_len) in crate::cf::READER_SCANNED_CFS {
-            for layer in std::iter::once(&*state).chain(sidecar) {
-                for (prefix, n, first, last) in layer.delete_groups(cf, prefix_len) {
-                    target.note_scanned_deletes(cf, prefix, n, first, last);
-                }
-            }
+        // reaches the threshold gets its span compacted off this thread. One
+        // call for the whole flush: its markets join one compaction batch.
+        let groups: Vec<_> = crate::cf::READER_SCANNED_CFS
+            .into_iter()
+            .flat_map(|(cf, prefix_len)| {
+                std::iter::once(&*state)
+                    .chain(sidecar)
+                    .flat_map(move |layer| layer.delete_groups(cf, prefix_len))
+                    .map(move |(prefix, n, first, last)| (cf, prefix, n, first, last))
+            })
+            .collect();
+        if !groups.is_empty() {
+            target.note_scanned_deletes(groups);
         }
         // L3 #2: record post-flush residency for the eviction-pressure gauge.
         if let Some(c) = member_cache.as_deref() {
