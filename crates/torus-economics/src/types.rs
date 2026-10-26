@@ -358,20 +358,25 @@ pub const SECONDS_PER_YEAR: u64 = 365 * 24 * 3600;
 /// Default supermajority threshold for PermanentUnlock proposals: 8000 bps (80%).
 pub const DEFAULT_PERMANENT_UNLOCK_THRESHOLD_BPS: u64 = 8000;
 
+// The built-in fee split (`torus_types::BUILTIN_FEE_SCHEDULE`, the split of a
+// genesis without `economics.fee_split`). Execution splits by the chain's
+// `ChainConfig::fee_schedule` (s140); these name the built-in values.
+use torus_types::BUILTIN_FEE_SCHEDULE as BUILTIN_FEES;
+
 /// Fee split transition epochs (5 years).
-pub const TRANSITION_EPOCHS: u64 = 1825;
+pub const TRANSITION_EPOCHS: u64 = BUILTIN_FEES.transition_epochs;
 
 /// Fee split start ratios (bps).
-pub const FEE_START_BURN_BPS: u16 = 1000;
-pub const FEE_START_VALIDATOR_BPS: u16 = 0;
-pub const FEE_START_TREASURY_BPS: u16 = 4500;
-pub const FEE_START_DEV_POOL_BPS: u16 = 4500;
+pub const FEE_START_BURN_BPS: u16 = BUILTIN_FEES.start.burn;
+pub const FEE_START_VALIDATOR_BPS: u16 = BUILTIN_FEES.start.validator;
+pub const FEE_START_TREASURY_BPS: u16 = BUILTIN_FEES.start.treasury;
+pub const FEE_START_DEV_POOL_BPS: u16 = BUILTIN_FEES.start.dev_pool;
 
 /// Fee split end ratios (bps).
-pub const FEE_END_BURN_BPS: u16 = 2500;
-pub const FEE_END_VALIDATOR_BPS: u16 = 2500;
-pub const FEE_END_TREASURY_BPS: u16 = 2500;
-pub const FEE_END_DEV_POOL_BPS: u16 = 2500;
+pub const FEE_END_BURN_BPS: u16 = BUILTIN_FEES.end.burn;
+pub const FEE_END_VALIDATOR_BPS: u16 = BUILTIN_FEES.end.validator;
+pub const FEE_END_TREASURY_BPS: u16 = BUILTIN_FEES.end.treasury;
+pub const FEE_END_DEV_POOL_BPS: u16 = BUILTIN_FEES.end.dev_pool;
 
 // ============================================================================
 // Slashing & Jailing Constants (Phase 3: 3.1)

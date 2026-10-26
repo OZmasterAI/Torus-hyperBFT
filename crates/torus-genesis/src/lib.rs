@@ -220,7 +220,10 @@ pub struct EconomicsConfig {
     pub treasury_address: Option<String>,
     #[serde(default)]
     pub dev_pool_address: Option<String>,
-    /// Must equal the built-in split; the loader refuses another value (row 80 option D).
+    /// The chain's gas-fee split (`ChainConfig::fee_schedule`, s140): start
+    /// and end each sum to 10_000 bps. Absent = the built-in split
+    /// ([`torus_types::BUILTIN_FEE_SCHEDULE`]).
+    #[serde(default)]
     pub fee_split: FeeSplitConfig,
     pub permanent_staking: PermanentStakingConfig,
     pub validator: ValidatorConstraints,
@@ -231,6 +234,24 @@ pub struct FeeSplitConfig {
     pub start: FeeSplit,
     pub end: FeeSplit,
     pub transition_epochs: u64,
+}
+
+impl Default for FeeSplitConfig {
+    /// The built-in split ([`torus_types::BUILTIN_FEE_SCHEDULE`]).
+    fn default() -> Self {
+        let b = torus_types::BUILTIN_FEE_SCHEDULE;
+        let shares = |s: torus_types::FeeShares| FeeSplit {
+            burn: s.burn.into(),
+            validator: s.validator.into(),
+            treasury: s.treasury.into(),
+            dev_pool: s.dev_pool.into(),
+        };
+        Self {
+            start: shares(b.start),
+            end: shares(b.end),
+            transition_epochs: b.transition_epochs,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -322,6 +343,17 @@ fn parse_address(s: &str) -> Result<Address, GenesisError> {
     let s = s.trim();
     s.parse::<Address>()
         .map_err(|_| GenesisError::InvalidAddress(s.to_string()))
+}
+
+/// s140 (owner): an `economics` address. Absent = the zero address (as
+/// before); present but malformed = a load error naming the field, never the
+/// zero address (fees and the governance treasury would go to 0x0).
+fn economics_address(field: &str, value: Option<&str>) -> Result<Address, GenesisError> {
+    match value {
+        None => Ok(Address::ZERO),
+        Some(s) => parse_address(s)
+            .map_err(|_| GenesisError::InvalidAddress(format!("economics.{field}: {s:?}"))),
+    }
 }
 
 fn parse_u256(s: &str) -> Result<U256, GenesisError> {
@@ -541,6 +573,8 @@ impl Genesis {
     /// a bad genesis fails at load (the node refuses to start) and
     /// `initialize` never depends on HashMap iteration order.
     fn check_keys_and_hex(&self) -> Result<(), GenesisError> {
+        self.treasury_address()?;
+        self.dev_pool_address()?;
         check_unique_keys("evm_alloc address", self.evm_alloc.keys(), parse_address)?;
         for (addr_str, entry) in &self.evm_alloc {
             parse_u256(&entry.balance)?;
@@ -600,48 +634,57 @@ impl Genesis {
         Ok(())
     }
 
-    /// Row 80 option D: fees are split by the built-in constants
-    /// (`torus_economics::types` FEE_* and TRANSITION_EPOCHS), not by this
-    /// field, so a genesis that asks for another split is refused until the
-    /// field is wired in or made a governance setting.
-    fn check_fee_split(&self) -> Result<(), GenesisError> {
-        use torus_economics::types as t;
+    /// `economics.treasury_address` (absent = the zero address; malformed =
+    /// an error, s140).
+    pub fn treasury_address(&self) -> Result<Address, GenesisError> {
+        economics_address(
+            "treasury_address",
+            self.economics.treasury_address.as_deref(),
+        )
+    }
+
+    /// `economics.dev_pool_address` (absent = the zero address; malformed =
+    /// an error, s140).
+    pub fn dev_pool_address(&self) -> Result<Address, GenesisError> {
+        economics_address(
+            "dev_pool_address",
+            self.economics.dev_pool_address.as_deref(),
+        )
+    }
+
+    /// s140: the chain's gas-fee split from `economics.fee_split` (absent =
+    /// the built-in split): every share 0..=10_000 bps, start and end each
+    /// summing to exactly 10_000 ([`torus_types::FeeSchedule::check`]); any
+    /// `transition_epochs`. Was row 80 option D (s100): only the built-in
+    /// split loaded.
+    pub fn fee_schedule(&self) -> Result<torus_types::FeeSchedule, GenesisError> {
         let fs = &self.economics.fee_split;
-        let start = [
-            fs.start.burn,
-            fs.start.validator,
-            fs.start.treasury,
-            fs.start.dev_pool,
-        ];
-        let end = [
-            fs.end.burn,
-            fs.end.validator,
-            fs.end.treasury,
-            fs.end.dev_pool,
-        ];
-        let want_start = [
-            t::FEE_START_BURN_BPS,
-            t::FEE_START_VALIDATOR_BPS,
-            t::FEE_START_TREASURY_BPS,
-            t::FEE_START_DEV_POOL_BPS,
-        ]
-        .map(u32::from);
-        let want_end = [
-            t::FEE_END_BURN_BPS,
-            t::FEE_END_VALIDATOR_BPS,
-            t::FEE_END_TREASURY_BPS,
-            t::FEE_END_DEV_POOL_BPS,
-        ]
-        .map(u32::from);
-        if start != want_start || end != want_end || fs.transition_epochs != t::TRANSITION_EPOCHS {
-            return Err(GenesisError::InvalidFeeSplit(format!(
-                "start {start:?} end {end:?} over {} epochs; the chain splits fees by the built-in \
-                 start {want_start:?} end {want_end:?} over {} epochs (burn, validator, treasury, dev_pool bps)",
-                fs.transition_epochs,
-                t::TRANSITION_EPOCHS
-            )));
-        }
-        Ok(())
+        let shares = |end: &str, s: &FeeSplit| -> Result<torus_types::FeeShares, GenesisError> {
+            let bps = |field: &str, v: u32| {
+                u16::try_from(v).ok().filter(|v| *v <= 10_000).ok_or_else(|| {
+                    GenesisError::InvalidFeeSplit(format!(
+                        "fee_split.{end}.{field} {v} bps is over 10000"
+                    ))
+                })
+            };
+            Ok(torus_types::FeeShares {
+                burn: bps("burn", s.burn)?,
+                validator: bps("validator", s.validator)?,
+                treasury: bps("treasury", s.treasury)?,
+                dev_pool: bps("dev_pool", s.dev_pool)?,
+            })
+        };
+        let schedule = torus_types::FeeSchedule {
+            start: shares("start", &fs.start)?,
+            end: shares("end", &fs.end)?,
+            transition_epochs: fs.transition_epochs,
+        };
+        schedule.check().map_err(GenesisError::InvalidFeeSplit)?;
+        Ok(schedule)
+    }
+
+    fn check_fee_split(&self) -> Result<(), GenesisError> {
+        self.fee_schedule().map(|_| ())
     }
 
     /// Initialize the state database with genesis data. Returns the state root.
@@ -824,12 +867,7 @@ impl Genesis {
         }
 
         // 7. Seed governance params
-        let treasury_address = self
-            .economics
-            .treasury_address
-            .as_deref()
-            .and_then(|s| parse_address(s).ok())
-            .unwrap_or(Address::ZERO);
+        let treasury_address = self.treasury_address()?;
         let gov = GovernanceManager::new(state_db.clone());
         gov.set_governance_params(&GovernanceParams::defaults(treasury_address))
             .map_err(|e| GenesisError::InvalidHex(format!("governance params: {e}")))?;
@@ -843,12 +881,16 @@ impl Genesis {
 
     /// Build a [`ChainConfig`] from the genesis parameters.
     ///
-    /// Panics on an activation schedule that does not merge; `from_json`
-    /// already refused such a genesis (the node does not start).
+    /// Panics on an activation schedule that does not merge, a malformed
+    /// economics address or an invalid fee split; `from_json` already
+    /// refused such a genesis (the node does not start).
     pub fn chain_config(&self) -> ChainConfig {
         let activations = self
             .activation_schedule()
             .unwrap_or_else(|e| panic!("genesis not loaded through from_json: {e}"));
+        let [treasury_address, dev_pool_address] =
+            [self.treasury_address(), self.dev_pool_address()]
+                .map(|a| a.unwrap_or_else(|e| panic!("genesis not loaded through from_json: {e}")));
         ChainConfig {
             chain_id: self.chain_id,
             chain_name: self.chain_name.clone(),
@@ -865,18 +907,11 @@ impl Genesis {
             fee_validator_bps: self.economics.fee_split.start.validator,
             fee_treasury_bps: self.economics.fee_split.start.treasury,
             fee_dev_pool_bps: self.economics.fee_split.start.dev_pool,
-            treasury_address: self
-                .economics
-                .treasury_address
-                .as_deref()
-                .and_then(|s| parse_address(s).ok())
-                .unwrap_or(Address::ZERO),
-            dev_pool_address: self
-                .economics
-                .dev_pool_address
-                .as_deref()
-                .and_then(|s| parse_address(s).ok())
-                .unwrap_or(Address::ZERO),
+            fee_schedule: self
+                .fee_schedule()
+                .unwrap_or_else(|e| panic!("genesis not loaded through from_json: {e}")),
+            treasury_address,
+            dev_pool_address,
             timeout_base_ms: self.consensus.timeout_base_ms,
             backoff_factor: self.consensus.backoff_factor,
             backoff_cap: self.consensus.backoff_cap,
@@ -1687,12 +1722,48 @@ mod tests {
         Genesis::from_json(&json.to_string()).unwrap();
     }
 
-    /// Row 80 option D (s100): fees are split by the built-in constants
-    /// (`torus_economics::types` FEE_*); the genesis `fee_split` is not wired
-    /// in, so the loader refuses any value that differs from them.
+    /// s140 (owner): `economics.fee_split` is the chain's fee split
+    /// (`ChainConfig::fee_schedule`): any split whose start and end each sum
+    /// to 10_000 bps loads, with any `transition_epochs`; a dev share of 0
+    /// is valid. Was row 80 option D (s100): only the built-in split loaded.
     #[test]
-    fn genesis_fee_split_must_match_the_built_in_split() {
-        assert!(Genesis::from_json(&sample_genesis_json()).is_ok());
+    fn genesis_fee_split_any_valid_split_reaches_the_chain_config() {
+        use torus_types::{FeeSchedule, FeeShares};
+        let base: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        let config = Genesis::from_json(&base.to_string()).unwrap().chain_config();
+        assert_eq!(config.fee_schedule, torus_types::BUILTIN_FEE_SCHEDULE);
+        let mut json = base.clone();
+        json["economics"]["fee_split"] = serde_json::json!({
+            "start": { "burn": 1000, "validator": 0, "treasury": 9000, "dev_pool": 0 },
+            "end": { "burn": 2000, "validator": 3000, "treasury": 5000, "dev_pool": 0 },
+            "transition_epochs": 365
+        });
+        let config = Genesis::from_json(&json.to_string()).unwrap().chain_config();
+        assert_eq!(
+            config.fee_schedule,
+            FeeSchedule {
+                start: FeeShares { burn: 1000, validator: 0, treasury: 9000, dev_pool: 0 },
+                end: FeeShares { burn: 2000, validator: 3000, treasury: 5000, dev_pool: 0 },
+                transition_epochs: 365,
+            }
+        );
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            (config.fee_burn_bps, config.fee_validator_bps, config.fee_treasury_bps, config.fee_dev_pool_bps),
+            (1000, 0, 9000, 0),
+            "the informational fields are the start shares"
+        );
+        json["economics"]["fee_split"]["transition_epochs"] = 0.into();
+        assert_eq!(
+            Genesis::from_json(&json.to_string()).unwrap().chain_config().fee_schedule.transition_epochs,
+            0
+        );
+    }
+
+    /// s140: a split whose start or end does not sum to exactly 10_000 bps
+    /// (or a share that does not fit) refuses to load.
+    #[test]
+    fn genesis_fee_split_must_sum_to_10000() {
         for (path, value) in [
             ("/economics/fee_split/start/burn", 2000),
             ("/economics/fee_split/start/validator", 1),
@@ -1702,21 +1773,53 @@ mod tests {
             ("/economics/fee_split/end/validator", 5000),
             ("/economics/fee_split/end/treasury", 2400),
             ("/economics/fee_split/end/dev_pool", 2600),
-            ("/economics/fee_split/transition_epochs", 365),
+            ("/economics/fee_split/start/burn", 10001),
+            // 65536 + 1000 would wrap a u16 back to the built-in 1000.
+            ("/economics/fee_split/start/burn", 66536),
         ] {
             let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
             *json.pointer_mut(path).unwrap() = value.into();
             let err = Genesis::from_json(&json.to_string()).unwrap_err();
             assert!(
                 matches!(err, GenesisError::InvalidFeeSplit(_)),
-                "{path}: {err}"
+                "{path}={value}: {err}"
             );
         }
+        // A share of 10_000 with the others 0 is valid.
+        let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        json["economics"]["fee_split"]["start"] =
+            serde_json::json!({ "burn": 10000, "validator": 0, "treasury": 0, "dev_pool": 0 });
+        Genesis::from_json(&json.to_string()).unwrap();
+    }
+
+    /// s140 determinism: a genesis without `economics.fee_split` (and one
+    /// with the built-in values, the sample) splits by the built-in schedule;
+    /// a dev share of 0 loads without a `dev_pool_address` (absent = the zero
+    /// address, as before s140; it is then never credited).
+    #[test]
+    fn genesis_without_fee_split_is_the_builtin_split() {
+        let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        json["economics"].as_object_mut().unwrap().remove("fee_split");
+        let config = Genesis::from_json(&json.to_string()).unwrap().chain_config();
+        assert_eq!(config.fee_schedule, torus_types::BUILTIN_FEE_SCHEDULE);
+        assert_eq!(
+            (config.fee_burn_bps, config.fee_validator_bps, config.fee_treasury_bps, config.fee_dev_pool_bps),
+            (1000, 0, 4500, 4500)
+        );
+        let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        json["economics"].as_object_mut().unwrap().remove("dev_pool_address");
+        json["economics"]["fee_split"]["start"] =
+            serde_json::json!({ "burn": 1000, "validator": 0, "treasury": 9000, "dev_pool": 0 });
+        json["economics"]["fee_split"]["end"] =
+            serde_json::json!({ "burn": 2500, "validator": 2500, "treasury": 5000, "dev_pool": 0 });
+        let config = Genesis::from_json(&json.to_string()).unwrap().chain_config();
+        assert_eq!(config.dev_pool_address, Address::ZERO);
+        assert!(!config.fee_schedule.pays_dev_pool());
     }
 
     /// The file loader (the node's path) applies the same check.
     #[test]
-    fn genesis_file_with_another_fee_split_is_refused() {
+    fn genesis_file_with_an_invalid_fee_split_is_refused() {
         let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
         json["economics"]["fee_split"]["start"]["burn"] = 2500.into();
         let dir = TempDir::new().unwrap();
@@ -2189,5 +2292,81 @@ mod tests {
                 .is_empty(),
             "refused before any write"
         );
+    }
+
+    /// s140 (owner): a present but malformed `economics.treasury_address` /
+    /// `dev_pool_address` refuses to load, naming the field, instead of
+    /// becoming the zero address (fees and the governance treasury would be
+    /// credited to 0x0).
+    #[test]
+    fn malformed_economics_address_is_refused_at_load() {
+        let base: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        for field in ["treasury_address", "dev_pool_address"] {
+            for bad in [
+                "FILL:treasury_address",
+                "",
+                "0x1234",
+                "0xzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ] {
+                let mut json = base.clone();
+                json["economics"][field] = bad.into();
+                let err = Genesis::from_json(&json.to_string())
+                    .expect_err(&format!("economics.{field} = {bad:?} must be refused"))
+                    .to_string();
+                assert!(err.contains("invalid address"), "{field} {bad:?}: {err}");
+                assert!(
+                    err.contains(&format!("economics.{field}")),
+                    "names the field: {err}"
+                );
+            }
+        }
+    }
+
+    /// s140: an ABSENT economics address keeps its meaning (the zero
+    /// address), so existing genesis files load as before.
+    #[test]
+    fn absent_economics_address_is_still_the_zero_address() {
+        let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        let economics = json["economics"].as_object_mut().unwrap();
+        economics.remove("treasury_address");
+        economics.remove("dev_pool_address");
+        let genesis = Genesis::from_json(&json.to_string()).expect("absent addresses load");
+        let config = genesis.chain_config();
+        assert_eq!(config.treasury_address, Address::ZERO);
+        assert_eq!(config.dev_pool_address, Address::ZERO);
+        let dir = TempDir::new().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        genesis
+            .initialize(&db)
+            .expect("absent addresses initialize");
+        let params = GovernanceManager::new(db.clone())
+            .get_governance_params()
+            .unwrap();
+        assert_eq!(params.treasury_address, Address::ZERO);
+    }
+
+    /// s140: initialize() refuses a Genesis whose economics address was
+    /// made malformed after from_json, before any write.
+    #[test]
+    fn initialize_refuses_malformed_economics_address_before_any_write() {
+        let base = Genesis::from_json(&sample_genesis_json()).unwrap();
+        let mut bad_treasury = base.clone();
+        bad_treasury.economics.treasury_address = Some("FILL:treasury_address".into());
+        let mut bad_dev_pool = base;
+        bad_dev_pool.economics.dev_pool_address = Some("0x1234".into());
+        for (genesis, field) in [
+            (bad_treasury, "treasury_address"),
+            (bad_dev_pool, "dev_pool_address"),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let db = StateDb::open(dir.path()).unwrap();
+            let err = genesis.initialize(&db).unwrap_err().to_string();
+            assert!(err.contains(&format!("economics.{field}")), "{err}");
+            assert!(
+                db.all_accounts().unwrap().is_empty(),
+                "refused before any write"
+            );
+        }
     }
 }

@@ -8,6 +8,7 @@ use torus_state::StateBackend;
 use crate::staking::StakingManager;
 use crate::types::*;
 use crate::EconomicsError;
+use torus_types::FeeSchedule;
 
 type Result<T> = std::result::Result<T, EconomicsError>;
 
@@ -15,14 +16,39 @@ type Result<T> = std::result::Result<T, EconomicsError>;
 pub struct RewardDistributor;
 
 impl RewardDistributor {
-    /// Distribute block fees according to the fee split schedule.
-    ///
-    /// 1. Compute BPS ratios via linear interpolation from start to end over transition_epochs.
-    /// 2. Burn portion is destroyed (no-op).
-    /// 3. Validator share goes to proposer's delegators pro-rata (minus commission).
-    /// 4. Treasury and dev_pool credited to configured addresses.
+    /// Distribute block fees by the built-in split
+    /// ([`BUILTIN_FEE_SCHEDULE`](torus_types::BUILTIN_FEE_SCHEDULE)); see
+    /// [`Self::distribute_block_fees_with`].
     pub fn distribute_block_fees<T: StateBackend>(
         staking: &StakingManager<T>,
+        proposer: Address,
+        total_fees: U256,
+        epoch: u64,
+        treasury_address: Address,
+        dev_pool_address: Address,
+    ) -> Result<()> {
+        Self::distribute_block_fees_with(
+            staking,
+            &torus_types::BUILTIN_FEE_SCHEDULE,
+            proposer,
+            total_fees,
+            epoch,
+            treasury_address,
+            dev_pool_address,
+        )
+    }
+
+    /// Distribute block fees by the chain's `schedule`
+    /// (`ChainConfig::fee_schedule`, s140), split by
+    /// [`FeeSplitter::split_fees_with`]:
+    ///
+    /// 1. Burn portion is destroyed (credited nowhere).
+    /// 2. Validator share goes to proposer's delegators pro-rata (minus commission).
+    /// 3. Treasury and dev_pool credited to configured addresses (a zero
+    ///    amount credits nothing: no account is created).
+    pub fn distribute_block_fees_with<T: StateBackend>(
+        staking: &StakingManager<T>,
+        schedule: &FeeSchedule,
         proposer: Address,
         total_fees: U256,
         epoch: u64,
@@ -33,31 +59,12 @@ impl RewardDistributor {
             return Ok(());
         }
 
-        let bps_10000 = U256::from(10_000u32);
-
-        let burn_bps = lerp_bps(
-            FEE_START_BURN_BPS,
-            FEE_END_BURN_BPS,
-            epoch,
-            TRANSITION_EPOCHS,
-        );
-        let validator_bps = lerp_bps(
-            FEE_START_VALIDATOR_BPS,
-            FEE_END_VALIDATOR_BPS,
-            epoch,
-            TRANSITION_EPOCHS,
-        );
-        let treasury_bps = lerp_bps(
-            FEE_START_TREASURY_BPS,
-            FEE_END_TREASURY_BPS,
-            epoch,
-            TRANSITION_EPOCHS,
-        );
-
-        let burn = total_fees * U256::from(burn_bps) / bps_10000;
-        let validator_share = total_fees * U256::from(validator_bps) / bps_10000;
-        let treasury = total_fees * U256::from(treasury_bps) / bps_10000;
-        let dev_pool = total_fees - burn - validator_share - treasury;
+        let FeeSplitResult {
+            validators: validator_share,
+            treasury,
+            dev_pool,
+            ..
+        } = FeeSplitter::split_fees_with(schedule, total_fees, epoch);
 
         if !validator_share.is_zero() {
             Self::distribute_validator_share(staking, &proposer, validator_share)?;
@@ -246,17 +253,22 @@ fn split_validator_reward<T: StateBackend>(
     Ok(())
 }
 
-/// Integer-only linear interpolation in basis points.
+/// Integer-only linear interpolation in basis points: `start` moved toward
+/// `end` by `|end - start| * numerator / denominator`, rounded down. In u128
+/// (s140: any genesis `transition_epochs`), so `delta * numerator` cannot
+/// overflow; the result equals the u64 one wherever that one did not overflow.
 pub fn lerp_bps(start: u16, end: u16, numerator: u64, denominator: u64) -> u16 {
     if denominator == 0 || numerator >= denominator {
         return end;
     }
+    // < delta (numerator < denominator), so it fits a u16.
+    let step = |delta: u16| {
+        (u128::from(delta) * u128::from(numerator) / u128::from(denominator)) as u16
+    };
     if start <= end {
-        let delta = (end - start) as u64;
-        start + ((delta * numerator) / denominator) as u16
+        start + step(end - start)
     } else {
-        let delta = (start - end) as u64;
-        start - ((delta * numerator) / denominator) as u16
+        start - step(start - end)
     }
 }
 
@@ -306,10 +318,28 @@ const SUPPLY_TRACKER_KEY: &[u8] = b"supply_tracker";
 pub struct FeeSplitter;
 
 impl FeeSplitter {
-    /// Split total fees into four buckets using interpolated BPS ratios.
-    /// burn + validators + treasury are computed via BPS; dev_pool gets the remainder
-    /// so the sum is exactly `total_fees` (no rounding loss).
+    /// Split total fees by the built-in split
+    /// ([`BUILTIN_FEE_SCHEDULE`](torus_types::BUILTIN_FEE_SCHEDULE)); see
+    /// [`Self::split_fees_with`].
     pub fn split_fees(total_fees: U256, epoch: u64) -> FeeSplitResult {
+        Self::split_fees_with(&torus_types::BUILTIN_FEE_SCHEDULE, total_fees, epoch)
+    }
+
+    /// Split total fees into four buckets by `schedule` at `epoch` (s140):
+    /// burn, validators and treasury each get the fees times their share
+    /// interpolated by [`lerp_bps`], rounded down; the dev pool gets the
+    /// remainder (its own share plus the rounding dust), as before s140. A
+    /// schedule without a dev share ([`FeeSchedule::pays_dev_pool`] false)
+    /// pays the dev pool nothing: the remainder is burned. The sum is exactly
+    /// `total_fees`.
+    ///
+    /// The validator and treasury amounts are capped by what the earlier
+    /// buckets left, so a schedule whose interpolated shares round to more
+    /// than 10_000 bps (possible with three or more moving shares) cannot
+    /// underflow. The cap never binds for the built-in schedule (its
+    /// interpolated burn + validator + treasury stay <= 7501 bps), whose
+    /// split is bit-identical to the pre-s140 one.
+    pub fn split_fees_with(schedule: &FeeSchedule, total_fees: U256, epoch: u64) -> FeeSplitResult {
         if total_fees.is_zero() {
             return FeeSplitResult {
                 burn: U256::ZERO,
@@ -319,37 +349,32 @@ impl FeeSplitter {
             };
         }
 
-        let bps_10000 = U256::from(10_000u32);
+        let (start, end) = (&schedule.start, &schedule.end);
+        let share = |from: u16, to: u16| {
+            let bps = lerp_bps(from, to, epoch, schedule.transition_epochs);
+            total_fees * U256::from(bps) / U256::from(10_000u32)
+        };
 
-        let burn_bps = lerp_bps(
-            FEE_START_BURN_BPS,
-            FEE_END_BURN_BPS,
-            epoch,
-            TRANSITION_EPOCHS,
-        );
-        let validator_bps = lerp_bps(
-            FEE_START_VALIDATOR_BPS,
-            FEE_END_VALIDATOR_BPS,
-            epoch,
-            TRANSITION_EPOCHS,
-        );
-        let treasury_bps = lerp_bps(
-            FEE_START_TREASURY_BPS,
-            FEE_END_TREASURY_BPS,
-            epoch,
-            TRANSITION_EPOCHS,
-        );
+        // A valid schedule's shares are <= 10_000 bps, so burn <= total_fees.
+        let burn = share(start.burn, end.burn).min(total_fees);
+        let validators = share(start.validator, end.validator).min(total_fees - burn);
+        let treasury = share(start.treasury, end.treasury).min(total_fees - burn - validators);
+        let rest = total_fees - burn - validators - treasury;
 
-        let burn = total_fees * U256::from(burn_bps) / bps_10000;
-        let validators = total_fees * U256::from(validator_bps) / bps_10000;
-        let treasury = total_fees * U256::from(treasury_bps) / bps_10000;
-        let dev_pool = total_fees - burn - validators - treasury;
-
-        FeeSplitResult {
-            burn,
-            validators,
-            treasury,
-            dev_pool,
+        if schedule.pays_dev_pool() {
+            FeeSplitResult {
+                burn,
+                validators,
+                treasury,
+                dev_pool: rest,
+            }
+        } else {
+            FeeSplitResult {
+                burn: burn + rest,
+                validators,
+                treasury,
+                dev_pool: U256::ZERO,
+            }
         }
     }
 
@@ -440,6 +465,7 @@ mod tests {
     use crate::staking::StakingManager;
     use revm::state::AccountInfo;
     use torus_state::StateDb;
+    use torus_types::{FeeShares, BUILTIN_FEE_SCHEDULE};
 
     fn setup() -> (tempfile::TempDir, StakingManager) {
         let dir = tempfile::tempdir().unwrap();
@@ -518,6 +544,25 @@ mod tests {
             ),
             2500
         );
+    }
+
+    /// s140 review: the genesis accepts any `transition_epochs`, so the
+    /// interpolation must not overflow for any epoch below it (u64
+    /// `delta * epoch` did past ~1.8e15 epochs).
+    #[test]
+    fn lerp_bps_any_transition_length_does_not_overflow() {
+        assert_eq!(lerp_bps(0, 10_000, u64::MAX - 1, u64::MAX), 9_999);
+        assert_eq!(lerp_bps(10_000, 0, u64::MAX - 1, u64::MAX), 1);
+        assert_eq!(lerp_bps(0, 10_000, u64::MAX / 2, u64::MAX), 4_999);
+        let s = FeeSchedule {
+            start: FeeShares { burn: 10_000, validator: 0, treasury: 0, dev_pool: 0 },
+            end: FeeShares { burn: 0, validator: 5_000, treasury: 5_000, dev_pool: 0 },
+            transition_epochs: u64::MAX,
+        };
+        let total = U256::from(1_000_003u64);
+        let r = FeeSplitter::split_fees_with(&s, total, u64::MAX - 1);
+        assert_eq!(r.burn + r.validators + r.treasury + r.dev_pool, total);
+        assert_eq!(r.treasury, total * U256::from(4_999u32) / U256::from(10_000u32));
     }
 
     #[test]
@@ -884,5 +929,232 @@ mod tests {
         let e2 = RewardDistributor::distribute_validator_inflation(&mgr, 43200).unwrap();
         let cum2 = get_cumulative_validator_inflation(&mgr).unwrap();
         assert_eq!(cum2, e1 + e2);
+    }
+
+    // ------------------------------------------------------------------
+    // s140: the genesis fee split (`ChainConfig::fee_schedule`)
+    // ------------------------------------------------------------------
+
+    /// The split as every chain computed it before s140 (verbatim copy of the
+    /// pre-s140 `split_fees` / `distribute_block_fees` arithmetic): the
+    /// reference the built-in schedule must reproduce bit for bit.
+    fn pre_s140_split(total_fees: U256, epoch: u64) -> FeeSplitResult {
+        if total_fees.is_zero() {
+            return FeeSplitResult {
+                burn: U256::ZERO,
+                validators: U256::ZERO,
+                treasury: U256::ZERO,
+                dev_pool: U256::ZERO,
+            };
+        }
+        let bps_10000 = U256::from(10_000u32);
+        let burn_bps = lerp_bps(1000, 2500, epoch, 1825);
+        let validator_bps = lerp_bps(0, 2500, epoch, 1825);
+        let treasury_bps = lerp_bps(4500, 2500, epoch, 1825);
+        let burn = total_fees * U256::from(burn_bps) / bps_10000;
+        let validators = total_fees * U256::from(validator_bps) / bps_10000;
+        let treasury = total_fees * U256::from(treasury_bps) / bps_10000;
+        let dev_pool = total_fees - burn - validators - treasury;
+        FeeSplitResult { burn, validators, treasury, dev_pool }
+    }
+
+    fn fee_totals() -> Vec<U256> {
+        let mut v: Vec<U256> = [0u128, 1, 2, 3, 7, 9_999, 10_000, 10_001, 123_456_789, 1_000_003]
+            .into_iter()
+            .map(U256::from)
+            .collect();
+        v.push(wei(100) + U256::from(7u8));
+        v.push(U256::from(u128::MAX));
+        v
+    }
+
+    /// The owner's s140 shape: no dev share, the old dev share moved to the treasury.
+    fn dev_zero_schedule() -> FeeSchedule {
+        FeeSchedule {
+            start: FeeShares { burn: 1000, validator: 0, treasury: 9000, dev_pool: 0 },
+            end: FeeShares { burn: 2500, validator: 2500, treasury: 5000, dev_pool: 0 },
+            transition_epochs: 1825,
+        }
+    }
+
+    /// Determinism: the built-in schedule splits exactly as before s140 at
+    /// every epoch of the transition and after it, for any fee total.
+    #[test]
+    fn builtin_schedule_split_is_the_pre_s140_split() {
+        assert_eq!(BUILTIN_FEE_SCHEDULE, FeeSchedule::default());
+        for epoch in (0..=1900).chain([u64::MAX / 2, u64::MAX]) {
+            for total in fee_totals() {
+                assert_eq!(
+                    FeeSplitter::split_fees_with(&BUILTIN_FEE_SCHEDULE, total, epoch),
+                    pre_s140_split(total, epoch),
+                    "epoch {epoch} total {total}"
+                );
+                assert_eq!(FeeSplitter::split_fees(total, epoch), pre_s140_split(total, epoch));
+            }
+        }
+    }
+
+    /// A split with no dev share credits the dev pool nothing at any epoch;
+    /// validators and treasury get their interpolated bps share (rounded
+    /// down) and the burn takes the rest, rounding dust included: the sum is
+    /// the fee total exactly.
+    #[test]
+    fn dev_zero_schedule_pays_the_dev_pool_nothing() {
+        let s = dev_zero_schedule();
+        for epoch in (0..=1900).chain([u64::MAX]) {
+            for total in fee_totals() {
+                let r = FeeSplitter::split_fees_with(&s, total, epoch);
+                assert_eq!(r.dev_pool, U256::ZERO, "epoch {epoch} total {total}");
+                assert_eq!(r.burn + r.validators + r.treasury + r.dev_pool, total);
+                let share = |a: u16, b: u16| {
+                    total * U256::from(lerp_bps(a, b, epoch, 1825)) / U256::from(10_000u32)
+                };
+                assert_eq!(r.validators, share(0, 2500), "epoch {epoch} total {total}");
+                assert_eq!(r.treasury, share(9000, 5000), "epoch {epoch} total {total}");
+                assert!(r.burn >= share(1000, 2500));
+            }
+        }
+        // Epoch 0, 1_000_003 wei: 90% = 900_002.7 -> 900_002 to the treasury,
+        // 100_000 + 1 dust burned.
+        let r = FeeSplitter::split_fees_with(&s, U256::from(1_000_003u64), 0);
+        assert_eq!(
+            r,
+            FeeSplitResult {
+                burn: U256::from(100_001u64),
+                validators: U256::ZERO,
+                treasury: U256::from(900_002u64),
+                dev_pool: U256::ZERO,
+            }
+        );
+    }
+
+    /// Any valid schedule conserves the fee total and never underflows, also
+    /// where the interpolated shares round to more than 10_000 bps; a
+    /// schedule without a dev share never pays the dev pool.
+    #[test]
+    fn any_valid_schedule_conserves_fees() {
+        // Rounds to 10_001 bps at epoch 17 of 100: burn 4 - 0, validator
+        // 3 - 0, treasury 9993 + 1 (the pre-s140 remainder would underflow).
+        let tricky = FeeSchedule {
+            start: FeeShares { burn: 4, validator: 3, treasury: 9993, dev_pool: 0 },
+            end: FeeShares { burn: 0, validator: 0, treasury: 9999, dev_pool: 1 },
+            transition_epochs: 100,
+        };
+        let mut schedules = vec![tricky];
+        // Deterministic pseudo-random valid schedules.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        let shares = |dev_zero: bool, next: &mut dyn FnMut(u64) -> u64| {
+            let a = next(10_001) as u16;
+            let b = next(10_001 - a as u64) as u16;
+            let c = next(10_001 - a as u64 - b as u64) as u16;
+            let d = 10_000 - a - b - c;
+            if dev_zero {
+                FeeShares { burn: a, validator: b, treasury: c + d, dev_pool: 0 }
+            } else {
+                FeeShares { burn: a, validator: b, treasury: c, dev_pool: d }
+            }
+        };
+        for i in 0..200 {
+            let dev_zero = i % 2 == 0;
+            let start = shares(dev_zero, &mut next);
+            let end = shares(dev_zero, &mut next);
+            schedules.push(FeeSchedule { start, end, transition_epochs: 1 + next(3000) });
+        }
+        for s in &schedules {
+            assert!(s.check().is_ok(), "{s:?}");
+            for epoch in (0..=s.transition_epochs + 1).step_by(7).chain([17]) {
+                for total in fee_totals() {
+                    let r = FeeSplitter::split_fees_with(s, total, epoch);
+                    assert_eq!(r.burn + r.validators + r.treasury + r.dev_pool, total, "{s:?} {epoch}");
+                    if !s.pays_dev_pool() {
+                        assert_eq!(r.dev_pool, U256::ZERO, "{s:?} {epoch}");
+                    }
+                }
+            }
+        }
+    }
+
+    fn dump(mgr: &StakingManager) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+        torus_state::cf::ALL_CF_NAMES
+            .iter()
+            .map(|cf| StateBackend::iterate_cf(mgr.state(), cf, None).unwrap())
+            .collect()
+    }
+
+    /// Distribute `fees` over `epochs` on a fresh DB (a validator with two
+    /// delegators proposing), by `schedule` (`None`: the pre-s140 entry point).
+    fn run_fee_blocks(schedule: Option<&FeeSchedule>, fees: &[(u64, U256)]) -> (tempfile::TempDir, StakingManager) {
+        let (dir, mgr) = setup();
+        let proposer = addr(1);
+        for a in [proposer, addr(2), addr(3)] {
+            fund(&mgr, &a, wei(100_000));
+        }
+        mgr.register_validator(proposer, [1u8; 32], 1000, wei(10_000)).unwrap();
+        mgr.delegate(addr(2), proposer, wei(30_000)).unwrap();
+        mgr.delegate(addr(3), proposer, wei(70_000)).unwrap();
+        for &(epoch, total) in fees {
+            match schedule {
+                Some(s) => RewardDistributor::distribute_block_fees_with(
+                    &mgr, s, proposer, total, epoch, addr(10), addr(11),
+                ),
+                None => RewardDistributor::distribute_block_fees(
+                    &mgr, proposer, total, epoch, addr(10), addr(11),
+                ),
+            }
+            .unwrap();
+        }
+        (dir, mgr)
+    }
+
+    fn fee_blocks() -> Vec<(u64, U256)> {
+        [0u64, 1, 2, 500, 912, 913, 1824, 1825, 4000]
+            .into_iter()
+            .flat_map(|e| [(e, wei(3) + U256::from(1_003u64)), (e, U256::from(9_999u64))])
+            .collect()
+    }
+
+    /// Determinism: fee-paying blocks under the built-in schedule leave every
+    /// CF and the state root exactly as the pre-s140 entry point does.
+    #[test]
+    fn builtin_schedule_fee_blocks_leave_identical_state() {
+        let (_a, legacy) = run_fee_blocks(None, &fee_blocks());
+        let (_b, builtin) = run_fee_blocks(Some(&BUILTIN_FEE_SCHEDULE), &fee_blocks());
+        assert_eq!(dump(&legacy), dump(&builtin));
+        assert_eq!(
+            torus_state::trie::compute_state_root_from_db(legacy.state()).unwrap(),
+            torus_state::trie::compute_state_root_from_db(builtin.state()).unwrap()
+        );
+        let bal = |m: &StakingManager, a| m.state().get_account(&a).unwrap().map(|i| i.balance);
+        assert!(bal(&legacy, addr(11)).unwrap() > U256::ZERO, "the dev pool was paid");
+    }
+
+    /// Fee-paying blocks under the dev-zero schedule: the dev pool account is
+    /// never created and the treasury gets exactly its interpolated shares.
+    #[test]
+    fn dev_zero_schedule_fee_blocks_credit_no_dev_pool() {
+        let s = dev_zero_schedule();
+        let (_d, mgr) = run_fee_blocks(Some(&s), &fee_blocks());
+        assert_eq!(mgr.state().get_account(&addr(11)).unwrap(), None);
+        let bal = |m: &StakingManager, a| {
+            m.state().get_account(&a).unwrap().map(|i| i.balance).unwrap_or_default()
+        };
+        let (mut want_treasury, mut want_validator, mut total) = (U256::ZERO, U256::ZERO, U256::ZERO);
+        for (epoch, fees) in fee_blocks() {
+            let r = FeeSplitter::split_fees_with(&s, fees, epoch);
+            want_treasury += r.treasury;
+            want_validator += r.validators;
+            total += fees;
+        }
+        assert_eq!(bal(&mgr, addr(10)), want_treasury);
+        assert!(want_validator > U256::ZERO && want_treasury < total);
+        // The validator share accrues as reward rows, as under the built-in split.
+        let (_b, builtin) = run_fee_blocks(Some(&BUILTIN_FEE_SCHEDULE), &fee_blocks());
+        assert_ne!(dump(&mgr), dump(&builtin));
     }
 }
