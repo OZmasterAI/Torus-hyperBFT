@@ -59,6 +59,10 @@ fake /proc (DRIVER_PROC). Pinned:
    same on every arm) sets NODES, METS (9161..9160+N) and every per-node loop of the body (hardscan, dusamp,
    ckptsamp, fdsum, dumeas, savelog, soakchk, stopwin), and the soak sampler takes every port it is given; a 3-node
    driver is the same text as before (FourValidatorTest).
+18. node counts 3..7 (18c msg 201, all-up shapes up to 7 equal-stake validators): N_VALIDATORS 5..7 give NODES=N,
+   METS 9161..9160+N and val0..valN-1 in every per-node loop; anything else (2, 8, "x") is a SPEC ERROR; the 3- and
+   4-node drivers are byte-identical to the pre-change generator's (f4010070's make-driver.py over the current
+   driver-body.sh) and to the 4-validator token table (NValidatorTest).
 """
 
 import glob
@@ -4714,7 +4718,7 @@ class FourValidatorTest(Base):
         spec["arms"][1]["harness_env"] = {"N_VALIDATORS": "3"}
         self.spec_error(spec, "N_VALIDATORS")
         self.spec_error(
-            minimal_spec(self.tmp, harness_env={"N_VALIDATORS": "5"}), "N_VALIDATORS"
+            minimal_spec(self.tmp, harness_env={"N_VALIDATORS": "8"}), "N_VALIDATORS"
         )
         # set on every arm (none at the top level): the arms' value
         spec = minimal_spec(self.tmp)
@@ -4765,6 +4769,169 @@ class FourValidatorTest(Base):
         self.assertTrue(all(len(x) == len(head) for x in rows), (head, rows))
         txt = gzip.open(os.path.join(cell, "metrics-1hz.txt.gz"), "rt").read()
         self.assertRegex(txt, r"(?m)^T [0-9.]+ val3 ERR ")
+
+
+# ---------------------------------------------------------------- node counts 3..7 (18c msg 201)
+
+# the generator before the 3..7 change (origin/main f4010070): its make-driver.py accepts 3 or 4 nodes
+PRE_NVAL_COMMIT = "f4010070"
+# the body tokens as the 3-or-4 generator substituted them (70027095's body_text), per node count
+OLD_TOKENS = {
+    3: {
+        "NODES": "3",
+        "NODE_IDX": "0 1 2",
+        "METS": "9161 9162 9163",
+        "FD_LAST": "4",
+        "FD_FMT": "val0 %d/%d val1 %d/%d val2 %d/%d",
+        "FD_ARGS": "m[2], e[2], m[3], e[3], m[4], e[4]",
+        "FD_STOPS": "m[2] > stop || m[3] > stop || m[4] > stop",
+    },
+    4: {
+        "NODES": "4",
+        "NODE_IDX": "0 1 2 3",
+        "METS": "9161 9162 9163 9164",
+        "FD_LAST": "5",
+        "FD_FMT": "val0 %d/%d val1 %d/%d val2 %d/%d val3 %d/%d",
+        "FD_ARGS": "m[2], e[2], m[3], e[3], m[4], e[4], m[5], e[5]",
+        "FD_STOPS": "m[2] > stop || m[3] > stop || m[4] > stop || m[5] > stop",
+    },
+}
+
+
+class NValidatorTest(Base):
+    """N_VALIDATORS 3..7 (all-up shapes up to 7 equal-stake validators): 5..7 drive every per-node piece of the
+    body; 3 and 4 stay byte-identical"""
+
+    def gen_n(self, n, name=None, **over):
+        name = name or "d%s" % n
+        he = dict(over.pop("harness_env", {}), N_VALIDATORS=str(n))
+        spec = minimal_spec(self.tmp, harness_env=he, **over)
+        return spec, self.generate(self.write_spec(spec, name + ".json"), name + ".sh")
+
+    def spec_error(self, spec, needle):
+        out = os.path.join(self.tmp, "bad.sh")
+        r = subprocess.run(
+            [sys.executable, "-I", GEN, self.write_spec(spec, "bad.json"), "-o", out],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(needle, r.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_five_and_seven_config(self):
+        for n in (5, 6, 7):
+            with self.subTest(n=n):
+                _, drv = self.gen_n(n)
+                text = open(drv).read()
+                self.assertRegex(text, r"(?m)^NODES=%d$" % n)
+                mets = " ".join(str(9161 + i) for i in range(n))
+                self.assertRegex(text, r"(?m)^METS=\(%s\) " % mets)
+                self.assertNotIn("@@", text)
+                r = subprocess.run(["bash", "-n", drv], capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                r = self.lib(drv, 'echo "$NODES ${#METS[@]} ${METS[%d]}"' % (n - 1))
+                self.assertEqual(
+                    r.stdout.strip(), "%d %d %d" % (n, n, 9160 + n), r.stdout + r.stderr
+                )
+
+    def test_per_node_loops_cover_every_node(self):
+        for n in (5, 7):
+            _, drv = self.gen_n(n)
+            text = open(drv).read()
+            idx = " ".join(str(i) for i in range(n))
+            for fn in PER_NODE_FUNCS:
+                self.assertRegex(func_text(text, fn), r"for [vi] in %s; do" % idx, (n, fn))
+            self.assertIn("all %d node pids alive" % n, func_text(text, "stopwin"))
+            soak = func_text(text, "soakchk")
+            self.assertIn("$(($2 * %d))" % n, soak)
+            self.assertIn("(< %d x $2)" % n, soak)
+
+    def test_seven_node_functions(self):
+        spec, drv = self.gen_n(7)
+        cell = os.path.join(spec["results_root"], LB)
+        os.makedirs(cell)
+        for v in range(7):
+            with gzip.open(os.path.join(cell, "val%d.log.gz" % v), "wt") as f:
+                f.write("2026  INFO torus: fine\n" if v < 6 else "2026 ERROR torus: FATAL boom\n")
+        r = self.lib(drv, "hardscan %s" % LB)
+        self.assertIn("HARD FINDING %s: val6 has 1 WARN/ERROR correctness lines" % LB, r.stdout, r.stderr)
+        with open(os.path.join(cell, "node-nofile.txt"), "w") as f:
+            f.write("pid=1 Max open files            1048576              1048576              files\n")
+        with open(os.path.join(cell, "fds.txt"), "w") as f:
+            f.write("1700000000 1 2 3 4 5 6 7\n1700000005 11 12 13 14 15 - 16385\n")
+        r = self.lib(drv, 'fdsum %s; echo "FD=$?"' % LB)
+        self.assertIn(
+            "fds max/end val0 11/11 val1 12/12 val2 13/13 val3 14/14 val4 15/15 val5 6/6 val6 16385/16385 "
+            "(limit soft/hard 1048576/1048576)",
+            r.stdout,
+            r.stderr,
+        )
+        self.assertIn("FD=1", r.stdout)
+        with open(os.path.join(cell, "fds.txt"), "w") as f:
+            f.write("1700000000 1 2 3 4 5 6 16384\n")
+        r = self.lib(drv, 'fdsum %s; echo "FD=$?"' % LB)
+        self.assertIn("FD=0", r.stdout, r.stdout + r.stderr)
+        for v in range(7):
+            d = os.path.join(spec["devnet_dir"], "data", "val%d" % v)
+            os.makedirs(d)
+            with open(os.path.join(d, "LOG"), "w") as f:
+                f.write("rocksdb log val%d\n" % v)
+        r = self.lib(drv, "savelog %s" % LB)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("saved RocksDB LOG for %s: 7 files" % LB, r.stdout)
+        du = open(os.path.join(cell, "data-du.txt")).read().splitlines()
+        self.assertEqual([ln.split()[0] for ln in du], ["val%d" % i for i in range(7)])
+
+    def test_out_of_range_is_a_spec_error(self):
+        for v in ("2", "8", "10", "x", "", "07"):
+            with self.subTest(v=v):
+                self.spec_error(minimal_spec(self.tmp, harness_env={"N_VALIDATORS": v}), "N_VALIDATORS")
+        spec = minimal_spec(self.tmp, harness_env={"N_VALIDATORS": "7"})
+        spec["arms"][1]["harness_env"] = {"N_VALIDATORS": "5"}
+        self.spec_error(spec, "N_VALIDATORS differs between arms")
+
+    def test_three_and_four_match_the_old_token_table(self):
+        """body_text(3) / body_text(4) = driver-body.sh with the 3-or-4 generator's literal tokens"""
+        body = open(os.path.join(HERE, "campaign", "driver-body.sh")).read()
+        for n, tok in OLD_TOKENS.items():
+            want = re.sub(r"@@([A-Z_]+)@@", lambda m: tok[m.group(1)], body)
+            self.assertEqual(self.gen.body_text(n), want, n)
+
+    def test_three_and_four_byte_identical_to_the_pre_change_generator(self):
+        """the 3- and 4-node drivers of one spec, from this make-driver.py and from f4010070's (both over the
+        current driver-body.sh / cell-step.sh), are the same bytes"""
+        try:
+            old = subprocess.run(
+                ["git", "-C", HERE, "show", "%s:tools/matched-bench/campaign/make-driver.py" % PRE_NVAL_COMMIT],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except OSError as e:
+            self.skipTest("git: %s" % e)
+        if old.returncode != 0:
+            self.skipTest("commit %s not in this clone: %s" % (PRE_NVAL_COMMIT, old.stderr.strip()))
+        camp = os.path.join(self.tmp, "oldgen", "campaign")
+        os.makedirs(camp)
+        oldgen = os.path.join(camp, "make-driver.py")
+        with open(oldgen, "w") as f:
+            f.write(old.stdout)
+        shutil.copy2(os.path.join(HERE, "campaign", "driver-body.sh"), camp)
+        shutil.copy2(os.path.join(HERE, "cell-step.sh"), os.path.dirname(camp))
+        specs = [("none", {}), ("n3", {"harness_env": {"N_VALIDATORS": "3"}}), ("n4", {"harness_env": {"N_VALIDATORS": "4"}})]
+        for name, over in specs:
+            with self.subTest(name):
+                sp = self.write_spec(minimal_spec(self.tmp, **over), name + ".json")
+                outs = []
+                for gen in (GEN, oldgen):
+                    out = os.path.join(self.tmp, "%s-%d.sh" % (name, len(outs)))
+                    r = subprocess.run(
+                        [sys.executable, "-I", gen, sp, "-o", out], capture_output=True, text=True
+                    )
+                    self.assertEqual(r.returncode, 0, (gen, r.stdout + r.stderr))
+                    outs.append(open(out, "rb").read())
+                self.assertEqual(outs[0], outs[1], name)
 
 
 if __name__ == "__main__":
