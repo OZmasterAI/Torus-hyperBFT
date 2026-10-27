@@ -37,7 +37,7 @@ Pull tools from main before the next campaign that has crash cells.
 explicitly for mode-3 arms. Each cell logs `cell=<label> book_mode=... <flag>='...'` and records `cell.book_mode` /
 `cell.node_flags` in summary.json. Pull tools from main before the next campaign.
 
-**Live status (18c main session, updated s138):** 9k (`896240d4`): standard shape DONE, section 125 on main (K -47.5% matched/s whole, -58% post-kill; blocks/s 1.40 vs 15.86; survivor body-fetch fallback + 17-50 s freeze in 5 of 7 K cells, 18c investigating on `fix/body-fetch-dead-peer`). Deep shape RUNNING since 17:30 (`bench-ozarchy-9k2-deep2`, health.py `c8fff67d`, dissemination-only REJECTs logged, deep K smoke ACCEPT), ETA ~19:15; section 125.7 follows. health.py kill-cell fix on main (`32db7ad9`). **Batch 12 LANDED (`cc8c9c4a`): 9o's 'after' arm can build main `cc8c9c4a`.** The post-kill body-fetch fix (`fix/body-fetch-dead-peer`, reviewed) lands in the next batch; K cells built before it still show the freezes. **Batch A LANDED (`d595f77e`):** orders on never-marked markets are rejected (code 18), so cells built from `d595f77e`+ must use main's run-cell.sh seed mode; nodes refuse peers with a different genesis digest (same binary + genesis per cell). Pin 9o's 'after' arm to one commit for the whole arm. **Also on main now:** chain-id safety fix `2da29bec`, TC tip rule `cffdbcc9`, 4-validator harness `07961d0a`, product batch `8964bd4d` (T / funding / fees unscheduled; resident position records +32 MB per 1M positions even with the bits off, visible in deep RSS). **Batch B LANDED `9083b278`** (deep all-up halt fix + body-fetch / log-flood fix + rpc-only fetch cap; merged main torus-consensus + hotstuff_rs 1101/1101): **9o's 'after' arm: build and pin `9083b278`.** **Batch C LANDED `a300c7f3`** (stored Commit PC + M2 + sibling unlock + dead-leader phases 1-3; dead-leader OFF by default, K=0; `CONSENSUS_DB_FORMAT_VERSION` 2, wipe data dirs): **9p unblocked: build and pin `a300c7f3`, 4 validators, `DL_K=3` required, smoke first.** Next on ozarchy: 9l / 9m / 9n, then 9o 'before' cells. 9o 'after' arm waits for batch 12 = D2 membership sync (`fix/vset-membership-sync`, Codex adversarial: approve) + lost-view timeout vote + reflexive lock rule (`fix/vsu-lock-reflexive`, cachyoz gate nextest 4715/4715; Codex adversarial found a P1 stall, fix in progress); 18c pings archy when it lands. 9p waits for dead-leader phases 1-3 (`feat/dead-leader-p3`, Codex: no findings), batch 12, and 4-validator run-cell.sh support (`tools/run-cell-4val`, building).
+**Live status (18c main session, updated s140):** QUEUE: **9p3** (below-saturation dead-leader one-down, pin main `0261068b`, spec below) is the only open item. DONE s138-s140: 9k (section 125), 9n deep-book capacity (126, + restart probe 127; GATES the testnet launch: PASS, restart ~10 s accepted, then cut to 2-3 s by `b738520d`), 9o TC-set one-down (126; all-up -3.3% traced by the 9o scan (128) to batch A, fixed by `a35705da`, re-bench 133: matched/s 1.038), 9m exec profile (126: Phase 5 revisit triggered), 9l binary gap (127: not resolved, closed by owner), 9q epoch-plan hand-off (127 + 129: PASS, default ON `5e82fb49`), 9s batch A cost (130), 9r item 6 Phase 5 r2 (131: FAIL, parked), 9p dead-leader one-down (129: 3/7 kill cells froze -> fixes `3c5d02ea` + `9d28eb48`; rerun 132 on `5e82fb49`: PASS, 0/10 freezes).
 
 **Owner s138: benches UNPAUSED.** Order: 9k first (pre-TC `896240d4`, a clean "before"); then 9l / 9m / 9n in any order; 9o's "after" arm on main after batch 12 (D2 membership sync + lost-view timeout vote + reflexive lock rule; 18c pings when it lands; its "before" cells may run earlier); 9p held until dead-leader phase 3 lands. Main now has the TC set (`d3de0abb`, `CONSENSUS_DB_FORMAT` v1): wipe data dirs for cells built from it; dead-leader will bump to v2.
 
@@ -1121,7 +1121,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    latency. Pass: all-up within noise; one-down blocks/s within -5%. Optional: WAN netem cell at 227 / 502 ms (trial
    net instead, owner s136). ~2 h (estimate).
    **Config (s136, batch 10 on main `2d2f3ed9`):** run as the testnet will: hash + attestation + L6.1 + L2.1 + fail-stop on. `gen-weighted-genesis.sh` (needed for 2/2/1 stakes) still defaults the hash OFF, so set `STATE_HASH_ACTIVATION` explicitly ON (hash from block 1; L6.1 follows it for Classic); L2.1 and fail-stop are on by default. Check the startup lines read `on=true`.
-9p. **[RERUN s140 on main `5e82fb49` (freeze fixes `9d28eb48` + hand-off default on): aK + bK ABBA n=6 + aU n=3, rate 14000, 4 val 1/1/1/1, DL_K=3 on a arms, val3 killed at 120 s, smoke first. First run (section 129, `3c5d02ea`): 3 of 7 aK cells froze 35-154 s before the exclusion committed (root cause fixed in `9d28eb48`)] [GO s140 (re-pinned): build and pin main `3c5d02ea` (batch C + epoch-plan hand-off + dead-leader post-exclusion freeze fix); the a300c7f3 DL_K=3 smoke froze ~30-35 s after the exclusion (fixed in `3c5d02ea`); dead-leader is OFF by default (K=0), so 9p MUST set DL_K=3; CONSENSUS_DB_FORMAT_VERSION 2, wipe data dirs; 4-node make-driver on main `70027095` (9k2-checks.sh configchk still val0-2: patch); smoke cell first] SHAPE CHANGED (owner s138): 4 validators, not 2/2/1.** At 2:2:1 with the stake-1 node down no validator-set update can commit (an update needs three consecutive live views; the dead node leads every third), so b1 would halt the chain at its first exclusion (`dead-leader-skip.md` section 8 finding 4). New shape: 4 nodes (1/1/1/1 or 2/2/1/1), one killed, at a MODERATE rate well below saturation (the question is recovery, not peak throughput; CPU starvation would mimic dead-leader timeouts). One short 4-node smoke cell first to check the rig keeps up. Before AND after arms both run in this 4-node shape (9k's 3-node cells are NOT its baseline); matched/s and p50/p99 are compared only inside 9p, never to the 3-node history. Original spec, superseded where it conflicts:** Dead-leader skip (b1) phase 4: before / after.** After dead-leader phases 1-3 land (rebased on
+9p. **[RE-RUN s140 on `5e82fb49` (18c msg 186), section 132: PASS (0 of 10 DL_K=3 kill runs freeze, max commit gap 2.6 s; post-exclusion blocks/s 0.966 ± 0.027 of all-up at the same offsets)] [RERUN s140 on main `5e82fb49` (freeze fixes `9d28eb48` + hand-off default on): aK + bK ABBA n=6 + aU n=3, rate 14000, 4 val 1/1/1/1, DL_K=3 on a arms, val3 killed at 120 s, smoke first. First run (section 129, `3c5d02ea`): 3 of 7 aK cells froze 35-154 s before the exclusion committed (root cause fixed in `9d28eb48`)] [GO s140 (re-pinned): build and pin main `3c5d02ea` (batch C + epoch-plan hand-off + dead-leader post-exclusion freeze fix); the a300c7f3 DL_K=3 smoke froze ~30-35 s after the exclusion (fixed in `3c5d02ea`); dead-leader is OFF by default (K=0), so 9p MUST set DL_K=3; CONSENSUS_DB_FORMAT_VERSION 2, wipe data dirs; 4-node make-driver on main `70027095` (9k2-checks.sh configchk still val0-2: patch); smoke cell first] SHAPE CHANGED (owner s138): 4 validators, not 2/2/1.** At 2:2:1 with the stake-1 node down no validator-set update can commit (an update needs three consecutive live views; the dead node leads every third), so b1 would halt the chain at its first exclusion (`dead-leader-skip.md` section 8 finding 4). New shape: 4 nodes (1/1/1/1 or 2/2/1/1), one killed, at a MODERATE rate well below saturation (the question is recovery, not peak throughput; CPU starvation would mimic dead-leader timeouts). One short 4-node smoke cell first to check the rig keeps up. Before AND after arms both run in this 4-node shape (9k's 3-node cells are NOT its baseline); matched/s and p50/p99 are compared only inside 9p, never to the 3-node history. Original spec, superseded where it conflicts:** Dead-leader skip (b1) phase 4: before / after.** After dead-leader phases 1-3 land (rebased on
    the TC set) and after 9k. Design `docs/plans/dead-leader-skip.md` section 5: before = 9k's cells; after = the same
    cells on the branch, ABBA, 3 runs each; `VALIDATOR_STAKES=2,2,1`, `KILL_NO_RESTART=val2`,
    `KILL_NO_RESTART_AT_S=120`, `BENCH_RPCS=0,1`, feed off, 600 s, plus all-up. Report three windows (pre-kill / kill
@@ -1138,6 +1138,14 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    0.91-1.00 (whole-run mean) / 0.77-0.88 (same wall offsets; blocks fuller, matched/s +22%). All-up aU vs bU
    matched/s +0.8% ± 1.3% (noise), blocks/s -5.5% ± 5.6%, order age p50 +14%. Next: 18c on the freeze logs, then
    aK-only re-run (n >= 6, ABBA with bK) after a fix.**
+   **Done s140, re-run (bench-ozarchy-s140-9p2 + FOREIGN reruns -rr / -rr2, main `5e82fb49` node `ebf779cf`,
+   freeze fix #2 `9d28eb48` + hand-off default on, 4 validators 1/1/1/1, rate 14,000, 600 s; aK / bK ABBA n = 6 + aU
+   n = 3, w1, 10 timed FOREIGN reruns + 1; section 132). PASS: 0 of 10 `DL_K=3` kill runs (+ smoke sA) freeze, max
+   per-survivor commit gap 2.6 s, survivors commit H within 0.2 s; kill -> commit of H 58.6-99.8 s (112-189 blocks);
+   post-exclusion 22.28 ± 0.48 blocks/s, 0.05 timeouts/min, blocks/s 0.966 ± 0.027 of all-up at the same offsets
+   (min 0.929), matched/s +21%. bK never excludes (1.99 blocks/s, 38.9 timeouts/min). Identical deltas, attestation
+   equal, AGREE in all 28 cells, 0 hand-off WARNs. Rate 14,000 did not unload the rig: the in-flight cap sets the load
+   (all-up still ~26 of 32 cores).**
 9l. **[GO, owner s138] Binary gap: `53a6d83c` vs
    `29bfc705`, hash-off Classic.** Section 124 found R (hash off, `29bfc705`) below section 120's A (hash off,
    `53a6d83c`) across campaigns: matched/s 0.983 / 0.970 (deep / standard), exec-thread on-CPU per 1k fills 1.053 /
@@ -1185,13 +1193,29 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    phase, H 5000 vs 5100); matched/s 224,858 -> 231,323 (+2.9%); every survivor logged the same delta per cell,
    attestation equal over 63 heights, AGREE; neither cell froze. Boundary stall seconds (val0 commit gap H-1 -> H)
    not resolved (no gap > 1 s with the flag off).**
-9s. **[GO s140, after 9p + 9q Part B] Batch A all-up cost (section 128 follow-up).** Section 128 put the all-up
+9s. **[RAN s140, section 130: CONFIRMED, -4.8% matched/s; cause = the RPC intake's per-action `ever_marked` oracle-row read (price band C) on the ingress threads; fix + re-bench = main session decision] [GO s140, after 9p + 9q Part B] Batch A all-up cost (section 128 follow-up).** Section 128 put the all-up
    -3.8% matched/s at batch A `d595f77e` (B2 `cc8c9c4a` -> B3: -13,451 +- 4,582 matched/s, process CPU per fill +8.3%,
    ~95% of it OFF the exec thread). (1) ABBA B2 vs B3, n = 4 per arm, std 2/2/1, seed, U only (~71 min); (2) if
    confirmed, whole-process profile diff B2 vs B3 (perf, all threads; suspects: genesis-digest handshake, price-band C
    checks on RPC / ingress / mempool threads); (3) only if the profile names nothing, bisect inside merge/s138-batch-a.
    Doc target: the next results-doc section.
-9r. **[GO s140, after 9s] Item 6 Phase 5 step 2 r2 re-A/B.** A = main `077fe56e`, B = `feat/item6-phase5-step2-r2`
+   **Done s140 (bench-ozarchy-s140-9s + bench-ozarchy-s140-9s-rr-prof, B2 `cc8c9c4a` node `6f64139c` vs B3 `d595f77e`
+   node `c50171eb`, U only, 2/2/1, seed, 300 s, w1 + ABBA n = 4, 9 / 9 cells valid + 2 FOREIGN reruns (a 15-min desktop
+   job, omarchy-agent-u + quickshell, hit r3-B2 / r4-B3) + 4 profile cells; section 130):** matched/s 280,698 -> 267,150
+   (-13,549 +- 2,276, 0.952 [0.944, 0.960]); process CPU per 1k fills 24.04 -> 26.08 (+2.04 +- 0.25, +8.5%), exec thread
+   +0.048 (1.020 [1.004, 1.036]), hotstuff flat; commit p99 +8.5%. Profile: `torus-ingress-v` carries +1.88 of +1.89 ms per
+   1k fills, all RocksDB point-read plumbing (`ReadView::get_cf_raw` -> `DBImpl::GetImpl`, + sys); cause: batch A's
+   `validate_known_markets` calls `oracle::ever_marked` once per market per action (uncached). Genesis-digest handshake:
+   nothing measurable. Step (3) (bisect) not needed. Next (main session): cache the monotonic first-mark predicate at the
+   intake, re-bench ABBA n = 4.
+   **Done s140, re-bench of the fix (bench-ozarchy-s140-9s2, A = main `b738520d` node `c3bdea73` vs B =
+   `perf/ever-marked-cache` `f0bd74ba` node `bab591cf`, same shape and harness, w1 + ABBA n = 4, 9 / 9 cells valid, 0
+   FOREIGN reruns: load windows timed between the 15-min desktop bursts by a per-cell `burstwait` check, one 346 s wait;
+   section 133):** matched/s 266,251 -> 276,486 (+10,235 +- 3,891, 1.038 [1.024, 1.053]); process CPU per 1k fills 26.16
+   -> 24.70 (-1.45 +- 0.44, -5.6%), exec thread flat (1.001 [0.982, 1.020]); `torus-ingress-v` 6.64 -> 5.03 ms per 1k
+   fills (-1.61 +- 0.18, back to 130's B2 5.04); commit p50 +0.9 ms (12.8 -> 13.6, B2's level), p99 not resolved.
+   Exec-path rule met. Next (main session): merge `perf/ever-marked-cache`.
+9r. **[RAN s140, section 131: FAILS the exec-path rule on both shapes: exec-thread on-CPU per fill +33% std / +25% deep, native blk/s -58% / -60%, the exec thread's cache_flush x2.3; do not merge; next = main session decision] [GO s140, after 9s] Item 6 Phase 5 step 2 r2 re-A/B.** A = main `077fe56e`, B = `feat/item6-phase5-step2-r2`
    `14b2abe9`. q7 two-arm build, md5 on every node, same env on both arms. Shapes: std hsdb-300m (standard load s127,
    `ORACLE_FEED=seed`) and deep (9n D). One A warm-up per shape, then ABBA n = 3, 600 s cells, fresh data dirs.
    Took effect: on B `torus_exec_users_drain_encodes` > 0, `_encode_inline` / encodes < 0.05,
@@ -1201,6 +1225,23 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    for on-CPU, exec ms or CPU per fill above 1; blocks/s, p50 and p99 not worse; RSS within +10%. A gain claim needs
    the on-CPU CI fully below 1. Builder note: B may come out level, not faster (in-place apply +0.175 ms / 1k fills in
    section 91; main's own flush is cheaper now).
+   **Done s140 (bench-ozarchy-s140-9r + FOREIGN reruns bench-ozarchy-s140-9r-rr, A `077fe56e` node `8649845d` vs B
+   `14b2abe9` node `be6a0d7a`, std 2/2/1 seed + deep 9n D, 600 s, w1 / w2 + ABBA n = 3 per shape, 14 / 14 cells valid,
+   6 FOREIGN reruns (the 15-min agents-usage desktop job, now at :07 / :22 / :37 / :52), all clean; section 131):**
+   took effect on every B cell (drain encodes 2,735-4,489 per node, inline / encodes <= 0.009, EVM-scope typed writes
+   0), none on A. Paired B / A [95% CI]: exec-thread on-CPU per 1k fills std 1.328 [1.293, 1.364] / deep 1.253
+   [1.175, 1.335]; native blk/s 0.422 / 0.399; block p50 x10.7 / x2.3 (deep CI spans 1); p99 1.66 / 2.18; exec ms per
+   1k fills 1.198 / 1.148; CPU-s per 1M fills 1.033 [1.018, 1.049] / 0.988 (n.r.); matched/s 0.940 [0.922, 0.959] /
+   0.981 (n.r.); RSS mean +27% / +13%. Cause: the exec thread's cache flush 0.53 -> 1.21 ms per 1k fills (x2.26 std,
+   x2.33 deep) outweighs the encode moved to the flush worker (0.28 ms per 1k fills, 13-19 ms per job); exec busy
+   0.88 -> 0.99, so blocks grow 2.2-2.4x. Fails every primary row; no gain claim.
+9p3. **[GO s140, pin main `0261068b`] Below-saturation dead-leader one-down.** 9p2 (section 132) passed but ran near
+   CPU saturation (all-up ~26 of 32 cores; RATE 20000 -> 14000 changed nothing because MAX_IN_FLIGHT sets the load) and
+   0 of 10 bounds the freeze rate only at <= 28% (95%). Same shape as 9p2 (4 val 1/1/1/1, `DL_K=3` on a arms, val3
+   killed at 120 s, seed, wiped dirs, hand-off default on) with a lower `MAX_IN_FLIGHT` so all-up uses ~12-16 of 32
+   cores (pick it from a quick aU probe and record it). aK + bK ABBA n = 6 + aU n = 3. Pass: 0 freezes (commit gap > 5 s)
+   in aK, same exclusion on all survivors, AGREE, post-exclusion blocks/s >= 90% of aU at the same offsets. Report the
+   combined 9p2 + 9p3 freeze bound. Doc target: the next results-doc section.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 

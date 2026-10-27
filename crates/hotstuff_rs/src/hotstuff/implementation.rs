@@ -1939,6 +1939,15 @@ impl<N: Network> HotStuff<N> {
 
         // 1. Collect the vote if correct.
         if phase_vote.is_correct(signer) {
+            // s140 review: the collectors must be over the block tree's current validator-set
+            // state when a vote is counted. Block sync commits (and decides) an update with
+            // `block_tree.update` directly, in the middle of a view, and does not reach these
+            // collectors; a pair built at the view's start over the old set then completes an
+            // old-set PC on a block the new set certifies. A no-op while the state is unchanged
+            // (one read of the state, as the pacemaker's tick does on every loop pass).
+            let _ = self
+                .phase_vote_collectors
+                .update_validator_sets(&block_tree.validator_set_state()?);
             if let Some(new_pc) = self.phase_vote_collectors.collect(signer, phase_vote) {
                 Event::CollectPC(CollectPCEvent {
                     timestamp: SystemTime::now(),
@@ -1974,6 +1983,25 @@ impl<N: Network> HotStuff<N> {
                 // collector; an old-set quorum of late Decide votes then completes it. Such a PC
                 // is checked (and dropped, with the stale collector) like a window PC. The update
                 // is already decided, so dropping it costs no progress.
+                // s140 (progress_and_validator_set_update_test): the lone collector of a replica
+                // outside any window is phase-blind too. Only the post-update set votes Decide on
+                // an updating block U, and this replica's committed set is that set only once it
+                // has committed U. Before (U Pending here, or its body still in flight) its
+                // collector is over the set before U, whose quorum of Decide votes completes a
+                // Decide PC that is no certificate: `is_correct` rejects it once U is in the tree,
+                // and accepts it while U is unknown (it falls back to the committed set). Taken as
+                // the highest PC it is rejected by every replica that committed U, and it blocks
+                // the correct Decide PC of the same view. Such a PC is dropped: the replica gets
+                // U's Decide PC from an aggregator that committed U. A Decide PC (one per
+                // update) is also always checked in full.
+                if new_pc.phase.is_decide()
+                    && (!matches!(
+                        block_tree.validator_set_updates_status(&new_pc.block)?,
+                        ValidatorSetUpdatesStatus::Committed
+                    ) || !new_pc.is_correct(self.config.chain_id, block_tree)?)
+                {
+                    return Ok(());
+                }
                 let validator_set_state = block_tree.validator_set_state()?;
                 if validator_set_state.update_decided()
                     && self.phase_vote_collectors.has_pvs_collector()
