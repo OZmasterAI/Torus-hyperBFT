@@ -819,6 +819,75 @@ fn gaps_and_slots(
     (gaps, slots)
 }
 
+/// The gap views ([`gaps_and_slots`]) lost to the excluded validator `dead`: those it leads under
+/// the `old` schedule (its slots: a view still given to it times out, it is down) or under the
+/// `installed` set (the update did not take it out of the schedule). A gap at a view a live
+/// validator leads under both is load, not the exclusion: on a loaded host a live leader's view
+/// times out too.
+fn views_lost_to(gaps: &[u64], old: &HsSet, installed: &HsSet, dead: &VerifyingKey) -> Vec<u64> {
+    gaps.iter()
+        .copied()
+        .filter(|v| {
+            let view = ViewNumber::new(*v);
+            select_leader(view, old) == *dead || select_leader(view, installed) == *dead
+        })
+        .collect()
+}
+
+/// One-down's loss count (s140: at load ~50 on 18c, 6 of 40 runs failed counting every gap view
+/// after the exclusion, the views of live leaders timing out under load): a gap view is lost to the
+/// excluded validator only if it leads that view under the old schedule (one of its slots timed
+/// out: the schedule still gives it to the dead validator) or still leads it under the set the
+/// update installed.
+#[test]
+fn one_down_counts_only_the_views_lost_to_the_excluded_validator() {
+    use hotstuff_rs::types::data_types::Power;
+    let vks: Vec<VerifyingKey> = (0..4u8)
+        .map(|i| ed25519_dalek::SigningKey::from_bytes(&[0x60 + i; 32]).verifying_key())
+        .collect();
+    let mut old = HsSet::new();
+    for vk in &vks {
+        old.put(vk, Power::new(1));
+    }
+    let x = vks[0];
+    let leads = |set: &HsSet, v: u64| select_leader(ViewNumber::new(v), set) == x;
+    let mut installed = old.clone();
+    assert!(installed.exclude_leader(&x));
+    let span: Vec<u64> = (40..80).collect();
+    let x_slots: Vec<u64> = span.iter().copied().filter(|&v| leads(&old, v)).collect();
+    let live_views: Vec<u64> = span.iter().copied().filter(|&v| !leads(&old, v)).collect();
+    assert!(
+        x_slots.len() >= 4,
+        "fixture: x leads views of the span: {x_slots:?}"
+    );
+    assert!(
+        span.iter().all(|&v| !leads(&installed, v)),
+        "fixture: x is skipped once excluded"
+    );
+
+    // Load: every view a live validator leads timed out. None is lost to x.
+    assert_eq!(
+        views_lost_to(&live_views, &old, &installed, &x),
+        Vec::<u64>::new()
+    );
+    // The exclusion not applied to the schedule: x's slots time out, every one is lost to it.
+    assert_eq!(views_lost_to(&span, &old, &installed, &x), x_slots);
+    // The update installed a set that still schedules x (another validator excluded): the views
+    // x leads under it count too, though none of them is one of its old slots.
+    let mut other = old.clone();
+    assert!(other.exclude_leader(&vks[1]));
+    let x_new: Vec<u64> = live_views
+        .iter()
+        .copied()
+        .filter(|&v| leads(&other, v))
+        .collect();
+    assert!(
+        !x_new.is_empty(),
+        "fixture: x leads views under the other set it does not lead under the old one"
+    );
+    assert_eq!(views_lost_to(&live_views, &old, &other, &x), x_new);
+}
+
 /// The first boundary at or above `height`.
 fn boundary_at_or_above(height: u64) -> u64 {
     height.div_ceil(L) * L
@@ -882,16 +951,20 @@ fn one_down(weights: &[u64], dead: usize) {
         }
     }
     // No view lost to the dead validator after the update (its Decide and the first block after
-    // it are no slots): fewer gap views than half its slots under the old schedule.
+    // it are no slots): fewer of its views lost than half its slots under the old schedule. Only
+    // the gap views it leads under the old schedule or the installed set count
+    // ([`views_lost_to`]): a live leader's view can time out on a loaded host (s140: 6 of 40 runs
+    // at load ~50 on 18c failed counting every gap view).
     let (gaps, slots) = gaps_and_slots(&qcs, update + 2, &set, &x);
+    let lost = views_lost_to(&gaps, &set, &c.hs_set(a), &x);
     assert!(
         slots >= 4,
         "fixture: the span after the update holds dead slots ({slots})"
     );
     assert!(
-        gaps.len() * 2 < slots,
-        "views lost after the exclusion: {gaps:?} ({slots} dead-validator slots under the old \
-         schedule)"
+        lost.len() * 2 < slots,
+        "views lost to the dead validator after the exclusion: {lost:?} ({slots} dead-validator \
+         slots under the old schedule; every view lost after the update: {gaps:?})"
     );
     let top = c.min_applied(&live);
     c.stop_all();
