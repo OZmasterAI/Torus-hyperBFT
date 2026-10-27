@@ -37,7 +37,7 @@ Pull tools from main before the next campaign that has crash cells.
 explicitly for mode-3 arms. Each cell logs `cell=<label> book_mode=... <flag>='...'` and records `cell.book_mode` /
 `cell.node_flags` in summary.json. Pull tools from main before the next campaign.
 
-**Live status (18c main session, updated s140):** QUEUE: **9p3** (below-saturation dead-leader one-down, pin main `0261068b`, spec below) is the only open item. DONE s138-s140: 9k (section 125), 9n deep-book capacity (126, + restart probe 127; GATES the testnet launch: PASS, restart ~10 s accepted, then cut to 2-3 s by `b738520d`), 9o TC-set one-down (126; all-up -3.3% traced by the 9o scan (128) to batch A, fixed by `a35705da`, re-bench 133: matched/s 1.038), 9m exec profile (126: Phase 5 revisit triggered), 9l binary gap (127: not resolved, closed by owner), 9q epoch-plan hand-off (127 + 129: PASS, default ON `5e82fb49`), 9s batch A cost (130), 9r item 6 Phase 5 r2 (131: FAIL, parked), 9p dead-leader one-down (129: 3/7 kill cells froze -> fixes `3c5d02ea` + `9d28eb48`; rerun 132 on `5e82fb49`: PASS, 0/10 freezes).
+**Live status (18c main session, updated s140):** QUEUE: empty (9p3 done, section 134: freeze / exclusion / AGREE PASS, post-exclusion blocks/s 0.894 of all-up FAILS the 0.90 line by cadence only; owner call). DONE s138-s140: 9k (section 125), 9n deep-book capacity (126, + restart probe 127; GATES the testnet launch: PASS, restart ~10 s accepted, then cut to 2-3 s by `b738520d`), 9o TC-set one-down (126; all-up -3.3% traced by the 9o scan (128) to batch A, fixed by `a35705da`, re-bench 133: matched/s 1.038), 9m exec profile (126: Phase 5 revisit triggered), 9l binary gap (127: not resolved, closed by owner), 9q epoch-plan hand-off (127 + 129: PASS, default ON `5e82fb49`), 9s batch A cost (130), 9r item 6 Phase 5 r2 (131: FAIL, parked), 9p dead-leader one-down (129: 3/7 kill cells froze -> fixes `3c5d02ea` + `9d28eb48`; rerun 132 on `5e82fb49`: PASS, 0/10 freezes), 9p3 below-saturation one-down (134: 0/8 freezes, 9p2 + 9p3 0/18 -> <= 17.6% at 95%; blocks/s criterion 0.894, FAIL).
 
 **Owner s138: benches UNPAUSED.** Order: 9k first (pre-TC `896240d4`, a clean "before"); then 9l / 9m / 9n in any order; 9o's "after" arm on main after batch 12 (D2 membership sync + lost-view timeout vote + reflexive lock rule; 18c pings when it lands; its "before" cells may run earlier); 9p held until dead-leader phase 3 lands. Main now has the TC set (`d3de0abb`, `CONSENSUS_DB_FORMAT` v1): wipe data dirs for cells built from it; dead-leader will bump to v2.
 
@@ -1235,13 +1235,25 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    0.981 (n.r.); RSS mean +27% / +13%. Cause: the exec thread's cache flush 0.53 -> 1.21 ms per 1k fills (x2.26 std,
    x2.33 deep) outweighs the encode moved to the flush worker (0.28 ms per 1k fills, 13-19 ms per job); exec busy
    0.88 -> 0.99, so blocks grow 2.2-2.4x. Fails every primary row; no gain claim.
-9p3. **[GO s140, pin main `0261068b`] Below-saturation dead-leader one-down.** 9p2 (section 132) passed but ran near
+9p3. **[DONE s140, section 134: 3 of 4 criteria PASS, blocks/s criterion FAIL 0.894 ± 0.001 (owner call)] [GO s140, pin main `0261068b`] Below-saturation dead-leader one-down.** 9p2 (section 132) passed but ran near
    CPU saturation (all-up ~26 of 32 cores; RATE 20000 -> 14000 changed nothing because MAX_IN_FLIGHT sets the load) and
    0 of 10 bounds the freeze rate only at <= 28% (95%). Same shape as 9p2 (4 val 1/1/1/1, `DL_K=3` on a arms, val3
    killed at 120 s, seed, wiped dirs, hand-off default on) with a lower `MAX_IN_FLIGHT` so all-up uses ~12-16 of 32
    cores (pick it from a quick aU probe and record it). aK + bK ABBA n = 6 + aU n = 3. Pass: 0 freezes (commit gap > 5 s)
    in aK, same exclusion on all survivors, AGREE, post-exclusion blocks/s >= 90% of aU at the same offsets. Report the
    combined 9p2 + 9p3 freeze bound. Doc target: the next results-doc section.
+   **Done s140 (bench-ozarchy-s140-9p3 + FOREIGN reruns bench-ozarchy-s140-9p3-rr, main `0261068b` node `50c1cfeb`,
+   bench `121459c5`, 4 val 1/1/1/1, 600 s, w1 + aK / bK ABBA n = 6 + aU n = 3, 16 / 16 cells rc 0 + 2 FOREIGN reruns
+   (both a claude session; 0 desktop-burst hits under burstwait pacing) + 1 driver rerun; section 134):** load knob =
+   `RATE`, not the cap: caps 1-3 at rate 14,000 stay at ~26 busy cores (closed loop, ~1,080-1,120 actions/s); rate
+   400 / 550 / 700 -> 12.3 / 16.3 / 20.7 cores; chosen 475 (all-up 14.3 cores). aK: 0 freezes in 8 runs + smoke sA
+   (max commit gap 2.6 s, H committed within 0.10 s on all survivors); combined 9p2 + 9p3 0 / 18 -> freeze rate
+   <= 17.6% (95% Wilson; Clopper-Pearson 18.5%). One identical delta on all survivors (H 6600-6800, kill -> commit
+   53.3-96.4 s); AGREE and attestation equal in all 19 load cells (1 dissemination-only REJECT, kill-cell shape).
+   Post-exclusion blocks/s 0.894 ± 0.001 of all-up at the same offsets: FAIL against 0.90, but matched/s (-0.1 to
+   +0.8%) and order age (154 / 597 vs 144 / 612 ms) are level: below saturation blocks/s is consensus cadence
+   (likely quorum = all 3 survivors; untested), not throughput. Owner call: keep the blocks/s line or judge on
+   matched/s + order age (or a 3-validator all-up reference).
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
