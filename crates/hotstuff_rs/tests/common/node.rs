@@ -429,6 +429,12 @@ impl Node {
         }
     }
 
+    /// Whether `block` is in the node's block tree (inserted, whatever the path that delivered its
+    /// body).
+    pub(crate) fn has_block(&self, block: &hotstuff_rs::types::data_types::CryptoHash) -> bool {
+        matches!(self.replica.block_tree_camera().snapshot().block_height(block), Ok(Some(_)))
+    }
+
     /// Query the VIEW of the node's Highest PC — the QC frontier's position in
     /// view-number space. Unlike [`highest_pc_height`](Self::highest_pc_height)
     /// this needs no block lookup, so it observes the frontier even when the
