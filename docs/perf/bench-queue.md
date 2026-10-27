@@ -37,7 +37,7 @@ Pull tools from main before the next campaign that has crash cells.
 explicitly for mode-3 arms. Each cell logs `cell=<label> book_mode=... <flag>='...'` and records `cell.book_mode` /
 `cell.node_flags` in summary.json. Pull tools from main before the next campaign.
 
-**Live status (18c main session, updated s140):** QUEUE: empty (9p3 done, section 134: freeze / exclusion / AGREE PASS, post-exclusion blocks/s 0.894 of all-up FAILS the 0.90 line by cadence only; owner call). DONE s138-s140: 9k (section 125), 9n deep-book capacity (126, + restart probe 127; GATES the testnet launch: PASS, restart ~10 s accepted, then cut to 2-3 s by `b738520d`), 9o TC-set one-down (126; all-up -3.3% traced by the 9o scan (128) to batch A, fixed by `a35705da`, re-bench 133: matched/s 1.038), 9m exec profile (126: Phase 5 revisit triggered), 9l binary gap (127: not resolved, closed by owner), 9q epoch-plan hand-off (127 + 129: PASS, default ON `5e82fb49`), 9s batch A cost (130), 9r item 6 Phase 5 r2 (131: FAIL, parked), 9p dead-leader one-down (129: 3/7 kill cells froze -> fixes `3c5d02ea` + `9d28eb48`; rerun 132 on `5e82fb49`: PASS, 0/10 freezes), 9p3 below-saturation one-down (134: 0/8 freezes, 9p2 + 9p3 0/18 -> <= 17.6% at 95%; blocks/s criterion 0.894, FAIL).
+**Live status (18c main session, updated s140):** QUEUE: empty (9p3 done, section 134: freeze / exclusion / AGREE PASS, post-exclusion blocks/s 0.894 of all-up FAILS the 0.90 line by cadence only; owner call). DONE s138-s140: 9k (section 125), 9n deep-book capacity (126, + restart probe 127; GATES the testnet launch: PASS, restart ~10 s accepted, then cut to 2-3 s by `b738520d`), 9o TC-set one-down (126; all-up -3.3% traced by the 9o scan (128) to batch A, fixed by `a35705da`, re-bench 133: matched/s 1.038), 9m exec profile (126: Phase 5 revisit triggered), 9l binary gap (127: not resolved, closed by owner), 9q epoch-plan hand-off (127 + 129: PASS, default ON `5e82fb49`), 9s batch A cost (130), 9r item 6 Phase 5 r2 (131: FAIL, parked), 9p dead-leader one-down (129: 3/7 kill cells froze -> fixes `3c5d02ea` + `9d28eb48`; rerun 132 on `5e82fb49`: PASS, 0/10 freezes), 9p3 below-saturation one-down (134: 0/8 freezes, 9p2 + 9p3 0/18 -> <= 17.6% at 95%; blocks/s criterion 0.894, FAIL). 9v vote-path cost of the validator-set-update fixes (135: `b42e5e98` vs `7251fc7c`, hotstuff-algo +2.8% CPU per block (paired CI +1.2..+4.5%), blocks/s and commit p99 level: PASS).
 
 **Owner s138: benches UNPAUSED.** Order: 9k first (pre-TC `896240d4`, a clean "before"); then 9l / 9m / 9n in any order; 9o's "after" arm on main after batch 12 (D2 membership sync + lost-view timeout vote + reflexive lock rule; 18c pings when it lands; its "before" cells may run earlier); 9p held until dead-leader phase 3 lands. Main now has the TC set (`d3de0abb`, `CONSENSUS_DB_FORMAT` v1): wipe data dirs for cells built from it; dead-leader will bump to v2.
 
@@ -1254,6 +1254,21 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    +0.8%) and order age (154 / 597 vs 144 / 612 ms) are level: below saturation blocks/s is consensus cadence
    (likely quorum = all 3 survivors; untested), not throughput. Owner call: keep the blocks/s line or judge on
    matched/s + order age (or a 3-validator all-up reference).
+9v. **[DONE s140, section 135: PASS] [GO s140 (18c / owner chat msg 196), A = main `7251fc7c`, B = main `b42e5e98`] Vote-path cost of the
+   validator-set-update fixes.** `b42e5e98` (Merge fix/vsu-laggard-and-collector `99e2f285`) refreshes the phase-vote
+   collectors to the current validator set before each incoming vote is counted (`57893292`: ~5 RocksDB reads per vote
+   on the consensus thread), fully checks every Decide PC (`4084518d`), and stops a replica from using itself as its
+   block-sync server (`2ece70d7`). 3-val std as 9s / 9s2 (U only, stakes 2/2/1, seed, 300 s, standard load rate 76000,
+   cap 4, `BENCH_RPCS=0,1`), section 133's tools, unscored w1 + ABBA n = 3. Primary: consensus (hotstuff) thread CPU per
+   block and per view, blocks/s, commit p50 / p99; also matched/s, process CPU per 1k fills, per-thread-group CPU.
+   Pass: hotstuff thread CPU within noise or < +5%; blocks/s and p99 not worse. Doc target: the next results-doc section.
+   **Done s140 (bench-ozarchy-s140-9p3u3-9v part 2, run dir ozarchy-s140-9v-run, A node `50c1cfeb` / bench `121459c5`,
+   B node `69fc5ee6` / bench `b2b06854`, w1 + A B B A A B, 7 / 7 cells rc 0 ACCEPT / AGREE / PASS, 0 FOREIGN reruns;
+   section 135):** hotstuff-algo on-CPU per committed block 14.53 -> 14.94 ms, +0.41 ± 0.47 (Welch), paired
+   +0.41 ± 0.24 (+2.8%, CI +1.2% to +4.5%); per view +2.9% (paired upper bound 4.7%); 0.235 -> 0.239 core per node.
+   blocks/s 16.13 -> 16.00 (-0.13 ± 0.34), commit p99 740 -> 731 ms (-9 ± 53), matched/s +392 ± 3,498, CPU per 1k
+   fills +0.08 ± 0.30: within noise. Commit p50 +0.6 ± 0.5 ms (Welch only). Sync-server thread flat. PASS. Not
+   measured: the growth with validator count (cost is per incoming vote).
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
