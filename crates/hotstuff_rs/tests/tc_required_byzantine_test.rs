@@ -789,8 +789,6 @@ const WINDOW_CEILING: Duration = Duration::from_secs(360);
 enum WindowStop {
     /// Every live validator applied the update.
     Applied,
-    /// Every live validator is past v + 1 and n0 never nudged U's Prepare PC (v) in v + 1.
-    NudgeMissed,
     /// No live validator's highest PC moved for [`WINDOW_STALL`].
     Stalled,
     /// [`WINDOW_CEILING`] elapsed.
@@ -802,40 +800,57 @@ enum WindowStop {
 enum WindowVerdict {
     /// The window was set up (U's Precommit PC (v + 1) formed) and the update committed.
     Pass,
-    /// The run missed the scenario: n0 never nudged U's Prepare PC, or the update committed
-    /// without U's Precommit PC (v + 1). A fresh cluster may try again.
+    /// The run missed the scenario: the update committed without the window (n0 never nudged
+    /// U's Prepare PC (v) in v + 1, or U's Precommit PC (v + 1) never formed). A fresh cluster
+    /// may try again.
     Missed,
-    /// Nothing committed the update: the window livelocked, whether U's Precommit PC formed or
-    /// not (a stall with no Precommit PC is the livelock of another stage, never a retry).
+    /// Nothing committed the update: the window livelocked, whether n0 nudged U's Prepare PC and
+    /// U's Precommit PC formed or not (a stall after a missed nudge, or with no Precommit PC, is
+    /// the livelock of another stage, never a retry).
     Livelocked,
+    /// U's Precommit PC (v + 1) formed but the log holds no nudge of U's Prepare PC (v) in v + 1,
+    /// the only message that collects its votes: the filter missed an event (a test bug).
+    LogMissedEvent,
 }
 
-fn window_verdict(stop: WindowStop, precommit_pc: bool) -> WindowVerdict {
-    match stop {
-        WindowStop::NudgeMissed => WindowVerdict::Missed,
-        WindowStop::Applied if precommit_pc => WindowVerdict::Pass,
-        WindowStop::Applied => WindowVerdict::Missed,
-        WindowStop::Stalled | WindowStop::Ceiling => WindowVerdict::Livelocked,
+/// The verdict of a stop, given whether n0 nudged U's Prepare PC (v) in v + 1 (`nudged`) and
+/// whether U's Precommit PC (v + 1) formed.
+fn window_verdict(stop: WindowStop, nudged: bool, precommit_pc: bool) -> WindowVerdict {
+    match (stop, nudged, precommit_pc) {
+        (_, false, true) => WindowVerdict::LogMissedEvent,
+        (WindowStop::Applied, true, true) => WindowVerdict::Pass,
+        (WindowStop::Applied, _, _) => WindowVerdict::Missed,
+        (WindowStop::Stalled | WindowStop::Ceiling, _, _) => WindowVerdict::Livelocked,
     }
 }
 
-/// The silent-leader verdict: only a missed nudge, or an update committed without the window,
-/// is a missed scenario; every stop without the update committed fails (s140 review P2).
+/// The silent-leader verdict: only an update committed without the window (no nudge of U's
+/// Prepare PC, or no Precommit PC (v + 1)) is a missed scenario; every stop without the update
+/// committed fails, a missed nudge or not (s140 review P2, P3 #1), and a Precommit PC (v + 1)
+/// without the nudge that alone can produce it fails as a gap in the event log (P3 #2).
 #[test]
 fn silent_leader_window_verdict_retries_only_a_missed_setup() {
     use WindowStop::*;
     use WindowVerdict::*;
-    for (stop, precommit_pc, verdict) in [
-        (Applied, true, Pass),
-        (Applied, false, Missed),
-        (NudgeMissed, false, Missed),
-        (NudgeMissed, true, Missed),
-        (Stalled, true, Livelocked),
-        (Stalled, false, Livelocked),
-        (Ceiling, true, Livelocked),
-        (Ceiling, false, Livelocked),
+    for (stop, nudged, precommit_pc, verdict) in [
+        (Applied, true, true, Pass),
+        (Applied, true, false, Missed),
+        (Applied, false, false, Missed),
+        (Applied, false, true, LogMissedEvent),
+        (Stalled, true, true, Livelocked),
+        (Stalled, true, false, Livelocked),
+        (Stalled, false, false, Livelocked),
+        (Stalled, false, true, LogMissedEvent),
+        (Ceiling, true, true, Livelocked),
+        (Ceiling, true, false, Livelocked),
+        (Ceiling, false, false, Livelocked),
+        (Ceiling, false, true, LogMissedEvent),
     ] {
-        assert_eq!(window_verdict(stop, precommit_pc), verdict, "{stop:?}, Precommit PC {precommit_pc}");
+        assert_eq!(
+            window_verdict(stop, nudged, precommit_pc),
+            verdict,
+            "{stop:?}, nudged {nudged}, Precommit PC {precommit_pc}"
+        );
     }
 }
 
@@ -876,10 +891,10 @@ type WindowEvent = (u64, usize, &'static str, bool, String, u64, Option<u64>);
 /// The window is set up only if n0 nudges U's Prepare PC in v + 1 and U's Precommit PC (v + 1)
 /// forms. On a loaded host view v can time out before n0 collects the Prepare votes (s140: TC(8),
 /// n0 proposed a fresh block in 9 and the update was re-proposed in fresh blocks, never U): the
-/// run missed the scenario and the test starts a fresh cluster, up to 3 times. Only that is a
-/// miss (every live validator past v + 1 without the nudge, or the update committed without the
-/// window); a run that stops with the update uncommitted fails, Precommit PC or not
-/// ([`window_verdict`]).
+/// run missed the scenario and the test starts a fresh cluster, up to 3 times. A missed nudge does
+/// not stop the run: it polls on under the same stall and ceiling limits, and only an update that
+/// then commits without the window is a miss; a run that stops with the update uncommitted fails,
+/// nudge and Precommit PC or not ([`window_verdict`]).
 #[test]
 fn validator_set_update_survives_a_silent_leader_after_the_precommit_pc() {
     let mut missed = Vec::new();
@@ -948,30 +963,12 @@ fn silent_leader_after_the_precommit_pc() -> Result<(), String> {
         .unwrap()
         .submit_transaction(NumberAppTransaction::SetValidator(target_key.to_bytes(), Power::new(2)));
     let applied = || cluster.live().all(|n| n.committed_validator_set().power(&target_key).map(|p| p.int()) == Some(2));
-    // n0's nudge of U's Prepare PC (v) in v + 1, if every live validator is past v + 1 without it.
-    // The log is read and released before any node is asked: a node's block-sync server sends
-    // while it holds its block-tree snapshot, and every send takes the log in the filter (the
-    // lock order of the s140 one-down P1).
-    let nudge_missed = || {
-        let (v, nudged) = {
-            let w = log.lock().unwrap();
-            let Some((_, v)) = w.update else { return false };
-            let nudged = w.events.iter().any(|&(view, _, kind, on_u, ref phase, justify_view, _)| {
-                view == v + 1 && kind == "nudge" && on_u && phase == "Prepare" && justify_view == v
-            });
-            (v, nudged)
-        };
-        !nudged && cluster.live().all(|n| n.highest_view_entered().int() >= v + 2)
-    };
     let pc_frontier = || cluster.live().map(|n| n.highest_pc_view()).max().unwrap_or(0);
     let start = std::time::Instant::now();
     let (mut frontier, mut moved) = (pc_frontier(), start);
     let stop = loop {
         if applied() {
             break WindowStop::Applied;
-        }
-        if nudge_missed() {
-            break WindowStop::NudgeMissed;
         }
         let f = pc_frontier();
         if f != frontier {
@@ -986,7 +983,9 @@ fn silent_leader_after_the_precommit_pc() -> Result<(), String> {
         std::thread::sleep(POLL_INTERVAL);
     };
 
-    // The nodes first, the log after (see `nudge_missed`).
+    // The nodes first, the log after: a node's block-sync server sends while it holds its
+    // block-tree snapshot, and every send takes the log in the filter (the lock order of the s140
+    // one-down P1).
     let described = cluster.describe();
     let log = log.lock().unwrap();
     let (_, v) = log.update.expect("scenario: the update block was proposed");
@@ -1005,17 +1004,29 @@ fn silent_leader_after_the_precommit_pc() -> Result<(), String> {
         log.events
     );
     let precommit_pc = log.precommit_pcs.contains(&(v + 1));
+    // n0's nudge of U's Prepare PC (v) in v + 1.
+    let nudged = log.events.iter().any(|&(view, _, kind, on_u, ref phase, justify_view, _)| {
+        view == v + 1 && kind == "nudge" && on_u && phase == "Prepare" && justify_view == v
+    });
     drop(log);
     assert_eq!(cluster.leader(v), proposer, "scenario: n{proposer} proposed U; {trace}");
     assert_eq!(cluster.leader(v + 2), down, "scenario: the silent validator leads v + 2; {trace}");
-    match window_verdict(stop, precommit_pc) {
+    match window_verdict(stop, nudged, precommit_pc) {
         WindowVerdict::Pass => {}
         WindowVerdict::Missed => {
-            return Err(format!("{stop:?} without U's Precommit PC (v + 1) (formed: {precommit_pc}); {trace}"))
+            return Err(format!(
+                "{stop:?} without the window (n0 nudged U's Prepare PC (v) in v + 1: {nudged}, U's Precommit PC \
+                 (v + 1) formed: {precommit_pc}); {trace}"
+            ))
         }
         WindowVerdict::Livelocked => panic!(
-            "the update window livelocked ({stop:?}, U's Precommit PC (v + 1) formed: {precommit_pc}): every \
-             live validator must commit U (no new PC for {WINDOW_STALL:?} or {WINDOW_CEILING:?} in all); {trace}"
+            "the update window livelocked ({stop:?}, n0 nudged U's Prepare PC (v) in v + 1: {nudged}, U's \
+             Precommit PC (v + 1) formed: {precommit_pc}): every live validator must commit the update (no new \
+             PC for {WINDOW_STALL:?} or {WINDOW_CEILING:?} in all); {trace}"
+        ),
+        WindowVerdict::LogMissedEvent => panic!(
+            "test bug: U's Precommit PC (v + 1) formed but the log holds no nudge of U's Prepare PC (v) in \
+             v + 1 ({stop:?}): the filter missed an event; {trace}"
         ),
     }
     let after = cluster.max_committed();
