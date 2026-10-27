@@ -306,6 +306,7 @@ impl From<Configuration>
         };
         let block_sync_client_config = BlockSyncClientConfiguration {
             chain_id: val.chain_id,
+            me: keypair.public(),
             request_limit: val.block_sync_request_limit,
             response_timeout: val.block_sync_response_timeout,
             blacklist_expiry_time: val.block_sync_blacklist_expiry_time,
