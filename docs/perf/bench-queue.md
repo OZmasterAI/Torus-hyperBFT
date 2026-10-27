@@ -37,7 +37,7 @@ Pull tools from main before the next campaign that has crash cells.
 explicitly for mode-3 arms. Each cell logs `cell=<label> book_mode=... <flag>='...'` and records `cell.book_mode` /
 `cell.node_flags` in summary.json. Pull tools from main before the next campaign.
 
-**Live status (18c main session, updated s140):** QUEUE: empty (9p3 done, section 134: freeze / exclusion / AGREE PASS, post-exclusion blocks/s 0.894 of all-up FAILS the 0.90 line by cadence only; owner call). DONE s138-s140: 9k (section 125), 9n deep-book capacity (126, + restart probe 127; GATES the testnet launch: PASS, restart ~10 s accepted, then cut to 2-3 s by `b738520d`), 9o TC-set one-down (126; all-up -3.3% traced by the 9o scan (128) to batch A, fixed by `a35705da`, re-bench 133: matched/s 1.038), 9m exec profile (126: Phase 5 revisit triggered), 9l binary gap (127: not resolved, closed by owner), 9q epoch-plan hand-off (127 + 129: PASS, default ON `5e82fb49`), 9s batch A cost (130), 9r item 6 Phase 5 r2 (131: FAIL, parked), 9p dead-leader one-down (129: 3/7 kill cells froze -> fixes `3c5d02ea` + `9d28eb48`; rerun 132 on `5e82fb49`: PASS, 0/10 freezes), 9p3 below-saturation one-down (134: 0/8 freezes, 9p2 + 9p3 0/18 -> <= 17.6% at 95%; blocks/s criterion 0.894, FAIL). 9v vote-path cost of the validator-set-update fixes (135: `b42e5e98` vs `7251fc7c`, hotstuff-algo +2.8% CPU per block (paired CI +1.2..+4.5%), blocks/s and commit p99 level: PASS).
+**Live status (18c main session, updated s140):** QUEUE: empty (9p3 done, section 134: freeze / exclusion / AGREE PASS; post-exclusion blocks/s 0.894 of 4-val all-up, 0.999 ± 0.002 of the 3-val reference U3 (134.10, owner option c): all four criteria PASS). DONE s138-s140: 9k (section 125), 9n deep-book capacity (126, + restart probe 127; GATES the testnet launch: PASS, restart ~10 s accepted, then cut to 2-3 s by `b738520d`), 9o TC-set one-down (126; all-up -3.3% traced by the 9o scan (128) to batch A, fixed by `a35705da`, re-bench 133: matched/s 1.038), 9m exec profile (126: Phase 5 revisit triggered), 9l binary gap (127: not resolved, closed by owner), 9q epoch-plan hand-off (127 + 129: PASS, default ON `5e82fb49`), 9s batch A cost (130), 9r item 6 Phase 5 r2 (131: FAIL, parked), 9p dead-leader one-down (129: 3/7 kill cells froze -> fixes `3c5d02ea` + `9d28eb48`; rerun 132 on `5e82fb49`: PASS, 0/10 freezes), 9p3 below-saturation one-down (134: 0/8 freezes, 9p2 + 9p3 0/18 -> <= 17.6% at 95%; blocks/s 0.894 of 4-val all-up, but 0.999 of a 3-validator all-up U3 (134.10, owner option c): PASS, the gap is 3-of-3 vs 3-of-4 voting). 9v vote-path cost of the validator-set-update fixes (135: `b42e5e98` vs `7251fc7c`, hotstuff-algo +2.8% CPU per block (paired CI +1.2..+4.5%), blocks/s and commit p99 level: PASS).
 
 **Owner s138: benches UNPAUSED.** Order: 9k first (pre-TC `896240d4`, a clean "before"); then 9l / 9m / 9n in any order; 9o's "after" arm on main after batch 12 (D2 membership sync + lost-view timeout vote + reflexive lock rule; 18c pings when it lands; its "before" cells may run earlier); 9p held until dead-leader phase 3 lands. Main now has the TC set (`d3de0abb`, `CONSENSUS_DB_FORMAT` v1): wipe data dirs for cells built from it; dead-leader will bump to v2.
 
@@ -1235,7 +1235,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    0.981 (n.r.); RSS mean +27% / +13%. Cause: the exec thread's cache flush 0.53 -> 1.21 ms per 1k fills (x2.26 std,
    x2.33 deep) outweighs the encode moved to the flush worker (0.28 ms per 1k fills, 13-19 ms per job); exec busy
    0.88 -> 0.99, so blocks grow 2.2-2.4x. Fails every primary row; no gain claim.
-9p3. **[DONE s140, section 134: 3 of 4 criteria PASS, blocks/s criterion FAIL 0.894 ± 0.001 (owner call)] [GO s140, pin main `0261068b`] Below-saturation dead-leader one-down.** 9p2 (section 132) passed but ran near
+9p3. **[DONE s140, section 134: 4 of 4 criteria PASS with owner option (c): blocks/s 0.999 ± 0.002 of a 3-validator all-up (134.10); 0.894 ± 0.001 of 4-val all-up] [GO s140, pin main `0261068b`] Below-saturation dead-leader one-down.** 9p2 (section 132) passed but ran near
    CPU saturation (all-up ~26 of 32 cores; RATE 20000 -> 14000 changed nothing because MAX_IN_FLIGHT sets the load) and
    0 of 10 bounds the freeze rate only at <= 28% (95%). Same shape as 9p2 (4 val 1/1/1/1, `DL_K=3` on a arms, val3
    killed at 120 s, seed, wiped dirs, hand-off default on) with a lower `MAX_IN_FLIGHT` so all-up uses ~12-16 of 32
@@ -1254,6 +1254,13 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    +0.8%) and order age (154 / 597 vs 144 / 612 ms) are level: below saturation blocks/s is consensus cadence
    (likely quorum = all 3 survivors; untested), not throughput. Owner call: keep the blocks/s line or judge on
    matched/s + order age (or a 3-validator all-up reference).
+   **U3 reference done s140 (owner option c, chat msg 196; bench-ozarchy-s140-9p3u3-9v, run dir
+   ozarchy-s140-9p3u3-run, same stage c7 node `50c1cfeb`, 3 val 1/1/1, no kill, `BENCH_RPCS=0,1,2`, `DL_K=3`, rate
+   475 cap 4, 600 s, w1 + U3 n = 3, 4 / 4 cells rc 0 ACCEPT / AGREE / PASS, 0 FOREIGN; section 134.10):** U3 26.23-26.28
+   blocks/s, 0.895 of 4-val all-up. aK post-exclusion / U3 at the same offsets 0.999 ± 0.002 (0.997-1.001):
+   PASS; age p50 0.990, p99 1.020, matched/s 1.003 of U3. Slowest-survivor guess holds: view 34.0 -> 38.0 ms, leader
+   vote gather +4-6 ms per view (3 of 3 votes against 3 of 4), replica vote delay flat (5.5-5.8 ms); aK post and U3 equal
+   within 0.5 ms on every view metric. Which survivor is slowest per view is not measured (no per-vote lines).
 9v. **[DONE s140, section 135: PASS] [GO s140 (18c / owner chat msg 196), A = main `7251fc7c`, B = main `b42e5e98`] Vote-path cost of the
    validator-set-update fixes.** `b42e5e98` (Merge fix/vsu-laggard-and-collector `99e2f285`) refreshes the phase-vote
    collectors to the current validator set before each incoming vote is counted (`57893292`: ~5 RocksDB reads per vote

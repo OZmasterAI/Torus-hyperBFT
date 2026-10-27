@@ -22240,9 +22240,12 @@ Paired per round (B - A, r1..r4):
 
 ## 134. Step 9p3, below-saturation dead-leader one-down (section 132 follow-up) on main `0261068b`: 4 validators, stakes 1 / 1 / 1 / 1, `ORACLE_FEED=seed`, rate 475 (all-up ~14 of 32 cores), in-flight cap 4, `BENCH_RPCS=0,1,2`, K = `KILL_NO_RESTART=val3` at bench+120 s, aK (`DL_K=3`) vs bK (dead-leader off), ABBA n = 6, + all-up aU (`DL_K=3`) n = 3 interleaved, hash + attestation + L6.1 + L2.1 + fail-stop on, Classic, 15 s checkpoints, 600 s cells, load windows timed between the 15-minute desktop bursts (campaign bench-ozarchy-s140-9p3 + FOREIGN reruns bench-ozarchy-s140-9p3-rr, run dirs ozarchy-s140-9p3-run, -rerun-run, archy, 2026-10-26/27)
 
-**9p3: no freeze, the same exclusion on every survivor, AGREE everywhere. The blocks/s criterion fails by a hair:
-post-exclusion runs at 0.894 ± 0.001 of all-up at the same offsets (pass line 0.90). matched/s and order age are
-level with all-up.**
+**9p3: no freeze, the same exclusion on every survivor, AGREE everywhere. The blocks/s criterion fails by a hair
+against 4-validator all-up: post-exclusion runs at 0.894 ± 0.001 of all-up at the same offsets (pass line 0.90).
+matched/s and order age are level with all-up. Update (134.10, owner option c): against a 3-validator all-up (U3,
+the survivors' shape without a kill) post-exclusion blocks/s is 0.999 ± 0.002, so it PASSES. U3 itself runs at
+0.895 of 4-validator all-up: the gap is 3-of-3 against 3-of-4 voting, not dead-leader skip. All four criteria
+pass.**
 * Load knob (134.2): `RATE`, not `MAX_IN_FLIGHT`. Caps 1 / 2 / 3 left all-up at ~26 of 32 busy cores, as cap 4 in 9p2.
   At rate 14,000 the bench runs closed loop at ~1,080-1,120 submitted actions/s whatever the cap. 132.7's advice
   ("lower `MAX_IN_FLIGHT`, not `RATE`") was wrong. Busy cores scale with `RATE` below ~1,080 actions/s: 12.3 / 16.3 /
@@ -22256,9 +22259,10 @@ level with all-up.**
   * blocks/s **0.894 ± 0.001** (0.892-0.896, all 8 aK runs 0.891-0.896): **FAIL** against the 0.90 line.
   * matched/s -0.1% to +0.8%; order age p50 / p99 154 / 597 ms vs 144 / 612 ms all-up; 0.03 timeouts per minute.
   * At this rate load does not set the block rate (all-up 29.0-29.6 blocks/s at 400-700 actions/s and here).
-    26.3 vs 29.4 is a consensus-cadence gap between 3 live voters and 4. Likely cause (not tested): with val3 gone
-    the quorum (3 of 4 stake) needs every survivor's vote, so the slowest survivor sets each round. In 9p2 (0.966)
-    execution set the block rate.
+    26.3 vs 29.4 is a consensus-cadence gap between 3 live voters and 4. Likely cause: with val3 gone
+    the quorum (3 of 4 stake) needs every survivor's vote, so the slowest survivor sets each round. Confirmed in
+    134.10: a 3-validator all-up runs at the same 26.3 blocks/s, and the leader's vote gather is ~5 ms longer per
+    view. In 9p2 (0.966) execution set the block rate.
 * Exclusion: every aK cell logs one identical delta on val0 / val1 / val2 (exclude=1, readmit=0, excluded=1,
   H 6600-6800). bK never excludes (0 of 6 + smoke sB). State attestation equal and AGREE in all 19 load cells.
   0 HARD FINDING, 0 hand-off WARNs.
@@ -22498,20 +22502,22 @@ Windows (K cells, val0):
   val2 in every aK run and sA. bK never excludes.
 * **AGREE everywhere: PASS.** 19 load cells + 2 smokes AGREE, state attestation equal. One dissemination-only REJECT
   (rerun-r3-aK), the known kill-cell shape.
-* **Post-exclusion blocks/s >= 90% of all-up at the same offsets: FAIL (0.894 ± 0.001, max 0.896). High
-  confidence it is below 0.90; low impact.**
+* **Post-exclusion blocks/s >= 90% of all-up at the same offsets: FAIL against 4-validator all-up (0.894 ± 0.001,
+  max 0.896); PASS against the 3-validator reference U3 (0.999 ± 0.002, 134.10, owner option c). High
+  confidence in both; the 4-validator line measures voter count, not dead-leader skip.**
   * The shortfall is 1.0-1.2 blocks/s out of 29.4 in block cadence only. matched/s, order age and timeouts after
     the exclusion match all-up.
   * The criterion was written at saturation, where blocks/s tracked throughput (9p2: 0.966). Below saturation it
     measures the 3-voter vs 4-voter consensus round time instead.
-  * Whether that counts against dead-leader skip is the owner's call. One option: judge post-exclusion on matched/s
-    and order age (both level), or compare blocks/s to a 3-validator all-up.
+  * Whether that counts against dead-leader skip was the owner's call. The owner chose option (c), a comparison
+    with a 3-validator all-up: 134.10 runs it, and the criterion passes there (0.999).
 
 ### 134.8 Limits and next
 
 * n = 6 scored aK, 8 aK runs in all. The combined bound (17.6%) still allows a rare freeze; it is not proven zero.
-* The blocks/s cause (quorum = all 3 survivors) is a hypothesis. A 3-up / 1-absent-from-genesis reference cell, or
-  per-round vote-arrival timing, would test it.
+* The blocks/s cause (quorum = all 3 survivors) is confirmed by the 3-validator reference (134.10): U3 = aK
+  post-exclusion on blocks/s, view duration and vote gather. Which survivor is slowest in a given view is not
+  measured (no per-vote arrival lines).
 * 132.7's load advice is corrected here: `RATE` sets the load only below the closed-loop ceiling (~1,080 actions/s
   at cap 4, 5,000 senders). Above it the nodes saturate whatever the cap.
 * FOREIGN: the 15-minute desktop job is handled by burstwait (0 hits). The claude session that runs the bench still
@@ -22546,6 +22552,76 @@ Windows (K cells, val0):
   * `gaps9p3.py` -> `gaps9p3.txt`, `gaps9p3-rerun.txt`;
   * `foreign9p3.py` -> `foreign9p3.txt`, `foreign9p3-rerun.txt`;
   * `deltas9p3.txt`.
+
+### 134.10 3-validator reference (owner option c): U3 = the survivors' shape without a kill (campaign bench-ozarchy-s140-9p3u3-9v, run dir ozarchy-s140-9p3u3-run, archy, 2026-10-27)
+
+**Against a 3-validator all-up (U3), post-exclusion blocks/s is 0.999 ± 0.002 (0.997-1.001): PASS (line 0.90).
+The 0.894 of 134.5 is the gap between 3 voters and 4, and a chain started with 3 validators shows it too
+(U3 / aU 0.895). The slowest-survivor guess holds: each view waits ~5 ms longer for the third of three votes.**
+
+Setup (owner option c, chat msg 196): the same staged binary as 9p3 (stage c7 = main `0261068b`, node `50c1cfeb`, md5
+checked on every node of every cell), harness worktree `wt/bq-0261068b`, the same load and env as 9p3 (rate 475,
+in-flight cap 4, 5,000 senders, seed oracle, 600 s cells, wiped dirs, hand-off default on, `DL_K=3`). Changes:
+`N_VALIDATORS=3`, `VALIDATOR_STAKES=1,1,1`, no kill. Validators val0..val2 are 9p3's survivors, and
+`BENCH_RPCS=0,1,2` is the same RPC load the survivors took in 9p3. With 3 equal stakes the quorum is again all 3
+votes, as for the survivors after the kill (val3 stays in the set with 1 of 4 stake). Order: unscored w1 + U3 r1..r3,
+from one generated driver (`ozarchy-s140-9p3u3-tools/drivers/ozarchy-s140-9p3u3-campaign.sh`, spec
+`specs/9p3u3.json` from `make-specs-9p3u3.py`). Checks: `configchk3` / `handoffchk3` (val0..val2), plus run.log
+expectations (stakes 1,1,1, `genesis validators=3`, no `4-validator devnet` line, no val3 start) and
+`RPC endpoints: 3`. burstwait paced the cells.
+
+* Validity: smoke (120 s, `ozarchy-s140-9p3u3-smk-smoke-s0`) and all 4 cells rc 0, ACCEPT / AGREE / PASS, state
+  attestation equal (63 checkpoints each). 0 timeouts, 0 panic / fail-stop / HARD FINDING lines.
+* FOREIGN: 0 of 4 cells broke the rule (max 2 s interval 0.24-0.37 core, all a claude session); no reruns.
+  burstwait kept every load window off the desktop burst. That burst's phase moved to :03:37 on 2026-10-27, so
+  the phase seeds were re-sampled before the launch (see section 135.1).
+* U3 whole load window (val0): blocks/s 26.23 / 26.28 / 26.28, matched/s 94,744 / 94,748 / 94,760, order age
+  p50 / p99 155 / 587, 155 / 585, 154 / 583 ms. Smoke: 26.10 blocks/s.
+
+Post-exclusion (9p3 scored aK, the windows of 134.5) against U3 at the same wall offsets from load start (mean of the
+3 U3 cells; `analyst/u3cmp.py` -> `u3cmp.txt`):
+
+| aK cell | post window | aK blk/s | U3 blk/s | aK / U3 | U3 / aU | age p50 aK / U3 ms | age p99 aK / U3 ms | matched/s aK vs U3 |
+|---|---|---|---|---|---|---|---|---|
+| r1-aK | +215..+612 s | 26.29 | 26.35 | 0.998 | 0.895 | 155 / 156 | 614 / 585 | +0.2% |
+| r2-aK | +190..+612 s | 26.38 | 26.35 | 1.001 | 0.894 | 154 / 156 | 589 / 585 | +0.1% |
+| rerun-r3-aK | +174..+613 s | 26.34 | 26.36 | 0.999 | 0.895 | 154 / 156 | 601 / 585 | +0.8% |
+| r4-aK | +180..+613 s | 26.27 | 26.36 | 0.997 | 0.895 | 154 / 156 | 590 / 585 | +0.1% |
+| r5-aK | +217..+613 s | 26.34 | 26.35 | 1.000 | 0.894 | 154 / 156 | 604 / 585 | +0.5% |
+| r6-aK | +207..+613 s | 26.33 | 26.35 | 0.999 | 0.894 | 154 / 156 | 584 / 585 | -0.1% |
+| **mean ± 95% CI (n = 6)** | | | | **0.999 ± 0.002** | 0.895 ± 0.000 | 0.990 ± 0.003 | 1.020 ± 0.020 | 1.003 ± 0.003 |
+
+Slowest-survivor check. The node logs have no per-vote arrival lines, so this uses the per-node view histograms in
+`sampler.csv`: ms per event over the windows above, mean of the 6 aK post windows, val0 / val1 / val2.
+
+| metric | aK post-exclusion | U3 (3 of 3 votes) | aU (3 of 4 votes) |
+|---|---|---|---|
+| views/s | 26.3 / 26.3 / 26.3 | 26.3 / 26.3 / 26.3 | 29.5 / 29.5 / 29.5 |
+| view duration | 38.0 / 38.0 / 38.0 | 38.0 / 38.0 / 38.0 | 34.0 / 34.0 / 34.0 |
+| vote gather (leader) | 29.6 / 30.1 / 29.5 | 29.1 / 29.5 / 29.3 | 23.2 / 25.8 / 24.2 |
+| QC collect (leader) | 37.2 / 36.3 / 37.3 | 38.8 / 38.1 / 38.3 | 33.4 / 32.8 / 32.3 |
+| proposal arrival (replica) | 28.0 / 28.6 / 27.8 | 29.1 / 29.3 / 29.2 | 21.9 / 22.6 / 22.4 |
+| vote delay (replica) | 5.7 / 5.7 / 5.7 | 5.6 / 5.5 / 5.5 | 5.7 / 5.8 / 5.8 |
+
+* A replica's vote delay is the same in all three (5.5-5.8 ms), so no voter got slower. What changes is how long the
+  leader waits for votes: +4-6 ms per view with 3 of 3 against 3 of 4. With 4 voters the quorum ignores the slowest
+  vote; with 3 it must wait for it. The view grows 34.0 -> 38.0 ms, which is 29.5 -> 26.3 views/s (0.89).
+* aK post-exclusion and U3 agree within 0.5 ms on every row. The dead-leader exclusion adds no cadence cost of its
+  own. The cost is the voter count.
+* Not resolved: which survivor is the slowest in a given view. That needs per-vote arrival timing, which the nodes
+  do not log.
+
+Verdict update for 134.7, criterion 4: **post-exclusion blocks/s ≥ 90% of a matching all-up: PASS against U3
+(0.999 ± 0.002)**. Against 4-validator all-up it stays 0.894 (FAIL), but U3 shows the same 0.895, so that line
+compares 3-of-3 voting with 3-of-4 voting, not dead-leader skip with no skip. With option (c) all four 9p3 criteria
+pass.
+
+Data: cells `ozarchy-s140-9p3u3-{w1,r1-U3,r2-U3,r3-U3}` and smoke `ozarchy-s140-9p3u3-smk-smoke-s0`. Run dir
+`ozarchy-s140-9p3u3-run/` (`campaign.log`, `campaign.done` exit=0, `cells.tsv`, `foreign.txt`,
+`burstwait-state.tsv`, `chain.log`, `chain.done`, `smoke-chain.log`, `smk/`). Tools `ozarchy-s140-9p3u3-tools/`:
+`make-specs-9p3u3.py`, `specs/`, `drivers/` (+ `.gen` / `.dry` / `.show` logs), `checks/9p3u3-checks.sh`, `prof/`
+(`burstwait.py`, `foreign-sampler.py`, `run-with-sampler.sh`, `phase/foreign-phase.txt`), `smoke-chain.sh`,
+`campaign-chain.sh`, and `analyst/u3cmp.py` -> `u3cmp.txt`, `foreign9p3u3.txt`.
 
 ## 135. Step 9v, vote-path cost of the validator-set-update fixes: A = main `7251fc7c` vs B = main `b42e5e98` (Merge fix/vsu-laggard-and-collector `99e2f285`), U (all up) only, stakes 2 / 2 / 1, `ORACLE_FEED=seed`, frozen `9083b278` harness genesis, hash + attestation + L6.1 + L2.1 + fail-stop on, Classic, 15 s checkpoints, w1 (A, unscored) + ABBA n = 3 (A B B A A B), 300 s cells, load windows timed between the 15-minute desktop bursts (campaign bench-ozarchy-s140-9p3u3-9v, part 2; run dir ozarchy-s140-9v-run, archy, 2026-10-27)
 
