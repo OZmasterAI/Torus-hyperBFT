@@ -301,9 +301,10 @@ fn power_shape() -> PowerShape {
 }
 
 fn old_quorum_generic_votes(p: &mut PowerShape, hotstuff: &mut crate::hotstuff::implementation::HotStuff<crate::hotstuff::header_fast_path_regression_test::NullNetwork>) {
-    for key in p.keys[..3].to_vec() {
+    let PowerShape { keys, tree, b, .. } = p;
+    for key in &keys[..3] {
         hotstuff
-            .on_receive_msg(HotStuffMessage::PhaseVote(vote(&key, 11, p.b.hash, Phase::Generic)), &key.verifying_key(), &mut p.tree, &mut InFlightApp)
+            .on_receive_msg(HotStuffMessage::PhaseVote(vote(key, 11, b.hash, Phase::Generic)), &key.verifying_key(), tree, &mut InFlightApp)
             .expect("processing a vote must not error");
     }
 }
