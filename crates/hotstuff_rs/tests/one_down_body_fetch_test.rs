@@ -248,14 +248,31 @@ fn survivors_fetch_each_others_bodies_without_asking_the_dead_validator() {
 
     let deadline = Instant::now() + Duration::from_secs(90);
     let failure = loop {
+        // A pending fetch whose block the requester now holds: delivered some other way. Asked
+        // with the probe released: the block-sync server sends while it holds its block-tree
+        // snapshot (the MemDB lock), and every send goes through the probe, so the probe must
+        // never be held across `has_block` (lock-order inversion, s140 review P1).
+        let pending: Vec<(VerifyingKey, CryptoHash)> = {
+            let p = probe.lock().unwrap();
+            p.fetches
+                .iter()
+                .filter(|(_, f)| f.body_at.is_none() && f.other_at.is_none())
+                .map(|(&key, _)| key)
+                .collect()
+        };
+        let held: Vec<((VerifyingKey, CryptoHash), Instant)> = pending
+            .into_iter()
+            .filter_map(|(requester, hash)| {
+                let holder = keys.iter().position(|k| *k == requester).and_then(|i| nodes.get(i))?;
+                let now = Instant::now();
+                holder.has_block(&hash).then_some(((requester, hash), now))
+            })
+            .collect();
         let mut p = probe.lock().unwrap();
-        // A pending fetch whose block the requester now holds: delivered some other way.
-        let now = Instant::now();
-        for ((requester, hash), f) in p.fetches.iter_mut() {
-            if f.body_at.is_none() && f.other_at.is_none() {
-                let holder = keys.iter().position(|k| k == requester).and_then(|i| nodes.get(i));
-                if holder.is_some_and(|n| n.has_block(hash)) {
-                    f.other_at = Some((now, "its block tree"));
+        for (key, at) in held {
+            if let Some(f) = p.fetches.get_mut(&key) {
+                if f.body_at.is_none() && f.other_at.is_none() {
+                    f.other_at = Some((at, "its block tree"));
                 }
             }
         }
