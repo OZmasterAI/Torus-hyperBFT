@@ -849,10 +849,13 @@ struct PrecommitWindowLog {
     reproposals: BTreeSet<u64>,
     /// Senders of Prepare votes for U, per view.
     prepare_votes: BTreeMap<u64, BTreeSet<usize>>,
-    /// Every distinct header and nudge sent from U on, for the failure message: (view, sender,
-    /// kind, on U, justify phase and view, TC view).
-    events: BTreeSet<(u64, usize, &'static str, bool, String, u64, Option<u64>)>,
+    /// Every distinct header and nudge sent from U on, for the failure message.
+    events: BTreeSet<WindowEvent>,
 }
+
+/// A header or nudge in the silent-leader window: (view, sender, kind, on U, justify phase and
+/// view, TC view).
+type WindowEvent = (u64, usize, &'static str, bool, String, u64, Option<u64>);
 
 /// One old-set validator is silent and leads the view right after the update block's Precommit PC
 /// (s138, reported by the D2 builder: a window livelocked in 3 of 9 runs with one old-set
