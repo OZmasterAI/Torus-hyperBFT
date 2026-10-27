@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# health-3val.sh — verify the WSL 3-val devnet (4 with N_VALIDATORS=4) is healthy at idle.
+# health-3val.sh — verify the WSL 3-val devnet (4..7 with N_VALIDATORS=4..7) is healthy at idle.
 # Scrapes each node's /metrics twice, WINDOW seconds apart, and reports:
 #   - idle block rate  = d(torus_blocks_committed_total)/dt   (NODE counter only)
 #   - height agreement = torus_block_height per node
@@ -22,8 +22,8 @@ scrape() { # $1=port $2=metric -> summed value as a bare integer (0 if absent/do
 
 declare -A H0 C0
 ports=($METRICS_PORTS)
-labels=(val0 val1 val2)
-[ "$N_VALIDATORS" = 4 ] && labels+=(val3)
+labels=()
+for i in $(seq 0 $(( N_VALIDATORS - 1 ))); do labels+=("val$i"); done
 NODE_IDX=$(seq 0 $(( N_VALIDATORS - 1 )))
 MIN_PEERS=$(( N_VALIDATORS - 1 ))
 

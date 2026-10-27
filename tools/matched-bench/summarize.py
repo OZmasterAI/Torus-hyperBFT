@@ -55,7 +55,7 @@ def genesis_book_mode_digit(v):
 GENESIS_BOOK_MODE = genesis_book_mode_digit(A.genesis_book_mode)
 
 # run-cell.sh N_VALIDATORS=4 (the 4-validator devnet, dead-leader bench 9p): val3 is a
-# validator like the other three. The count is this run's: run-id.json n_validators
+# validator like the other three (N_VALIDATORS=3..7: val0..valN-1). The count is this run's: run-id.json n_validators
 # (reset_run_artifacts writes it at cell start, so an OVERWRITE=1 3-validator rerun of a
 # former 4-validator dir is 3 whatever val3 files are left). A run-id.json without it (a
 # cell from before the field): a val3 iff run-cell.sh scraped metrics-before-val3.txt;
@@ -66,12 +66,12 @@ def run_validator_count(out):
             n = json.load(f).get("n_validators")
     except (OSError, ValueError, AttributeError):
         n = None
-    if n in (3, 4):
+    if n in (3, 4, 5, 6, 7):
         return n
     return 4 if os.path.exists(os.path.join(out, "metrics-before-val3.txt")) else 3
 
 
-ALL_NODES = ("val0", "val1", "val2", "val3")[:run_validator_count(OUT)]
+ALL_NODES = tuple("val%d" % i for i in range(run_validator_count(OUT)))
 
 # ---------------------------------------------------------------- no-restart kill
 # run-cell.sh KILL_NO_RESTART=val<i> (the one-validator-down baseline):

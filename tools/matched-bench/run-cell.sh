@@ -101,7 +101,7 @@
 #                values). BLOCK_CAP=200 = the r3-s75 default; BLOCK_CAP=100
 #                = the pre-r4 cap-100 control.
 #   BENCH_RPCS=all  bench ingress over all three validators (the bench pins
-#                sender i to url i % 3; all four, i % 4, with N_VALIDATORS=4).
+#                sender i to url i % 3; all N, i % N, with N_VALIDATORS=N).
 #                DEFAULT since s76 (unset = all).
 #                BENCH_RPCS=0 = val0 only, the ingress every pre-s76 cell used.
 #                BENCH_RPCS=0,1 (a comma list of distinct validator indices)
@@ -147,12 +147,12 @@
 #                (logged, crash-kill.skipped). Per-kill chain freeze:
 #                tools/matched-bench/crash-freeze.py <results-dir>.
 #   KILL_NODE    which validator the crash gate kills: val1 (default) or val2
-#                (or val3 with N_VALIDATORS=4).
+#                (or val3..val<N-1> with N_VALIDATORS=N, 4..7).
 #                NEVER val0 (it serves the bench RPC and every headline number),
 #                and never anything outside this devnet — see the guard in
 #                crash-kill.sh.
 #   KILL_NO_RESTART=val1|val2  KILL_NO_RESTART_AT_S=N  ONE VALIDATOR DOWN (s134
-#                baseline; val3 too with N_VALIDATORS=4, never val0): N
+#                baseline; val3..val<N-1> too with N_VALIDATORS=N, never val0): N
 #                seconds into the load, SIGKILL that validator and
 #                NEVER restart it (crash-kill.sh norestart: the same target guard;
 #                its line in $RUN_DIR/pids is blanked, kill-norestart.json records
@@ -181,12 +181,12 @@
 #                age p50/p90/p99; .headline.killed_node. MAX_IN_FLIGHT's block
 #                tail reads val1 instead of val2 when val2 is the one killed.
 #   VALIDATOR_STAKES=a,b,c  per-validator stake weights of the cell genesis
-#                (a,b,c,d with N_VALIDATORS=4, val0..val3)
+#                (a,b,c,d with N_VALIDATORS=4, val0..val3; N weights with N_VALIDATORS=N)
 #                (gen-3val-genesis.sh: stake = weight x the 1M TRS base stake;
 #                positive integers). A genesis input (genesis_cache.py keys it).
 #                Unset (default) = the equal base stakes, genesis byte-identical.
 #                A run-cell.sh knob, never EXTRA_ENV (refused there).
-#   HOTSTUFF_CPUS=a/b/c  (a/b/c/d with N_VALIDATORS=4) pin each node's
+#   HOTSTUFF_CPUS=a/b/c  (a/b/c/d with N_VALIDATORS=4, N lists with N) pin each node's
 #                "hotstuff-algo" thread (the consensus
 #                thread, named by the node binary) to CPU list a / b / c (one
 #                CPU or a range per node, taskset syntax, e.g. 2/6/10 or
@@ -472,7 +472,7 @@
 #   PRELOAD_DISTANCE=D (default 1000 ticks; > BAND)  PRELOAD_LEVELS=L (default
 #                100 price levels per side)  PRELOAD_RATE=R (default 50
 #                actions/s)  PRELOAD_TIMEOUT=S (default 900 s to reach N).
-#   N_VALIDATORS=3|4  the devnet's validator count (default 3: everything as
+#   N_VALIDATORS=3..7  the devnet's validator count (default 3: everything as
 #                before, byte for byte). 4 = the dead-leader bench 9p devnet
 #                (owner s138: at 2:2:1 with the stake-1 node down no
 #                validator-set update can commit, docs/plans/dead-leader-skip.md
@@ -494,6 +494,15 @@
 #                otherwise. The state-hash attest drain bound and the feed-live
 #                mempool bound scale with the validator count (2 x N). A
 #                run-cell.sh knob, never EXTRA_ENV.
+#                5..7 (all-up shapes up to 7 equal-stake validators, 18c msg
+#                201): the same per-node steps over val0..val<N-1>; val<i> =
+#                ed25519 key 0<i+1>, RPC 8645+i / metrics 9161+i / p2p 30401+i,
+#                dialing every lower-index validator; keys in
+#                devnet/wsl/keys-<N>val/ (gen-3val-genesis.sh adds val4..val6 to
+#                devnet/genesis.json's 4 validators). KILL_NO_RESTART may name
+#                val1..val<N-1>; VALIDATOR_STAKES / HOTSTUFF_CPUS take N entries.
+#                Pre-flight refuses a worktree / TOOLS_DIR without the 3..7
+#                support (the marker N_VALIDATORS=3..7). 3 and 4 are unchanged.
 #   DL_K=K  DL_JCAP=J  dead-leader skip genesis parameters (branch
 #                feat/dead-leader-p3): consensus.leader_miss_threshold = K (0 =
 #                off, else 2..=64; node default 0 = off, owner s138) and
@@ -508,7 +517,7 @@
 #                .leader_exclusion_cap. run-cell.sh knobs, never EXTRA_ENV.
 #   DL_REPORT=0|1  the dead-leader window report (bench 9p, dl_window.py beside
 #                this script): needs KILL_NO_RESTART; default 1 when
-#                N_VALIDATORS=4 and KILL_NO_RESTART are set, else 0. Splits the
+#                N_VALIDATORS>=4 and KILL_NO_RESTART are set, else 0. Splits the
 #                load window into pre_kill [bench start, kill], kill_to_exclusion
 #                [kill, exclusion update committed] and post_exclusion
 #                [committed, bench end], per survivor: blk/s, committed blk/s,
@@ -629,12 +638,14 @@ DL_K=${DL_K:-}
 DL_JCAP=${DL_JCAP:-}
 DL_REPORT=${DL_REPORT:-}
 case "$N_VALIDATORS" in
-    3|4) ;;
-    *) echo "FATAL: N_VALIDATORS must be 3 or 4 (got '$N_VALIDATORS')" >&2; exit 2 ;;
+    3|4|5|6|7) ;;
+    *) echo "FATAL: N_VALIDATORS must be 3 to 7 (got '$N_VALIDATORS')" >&2; exit 2 ;;
 esac
-# every validator index; ALL_IDX = 0 1 2 unless N_VALIDATORS=4
+# every validator index: ALL_IDX = 0 .. N_VALIDATORS-1 (0 1 2 by default)
 ALL_IDX=(0 1 2)
-[ "$N_VALIDATORS" = 3 ] || ALL_IDX+=(3)
+# killable_names: the KILL_NODE / KILL_NO_RESTART choices, "val1 or val2" (+ " or val<i>" per further validator)
+killable_names() { local i out="val1 or val2"; for ((i = 3; i < N_VALIDATORS; i++)); do out+=" or val$i"; done; printf '%s' "$out"; }
+for ((i = 3; i < N_VALIDATORS; i++)); do ALL_IDX+=("$i"); done
 HOTSTUFF_CPUS=${HOTSTUFF_CPUS:-}
 SCHED_THREADS="hotstuff-algo torus-execution torus-flush-worker"
 ORACLE_FEED=${ORACLE_FEED:-seed}
@@ -666,8 +677,8 @@ LIQUIDATOR_VAULT=0x746f7275732d6c697175696461746f722d766c74
 ADL_ESCROW_LONG=0x746f7275732d61646c2d657363726f772d6c6e67
 ADL_ESCROW_SHORT=0x746f7275732d61646c2d657363726f772d736874
 ORACLE_KEYS="$MAINREPO/devnet/wsl/bench-validator-keys.json"
-# 4-validator devnet: the same 3 keys + val3's (and its oracle signer beside it)
-[ "$N_VALIDATORS" = 3 ] || ORACLE_KEYS="$MAINREPO/devnet/wsl/keys-4val/bench-validator-keys.json"
+# N-validator devnet (4..7): the same 3 keys + val3..val<N-1>'s (and their oracle signers beside them)
+[ "$N_VALIDATORS" = 3 ] || ORACLE_KEYS="$MAINREPO/devnet/wsl/keys-${N_VALIDATORS}val/bench-validator-keys.json"
 ORACLE_FRESH_TIMEOUT=90
 OUT="$RESULTS_ROOT/$LABEL"
 
@@ -819,7 +830,7 @@ else
 fi
 
 RPCS=(http://127.0.0.1:8645 http://127.0.0.1:8646 http://127.0.0.1:8647)
-[ "$N_VALIDATORS" = 3 ] || RPCS+=(http://127.0.0.1:8648)
+for i in "${ALL_IDX[@]:3}"; do RPCS+=("http://127.0.0.1:$((8645 + i))"); done
 # s76: which validators take bench ingress (see BENCH_RPCS in the usage).
 bench_rpc_urls() {
     local i seen=, out=() hi=$(( ${#RPCS[@]} - 1 ))
@@ -841,7 +852,7 @@ bench_rpc_urls() {
 }
 BENCH_RPC_URLS=$(bench_rpc_urls) || exit 2
 METS=(9161 9162 9163)
-[ "$N_VALIDATORS" = 3 ] || METS+=(9164)
+for i in "${ALL_IDX[@]:3}"; do METS+=($((9161 + i))); done
 METS_URLS=(); for i in "${ALL_IDX[@]}"; do METS_URLS+=("http://127.0.0.1:${METS[$i]}/metrics"); done
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$OUT/run.log"; }
@@ -1000,6 +1011,9 @@ done
 if [ "$N_VALIDATORS" = 3 ]; then
     [ -z "$VALIDATOR_STAKES" ] || [[ "$VALIDATOR_STAKES" =~ ^[1-9][0-9]{0,5},[1-9][0-9]{0,5},[1-9][0-9]{0,5}$ ]] \
         || { echo "FATAL: VALIDATOR_STAKES must be three positive integer stake weights a,b,c (val0,val1,val2; got '$VALIDATOR_STAKES')" >&2; exit 2; }
+elif [ "$N_VALIDATORS" -ge 5 ]; then
+    [ -z "$VALIDATOR_STAKES" ] || [[ "$VALIDATOR_STAKES" =~ ^[1-9][0-9]{0,5}(,[1-9][0-9]{0,5}){$((N_VALIDATORS - 1))}$ ]] \
+        || { echo "FATAL: VALIDATOR_STAKES must be $N_VALIDATORS positive integer stake weights with N_VALIDATORS=$N_VALIDATORS (val0..val$((N_VALIDATORS - 1)); got '$VALIDATOR_STAKES')" >&2; exit 2; }
 else
     [ -z "$VALIDATOR_STAKES" ] || [[ "$VALIDATOR_STAKES" =~ ^[1-9][0-9]{0,5},[1-9][0-9]{0,5},[1-9][0-9]{0,5},[1-9][0-9]{0,5}$ ]] \
         || { echo "FATAL: VALIDATOR_STAKES must be four positive integer stake weights a,b,c,d with N_VALIDATORS=4 (val0..val3; got '$VALIDATOR_STAKES')" >&2; exit 2; }
@@ -1053,6 +1067,16 @@ if [ "$N_VALIDATORS" = 4 ]; then
             || { echo "FATAL: N_VALIDATORS=4 but $TOOLS_DIR/$f has no 4-node support (TOOLS_FROM_WORKTREE=$TOOLS_FROM_WORKTREE; point TOOLS_DIR= at a tools/matched-bench with it, or merge the harness branch into the worktree)" >&2; exit 1; }
     done
     [ -s "$ORACLE_KEYS" ] || { echo "FATAL: N_VALIDATORS=4 needs $ORACLE_KEYS (the 4 validators' account keys)" >&2; exit 1; }
+elif [ "$N_VALIDATORS" -ge 5 ]; then
+    # 5..7 validators: the worktree's devnet/wsl knows val<N-1> (env.sh KEY<N-1>, start-node.sh's full mesh) and the
+    # scoring tools take up to 7 nodes (the marker N_VALIDATORS=3..7)
+    { grep -q "^KEY$((N_VALIDATORS - 1))=" "$WSL/env.sh" 2>/dev/null && grep -q 'N_VALIDATORS=3..7' "$WSL/start-node.sh" 2>/dev/null; } \
+        || { echo "FATAL: N_VALIDATORS=$N_VALIDATORS but $WSL (env.sh / start-node.sh) has no $N_VALIDATORS-validator devnet: merge the harness branch (tools/make-driver-nval) into the worktree" >&2; exit 1; }
+    for f in summarize.py health.py collect_logs.py crash-kill.sh; do
+        grep -q 'N_VALIDATORS=3..7' "$TOOLS_DIR/$f" 2>/dev/null \
+            || { echo "FATAL: N_VALIDATORS=$N_VALIDATORS but $TOOLS_DIR/$f has no 3..7-node support (TOOLS_FROM_WORKTREE=$TOOLS_FROM_WORKTREE; point TOOLS_DIR= at a tools/matched-bench with it, or merge the harness branch into the worktree)" >&2; exit 1; }
+    done
+    [ -s "$ORACLE_KEYS" ] || { echo "FATAL: N_VALIDATORS=$N_VALIDATORS needs $ORACLE_KEYS (the $N_VALIDATORS validators' account keys)" >&2; exit 1; }
 fi
 
 case "$ORACLE_FEED" in
@@ -1170,11 +1194,9 @@ if [ -n "$CRASH_KILL_AT_S" ]; then
     # shellcheck source=/dev/null
     CRASH_KILL_LIB=1 source "$TOOLS_DIR/crash-kill.sh"
     case "$KILL_NODE" in
-        val1) KILL_IDX=1 ;;
-        val2) KILL_IDX=2 ;;
-        val3) [ "$N_VALIDATORS" = 4 ] && KILL_IDX=3 ;;
+        val[1-6]) [ "${KILL_NODE#val}" -lt "$N_VALIDATORS" ] && KILL_IDX=${KILL_NODE#val} ;;
     esac
-    [ -n "$KILL_IDX" ] || { echo "FATAL: KILL_NODE must be val1 or val2$([ "$N_VALIDATORS" = 4 ] && echo ' or val3') (never val0 — it serves the bench RPC and every headline number)" >&2; exit 2; }
+    [ -n "$KILL_IDX" ] || { echo "FATAL: KILL_NODE must be $(killable_names) (never val0 — it serves the bench RPC and every headline number)" >&2; exit 2; }
     crash_kill_list_ok "$CRASH_KILL_AT_S" "$DUR" || {
         echo "FATAL: CRASH_KILL_AT_S=$CRASH_KILL_AT_S is not a valid kill list for a ${DUR}s cell (each offset >= 10 and <= $((DUR-30)); killing during the drain hangs the agreement probe; a list must strictly increase with >= ${CRASH_KILL_MIN_GAP_S}s between kills)" >&2; exit 2; }
     IFS=, read -r -a CRASH_AT <<< "$CRASH_KILL_AT_S"
@@ -1185,7 +1207,7 @@ fi
 # LIVE_IDX = the validators that take part after the load (the survivors).
 KNR_IDX=""
 LIVE_IDX=(0 1 2)
-[ "$N_VALIDATORS" = 3 ] || LIVE_IDX+=(3)
+for i in "${ALL_IDX[@]:3}"; do LIVE_IDX+=("$i"); done
 if [ -n "$KILL_NO_RESTART" ] || [ -n "$KILL_NO_RESTART_AT_S" ]; then
     [ -n "$KILL_NO_RESTART" ] && [ -n "$KILL_NO_RESTART_AT_S" ] \
         || { echo "FATAL: KILL_NO_RESTART (val1|val2) and KILL_NO_RESTART_AT_S (seconds into the load) go together" >&2; exit 2; }
@@ -1194,11 +1216,9 @@ if [ -n "$KILL_NO_RESTART" ] || [ -n "$KILL_NO_RESTART_AT_S" ]; then
     # shellcheck source=/dev/null
     CRASH_KILL_LIB=1 source "$TOOLS_DIR/crash-kill.sh"
     case "$KILL_NO_RESTART" in
-        val1) KNR_IDX=1 ;;
-        val2) KNR_IDX=2 ;;
-        val3) [ "$N_VALIDATORS" = 4 ] && KNR_IDX=3 ;;
+        val[1-6]) [ "${KILL_NO_RESTART#val}" -lt "$N_VALIDATORS" ] && KNR_IDX=${KILL_NO_RESTART#val} ;;
     esac
-    [ -n "$KNR_IDX" ] || { echo "FATAL: KILL_NO_RESTART must be val1 or val2$([ "$N_VALIDATORS" = 4 ] && echo ' or val3') (never val0 — it serves the bench RPC and every headline number)" >&2; exit 2; }
+    [ -n "$KNR_IDX" ] || { echo "FATAL: KILL_NO_RESTART must be $(killable_names) (never val0 — it serves the bench RPC and every headline number)" >&2; exit 2; }
     # the selected tools must know the mode: a candidate worktree's older copies would kill and restart, drain
     # all three nodes (never quiet), or score two agreement rows as INCOMPLETE
     { declare -F crash_norestart_quorum_ok >/dev/null && grep -q -- '--exclude' "$TOOLS_DIR/health.py" 2>/dev/null \
@@ -1206,14 +1226,16 @@ if [ -n "$KILL_NO_RESTART" ] || [ -n "$KILL_NO_RESTART_AT_S" ]; then
         || { echo "FATAL: KILL_NO_RESTART needs crash-kill.sh norestart, health.py drain --exclude and a summarize.py that reads kill-norestart.json, and $TOOLS_DIR lacks one (TOOLS_FROM_WORKTREE=$TOOLS_FROM_WORKTREE; point TOOLS_DIR= at a newer tools/matched-bench)" >&2; exit 1; }
     crash_kill_at_ok "$KILL_NO_RESTART_AT_S" "$DUR" \
         || { echo "FATAL: KILL_NO_RESTART_AT_S=$KILL_NO_RESTART_AT_S is not inside the load window of a ${DUR}s cell (>= 10 and <= $((DUR-30)); DUR >= 40)" >&2; exit 2; }
-    KNR_STAKES=${VALIDATOR_STAKES:-1,1,1}
-    [ "$N_VALIDATORS" = 3 ] || KNR_STAKES=${VALIDATOR_STAKES:-1,1,1,1}
+    KNR_STAKES=${VALIDATOR_STAKES:-$(IFS=,; a=("${ALL_IDX[@]/*/1}"); echo "${a[*]}")}
     if [ "$N_VALIDATORS" = 3 ]; then
         crash_norestart_quorum_ok "$KNR_IDX" "$KNR_STAKES" \
             || { echo "FATAL: KILL_NO_RESTART=$KILL_NO_RESTART: the two validators left would hold no consensus quorum (> 2/3 of the power) under stakes ${VALIDATOR_STAKES:-1,1,1} (VALIDATOR_STAKES): the chain would halt at the kill. Use VALIDATOR_STAKES=2,2,1 with KILL_NO_RESTART=val2" >&2; exit 2; }
-    else
+    elif [ "$N_VALIDATORS" = 4 ]; then
         crash_norestart_quorum_ok "$KNR_IDX" "$KNR_STAKES" \
             || { echo "FATAL: KILL_NO_RESTART=$KILL_NO_RESTART: the three validators left would hold no consensus quorum (> 2/3 of the power) under stakes $KNR_STAKES (VALIDATOR_STAKES): the chain would halt at the kill. Equal stakes (unset) keep 3/4; 2,2,1,1 needs val2 or val3 down" >&2; exit 2; }
+    else
+        crash_norestart_quorum_ok "$KNR_IDX" "$KNR_STAKES" \
+            || { echo "FATAL: KILL_NO_RESTART=$KILL_NO_RESTART: the $((N_VALIDATORS - 1)) validators left would hold no consensus quorum (> 2/3 of the power) under stakes $KNR_STAKES (VALIDATOR_STAKES): the chain would halt at the kill. Equal stakes (unset) keep $((N_VALIDATORS - 1))/$N_VALIDATORS" >&2; exit 2; }
     fi
     [ "$ORACLE_FEED" != 1 ] || { echo "FATAL: KILL_NO_RESTART with ORACLE_FEED=1: a fresh oracle aggregate needs all 3 validators, the marks would go stale at the kill" >&2; exit 2; }
     ! evm_load_on || { echo "FATAL: KILL_NO_RESTART with EVM_LOAD_RATE > 0: the EVM senders are pinned one validator each" >&2; exit 2; }
@@ -1224,9 +1246,9 @@ if [ -n "$KILL_NO_RESTART" ] || [ -n "$KILL_NO_RESTART_AT_S" ]; then
     for i in "${ALL_IDX[@]}"; do [ "$i" = "$KNR_IDX" ] || LIVE_IDX+=("$i"); done
 fi
 LIVE_RPCS=(); for i in "${LIVE_IDX[@]}"; do LIVE_RPCS+=("${RPCS[$i]}"); done
-# Dead-leader window report (DL_REPORT): default on for a 4-validator no-restart kill cell.
+# Dead-leader window report (DL_REPORT): default on for a 4..7-validator no-restart kill cell.
 case "$DL_REPORT" in
-    '') if [ "$N_VALIDATORS" = 4 ] && [ -n "$KNR_IDX" ]; then DL_REPORT=1; else DL_REPORT=0; fi ;;
+    '') if [ "$N_VALIDATORS" -ge 4 ] && [ -n "$KNR_IDX" ]; then DL_REPORT=1; else DL_REPORT=0; fi ;;
     0) ;;
     1) [ -n "$KNR_IDX" ] || { echo "FATAL: DL_REPORT=1 needs KILL_NO_RESTART (the windows start at the kill)" >&2; exit 2; } ;;
     *) echo "FATAL: DL_REPORT must be 0 or 1 (got '$DL_REPORT')" >&2; exit 2 ;;
@@ -1442,7 +1464,7 @@ if [ -f "$RUN_DIR/pids" ] && xargs -a "$RUN_DIR/pids" -r -I{} kill -0 {} 2>/dev/
     echo "FATAL: a devnet is already running ($RUN_DIR/pids) — run $WSL/stop-3val.sh first" >&2; exit 1
 fi
 # The live testnet validator (8555/9090/30333) is never touched: we only use
-# 8645-8647 / 9161-9163 / 30401-30403 (+ 8648 / 9164 / 30404 with N_VALIDATORS=4)
+# 8645-8647 / 9161-9163 / 30401-30403 (+ 8645+i / 9161+i / 30401+i for val3..val6 with N_VALIDATORS=4..7)
 # and never write into ~/.cargo-target.
 if [ -d "$OUT" ] && [ -n "$(ls -A "$OUT" 2>/dev/null)" ] && [ "${OVERWRITE:-0}" != 1 ]; then
     echo "FATAL: $OUT exists and is non-empty (pick a new label or OVERWRITE=1)" >&2; exit 1
@@ -1456,16 +1478,16 @@ mkdir -p "$OUT"
 # crash-kill.sh norestart copies its run_id into kill-norestart.json and
 # summarize.py applies the record's exclusion only when run_id and kill_node
 # match it (a record it cannot match REJECTs the cell: stale kill record).
-# run-id.json also carries this run's validator count (n_validators: summarize.py's node set), and a
-# 3-validator run clears a former 4-validator run's val3 files (summarize.py / gap_attr.py read
+# run-id.json also carries this run's validator count (n_validators: summarize.py's node set), and an
+# N-validator run clears a former larger run's val<N>..val6 files (summarize.py / gap_attr.py read
 # metrics-before-val3.txt as "this cell has a val3" when run-id.json has no count).
 reset_run_artifacts() { # <out> <label> <KILL_NO_RESTART or empty> <N_VALIDATORS (default 3)>
-    local out=${1:?} f n=${4:-3} val3=()
-    [ "$n" != 3 ] || val3=("$out"/*-val3.* "$out"/val3.*)
+    local out=${1:?} f n=${4:-3} higher=() v
+    for ((v = n; v < 7; v++)); do higher+=("$out"/*-val"$v".* "$out"/val"$v".*); done
     for f in "$out"/kill-norestart.json "$out"/crash.json "$out"/crash-[0-9]*.json \
              "$out"/crash-kill.json "$out"/crash-kill-[0-9]*.json "$out"/crash-kill.skipped \
              "$out"/crash-restart-tail.log "$out"/crash-restart-tail-[0-9]*.log "$out"/run-id.json \
-             ${val3[@]+"${val3[@]}"}; do
+             ${higher[@]+"${higher[@]}"}; do
         [ -e "$f" ] || continue
         rm -f -- "${f:?}" || return 1
     done
@@ -1584,7 +1606,7 @@ fi
 WT_COMMIT=$(git -C "$WT" rev-parse HEAD)
 WT_DIRTY=$(git -C "$WT" status --porcelain --untracked-files=no | wc -l)
 log "worktree commit=$WT_COMMIT dirty_files=$WT_DIRTY"
-[ "$N_VALIDATORS" = 3 ] || log "4-validator devnet: N_VALIDATORS=4 (val0..val3; rpc ${RPCS[*]}; metrics ${METS[*]}; keys $ORACLE_KEYS)"
+[ "$N_VALIDATORS" = 3 ] || log "$N_VALIDATORS-validator devnet: N_VALIDATORS=$N_VALIDATORS (val0..val$((N_VALIDATORS - 1)); rpc ${RPCS[*]}; metrics ${METS[*]}; keys $ORACLE_KEYS)"
 [ -z "$DL_K$DL_JCAP" ] || log "dead-leader skip genesis knobs: DL_K='${DL_K:-unset (node default 0 = off)}' DL_JCAP='${DL_JCAP:-unset (node default 6)}' (torus-node knows them: leader_miss_threshold found in $SRC_NODE)"
 
 # ---------------------------------------------------------------- 1. stage binary
@@ -1820,8 +1842,10 @@ if [ -n "$HOTSTUFF_CPUS" ]; then
     IFS=/ read -r -a HS_CPU <<< "$HOTSTUFF_CPUS"
     if [ "$N_VALIDATORS" = 3 ]; then
         [ "${#HS_CPU[@]}" = 3 ] || die "HOTSTUFF_CPUS must be a/b/c (one CPU list per node), got '$HOTSTUFF_CPUS'"
-    else
+    elif [ "$N_VALIDATORS" = 4 ]; then
         [ "${#HS_CPU[@]}" = 4 ] || die "HOTSTUFF_CPUS must be a/b/c/d with N_VALIDATORS=4 (one CPU list per node), got '$HOTSTUFF_CPUS'"
+    else
+        [ "${#HS_CPU[@]}" = "$N_VALIDATORS" ] || die "HOTSTUFF_CPUS must be $N_VALIDATORS slash-separated CPU lists with N_VALIDATORS=$N_VALIDATORS (one per node), got '$HOTSTUFF_CPUS'"
     fi
     command -v taskset >/dev/null || die "HOTSTUFF_CPUS set but taskset not found"
     for i in "${ALL_IDX[@]}"; do

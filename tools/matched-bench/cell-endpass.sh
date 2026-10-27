@@ -16,17 +16,16 @@ L=$(basename "$D")
 . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/log-scans.sh" || exit 1
 M=$D/$DEFERRED_MARKER
 [ -f "$M" ] || { echo "END PASS $L: nothing deferred (no $DEFERRED_MARKER)"; exit 0; }
-# ingest_log_bytes: one entry per validator log, 3 (4 on the 4-validator devnet, run-cell N_VALIDATORS=4)
-read -r SUB B0 B1 B2 B3 < <(python3 -I -c '
+# ingest_log_bytes: one entry per validator log, 3 (4..7 on the N-validator devnet, run-cell N_VALIDATORS=3..7)
+read -r SUB BYTES_LINE < <(python3 -I -c '
 import json, sys
 m = json.load(open(sys.argv[1]))
 b = m["ingest_log_bytes"]
-assert len(b) in (3, 4) and all(isinstance(x, int) and x >= 0 for x in b)
+assert 3 <= len(b) <= 7 and all(isinstance(x, int) and x >= 0 for x in b)
 print(m.get("bench_submitted") or "-", *b)' "$M") || { echo "END PASS FAIL $L: unreadable $M"; exit 1; }
 [ "$SUB" = - ] && SUB=
-BYTES=("$B0" "$B1" "$B2")
-NODE_IDX="0 1 2"
-if [ -n "$B3" ]; then BYTES+=("$B3"); NODE_IDX="0 1 2 3"; fi
+read -r -a BYTES <<< "$BYTES_LINE"
+NODE_IDX=$(seq -s ' ' 0 $(( ${#BYTES[@]} - 1 )))
 for i in $NODE_IDX; do
     g=$D/val$i.log.gz
     [ -s "$g" ] && gzip -t "$g" 2>/dev/null || { echo "END PASS FAIL $L: $g missing or corrupt (marker kept)"; exit 1; }

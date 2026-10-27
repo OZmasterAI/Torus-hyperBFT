@@ -88,8 +88,8 @@ REASON = "state hash attestation failed: "
 
 # ------------------------------------------------------------------ keys
 def read_keys(path):
-    """[(index, address lowercase, private key hex without 0x)] sorted by index, exactly indices 0, 1, 2 (0..3 for
-    the 4-validator devnet's devnet/wsl/keys-4val/bench-validator-keys.json, run-cell N_VALIDATORS=4)"""
+    """[(index, address lowercase, private key hex without 0x)] sorted by index, exactly indices 0, 1, 2 (0..N-1 for
+    the N-validator devnet's devnet/wsl/keys-<N>val/bench-validator-keys.json, run-cell N_VALIDATORS=4..7)"""
     with open(path) as f:
         d = json.load(f)
     out = []
@@ -106,7 +106,7 @@ def read_keys(path):
             )
         out.append((int(v["index"]), a, k.lower()))
     out.sort()
-    if [i for i, _, _ in out] not in ([0, 1, 2], [0, 1, 2, 3]):
+    if [i for i, _, _ in out] not in [list(range(n)) for n in range(3, 8)]:
         raise ValueError(
             "%s: need validators with index 0, 1, 2 (got %s)"
             % (path, [i for i, _, _ in out])
@@ -788,7 +788,7 @@ def main(argv=None):
         "--exclude",
         action="append",
         default=[],
-        choices=("val1", "val2", "val3"),
+        choices=tuple("val%d" % i for i in range(1, 7)),
         help="run-cell KILL_NO_RESTART: a validator killed without restart (its --rpc/--metrics/--log are not read, "
         "its votes not required)",
     )

@@ -152,9 +152,10 @@ def hist_tail(cell, name="torus_view_duration_seconds"):
             elif line.startswith(name + "_count "):
                 c = float(line.split()[-1])
         return b, s, c
-    # val3: run-cell.sh N_VALIDATORS=4 (the 4-validator devnet) only
-    nodes = ["val0", "val1", "val2"] + (
-        ["val3"] if os.path.exists(os.path.join(cell, "metrics-before-val3.txt")) else [])
+    # val3..val6: run-cell.sh N_VALIDATORS=4..7 only (consecutive from val3)
+    nodes = ["val0", "val1", "val2"]
+    while len(nodes) < 7 and os.path.exists(os.path.join(cell, "metrics-before-val%d.txt" % len(nodes))):
+        nodes.append("val%d" % len(nodes))
     for node in nodes:
         try:
             b0, s0, c0 = h(os.path.join(cell, f"metrics-before-{node}.txt"))
@@ -179,9 +180,11 @@ def _node_logs(cell):
     for sub in ("run", ""):
         paths = {n: os.path.join(cell, sub, n + ".log") for n in ("val0", "val1", "val2")}
         if all(os.path.exists(p) for p in paths.values()):
-            val3 = os.path.join(cell, sub, "val3.log")  # run-cell.sh N_VALIDATORS=4 only
-            if os.path.exists(val3):
-                paths["val3"] = val3
+            while len(paths) < 7:  # val3..val6: run-cell.sh N_VALIDATORS=4..7 only
+                p = os.path.join(cell, sub, "val%d.log" % len(paths))
+                if not os.path.exists(p):
+                    break
+                paths["val%d" % len(paths)] = p
             return paths
     return None
 

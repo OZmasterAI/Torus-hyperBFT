@@ -155,8 +155,9 @@ while not a.no_idle_wait and (os.getloadavg()[0] >= 1.5 or maintenance_active())
     )
     time.sleep(20)
 ports = [8645, 8646, 8647, 9161, 9162, 9163]
-if runner_env.get("N_VALIDATORS") == "4":
-    ports += [8648, 9164]  # run-cell.sh N_VALIDATORS=4: val3
+n_val = runner_env.get("N_VALIDATORS") or "3"
+for i in range(3, int(n_val) if n_val in ("4", "5", "6", "7") else 3):
+    ports += [8645 + i, 9161 + i]  # run-cell.sh N_VALIDATORS=4..7: val3..val6
 for port in ports:
     with socket.socket() as sock:
         if sock.connect_ex(("127.0.0.1", port)) == 0:

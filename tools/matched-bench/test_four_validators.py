@@ -83,14 +83,14 @@ class DevnetTopologyTest(unittest.TestCase):
         )
         self.assertIn("N=3\n", r.stdout)
 
-    def test_four_adds_val3_and_five_is_refused(self):
+    def test_four_adds_val3_and_eight_is_refused(self):
         r = self.env("4")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("PORTS=9161 9162 9163 9164\n", r.stdout)
         self.assertIn("http://localhost:8648\n", r.stdout)
-        r = self.env("5")
+        r = self.env("8")  # 5..7: test_n_validators.py
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("N_VALIDATORS must be 3 or 4", r.stderr)
+        self.assertIn("N_VALIDATORS must be 3 to 7", r.stderr)
 
     def test_peer_ids_derive_from_the_keys(self):
         """PID<i> = the libp2p ed25519 peer id of KEY<i> (cross-checked against the two docker-compose ids)"""
@@ -135,7 +135,7 @@ class DevnetTopologyTest(unittest.TestCase):
 
     def test_node_peers(self):
         r = bash(
-            'source "$1"; source "$2"; for i in 0 1 2 3; do echo "$(node_peers $i)"; done; node_peers 4 || echo REFUSED',
+            'source "$1"; source "$2"; for i in 0 1 2 3; do echo "$(node_peers $i)"; done; node_peers 7 || echo REFUSED',
             os.path.join(WSL, "env.sh"),
             os.path.join(WSL, "start-node.sh"),
         )
@@ -226,7 +226,7 @@ class CrashKillFourTest(unittest.TestCase):
             (0, "1,1,1,1"),
             (4, "1,1,1,1"),
             (3, "1,1,1"),
-            (2, "1,1,1,1,1"),
+            (2, "1,1,1,1,1,1,1,1"),  # 5..7 weights: test_n_validators.py
             (2, "0,1,1,1"),
         ):
             self.assertFalse(self.quorum(idx, w), (idx, w))
@@ -357,7 +357,7 @@ class GenesisFourTest(unittest.TestCase):
 
     def test_bad_input_is_fatal(self):
         for env, msg in (
-            ({"N_VALIDATORS": "5"}, "N_VALIDATORS must be 3 or 4"),
+            ({"N_VALIDATORS": "8"}, "N_VALIDATORS must be 3 to 7"),
             (
                 {"N_VALIDATORS": "4", "VALIDATOR_STAKES": "2,2,1"},
                 "four positive integer weights",
@@ -486,7 +486,7 @@ class CliNodeCountTest(unittest.TestCase):
     def test_drain_refusals(self):
         for urls, extra in (
             (self.urls[:2], ()),
-            (self.urls + self.urls[:1], ()),
+            (self.urls * 2, ()),  # 5..7 URLs: test_n_validators.py
             (self.urls[:3], ("--exclude", "val3")),
             (
                 self.urls,
@@ -597,7 +597,7 @@ class RunCellFourTest(unittest.TestCase):
     def setUp(self):
         self.pre = src_between(RUN_CELL_SH, self.PRE_START, self.PRE_END)
         self.urls_fn = src_between(RUN_CELL_SH, "bench_rpc_urls() {", "\n}\n")
-        self.idx = src_between(RUN_CELL_SH, "ALL_IDX=(0 1 2)\n", "ALL_IDX+=(3)\n")
+        self.idx = src_between(RUN_CELL_SH, "ALL_IDX=(0 1 2)\n", 'ALL_IDX+=("$i"); done\n')
 
     def preflight(self, **env):
         script = (
@@ -735,7 +735,7 @@ class RunCellFourTest(unittest.TestCase):
             os.chmod(p, 0o755)
         script, wt = sandbox_repo(tmp)
         for env, rc, msg in (
-            (dict(N_VALIDATORS="5"), 2, "N_VALIDATORS must be 3 or 4"),
+            (dict(N_VALIDATORS="8"), 2, "N_VALIDATORS must be 3 to 7"),
             (dict(N_VALIDATORS="4"), 1, "has no 4-validator devnet"),
             (dict(DL_K="3"), 1, "has no dead-leader skip"),
             (dict(DL_K="1"), 2, "DL_K"),
@@ -796,9 +796,9 @@ class ThreeNodeExpansionTest(unittest.TestCase):
         line = lambda start: src[src.index(start): src.index("\n", src.index(start)) + 1]
         script = "set -uo pipefail\nN_VALIDATORS=%s; MARKETS=300; ORACLE_FEED_DRAIN_MAX_LAG=2; RUN_DIR=/R\n" % n
         script += ". %s\n" % os.path.join(HERE, "log-scans.sh")
-        script += src_between(RUN_CELL_SH, "ALL_IDX=(0 1 2)\n", "ALL_IDX+=(3)\n")
-        for start in ("RPCS=(http://127.0.0.1:8645", '[ "$N_VALIDATORS" = 3 ] || RPCS+=', "METS=(9161 9162 9163)",
-                      '[ "$N_VALIDATORS" = 3 ] || METS+=', "METS_URLS=()", "MIN_PEERS=", "DRAIN_URLS=(",
+        script += src_between(RUN_CELL_SH, "ALL_IDX=(0 1 2)\n", 'ALL_IDX+=("$i"); done\n')
+        for start in ("RPCS=(http://127.0.0.1:8645", 'for i in "${ALL_IDX[@]:3}"; do RPCS+=', "METS=(9161 9162 9163)",
+                      'for i in "${ALL_IDX[@]:3}"; do METS+=', "METS_URLS=()", "MIN_PEERS=", "DRAIN_URLS=(",
                       "    FEED_DRAIN_ARGS=(--feed-live", "    ATTEST_DRAIN_ARGS=(--attest-live", "NODE_LOGS=();",
                       "    SA_ARGS=(); for i in"):
             script += line(start)

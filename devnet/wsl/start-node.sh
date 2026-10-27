@@ -10,8 +10,8 @@
 # tools/matched-bench/test_harness.py (test_restart_uses_the_same_argv_as_launch).
 #
 # Requires env.sh to have been sourced first (BIN, GENESIS, DATA_ROOT, RUN_DIR,
-# KEY0..3, P2P0..3, RPC0..3, MET0..3, PEER_TO_V0/V1/V2; val3 only with
-# N_VALIDATORS=4).
+# KEY0..6, P2P0..6, RPC0..6, MET0..6, PEER_TO_V0..V5). The devnet runs
+# val0..val<N-1>, N_VALIDATORS=3..7 (val3..val6 only on a 4..7-node devnet).
 #
 #   start_node <idx> [truncate|append]   ->  sets $STARTED_PID
 #
@@ -24,14 +24,18 @@
 # shellcheck disable=SC2154
 node_var() { local v="$1$2"; printf '%s' "${!v-}"; }
 
-# val0 dials val1; val1 dials val0; val2 dials both; val3 (N_VALIDATORS=4) dials
-# all three, so the 4 nodes form a full mesh. All edges use known ids.
+# val0 dials val1; val1 dials val0; val2 dials both; val<i> (i >= 3,
+# N_VALIDATORS=4..7) dials val0..val<i-1>, so the N nodes form a full mesh.
+# All edges use known ids.
 node_peers() {
+    local i out
     case "$1" in
         0) printf '%s' "$PEER_TO_V1" ;;
         1) printf '%s' "$PEER_TO_V0" ;;
-        2) printf '%s' "$PEER_TO_V0,$PEER_TO_V1" ;;
-        3) printf '%s' "$PEER_TO_V0,$PEER_TO_V1,$PEER_TO_V2" ;;
+        2|3|4|5|6)
+            out=$PEER_TO_V0
+            for i in $(seq 1 $(( $1 - 1 ))); do out+=",$(node_var PEER_TO_V "$i")"; done
+            printf '%s' "$out" ;;
         *) return 1 ;;
     esac
 }

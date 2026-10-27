@@ -810,8 +810,45 @@ N_VALIDATORS=4 BENCH_RPCS=0,1,2 KILL_NO_RESTART=val3 KILL_NO_RESTART_AT_S=30 \
 - **Campaign driver:** the knobs are allowed in `harness_env`
   (`campaign/run_cell.py` also checks ports 8648 / 9164 free). The driver's
   own samplers (`dusamp`, `ckptsamp`, fd sums, `hardscan`, `dumeas`,
-  `savelog`) still cover val0..val2 only; `watch_nodes` follows every pid in
-  `run/pids` (val3 included).
+  `savelog`) cover val0..val<N-1> (make-driver.py, since s140); `watch_nodes`
+  follows every pid in `run/pids` (val3 included).
+
+## Five to seven validators — `N_VALIDATORS=5..7` (all-up shapes, 18c msg 201)
+
+`N_VALIDATORS` takes 3..7 (anything else is FATAL in run-cell.sh, env.sh and
+gen-3val-genesis.sh, and a SPEC ERROR in make-driver.py). 3 and 4 are unchanged
+byte for byte (genesis vs the pre-change generator, run-cell.sh messages and
+expansions, make-driver.py drivers vs f4010070's; `test_n_validators.py`,
+`test_make_driver.py NValidatorTest`).
+
+```
+# 7 equal validators, all up, bench ingress over all seven
+N_VALIDATORS=7 tools/matched-bench/run-cell.sh <wt> n7-smoke 10 120 20000
+```
+
+- **Topology:** val<i> = ed25519 key `0<i+1>..`, RPC 8645+i, metrics 9161+i,
+  p2p 30401+i (val6: 8651 / 9167 / 30407), dialing every lower-index validator
+  (`start-node.sh node_peers`: a full mesh). devnet/genesis.json lists only 4
+  validators: `gen-3val-genesis.sh` adds val4..val6 as copies of its 4th entry
+  (stake, commission) with the pubkeys of keys 05..07 (`EXTRA_PUBKEYS`).
+- **Keys:** `devnet/wsl/keys-<N>val/` (one dir per count: the oracle feed and
+  `state_attest.py` take every entry of their file as a validator). Indices
+  0..3 = keys-4val verbatim; val4..val6 = hardhat dev mnemonic 108..110, their
+  oracle signers 111..113 (pinned by `KeyFilesNTest`, which re-derives them).
+- **Knobs:** `VALIDATOR_STAKES` and `HOTSTUFF_CPUS` take N entries;
+  `KILL_NODE` / `KILL_NO_RESTART` take val1..val<N-1> (equal stakes keep
+  (N-1)/N > 2/3 with any one down); `BENCH_RPCS` takes indices 0..N-1;
+  `DL_REPORT` defaults on for any N >= 4 with a no-restart kill.
+- **Pre-flight:** with N >= 5 run-cell.sh refuses a worktree whose
+  `devnet/wsl/env.sh` has no `KEY<N-1>` or whose `start-node.sh` /
+  summarize.py / health.py / collect_logs.py / crash-kill.sh lack the marker
+  `N_VALIDATORS=3..7` (merge `tools/make-driver-nval` into the worktree).
+- **Scoring tools:** health.py drain, sample_metrics.py, collect_logs.py take
+  3..7 URLs / logs; summarize.py reads `run-id.json n_validators` 3..7;
+  `cell-endpass.sh` / `write_deferred_marker` carry 3..7 byte counts;
+  rescore.sh, gap_attr.py, state_attest.py (`--exclude val1..val6`),
+  `campaign/run_cell.py` (ports 8645+i / 9161+i free) follow N; an N-node run
+  clears a former larger run's val<N>..val6 files (`reset_run_artifacts`).
 
 ## Liveness and benchmark acceptance
 
@@ -1076,7 +1113,7 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
   2 s), `mem-samples.txt` + `smaps/` (smaps_rollup, status and memory gauges every 5 s; val0's
   full smaps every 30 s), `node-nofile.txt` + `fds.txt` (open fds; 5 s), `vmstat-1hz.txt`,
   and the hand drivers' 1 Hz soak sidecar `python3 -I $TOOLS/soak-sampler.py <cell> 9161 9162
-  9163` (+ 9164 with `N_VALIDATORS=4`; `tools/matched-bench/soak-sampler.py`, the s58rl / p4soak10
+  9163` (+ 9164.. with `N_VALIDATORS=4..7`; `tools/matched-bench/soak-sampler.py`, the s58rl / p4soak10
   tools' copy, since s138 scraping every port it is given): `metrics-1hz.txt.gz` (per node and second `T <epoch> val<i> ok <scrape_s>|ERR` + the
   /metrics lines without comments or buckets, except the slow-tail buckets le >= 0.128 of its
   latency families: per-second consensus drops and timeouts) and `host-1hz.tsv` (meminfo
@@ -1167,7 +1204,7 @@ arm r-1, as Job 4; `"fixed"`; or a list `["r1:A", "r1:B", ...]`), `warmup` (`{ar
 duration_s, gate}`, default baseline / `w1` / `duration_s` / `true`; `false` = none), `smoke` (`{arm,
 duration_s}`, default baseline / 60), `node_env` (node env for every arm), `harness_env`
 (run-cell.sh env for every cell, e.g. `BLOCK_CAP`, `MAX_IN_FLIGHT`, `ORACLE_FEED`; its
-`N_VALIDATORS` (`"3"` default or `"4"`, the same on every arm, else a SPEC ERROR) is also the
+`N_VALIDATORS` (`"3"` default, or `"4"` .. `"7"`, the same on every arm, else a SPEC ERROR) is also the
 driver's node count: `NODES`, `METS` 9161..9160+N, and every per-node sampler / scan / check
 loop (hardscan, du / ckpt / mem / fd samplers, fdsum, savelog, data-du, soakchk) covers val0..val<N-1>;
 a 3-node driver is the same text as before),
