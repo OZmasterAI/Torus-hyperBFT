@@ -784,6 +784,64 @@ const WINDOW_STALL: Duration = Duration::from_secs(120);
 /// re-proposed in fresh blocks before it commits, still moving.
 const WINDOW_CEILING: Duration = Duration::from_secs(360);
 
+/// Why the silent-leader window test stopped polling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowStop {
+    /// Every live validator applied the update.
+    Applied,
+    /// Every live validator is past v + 1 and n0 never nudged U's Prepare PC (v) in v + 1.
+    NudgeMissed,
+    /// No live validator's highest PC moved for [`WINDOW_STALL`].
+    Stalled,
+    /// [`WINDOW_CEILING`] elapsed.
+    Ceiling,
+}
+
+/// What a stop of the silent-leader window test means.
+#[derive(Debug, PartialEq, Eq)]
+enum WindowVerdict {
+    /// The window was set up (U's Precommit PC (v + 1) formed) and the update committed.
+    Pass,
+    /// The run missed the scenario: n0 never nudged U's Prepare PC, or the update committed
+    /// without U's Precommit PC (v + 1). A fresh cluster may try again.
+    Missed,
+    /// Nothing committed the update: the window livelocked, whether U's Precommit PC formed or
+    /// not (a stall with no Precommit PC is the livelock of another stage, never a retry).
+    Livelocked,
+}
+
+fn window_verdict(stop: WindowStop, precommit_pc: bool) -> WindowVerdict {
+    // s140 (as on 3b7ecc38): retry whenever the Precommit PC did not form.
+    if stop == WindowStop::NudgeMissed || !precommit_pc {
+        return WindowVerdict::Missed;
+    }
+    if stop == WindowStop::Applied {
+        WindowVerdict::Pass
+    } else {
+        WindowVerdict::Livelocked
+    }
+}
+
+/// The silent-leader verdict: only a missed nudge, or an update committed without the window,
+/// is a missed scenario; every stop without the update committed fails (s140 review P2).
+#[test]
+fn silent_leader_window_verdict_retries_only_a_missed_setup() {
+    use WindowStop::*;
+    use WindowVerdict::*;
+    for (stop, precommit_pc, verdict) in [
+        (Applied, true, Pass),
+        (Applied, false, Missed),
+        (NudgeMissed, false, Missed),
+        (NudgeMissed, true, Missed),
+        (Stalled, true, Livelocked),
+        (Stalled, false, Livelocked),
+        (Ceiling, true, Livelocked),
+        (Ceiling, false, Livelocked),
+    ] {
+        assert_eq!(window_verdict(stop, precommit_pc), verdict, "{stop:?}, Precommit PC {precommit_pc}");
+    }
+}
+
 #[derive(Default)]
 struct PrecommitWindowLog {
     /// The update block U and the view of its first header.

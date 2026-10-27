@@ -27,6 +27,7 @@
 
 use super::*;
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -152,6 +153,9 @@ struct Cluster {
     /// The only validator the scenario lets be planned for exclusion (`Some`): every wait then
     /// ends the run as [`ScenarioMissed`] once a running node planned another one.
     only_excludable: Option<usize>,
+    /// The validator-set updates seen while waiting with `only_excludable` set: update height ->
+    /// the committed hotstuff set from it on (the A1 oracle's leader schedule, [`Cluster::installed_set`]).
+    updates: RefCell<BTreeMap<u64, HsSet>>,
 }
 
 /// The panic payload of a wait that found the scenario missed: a validator that runs was planned
@@ -160,7 +164,9 @@ struct Cluster {
 struct ScenarioMissed(String);
 
 /// Run `attempt` on fresh clusters until one is not [`ScenarioMissed`], at most `tries` times.
-/// Any other failure propagates as is.
+/// Any other failure propagates as is. A [`ScenarioMissed`] is raised only for a miss the A1
+/// oracle confirms over the committed QC chain ([`planned_by_the_chain`]); one it does not
+/// confirm is a misattribution and fails the test.
 fn retry_missed(tries: u32, attempt: impl Fn()) {
     let mut missed = Vec::new();
     for _ in 0..tries {
@@ -224,6 +230,7 @@ impl Cluster {
             genesis,
             nodes,
             only_excludable: None,
+            updates: RefCell::default(),
         }
     }
 
@@ -499,19 +506,77 @@ impl Cluster {
             .sum()
     }
 
+    /// Record every running node's last validator-set update (height and the committed set
+    /// from it on, read from one snapshot) in [`Cluster::updates`].
+    fn record_updates(&self) {
+        for i in self.running() {
+            let snapshot = self.replica(i).block_tree_camera().snapshot();
+            let height = snapshot
+                .validator_set_update_block_height()
+                .expect("update height");
+            if let Some(h) = height {
+                let set = snapshot
+                    .committed_validator_set()
+                    .expect("committed validator set");
+                self.updates.borrow_mut().entry(h.int() + 1).or_insert(set);
+            }
+        }
+    }
+
+    /// The hotstuff set installed when height `h` executes (A1's leader schedule): the set of
+    /// the last recorded update below `h`, else the genesis set.
+    fn installed_set(&self, h: u64) -> HsSet {
+        self.updates
+            .borrow()
+            .range(..h)
+            .next_back()
+            .map_or_else(|| self.genesis_set(), |(_, set)| set.clone())
+    }
+
+    /// Validator `v`'s A1 run after height `h` per the oracle over node `i`'s committed QC chain
+    /// from height `from` on, under [`Cluster::installed_set`] (`None`: `h` not in that span).
+    /// Waits (bounded) for node `i`'s block tree to commit `h`: execution may be ahead of it.
+    fn oracle_run(&self, i: usize, v: usize, from: u64, h: u64) -> Option<u32> {
+        let start = Instant::now();
+        while self.hs_committed(i) < h && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(POLL);
+        }
+        let qcs: Vec<_> = self
+            .chain(i, self.hs_committed(i).min(h))
+            .into_iter()
+            .filter(|(height, _)| *height >= from)
+            .collect();
+        miss_runs(&qcs, |height| self.installed_set(height), &self.vk(v))
+            .into_iter()
+            .find(|&(height, _)| height == h)
+            .map(|(_, run)| run)
+    }
+
     /// The first running node that planned the exclusion of a validator other than
-    /// `only_excludable` (A1 attributes the misses, the boundary sets `excluded_at`).
-    fn excluded_other(&self) -> Option<String> {
+    /// `only_excludable` (A1 attributes the misses, the boundary sets `excluded_at`): `Ok` (the
+    /// scenario missed) when the A1 oracle over the node's committed QC chain also has that
+    /// validator's run at K at the plan boundary (its slots really timed out), `Err` (an A1
+    /// misattribution, a bug) otherwise.
+    fn excluded_other(&self) -> Option<Result<String, String>> {
         let x = self.only_excludable?;
         self.running().into_iter().find_map(|i| {
             (0..self.n())
                 .filter(|&v| v != x)
-                .find(|&v| self.stats(i, v).excluded_at.is_some())
-                .map(|v| {
-                    format!(
-                        "node {i} planned validator {v}'s exclusion: {}",
+                .find_map(|v| Some((v, self.stats(i, v).excluded_at?)))
+                .map(|(v, at)| {
+                    let plan = at - L;
+                    let run = self.oracle_run(i, v, 1, plan);
+                    let why = format!(
+                        "node {i} planned validator {v}'s exclusion at {at} (plan boundary {plan}, \
+                         oracle run there {run:?}, recorded updates {:?}): {}",
+                        self.updates.borrow().keys().collect::<Vec<_>>(),
                         self.status()
-                    )
+                    );
+                    if planned_by_the_chain(run) {
+                        Ok(why)
+                    } else {
+                        Err(why)
+                    }
                 })
         })
     }
@@ -526,8 +591,18 @@ impl Cluster {
         loop {
             if checked.elapsed() >= Duration::from_millis(250) || checked == start {
                 checked = Instant::now();
-                if let Some(why) = self.excluded_other() {
-                    std::panic::panic_any(ScenarioMissed(format!("waiting for {what}: {why}")));
+                if self.only_excludable.is_some() {
+                    self.record_updates();
+                }
+                match self.excluded_other() {
+                    Some(Ok(why)) => {
+                        std::panic::panic_any(ScenarioMissed(format!("waiting for {what}: {why}")))
+                    }
+                    Some(Err(why)) => panic!(
+                        "A1 misattribution, the committed QC chain does not bring the run to K: \
+                         waiting for {what}: {why}"
+                    ),
+                    None => {}
                 }
             }
             if cond(self) {
@@ -667,19 +742,22 @@ impl Drop for Cluster {
 }
 
 /// A1 over a committed QC chain, as execution runs it (the oracle): `(height, evidence)` in
-/// height order, leader(v) over `set`. Returns the first height whose execution brings
-/// validator `dead`'s run of missed leader slots to `k` (`None`: never).
-fn kth_miss_height(
+/// height order, leader(v) at height `h` over `set_at(h)` (the set installed when `h` executes).
+/// Returns validator `dead`'s run of missed leader slots after each height. The run starts at 0
+/// (a span from height 1, or from just after a re-admission, when an excluded validator's run is
+/// 0 and the gap rule attributes nothing for two heights).
+fn miss_runs(
     qcs: &[(u64, LeaderEvidence)],
-    set: &HsSet,
+    set_at: impl Fn(u64) -> HsSet,
     dead: &VerifyingKey,
-    k: u32,
-) -> Option<u64> {
-    let leader = |v: u64| select_leader(ViewNumber::new(v), set);
+) -> Vec<(u64, u32)> {
     let mut cursor: Option<(u64, bool)> = None;
     let mut run = 0u32;
+    let mut runs = Vec::with_capacity(qcs.len());
     for (height, ev) in qcs {
         if ev.phase == QC_GENERIC {
+            let set = set_at(*height);
+            let leader = |v: u64| select_leader(ViewNumber::new(v), &set);
             match cursor {
                 Some((c, false)) if ev.view > c => {
                     run += (c + 1..ev.view).filter(|v| leader(*v) == *dead).count() as u32;
@@ -692,11 +770,29 @@ fn kth_miss_height(
             }
         }
         cursor = Some((ev.view, ev.phase != QC_GENERIC));
-        if run >= k {
-            return Some(*height);
-        }
+        runs.push((*height, run));
     }
-    None
+    runs
+}
+
+/// The first height whose execution brings validator `dead`'s run to `k` under the fixed `set`
+/// ([`miss_runs`]; `None`: never).
+fn kth_miss_height(
+    qcs: &[(u64, LeaderEvidence)],
+    set: &HsSet,
+    dead: &VerifyingKey,
+    k: u32,
+) -> Option<u64> {
+    miss_runs(qcs, |_| set.clone(), dead)
+        .into_iter()
+        .find(|&(_, run)| run >= k)
+        .map(|(height, _)| height)
+}
+
+/// Whether the oracle's run at a plan boundary ([`Cluster::oracle_run`]) justifies the exclusion
+/// planned there (A2: a run of at least K). Only then is an unplanned exclusion a missed scenario.
+fn planned_by_the_chain(oracle_run_at_plan: Option<u32>) -> bool {
+    oracle_run_at_plan.is_some_and(|run| run >= K)
 }
 
 /// The views no QC of the chain certifies between consecutive generic QCs of the heights
@@ -912,14 +1008,21 @@ fn restarted_validator_is_readmitted_and_proposes() {
     );
     c.wait_applied(&all, readmitted + 2 * L + 2);
     for i in all {
-        let st = c.stats(i, x);
-        // A run of x's own after its success: its later slots timed out (s140, load ~100 on
-        // 18c: `miss_run: 2`, all else reset). Not the run the test describes (no miss after
-        // the re-admission); j, the floor and the evidence are checked whenever it is.
-        if st.miss_run > 0 || st.excluded_at.is_some() {
-            std::panic::panic_any(ScenarioMissed(format!(
-                "node {i}: x's slots timed out after its re-admission: {st:?}"
-            )));
+        // x's statistics and the height they are of (rows and marker flush together).
+        let (applied, st) = loop {
+            let (a, st) = (c.applied(i), c.stats(i, x));
+            if c.applied(i) == a {
+                break (a, st);
+            }
+        };
+        // x's A1 run from just after its re-admission (excluded, its run was 0).
+        let oracle_run = |h: u64| c.oracle_run(i, x, readmitted + 1, h);
+        match readmitted_verdict(&st, applied, oracle_run) {
+            Readmitted::Reset => {}
+            Readmitted::Missed(why) => std::panic::panic_any(ScenarioMissed(format!(
+                "node {i}: x's slots timed out after its re-admission: {why}"
+            ))),
+            Readmitted::Bug(why) => panic!("node {i}: {why}"),
         }
         assert_eq!(
             st,
@@ -937,6 +1040,79 @@ fn restarted_validator_is_readmitted_and_proposes() {
     let top = c.min_applied(&all);
     c.stop_all();
     c.assert_agree(&all, top);
+}
+
+/// What the re-admitted validator's statistics say in the restarted test, once two boundaries
+/// passed after its re-admission and it proposed a committed block.
+#[derive(Debug, PartialEq, Eq)]
+enum Readmitted {
+    /// Its success reset everything (`LeaderStats::default()`).
+    Reset,
+    /// The success reset everything, then its later slots really timed out (the oracle agrees):
+    /// not the run the test describes, a fresh cluster may try again.
+    Missed(String),
+    /// A reset bug or an A1 misattribution.
+    Bug(String),
+}
+
+/// The verdict on `st`, x's statistics after height `applied`. `oracle_run(h)`: x's run after
+/// height `h` per the A1 oracle from its re-admission on ([`Cluster::oracle_run`]).
+fn readmitted_verdict(
+    st: &LeaderStats,
+    applied: u64,
+    oracle_run: impl Fn(u64) -> Option<u32>,
+) -> Readmitted {
+    // s140 (as on 3b7ecc38).
+    let _ = (applied, &oracle_run);
+    if st.miss_run > 0 || st.excluded_at.is_some() {
+        return Readmitted::Missed(format!("{st:?}"));
+    }
+    if *st == LeaderStats::default() {
+        Readmitted::Reset
+    } else {
+        Readmitted::Bug(format!("re-admitted, its success reset the run and j: {st:?}"))
+    }
+}
+
+/// The restarted test retries only a miss that leaves the success's reset visible and that the
+/// QC chain confirms; a success that kept j (or the floor or the evidence), a re-exclusion with
+/// a stale j, or a run the chain does not give fails (s140 review P2).
+#[test]
+fn readmitted_verdict_retries_only_a_confirmed_miss_after_the_reset() {
+    let missed = |v: Readmitted| matches!(v, Readmitted::Missed(_));
+    let bug = |v: Readmitted| matches!(v, Readmitted::Bug(_));
+    let at = |run: u32| move |_: u64| Some(run);
+    let reset = LeaderStats::default();
+    assert_eq!(readmitted_verdict(&reset, 50, at(0)), Readmitted::Reset);
+    // Later slots timed out, everything else reset: retried if the chain gives that run.
+    let run2 = LeaderStats { miss_run: 2, ..reset.clone() };
+    assert!(missed(readmitted_verdict(&run2, 50, at(2))));
+    assert!(bug(readmitted_verdict(&run2, 50, at(0))), "a run the chain does not give");
+    assert!(bug(readmitted_verdict(&run2, 50, |_| None)), "no oracle run");
+    // The forced reset bug: the success left j at 1 (with or without a later miss).
+    for miss_run in [0, 2] {
+        let kept_j = LeaderStats { miss_run, j: 1, ..reset.clone() };
+        assert!(bug(readmitted_verdict(&kept_j, 50, at(miss_run))), "kept j, miss_run {miss_run}");
+    }
+    let kept_seen = LeaderStats { miss_run: 2, seen_at: Some(31), ..reset.clone() };
+    assert!(bug(readmitted_verdict(&kept_seen, 50, at(2))), "kept the evidence");
+    // Re-excluded: a fresh exclusion (j 1, after the reset) the chain gives is a miss; a stale j
+    // (the success did not reset it) or a run below K at the plan boundary is a bug.
+    let again = |j: u32| LeaderStats {
+        miss_run: 0,
+        j,
+        excluded_at: Some(60),
+        readmit_after: 60 + L * (1 << (j - 1)),
+        seen_at: None,
+    };
+    assert!(missed(readmitted_verdict(&again(1), 55, at(K))));
+    assert!(bug(readmitted_verdict(&again(2), 55, at(K))), "re-excluded with a stale j");
+    assert!(bug(readmitted_verdict(&again(1), 55, at(K - 1))), "re-excluded below K");
+    // An exclusion of a live validator is a miss only with the chain's run at K at its plan.
+    assert!(planned_by_the_chain(Some(K)));
+    assert!(planned_by_the_chain(Some(K + 2)));
+    assert!(!planned_by_the_chain(Some(K - 1)));
+    assert!(!planned_by_the_chain(None));
 }
 
 /// The re-admission floor `L * 2^j` with the j cap at 1 (genesis `leader_exclusion_cap`):
@@ -1273,6 +1449,13 @@ fn dl_cluster_mixed_k_config_diverges_in_state_and_halts_at_the_exclusion() {
         assert!(
             c.committed(i) < planned,
             "node {i} committed the update height {planned}: {}",
+            c.status()
+        );
+        // The update block got no quorum either way: no PC certifies it (or anything above it).
+        assert!(
+            c.hs_highest_pc(i) < planned,
+            "node {i}: a PC on {} at or above the update height {planned}: {}",
+            c.hs_highest_pc(i),
             c.status()
         );
         assert!(!c.failed(i), "node {i} failed");
