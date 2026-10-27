@@ -811,14 +811,11 @@ enum WindowVerdict {
 }
 
 fn window_verdict(stop: WindowStop, precommit_pc: bool) -> WindowVerdict {
-    // s140 (as on 3b7ecc38): retry whenever the Precommit PC did not form.
-    if stop == WindowStop::NudgeMissed || !precommit_pc {
-        return WindowVerdict::Missed;
-    }
-    if stop == WindowStop::Applied {
-        WindowVerdict::Pass
-    } else {
-        WindowVerdict::Livelocked
+    match stop {
+        WindowStop::NudgeMissed => WindowVerdict::Missed,
+        WindowStop::Applied if precommit_pc => WindowVerdict::Pass,
+        WindowStop::Applied => WindowVerdict::Missed,
+        WindowStop::Stalled | WindowStop::Ceiling => WindowVerdict::Livelocked,
     }
 }
 
@@ -876,7 +873,10 @@ struct PrecommitWindowLog {
 /// The window is set up only if n0 nudges U's Prepare PC in v + 1 and U's Precommit PC (v + 1)
 /// forms. On a loaded host view v can time out before n0 collects the Prepare votes (s140: TC(8),
 /// n0 proposed a fresh block in 9 and the update was re-proposed in fresh blocks, never U): the
-/// run missed the scenario and the test starts a fresh cluster, up to 3 times.
+/// run missed the scenario and the test starts a fresh cluster, up to 3 times. Only that is a
+/// miss (every live validator past v + 1 without the nudge, or the update committed without the
+/// window); a run that stops with the update uncommitted fails, Precommit PC or not
+/// ([`window_verdict`]).
 #[test]
 fn validator_set_update_survives_a_silent_leader_after_the_precommit_pc() {
     let mut missed = Vec::new();
@@ -884,7 +884,7 @@ fn validator_set_update_survives_a_silent_leader_after_the_precommit_pc() {
         match silent_leader_after_the_precommit_pc() {
             Ok(()) => return,
             Err(why) => {
-                eprintln!("scenario missed, fresh cluster: {why}");
+                eprintln!("SCENARIO MISSED, fresh cluster: {why}");
                 missed.push(why);
             }
         }
@@ -946,34 +946,45 @@ fn silent_leader_after_the_precommit_pc() -> Result<(), String> {
         .submit_transaction(NumberAppTransaction::SetValidator(target_key.to_bytes(), Power::new(2)));
     let applied = || cluster.live().all(|n| n.committed_validator_set().power(&target_key).map(|p| p.int()) == Some(2));
     // n0's nudge of U's Prepare PC (v) in v + 1, if every live validator is past v + 1 without it.
+    // The log is read and released before any node is asked: a node's block-sync server sends
+    // while it holds its block-tree snapshot, and every send takes the log in the filter (the
+    // lock order of the s140 one-down P1).
     let nudge_missed = || {
-        let w = log.lock().unwrap();
-        w.update.is_some_and(|(_, v)| {
-            cluster.live().all(|n| n.highest_view_entered().int() >= v + 2)
-                && !w.events.iter().any(|&(view, _, kind, on_u, ref phase, justify_view, _)| {
-                    view == v + 1 && kind == "nudge" && on_u && phase == "Prepare" && justify_view == v
-                })
-        })
+        let (v, nudged) = {
+            let w = log.lock().unwrap();
+            let Some((_, v)) = w.update else { return false };
+            let nudged = w.events.iter().any(|&(view, _, kind, on_u, ref phase, justify_view, _)| {
+                view == v + 1 && kind == "nudge" && on_u && phase == "Prepare" && justify_view == v
+            });
+            (v, nudged)
+        };
+        !nudged && cluster.live().all(|n| n.highest_view_entered().int() >= v + 2)
     };
     let pc_frontier = || cluster.live().map(|n| n.highest_pc_view()).max().unwrap_or(0);
     let start = std::time::Instant::now();
     let (mut frontier, mut moved) = (pc_frontier(), start);
-    let mut nudged = true;
-    while !applied() {
+    let stop = loop {
+        if applied() {
+            break WindowStop::Applied;
+        }
         if nudge_missed() {
-            nudged = false;
-            break;
+            break WindowStop::NudgeMissed;
         }
         let f = pc_frontier();
         if f != frontier {
             (frontier, moved) = (f, std::time::Instant::now());
         }
-        if moved.elapsed() >= WINDOW_STALL || start.elapsed() >= WINDOW_CEILING {
-            break;
+        if moved.elapsed() >= WINDOW_STALL {
+            break WindowStop::Stalled;
+        }
+        if start.elapsed() >= WINDOW_CEILING {
+            break WindowStop::Ceiling;
         }
         std::thread::sleep(POLL_INTERVAL);
-    }
+    };
 
+    // The nodes first, the log after (see `nudge_missed`).
+    let described = cluster.describe();
     let log = log.lock().unwrap();
     let (_, v) = log.update.expect("scenario: the update block was proposed");
     let trace = format!(
@@ -987,21 +998,23 @@ fn silent_leader_after_the_precommit_pc() -> Result<(), String> {
         log.precommit_pcs,
         log.reproposals,
         log.prepare_votes,
-        cluster.describe(),
+        described,
         log.events
     );
     let precommit_pc = log.precommit_pcs.contains(&(v + 1));
     drop(log);
     assert_eq!(cluster.leader(v), proposer, "scenario: n{proposer} proposed U; {trace}");
     assert_eq!(cluster.leader(v + 2), down, "scenario: the silent validator leads v + 2; {trace}");
-    if !nudged || !precommit_pc {
-        return Err(format!("U's Precommit PC (v + 1) did not form (nudged {nudged}); {trace}"));
+    match window_verdict(stop, precommit_pc) {
+        WindowVerdict::Pass => {}
+        WindowVerdict::Missed => {
+            return Err(format!("{stop:?} without U's Precommit PC (v + 1) (formed: {precommit_pc}); {trace}"))
+        }
+        WindowVerdict::Livelocked => panic!(
+            "the update window livelocked ({stop:?}, U's Precommit PC (v + 1) formed: {precommit_pc}): every \
+             live validator must commit U (no new PC for {WINDOW_STALL:?} or {WINDOW_CEILING:?} in all); {trace}"
+        ),
     }
-    assert!(
-        applied(),
-        "the update window livelocked: every live validator must commit U (no new PC for {WINDOW_STALL:?} or \
-         {WINDOW_CEILING:?} in all); {trace}"
-    );
     let after = cluster.max_committed();
     cluster.wait_for_commits(after + 2, "after the update");
     Ok(())

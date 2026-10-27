@@ -65,3 +65,25 @@ slow-timeout = { period = "120s", terminate-after = 10 }
 [[profile.ci.overrides]]
 filter = "package(torus-consensus) & (test(/crash_recovery_tests::(l31|l61|o0)_/) | test(running_hash_write_set_determinism))"
 slow-timeout = { period = "120s", terminate-after = 10 }
+
+# s140: two cluster tests start a fresh cluster when a run missed its scenario (the A1 oracle
+# confirms a live validator's slots really timed out, or n0 never nudged the update's Prepare
+# PC); any other failure still fails. Each retried miss prints a "SCENARIO MISSED, fresh
+# cluster: ..." line to stderr, shown on a pass too: search a run's output for it. The
+# dead-leader test's output is a few lines (shown again in the final summary); the hotstuff
+# test's carries every replica event, so it is shown once, where it ran.
+[[profile.default.overrides]]
+filter = "package(torus-consensus) & test(=app::dead_leader_cluster_tests::dl_cluster_restarted_validator_is_readmitted_and_proposes)"
+success-output = "immediate-final"
+
+[[profile.ci.overrides]]
+filter = "package(torus-consensus) & test(=app::dead_leader_cluster_tests::dl_cluster_restarted_validator_is_readmitted_and_proposes)"
+success-output = "immediate-final"
+
+[[profile.default.overrides]]
+filter = "package(hotstuff_rs) & test(=validator_set_update_survives_a_silent_leader_after_the_precommit_pc)"
+success-output = "immediate"
+
+[[profile.ci.overrides]]
+filter = "package(hotstuff_rs) & test(=validator_set_update_survives_a_silent_leader_after_the_precommit_pc)"
+success-output = "immediate"

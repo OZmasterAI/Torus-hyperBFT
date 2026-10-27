@@ -174,7 +174,7 @@ fn retry_missed(tries: u32, attempt: impl Fn()) {
             Ok(()) => return,
             Err(payload) => match payload.downcast::<ScenarioMissed>() {
                 Ok(m) => {
-                    eprintln!("scenario missed, fresh cluster: {}", m.0);
+                    eprintln!("SCENARIO MISSED, fresh cluster: {}", m.0);
                     missed.push(m.0);
                 }
                 Err(other) => std::panic::resume_unwind(other),
@@ -973,7 +973,11 @@ fn first_seen_boundary(qcs: &[(u64, LeaderEvidence)], from: u64, pos: usize) -> 
 ///
 /// Only `x` misses its slots here: a run in which a running validator's slow leader slots ran
 /// to K misses first (s140, a loaded `cargo test` on 18c: validator 3 excluded at 20, then `x`
-/// never could be) is a missed scenario and gets a fresh cluster.
+/// never could be) is a missed scenario and gets a fresh cluster, if the A1 oracle over the
+/// committed QC chain also brings that validator's run to K at the plan boundary (else it fails
+/// as a misattribution). After the re-admission the success's reset (j, the floor, the evidence)
+/// is checked in every run; a later run of `x`'s own, or a fresh exclusion with j 1, is retried
+/// only when the chain gives it ([`readmitted_verdict`]).
 #[test]
 fn dl_cluster_restarted_validator_is_readmitted_and_proposes() {
     retry_missed(3, restarted_validator_is_readmitted_and_proposes);
@@ -1062,16 +1066,42 @@ fn readmitted_verdict(
     applied: u64,
     oracle_run: impl Fn(u64) -> Option<u32>,
 ) -> Readmitted {
-    // s140 (as on 3b7ecc38).
-    let _ = (applied, &oracle_run);
-    if st.miss_run > 0 || st.excluded_at.is_some() {
-        return Readmitted::Missed(format!("{st:?}"));
+    if let Some(at) = st.excluded_at {
+        // Excluded again: only a fresh exclusion after the success's reset (j 0 -> 1), with the
+        // run at K at its plan boundary on the chain, is a miss.
+        if st.j != 1 {
+            return Readmitted::Bug(format!(
+                "excluded again at {at} with j {} (after its success reset j a fresh exclusion has \
+                 j 1): {st:?}",
+                st.j
+            ));
+        }
+        let run = oracle_run(at - L);
+        return if planned_by_the_chain(run) {
+            Readmitted::Missed(format!("excluded again at {at}, oracle run {run:?} at its plan: {st:?}"))
+        } else {
+            Readmitted::Bug(format!(
+                "A1 misattribution: excluded again at {at}, the chain's run at its plan is {run:?}: {st:?}"
+            ))
+        };
     }
-    if *st == LeaderStats::default() {
-        Readmitted::Reset
-    } else {
-        Readmitted::Bug(format!("re-admitted, its success reset the run and j: {st:?}"))
+    if (LeaderStats { miss_run: 0, ..st.clone() }) != LeaderStats::default() {
+        return Readmitted::Bug(format!(
+            "re-admitted, its success did not reset j, the floor or the evidence: {st:?}"
+        ));
     }
+    if st.miss_run > 0 {
+        let run = oracle_run(applied);
+        return if run == Some(st.miss_run) {
+            Readmitted::Missed(format!("its slots timed out after its success: {st:?} at {applied}"))
+        } else {
+            Readmitted::Bug(format!(
+                "A1 misattribution: miss_run {} at {applied}, the chain gives {run:?}: {st:?}",
+                st.miss_run
+            ))
+        };
+    }
+    Readmitted::Reset
 }
 
 /// The restarted test retries only a miss that leaves the success's reset visible and that the
@@ -1428,10 +1458,10 @@ fn dl_cluster_mixed_k_config_diverges_in_state_and_halts_at_the_exclusion() {
     });
     let planned = planned_any_exclusion(&c, 1).unwrap();
     // The chain reached the height below the update once every node holds the PC on
-    // `planned - 1` (the next proposal is the update block, which gets no quorum): what that PC
-    // commits is final. Usually `planned - 3` or more; lower when views between the last
-    // certified blocks timed out (s140: all three stuck at 25 for 240 s below 30 under a loaded
-    // `cargo test` run on 18c).
+    // `planned - 1` (the next proposal is the update block, which never commits): at most the
+    // update block's own phases certify more. Usually `planned - 3` or more is committed; lower
+    // when views between the last certified blocks timed out (s140: all three stuck at 25 for
+    // 240 s below 30 under a loaded `cargo test` run on 18c).
     c.wait_until(
         "the chain reaches the height below the planned update",
         |c| {
@@ -1451,10 +1481,12 @@ fn dl_cluster_mixed_k_config_diverges_in_state_and_halts_at_the_exclusion() {
             "node {i} committed the update height {planned}: {}",
             c.status()
         );
-        // The update block got no quorum either way: no PC certifies it (or anything above it).
+        // The update block never commits, so nothing above it is certified (its children need
+        // its Decide PC). Its own phases can still certify it (s140: a PC on 30 = `planned`
+        // after the wait, committed 28).
         assert!(
-            c.hs_highest_pc(i) < planned,
-            "node {i}: a PC on {} at or above the update height {planned}: {}",
+            c.hs_highest_pc(i) <= planned,
+            "node {i}: a PC on {} above the update height {planned}: {}",
             c.hs_highest_pc(i),
             c.status()
         );
