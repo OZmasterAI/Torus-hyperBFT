@@ -22240,9 +22240,12 @@ Paired per round (B - A, r1..r4):
 
 ## 134. Step 9p3, below-saturation dead-leader one-down (section 132 follow-up) on main `0261068b`: 4 validators, stakes 1 / 1 / 1 / 1, `ORACLE_FEED=seed`, rate 475 (all-up ~14 of 32 cores), in-flight cap 4, `BENCH_RPCS=0,1,2`, K = `KILL_NO_RESTART=val3` at bench+120 s, aK (`DL_K=3`) vs bK (dead-leader off), ABBA n = 6, + all-up aU (`DL_K=3`) n = 3 interleaved, hash + attestation + L6.1 + L2.1 + fail-stop on, Classic, 15 s checkpoints, 600 s cells, load windows timed between the 15-minute desktop bursts (campaign bench-ozarchy-s140-9p3 + FOREIGN reruns bench-ozarchy-s140-9p3-rr, run dirs ozarchy-s140-9p3-run, -rerun-run, archy, 2026-10-26/27)
 
-**9p3: no freeze, the same exclusion on every survivor, AGREE everywhere. The blocks/s criterion fails by a hair:
-post-exclusion runs at 0.894 ± 0.001 of all-up at the same offsets (pass line 0.90). matched/s and order age are
-level with all-up.**
+**9p3: no freeze, the same exclusion on every survivor, AGREE everywhere. The blocks/s criterion fails by a hair
+against 4-validator all-up: post-exclusion runs at 0.894 ± 0.001 of all-up at the same offsets (pass line 0.90).
+matched/s and order age are level with all-up. Update (134.10, owner option c): against a 3-validator all-up (U3,
+the survivors' shape without a kill) post-exclusion blocks/s is 0.999 ± 0.002, so it PASSES. U3 itself runs at
+0.895 of 4-validator all-up: the gap is 3-of-3 against 3-of-4 voting, not dead-leader skip. All four criteria
+pass.**
 * Load knob (134.2): `RATE`, not `MAX_IN_FLIGHT`. Caps 1 / 2 / 3 left all-up at ~26 of 32 busy cores, as cap 4 in 9p2.
   At rate 14,000 the bench runs closed loop at ~1,080-1,120 submitted actions/s whatever the cap. 132.7's advice
   ("lower `MAX_IN_FLIGHT`, not `RATE`") was wrong. Busy cores scale with `RATE` below ~1,080 actions/s: 12.3 / 16.3 /
@@ -22256,9 +22259,10 @@ level with all-up.**
   * blocks/s **0.894 ± 0.001** (0.892-0.896, all 8 aK runs 0.891-0.896): **FAIL** against the 0.90 line.
   * matched/s -0.1% to +0.8%; order age p50 / p99 154 / 597 ms vs 144 / 612 ms all-up; 0.03 timeouts per minute.
   * At this rate load does not set the block rate (all-up 29.0-29.6 blocks/s at 400-700 actions/s and here).
-    26.3 vs 29.4 is a consensus-cadence gap between 3 live voters and 4. Likely cause (not tested): with val3 gone
-    the quorum (3 of 4 stake) needs every survivor's vote, so the slowest survivor sets each round. In 9p2 (0.966)
-    execution set the block rate.
+    26.3 vs 29.4 is a consensus-cadence gap between 3 live voters and 4. Likely cause: with val3 gone
+    the quorum (3 of 4 stake) needs every survivor's vote, so the slowest survivor sets each round. Confirmed in
+    134.10: a 3-validator all-up runs at the same 26.3 blocks/s, and the leader's vote gather is ~5 ms longer per
+    view. In 9p2 (0.966) execution set the block rate.
 * Exclusion: every aK cell logs one identical delta on val0 / val1 / val2 (exclude=1, readmit=0, excluded=1,
   H 6600-6800). bK never excludes (0 of 6 + smoke sB). State attestation equal and AGREE in all 19 load cells.
   0 HARD FINDING, 0 hand-off WARNs.
@@ -22498,20 +22502,22 @@ Windows (K cells, val0):
   val2 in every aK run and sA. bK never excludes.
 * **AGREE everywhere: PASS.** 19 load cells + 2 smokes AGREE, state attestation equal. One dissemination-only REJECT
   (rerun-r3-aK), the known kill-cell shape.
-* **Post-exclusion blocks/s >= 90% of all-up at the same offsets: FAIL (0.894 ± 0.001, max 0.896). High
-  confidence it is below 0.90; low impact.**
+* **Post-exclusion blocks/s >= 90% of all-up at the same offsets: FAIL against 4-validator all-up (0.894 ± 0.001,
+  max 0.896); PASS against the 3-validator reference U3 (0.999 ± 0.002, 134.10, owner option c). High
+  confidence in both; the 4-validator line measures voter count, not dead-leader skip.**
   * The shortfall is 1.0-1.2 blocks/s out of 29.4 in block cadence only. matched/s, order age and timeouts after
     the exclusion match all-up.
   * The criterion was written at saturation, where blocks/s tracked throughput (9p2: 0.966). Below saturation it
     measures the 3-voter vs 4-voter consensus round time instead.
-  * Whether that counts against dead-leader skip is the owner's call. One option: judge post-exclusion on matched/s
-    and order age (both level), or compare blocks/s to a 3-validator all-up.
+  * Whether that counts against dead-leader skip was the owner's call. The owner chose option (c), a comparison
+    with a 3-validator all-up: 134.10 runs it, and the criterion passes there (0.999).
 
 ### 134.8 Limits and next
 
 * n = 6 scored aK, 8 aK runs in all. The combined bound (17.6%) still allows a rare freeze; it is not proven zero.
-* The blocks/s cause (quorum = all 3 survivors) is a hypothesis. A 3-up / 1-absent-from-genesis reference cell, or
-  per-round vote-arrival timing, would test it.
+* The blocks/s cause (quorum = all 3 survivors) is confirmed by the 3-validator reference (134.10): U3 = aK
+  post-exclusion on blocks/s, view duration and vote gather. Which survivor is slowest in a given view is not
+  measured (no per-vote arrival lines).
 * 132.7's load advice is corrected here: `RATE` sets the load only below the closed-loop ceiling (~1,080 actions/s
   at cap 4, 5,000 senders). Above it the nodes saturate whatever the cap.
 * FOREIGN: the 15-minute desktop job is handled by burstwait (0 hits). The claude session that runs the bench still
@@ -22546,6 +22552,240 @@ Windows (K cells, val0):
   * `gaps9p3.py` -> `gaps9p3.txt`, `gaps9p3-rerun.txt`;
   * `foreign9p3.py` -> `foreign9p3.txt`, `foreign9p3-rerun.txt`;
   * `deltas9p3.txt`.
+
+### 134.10 3-validator reference (owner option c): U3 = the survivors' shape without a kill (campaign bench-ozarchy-s140-9p3u3-9v, run dir ozarchy-s140-9p3u3-run, archy, 2026-10-27)
+
+**Against a 3-validator all-up (U3), post-exclusion blocks/s is 0.999 ± 0.002 (0.997-1.001): PASS (line 0.90).
+The 0.894 of 134.5 is the gap between 3 voters and 4, and a chain started with 3 validators shows it too
+(U3 / aU 0.895). The slowest-survivor guess holds: each view waits ~5 ms longer for the third of three votes.**
+
+Setup (owner option c, chat msg 196): the same staged binary as 9p3 (stage c7 = main `0261068b`, node `50c1cfeb`, md5
+checked on every node of every cell), harness worktree `wt/bq-0261068b`, the same load and env as 9p3 (rate 475,
+in-flight cap 4, 5,000 senders, seed oracle, 600 s cells, wiped dirs, hand-off default on, `DL_K=3`). Changes:
+`N_VALIDATORS=3`, `VALIDATOR_STAKES=1,1,1`, no kill. Validators val0..val2 are 9p3's survivors, and
+`BENCH_RPCS=0,1,2` is the same RPC load the survivors took in 9p3. With 3 equal stakes the quorum is again all 3
+votes, as for the survivors after the kill (val3 stays in the set with 1 of 4 stake). Order: unscored w1 + U3 r1..r3,
+from one generated driver (`ozarchy-s140-9p3u3-tools/drivers/ozarchy-s140-9p3u3-campaign.sh`, spec
+`specs/9p3u3.json` from `make-specs-9p3u3.py`). Checks: `configchk3` / `handoffchk3` (val0..val2), plus run.log
+expectations (stakes 1,1,1, `genesis validators=3`, no `4-validator devnet` line, no val3 start) and
+`RPC endpoints: 3`. burstwait paced the cells.
+
+* Validity: smoke (120 s, `ozarchy-s140-9p3u3-smk-smoke-s0`) and all 4 cells rc 0, ACCEPT / AGREE / PASS, state
+  attestation equal (63 checkpoints each). 0 timeouts, 0 panic / fail-stop / HARD FINDING lines.
+* FOREIGN: 0 of 4 cells broke the rule (max 2 s interval 0.24-0.37 core, all a claude session); no reruns.
+  burstwait kept every load window off the desktop burst. That burst's phase moved to :03:37 on 2026-10-27, so
+  the phase seeds were re-sampled before the launch (see section 135.1).
+* U3 whole load window (val0): blocks/s 26.23 / 26.28 / 26.28, matched/s 94,744 / 94,748 / 94,760, order age
+  p50 / p99 155 / 587, 155 / 585, 154 / 583 ms. Smoke: 26.10 blocks/s.
+
+Post-exclusion (9p3 scored aK, the windows of 134.5) against U3 at the same wall offsets from load start (mean of the
+3 U3 cells; `analyst/u3cmp.py` -> `u3cmp.txt`):
+
+| aK cell | post window | aK blk/s | U3 blk/s | aK / U3 | U3 / aU | age p50 aK / U3 ms | age p99 aK / U3 ms | matched/s aK vs U3 |
+|---|---|---|---|---|---|---|---|---|
+| r1-aK | +215..+612 s | 26.29 | 26.35 | 0.998 | 0.895 | 155 / 156 | 614 / 585 | +0.2% |
+| r2-aK | +190..+612 s | 26.38 | 26.35 | 1.001 | 0.894 | 154 / 156 | 589 / 585 | +0.1% |
+| rerun-r3-aK | +174..+613 s | 26.34 | 26.36 | 0.999 | 0.895 | 154 / 156 | 601 / 585 | +0.8% |
+| r4-aK | +180..+613 s | 26.27 | 26.36 | 0.997 | 0.895 | 154 / 156 | 590 / 585 | +0.1% |
+| r5-aK | +217..+613 s | 26.34 | 26.35 | 1.000 | 0.894 | 154 / 156 | 604 / 585 | +0.5% |
+| r6-aK | +207..+613 s | 26.33 | 26.35 | 0.999 | 0.894 | 154 / 156 | 584 / 585 | -0.1% |
+| **mean ± 95% CI (n = 6)** | | | | **0.999 ± 0.002** | 0.895 ± 0.000 | 0.990 ± 0.003 | 1.020 ± 0.020 | 1.003 ± 0.003 |
+
+Slowest-survivor check. The node logs have no per-vote arrival lines, so this uses the per-node view histograms in
+`sampler.csv`: ms per event over the windows above, mean of the 6 aK post windows, val0 / val1 / val2.
+
+| metric | aK post-exclusion | U3 (3 of 3 votes) | aU (3 of 4 votes) |
+|---|---|---|---|
+| views/s | 26.3 / 26.3 / 26.3 | 26.3 / 26.3 / 26.3 | 29.5 / 29.5 / 29.5 |
+| view duration | 38.0 / 38.0 / 38.0 | 38.0 / 38.0 / 38.0 | 34.0 / 34.0 / 34.0 |
+| vote gather (leader) | 29.6 / 30.1 / 29.5 | 29.1 / 29.5 / 29.3 | 23.2 / 25.8 / 24.2 |
+| QC collect (leader) | 37.2 / 36.3 / 37.3 | 38.8 / 38.1 / 38.3 | 33.4 / 32.8 / 32.3 |
+| proposal arrival (replica) | 28.0 / 28.6 / 27.8 | 29.1 / 29.3 / 29.2 | 21.9 / 22.6 / 22.4 |
+| vote delay (replica) | 5.7 / 5.7 / 5.7 | 5.6 / 5.5 / 5.5 | 5.7 / 5.8 / 5.8 |
+
+* A replica's vote delay is the same in all three (5.5-5.8 ms), so no voter got slower. What changes is how long the
+  leader waits for votes: +4-6 ms per view with 3 of 3 against 3 of 4. With 4 voters the quorum ignores the slowest
+  vote; with 3 it must wait for it. The view grows 34.0 -> 38.0 ms, which is 29.5 -> 26.3 views/s (0.89).
+* aK post-exclusion and U3 agree within 0.5 ms on every row. The dead-leader exclusion adds no cadence cost of its
+  own. The cost is the voter count.
+* Not resolved: which survivor is the slowest in a given view. That needs per-vote arrival timing, which the nodes
+  do not log.
+
+Verdict update for 134.7, criterion 4: **post-exclusion blocks/s ≥ 90% of a matching all-up: PASS against U3
+(0.999 ± 0.002)**. Against 4-validator all-up it stays 0.894 (FAIL), but U3 shows the same 0.895, so that line
+compares 3-of-3 voting with 3-of-4 voting, not dead-leader skip with no skip. With option (c) all four 9p3 criteria
+pass.
+
+Data: cells `ozarchy-s140-9p3u3-{w1,r1-U3,r2-U3,r3-U3}` and smoke `ozarchy-s140-9p3u3-smk-smoke-s0`. Run dir
+`ozarchy-s140-9p3u3-run/` (`campaign.log`, `campaign.done` exit=0, `cells.tsv`, `foreign.txt`,
+`burstwait-state.tsv`, `chain.log`, `chain.done`, `smoke-chain.log`, `smk/`). Tools `ozarchy-s140-9p3u3-tools/`:
+`make-specs-9p3u3.py`, `specs/`, `drivers/` (+ `.gen` / `.dry` / `.show` logs), `checks/9p3u3-checks.sh`, `prof/`
+(`burstwait.py`, `foreign-sampler.py`, `run-with-sampler.sh`, `phase/foreign-phase.txt`), `smoke-chain.sh`,
+`campaign-chain.sh`, and `analyst/u3cmp.py` -> `u3cmp.txt`, `foreign9p3u3.txt`.
+
+## 135. Step 9v, vote-path cost of the validator-set-update fixes: A = main `7251fc7c` vs B = main `b42e5e98` (Merge fix/vsu-laggard-and-collector `99e2f285`), U (all up) only, stakes 2 / 2 / 1, `ORACLE_FEED=seed`, frozen `9083b278` harness genesis, hash + attestation + L6.1 + L2.1 + fail-stop on, Classic, 15 s checkpoints, w1 (A, unscored) + ABBA n = 3 (A B B A A B), 300 s cells, load windows timed between the 15-minute desktop bursts (campaign bench-ozarchy-s140-9p3u3-9v, part 2; run dir ozarchy-s140-9v-run, archy, 2026-10-27)
+
+**9v: PASS. The fixes cost the consensus thread +2.8% CPU per block (+0.41 ms on 14.5 ms; paired 95% CI +1.2% to
++4.5%), under the +5% line. blocks/s, commit p99, matched/s and process CPU per fill do not move beyond noise.**
+* hotstuff-algo on-CPU per committed block: 14.53 -> 14.94 ms, step +0.41 ± 0.47 (Welch), paired +0.41 ± 0.24 ms.
+  All three rounds point the same way (+0.30 / +0.46 / +0.47). Per view: 14.39 -> 14.80 ms, +2.9% (paired +1.1% to
+  +4.7%). Two independent counters agree: schedstat over the load window, and the /proc task snapshots
+  (14.33 -> 14.74 ms per block).
+* In cores, hotstuff-algo goes 0.235 -> 0.239 per node (+0.005 ± 0.004), or 0.868 -> 0.884 ms per 1k fills (+1.9%,
+  Welch [+0.5%, +3.2%]). Process CPU per 1k fills: +0.08 ± 0.30 ms (24.57 -> 24.65), within noise.
+* blocks/s 16.13 -> 16.00 (-0.13 ± 0.34; ratio 0.992 [0.971, 1.013]); views/s 16.31 -> 16.16 (-0.15 ± 0.46);
+  commit interval p99 740 -> 731 ms (-9 ± 53). Not worse. Commit interval p50 12.4 -> 12.9 ms (+0.6 ± 0.5,
+  Welch-resolved, paired ± 0.8 not): small if real.
+* The sync-server fix (`2ece70d7`) shows no cost: hotstuff-syncsv 0.109 -> 0.112 ms per block (not resolved),
+  hotstuff-bodyse flat.
+
+Question (18c / owner chat msg 196): main `b42e5e98` landed two validator-set-update fixes:
+* `57893292`: the phase-vote collectors are refreshed to the current validator set before each incoming vote is
+  counted (~5 RocksDB reads per vote on the consensus thread), and every Decide PC gets a full check (with
+  `4084518d`);
+* `2ece70d7`: a replica no longer uses itself as its block-sync server.
+
+What do they cost on the vote path? Pass:
+* hotstuff thread CPU within noise or < +5%;
+* blocks/s and commit p99 not worse.
+
+### 135.1 Setup
+
+* Binaries: fresh release builds (`build/build-9v.sh` = section 133's `build-9s2.sh` with the new shas: one detached
+  worktree (`wt/bq-7251fc7c`, `wt/bq-b42e5e98`) and one fresh target dir per arm (`~/.cargo-target-s140-9v-{A,B}`),
+  `--locked`, `CARGO_INCREMENTAL=0`, under the shared build lock), staged in `ozarchy-s140-9v-stage/{A,B}/release`.
+  md5 checked against `build/md5s.txt` after the copy, by the driver's preflight and on every node of every cell.
+  merge-base(A, B) = A.
+
+| arm | commit | node md5 | bench md5 | change |
+|---|---|---|---|---|
+| A | main `7251fc7c` | `50c1cfeb` | `121459c5` | base (Merge docs/roadmap-s140 `0df7c871`) |
+| B | main `b42e5e98` | `69fc5ee6` | `b2b06854` | A + Merge fix/vsu-laggard-and-collector `99e2f285`: `2ece70d7`, `4084518d`, `57893292` + RED tests (`crates/hotstuff_rs`) |
+
+  * A's node is byte-identical to section 134's stage c7 (`0261068b`, node `50c1cfeb`). `0261068b..7251fc7c`
+    changes only docs and `tools/genesis-draft`.
+  * B's `bench-throughput` differs from A's because it links `hotstuff_rs`. Each arm runs its own bench binary, as in
+    section 133.
+* Specs: `make-specs-9v.py` = section 133's `make-specs-9s2.py` with the new shas, run dir and order. Base spec
+  (`specs/base-bisect-main.json`), harness env, node env, absent env, expectations, host checks, samplers and the
+  harness worktree `wt/bq-9083b278` are unchanged.
+  * Load: 300 markets, rate 76,000, 5,000 senders, batch 400, `MAX_IN_FLIGHT` 4, commit tail, `BENCH_RPCS=0,1`.
+  * Checks file `checks/s140-9v-checks.sh` = `configchk` + `burstwait`, as section 133.
+* Per-thread CPU: `prof/run-campaign-9v.sh` (section 133's `run-campaign-9s2.sh`) takes /proc task snapshots of
+  the 3 nodes at bench+5 and bench+290 s, as before. The consensus-thread rows use two sources:
+  * schedstat: `summary.json` `sched_by_node` hotstuff-algo on-CPU over the load window, per committed block, per
+    view (`torus_consensus_view` delta, `sampler.csv`) and per 1k fills;
+  * the task snapshots, per thread: hotstuff-algo, hotstuff-syncsv (block-sync server), hotstuff-bodyse.
+  * View timings (QC collect, vote gather, vote delay, view duration) are window means of the `sampler.csv`
+    histogram sums / counts, mean of 3 nodes.
+* Order: unscored w1 (A, warm-up gate) + r1 A B, r2 B A, r3 A B, from one generated driver
+  (`drivers/ozarchy-s140-9v-campaign.sh`). The chained unit bench-ozarchy-s140-9p3u3-9v started it right after
+  section 134.10's U3 cells (one bench unit, `ozarchy-s140-9p3u3-tools/campaign-chain.sh`); nothing ran in between.
+* **Burst phase moved.** On 2026-10-27 the desktop burst (`omarchy-agent-u` + `quickshell`) ran at hh:03:37 /
+  :18:37 / :33:37 / :48:37, not :07:21 (section 133) or :06:26 (section 134). Evidence: one burst in the 9v smoke A
+  sampler (18:18:36) and one in a pre-launch phase sample (18:33:39), none at 18:21:26. Older seeds would have
+  outvoted the new phase, so both burstwait copies were re-seeded with today's samples only
+  (`ozarchy-s140-9p3u3-tools/prof/phase/foreign-phase.txt` + the smoke A sampler). The run's own `foreign.txt` took
+  over from w1 on: 8 of 8, then 9 of 10 clusters on the new phase.
+
+### 135.2 Validity
+
+* Smokes (60 s, `ozarchy-s140-9v-smk-{a,b}-smoke-s0`): ACCEPT / AGREE / PASS, every check OK. A 278,981, B 271,160
+  matched/s.
+* 7 of 7 cells rc 0, ACCEPT / AGREE / PASS, state attestation equal (63 checkpoints each), node md5 = the arm's
+  staged md5 on all 3 nodes. 0 panic / fail-stop / HARD FINDING lines, 0 CHECK FAIL, 0 CELL-FLAG.
+* FOREIGN: 0 of 6 scored cells broke the rule (max 2 s interval 0.07-0.39 core). The unscored w1 had one 0.53-core
+  interval (a claude session). No reruns. burstwait waited once (341 s, before r3-A).
+
+### 135.3 Per cell (run order; mean of 3 nodes; `analyst/abba9v.txt`)
+
+| tag | arm | hs-algo ms / block | hs-algo ms / view | syncsv ms / block | views/s | blk/s | commit p50 ms | commit p99 ms | matched/s | CPU ms / 1k fills | hs-algo ms / 1k fills | timeouts |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 | A | 14.308 | 14.297 | 0.109 | 16.19 | 16.20 | 12.6 | 730 | 267,146 | 24.579 | 0.867 | 3 |
+| r1 | A | 14.438 | 14.281 | 0.106 | 16.52 | 16.30 | 12.6 | 722 | 271,590 | 24.470 | 0.869 | 0 |
+| r1 | B | 14.736 | 14.580 | 0.109 | 16.32 | 16.10 | 12.8 | 714 | 270,162 | 24.509 | 0.881 | 0 |
+| r2 | B | 15.021 | 14.887 | 0.114 | 16.18 | 16.00 | 12.9 | 722 | 270,437 | 24.679 | 0.891 | 1 |
+| r2 | A | 14.557 | 14.447 | 0.108 | 16.22 | 16.10 | 12.2 | 747 | 268,931 | 24.670 | 0.871 | 1 |
+| r3 | A | 14.582 | 14.427 | 0.112 | 16.18 | 16.00 | 12.3 | 752 | 269,848 | 24.574 | 0.865 | 1 |
+| r3 | B | 15.050 | 14.935 | 0.113 | 15.98 | 15.90 | 13.1 | 758 | 270,946 | 24.764 | 0.881 | 0 |
+
+### 135.4 Arm means and B - A (n = 3 per arm; ± = Welch 95% CI; paired = per-round B - A ± t(2) CI)
+
+| metric | A | B | B - A (Welch) | ratio [95% CI] | paired B - A |
+|---|---|---|---|---|---|
+| **hs-algo on-CPU ms / committed block** | 14.526 | 14.936 | **+0.410 ± 0.471** | 1.028 [0.996, 1.061] | **+0.410 ± 0.240** (+0.30 / +0.46 / +0.47) |
+| **hs-algo on-CPU ms / view** | 14.385 | 14.801 | **+0.416 ± 0.528** | 1.029 [0.992, 1.066] | +0.416 ± 0.264 |
+| hs-algo ms / block (task snapshots) | 14.331 | 14.742 | +0.411 ± 0.461 | 1.029 [0.997, 1.061] | +0.411 ± 0.318 |
+| hs-algo ms / 1k fills (schedstat) | 0.868 | 0.884 | +0.016 ± 0.012 | 1.019 [1.005, 1.032] | +0.016 ± 0.009 |
+| hs-algo cores per node | 0.235 | 0.239 | +0.005 ± 0.004 | 1.020 [1.004, 1.035] | +0.005 ± 0.006 |
+| hs-syncsv ms / block | 0.109 | 0.112 | +0.003 ± 0.008 | 1.032 [0.961, 1.103] | +0.003 ± 0.006 |
+| hs-bodyse ms / block | 0.034 | 0.035 | +0.001 ± 0.002 | 1.020 [0.963, 1.076] | +0.001 ± 0.001 |
+| **blocks/s** | 16.13 | 16.00 | **-0.13 ± 0.34** | 0.992 [0.971, 1.013] | -0.13 ± 0.14 |
+| views/s | 16.31 | 16.16 | -0.15 ± 0.46 | 0.991 [0.963, 1.019] | -0.15 ± 0.23 |
+| commit interval p50 ms | 12.4 | 12.9 | +0.6 ± 0.5 | 1.046 [1.007, 1.085] | +0.6 ± 0.8 |
+| **commit interval p99 ms** | 740 | 731 | **-9 ± 53** | 0.988 [0.917, 1.059] | -9 ± 39 |
+| view duration ms | 61.36 | 61.79 | +0.43 ± 1.74 | 1.007 [0.979, 1.035] | +0.43 ± 0.55 |
+| QC collect ms (leader) | 38.75 | 38.89 | +0.13 ± 1.54 | 1.004 [0.964, 1.043] | +0.13 ± 1.22 |
+| vote gather ms (leader) | 25.16 | 25.43 | +0.28 ± 0.64 | 1.011 [0.985, 1.037] | +0.28 ± 1.07 |
+| vote delay ms (replica) | 8.92 | 9.15 | +0.23 ± 0.65 | 1.026 [0.953, 1.098] | +0.23 ± 0.33 |
+| matched/s | 270,123 | 270,515 | +392 ± 3,498 | 1.001 [0.989, 1.014] | +392 ± 3,949 |
+| process CPU ms / 1k fills | 24.571 | 24.651 | +0.079 ± 0.301 | 1.003 [0.991, 1.016] | +0.079 ± 0.242 |
+| exec thread ms / 1k fills | 2.395 | 2.395 | -0.001 ± 0.030 | 1.000 [0.987, 1.012] | -0.001 ± 0.034 |
+| order age p50 / p99 ms | 2260 / 9598 | 2240 / 9630 | -20 ± 293 / +31 ± 92 | 0.991 / 1.003 | |
+| timeouts per cell | 0.7 | 0.3 | -0.3 ± 1.3 | | |
+
+Thread groups per 1k fills (task snapshots), all within noise: ingress 4.985 -> 5.048, network 3.532 -> 3.542,
+rpc 1.684 -> 1.685, tokio 1.985 -> 2.000, exec 8.396 -> 8.416, rocksdb 1.162 -> 1.188, all threads
+23.897 -> 24.058 (+0.161 ± 0.320).
+
+### 135.5 Cross-checks and drift
+
+* Both hotstuff-algo counters (schedstat over the whole load window; the task snapshots over bench+5..+290 s) give
+  the same step (+0.410 / +0.411 ms per block).
+* Drift: both arms rise slowly with run position (A 14.44 / 14.56 / 14.58, B 14.74 / 15.02 / 15.05 ms per block).
+  The per-round step is positive in r2, where B runs first (+0.46), as in r1 and r3 where A runs first (+0.30 /
+  +0.47). The order does not make the step.
+* Levels against section 133 (same shape and harness; there A = `b738520d`, B = `f0bd74ba`): matched/s 270k here
+  vs 266k / 276k; blocks/s 16.1 vs 15.3; hotstuff-algo 0.868 ms per 1k fills vs 0.867 / 0.873, and 14.3-15.1 ms per
+  block vs 14.8-16.6 (per node). That is the usual range. Cross-campaign: levels only, not a step.
+
+### 135.6 Verdict
+
+* **hotstuff thread CPU within noise or < +5%: PASS.** +2.8% per block (paired 95% CI +1.2% to +4.5%; Welch upper
+  bound 6.1%), +2.9% per view (paired upper bound 4.7%). The cost is resolved but small: +0.41 ms of consensus-thread
+  CPU per block, ~0.005 core per node at 16 blocks/s. High confidence that it is below +5% on this shape (paired);
+  medium on the Welch bound.
+* **blocks/s not worse: PASS** (-0.8%, CI -2.9% to +1.3%; not resolved). **commit p99 not worse: PASS** (-1.2%, CI
+  -8.3% to +5.9%).
+* Everything else is level: matched/s, process and exec CPU per fill, order age, timeouts, view timings. The
+  block-sync-server fix shows no cost.
+
+### 135.7 Limits and next
+
+* n = 3 per arm. The Welch CIs are wide (df 2-4). The paired rows carry the verdict.
+* The refresh runs per incoming vote, so the cost likely grows with votes per block, that is with the validator
+  count. 3 validators is the smallest set. This bench does not measure the growth: a 4- or 7-validator A/B
+  would.
+* The consensus thread here runs at ~0.24 core (~15 ms per 61 ms view), so +0.4 ms per block does not move the
+  cadence. On a shape where hotstuff-algo sets the cadence, the same cost would show up in blocks/s.
+* The commit p50 +0.6 ms (Welch-resolved, not paired-resolved) is within 1 ms. Watch it in the next std bench.
+
+### 135.8 Data
+
+* Cells (`~/bench-results-matched/`), each with `summary.json`, `sampler.csv`, `buckets.csv`, `schedstat.json`,
+  `prof-tasks-load-{0,1}.txt` + `prof-load-{0,1}.ts`, `val*.log.gz` and `.campaign.log` / `.cell.rc`:
+  `ozarchy-s140-9v-{w1,r1-A,r1-B,r2-B,r2-A,r3-A,r3-B}`; smokes `ozarchy-s140-9v-smk-{a,b}-smoke-s0`.
+* Run dir `ozarchy-s140-9v-run/`: `campaign.log`, `campaign.done` exit=0, `cells.tsv`, `foreign.txt`,
+  `burstwait-state.tsv`, `genesis-cache/`, `smk-A/`, `smk-B/`. The chain unit's log is
+  `ozarchy-s140-9p3u3-run/chain.log` (`chain.done`: u3=0 9v=0); the smokes ran from
+  `ozarchy-s140-9p3u3-tools/smoke-chain.sh` (`ozarchy-s140-9p3u3-run/smoke-chain.log`).
+* Stage: `ozarchy-s140-9v-stage/` (`build/build-9v.log`, `build/md5s.txt`, `build/build.done`).
+* Tools: `ozarchy-s140-9v-tools/`:
+  * `make-specs-9v.py`, `specs/`, `drivers/` (generated by `wt/bq-9083b278`'s `make-driver.py`, with `.gen` /
+    `.dry` / `.show` logs), `checks/s140-9v-checks.sh`, `build/build-9v.sh`;
+  * `prof/` (`burstwait.py`, `foreign-sampler.py`, `run-with-sampler.sh`, `run-campaign-9v.sh`).
+* Analysis: `ozarchy-s140-9v-tools/analyst/abba9v.py` -> `abba9v.txt`, `foreign9v.txt` (section 134's
+  `foreign9p3.py`).
 
 ## Open
 
