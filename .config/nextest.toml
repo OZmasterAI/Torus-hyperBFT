@@ -56,14 +56,81 @@ slow-timeout = { period = "120s", terminate-after = 10 }
 
 # s140: execution-only tests that take minutes alone (l61: 150-200 s, the running-hash
 # determinism runs: 300-370 s) were killed at the 10 min cap under a loaded full gate on 18c
-# (load 50-185); at load 100-365 the l31 / l61 / o0 crash-recovery runs were all still going at
-# 400-520 s. No cluster and no wall-clock assert in them: only the cap moves, to 20 min.
+# (load 50-185). No cluster and no wall-clock assert in them: only the cap moves, to 20 min, for
+# the ones that are long: the 31 of the 63 `crash_recovery_tests::(l31|l61|o0)_` and
+# `running_hash_write_set_determinism*` tests that took over 120 s when the 63 ran together
+# (s140, 18c: 120-595 s; the next longest took 83 s, most under 60 s, and keep the default).
+# A new long test of this module needs its name here.
 [[profile.default.overrides]]
-filter = "package(torus-consensus) & (test(/crash_recovery_tests::(l31|l61|o0)_/) | test(running_hash_write_set_determinism))"
+filter = """package(torus-consensus) & (
+    test(=app::crash_recovery_tests::l31_coalesced_book_save_matches_per_block_at_every_checkpoint) |
+    test(=app::crash_recovery_tests::l31_crash_mid_window_replays_from_s_to_the_golden) |
+    test(=app::crash_recovery_tests::l31_golden_catches_a_close_that_skips_its_encode) |
+    test(=app::crash_recovery_tests::l61_crash_mid_window_replays_to_the_same_hash) |
+    test(=app::crash_recovery_tests::l61_follows_the_header_bit_from_its_activation) |
+    test(=app::crash_recovery_tests::l61_forced_attest_block_runs_the_same_transition_on_every_node) |
+    test(=app::crash_recovery_tests::l61_golden_catches_book_window_mutants) |
+    test(=app::crash_recovery_tests::l61_hash_and_state_agree_across_checkpoint_windows) |
+    test(=app::crash_recovery_tests::l61_write_sets_differ_from_off_only_in_book_entries) |
+    test(=app::crash_recovery_tests::o0_coverage_floor_per_config) |
+    test(=app::crash_recovery_tests::o0_equivalence_classic_every5) |
+    test(=app::crash_recovery_tests::o0_equivalence_classic_every5_defer_books) |
+    test(=app::crash_recovery_tests::o0_equivalence_classic_every5_epoch_off) |
+    test(=app::crash_recovery_tests::o0_equivalence_classic_interval0) |
+    test(=app::crash_recovery_tests::o0_equivalence_classic_never) |
+    test(=app::crash_recovery_tests::o0_equivalence_level_authority_modes_interval0) |
+    test(=app::crash_recovery_tests::o0_equivalence_orderrows_every5) |
+    test(=app::crash_recovery_tests::o0_equivalence_orderrows_interval0) |
+    test(=app::crash_recovery_tests::o0_equivalence_orderrows_never) |
+    test(=app::crash_recovery_tests::o0_golden_fast_path_d) |
+    test(=app::crash_recovery_tests::o0_golden_fast_path_g) |
+    test(=app::crash_recovery_tests::o0_golden_today) |
+    test(=app::crash_recovery_tests::o0_golden_today_g) |
+    test(=app::crash_recovery_tests::o0_mixed_replicas_agree) |
+    test(=app::crash_recovery_tests::o0_mixed_replicas_agree_g) |
+    test(=app::crash_recovery_tests::o0_planted_bypass_journal_is_caught) |
+    test(=app::crash_recovery_tests::o0_planted_bypass_lane_is_caught) |
+    test(=app::crash_recovery_tests::o0_planted_bypass_revm_is_caught) |
+    test(=app::crash_recovery_tests::o0_planted_skip_inflight_checkpoint_evm) |
+    test(=app::crash_recovery_tests::o0_planted_skip_parent_layer) |
+    test(=app::crash_recovery_tests::running_hash_write_set_determinism)
+)"""
 slow-timeout = { period = "120s", terminate-after = 10 }
 
 [[profile.ci.overrides]]
-filter = "package(torus-consensus) & (test(/crash_recovery_tests::(l31|l61|o0)_/) | test(running_hash_write_set_determinism))"
+filter = """package(torus-consensus) & (
+    test(=app::crash_recovery_tests::l31_coalesced_book_save_matches_per_block_at_every_checkpoint) |
+    test(=app::crash_recovery_tests::l31_crash_mid_window_replays_from_s_to_the_golden) |
+    test(=app::crash_recovery_tests::l31_golden_catches_a_close_that_skips_its_encode) |
+    test(=app::crash_recovery_tests::l61_crash_mid_window_replays_to_the_same_hash) |
+    test(=app::crash_recovery_tests::l61_follows_the_header_bit_from_its_activation) |
+    test(=app::crash_recovery_tests::l61_forced_attest_block_runs_the_same_transition_on_every_node) |
+    test(=app::crash_recovery_tests::l61_golden_catches_book_window_mutants) |
+    test(=app::crash_recovery_tests::l61_hash_and_state_agree_across_checkpoint_windows) |
+    test(=app::crash_recovery_tests::l61_write_sets_differ_from_off_only_in_book_entries) |
+    test(=app::crash_recovery_tests::o0_coverage_floor_per_config) |
+    test(=app::crash_recovery_tests::o0_equivalence_classic_every5) |
+    test(=app::crash_recovery_tests::o0_equivalence_classic_every5_defer_books) |
+    test(=app::crash_recovery_tests::o0_equivalence_classic_every5_epoch_off) |
+    test(=app::crash_recovery_tests::o0_equivalence_classic_interval0) |
+    test(=app::crash_recovery_tests::o0_equivalence_classic_never) |
+    test(=app::crash_recovery_tests::o0_equivalence_level_authority_modes_interval0) |
+    test(=app::crash_recovery_tests::o0_equivalence_orderrows_every5) |
+    test(=app::crash_recovery_tests::o0_equivalence_orderrows_interval0) |
+    test(=app::crash_recovery_tests::o0_equivalence_orderrows_never) |
+    test(=app::crash_recovery_tests::o0_golden_fast_path_d) |
+    test(=app::crash_recovery_tests::o0_golden_fast_path_g) |
+    test(=app::crash_recovery_tests::o0_golden_today) |
+    test(=app::crash_recovery_tests::o0_golden_today_g) |
+    test(=app::crash_recovery_tests::o0_mixed_replicas_agree) |
+    test(=app::crash_recovery_tests::o0_mixed_replicas_agree_g) |
+    test(=app::crash_recovery_tests::o0_planted_bypass_journal_is_caught) |
+    test(=app::crash_recovery_tests::o0_planted_bypass_lane_is_caught) |
+    test(=app::crash_recovery_tests::o0_planted_bypass_revm_is_caught) |
+    test(=app::crash_recovery_tests::o0_planted_skip_inflight_checkpoint_evm) |
+    test(=app::crash_recovery_tests::o0_planted_skip_parent_layer) |
+    test(=app::crash_recovery_tests::running_hash_write_set_determinism)
+)"""
 slow-timeout = { period = "120s", terminate-after = 10 }
 
 # s140: two cluster tests start a fresh cluster when a run missed its scenario (the A1 oracle
