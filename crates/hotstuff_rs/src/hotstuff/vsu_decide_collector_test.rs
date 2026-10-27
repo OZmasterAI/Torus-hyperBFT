@@ -201,3 +201,148 @@ fn decide_pc_collected_after_committing_the_update_is_applied() {
     assert_eq!((highest.phase, highest.view.int(), highest.signatures.len()), (Phase::Decide, 10, 3), "U's Decide PC is formed and applied");
     assert!(tree.validator_set_state().unwrap().update_decided(), "U is decided");
 }
+
+// ---------------------------------------------------------------------------------------------
+// s140 review (P1): U committed and decided outside HotStuff (block sync calls
+// `block_tree.update` directly) in the middle of a view. The collector pair was built at the
+// view's start over the old set, and nothing refreshed it: n0's vote alone completed an old-set
+// PC on a block whose certifying set is now the post-update set. Its block's updates are
+// Committed here, so the Decide guard above let it through to the steady-state branch: debug
+// builds abort, release builds act on a 1-signature PC.
+// ---------------------------------------------------------------------------------------------
+
+/// A HotStuff at `view` built over the old set, then U committed and decided out of band.
+/// Returns the HotStuff, the tree and U's (post-update) Decide PC.
+fn stale_collector_after_an_out_of_band_decide(
+    s: &Shape,
+    view: u64,
+) -> (crate::hotstuff::implementation::HotStuff<crate::hotstuff::header_fast_path_regression_test::NullNetwork>, BlockTreeSingleton<MemKV>, PhaseCertificate) {
+    let (mut tree, _) = steady_block_tree(&s.old_set);
+    tree.insert(&s.a, None, None).unwrap();
+    tree.update(&s.qc_a, &None).unwrap();
+    let hotstuff = hotstuff_at(ViewNumber::new(view), s.keys[2].clone(), tree.validator_set_state().unwrap());
+    tree.insert(&s.u, None, Some(&s.updates)).unwrap();
+    tree.update(&s.commit, &None).unwrap();
+    let decide = certify(10, s.u.hash, Phase::Decide, &s.keys, &s.new_set);
+    tree.update(&decide, &None).unwrap();
+    let state = tree.validator_set_state().unwrap();
+    assert!(
+        state.update_decided() && state.committed_validator_set() == &s.new_set,
+        "fixture: U committed and decided out of band"
+    );
+    (hotstuff, tree, decide)
+}
+
+#[test]
+fn stale_collector_after_an_out_of_band_decide_forms_no_old_set_decide_pc() {
+    let s = shape();
+    let (mut hotstuff, mut tree, decide) = stale_collector_after_an_out_of_band_decide(&s, 10);
+    let n0 = s.keys[0].verifying_key();
+    hotstuff
+        .on_receive_msg(HotStuffMessage::PhaseVote(vote(&s.keys[0], 10, s.u.hash, Phase::Decide)), &n0, &mut tree, &mut InFlightApp)
+        .expect("processing a vote must not error");
+    assert!(tree.highest_pc().unwrap() == decide, "the highest PC stays U's post-update Decide PC");
+}
+
+#[test]
+fn stale_collector_after_an_out_of_band_decide_forms_no_old_set_generic_pc() {
+    let s = shape();
+    let (mut hotstuff, mut tree, decide) = stale_collector_after_an_out_of_band_decide(&s, 11);
+    let c = Block::new(BlockHeight::new(2), decide.clone(), CryptoHash::new([12; 32]), Data::new(vec![]));
+    tree.insert(&c, None, None).unwrap();
+    let n0 = s.keys[0].verifying_key();
+    hotstuff
+        .on_receive_msg(HotStuffMessage::PhaseVote(vote(&s.keys[0], 11, c.hash, Phase::Generic)), &n0, &mut tree, &mut InFlightApp)
+        .expect("processing a vote must not error");
+    assert!(tree.highest_pc().unwrap() == decide, "n0's lone vote is no post-update quorum on U's child");
+}
+
+// ---------------------------------------------------------------------------------------------
+// s140 review (P3): a power-only update keeps the member list (and so the signature-set length):
+// an old-set quorum of Generic votes on U's child B must not pass for a certificate here either,
+// whether B's header (justified by U's Decide PC) arrived or not.
+// ---------------------------------------------------------------------------------------------
+
+struct PowerShape {
+    keys: Vec<SigningKey>,
+    new_set: ValidatorSet,
+    tree: BlockTreeSingleton<MemKV>,
+    decide: PhaseCertificate,
+    b: Block,
+}
+
+/// Four validators of power 1; U raises n3 to 3. The replica (n0) holds U Pending and U's
+/// Commit PC as its highest PC only (AdvanceView), so its committed set is the old one.
+fn power_shape() -> PowerShape {
+    let keys = signing_keys(&[1, 2, 3, 4]);
+    let old_set = validator_set(&keys);
+    let mut updates = ValidatorSetUpdates::new();
+    updates.insert(keys[3].verifying_key(), Power::new(3));
+    let mut new_set = old_set.clone();
+    new_set.apply_updates(&updates);
+    let old_quorum_new_power: u128 = keys[..3].iter().map(|k| u128::from(new_set.power(&k.verifying_key()).unwrap().int())).sum();
+    assert!(
+        new_set.len() == old_set.len() && old_quorum_new_power < new_set.quorum().int(),
+        "fixture: same members, and n0..n2 are an old quorum but no new one"
+    );
+    let a = Block::new(BlockHeight::new(0), PhaseCertificate::genesis_pc(), CryptoHash::new([10; 32]), Data::new(vec![]));
+    let qc_a = generic_pc(ViewNumber::new(6), a.hash, &keys[..3], &old_set);
+    let u = Block::new(BlockHeight::new(1), qc_a.clone(), CryptoHash::new([11; 32]), Data::new(vec![]));
+    let commit = certify(9, u.hash, Phase::Commit, &keys[..3], &old_set);
+    let decide = certify(10, u.hash, Phase::Decide, &keys, &new_set);
+    let (mut tree, _) = steady_block_tree(&old_set);
+    tree.insert(&a, None, None).unwrap();
+    tree.update(&qc_a, &None).unwrap();
+    tree.insert(&u, None, Some(&updates)).unwrap();
+    tree.advance_highest_pc_from_remote(&commit, &None).unwrap();
+    assert!(tree.validator_set_state().unwrap().committed_validator_set() == &old_set, "fixture: U not committed");
+    let b = Block::new(BlockHeight::new(2), decide.clone(), CryptoHash::new([12; 32]), Data::new(vec![]));
+    PowerShape { keys, new_set, tree, decide, b }
+}
+
+fn old_quorum_generic_votes(p: &mut PowerShape, hotstuff: &mut crate::hotstuff::implementation::HotStuff<crate::hotstuff::header_fast_path_regression_test::NullNetwork>) {
+    for key in p.keys[..3].to_vec() {
+        hotstuff
+            .on_receive_msg(HotStuffMessage::PhaseVote(vote(&key, 11, p.b.hash, Phase::Generic)), &key.verifying_key(), &mut p.tree, &mut InFlightApp)
+            .expect("processing a vote must not error");
+    }
+}
+
+#[test]
+fn power_only_update_old_quorum_on_the_child_of_u_is_no_pc_with_its_header() {
+    let mut p = power_shape();
+    let mut hotstuff = hotstuff_at(ViewNumber::new(11), p.keys[0].clone(), p.tree.validator_set_state().unwrap());
+    let leader = crate::pacemaker::implementation::select_leader(ViewNumber::new(11), &p.new_set);
+    let header = ProposalHeader {
+        chain_id: CHAIN_ID,
+        view: ViewNumber::new(11),
+        block_hash: p.b.hash,
+        height: p.b.height,
+        data_hash: p.b.data_hash,
+        justify: p.decide.clone(),
+        tc: None,
+        nec: None,
+        has_validator_set_updates: false,
+        leader_signature: SignatureBytes::new([0; 64]),
+    };
+    hotstuff
+        .on_receive_msg(HotStuffMessage::ProposalHeader(signed_by(header, &leader)), &leader, &mut p.tree, &mut InFlightApp)
+        .expect("processing B's header must not error");
+    old_quorum_generic_votes(&mut p, &mut hotstuff);
+    let highest = p.tree.highest_pc().unwrap();
+    assert!(
+        !(highest.phase == Phase::Generic && highest.block == p.b.hash),
+        "an old-set quorum of Generic votes on U's child is no certificate: highest PC {:?} v{}",
+        highest.phase,
+        highest.view.int()
+    );
+}
+
+#[test]
+fn power_only_update_old_quorum_on_the_child_of_u_is_no_pc_without_its_header() {
+    let mut p = power_shape();
+    let mut hotstuff = hotstuff_at(ViewNumber::new(11), p.keys[0].clone(), p.tree.validator_set_state().unwrap());
+    old_quorum_generic_votes(&mut p, &mut hotstuff);
+    let highest = p.tree.highest_pc().unwrap();
+    assert_eq!((highest.phase, highest.view.int()), (Phase::Commit, 9), "no PC on an unknown block above a pending update");
+}
