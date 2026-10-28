@@ -23214,6 +23214,165 @@ match each node's `torus_block_build_seconds_count` delta to ±1.
   `cells9t.txt` (wraps section 136's `abba9v2.py` `cell()`), `analyst/leaders9t.py` -> `leaders9t.txt`, FOREIGN
   (`ozarchy-s140-9v2-tools/analyst/foreign9v2.py`) -> `analyst/foreign9t.txt`.
 
+## 139. Step 9h, header re-send interval A/B: main `2a60118c`, arm A = `TORUS_HEADER_RESEND_MS=250` (the default, set explicitly) vs arm B = `75`, node env only, one binary; shapes T (section 137's 2 / 2 / 1, `ORACLE_FEED=seed`, `BENCH_RPCS=0,1`, 300 s) and S (137's 3 equal stakes, 100k genesis, `ORACLE_FEED=1`, 600 s), standard load, w1 + ABBA n = 3 per shape, plus an unscored proof smoke with the limiter drop logged (unit bench-ozarchy-s140-9h-chain, run dirs ozarchy-s140-9h-{t,s}-run, archy, 2026-10-28)
+
+**9h: the limiter drop -> lost header -> 250 ms re-send chain is real (139.2), but a 75 ms re-send is no fix. It halves
+the time spent in views > 200 ms in S and cuts S's commit p99 by 196 ms, yet in T the p99 does not move (729 -> 725
+ms): T's tail is long heavy views (300-1,000 ms, mostly without a re-send), not re-send stalls. B also has costs in both
+shapes. Re-sends rise 2.6-4.8x, they feed the same per-author limiter (drops +145% T, +44% S), stall views double, and
+commit p50 rises +6 ms. matched/s does not change measurably in either shape.**
+
+| shape, arm | n | views > 200 ms (wall) | re-send views (wall) / mean ms | re-send lines | limiter drops (3 nodes) | empty (content) | matched/s | blocks/s | native blk/s | commit p50 / p99 ms | order age p50 / p99 ms | timeouts |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| T, A 250 ms | 3 | 58.6% ± 3.2 | 22.6% ± 1.8 / 275 ± 8 | 250 ± 13 | 1,514 ± 256 | 51.2% ± 1.6 | 275,997 ± 3,920 | 15.83 ± 0.38 | 9.79 ± 0.17 | 13.4 ± 0.8 / 729 ± 49 | 2,210 ± 163 / 9,637 ± 101 | 0, 0, 0 |
+| T, B 75 ms | 3 | 40.9% ± 0.5 | 56.8% ± 0.8 / 180 ± 13 | 1,201 ± 21 | 3,706 ± 509 | 42.1% ± 1.2 | 271,754 ± 1,900 | 16.17 ± 0.52 | 11.41 ± 0.23 | 19.2 ± 0.5 / 725 ± 25 | 2,076 ± 177 / 9,730 ± 80 | 1, 2, 0 |
+| T, B - A (paired) | 3 | **-17.6 ± 3.3 pts** | **+34.2 ± 1.2 pts / -95 ± 12** | **+951 ± 31** | **+2,192 ± 366** | **-9.1 ± 2.1 pts** | -4,243 ± 5,010 (-1.5%) | +0.33 ± 0.87 | **+1.61 ± 0.06** | **+5.8 ± 0.5** / -5 ± 64 | -133 ± 276 / +93 ± 157 | +1 ± 2.5 |
+| S, A 250 ms | 3 | 31.6% ± 3.4 | 24.9% ± 3.8 / 285 ± 8 | 528 ± 89 | 2,916 ± 654 | 47.5% ± 2.7 | 255,423 ± 1,870 | 23.50 ± 0.50 | 23.53 ± 0.52 | 12.0 ± 0.5 / 457 ± 9 | 283 ± 12 / 4,695 ± 161 | 0, 0, 0 |
+| S, B 75 ms | 3 | 7.9% ± 3.4 | 27.2% ± 3.5 / 132 ± 5 | 1,352 ± 177 | 4,200 ± 309 | 31.7% ± 2.6 | 254,597 ± 4,940 | 23.67 ± 0.57 | 23.69 ± 0.52 | 18.1 ± 1.0 / 261 ± 26 | 232 ± 12 / 4,604 ± 362 | 0, 0, 0 |
+| S, B - A (paired) | 3 | **-23.7 ± 6.6 pts** | +2.2 ± 4.7 pts / **-153 ± 3** | **+823 ± 209** | **+1,283 ± 611** | **-15.8 ± 3.1 pts** | -827 ± 6,110 (-0.3%) | +0.17 ± 1.03 | +0.16 ± 1.02 | **+6.1 ± 1.1 / -196 ± 34** | **-51 ± 22** / -90 ± 347 | 0 |
+
+* ± = 95% t interval, df 2 (n = 3); paired = per-replicate B - A (ABBA: r1, r2, r3 each hold one cell of each arm);
+  bold = the interval excludes 0. Sources (`analyst/cells9h.py`, `views9h.py`): views from each node's own INFO log
+  (a view starts at the first `view=N` line above every earlier view; > 200 ms share = summed length / load window,
+  mean of the 3 nodes); re-send views = views with a `header re-send` line on any node; re-send lines = all 3 nodes,
+  load window; drops = `torus_consensus_rate_limited_dropped_total` after - before, summed over the nodes (per node
+  in 139.3); empty = committed blocks with `native=0` on val0 (by content, as 138); matched/s, blocks/s, native blk/s,
+  timeouts = headline; commit interval and order age = `torus_commit_interval_seconds` / `torus_order_age_commit_seconds`
+  histogram deltas over the load window, mean of the nodes (section 136's `abba9v2.py`).
+
+Question (18c chat msg 216, from 9t's r1 R2 / R3 logs): about a third of T's empty-block runs end in a lost-header
+stall. The leader logs `header re-send ... (still in own view)` after `TORUS_HEADER_RESEND_MS` = 250 ms, so these views
+last ~255 ms and take 16-18% of wall time; the next block then hits the 400-action cap. Probable cause (not proven):
+the per-author consensus gossip limiter (`ConsensusRateLimiter`, 50 / s, burst 50, no validator exemption;
+`torus_consensus_rate_limited_dropped_total` 407 -> 828 on val0), whose drops log only at debug. Does a 75 ms
+re-send shorten the stalls, and is the drop -> missing header -> re-send chain real?
+
+### 139.1 Setup
+
+* Binary: main `2a60118c` (f4010070 + the torus-state scanned-delete compaction batching fix; its hotstuff_rs changes
+  since f4010070 are tests only), built in a fresh detached `wt/bq-2a60118c` with its own target dir,
+  `CARGO_INCREMENTAL=0`, under the shared build lock (`ozarchy-s140-9h-tools/build/build-9h.sh`, 274 s). Stage
+  `ozarchy-s140-9h-stage/M`: node `d86bfb18`, bench `5decc61e`, flood `dd59d50d` (`build/md5s.txt`).
+* Harness and tools frozen at main `9807e955` (`wt/bq-9807e955`: tools-only changes on top of `2a60118c`, N 3..7 and
+  the head-height spread limit 15 for every N; the untracked `testnet/genesis-weighted-full.json` copied from
+  `wt/bq-f4010070`, testnet inputs unchanged). 18c msg 220: `9807e955` breaks only the N = 4 preflight (fixed on
+  `5dc5e840`); 9h is 3-validator, so the freeze was kept. The older frozen copy (`wt/bq-b646c455` + section 136's
+  summarize height-spread patch) is retired: nothing here uses it.
+* Specs `ozarchy-s140-9h-tools/make-specs-9h.py`: T = section 137's `9n2-t.json`, S = 137's `9n2-sd.json` arm S; only
+  the harness worktree, stage and arms change. Arm node env `TORUS_HEADER_RESEND_MS` = `250` (A) / `75` (B); the
+  driver checks it on all 3 nodes from `/proc/<pid>/environ` (`node-env-all.txt`; the node itself does not log the
+  value), plus an expectation on the same file. T arms also expect `RPC endpoints: 2` and the 2,2,1 stakes line; S arms
+  the oracle feed pid and no `BULK_COUNT`. Checks `configchk3` + `handoffchk3` (section 136's file) + `burstwait`
+  (`checks/9h-checks.sh`; burstwait copy with LOAD_S 606 for S and 9h-only phase seeds). Warm-up gate on.
+* Duration is spec-wide in `make-driver.py`, so one generated driver per shape; both run in one bench unit, one after
+  the other (`campaign-chain-9h.sh`, as 137's 9n2): T w1 A, r1 A B, r2 B A, r3 A B; then S the same order. Each beside
+  the foreign-CPU sampler.
+* Smokes first, one per arm: T arm B 60 s and S arm A 90 s, both ACCEPT / AGREE / PASS, every check OK (19 CHECK OK
+  each, 0 FAIL). Burst phase re-sampled before the launch: the desktop burst moved from mm:07:25 (9t, morning) to
+  mm:01:05 (bursts 15:46:05, 16:01:05), so the burstwait copy reads only this run's seeds
+  (`ozarchy-s140-9h-tools/prof/phase/`). Preflight: no rust-analyzer, localsearch-3 masked, Codex stop review off,
+  `perf_event_paranoid` 2. Nothing else ran during the cells.
+
+### 139.2 Proof smoke: limiter drop -> missing header -> re-send stall
+
+* Cell `ozarchy-s140-9h-proof-smoke-s0` (unscored; T shape, arm A, 120 s; driver `drivers/ozarchy-s140-9h-proof-campaign.sh
+  launch smoke`): ACCEPT / AGREE / PASS, 277,306 matched/s. Binary P = a wrapper (`ozarchy-s140-9h-stage/P`) that
+  execs the same node (md5 `d86bfb18` checked on all 3 nodes) with `--log-level=info,torus_network::swarm[{author}]=debug`:
+  info everywhere plus the swarm.rs events with an `author` field at debug, i.e. only `consensus_rate_limit_admit`'s
+  drop line. `RUST_LOG` cannot do this: `main.rs` overwrites `RUST_LOG` with `--log-level`, which `start-node.sh`
+  pins to `info`.
+* Filter check: 811 / 810 / 850 drop lines on val0 / val1 / val2 over the whole log; the counter moved 464 -> 707 /
+  708 / 744 between the before / after scrapes (counter 464 at the first scrape: most drops happen at startup).
+  140 / 142 / 171 drops in the 122 s load window, ~85 per author for val0 / val1 and ~55 for val2 (stake 1) at each
+  receiver. Both receivers drop the same author at the same moment (same gossip, same bucket state).
+* Method (`analyst/proof9h.py`): each node's led views = its own view list entries that start within 50 ms after its
+  `produce_block called (CTE)` line (t_p); a stall = the leader logged `header re-send: view=V`. A hit = another node
+  logged a drop with author = the leader in [t_p, t_p + 50 ms].
+* Result: **92 stall views, 80 (87%) had both other nodes drop a message authored by the leader within 50 ms of the
+  proposal** (79 both, 1 one), and in every such stall the re-send came 250 ms after the last matching drop (p10 /
+  p50 / p90 all 250 ms). Of 1,789 led views without a stall, 265 (14.8%) had the same early drop. P(stall | early
+  drop) = 80 / 345 = 23%, P(stall | no drop) = 12 / 1,536 = 0.8%. The drop -> stall chain is shown: a drop of the
+  leader's message at proposal time makes a stall ~30x more likely and precedes 87% of them. Not every drop stalls:
+  the dropped message is not always the header, or the header's direct copy arrives (consensus messages also go
+  peer-to-peer; the limiter sits on the gossip path only).
+
+### 139.3 Validity
+
+* Main chain (unit bench-ozarchy-s140-9h-chain, 16:01-18:46): T 7 cells, then S 7 cells. All rc 0, ACCEPT / AGREE /
+  PASS, node md5 `d86bfb18` on all 3 nodes, `TORUS_HEADER_RESEND_MS` = the arm's value on all 3 nodes, 127 CHECK OK
+  per driver, 0 CHECK FAIL, 0 CELL-FLAG, 0 HARD FINDING, nothing queued for the in-driver rerun pass.
+* FOREIGN rule (foreign avg > 0.1 core or any 2 s interval > 0.5 core in the load window; `analyst/foreign9h.txt`):
+  7 of the 12 scored cells broke it: T r1-A, r1-B, r3-A, r3-B and S r1-A, r1-B, r3-A, plus the unscored T w1. The causes:
+  (1) T r1-A and S r1-A hit the 15-minute desktop burst (2.2 cores; now at mm:01 / 16 / 31 / 46 :08). burstwait's
+  default D of 130 s is right for T (~112 s) but not for S (~41 s), and before T r1-A it had only 2 clusters to vote a
+  phase on. (2) A new host-periodic load: every 10 minutes the `claude` process in `tmux-spawn-7a63f964` spikes at
+  mm:x8:00 and the Claude desktop app at mm:x5:58 (0.3-1.1 core for 2-4 s). A 300 s window can avoid both; a 606 s S
+  window cannot avoid a 600 s period.
+* Reruns from a second timed driver, as the accepted rule (msg 180) requires: unit bench-ozarchy-s140-9h-rerun-chain
+  (18:49-20:36), drivers `ozarchy-s140-9h-{s,t}-rerun` (same specs, `make-specs-9h.py rerun`), paced by
+  `prof/timedwait.py`. This is burstwait plus the two 10-minute spikes for 300 s cells, a per-shape D, and a `--first`
+  sleep before each driver's first cell. All 7 reruns: rc 0, ACCEPT / AGREE / PASS, md5 OK, 0 CHECK FAIL, and FOREIGN
+  clean (avg 0.038-0.042 core, max interval 0.10-0.49). Scored sets: T `rerun-r1-A rerun-r1-B r2-B r2-A rerun-r3-A
+  rerun-r3-B`; S `rerun-r1-A rerun-r1-B r2-B r2-A rerun-r3-A r3-B`.
+* The replaced cells agree with their reruns: T r1-A 277,078 vs 277,166, r1-B 271,877 vs 272,139, r3-A 277,258 vs
+  276,624, r3-B 271,978 vs 270,873; S r1-A 257,506 vs 255,154, r1-B 253,929 vs 253,090, r3-A 256,935 vs 256,273
+  matched/s. Run order shows no drift: T A 277,166 / 274,202 / 276,624, B 272,139 / 272,251 / 270,873; S A 255,154 /
+  254,843 / 256,273, B 253,090 / 256,851 / 253,849. The T reruns ran ~1.5-3.5 h after the r2 cells.
+* Limiter counter per node, start -> end (val0 / val1 / val2), T A r2: 425 -> 917, 424 -> 908, 427 -> 1,010; T B r2:
+  1,263 -> 2,526, 1,261 -> 2,499, 1,264 -> 2,684; S A r2: 90 -> 1,155, 91 -> 1,166, 91 -> 1,162; S B r2: 241 -> 1,681,
+  240 -> 1,694, 242 -> 1,632. Every cell's values are in `analyst/cells9h-{t,s}.txt`. B starts higher too: the drops
+  before the load (health wait, oracle seeding) are also ~3x A's in T.
+* Timeouts: T B 1 / 2 / 0 (A 0 / 0 / 0, w1 1); S 0 everywhere.
+
+### 139.4 Where the time goes: view-length bands (r2 cells, val0, share of the load window; re-send views in brackets)
+
+| cell | views | 0-75 ms | 75-200 ms | 200-300 ms | 300-500 ms | 500-1,000+ ms | view p50 / p99 / max ms |
+|---|---|---|---|---|---|---|---|
+| T r2-A | 4,862 | 20.9% (14) | 21.2% (0) | 31.7% (205) | 13.6% (23) | 12.7% (6) | 16 / 532 / 1,074 |
+| T r2-B | 4,929 | 22.0% (43) | 37.6% (654) | 14.3% (156) | 15.0% (105) | 11.1% (33) | 22 / 478 / 2,611 |
+| S r2-A | 14,158 | 36.8% (34) | 30.5% (1) | 19.5% (330) | 12.4% (197) | 0.9% (5) | 13 / 321 / 751 |
+| S r2-B | 14,330 | 47.2% (31) | 44.9% (1,059) | 4.9% (108) | 2.4% (39) | 0.6% (3) | 25 / 212 / 597 |
+
+* A's 200-300 ms band is the re-send stall: 205 of 371 T views, 330 of 445 S views there carry a re-send. B moves
+  them into the 75-200 ms band. Stall views stay long, though: 180 ms (T) and 132 ms (S) on average, not ~80 ms. B
+  fires re-sends in 2-4x more views (T 248 -> 991, S 567 -> 1,240 re-send views in r2), and every re-send is
+  consensus gossip that spends the author's limiter tokens (drops +145% T, +44% S).
+* T's views over 300 ms (26.3% of wall with A, 26.1% with B) mostly carry no re-send (29 of 166 with A). They are the
+  heavy native blocks (28k fills per native block, section 138) and set T's commit p99. B does not touch them, so T's
+  p99 stays (729 -> 725 ms). S has few views over 300 ms once the stalls are gone, so S's p99 falls 457 -> 261 ms.
+
+### 139.5 Verdict and limits
+
+* **Proof (139.2): shown.** In 87% of stall views both other validators dropped a gossip message authored by the
+  leader within 50 ms of its proposal, and the re-send came exactly 250 ms later. P(stall | drop) 23% vs 0.8% without
+  a drop. One 120 s smoke, T shape, arm A.
+* **75 ms vs 250 ms:** it fixes the symptom in S (views > 200 ms -23.7 pts, commit p99 -196 ± 34 ms, order age p50
+  -51 ± 22 ms) but not in T (views > 200 ms -17.6 pts, p99 -5 ± 64 ms: T's 766 / 729 ms p99 is NOT mainly re-send
+  stalls). Costs in both: commit p50 +6 ms, 2.6-4.8x re-sends, 1.4-2.5x limiter drops, 2-4x stall views, T timeouts 0 ->
+  1 / 2 / 0. matched/s: T -1.5% (-4,243 ± 5,010), S -0.3%, both inside the noise. Empty blocks by content fall
+  (T 51 -> 42%, S 47 -> 32%), and T native blk/s rises +1.61 ± 0.06 with smaller blocks at the same matched/s.
+* Root cause = the limiter, not the re-send interval: 50 / s with burst 50 per author is below what a validator emits
+  at 16-24 views / s (proposal + votes + new-view per view), and a shorter re-send adds load to the same bucket. The
+  likely fix is a validator-set exemption, or a bucket sized to the view rate. That is a code change, untested here.
+* Limits: n = 3 per arm (df 2). 7 of 12 scored cells are reruns from a second driver, run 0.5-3.5 h after their
+  partners. Views come from INFO logs (first `view=N` line), so a view's start is when the node first heard of it.
+  Drops count all consensus gossip; the debug line has no message type, so "header" is inferred from timing (139.2).
+
+### 139.6 Data
+
+* Cells (`~/bench-results-matched/`): `ozarchy-s140-9h-{t,s}-{w1,r1-A,r1-B,r2-B,r2-A,r3-A,r3-B}` (main; T r1-A r1-B
+  r3-A r3-B and S r1-A r1-B r3-A replaced, FOREIGN), reruns `ozarchy-s140-9h-t-rerun-{r1-A,r1-B,r3-A,r3-B}` and
+  `ozarchy-s140-9h-s-rerun-{r1-A,r1-B,r3-A}`, smokes `ozarchy-s140-9h-{t,s,proof}-smoke-s0`.
+* Run dirs `ozarchy-s140-9h-{t,s,t-rerun,s-rerun}-run/` (`campaign.log`, `campaign.done` exit=0, `cells.tsv`,
+  `foreign.txt`, `burstwait-state.tsv`), chain logs `ozarchy-s140-9h-chain-run/` and `ozarchy-s140-9h-rerun-chain-run/`,
+  proof `ozarchy-s140-9h-proof-run/smoke/`, stage `ozarchy-s140-9h-stage/{M,P,build}`.
+* Tools `ozarchy-s140-9h-tools/`: `make-specs-9h.py`, `specs/` (9h-t, 9h-s, 9h-proof, 9h-{t,s}-rerun), `drivers/` (+
+  `.gen` / `.dry` / `.show` logs), `campaign-chain-9h.sh`, `campaign-chain-9h-rerun.sh`, `checks/9h-checks.sh`,
+  `checks/9h-rerun-checks.sh`, `prof/` (`burstwait.py`, `timedwait.py`, `foreign-sampler.py`, `run-with-sampler.sh`,
+  `phase/`), `build/build-9h.sh` + `build.log`; analysis `analyst/views9h.py` (views > 200 ms, re-send views,
+  re-sends, limiter counter, empty by content), `analyst/cells9h.py` -> `cells9h-{t,s}.txt` (arm table, paired B - A),
+  `analyst/proof9h.py` (139.2), FOREIGN (`ozarchy-s140-9s2-tools/analyst/foreign9s.py`) -> `analyst/foreign9h.txt`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

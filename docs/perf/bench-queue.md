@@ -1316,6 +1316,24 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    R3 - R2 paired matched/s -18,672 ± 1,429 (-6.8%), native blk/s +3.09 ± 0.08, blocks/s 15.7 -> 20.9, fills per
    native block -8,264 ± 358 (28.1k -> 19.9k), commit p99 766 -> 483 ms. R3 lands near 137's S. 137's "S / D 0 empty"
    is the oracle feed running the engine every block; by content S is ~49% empty too.
+9h (s140). **[DONE s140, section 139] [GO s140 (18c chat msg 216), main `2a60118c`] Header re-send interval A/B.**
+   (Not the s73 9h L2.1 microbench above; 18c named it 9h.) 18c's 9t log analysis: ~1/3 of T's empty-block runs end
+   in a lost-header stall (`header re-send ... (still in own view)` after `TORUS_HEADER_RESEND_MS` = 250 ms, ~255 ms
+   views, 16-18% of wall time), probably from the per-author consensus gossip limiter (50 / s, burst 50). One binary
+   (main `2a60118c`, tools frozen at `9807e955`), node env only: A = 250 (set explicitly) vs B = 75; shapes T (137's
+   2 / 2 / 1, seed, `BENCH_RPCS=0,1`, 300 s) and S (137's S, 600 s); w1 + ABBA n = 3 each, plus a proof smoke with the
+   limiter drop logged. Report views > 200 ms, re-send lines, limiter counter per node, empty share by content,
+   matched/s, blocks/s, commit / order-age p50 / p99, timeouts.
+   **Done s140 (units bench-ozarchy-s140-9h-chain + bench-ozarchy-s140-9h-rerun-chain, run dirs
+   ozarchy-s140-9h-{t,s,t-rerun,s-rerun}-run; node `d86bfb18`, bench `5decc61e`; one generated driver per shape in one
+   unit; 12 scored + 2 w1 ACCEPT / AGREE / PASS, 7 FOREIGN reruns (desktop burst, and new 10-minute claude spikes at
+   mm:x8:00 / mm:x5:58) from timed second drivers; section 139):** proof shown: in 87% of stall views both other nodes
+   dropped a message from the leader within 50 ms of its proposal, and the re-send came 250 ms later (P(stall | drop)
+   23% vs 0.8%). B = 75 ms cuts views > 200 ms by 23.7 pts in S (p99 457 -> 261 ms, -196 ± 34) and by 17.6 pts in T,
+   but T's p99 holds (729 -> 725 ± 64). T's tail is heavy 300-1,000 ms views without a re-send. B costs p50 +6 ms,
+   2.6-4.8x re-sends, 1.4-2.5x limiter drops (re-sends spend the same bucket), and 2-4x stall views. matched/s does
+   not change (T -1.5% ± 1.8, S -0.3%). Fix belongs in the limiter (validator exemption / bucket sized to the view
+   rate), not the re-send interval.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
