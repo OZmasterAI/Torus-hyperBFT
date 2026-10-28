@@ -18,7 +18,7 @@
 //! everything sent to it is lost, as with a killed process). Once it has been silent for a few
 //! seconds, the mock network loses the first [`LOST_ASKS`] body requests each survivor sends to
 //! the live holder of a block proposed from then on (a serving stall of about half a second).
-//! Every such fetch must still get its body well inside the 4 s budget, and no request may go to
+//! Every such fetch must still get its body inside the 4 s budget ([`BODY_WITHIN`]), and no request may go to
 //! the dead node.
 
 use std::{
@@ -28,6 +28,7 @@ use std::{
 };
 
 use hotstuff_rs::{
+    block_sync::messages::BlockSyncMessage,
     hotstuff::messages::HotStuffMessage,
     networking::messages::{Message, ProgressMessage},
     types::{
@@ -58,8 +59,12 @@ const LOST_ASKS: u32 = 6;
 /// count it as live just after it stops).
 const SILENCE_BEFORE_MEASURING: Duration = Duration::from_secs(3);
 
-/// A measured fetch must have its body within this (the fallback-to-sync budget is 4 s).
-const BODY_WITHIN: Duration = Duration::from_millis(2500);
+/// A measured fetch must have its body within this: before the 4 s fallback-to-sync budget, with
+/// a margin. Idle, the body comes at the 7th ask after ~0.6 s; the asks are spaced by the
+/// requester's loop, which a loaded host stretches (s140, 18c at load 20-40: 6 asks in 3.1 s,
+/// a body after 2.54 s against the former 2.5 s bound). A schedule that spends asks on the dead
+/// node fails `asks_to_dead` at its first such ask, and never gets the body before the budget.
+const BODY_WITHIN: Duration = Duration::from_millis(3750);
 
 /// Measured fetches to observe before passing.
 const FETCHES_TO_OBSERVE: usize = 3;
@@ -70,6 +75,13 @@ struct Fetch {
     lost: u32,
     targets: Vec<VerifyingKey>,
     body_at: Option<Instant>,
+    /// The block reached the requester another way first (a block-sync response, a full
+    /// proposal, or found in its block tree with no message seen): its fetch stops there without
+    /// a `BlockDataResponse`, so it is not a measured fetch. s140, 18c at load 15-30: "no body
+    /// after 2.72 s, asks [n0]", a fetch that stopped after its first ask. Still bounded: a block
+    /// that comes after the bound (a sync fallback after the fetch budget) fails the test like a
+    /// missing body.
+    other_at: Option<(Instant, &'static str)>,
 }
 
 struct Probe {
@@ -87,6 +99,25 @@ impl Probe {
         let now = Instant::now();
         if now < self.measuring_from {
             return Some(message);
+        }
+        let mut delivered = |hash: CryptoHash, route: &'static str| {
+            if let Some(fetch) = self.fetches.get_mut(&(*recipient, hash)) {
+                fetch.other_at.get_or_insert((now, route));
+            }
+        };
+        match &message {
+            Message::BlockSyncMessage(BlockSyncMessage::BlockSyncResponse(resp)) => {
+                for block in &resp.blocks {
+                    delivered(block.hash, "block sync");
+                }
+            }
+            Message::ProgressMessage(ProgressMessage::HotStuffMessage(HotStuffMessage::Proposal(p))) => {
+                delivered(p.block.hash, "proposal");
+            }
+            Message::ProgressMessage(ProgressMessage::HotStuffMessage(HotStuffMessage::ProposalResponse(r))) => {
+                delivered(r.block.hash, "proposal response");
+            }
+            _ => {}
         }
         let Message::ProgressMessage(ProgressMessage::HotStuffMessage(hs)) = &message else {
             return Some(message);
@@ -129,11 +160,12 @@ impl Probe {
             .map(|((requester, hash), f)| {
                 let first = f.first_ask.unwrap_or(now);
                 format!(
-                    "{} fetch {:02x?}: age {:?}, body after {:?}, asks {:?}",
+                    "{} fetch {:02x?}: age {:?}, body after {:?}, {}asks {:?}",
                     Self::short(requester, keys),
                     &hash.bytes()[..4],
                     now - first,
                     f.body_at.map(|t| t - first),
+                    f.other_at.map_or(String::new(), |(t, route)| format!("by {route} after {:?}, ", t - first)),
                     f.targets.iter().map(|t| Self::short(t, keys)).collect::<Vec<_>>(),
                 )
             })
@@ -197,13 +229,18 @@ fn survivors_fetch_each_others_bodies_without_asking_the_dead_validator() {
         let mut done = 0;
         for f in p.fetches.values() {
             let first = f.first_ask.expect("tracked fetches have an ask");
-            match f.body_at {
-                Some(at) if at - first <= BODY_WITHIN => done += 1,
-                Some(at) => return Err(format!("a body took {:?} (bound {BODY_WITHIN:?})", at - first)),
-                None if now - first > BODY_WITHIN => {
+            match (f.body_at, f.other_at) {
+                (Some(at), _) if at - first <= BODY_WITHIN => done += 1,
+                (Some(at), None) => return Err(format!("a body took {:?} (bound {BODY_WITHIN:?})", at - first)),
+                // Delivered another way within the bound: not a measured fetch.
+                (_, Some((at, _))) if at - first <= BODY_WITHIN => {}
+                (_, Some((at, route))) => {
+                    return Err(format!("the block came by {route} after {:?} (bound {BODY_WITHIN:?})", at - first))
+                }
+                (None, None) if now - first > BODY_WITHIN => {
                     return Err(format!("no body after {:?} (bound {BODY_WITHIN:?})", now - first))
                 }
-                None => {}
+                (None, None) => {}
             }
         }
         Ok(done >= FETCHES_TO_OBSERVE)
@@ -211,7 +248,34 @@ fn survivors_fetch_each_others_bodies_without_asking_the_dead_validator() {
 
     let deadline = Instant::now() + Duration::from_secs(90);
     let failure = loop {
-        let p = probe.lock().unwrap();
+        // A pending fetch whose block the requester now holds: delivered some other way. Asked
+        // with the probe released: the block-sync server sends while it holds its block-tree
+        // snapshot (the MemDB lock), and every send goes through the probe, so the probe must
+        // never be held across `has_block` (lock-order inversion, s140 review P1).
+        let pending: Vec<(VerifyingKey, CryptoHash)> = {
+            let p = probe.lock().unwrap();
+            p.fetches
+                .iter()
+                .filter(|(_, f)| f.body_at.is_none() && f.other_at.is_none())
+                .map(|(&key, _)| key)
+                .collect()
+        };
+        let held: Vec<((VerifyingKey, CryptoHash), Instant)> = pending
+            .into_iter()
+            .filter_map(|(requester, hash)| {
+                let holder = keys.iter().position(|k| *k == requester).and_then(|i| nodes.get(i))?;
+                let now = Instant::now();
+                holder.has_block(&hash).then_some(((requester, hash), now))
+            })
+            .collect();
+        let mut p = probe.lock().unwrap();
+        for (key, at) in held {
+            if let Some(f) = p.fetches.get_mut(&key) {
+                if f.body_at.is_none() && f.other_at.is_none() {
+                    f.other_at = Some((at, "its block tree"));
+                }
+            }
+        }
         match check(&p) {
             Ok(true) => break None,
             Ok(false) if Instant::now() < deadline => {}

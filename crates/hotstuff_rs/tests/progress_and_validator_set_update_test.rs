@@ -11,11 +11,27 @@ use common::{logging::log_with_context, number_app::NumberApp};
 mod common;
 
 use crate::common::{
-    network::mock_network, node::Node, number_app::NumberAppTransaction, poll::wait_until,
+    network::mock_network, node::Node, number_app::NumberAppTransaction,
+    poll::wait_until_progressing,
 };
 
 /// Interval between polls of cluster state.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// A wait fails once no replica committed a block for this long (a wedged cluster) ...
+const STALL: Duration = Duration::from_secs(120);
+
+/// ... or after this long in total: a loaded host (s140: 18c at load 50-185, "replica numbers =
+/// [1, 1, 1]" after 120 s, passes alone) slows a committing cluster several times over.
+const CEILING: Duration = Duration::from_secs(360);
+
+/// What grows while the cluster commits: every replica's committed height and number.
+fn progress(nodes: &[Node]) -> u64 {
+    nodes
+        .iter()
+        .map(|node| node.committed_height().unwrap_or(0) + u64::from(node.number()))
+        .sum()
+}
 
 /// Tests app state updates and "simple" validator set updates.
 ///
@@ -65,11 +81,13 @@ fn progress_and_validator_set_update_test() {
         None,
         "Polling the app state of every replica until the value is 1.",
     );
-    wait_until(
-        Duration::from_secs(120),
+    wait_until_progressing(
+        CEILING,
+        STALL,
         POLL_INTERVAL,
         "every replica to see the number as 1",
         || nodes.iter().all(|node| node.number() == 1),
+        || progress(&nodes),
         || {
             format!(
                 "replica numbers = {:?}",
@@ -92,8 +110,9 @@ fn progress_and_validator_set_update_test() {
         None,
         "Polling the validator set of every replica until we have 3 validators.",
     );
-    wait_until(
-        Duration::from_secs(120),
+    wait_until_progressing(
+        CEILING,
+        STALL,
         POLL_INTERVAL,
         "every replica to see 3 validators in their committed validator set",
         || {
@@ -101,6 +120,7 @@ fn progress_and_validator_set_update_test() {
                 .iter()
                 .all(|node| node.committed_validator_set().len() == 3)
         },
+        || progress(&nodes),
         || {
             format!(
                 "committed validator set sizes = {:?}",
@@ -128,15 +148,26 @@ fn progress_and_validator_set_update_test() {
         None,
         "Polling the app state of every replica until the value is 4",
     );
-    wait_until(
-        Duration::from_secs(120),
+    wait_until_progressing(
+        CEILING,
+        STALL,
         POLL_INTERVAL,
         "every replica to see the number as 4",
         || nodes.iter().all(|node| node.number() == 4),
+        || progress(&nodes),
         || {
             format!(
-                "replica numbers = {:?}",
-                nodes.iter().map(|node| node.number()).collect::<Vec<_>>()
+                "replica numbers = {:?}; (committed height, highest PC height, highest PC view, view) = {:?}",
+                nodes.iter().map(|node| node.number()).collect::<Vec<_>>(),
+                nodes
+                    .iter()
+                    .map(|node| (
+                        node.committed_height(),
+                        node.highest_pc_height(),
+                        node.highest_pc_view(),
+                        node.highest_view_entered().int()
+                    ))
+                    .collect::<Vec<_>>()
             )
         },
     );
