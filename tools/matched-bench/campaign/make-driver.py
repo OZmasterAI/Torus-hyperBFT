@@ -112,6 +112,8 @@ BAD_VALUE_RE = re.compile(r"[\s'\"\\$`]")
 SYSCTL_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[A-Za-z0-9_-]+)+$")
 FN_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 SMOKE_TAG = "s0"
+# run-cell.sh N_VALIDATORS: the devnet sizes it can launch (devnet/wsl env.sh: val0..val6)
+NODE_COUNTS = ("3", "4", "5", "6", "7")
 
 
 def driver_functions():
@@ -495,14 +497,15 @@ def validate(spec):
             }
         )
     labels = [a["label"] for a in p["arms"]]
-    # the devnet's validator count: run-cell.sh N_VALIDATORS (3 or 4, default 3) from the arm's harness env. NODES
+    # the devnet's validator count: run-cell.sh N_VALIDATORS (3..7, default 3) from the arm's harness env. NODES
     # and the body's per-node loops are campaign-wide, so every arm (and with it the warm-up and smoke cells) must
     # run the same count
     nv = {a["label"]: a["henv"].get("N_VALIDATORS", "3") for a in p["arms"]}
     for lb, v in nv.items():
         need(
-            v in ("3", "4"),
-            "arm %s: N_VALIDATORS=%r: run-cell.sh runs 3 or 4 validators" % (lb, v),
+            v in NODE_COUNTS,
+            "arm %s: N_VALIDATORS=%r: run-cell.sh runs %s to %s validators"
+            % (lb, v, NODE_COUNTS[0], NODE_COUNTS[-1]),
         )
     need(
         len(set(nv.values())) == 1,

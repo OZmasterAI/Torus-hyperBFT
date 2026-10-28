@@ -1,0 +1,35 @@
+{
+  "note": "TEST-ONLY keys, publicly known, never use on a real network. The 6-validator matched-bench devnet (tools/matched-bench/run-cell.sh N_VALIDATORS=6, all-up shapes): indices 0..3 are devnet/wsl/keys-4val/bench-validator-keys.json verbatim (mnemonic indices 100..102, 106); index i in 4..5 = val i (RPC 8645+i) is the hardhat/anvil dev mnemonic 'test test test test test test test test test test test junk' at m/44'/60'/0'/0/(104+i) (cast wallet private-key --mnemonic-index 108..109). devnet/wsl/gen-3val-genesis.sh N_VALIDATORS=6 writes these addresses into the 6 validator entries. One file per validator count: state_attest.py keys and bench-throughput oracle-feed take every entry of their file as a validator.",
+  "validators": [
+    {
+      "index": 0,
+      "address": "0x8c3229ec621644789d7f61faa82c6d0e5f97d43d",
+      "private_key": "0xdae4671006c60a3619556ace98eca6f6e092948d05b13070a27ac492a4fba419"
+    },
+    {
+      "index": 1,
+      "address": "0x9586a4833970847aef259ad5bfb7aa8901ddf746",
+      "private_key": "0x13986e078393fca89aedc2ecd014df01dfbff153434c04b2e38cfedcbef710f7"
+    },
+    {
+      "index": 2,
+      "address": "0x0e9971c0005d91336c1441b8f03c1c4fe5fb4584",
+      "private_key": "0x7382cc0c1dd9fc4ff87ed969fafac4c040ebd4890d0b8fa35781524df5b15476"
+    },
+    {
+      "index": 3,
+      "address": "0x4548774216f19914493d051481feb56246bc13f0",
+      "private_key": "0xc69422615b990ce3dbed91d6ed41e378ff92f0ebf23b8d18bf3db912c6797fa1"
+    },
+    {
+      "index": 4,
+      "address": "0x7d19cea5598accbbf0005a8eb8ed6a02c6f8ab84",
+      "private_key": "0x42e75fe4e54a2126d34a7e302d8dff04d888dbd434a6c690cfc2e1e3d9499c10"
+    },
+    {
+      "index": 5,
+      "address": "0xeabd5094570298ffd24e93e7af378162884611cb",
+      "private_key": "0xb479c6ebcce0347b5a9335f52519198307f01a7c4917e6b1e93e123a77e74aff"
+    }
+  ]
+}

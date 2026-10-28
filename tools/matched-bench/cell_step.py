@@ -40,7 +40,8 @@ Known artifacts (stay ok; named on stdout and in the evidence json):
   mark-only-digest               DISAGREE whose only evidence is a state digest difference in the 5 mark
           fields (accountValue freeMargin maintenanceMarginUsed totalMarginUsed withdrawable) on the
           differing node(s), with block hash, header state root and survivor counters equal, no
-          panic lines and height spread <= 5 (state-digest-val*.txt, same classification as a-cells.py).
+          panic lines and height spread <= 15 (summarize.py's limit; state-digest-val*.txt, same
+          classification as a-cells.py).
   restart-liveness-unverified    a restart cell's 'liveness unverified' (validity.unverified_reasons).
   A non-zero rc is excused only when it is 2 (health.py accept: not ACCEPT) and every validity fail /
   unverified reason is excused by the above.
@@ -89,6 +90,9 @@ HEADER = ("label", "arm", "rep", "rc", "agree", "md5_ok", "metric", "flag")
 QUEUE = "rerun-queue.tsv"
 TSV = "cells.tsv"
 V = ("val0", "val1", "val2")
+# summarize.py's post-drain head-height spread limit (HEIGHT_SPREAD_MAX), 15 for every N (18c chat msg 213,
+# option A): the head heights are one metrics-after scrape pass while the chain keeps committing.
+HEIGHT_SPREAD_MAX = 15
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 # Pre-s131 crash-kill.sh crash_scan_restart_tail pattern (no level filter; it counted the INFO
 # `on=false` line; `on=true` since fail-stop is on by default, s136). Kept to classify cells summarized before the ERROR-level rule.
@@ -287,7 +291,7 @@ def mark_only_digest(cell, summary):
         return False, "state digests are not the difference"
     if int(a.get("panic_or_failstop_lines") or 0) != 0:
         return False, "panic/fail-stop lines in the 3-node run"
-    if a.get("height_spread") is None or a["height_spread"] > 5:
+    if a.get("height_spread") is None or a["height_spread"] > HEIGHT_SPREAD_MAX:
         return False, "height_spread=%r" % a.get("height_spread")
     nodes = {n.get("node"): n.get("state_digest") for n in a.get("nodes") or []}
     if set(nodes) != set(V):

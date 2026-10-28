@@ -117,11 +117,11 @@ def collect_all(paths):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--logs', type=Path, nargs='+', required=True,
-                        help='val0..valN-1 node logs: 3 (4 with run-cell N_VALIDATORS=4)')
+                        help='val0..valN-1 node logs: 3 to 7 (run-cell N_VALIDATORS=3..7)')
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()
-    if len(args.logs) not in (3, 4):
-        parser.error('--logs: 3 node logs (4 on the 4-validator devnet), got %d' % len(args.logs))
+    if not 3 <= len(args.logs) <= 7:
+        parser.error('--logs: 3 to 7 node logs (one per validator), got %d' % len(args.logs))
     result = collect_all(args.logs)
     args.out.write_text(json.dumps(result, indent=2)+'\n')
     print(' '.join(node+':'+','.join(f'{key}={entry["counts"][key]}' for key in FIELDS)

@@ -48,7 +48,9 @@ CLEAN=1 ./devnet/wsl/launch-3val.sh
 overridable via env. `N_VALIDATORS=4` (env, for every step above) runs a
 4-validator devnet instead (val3: key `04..`, RPC 8648, metrics 9164, p2p 30404;
 genesis accounts from `keys-4val/`; dead-leader bench 9p, see
-tools/matched-bench/README.md). The node runtime env (`TORUS_HASH_ONLY_PUSH_THRESHOLD=8000000` — at the r4
+tools/matched-bench/README.md); `N_VALIDATORS=5..7` runs val0..val<N-1> (val<i>:
+key `0<i+1>..`, RPC 8645+i, metrics 9161+i, p2p 30401+i, dialing every lower
+index; accounts from `keys-<N>val/`). The node runtime env (`TORUS_HASH_ONLY_PUSH_THRESHOLD=8000000` — at the r4
 8 MB direct-push floor; the block cap is left at the compiled r4 default of 200 unless
 `TORUS_NATIVE_TOTAL_BLOCK_CAP` is exported) is set in `env.sh`, evolved from the S415/S458
 devnet body-push tuning so a later bench (A3) runs against the same config.

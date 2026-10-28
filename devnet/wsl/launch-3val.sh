@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # launch-3val.sh — start 3 bare torus-node validators on localhost (NO docker);
-# N_VALIDATORS=4 (env.sh) starts val0..val3 (the dead-leader 9p devnet).
+# N_VALIDATORS=4 (env.sh) starts val0..val3 (the dead-leader 9p devnet),
+# N_VALIDATORS=5..7 val0..val<N-1>.
 # Idempotent-ish: refuses to start if a devnet is already running (stale pids).
 # Data dirs persist across restarts; pass CLEAN=1 to wipe them first (fresh
 # genesis init).
@@ -37,11 +38,7 @@ done
 
 echo
 echo "launched pids: $(tr '\n' ' ' < "$RUN_DIR/pids")"
-if [ "$N_VALIDATORS" = 4 ]; then
-    echo "logs:          $RUN_DIR/val{0,1,2,3}.log"
-else
-    echo "logs:          $RUN_DIR/val{0,1,2}.log"
-fi
+echo "logs:          $RUN_DIR/val{$(seq -s, 0 $(( N_VALIDATORS - 1 )))}.log"
 echo "rpc:           $RPC_URLS"
 echo "metrics:       $METRICS_PORTS"
 echo "run health-3val.sh in ~40s to confirm idle block production."

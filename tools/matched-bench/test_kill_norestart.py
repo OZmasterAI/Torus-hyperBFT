@@ -136,7 +136,8 @@ class QuorumAndPidLineTest(unittest.TestCase):
             ("", "2,2,1"),
             (2, "2,2"),
             (2, "0,1,1"),
-            (2, "2,2,1,1,1"),  # 4 weights = the 4-validator devnet (test_four_validators.py)
+            (2, "2,2,1,1,1,1,1,1"),  # 4..7 weights = the 4..7-validator devnets (test_four_validators.py,
+            (7, "1,1,1,1,1,1,1"),  # test_n_validators.py); 8 are none, nor an index past the last weight
             (2, "a,b,c"),
             (2, ""),
         ):

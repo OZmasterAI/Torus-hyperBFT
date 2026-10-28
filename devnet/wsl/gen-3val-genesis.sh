@@ -67,6 +67,13 @@
 #               bench-validator-keys.json, 3 = mnemonic index 106). 3 (or unset)
 #               = OUT byte-identical to a run without the knob.
 #   VALIDATOR_STAKES with N_VALIDATORS=4 takes four weights a,b,c,d.
+#   N_VALIDATORS=5..7  all-up shapes up to 7 validators (18c msg 201):
+#               devnet/genesis.json's 4 validators plus val4..val6, each a
+#               copy of its 4th entry (stake, commission) with the ed25519
+#               pubkey of devnet key 05 / 06 / 07 (env.sh KEY4..KEY6;
+#               EXTRA_PUBKEYS below), addresses from
+#               devnet/wsl/keys-<N>val/bench-validator-keys.json (indices 4..6
+#               = mnemonic indices 108..110). VALIDATOR_STAKES takes N weights.
 #   DL_K=K  DL_JCAP=J  dead-leader skip genesis parameters (branch
 #               feat/dead-leader-p3, docs/plans/dead-leader-skip.md):
 #               .consensus.leader_miss_threshold = K (0 = off, else 2..=64;
@@ -107,11 +114,14 @@ fi
 
 N_VALIDATORS="${N_VALIDATORS:-3}"
 case "$N_VALIDATORS" in
-    3|4) ;;
-    *) echo "FATAL: N_VALIDATORS must be 3 or 4 (got '$N_VALIDATORS')" >&2; exit 1 ;;
+    3|4|5|6|7) ;;
+    *) echo "FATAL: N_VALIDATORS must be 3 to 7 (got '$N_VALIDATORS')" >&2; exit 1 ;;
 esac
 if [ -n "${VALIDATOR_STAKES:-}" ]; then
-    if [ "$N_VALIDATORS" = 4 ]; then
+    if [ "$N_VALIDATORS" -ge 5 ]; then
+        [[ "$VALIDATOR_STAKES" =~ ^[1-9][0-9]{0,5}(,[1-9][0-9]{0,5}){$(( N_VALIDATORS - 1 ))}$ ]] \
+            || { echo "FATAL: VALIDATOR_STAKES must be $N_VALIDATORS positive integer weights (val0..val$(( N_VALIDATORS - 1 ))) with N_VALIDATORS=$N_VALIDATORS (got '$VALIDATOR_STAKES')" >&2; exit 1; }
+    elif [ "$N_VALIDATORS" = 4 ]; then
         [[ "$VALIDATOR_STAKES" =~ ^[1-9][0-9]{0,5},[1-9][0-9]{0,5},[1-9][0-9]{0,5},[1-9][0-9]{0,5}$ ]] \
             || { echo "FATAL: VALIDATOR_STAKES must be four positive integer weights a,b,c,d with N_VALIDATORS=4 (got '$VALIDATOR_STAKES')" >&2; exit 1; }
     else
@@ -169,10 +179,17 @@ fi
 #    hold, so each validator can sign oracle price submissions. Consensus uses
 #    the ed25519 pubkeys only; the address is the validator's account identity.
 KEYS="$REPO/devnet/wsl/bench-validator-keys.json"
-[ "$N_VALIDATORS" = 4 ] && KEYS="$REPO/devnet/wsl/keys-4val/bench-validator-keys.json"
+[ "$N_VALIDATORS" = 3 ] || KEYS="$REPO/devnet/wsl/keys-${N_VALIDATORS}val/bench-validator-keys.json"
 [ -f "$KEYS" ] || { echo "FATAL: missing $KEYS" >&2; exit 1; }
-VALS=$(jq --slurpfile k "$KEYS" --argjson n "$N_VALIDATORS" '
-    if (.validators | length) < $n then error("devnet/genesis.json has \(.validators | length) validators, need \($n)") else . end
+# val4..val6 (N_VALIDATORS=5..7; devnet/genesis.json lists 4 validators): the ed25519 pubkeys of devnet keys
+# 05 / 06 / 07 (env.sh KEY4..KEY6), each entry otherwise a copy of devnet/genesis.json's 4th validator.
+EXTRA_PUBKEYS='["0xf4bd46521ce7b57899ae6f4ca09eddec689327a86a2232d4a3f2a4f39ac68a9e",
+ "0x34790764308e0b7b5f7cc9d5cdd29845fd82a03df53d2cffef3c0228547487c5",
+ "0xa2fa2f4a355ba2e907a53009e9e37caddf7ac7e66a08ba07631f553072b3f24c"]'
+VALS=$(jq --slurpfile k "$KEYS" --argjson n "$N_VALIDATORS" --argjson extra "$EXTRA_PUBKEYS" '
+    if (.validators | length) < $n and ((.validators | length) != 4 or 4 + ($extra | length) < $n)
+    then error("devnet/genesis.json has \(.validators | length) validators, need \($n) (or 4 + the \($extra | length) extra pubkeys)") else . end
+    | if $n > (.validators | length) then .validators += [.validators[3] as $v | $extra[] | $v + {pubkey: .}] else . end
     | [.validators[0:$n] | to_entries[] | .key as $i
         | ([$k[0].validators[] | select(.index == $i) | .address]) as $a
         | if ($a|length) != 1 then error("bench-validator-keys.json: need exactly one entry with index \($i)")

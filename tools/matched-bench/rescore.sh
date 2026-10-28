@@ -13,9 +13,9 @@ LABEL=$(basename "$SRC")
 mkdir -p "$2"; DEST="$(cd "$2" && pwd)/$LABEL"
 [ ! -e "$DEST" ] || { echo "rescore: $DEST exists (refusing to overwrite)" >&2; exit 1; }
 [ "$DEST" != "$SRC" ] || { echo "rescore: dest is the source" >&2; exit 1; }
-# val0..val2, plus val3 on a 4-validator cell (run-cell.sh N_VALIDATORS=4: run-id.json n_validators)
+# val0..val2, plus val3.. on a 4..7-validator cell (run-cell.sh N_VALIDATORS=4..7: run-id.json n_validators)
 N=$(jq -r '.n_validators // 3' "$SRC/run-id.json" 2>/dev/null || echo 3)
-case "$N" in 3|4) ;; *) echo "rescore: $SRC/run-id.json n_validators=$N (3 or 4)" >&2; exit 1 ;; esac
+case "$N" in 3|4|5|6|7) ;; *) echo "rescore: $SRC/run-id.json n_validators=$N (3 to 7)" >&2; exit 1 ;; esac
 LOGS=()
 for i in $(seq 0 $((N - 1))); do LOGS+=("val$i.log.gz"); done
 for f in summary.json "${LOGS[@]}"; do

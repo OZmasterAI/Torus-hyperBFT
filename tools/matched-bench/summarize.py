@@ -55,7 +55,7 @@ def genesis_book_mode_digit(v):
 GENESIS_BOOK_MODE = genesis_book_mode_digit(A.genesis_book_mode)
 
 # run-cell.sh N_VALIDATORS=4 (the 4-validator devnet, dead-leader bench 9p): val3 is a
-# validator like the other three. The count is this run's: run-id.json n_validators
+# validator like the other three (N_VALIDATORS=3..7: val0..valN-1). The count is this run's: run-id.json n_validators
 # (reset_run_artifacts writes it at cell start, so an OVERWRITE=1 3-validator rerun of a
 # former 4-validator dir is 3 whatever val3 files are left). A run-id.json without it (a
 # cell from before the field): a val3 iff run-cell.sh scraped metrics-before-val3.txt;
@@ -66,12 +66,12 @@ def run_validator_count(out):
             n = json.load(f).get("n_validators")
     except (OSError, ValueError, AttributeError):
         n = None
-    if n in (3, 4):
+    if n in (3, 4, 5, 6, 7):
         return n
     return 4 if os.path.exists(os.path.join(out, "metrics-before-val3.txt")) else 3
 
 
-ALL_NODES = ("val0", "val1", "val2", "val3")[:run_validator_count(OUT)]
+ALL_NODES = tuple("val%d" % i for i in range(run_validator_count(OUT)))
 
 # ---------------------------------------------------------------- no-restart kill
 # run-cell.sh KILL_NO_RESTART=val<i> (the one-validator-down baseline):
@@ -1129,6 +1129,15 @@ if DEAD_NODE:
 if len(agree_rows) == len(LIVE_NODES):
     hs = [r["height"] for r in agree_rows]
     agreement["height_spread"] = max(hs) - min(hs)
+    # s140 9v2: the head heights come from one 30-50 ms metrics-after scrape pass after the drain, while the
+    # chain keeps committing (~25-45 blk/s). On 7 validators that pass read heads 6-10 blocks apart with an
+    # equal block hash at cmp_height, equal state digest and equal counters (ozarchy-s140-9v2-7p350-smoke-s0)
+    # -> false DISAGREE. The guard only has to catch a stalled node, so it allows 15 blocks (~0.4-0.6 s) for
+    # EVERY N, 3 / 4 included (owner decision, 18c chat msg 213, option A). height_spread_max is written for
+    # N > 4 only so a 3 / 4-node summary.json gains no key: it changes only where the spread is 6..15 (verdict).
+    HEIGHT_SPREAD_MAX = 15
+    if len(agree_rows) > 4:
+        agreement["height_spread_max"] = HEIGHT_SPREAD_MAX
     agreement["block_hash_equal"] = len({r["block_hash"] for r in agree_rows}) == 1 and agree_rows[0]["block_hash"] != "ERR"
     agreement["header_state_root_equal"] = len({r["header_state_root"] for r in agree_rows}) == 1
     agreement["state_digest_equal"] = len({r["state_digest"] for r in agree_rows}) == 1
@@ -1160,12 +1169,12 @@ if len(agree_rows) == len(LIVE_NODES):
         and digest_unpinned
         and (agreement["digest_height_spread"] or 0) <= MAX_DIGEST_HEIGHT_SKEW)
     # Consensus evidence that does NOT depend on when the digest was taken.
-    consensus_ok = bool(agreement["height_spread"] <= 5 and agreement["block_hash_equal"]
+    consensus_ok = bool(agreement["height_spread"] <= HEIGHT_SPREAD_MAX and agreement["block_hash_equal"]
                         and agreement["counters_equal"]
                         and agreement["panic_or_failstop_lines"] == 0)
     if consensus_ok and agreement["state_digest_equal"]:
         verdict = "AGREE"
-    elif (agreement["action_counter_skew_only"] and agreement["height_spread"] <= 5
+    elif (agreement["action_counter_skew_only"] and agreement["height_spread"] <= HEIGHT_SPREAD_MAX
           and agreement["block_hash_equal"] and agreement["header_state_root_equal"]
           and agreement["state_digest_equal"]
           and agreement["panic_or_failstop_lines"] == 0):

@@ -9,8 +9,9 @@ import time
 from urllib.request import urlopen
 
 NODES = ('val0', 'val1', 'val2')
-# run-cell.sh N_VALIDATORS=4 (the 4-validator devnet): drain --urls takes 4 URLs, the nodes are val0..val3.
-MAX_NODES = ('val0', 'val1', 'val2', 'val3')
+# run-cell.sh N_VALIDATORS=4 (the 4-validator devnet): drain --urls takes 4 URLs, the nodes are val0..val3;
+# N_VALIDATORS=3..7 in general: 3 to 7 URLs, val0..valN-1.
+MAX_NODES = tuple('val%d' % i for i in range(7))
 COMMITTED = 'torus_blocks_committed_total'
 MEMPOOL = 'torus_mempool_native_size'
 EXEC_QUEUE = 'torus_exec_queue_depth'
@@ -505,14 +506,15 @@ def kill_dissemination(log_summary, killed, kill_ts, counts=None, nodes=None):
     (truncated, or a log-summary.json from before the records). counts
     (summarize.py's --dissem, per node) must equal the log summary's own,
     else nothing is exempt. nodes = the run's validators (val0..valN-1, N = 3
-    or 4: run-cell N_VALIDATORS=4 adds val3, which may be the killed node);
-    None = val0..val2, plus val3 when the log summary or counts carry it.
+    to 7: run-cell N_VALIDATORS=4..7 adds val3.., any of which may be the killed node);
+    None = val0..val2, plus every further valK up to the highest the log summary or counts carry.
     -> {clean, killed_node, kill_ts, exempt_toward_killed, live_failures,
         live_by_node: {node: {lines, toward: {node|'unknown': n}}}, evidence}"""
     if not killed:
         return None
     if nodes is None:
-        nodes = MAX_NODES if 'val3' in log_summary or 'val3' in (counts or {}) else NODES
+        seen = [i for i, n in enumerate(MAX_NODES) if n in log_summary or n in (counts or {})]
+        nodes = MAX_NODES[:max(seen + [len(NODES) - 1]) + 1]
     entries = {n: log_summary.get(n) or {} for n in nodes}
     peer_nodes = {e['local_peer_id']: n for n, e in entries.items() if e.get('local_peer_id')}
     exempt, live, notes = 0, {}, {}
@@ -630,8 +632,8 @@ def main():
     if args.attest_live and not args.attest_rpc:
         parser.error('--attest-live needs --attest-rpc (3 URLs): without the block bodies the '
                      'quiet window cannot tell attestations from other native actions')
-    if len(args.urls) not in (3, 4):
-        parser.error('--urls: 3 metrics URLs (4 on the 4-validator devnet), got %d' % len(args.urls))
+    if not len(NODES) <= len(args.urls) <= len(MAX_NODES):
+        parser.error('--urls: 3 to 7 metrics URLs (one per validator, N_VALIDATORS=3..7), got %d' % len(args.urls))
     all_nodes = MAX_NODES[:len(args.urls)]
     if args.attest_rpc and len(args.attest_rpc) != len(args.urls):
         parser.error('--attest-rpc: one URL per --urls entry (%d), got %d' % (len(args.urls), len(args.attest_rpc)))

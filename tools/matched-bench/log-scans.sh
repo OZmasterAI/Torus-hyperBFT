@@ -33,10 +33,9 @@ ingest_line() {
     echo "ingest: bench submitted=${1:-?} actions; mempool nonce-expired evictions per node: $2"
 }
 
-# node_indices: the devnet's validator indices, one per line: 0 1 2 (+ 3 with run-cell.sh N_VALIDATORS=4)
+# node_indices: the devnet's validator indices, one per line: 0 1 2 (+ 3.. with run-cell.sh N_VALIDATORS=4..7)
 node_indices() {
-    printf '%s\n' 0 1 2
-    [ "${N_VALIDATORS:-3}" = 3 ] || echo 3
+    seq 0 $(( ${N_VALIDATORS:-3} - 1 ))
 }
 
 # file_bytes FILE...: "b0 b1 b2" (0 for a missing file; one per FILE: "b0 b1 b2 b3" on the 4-validator devnet)
@@ -47,14 +46,11 @@ file_bytes() {
 }
 
 # write_deferred_marker OUT BENCH_SUBMITTED "b0 b1 b2": the end pass's to-do for this cell
-# ("b0 b1 b2 b3" on the 4-validator devnet, run-cell N_VALIDATORS=4: four entries; else exactly three)
+# ("b0 .. b<N-1>" on the N-validator devnet, run-cell N_VALIDATORS=4..7: N entries; else exactly three)
 write_deferred_marker() {
-    local out=$1 sub=$2 b=($3)
-    if [ "${#b[@]}" = 4 ]; then
-        printf '{"version": 1, "scans": "%s", "bench_submitted": "%s", "ingest_log_bytes": [%s, %s, %s, %s]}\n' \
-            "$REPORT_SCANS" "$sub" "${b[0]:-0}" "${b[1]:-0}" "${b[2]:-0}" "${b[3]:-0}" > "$out/$DEFERRED_MARKER"
-        return
-    fi
-    printf '{"version": 1, "scans": "%s", "bench_submitted": "%s", "ingest_log_bytes": [%s, %s, %s]}\n' \
-        "$REPORT_SCANS" "$sub" "${b[0]:-0}" "${b[1]:-0}" "${b[2]:-0}" > "$out/$DEFERRED_MARKER"
+    local out=$1 sub=$2 b=($3) i list
+    list="${b[0]:-0}, ${b[1]:-0}, ${b[2]:-0}"
+    for ((i = 3; i < ${#b[@]} && i < 7; i++)); do list+=", ${b[$i]:-0}"; done
+    printf '{"version": 1, "scans": "%s", "bench_submitted": "%s", "ingest_log_bytes": [%s]}\n' \
+        "$REPORT_SCANS" "$sub" "$list" > "$out/$DEFERRED_MARKER"
 }
