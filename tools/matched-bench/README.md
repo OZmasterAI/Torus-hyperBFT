@@ -326,9 +326,10 @@ python3 tools/matched-bench/test_harness.py
    `drained` + `drain_timeout_s`.
    The head heights are one `metrics-after` scrape pass while the chain keeps
    committing after the drain; on 7 validators they read 6-10 blocks apart with
-   everything at `cmp_height` equal (s140 9v2), so cells with more than 4 nodes
-   allow a spread of 15 and record it as `agreement.height_spread_max`; 3 / 4
-   nodes keep 5 (no new key).
+   everything at `cmp_height` equal (s140 9v2), so every cell allows a spread
+   of 15 (3 / 4 nodes included; cell_step.py's mark-only-digest excuse uses the
+   same limit). Cells with more than 4 nodes record it as
+   `agreement.height_spread_max`; 3 / 4 nodes get no new key.
 
    **Crash cells** (`CRASH_KILL_AT_S`, below) score the counters over the
    SURVIVORS only: Prometheus counters are process-lifetime, so the SIGKILLed

@@ -1132,9 +1132,10 @@ if len(agree_rows) == len(LIVE_NODES):
     # s140 9v2: the head heights come from one 30-50 ms metrics-after scrape pass after the drain, while the
     # chain keeps committing (~25-45 blk/s). On 7 validators that pass read heads 6-10 blocks apart with an
     # equal block hash at cmp_height, equal state digest and equal counters (ozarchy-s140-9v2-7p350-smoke-s0)
-    # -> false DISAGREE. The guard only has to catch a stalled node, so N > 4 allows 15 blocks (~0.4-0.6 s);
-    # 3 / 4 nodes keep 5 and their summary.json is unchanged (height_spread_max is written for N > 4 only).
-    HEIGHT_SPREAD_MAX = 5 if len(agree_rows) <= 4 else 15
+    # -> false DISAGREE. The guard only has to catch a stalled node, so it allows 15 blocks (~0.4-0.6 s) for
+    # EVERY N, 3 / 4 included (owner decision, 18c chat msg 213, option A). height_spread_max is written for
+    # N > 4 only so a 3 / 4-node summary.json gains no key: it changes only where the spread is 6..15 (verdict).
+    HEIGHT_SPREAD_MAX = 15
     if len(agree_rows) > 4:
         agreement["height_spread_max"] = HEIGHT_SPREAD_MAX
     agreement["block_hash_equal"] = len({r["block_hash"] for r in agree_rows}) == 1 and agree_rows[0]["block_hash"] != "ERR"

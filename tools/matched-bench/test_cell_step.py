@@ -297,7 +297,12 @@ def test_artifact_crash_gate_info_line_on_true_ok(e):
         tail = fh.read()
     assert "(TORUS_STATE_HASH_FAILSTOP) on=false" in tail
     with open(p, "w") as fh:
-        fh.write(tail.replace("(TORUS_STATE_HASH_FAILSTOP) on=false", "(TORUS_STATE_HASH_FAILSTOP) on=true"))
+        fh.write(
+            tail.replace(
+                "(TORUS_STATE_HASH_FAILSTOP) on=false",
+                "(TORUS_STATE_HASH_FAILSTOP) on=true",
+            )
+        )
     r = e.step(TS2, "s2", "t1")
     assert r.returncode == 0, r.stdout + r.stderr
     (row,) = e.table()
@@ -396,6 +401,45 @@ def test_bad_disagree_block_hash_differs(e):
     )
     assert e.step(TM, "m", "t1").returncode == 1
     assert "disagree" in bad_reasons(e.table()[0]["flag"])
+
+
+def _mark_only_with_spread(e, spread):
+    edit_json(
+        e.path(TM, "summary.json"),
+        lambda d: d["agreement"].update(height_spread=spread),
+    )
+    return e.step(TM, "m", "t1")
+
+
+@with_env(TM)
+def test_artifact_mark_only_digest_head_spread_six_ok(e):
+    """the mark-only excuse takes summarize.py's head-height spread limit of 15 for every N
+    (18c chat msg 213, option A): spread 6 was over the old limit of 5"""
+    r = _mark_only_with_spread(e, 6)
+    assert r.returncode == 0, r.stdout + r.stderr
+    (row,) = e.table()
+    assert row["flag"] == "ok", row
+    assert "mark-only-digest" in r.stdout, r.stdout
+
+
+@with_env(TM)
+def test_artifact_mark_only_digest_head_spread_fifteen_ok(e):
+    """spread 15 is the limit itself: still the mark-only artifact"""
+    r = _mark_only_with_spread(e, 15)
+    assert r.returncode == 0, r.stdout + r.stderr
+    (row,) = e.table()
+    assert row["flag"] == "ok", row
+    assert "mark-only-digest" in r.stdout, r.stdout
+
+
+@with_env(TM)
+def test_bad_disagree_mark_only_head_spread_sixteen(e):
+    """a head spread of 16 (a stalled node) is not excused by mark-only digest lines"""
+    r = _mark_only_with_spread(e, 16)
+    assert r.returncode == 1, r.stdout + r.stderr
+    reasons = bad_reasons(e.table()[0]["flag"])
+    assert "disagree" in reasons, reasons
+    assert "mark-only-digest" not in r.stdout, r.stdout
 
 
 @with_env(TM)

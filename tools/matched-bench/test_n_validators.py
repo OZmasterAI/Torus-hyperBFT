@@ -1323,7 +1323,7 @@ class AgreementHeightSpreadNTest(unittest.TestCase):
     """s140 9v2 7p350-smoke: after the drain the chain keeps committing, so torus_block_height read in one
     scrape pass is up to 6-10 blocks apart on 7 nodes, with block hash at cmp_height, state digest and every
     counter equal (ozarchy-s140-9v2-7p350-smoke-s0/agreement.jsonl). The fixed `height_spread <= 5` guard
-    scored it DISAGREE. N > 4 takes a wider limit; 3 / 4 nodes keep 5 (verdicts unchanged here)."""
+    scored it DISAGREE. The limit is 15 for every N (owner decision, 18c chat msg 213, option A)."""
 
     # the 7 head heights of ozarchy-s140-9v2-7p350-smoke-s0 (spread 6)
     SMOKE_HEADS = [6232, 6231, 6232, 6232, 6234, 6235, 6237]
@@ -1426,29 +1426,69 @@ class AgreementHeightSpreadNTest(unittest.TestCase):
         self.assertTrue(a["action_counter_skew_only"], a)
         self.assertEqual(a["agreement_verdict"], "DIGEST_UNVERIFIED", a)
 
-    def test_three_and_four_keep_five(self):
+    def test_three_and_four_spread_up_to_fifteen_agrees(self):
+        """owner decision (18c chat msg 213, option A): the limit is 15 for every N, so 3 / 4 nodes with a
+        head spread of 6..15 are AGREE (they were DISAGREE under the old N <= 4 limit of 5). No
+        height_spread_max key for N <= 4: their summary.json changes only in the verdict."""
         for n in (3, 4):
-            with self.subTest(n=n, spread=5):
-                a = self.score(self.heads(n, 5))
-                self.assertEqual(a["agreement_verdict"], "AGREE", a)
-                self.assertNotIn("height_spread_max", a)
-            with self.subTest(n=n, spread=6):
-                a = self.score(self.heads(n, 6))
+            for spread in (5, 6, 8, 10, 15):
+                with self.subTest(n=n, spread=spread):
+                    a = self.score(self.heads(n, spread))
+                    self.assertEqual(a["height_spread"], spread)
+                    self.assertEqual(a["agreement_verdict"], "AGREE", a)
+                    self.assertIs(a["validators_agree"], True)
+                    self.assertNotIn("height_spread_max", a)
+
+    def test_three_and_four_stalled_node_is_still_disagree(self):
+        for n in (3, 4):
+            with self.subTest(n=n):
+                a = self.score(self.heads(n, 16))
+                self.assertEqual(a["height_spread"], 16)
                 self.assertEqual(a["agreement_verdict"], "DISAGREE", a)
                 self.assertNotIn("height_spread_max", a)
 
-    def test_four_action_counter_skew_with_spread_six_stays_disagree(self):
+    def test_three_and_four_state_digest_mismatch_is_disagree(self):
+        def bad(i, r):
+            if i == 1:
+                r["state_digest"] = "other"
+
+        for n in (3, 4):
+            for spread in (0, 10):
+                with self.subTest(n=n, spread=spread):
+                    a = self.score(self.heads(n, spread), mutate=bad)
+                    self.assertFalse(a["state_digest_equal"])
+                    self.assertEqual(a["agreement_verdict"], "DISAGREE", a)
+                    self.assertIs(a["validators_agree"], False)
+
+    def test_three_and_four_block_hash_mismatch_is_disagree(self):
+        def bad(i, r):
+            if i == 2:
+                r["block_hash"] = "0xbeef"
+
+        for n in (3, 4):
+            for spread in (0, 10):
+                with self.subTest(n=n, spread=spread):
+                    a = self.score(self.heads(n, spread), mutate=bad)
+                    self.assertFalse(a["block_hash_equal"])
+                    self.assertEqual(a["agreement_verdict"], "DISAGREE", a)
+
+    def test_four_action_counter_skew_with_head_lag_is_unverified(self):
+        """the skew-only branch takes the same limit on 4 nodes: spread 6 -> DIGEST_UNVERIFIED (was
+        DISAGREE under the old limit of 5); spread 16 stays DISAGREE."""
+
         def skew(i, r):
             if i == 3:
                 r["actions"] += 1
 
-        a = self.score(
-            self.heads(4, 6),
-            digest_heights=[1300 + i % 2 for i in range(4)],
-            mutate=skew,
-        )
-        self.assertTrue(a["action_counter_skew_only"], a)
-        self.assertEqual(a["agreement_verdict"], "DISAGREE", a)
+        for spread, want in ((6, "DIGEST_UNVERIFIED"), (15, "DIGEST_UNVERIFIED"), (16, "DISAGREE")):
+            with self.subTest(spread=spread):
+                a = self.score(
+                    self.heads(4, spread),
+                    digest_heights=[1300 + i % 2 for i in range(4)],
+                    mutate=skew,
+                )
+                self.assertTrue(a["action_counter_skew_only"], a)
+                self.assertEqual(a["agreement_verdict"], want, a)
 
 
 if __name__ == "__main__":
