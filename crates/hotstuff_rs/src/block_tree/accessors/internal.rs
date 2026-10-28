@@ -1283,7 +1283,11 @@ impl From<KVSetError> for BlockTreeError {
 }
 
 /// `self.1`: the batch sets a validator-set state variable (see
-/// [`BlockTreeSingleton::validator_set_state_generation`]).
+/// [`BlockTreeSingleton::validator_set_state_generation`]). Every setter that writes one of
+/// [`VALIDATOR_SET_STATE_KEYS`](variables::VALIDATOR_SET_STATE_KEYS) MUST set it (`self.1 = true`):
+/// HotStuff's phase-vote collectors re-sync only when the generation changed, so an unmarked
+/// validator-set write lets an old-set quorum complete a PC (s140 review P1; see that constant,
+/// `hotstuff/vote_vset_cache_test.rs`, and `validator_set_state_setters_mark_the_batch` below).
 pub struct BlockTreeWriteBatch<W: WriteBatch>(pub(super) W, bool);
 
 impl<W: WriteBatch> BlockTreeWriteBatch<W> {
@@ -3195,5 +3199,67 @@ mod leader_exclusion_storage_tests {
         let vss2 = reloaded.validator_set_state().unwrap();
         assert!(vss2.committed_validator_set() == vss.committed_validator_set());
         assert!(vss2.previous_validator_set() == vss.previous_validator_set());
+    }
+}
+
+#[cfg(test)]
+mod validator_set_state_generation_tests {
+    //! perf/vote-vset-cache (review P3): every write-batch setter of a validator-set state
+    //! variable marks the batch, and every such variable has a marking setter.
+    use super::*;
+    use crate::block_tree::pluggables::WriteBatch;
+
+    #[derive(Default)]
+    struct KeysWb {
+        keys: Vec<Vec<u8>>,
+    }
+
+    impl WriteBatch for KeysWb {
+        fn new() -> Self {
+            Self::default()
+        }
+        fn set(&mut self, key: &[u8], _value: &[u8]) {
+            self.keys.push(key.to_vec());
+        }
+        fn delete(&mut self, key: &[u8]) {
+            self.keys.push(key.to_vec());
+        }
+    }
+
+    #[test]
+    fn validator_set_state_setters_mark_the_batch() {
+        type Setter = fn(&mut BlockTreeWriteBatch<KeysWb>);
+        let setters: [(&str, Setter); 5] = [
+            ("set_committed_validator_set", |wb| wb.set_committed_validator_set(&ValidatorSet::new()).unwrap()),
+            ("set_previous_validator_set", |wb| wb.set_previous_validator_set(&ValidatorSet::new()).unwrap()),
+            ("set_validator_set_update_block_height", |wb| {
+                wb.set_validator_set_update_block_height(BlockHeight::new(3)).unwrap()
+            }),
+            ("set_validator_set_update_decided", |wb| wb.set_validator_set_update_decided(true).unwrap()),
+            ("set_validator_set_update_view", |wb| wb.set_validator_set_update_view(ViewNumber::new(3)).unwrap()),
+        ];
+        let mut covered = Vec::new();
+        for (name, setter) in setters {
+            let mut wb = BlockTreeWriteBatch::<KeysWb>::new();
+            assert!(!wb.1, "a new batch sets no validator-set state");
+            setter(&mut wb);
+            assert!(wb.1, "{name} writes the validator-set state and must mark the batch");
+            for key in &wb.0.keys {
+                assert!(
+                    variables::VALIDATOR_SET_STATE_KEYS.iter().any(|k| k.as_slice() == key.as_slice()),
+                    "{name} writes {key:?}, not in VALIDATOR_SET_STATE_KEYS"
+                );
+            }
+            covered.extend(wb.0.keys);
+        }
+        for key in variables::VALIDATOR_SET_STATE_KEYS {
+            assert!(
+                covered.iter().any(|k| k.as_slice() == key.as_slice()),
+                "no marking setter writes validator-set state key {key:?}"
+            );
+        }
+        let mut wb = BlockTreeWriteBatch::<KeysWb>::new();
+        wb.set_highest_view_entered(ViewNumber::new(3)).unwrap();
+        assert!(!wb.1, "a write of another variable does not mark the batch");
     }
 }
