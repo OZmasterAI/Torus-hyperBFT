@@ -1276,6 +1276,22 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    blocks/s 16.13 -> 16.00 (-0.13 ± 0.34), commit p99 740 -> 731 ms (-9 ± 53), matched/s +392 ± 3,498, CPU per 1k
    fills +0.08 ± 0.30: within noise. Commit p50 +0.6 ± 0.5 ms (Welch only). Sync-server thread flat. PASS. Not
    measured: the growth with validator count (cost is per incoming vote).
+9v2. **[DONE s140, section 136: PASS at 4 val, FAIL (CPU) at 7 val] [GO s140 (18c / owner chat msgs 201 + 203), A = main
+   `7251fc7c`, B = main `b42e5e98`] Vote-path cost vs validator count.** Section 135's pair on 9p's 4-val all-up shape
+   (1/1/1/1, `DL_K=3`, seed, `BENCH_RPCS=0,1,2`, 300 s): below saturation (RATE 475, cap 4) and saturated (RATE 76000),
+   then 7 val (1/.../1) below saturation only, RATE from an all-up probe at <= ~20 of 32 busy threads (msg 203); w1 +
+   ABBA n = 3 per step. Primary: hotstuff thread ms per block / per view vs N, blocks/s, commit p50 / p99; also
+   matched/s. Pass at each N: hotstuff thread < +5%, blocks/s and p99 not worse.
+   **Done s140 (units bench-ozarchy-s140-9v2-chain4 + bench-ozarchy-s140-chain-c, run dirs
+   ozarchy-s140-9v2-{4l,4s,7l}-run; A node `50c1cfeb`, B node `69fc5ee6`; 4 val on harness `wt/bq-0261068b`, 7 val
+   on frozen `tools/make-driver-nval` `b646c455` + a local `summarize.py` height-spread patch; 18 scored cells + 3 w1
+   ACCEPT / AGREE / PASS, 3 driver reruns for a false DISAGREE (4l), 0 FOREIGN; section 136):** hotstuff-algo per
+   block A -> B: 4l 5.844 -> 6.066 ms (+3.8%, paired CI +2.5..+5.1%) PASS; 4s 10.83 -> 11.02 (+1.7%, not resolved,
+   cadence swings) PASS on the point estimate; 7l (RATE 180, 18.9-19.6 busy threads) 5.891 -> 6.307 (+7.1%, paired
+   +6.3..+7.9%) FAIL. blocks/s (-1.1% / -0.1% / -1.4%) and commit p99 (+2 / +15 / -4 ms) not worse at any N.
+   Growth ~+0.064 ± 0.030 ms per block per added validator (A's own cost flat in N: fits a per-vote cost). Harness
+   finding: `summarize.py` `height_spread <= 5` false-DISAGREEs cells whose post-drain heads are 6-10 apart (3 of 6
+   first-pass 4l cells, the 7-val smoke; equal hashes and digests); patch + port note in 136.2.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
