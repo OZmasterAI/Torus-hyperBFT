@@ -597,7 +597,9 @@ class RunCellFourTest(unittest.TestCase):
     def setUp(self):
         self.pre = src_between(RUN_CELL_SH, self.PRE_START, self.PRE_END)
         self.urls_fn = src_between(RUN_CELL_SH, "bench_rpc_urls() {", "\n}\n")
-        self.idx = src_between(RUN_CELL_SH, "ALL_IDX=(0 1 2)\n", 'ALL_IDX+=("$i"); done\n')
+        self.idx = src_between(
+            RUN_CELL_SH, "ALL_IDX=(0 1 2)\n", 'ALL_IDX+=("$i"); done\n'
+        )
 
     def preflight(self, **env):
         script = (
@@ -763,6 +765,69 @@ class RunCellFourTest(unittest.TestCase):
                 "must fail before any launch",
             )
 
+    def test_script_preflight_accepts_this_repos_devnet(self):
+        """s140: with this checkout's own devnet/wsl, N=4..7 pass the devnet check (the N_VALIDATORS=3..7
+        start-node.sh has no literal PEER_TO_V2 any more); the run then stops at the next check (stub tools)"""
+        tmp = tempfile.mkdtemp(prefix="rc4-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        tgt = os.path.join(tmp, "release")
+        os.makedirs(tgt)
+        for b in ("torus-node", "bench-throughput"):
+            p = os.path.join(tgt, b)
+            open(p, "w").write("#!/bin/sh\nexit 0\n")
+            os.chmod(p, 0o755)
+        script, wt = sandbox_repo(tmp)
+        for f in ("env.sh", "start-node.sh", "launch-3val.sh"):
+            shutil.copy2(
+                os.path.join(REPO, "devnet", "wsl", f),
+                os.path.join(wt, "devnet", "wsl", f),
+            )
+        for n in ("4", "5", "7"):
+            r = subprocess.run(
+                [script, wt, "rc4-x", "10", "120", "1000"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=dict(
+                    os.environ,
+                    TARGET_DIR=tmp,
+                    RESULTS_ROOT=tmp,
+                    DATA_ROOT=tmp,
+                    BENCH_ALLOW_UNDETACHED="1",
+                    N_VALIDATORS=n,
+                ),
+            )
+            self.assertNotIn("-validator devnet", r.stderr, (n, r.stderr))
+            self.assertIn("node support", r.stderr, (n, r.stderr))
+            self.assertFalse(
+                os.path.exists(os.path.join(tmp, "rc4-x")),
+                "must fail before any launch",
+            )
+
+    def test_preflight_tool_markers_match_this_repos_tools(self):
+        """s140: every scoring tool the N=4 preflight greps carries a marker it accepts (collect_logs.py has
+        only the N_VALIDATORS=3..7 one since the 3..7 harness)"""
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        start = src.index("# ---- 4-validator devnet (N_VALIDATORS=4) pre-flight")
+        start = src.index('if [ "$N_VALIDATORS" = 4 ]; then', start)
+        four = src[start : src.index('elif [ "$N_VALIDATORS" -ge 5 ]; then', start)]
+        loop = four.index(
+            "for f in summarize.py health.py collect_logs.py crash-kill.sh; do"
+        )
+        four = four[
+            loop : four.index("done", loop)
+        ]  # the tools check only, not the devnet one
+        for f in ("summarize.py", "health.py", "collect_logs.py", "crash-kill.sh"):
+            with open(os.path.join(HERE, f)) as fh:
+                body = fh.read()
+            accepted = [
+                m
+                for m in ("N_VALIDATORS=4", "N_VALIDATORS=3..7")
+                if m in four and m in body
+            ]
+            self.assertTrue(accepted, f"{f}: no marker the N=4 preflight accepts")
+
     def test_no_three_node_loop_left(self):
         with open(RUN_CELL_SH) as f:
             src = f.read()
@@ -793,19 +858,38 @@ class ThreeNodeExpansionTest(unittest.TestCase):
 
     def expand(self, n):
         src = open(RUN_CELL_SH).read()
-        line = lambda start: src[src.index(start): src.index("\n", src.index(start)) + 1]
-        script = "set -uo pipefail\nN_VALIDATORS=%s; MARKETS=300; ORACLE_FEED_DRAIN_MAX_LAG=2; RUN_DIR=/R\n" % n
+        line = lambda start: src[
+            src.index(start) : src.index("\n", src.index(start)) + 1
+        ]
+        script = (
+            "set -uo pipefail\nN_VALIDATORS=%s; MARKETS=300; ORACLE_FEED_DRAIN_MAX_LAG=2; RUN_DIR=/R\n"
+            % n
+        )
         script += ". %s\n" % os.path.join(HERE, "log-scans.sh")
-        script += src_between(RUN_CELL_SH, "ALL_IDX=(0 1 2)\n", 'ALL_IDX+=("$i"); done\n')
-        for start in ("RPCS=(http://127.0.0.1:8645", 'for i in "${ALL_IDX[@]:3}"; do RPCS+=', "METS=(9161 9162 9163)",
-                      'for i in "${ALL_IDX[@]:3}"; do METS+=', "METS_URLS=()", "MIN_PEERS=", "DRAIN_URLS=(",
-                      "    FEED_DRAIN_ARGS=(--feed-live", "    ATTEST_DRAIN_ARGS=(--attest-live", "NODE_LOGS=();",
-                      "    SA_ARGS=(); for i in"):
+        script += src_between(
+            RUN_CELL_SH, "ALL_IDX=(0 1 2)\n", 'ALL_IDX+=("$i"); done\n'
+        )
+        for start in (
+            "RPCS=(http://127.0.0.1:8645",
+            'for i in "${ALL_IDX[@]:3}"; do RPCS+=',
+            "METS=(9161 9162 9163)",
+            'for i in "${ALL_IDX[@]:3}"; do METS+=',
+            "METS_URLS=()",
+            "MIN_PEERS=",
+            "DRAIN_URLS=(",
+            "    FEED_DRAIN_ARGS=(--feed-live",
+            "    ATTEST_DRAIN_ARGS=(--attest-live",
+            "NODE_LOGS=();",
+            "    SA_ARGS=(); for i in",
+        ):
             script += line(start)
-        script += src_between(RUN_CELL_SH, '    for i in "${ALL_IDX[@]}"; do SA_ARGS+=(--metrics',
-                              'SA_ARGS+=(--log "$RUN_DIR/val$i.log"); done\n')
+        script += src_between(
+            RUN_CELL_SH,
+            '    for i in "${ALL_IDX[@]}"; do SA_ARGS+=(--metrics',
+            'SA_ARGS+=(--log "$RUN_DIR/val$i.log"); done\n',
+        )
         i = src.index('--metrics-urls "') + len('--metrics-urls "')
-        pm = src[i: src.index('" \\\n', i)]
+        pm = src[i : src.index('" \\\n', i)]
         script += (
             'echo "PRELOAD_METS=' + pm + '"\n'
             'echo "DRAIN=${DRAIN_URLS[*]}"\necho "FEED=${FEED_DRAIN_ARGS[*]}"\necho "ATTEST=${ATTEST_DRAIN_ARGS[*]}"\n'
@@ -813,7 +897,9 @@ class ThreeNodeExpansionTest(unittest.TestCase):
             'echo "SA=${SA_ARGS[*]}"\necho "STAKES=$(IFS=,; echo "${ALL_IDX[*]/#/val}")"\n'
             'LIVE_IDX=(0 1); echo "LIVE=only ${LIVE_IDX[*]/#/val} are"\n'
         )
-        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+        r = subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True, timeout=30
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
         return dict(l.split("=", 1) for l in r.stdout.splitlines())
 
@@ -823,20 +909,37 @@ class ThreeNodeExpansionTest(unittest.TestCase):
         rpc = ["http://127.0.0.1:%d" % p for p in (8645, 8646, 8647)]
         self.assertEqual(v["PRELOAD_METS"], ",".join(m))
         self.assertEqual(v["DRAIN"], " ".join(m))
-        self.assertEqual(v["FEED"], "--feed-live --feed-mempool-max %d --max-lag 2" % (6 * ((300 + 255) // 256)))
-        self.assertEqual(v["ATTEST"], "--attest-live --attest-mempool-max 6 --attest-rpc " + " ".join(rpc))
+        self.assertEqual(
+            v["FEED"],
+            "--feed-live --feed-mempool-max %d --max-lag 2"
+            % (6 * ((300 + 255) // 256)),
+        )
+        self.assertEqual(
+            v["ATTEST"],
+            "--attest-live --attest-mempool-max 6 --attest-rpc " + " ".join(rpc),
+        )
         self.assertEqual(v["HEALTH"], "all 3 committing, peers>=2")
         self.assertEqual(v["LOGS"], "/R/val0.log /R/val1.log /R/val2.log")
-        self.assertEqual(v["SA"], " ".join(["--rpc " + u for u in rpc] + ["--metrics " + u for u in m]
-                                           + ["--log /R/val%d.log" % i for i in range(3)]))
+        self.assertEqual(
+            v["SA"],
+            " ".join(
+                ["--rpc " + u for u in rpc]
+                + ["--metrics " + u for u in m]
+                + ["--log /R/val%d.log" % i for i in range(3)]
+            ),
+        )
         self.assertEqual(v["STAKES"], "val0,val1,val2")
         self.assertEqual(v["LIVE"], "only val0 val1 are")
 
     def test_four(self):
         v = self.expand(4)
         self.assertTrue(v["PRELOAD_METS"].endswith(",http://127.0.0.1:9164/metrics"))
-        self.assertEqual(v["ATTEST"].split()[:3], ["--attest-live", "--attest-mempool-max", "8"])
-        self.assertTrue(v["ATTEST"].endswith("http://127.0.0.1:8647 http://127.0.0.1:8648"))
+        self.assertEqual(
+            v["ATTEST"].split()[:3], ["--attest-live", "--attest-mempool-max", "8"]
+        )
+        self.assertTrue(
+            v["ATTEST"].endswith("http://127.0.0.1:8647 http://127.0.0.1:8648")
+        )
         self.assertIn("--feed-mempool-max 16 ", v["FEED"])
         self.assertEqual(v["HEALTH"], "all 4 committing, peers>=3")
         self.assertTrue(v["LOGS"].endswith("/R/val3.log"))
@@ -1139,7 +1242,6 @@ class DlWindowTest(unittest.TestCase):
         self.assertIn("FAILED", r.stdout)
 
 
-
 # ------------------------------------------------------------------ Codex P2s (s138): stale val3, resummarize, failed survivor scrapes
 class StaleVal3ArtifactsTest(unittest.TestCase):
     """OVERWRITE=1 N_VALIDATORS=3 on a former 4-validator result dir: the validator count comes from this run
@@ -1151,14 +1253,29 @@ class StaleVal3ArtifactsTest(unittest.TestCase):
 
     def reset(self, n):
         fn = src_between(RUN_CELL_SH, "reset_run_artifacts() {", "\n}\n")
-        r = bash("set -uo pipefail\n" + fn + '\nreset_run_artifacts "$1" "$2" "$3" "$4"', self.d, "c", "", n)
+        r = bash(
+            "set -uo pipefail\n" + fn + '\nreset_run_artifacts "$1" "$2" "$3" "$4"',
+            self.d,
+            "c",
+            "",
+            n,
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(os.path.join(self.d, "run-id.json")) as f:
             return json.load(f)
 
-    VAL3 = ("metrics-before-val3.txt", "metrics-after-val3.txt", "funnel-val3.csv", "phase-val3.csv",
-            "state-digest-val3.txt", "digest-val3.out", "vault-val3.json", "val3.log.gz", "val3.log.excerpt",
-            "analysis-val3.txt")
+    VAL3 = (
+        "metrics-before-val3.txt",
+        "metrics-after-val3.txt",
+        "funnel-val3.csv",
+        "phase-val3.csv",
+        "state-digest-val3.txt",
+        "digest-val3.out",
+        "vault-val3.json",
+        "val3.log.gz",
+        "val3.log.excerpt",
+        "analysis-val3.txt",
+    )
     KEEP = ("metrics-before-val2.txt", "val2.log.gz", "sampler.csv")
 
     def touch_all(self):
@@ -1182,7 +1299,10 @@ class StaleVal3ArtifactsTest(unittest.TestCase):
 
     def test_wiring_passes_n_validators(self):
         with open(RUN_CELL_SH) as f:
-            self.assertIn('reset_run_artifacts "$OUT" "$LABEL" "$KILL_NO_RESTART" "$N_VALIDATORS"', f.read())
+            self.assertIn(
+                'reset_run_artifacts "$OUT" "$LABEL" "$KILL_NO_RESTART" "$N_VALIDATORS"',
+                f.read(),
+            )
 
     def test_summarize_trusts_run_id_over_a_stale_val3_file(self):
         from test_harness import write_agreement, write_cell
@@ -1193,12 +1313,24 @@ class StaleVal3ArtifactsTest(unittest.TestCase):
             write_cell(d, 1000, 1000, dur=120)
             write_agreement(d, ["0xaa"] * 3)
             with open(os.path.join(d, "run-id.json"), "w") as f:
-                json.dump({"label": "t", "run_id": RUN_ID, "kill_no_restart": None, "n_validators": 3}, f)
-        open(os.path.join(self.d, "metrics-before-val3.txt"), "w").write("torus_block_height 0\n")
+                json.dump(
+                    {
+                        "label": "t",
+                        "run_id": RUN_ID,
+                        "kill_no_restart": None,
+                        "n_validators": 3,
+                    },
+                    f,
+                )
+        open(os.path.join(self.d, "metrics-before-val3.txt"), "w").write(
+            "torus_block_height 0\n"
+        )
         s, _ = run_summarize(self.d, dur=120)
         base, _ = run_summarize(twin, dur=120)
         self.assertNotEqual(s["agreement"]["agreement_verdict"], "INCOMPLETE")
-        self.assertEqual(s["agreement"]["agreement_verdict"], base["agreement"]["agreement_verdict"])
+        self.assertEqual(
+            s["agreement"]["agreement_verdict"], base["agreement"]["agreement_verdict"]
+        )
         self.assertEqual(sorted(s["liveness"]["nodes"]), ["val0", "val1", "val2"])
         self.assertEqual(s["validity"]["verdict"], base["validity"]["verdict"])
         self.assertEqual(s["liveness"], base["liveness"])
@@ -1206,10 +1338,29 @@ class StaleVal3ArtifactsTest(unittest.TestCase):
     def test_summarize_run_id_four_without_file(self):
         write_four_cell(self.d, kill=None)
         with open(os.path.join(self.d, "run-id.json"), "w") as f:
-            json.dump({"label": "t", "run_id": RUN_ID, "kill_no_restart": None, "n_validators": 4}, f)
+            json.dump(
+                {
+                    "label": "t",
+                    "run_id": RUN_ID,
+                    "kill_no_restart": None,
+                    "n_validators": 4,
+                },
+                f,
+            )
         os.remove(os.path.join(self.d, "metrics-before-val3.txt"))
-        s, _ = run_summarize(self.d, dur=120, extra=["--digest-quiescent", "1", "--digest-heights", "1200 1201 1202 1203"])
-        self.assertEqual(sorted(s["liveness"]["nodes"]), ["val0", "val1", "val2", "val3"])
+        s, _ = run_summarize(
+            self.d,
+            dur=120,
+            extra=[
+                "--digest-quiescent",
+                "1",
+                "--digest-heights",
+                "1200 1201 1202 1203",
+            ],
+        )
+        self.assertEqual(
+            sorted(s["liveness"]["nodes"]), ["val0", "val1", "val2", "val3"]
+        )
 
 
 class ResummarizeFourTest(unittest.TestCase):
@@ -1221,10 +1372,22 @@ class ResummarizeFourTest(unittest.TestCase):
 
     def test_shape_and_dead_leader_survive(self):
         write_four_cell(self.d)
-        dissem = " ".join("%s:exhausted=0,sync_fallback=0,da_outbound_fail=0,starvation=0" % n
-                          for n in ("val0", "val1", "val2", "val3"))
-        run_summarize(self.d, dur=120, extra=["--dissem", dissem, "--digest-quiescent", "1",
-                                              "--digest-heights", "1200 1201 1202"])
+        dissem = " ".join(
+            "%s:exhausted=0,sync_fallback=0,da_outbound_fail=0,starvation=0" % n
+            for n in ("val0", "val1", "val2", "val3")
+        )
+        run_summarize(
+            self.d,
+            dur=120,
+            extra=[
+                "--dissem",
+                dissem,
+                "--digest-quiescent",
+                "1",
+                "--digest-heights",
+                "1200 1201 1202",
+            ],
+        )
         sp = os.path.join(self.d, "summary.json")
         with open(sp) as f:
             s = json.load(f)
@@ -1239,15 +1402,35 @@ class ResummarizeFourTest(unittest.TestCase):
                 f.write("2026-10-22T00:00:00.000000Z  INFO torus_node: started\n")
                 if n != "val3":
                     f.write(delta_line(kill_ts + 15.2, 800))
-        r = subprocess.run([sys.executable, os.path.join(HERE, "dl_window.py"), "--dir", self.d,
-                            "--t-bench0", str(BENCH_START), "--t-bench1", str(BENCH_START + 120),
-                            "--dl-k", "3", "--dl-jcap", "6"], capture_output=True, text=True, timeout=60)
+        r = subprocess.run(
+            [
+                sys.executable,
+                os.path.join(HERE, "dl_window.py"),
+                "--dir",
+                self.d,
+                "--t-bench0",
+                str(BENCH_START),
+                "--t-bench1",
+                str(BENCH_START + 120),
+                "--dl-k",
+                "3",
+                "--dl-jcap",
+                "6",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         with open(sp) as f:
             before = json.load(f)["dead_leader"]
         os.remove(os.path.join(self.d, "dl-window.json"))
-        r = subprocess.run(["bash", os.path.join(HERE, "resummarize.sh"), self.d],
-                           capture_output=True, text=True, timeout=120)
+        r = subprocess.run(
+            ["bash", os.path.join(HERE, "resummarize.sh"), self.d],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(sp) as f:
             s = json.load(f)
@@ -1255,7 +1438,9 @@ class ResummarizeFourTest(unittest.TestCase):
         self.assertEqual(s["genesis"]["leader_miss_threshold"], 3)
         self.assertEqual(s["genesis"]["leader_exclusion_cap"], 6)
         self.assertEqual(s["dead_leader"], before)
-        self.assertTrue(os.path.exists(os.path.join(self.d, "dl-window.json")))  # regenerated
+        self.assertTrue(
+            os.path.exists(os.path.join(self.d, "dl-window.json"))
+        )  # regenerated
 
     def test_three_val_cell_gets_no_shape_fields(self):
         from test_harness import write_agreement, write_cell
@@ -1263,8 +1448,12 @@ class ResummarizeFourTest(unittest.TestCase):
         write_cell(self.d, 1000, 1000, dur=120)
         write_agreement(self.d, ["0xaa"] * 3)
         run_summarize(self.d, dur=120)
-        r = subprocess.run(["bash", os.path.join(HERE, "resummarize.sh"), self.d],
-                           capture_output=True, text=True, timeout=120)
+        r = subprocess.run(
+            ["bash", os.path.join(HERE, "resummarize.sh"), self.d],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(os.path.join(self.d, "summary.json")) as f:
             s = json.load(f)
@@ -1289,12 +1478,13 @@ class DlWindowFailedScrapeTest(DlWindowTest):
             csv.writer(f).writerows(rows)
         self.logs({"val0": [delta_line(self.kill_ts + 15.2, 800)]})
         d, _ = self.run_dl()
-        self.assertEqual(d["timeouts"]["last_increment_after_kill_s_by_node"]["val1"], 19.5)
+        self.assertEqual(
+            d["timeouts"]["last_increment_after_kill_s_by_node"]["val1"], 19.5
+        )
         self.assertEqual(d["headline"]["post_exclusion"]["timeouts_per_min"], 0.0)
         w = d["per_node"]["val1"]["post_exclusion"]
         self.assertEqual(w["timeouts_per_min"], 0.0)
         self.assertEqual(w["matched_s"], 1000.0)
-
 
     def test_survivor_with_only_failed_scrapes_keeps_its_log_and_identity(self):
         # val1: every scrape failed; the exclusion delta is logged only by val1

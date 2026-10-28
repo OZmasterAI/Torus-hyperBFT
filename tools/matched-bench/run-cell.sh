@@ -1060,10 +1060,10 @@ FEED_STOP_SETTLE_MAX_S=$((10#$FEED_STOP_SETTLE_MAX_S))
 # worktree has no keys-4val/, and its missing-key error would hide this one.
 if [ "$N_VALIDATORS" = 4 ]; then
     { grep -q '^KEY3=' "$WSL/env.sh" 2>/dev/null && grep -q 'N_VALIDATORS' "$WSL/launch-3val.sh" 2>/dev/null \
-        && grep -q 'PEER_TO_V2' "$WSL/start-node.sh" 2>/dev/null; } \
+        && grep -q -e 'PEER_TO_V2' -e 'N_VALIDATORS=3..7' "$WSL/start-node.sh" 2>/dev/null; } \
         || { echo "FATAL: N_VALIDATORS=4 but $WSL (env.sh / launch-3val.sh / start-node.sh) has no 4-validator devnet: merge the harness branch (tools/run-cell-4val) into the worktree" >&2; exit 1; }
     for f in summarize.py health.py collect_logs.py crash-kill.sh; do
-        grep -q 'N_VALIDATORS=4' "$TOOLS_DIR/$f" 2>/dev/null \
+        grep -q -e 'N_VALIDATORS=4' -e 'N_VALIDATORS=3..7' "$TOOLS_DIR/$f" 2>/dev/null \
             || { echo "FATAL: N_VALIDATORS=4 but $TOOLS_DIR/$f has no 4-node support (TOOLS_FROM_WORKTREE=$TOOLS_FROM_WORKTREE; point TOOLS_DIR= at a tools/matched-bench with it, or merge the harness branch into the worktree)" >&2; exit 1; }
     done
     [ -s "$ORACLE_KEYS" ] || { echo "FATAL: N_VALIDATORS=4 needs $ORACLE_KEYS (the 4 validators' account keys)" >&2; exit 1; }
