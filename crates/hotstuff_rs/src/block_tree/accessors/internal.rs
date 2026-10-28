@@ -92,6 +92,24 @@ fn note_gap_commit_deferral(block: &CryptoHash) -> Option<u64> {
     })
 }
 
+/// Test seam: counts [`BlockTreeSingleton::validator_set_state`] reads on this thread (each is
+/// ~5 KV gets and 2 validator-set deserializations), so a test can bound the reads a code path
+/// makes (perf/vote-vset-cache: a steady view's votes must not read the state per vote).
+#[cfg(test)]
+pub(crate) mod validator_set_state_reads {
+    use std::cell::Cell;
+    thread_local! {
+        static READS: Cell<u64> = const { Cell::new(0) };
+    }
+    pub(crate) fn note() {
+        READS.with(|r| r.set(r.get() + 1));
+    }
+    /// Reads of the validator-set state made on this thread so far.
+    pub(crate) fn count() -> u64 {
+        READS.with(Cell::get)
+    }
+}
+
 /// Result of a [`BlockTreeSingleton::update`] call, containing both the
 /// validator set updates (if any) and the list of newly committed block hashes
 /// (oldest to newest). The caller uses `committed_block_hashes` to invoke
@@ -1114,6 +1132,8 @@ impl<K: KVStore> BlockTreeSingleton<K> {
     }
 
     pub fn validator_set_state(&self) -> Result<ValidatorSetState, BlockTreeError> {
+        #[cfg(test)]
+        validator_set_state_reads::note();
         Ok(self.0.validator_set_state()?)
     }
 
