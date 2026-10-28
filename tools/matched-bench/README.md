@@ -304,7 +304,7 @@ python3 tools/matched-bench/test_harness.py
 
    | verdict | meaning | `validators_agree` |
    |---|---|---|
-   | `AGREE` | spread<=5, hashes equal, counters equal, **digests equal**, no panic/fail-stop | `true` |
+   | `AGREE` | head-height spread<=5 (<=15 with more than 4 validators), hashes equal, counters equal, **digests equal**, no panic/fail-stop | `true` |
    | `DIGEST_UNVERIFIED` | all of the above except the digest, AND the digest window was not quiescent (counters moved) or the cell never drained | `null` |
    | `DIGEST_UNVERIFIED` | hash + header root + digest all equal, matched/placed/resting equal, and ONLY `native_actions` apart with the digests taken <= 2 blocks apart | `null` |
    | `DISAGREE` | anything else — hash/counter/height divergence, panic, or unequal digests taken over a pinned state | `false` |
@@ -324,6 +324,11 @@ python3 tools/matched-bench/test_harness.py
    `state_digest_seconds_per_node`, `state_digest_heights`,
    `digest_height_spread` and `action_counter_skew_only`; `timing` carries
    `drained` + `drain_timeout_s`.
+   The head heights are one `metrics-after` scrape pass while the chain keeps
+   committing after the drain; on 7 validators they read 6-10 blocks apart with
+   everything at `cmp_height` equal (s140 9v2), so cells with more than 4 nodes
+   allow a spread of 15 and record it as `agreement.height_spread_max`; 3 / 4
+   nodes keep 5 (no new key).
 
    **Crash cells** (`CRASH_KILL_AT_S`, below) score the counters over the
    SURVIVORS only: Prometheus counters are process-lifetime, so the SIGKILLed

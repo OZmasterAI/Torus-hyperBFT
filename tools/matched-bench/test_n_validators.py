@@ -1319,5 +1319,137 @@ class SummarizeNTest(unittest.TestCase):
         self.assertEqual(s["agreement"]["agreement_verdict"], "INCOMPLETE")
 
 
+class AgreementHeightSpreadNTest(unittest.TestCase):
+    """s140 9v2 7p350-smoke: after the drain the chain keeps committing, so torus_block_height read in one
+    scrape pass is up to 6-10 blocks apart on 7 nodes, with block hash at cmp_height, state digest and every
+    counter equal (ozarchy-s140-9v2-7p350-smoke-s0/agreement.jsonl). The fixed `height_spread <= 5` guard
+    scored it DISAGREE. N > 4 takes a wider limit; 3 / 4 nodes keep 5 (verdicts unchanged here)."""
+
+    # the 7 head heights of ozarchy-s140-9v2-7p350-smoke-s0 (spread 6)
+    SMOKE_HEADS = [6232, 6231, 6232, 6232, 6234, 6235, 6237]
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="summspread-")
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+
+    def score(self, heads, digest_heights=None, mutate=None):
+        """A len(heads)-node cell whose agreement rows differ only in head height (unless `mutate` changes
+        row i: mutate(i, row)); returns summary.json["agreement"]."""
+        n = len(heads)
+        write_n_cell(self.d, n)
+        path = os.path.join(self.d, "agreement.jsonl")
+        with open(path) as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+        for i, r in enumerate(rows):
+            r["height"] = heads[i]
+            r["cmp_height"] = min(heads) - 5
+            if mutate:
+                mutate(i, r)
+        with open(path, "w") as f:
+            f.writelines(json.dumps(r) + "\n" for r in rows)
+        dh = digest_heights or [min(heads) + 100] * n
+        dissem = " ".join(
+            "val%d:exhausted=0,sync_fallback=0,da_outbound_fail=0,starvation=0" % i
+            for i in range(n)
+        )
+        s, _ = run_summarize(
+            self.d,
+            dur=120,
+            extra=[
+                "--dissem",
+                dissem,
+                "--digest-quiescent",
+                "1",
+                "--digest-heights",
+                " ".join(map(str, dh)),
+            ],
+        )
+        return s["agreement"]
+
+    def heads(self, n, spread):
+        return [1200 + (spread if i == n - 1 else i % 2) for i in range(n)]
+
+    def test_seven_smoke_head_lag_agrees(self):
+        a = self.score(self.SMOKE_HEADS)
+        self.assertEqual(a["height_spread"], 6)
+        self.assertEqual(a["agreement_verdict"], "AGREE", a)
+        self.assertIs(a["validators_agree"], True)
+
+    def test_seven_spread_up_to_ten_agrees(self):
+        for spread in (6, 8, 10):
+            with self.subTest(spread=spread):
+                a = self.score(self.heads(7, spread))
+                self.assertEqual(a["height_spread"], spread)
+                self.assertEqual(a["agreement_verdict"], "AGREE", a)
+
+    def test_seven_records_the_limit(self):
+        a = self.score(self.SMOKE_HEADS)
+        self.assertEqual(a["height_spread_max"], 15)
+
+    def test_seven_stalled_node_is_still_disagree(self):
+        a = self.score(self.heads(7, 16))
+        self.assertEqual(a["agreement_verdict"], "DISAGREE", a)
+
+    def test_seven_state_digest_mismatch_is_disagree(self):
+        def bad(i, r):
+            if i == 4:
+                r["state_digest"] = "other"
+
+        for heads in (self.SMOKE_HEADS, self.heads(7, 0)):
+            with self.subTest(heads=heads):
+                a = self.score(heads, mutate=bad)
+                self.assertFalse(a["state_digest_equal"])
+                self.assertEqual(a["agreement_verdict"], "DISAGREE", a)
+                self.assertIs(a["validators_agree"], False)
+
+    def test_seven_block_hash_mismatch_is_disagree(self):
+        def bad(i, r):
+            if i == 6:
+                r["block_hash"] = "0xbeef"
+
+        a = self.score(self.SMOKE_HEADS, mutate=bad)
+        self.assertFalse(a["block_hash_equal"])
+        self.assertEqual(a["agreement_verdict"], "DISAGREE", a)
+
+    def test_seven_action_counter_skew_with_head_lag_is_unverified(self):
+        """the action-counter-skew-only branch takes the same limit: digests one block apart, only the
+        action counter off, head spread 8 -> DIGEST_UNVERIFIED (not DISAGREE)."""
+
+        def skew(i, r):
+            if i == 3:
+                r["actions"] += 1
+
+        heads = self.heads(7, 8)
+        a = self.score(
+            heads, digest_heights=[1300 + i % 2 for i in range(7)], mutate=skew
+        )
+        self.assertTrue(a["action_counter_skew_only"], a)
+        self.assertEqual(a["agreement_verdict"], "DIGEST_UNVERIFIED", a)
+
+    def test_three_and_four_keep_five(self):
+        for n in (3, 4):
+            with self.subTest(n=n, spread=5):
+                a = self.score(self.heads(n, 5))
+                self.assertEqual(a["agreement_verdict"], "AGREE", a)
+                self.assertNotIn("height_spread_max", a)
+            with self.subTest(n=n, spread=6):
+                a = self.score(self.heads(n, 6))
+                self.assertEqual(a["agreement_verdict"], "DISAGREE", a)
+                self.assertNotIn("height_spread_max", a)
+
+    def test_four_action_counter_skew_with_spread_six_stays_disagree(self):
+        def skew(i, r):
+            if i == 3:
+                r["actions"] += 1
+
+        a = self.score(
+            self.heads(4, 6),
+            digest_heights=[1300 + i % 2 for i in range(4)],
+            mutate=skew,
+        )
+        self.assertTrue(a["action_counter_skew_only"], a)
+        self.assertEqual(a["agreement_verdict"], "DISAGREE", a)
+
+
 if __name__ == "__main__":
     unittest.main()
