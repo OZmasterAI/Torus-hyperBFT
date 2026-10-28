@@ -22787,6 +22787,433 @@ rpc 1.684 -> 1.685, tokio 1.985 -> 2.000, exec 8.396 -> 8.416, rocksdb 1.162 -> 
 * Analysis: `ozarchy-s140-9v-tools/analyst/abba9v.py` -> `abba9v.txt`, `foreign9v.txt` (section 134's
   `foreign9p3.py`).
 
+## 136. Step 9v2, vote-path cost vs validator count: A = main `7251fc7c` vs B = main `b42e5e98` (section 135's pair) at 4 validators (below saturation RATE 475 and saturated RATE 76,000) and 7 validators (below saturation RATE 180), 1 / 1 / ... / 1 all up, `DL_K=3`, `ORACLE_FEED=seed`, `BENCH_RPCS=0,1,2`, hash + attestation + L6.1 + L2.1 + fail-stop on, Classic, 15 s checkpoints, w1 (A, unscored) + ABBA n = 3 per step, 300 s cells, load windows timed between the 15-minute desktop bursts (units bench-ozarchy-s140-9v2-chain4 and bench-ozarchy-s140-chain-c; run dirs ozarchy-s140-9v2-{4l,4s,7l}-run, archy, 2026-10-27 / 28)
+
+**9v2: PASS at 4 validators, FAIL at 7 on the CPU line. The extra consensus-thread CPU per block of `b42e5e98` grows
+with the validator count: +3.8% at 4, +7.1% at 7 (below saturation). That is +0.064 ± 0.030 ms per block per added
+validator. blocks/s and commit p99 do not get worse at either N.**
+
+| step | N | RATE | busy threads | hotstuff ms / block A -> B | B - A (paired ± t(2) CI) | % (paired CI) | blocks/s A -> B | p50 / p99 ms A -> B | matched/s A -> B | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 135 (ref.) | 3 (2/2/1) | 76,000 | ~22.7 | 14.53 -> 14.94 | +0.41 ± 0.24 | +2.8% (+1.2..+4.5) | 16.13 -> 16.00 | 12.4 / 740 -> 12.9 / 731 | 270,123 -> 270,515 | PASS |
+| 4l | 4 | 475 | 14.2 / 14.1 | 5.844 -> 6.066 | +0.223 ± 0.076 | +3.8% (+2.5..+5.1) | 29.43 -> 29.10 | 12.9 / 472 -> 13.0 / 474 | 95,265 -> 95,220 | PASS |
+| 4s | 4 | 76,000 | 23.8 / 23.7 | 10.83 -> 11.02 | +0.18 ± 1.70 | +1.7% (-14..+17) | 20.70 -> 20.67 | 12.1 / 500 -> 12.2 / 516 | 202,226 -> 203,527 | PASS (low power) |
+| 7l | 7 | 180 | 18.9 / 19.4 | 5.891 -> 6.307 | +0.416 ± 0.047 | +7.1% (+6.3..+7.9) | 35.07 -> 34.57 | 15.2 / 451 -> 16.3 / 446 | 36,465 -> 36,474 | FAIL (CPU) |
+
+* hotstuff ms / block = hotstuff-algo on-CPU per committed block (schedstat, load window, mean of N nodes). The
+  per-view numbers and the /proc task-snapshot numbers give the same steps (136.4).
+* 4l: +0.223 ms per block. All three rounds agree (+0.206 / +0.258 / +0.204); Welch +0.223 ± 0.125 (+1.7% to
+  +6.0%). The point estimate and the paired CI sit under +5%; the Welch upper bound does not.
+* 7l: +0.416 ms per block, rounds +0.394 / +0.426 / +0.428; Welch +0.416 ± 0.107 (+5.2% to +8.9%). Above +5% on
+  every bound.
+* 4s: at saturation, blocks/s swings 18.5-22.3 between cells (both arms), and hotstuff ms per block follows
+  1 / blocks/s. The step (+0.18 ms) is not resolved (± 1.35 Welch). Not a measurement of the vote-path cost.
+* Growth: A's own cost per block hardly changes with N (5.84 ms at 4 val, 5.89 at 7). B's extra goes 0.223 -> 0.416
+  ms, about +0.064 ms per added validator (difference of the paired steps / 3; ± 0.030). That fits a cost per incoming
+  vote (the collector refresh, ~5 RocksDB reads per vote, section 135) times votes per block, which grows with N.
+  This is inferred: the bench does not count votes per block.
+
+Question (18c / owner chat msg 201, scope update msg 203): section 135 measured the cost of `b42e5e98`'s
+validator-set-update fixes at 3 validators only (+2.8% hotstuff CPU per block). The collector refresh runs per
+incoming vote, so the cost may grow with the validator count. Measure it at 4 validators (below saturation as 9p3,
+and saturated as 9s) and at 7 (or 5 if 7 do not fit). Msg 203: run N > 4 only below saturation, with <= ~20 of 32
+host threads busy (else CPU starvation looks like consensus cost); same RATE for A and B; record busy threads per
+cell. Pass at each N: hotstuff thread CPU < +5%; blocks/s and commit p99 not worse.
+
+### 136.1 Setup
+
+* Binaries: section 135's stage `ozarchy-s140-9v-stage/{A,B}/release` (A node `50c1cfeb` / bench `121459c5`, B node
+  `69fc5ee6` / bench `b2b06854`), md5 re-checked against `build/md5s.txt` by every driver's preflight and on every node
+  of every cell. Each arm runs its own bench binary.
+* Shape: section 134's 4-val all-up arm aU (`ozarchy-s140-9p3-tools/specs/9p3.json`): 300 markets, 100k-account
+  standard genesis, stakes 1 / 1 / ... / 1, `DL_K=3` (no kill, so no leader misses), seed oracle, `BENCH_RPCS=0,1,2`
+  (3 load endpoints at every N), 5,000 senders, batch 400, `MAX_IN_FLIGHT` 4, commit tail; node env, absent env and
+  host checks unchanged. 300 s cells (9p3: 600 s).
+* Harness:
+  * 4 val: `wt/bq-0261068b` (9p3's), whose `tools/matched-bench` is byte-identical to main `f4010070`'s.
+  * 7 val: a frozen detached worktree of `origin/tools/make-driver-nval` `b646c455` (`wt/bq-b646c455`: make-driver.py
+    and run-cell.sh with N_VALIDATORS 3..7) plus one local patch to `summarize.py` (136.2), with the untracked
+    `testnet/genesis-weighted-full.json` copied in from `wt/bq-0261068b`.
+* Specs: `make-specs-9v2.py` (from 9p3.json; `4` -> 4l / 4s, `7p` -> RATE probes, `7l` -> the 7-val step). Checks file
+  `checks/9v2-checks.sh`: `configchk<N>` + `handoffchk<N>` (9p3's patterns over val0..val<N-1>, and no val<N> log) +
+  `burstwait`. Drivers generated by each harness's own `make-driver.py`, unchanged; one driver per step:
+  `drivers/ozarchy-s140-9v2-{4l,4s,7l}-campaign.sh`.
+* Order per step: unscored w1 (A, warm-up gate) + r1 A B, r2 B A, r3 A B. 4l and 4s ran back to back in one unit
+  (`campaign-chain-4.sh`); 7l ran in a second unit (`campaign-chain-7l-9n2.sh`, followed by section 137's cells).
+* Per-thread CPU: `prof/run-campaign-9v2.sh` = section 135's `run-campaign-9v.sh` changed to snapshot every pid of
+  run.log's `node pids:` line (4 or 7) at bench+5 and bench+290 s. Analyst `analyst/abba9v2.py` = `abba9v.py` over N
+  nodes, plus `host_busy` (busy host CPUs = 32 x (100 - idle)% from `vmstat-1hz.txt` in the load window) and
+  `node_cores` (sum of the N node processes).
+* 7-val RATE probe (arm A, one 180 s cell each; RATE 350 = the 60 s smoke):
+
+| RATE | busy threads | node cores (sum of 7) | blocks/s | matched/s | hotstuff ms / block |
+|---|---|---|---|---|---|
+| 150 | 17.1 | 15.6 | 35.6 | 30,612 | 5.58 |
+| 250 | 22.8 | 21.0 | 34.7 | 51,506 | 6.69 |
+| 350 | 26.0 | 24.3 | 24.4 | 77,343 | 9.05 |
+
+  RATE 180 (interpolated ~19 threads) was picked; the 7l cells ran at 18.8-19.6 busy threads. RAM: MemAvailable stayed
+  >= 36.6 GB in the 7-val smoke (56.5 GB before), so 7 nodes fit and 5 were not needed. At 4 val, RATE 475 runs at ~14
+  threads, as 9p3.
+* Burst phase: hh:07:2x / :22 / :37 / :52 on 2026-10-27 / 28 (two pre-launch samples 22:27-23:28, then each run's own
+  `foreign.txt`; 7 of 8 up to 16 of 21 clusters on that phase). `prof/burstwait.py` = section 135's, with the run dir
+  derived from the label and the seeds read from `prof/phase/*.txt` (last 36 h only).
+
+### 136.2 Validity and harness findings
+
+* 18 scored + 3 w1 cells used: rc 0, ACCEPT / AGREE / PASS, state attestation equal, node md5 = the arm's staged md5
+  on all N nodes. 0 panic / fail-stop / HARD FINDING lines, 0 CHECK FAIL (483 CHECK OK in the three campaign logs).
+* **False DISAGREE, 3 of 6 first-pass 4l cells (r1-A, r1-B, r3-A), and the 7-val smoke.** Every node had the same
+  block hash, header root, state digest and counters at the compared height. `summarize.py` requires
+  `height_spread <= 5` (the heads read from one `metrics-after` pass). After the drain the chain still commits
+  ~25-45 empty blocks/s, and the heads were 6 / 9 / 10 blocks apart at 4 val (the 7 scrapes of the 7-val smoke took 50
+  ms in total and still read 6 apart). So this is real head lag, not scrape skew, and not a fork. The driver flagged
+  and reran all three 4l cells (`-rerun`, clean); the analysis uses the reruns. 15 of the 19 4-val cells read a
+  spread of 1-2.
+* **Patch in the frozen 7-val copy only** (`wt/bq-b646c455/tools/matched-bench/summarize.py`, saved as
+  `ozarchy-s140-9v2-tools/build/nval-b646c455-summarize-height-spread.patch`): `HEIGHT_SPREAD_MAX = 5 if N <= 4
+  else 15`, used in `consensus_ok` and in the `DIGEST_UNVERIFIED` branch in place of the literal 5. A cell with
+  N > 4 also records `agreement.height_spread_max`; 3- and 4-node output is unchanged. The 7-val smoke, re-scored with
+  `resummarize.sh` (no new cell; the original summary kept as `summary.json.unpatched-b646c455`): REJECT / DISAGREE ->
+  ACCEPT / AGREE, nothing else changed. The 4-val false DISAGREE is the same rule on main's harness, so the 4-node
+  limit wants a look too. To port with a test: `tools/make-driver-nval` (and main). `cell_step.py:290` (the 3-node
+  mark-only-digest rescue) keeps `> 5`.
+* FOREIGN rule (`analyst/foreign9v2.txt`, section 134's `foreign9p3.py`): 0 of 18 scored cells used broke it (max 2 s
+  interval 0.06-0.48 core). The unscored 4l w1 (7.4-core interval) and the first-pass 4l r1-A (0.78, a claude
+  session; replaced by its rerun anyway) did.
+
+### 136.3 Per cell (run order; mean of N nodes; `analyst/abba9v2-{4l,4s,7l}.txt`)
+
+| step | cell | busy thr | hotstuff ms / blk | ms / view | blocks/s | matched/s | p50 / p99 ms | CPU ms / 1k fills | timeouts |
+|---|---|---|---|---|---|---|---|---|---|
+| 4l | w1 A | 14.18 | 5.841 | 5.841 | 29.4 | 95,199 | 12.8 / 473 | 33.39 | 0 |
+| 4l | r1 A (rerun) | 14.22 | 5.831 | 5.829 | 29.4 | 95,393 | 12.8 / 472 | 33.65 | 1 |
+| 4l | r1 B (rerun) | 14.08 | 6.037 | 6.036 | 29.3 | 95,237 | 13.0 / 474 | 33.39 | 2 |
+| 4l | r2 B | 14.07 | 6.121 | 6.118 | 28.6 | 95,208 | 13.0 / 475 | 33.35 | 4 |
+| 4l | r2 A | 14.27 | 5.863 | 5.862 | 29.5 | 95,213 | 12.9 / 472 | 33.83 | 0 |
+| 4l | r3 A (rerun) | 14.13 | 5.838 | 5.838 | 29.4 | 95,189 | 12.9 / 473 | 33.54 | 0 |
+| 4l | r3 B | 14.23 | 6.042 | 6.040 | 29.4 | 95,214 | 13.0 / 474 | 33.71 | 2 |
+| 4s | w1 A | 23.86 | 11.724 | 11.720 | 18.5 | 208,286 | 12.0 / 619 | 25.52 | 2 |
+| 4s | r1 A | 23.79 | 11.043 | 11.044 | 20.3 | 203,873 | 12.4 / 505 | 26.02 | 0 |
+| 4s | r1 B | 23.89 | 10.491 | 10.489 | 22.3 | 200,635 | 12.2 / 487 | 26.56 | 1 |
+| 4s | r2 B | 23.48 | 11.516 | 11.433 | 19.1 | 204,117 | 12.1 / 560 | 25.66 | 0 |
+| 4s | r2 A | 23.94 | 10.717 | 10.713 | 21.2 | 201,430 | 12.0 / 495 | 26.42 | 2 |
+| 4s | r3 A | 23.55 | 10.735 | 10.734 | 20.6 | 201,375 | 11.9 / 501 | 26.10 | 0 |
+| 4s | r3 B | 23.85 | 11.041 | 11.037 | 20.6 | 205,828 | 12.2 / 499 | 25.85 | 2 |
+| 7l | w1 A | 19.01 | 5.903 | 5.901 | 34.9 | 36,495 | 15.3 / 452 | 67.84 | 4 |
+| 7l | r1 A | 18.81 | 5.888 | 5.886 | 35.0 | 36,500 | 15.1 / 452 | 67.09 | 3 |
+| 7l | r1 B | 19.43 | 6.282 | 6.278 | 34.4 | 36,407 | 16.3 / 446 | 69.36 | 8 |
+| 7l | r2 B | 19.03 | 6.281 | 6.278 | 34.4 | 36,496 | 16.0 / 448 | 67.81 | 5 |
+| 7l | r2 A | 18.90 | 5.855 | 5.854 | 35.3 | 36,393 | 15.1 / 450 | 67.30 | 2 |
+| 7l | r3 A | 19.03 | 5.931 | 5.927 | 34.9 | 36,502 | 15.4 / 450 | 67.82 | 6 |
+| 7l | r3 B | 19.63 | 6.358 | 6.357 | 34.9 | 36,518 | 16.7 / 445 | 70.03 | 2 |
+
+### 136.4 Arm means and B - A (n = 3 per arm; ± = Welch 95% CI; paired = per-round B - A ± t(2) CI)
+
+| metric | 4l A -> B | 4l step (Welch / paired) | 7l A -> B | 7l step (Welch / paired) |
+|---|---|---|---|---|
+| hotstuff-algo ms / block (schedstat) | 5.844 -> 6.066 | +0.223 ± 0.125 / ± 0.076 | 5.891 -> 6.307 | +0.416 ± 0.107 / ± 0.047 |
+| hotstuff-algo ms / view | 5.843 -> 6.065 | +0.221 ± 0.123 / ± 0.073 | 5.889 -> 6.305 | +0.415 ± 0.108 / ± 0.051 |
+| hotstuff-algo ms / block (task snapshots) | 5.808 -> 6.032 | +0.224 ± 0.135 / ± 0.065 | 5.865 -> 6.281 | +0.416 ± 0.100 / ± 0.065 |
+| hotstuff-algo cores / node | 0.172 -> 0.176 | +0.005 ± 0.003 | 0.207 -> 0.218 | +0.012 ± 0.008 |
+| hotstuff-syncsv ms / block | 0.052 -> 0.052 | +0.001 ± 0.001 | 0.054 -> 0.056 | +0.002 ± 0.002 |
+| blocks/s | 29.43 -> 29.10 | -0.33 ± 1.09 / ± 1.23 | 35.07 -> 34.57 | -0.50 ± 0.65 / ± 1.14 |
+| commit interval p50 ms | 12.9 -> 13.0 | +0.2 ± 0.2 / ± 0.2 | 15.2 -> 16.3 | +1.1 ± 0.7 / ± 0.5 |
+| commit interval p99 ms | 472 -> 474 | +2 ± 1 / ± 3 | 451 -> 446 | -4 ± 4 / ± 5 |
+| vote gather / vote delay ms per view | 24.69 / 6.01 -> 24.66 / 6.04 | level | 16.55 / 6.87 -> 16.55 / 6.87 | level |
+| matched/s | 95,265 -> 95,220 | -45 ± 279 | 36,465 -> 36,474 | +9 ± 158 |
+| process CPU ms / 1k fills | 33.67 -> 33.49 | -0.19 ± 0.46 | 67.41 -> 69.07 | +1.66 ± 2.99 |
+| busy host threads | 14.21 -> 14.13 | -0.08 ± 0.21 | 18.92 -> 19.36 | +0.45 ± 0.82 |
+| timeouts per 1k blocks | 0.04 -> 0.29 | +0.26 ± 0.36 | 0.32 -> 0.44 | +0.12 ± 0.59 |
+
+* 4s (same columns, `abba9v2-4s.txt`): hotstuff 10.83 -> 11.02 ms per block (+0.18 ± 1.35, paired ± 1.70), per view
+  10.83 -> 10.99, blocks/s 20.70 -> 20.67 (± 4.14), p50 / p99 12.1 / 500 -> 12.2 / 516 (+15 ± 98), matched/s
+  202,226 -> 203,527 (+1,301 ± 5,523), CPU per 1k fills 26.18 -> 26.02. Nothing resolves.
+* Drift: no trend with run position in either arm at 4l or 7l (A 5.83 / 5.86 / 5.84 and 5.89 / 5.86 / 5.93; B 6.04 /
+  6.12 / 6.04 and 6.28 / 6.28 / 6.36). The step has the same sign and size whether A or B runs first in a round.
+
+### 136.5 Verdict
+
+* **4 validators: PASS.** Hotstuff thread +3.8% per block (paired CI +2.5% to +5.1%, Welch upper bound 6.0%): under
+  +5% on the point estimate and nearly on the paired bound. blocks/s -1.1% (not resolved); commit p99 +2 ms of 472
+  (+0.5%, Welch-resolved, paired not): not worse in any way that matters. The saturated 4s step cannot resolve a cost
+  this size (PASS on the point estimate, low power).
+* **7 validators: FAIL on the CPU line, PASS on the other two.** Hotstuff thread +7.1% per block (paired CI +6.3% to
+  +7.9%). blocks/s -1.4% (CI -3.3% to +0.4%; not resolved); commit p99 -4 ms (better). Commit p50 +1.1 ms (+7%) is
+  resolved, but it is not a criterion.
+* **Growth: about +0.064 ms of consensus-thread CPU per block per added validator** (± 0.030; +3.8% -> +7.1%, about
+  +1.1 points per validator on a ~5.9 ms base). At 7 validators and ~35 blocks/s that is 0.012 core per node. The
+  cadence does not move at this load.
+
+### 136.6 Limits and next
+
+* n = 3 per arm. The paired CIs carry the 4l / 7l verdicts; at 4s the cell-to-cell cadence swings hide the step.
+* The N steps run at different RATEs (475 vs 180, msg 203's thread cap) and different blocks/s (29 vs 35). The
+  growth figure assumes the cost is per vote and not per fill: A's per-block cost does not move between them, which
+  fits, but it is not proven.
+* 3 validators were measured only saturated on the 2 / 2 / 1 shape (section 135). A below-saturation 3-val point
+  on this shape would pin the line's intercept.
+* The cost is CPU, not cadence: on these shapes hotstuff-algo runs at 0.18-0.22 core. Where the consensus thread
+  sets the cadence (larger N, a slower CPU), +7% would show up in blocks/s. Options for the owner: accept it, or batch
+  or cache the collector refresh (one validator-set read per view, not per vote).
+* Harness: the false-DISAGREE `height_spread` rule (136.2) needs a fix with a test on the nval branch before 5- to
+  7-val cells run unattended, and a look at 4 val (3 of 6 4l first-pass cells hit it).
+
+### 136.7 Data
+
+* Cells (`~/bench-results-matched/`): `ozarchy-s140-9v2-{4l,4s,7l}-{w1,r1-A,r1-B,r2-B,r2-A,r3-A,r3-B}`, the 4l
+  reruns `ozarchy-s140-9v2-4l-{r1-A,r1-B,r3-A}-rerun` (used), probes `ozarchy-s140-9v2-7p{150,250}-r1-A`, smokes
+  `ozarchy-s140-9v2-{4l,4s,7l}-smoke-s0` and `ozarchy-s140-9v2-7p350-smoke-s0` (re-scored; original
+  `summary.json.unpatched-b646c455`, `resummarize-patched.log`).
+* Run dirs `ozarchy-s140-9v2-{4l,4s,7l}-run/` (`campaign.log`, `campaign.done`, `cells.tsv`, `foreign.txt`,
+  `burstwait-state.tsv`, `smoke/`), `ozarchy-s140-9v2-7p{150,250,350}-run/`, chain logs
+  `ozarchy-s140-9v2-chain4-run/` (4l=0 4s=0), `ozarchy-s140-9v2-7probe-run/`, `ozarchy-s140-chain-c-run/`
+  (7l=0 sd=0 t=0).
+* Tools `ozarchy-s140-9v2-tools/`: `make-specs-9v2.py`, `specs/`, `drivers/` (+ `.gen` / `.dry` / `.show` logs),
+  `checks/9v2-checks.sh`, `prof/` (`burstwait.py`, `foreign-sampler.py`, `run-campaign-9v2.sh`, `phase/`),
+  `campaign-chain-4.sh`, `probe-chain-7.sh`, `smoke-chain-b.sh`, `campaign-chain-7l-9n2.sh`,
+  `build/nval-b646c455-summarize-height-spread.patch`; analysis `analyst/abba9v2.py` -> `abba9v2-{4l,4s,7l}.txt`,
+  `foreign9v2.py` -> `foreign9v2.txt`.
+
+## 137. Step 9n2, fresh pre-testnet baselines on main `f4010070` (all s138-s140 fixes, epoch-plan hand-off default on): section 126's 9n shapes S (standard 100k genesis) and D (1M accounts + 1M pre-loaded resting orders), 3 val equal stakes, `ORACLE_FEED=1`, 600 s, n = 2 each, plus the 9s 2 / 2 / 1 shape T of sections 130 / 133 (`ORACLE_FEED=seed`, `BENCH_RPCS=0,1`, 300 s), n = 2; standard load (rate 76,000, cap 4), hash + attestation + L6.1 + L2.1 + fail-stop on, Classic, 15 s checkpoints (unit bench-ozarchy-s140-chain-c after section 136's 7l; run dirs ozarchy-s140-9n2-{sd,t,sd-rerun}-run, archy, 2026-10-28)
+
+**9n2: section 126's capacity numbers still hold on current main. Equal-stake standard S: 256,889 matched/s at 23.5
+native blocks/s (126: 259,102 at 22.6). Deep D: 247,013 at 22.8 (126: 247,335 at 21.9). The 2 / 2 / 1 shape T:
+276,669 matched/s at 15.85 blocks/s, 9.75 native (133 B: 276,486, 15.25, 9.33). T's blocks are 2.6x larger because
+about 39% of its blocks carry no native work, not because consensus is slower per block (137.4).**
+
+| shape | n | matched/s | blocks/s | native blk/s | fills / native blk | commit p50 / p99 ms | RSS load mean MB (val0 / val1 / val2) | RSS load max MB | CPU ms / 1k fills | engine ms / 1k fills |
+|---|---|---|---|---|---|---|---|---|---|---|
+| S | 2 | 256,889 (257,153 / 256,625) | 23.50 | 23.50 | 10,719 | 11.7 / 458 | 2,955 / 2,973 / 3,818 | 4,211 / 4,265 / 5,207 | 25.20 | 2.95 |
+| D | 2 | 247,013 (248,538 / 245,489) | 22.80 | 22.79 | 10,599 | 12.3 / 462 | 4,412 / 4,415 / 5,176 | 5,541 / 5,886 / 6,521 | 26.68 | 3.13 |
+| T | 2 | 276,669 (275,645 / 277,692) | 15.85 | 9.75 | 28,130 | 13.3 / 749 | 3,471 / 3,367 / 4,598 | 3,957 / 3,835 / 6,294 | 24.54 | 2.59 |
+| 126 S | 2 | 259,102 | 22.6 | 22.64 | 11,192 | 11.9 / 464 | 3,018 / 2,952 / 3,790 | 4,205 / 4,306 / 4,856 | - | 2.95 |
+| 126 D | 2 | 247,335 | 21.9 | 21.92 | 11,010 | 12.5 / 463 | 4,412 / 4,465 / 5,203 | 5,317 / 5,471 / 6,722 | - | 3.15 |
+| 133 B | 4 | 276,486 | 15.25 | 9.33 | - | - | - | - | - | - |
+
+* Sources: matched/s, blocks/s, native blocks/s and fills per native block from the headline (val0 view);
+  commit interval p50 / p99 = load-window delta of `torus_commit_interval_seconds`, mean of 3 nodes; CPU = process
+  user + sys per 1k fills, mean of 3 nodes; engine = val0's engine phase per 1k fills; RSS = `mem-samples.txt` VmRSS
+  in the load window, per node (mean of the 2 cells; max = the larger cell max). 126's p50 / p99 and RSS are the
+  means of its two cells.
+* Against 126 (cross-campaign, levels only): S matched/s -0.9%, native blocks/s +3.8%, fills per native block -4.2%;
+  D matched/s -0.1%, native blocks/s +4.0%. RSS level. So the s138-s140 changes on main left matched/s where it was. Blocks come ~4% more
+  often and are ~4% smaller.
+* Against 133's B arm (`f0bd74ba`, same T shape and load; 133's harness was the frozen `9083b278` one): matched/s
+  +0.1%, blocks/s +3.9%, native +4.5%.
+
+Question (18c / owner chat msg 201): one table of current numbers before testnet, on main `f4010070`. Does ~260k
+matched/s at ~22 native blocks/s (equal-stake standard, section 126) still hold? And why does the 2 / 2 / 1 shape make
+~2.5x larger blocks at ~15 blocks/s? Name the setting that differs if the data shows it; no extra cells for that.
+
+### 137.1 Setup
+
+* Binary: fresh release build of main `f4010070` (`ozarchy-s140-9n2-tools/build/build-9n2.sh` = section 135's
+  `build-9v.sh` with one arm: worktree `wt/bq-f4010070`, target `~/.cargo-target-s140-9n2-M`, `--locked`,
+  `CARGO_INCREMENTAL=0`, under the shared build lock), staged in `ozarchy-s140-9n2-stage/M/release`: node
+  `69fc5ee6`, bench `b2b06854`. **That node is byte-identical to section 135 / 136's B (`b42e5e98`):**
+  `b42e5e98..f4010070` changes only docs.
+* Harness: `wt/bq-f4010070` itself (its `tools/matched-bench` = `wt/bq-0261068b`'s); the untracked
+  `testnet/genesis-weighted-full.json` was copied in, else preflight refuses (`FORCE=1` rebuilds it in each run's
+  first cell anyway).
+* Specs: `make-specs-9n2.py`. S / D = section 126's `9n-{std,deep}.json` (equal stakes, oracle feed, default
+  `BENCH_RPCS` = all 3 nodes, 600 s; D adds `BULK_COUNT=1000000` `PRELOAD=1000000`); T = section 133's
+  `base-bisect-main.json` (stakes 2 / 2 / 1, seed, `BENCH_RPCS=0,1`, 300 s). Both: rate 76,000, 5,000 senders, batch
+  400, cap 4, commit tail, same node env. Checks: `configchk3` + `handoffchk3` + `burstwait` (section 136's checks
+  file); arm expectations: D `preload.json` resting 1,000,000 on all 3 nodes and `BULK_COUNT=1000000` in run.log; S
+  no 1M bulk; T the 2,2,1 stakes line.
+* **Two generated drivers, not one:** make-driver.py takes the cell duration and the rate per spec, not per arm (they
+  are run-cell.sh's positional arguments), so the 600 s S / D cells and the 300 s T cells cannot share a driver.
+  `drivers/ozarchy-s140-9n2-sd-campaign.sh` (w1 S 300 s unscored + r1 S D, r2 D S) then
+  `drivers/ozarchy-s140-9n2-t-campaign.sh` (r1 T, r2 T; no warm-up, it ran straight after sd), chained in one bench
+  unit after section 136's 7l (`ozarchy-s140-9v2-tools/campaign-chain-7l-9n2.sh`), nothing in between. Smokes first
+  (D 90 s, T 60 s, `smoke-chain-b.sh`): ACCEPT / AGREE / PASS, every check OK.
+* Burst pacing: section 136's `burstwait.py` (LOAD_S 606 for the 600 s cells).
+
+### 137.2 Validity
+
+* 7 scored + 1 w1 cells used: rc 0, ACCEPT / AGREE / PASS, state attestation equal, node md5 `69fc5ee6` on all 3
+  nodes. D: 1,000,000 orders resting on all 3 nodes in both cells. 0 panic / fail-stop / HARD FINDING lines, 0 CHECK
+  FAIL, 0 CELL-FLAG. Consensus timeouts: 0 in S / D, 1 in T r1.
+* FOREIGN: `sd r1-S` broke the rule (a 2.08-core 2 s interval: the 04:37:26 desktop burst fell into its window,
+  because the run's first burstwait call used the default 130 s start delay and the cell started ~40 s after it).
+  It was rerun from a second, timed driver (`drivers/ozarchy-s140-9n2-sd-rerun-campaign.sh`, launched at 06:23:30 so
+  its load window 06:24:23-06:34:26 sat between bursts; clean, max interval 0.38 core) and the rerun is used. The
+  broken cell's numbers hardly differ (257,185 matched/s, 22.67 native blocks/s). The other 6 scored cells: max
+  interval 0.30-0.48 core.
+
+### 137.3 Per cell (run order)
+
+| cell | matched/s | blocks/s | native blk/s | empty blk/s | fills / native blk | p50 / p99 ms | CPU ms / 1k fills | exec block_ms |
+|---|---|---|---|---|---|---|---|---|
+| sd w1 S (300 s, unscored) | 261,660 | 21.5 | 21.53 | - | 11,647 | 11.6 / 481 | 24.03 | - |
+| sd r1 S (FOREIGN, replaced) | 257,185 | 22.7 | 22.67 | - | 11,104 | 12.0 / 466 | 25.19 | - |
+| sd r1 D | 248,538 | 22.6 | 22.56 | 0.0 | 10,745 | 11.9 / 469 | 26.38 | 41.1 |
+| sd r2 D | 245,489 | 23.0 | 23.03 | 0.0 | 10,453 | 12.7 / 454 | 26.98 | 41.6 |
+| sd r2 S | 256,625 | 23.6 | 23.64 | 0.0 | 10,646 | 11.6 / 459 | 25.21 | 38.3 |
+| t r1 T | 275,645 | 15.7 | 9.60 | 6.14 | 28,444 | 12.9 / 747 | 24.59 | 89.6 |
+| t r2 T | 277,692 | 16.0 | 9.90 | 6.05 | 27,815 | 13.6 / 751 | 24.49 | 87.7 |
+| sd-rerun r1 S | 257,153 | 23.4 | 23.37 | 0.0 | 10,793 | 11.9 / 458 | 25.20 | 38.5 |
+
+### 137.4 Why T makes ~2.6x larger blocks at ~16 blocks/s
+
+* In T, 6.1 of 15.85 blocks/s (38.5%) are empty of native work; in S and D, 0. Every validator builds the same share
+  of blocks in both shapes (`block_build_count` 1,607 / 1,607 / 1,608 in T r2, 4,751 / 4,751 / 4,752 in S r2: leaders
+  rotate evenly; stake does not weight leadership).
+* T sends the load to val0 and val1 only (`BENCH_RPCS=0,1`, bench.log `RPC endpoints: 2`; S / D: 3). The empty
+  third of the blocks matches val2's leader views finding no native transactions in its own mempool. **Inferred:**
+  the bench does not record per-proposer block contents.
+  **Corrected by section 138 (9t):** the inference does not hold. Counted from node logs, ~50% of committed blocks
+  carry no native action for every leader (val2 included) with `BENCH_RPCS=0,1` and with `0,1,2`, and in S too. The
+  38.5% above counts blocks where the execution engine did not run, which the live oracle feed (S, D) triggers on
+  every block; it is not a content count. `BENCH_RPCS=0,1,2` does change T's block rate and size (138).
+* So the same offered load lands in 2 of every 3 blocks. Fills per native block go 10.7k -> 28.1k, exec time per
+  native block 38 -> 88 ms, and the view is longer, hence 15.85 instead of 23.5 blocks/s. Commit p99 749 vs 458 ms
+  follows.
+* The other two differences, stakes 2 / 2 / 1 (quorum without val2) and seed vs feed oracle, are not separated by
+  these cells. Neither explains an empty third of the blocks.
+* T's matched/s is 7.7% above S's on the same binary. Larger blocks spread the per-block overhead (CPU per 1k fills
+  24.5 vs 25.2, engine 2.59 vs 2.95 ms). It is a shape effect, not a capacity difference.
+
+### 137.5 Verdict and limits
+
+* **~260k at ~22 native blocks/s still holds** on `f4010070`: S 256.9k at 23.5 (-0.9% / +3.8% vs 126); deep D 247.0k
+  at 22.8 (level). RSS level (D peak 6.5 GB per node). The 2 / 2 / 1 baseline matches section 133's B.
+* n = 2 per shape, 2 cells each, so no CIs (df 1). These are levels for the table, not steps. The S / D w1 of section
+  126 was a counted 600 s cell; here w1 was 300 s and unscored.
+* T's block size is explained by the load reaching 2 of 3 leaders. To confirm it: a T cell with `BENCH_RPCS=0,1,2`
+  (and/or equal stakes), not run (owner: no extra cells).
+
+### 137.6 Data
+
+* Cells (`~/bench-results-matched/`): `ozarchy-s140-9n2-sd-{w1,r1-S,r1-D,r2-D,r2-S}`,
+  `ozarchy-s140-9n2-sd-rerun-r1-S` (used for r1 S), `ozarchy-s140-9n2-t-{r1-T,r2-T}`; smokes
+  `ozarchy-s140-9n2-{sd,t}-smoke-s0`.
+* Run dirs `ozarchy-s140-9n2-{sd,t,sd-rerun}-run/` (`campaign.log`, `campaign.done`, `cells.tsv`, `foreign.txt`,
+  `burstwait-state.tsv`, `smoke/`); chain log `ozarchy-s140-chain-c-run/chain.log` (`chain.done`: 7l=0 sd=0 t=0).
+* Stage `ozarchy-s140-9n2-stage/` (`build-9n2.log`, `build/md5s.txt`, `build/build.done`).
+* Tools `ozarchy-s140-9n2-tools/`: `make-specs-9n2.py`, `specs/`, `drivers/` (+ `.gen` / `.dry` / `.show` logs),
+  `build/build-9n2.sh`, `prof/` (`run-with-sampler.sh`, `foreign-sampler.py`), `campaign-chain-9n2.sh` (written,
+  superseded by the combined chain); analysis `analyst/cells9n2.py` -> `cells9n2.txt`, `n_mem.py` (section 126's) ->
+  `mem9n2.txt`; FOREIGN in `ozarchy-s140-9v2-tools/analyst/foreign9v2.txt`.
+
+## 138. Step 9t, T-shape empty-block check: section 137's T shape (main `f4010070`, stakes 2 / 2 / 1, `ORACLE_FEED=seed`, U all up, rate 76,000, cap 4, 300 s), arm R2 = `BENCH_RPCS=0,1` (the T default) vs arm R3 = `BENCH_RPCS=0,1,2`, same load, w1 (R2, unscored) + ABBA n = 2 (unit bench-ozarchy-s140-9t, run dir ozarchy-s140-9t-run, archy, 2026-10-28)
+
+**9t: section 137.4's inference does not hold. Sending load to val2 as well does not remove empty blocks. About half
+of all committed blocks carry no native action in both arms, and the share is the same for every leader. val2's own
+empty share is 52.5% / 52.7% with R2 and 50.9% / 51.6% with R3. BENCH_RPCS does change T's cadence: R3 makes 33% more
+blocks/s, 29% smaller blocks, commit p99 -37% and matched/s -6.8%, which lands close to section 137's S. The engine-empty
+share stays at 38% in both arms (138.4).**
+
+| arm | n | matched/s | blocks/s | native blk/s | empty blk/s | fills / native blk | commit p50 / p99 ms | CPU ms / 1k fills |
+|---|---|---|---|---|---|---|---|---|
+| R2 (`0,1`) | 2 | 275,626 ± 7,857 | 15.70 ± 0.00 | 9.77 ± 0.23 | 5.93 ± 0.36 | 28,149 ± 374 | 13.6 ± 1.9 / 766 ± 25 | 24.75 |
+| R3 (`0,1,2`) | 2 | 256,954 ± 6,428 | 20.90 ± 3.81 | 12.86 ± 0.31 | 8.03 ± 3.72 | 19,885 ± 15 | 11.9 ± 2.3 / 483 ± 15 | 25.00 |
+| R3 - R2 (paired, r1 / r2) | 2 | **-18,672 ± 1,429 (-6.8%)** | +5.20 ± 3.81 | **+3.09 ± 0.08** | +2.10 ± 3.36 | **-8,264 ± 358** | -1.7 ± 4.2 / **-283 ± 10** | +0.26 ± 2.33 |
+
+* ± = 95% t interval, df 1 (n = 2): wide. Paired = per-replicate R3 - R2 (ABBA: r1 and r2 each hold one cell of each
+  arm). Sources: section 137's definitions (headline val0 view; native blk/s = `torus_exec_engine_seconds_count`
+  delta, so empty blk/s = blocks the engine skipped; commit p50 / p99 = `torus_commit_interval_seconds`, mean of 3
+  nodes).
+* Against section 137 (same binary, same harness): R2 = 137's T (276,669, 15.85 / 9.75, p99 749). R3 sits next to
+  137's S (256,889 at 23.5 blk/s, 10.7k fills / block, p99 458), but R3 keeps stakes 2 / 2 / 1 and the seed oracle.
+
+Question (18c chat msg 209): section 137 found 38.5% of T's blocks carry no native work while the leaders rotate
+evenly, and inferred that val2-led views find an empty mempool because `BENCH_RPCS=0,1` sends the load only to val0 /
+val1. Does load on val2 remove the empty blocks?
+
+### 138.1 Setup
+
+* Binary: section 137's stage `ozarchy-s140-9n2-stage/M` (main `f4010070`): node `69fc5ee6`, bench `b2b06854`, both
+  md5-checked against `build/md5s.txt` before the launch and on all 3 nodes in every cell. Harness: the same frozen
+  `wt/bq-f4010070` tools 137's T cells used.
+* Spec `ozarchy-s140-9t-tools/make-specs-9t.py`: section 137's `9n2-t.json` with `BENCH_RPCS` moved from the spec-wide
+  harness env into each arm (R2 `0,1`, R3 `0,1,2`). Arm expectations: the 2,2,1 stakes line, and bench.log `RPC
+  endpoints: 2` (R2) / `3` (R3); both endpoint regexes were checked to fail on a 137 cell of the other kind. Checks `configchk3` +
+  `handoffchk3` + `burstwait` (section 136's file). Warm-up gate on.
+* One generated driver (`drivers/ozarchy-s140-9t-campaign.sh`) beside the foreign-CPU sampler
+  (`prof/run-with-sampler.sh`). Order w1 R2, r1 R2 R3, r2 R3 R2. Smoke R3 60 s first: ACCEPT / AGREE / PASS, every
+  check OK. The desktop burst phase was re-sampled for 32 min before the launch
+  (`ozarchy-s140-9v2-tools/prof/phase/foreign-phase-5-9t.txt`). Preflight: no rust-analyzer, localsearch-3 masked,
+  Codex stop review off, `perf_event_paranoid` 2. The bench agent started nothing during the cells (FOREIGN below).
+
+### 138.2 Validity
+
+* 4 scored + 1 w1 cells: rc 0, ACCEPT / AGREE / PASS, node md5 `69fc5ee6` on all 3 nodes. 0 CHECK FAIL, 0 CELL-FLAG.
+  Consensus timeouts: 1 in w1, r1 R2, r2 R3 and r2 R2, 0 in r1 R3.
+* FOREIGN: only the unscored w1 broke the rule (the 07:22:25 desktop burst, max 2 s interval 5.55 cores). It passed
+  the warm-up gate and is not used. The 4 scored cells: foreign avg 0.043-0.045 core, max interval 0.22-0.33 core.
+  No reruns.
+* Run order shows no drift: R2 276,245 -> 275,008 and R3 257,460 -> 256,448 (-0.4% each), w1 275,749.
+
+### 138.3 Per cell (run order)
+
+| cell | matched/s | blocks/s | native blk/s | empty blk/s | fills / native blk | p50 / p99 ms | CPU ms / 1k fills |
+|---|---|---|---|---|---|---|---|
+| w1 R2 (unscored, FOREIGN) | 275,749 | 15.7 | 9.37 | 6.33 | 29,112 | 12.9 / 737 | 24.44 |
+| r1 R2 | 276,245 | 15.7 | 9.79 | 5.95 | 28,178 | 13.8 / 764 | 24.65 |
+| r1 R3 | 257,460 | 21.2 | 12.89 | 8.32 | 19,886 | 11.7 / 482 | 25.09 |
+| r2 R3 | 256,448 | 20.6 | 12.84 | 7.73 | 19,883 | 12.1 / 484 | 24.91 |
+| r2 R2 | 275,008 | 15.7 | 9.75 | 5.90 | 28,119 | 13.5 / 768 | 24.84 |
+
+### 138.4 Per leader: who builds the empty blocks
+
+Read from the node logs in each load window (`analyst/leaders9t.py`). A build is a `produce_block called (CTE)`
+line. A native build is a `selected actions for block` line with `native_actions` > 0 (logged only when the build
+took evm or native work). A committed block is val0's `on_committed_block ... native=N` line, assigned to the node
+whose last build on parent `h - 1` came before that commit (unassigned 0, never two builders). The build counts
+match each node's `torus_block_build_seconds_count` delta to ±1.
+
+| cell | val0 committed / empty share | val1 | val2 | all: empty share (content) | engine-empty share (headline) |
+|---|---|---|---|---|---|
+| 137 t r1 (R2) | 1,611 / 50.7% | 1,611 / 50.3% | 1,611 / 53.8% | 51.6% | 39.1% |
+| 137 t r2 (R2) | 1,607 / 50.5% | 1,607 / 48.3% | 1,607 / 51.4% | 50.1% | 37.8% |
+| r1 R2 | 1,590 / 50.0% | 1,590 / 48.8% | 1,589 / 52.5% | 50.4% | 37.9% |
+| r2 R2 | 1,588 / 48.5% | 1,588 / 49.2% | 1,587 / 52.7% | 50.1% | 37.6% |
+| r1 R3 | 2,130 / 51.5% | 2,130 / 50.2% | 2,129 / 50.9% | 50.9% | 39.2% |
+| r2 R3 | 2,082 / 51.4% | 2,082 / 48.9% | 2,081 / 51.6% | 50.6% | 37.5% |
+| 137 sd r2 S (all RPCs, feed) | 4,754 / 50.1% | 4,754 / 46.0% | 4,754 / 50.0% | 48.7% | 0% |
+
+* **The inference is refuted.** In R2, val2's views are empty at about the rate of val0's and val1's (+2-4 points),
+  not all of them. In R3 the gap closes, but the total empty share does not move (50.4 / 50.1% -> 50.9 / 50.6%). val2
+  takes the load from its mempool through gossip: 137's T r2 shows val2 `peak_mempool_native` 10.8k, the same as val0 /
+  val1, although it published 52 own actions. Per native build, val2 packs as many actions as the others (R2 199-200
+  vs 182-189).
+* Leaders rotate evenly in every cell (33.3% each). Stake 2 / 2 / 1 does not weight leadership.
+* Empty blocks come in runs, not one per round: P(native | previous native) 0.79, P(native | previous empty) 0.20 in
+  both arms (val0 view, r1). Mean run ~5 blocks: the load arrives in waves (cap 4 in flight, commit tail), and the
+  blocks between waves are empty.
+* **Two "empty" definitions.** Content-empty (no native action in the block) is ~50% in every shape: T R2, T R3 and
+  137's S. Engine-empty (headline `empty_blk_s`: blocks where the engine did not run) is ~38% in T and 0 in S / D. With
+  `ORACLE_FEED=1` the engine runs every block. With seed it also runs on ~580 blocks that carry no actions
+  (2,991 engine blocks vs 2,408 blocks with actions of 4,821 in 137 t r2). So section 137's "S / D 0 empty" is the oracle feed
+  keeping the engine busy, not fuller blocks.
+* Why T's blocks are 2.6x larger is therefore not answered by leader emptiness. Measured: with 3 ingress RPCs the
+  chain commits 33% more blocks/s at 29% fewer fills each, hotstuff CPU per block drops (`hs_blk` 15.6 -> 12.0) and
+  matched/s drops 6.8%. The empty share stays ~50% / ~38% in both arms. Not measured: the mechanism (bench-side
+  pacing per RPC, view timing). The bench does not log it.
+
+### 138.5 Verdict and limits
+
+* **Inference (137.4) refuted:** load on val2 does not cut empty blocks (empty blk/s +2.1 ± 3.4, CI spans 0;
+  engine-empty share 37.7% -> 38.4%), and val2-led views are not the empty ones in either arm.
+* `BENCH_RPCS` alone moves T's cadence and block size most of the way to S. `0,1` gives T its larger blocks, its
+  higher matched/s (+7.3% over R3) and its long p99. So T and S differ mainly in ingress, not in stakes or oracle
+  (stakes / oracle not separated; R3 is still 2.6 blk/s below 137's S).
+* n = 2 per arm, df 1: only the paired matched/s, native blk/s, fills / block and p99 differences are resolved.
+* Per-leader counts are builds and commits from INFO logs. A block's actions are counted at selection and at commit,
+  not by executed fills.
+
+### 138.6 Data
+
+* Cells (`~/bench-results-matched/`): `ozarchy-s140-9t-{w1,r1-R2,r1-R3,r2-R3,r2-R2}`, smoke `ozarchy-s140-9t-smoke-s0`.
+* Run dir `ozarchy-s140-9t-run/` (`campaign.log`, `campaign.done` exit=0, `wrapper.done`, `cells.tsv`, `foreign.txt`,
+  `burstwait-state.tsv`, `smoke/`).
+* Tools `ozarchy-s140-9t-tools/`: `make-specs-9t.py`, `specs/9t.json`, `drivers/` (+ `.gen` / `.dry` / `.show` logs),
+  `prof/` (copies of 137's `run-with-sampler.sh`, `foreign-sampler.py`); analysis `analyst/cells9t.py` ->
+  `cells9t.txt` (wraps section 136's `abba9v2.py` `cell()`), `analyst/leaders9t.py` -> `leaders9t.txt`, FOREIGN
+  (`ozarchy-s140-9v2-tools/analyst/foreign9v2.py`) -> `analyst/foreign9t.txt`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

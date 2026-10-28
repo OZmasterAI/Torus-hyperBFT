@@ -1276,6 +1276,46 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    blocks/s 16.13 -> 16.00 (-0.13 ± 0.34), commit p99 740 -> 731 ms (-9 ± 53), matched/s +392 ± 3,498, CPU per 1k
    fills +0.08 ± 0.30: within noise. Commit p50 +0.6 ± 0.5 ms (Welch only). Sync-server thread flat. PASS. Not
    measured: the growth with validator count (cost is per incoming vote).
+9v2. **[DONE s140, section 136: PASS at 4 val, FAIL (CPU) at 7 val] [GO s140 (18c / owner chat msgs 201 + 203), A = main
+   `7251fc7c`, B = main `b42e5e98`] Vote-path cost vs validator count.** Section 135's pair on 9p's 4-val all-up shape
+   (1/1/1/1, `DL_K=3`, seed, `BENCH_RPCS=0,1,2`, 300 s): below saturation (RATE 475, cap 4) and saturated (RATE 76000),
+   then 7 val (1/.../1) below saturation only, RATE from an all-up probe at <= ~20 of 32 busy threads (msg 203); w1 +
+   ABBA n = 3 per step. Primary: hotstuff thread ms per block / per view vs N, blocks/s, commit p50 / p99; also
+   matched/s. Pass at each N: hotstuff thread < +5%, blocks/s and p99 not worse.
+   **Done s140 (units bench-ozarchy-s140-9v2-chain4 + bench-ozarchy-s140-chain-c, run dirs
+   ozarchy-s140-9v2-{4l,4s,7l}-run; A node `50c1cfeb`, B node `69fc5ee6`; 4 val on harness `wt/bq-0261068b`, 7 val
+   on frozen `tools/make-driver-nval` `b646c455` + a local `summarize.py` height-spread patch; 18 scored cells + 3 w1
+   ACCEPT / AGREE / PASS, 3 driver reruns for a false DISAGREE (4l), 0 FOREIGN; section 136):** hotstuff-algo per
+   block A -> B: 4l 5.844 -> 6.066 ms (+3.8%, paired CI +2.5..+5.1%) PASS; 4s 10.83 -> 11.02 (+1.7%, not resolved,
+   cadence swings) PASS on the point estimate; 7l (RATE 180, 18.9-19.6 busy threads) 5.891 -> 6.307 (+7.1%, paired
+   +6.3..+7.9%) FAIL. blocks/s (-1.1% / -0.1% / -1.4%) and commit p99 (+2 / +15 / -4 ms) not worse at any N.
+   Growth ~+0.064 ± 0.030 ms per block per added validator (A's own cost flat in N: fits a per-vote cost). Harness
+   finding: `summarize.py` `height_spread <= 5` false-DISAGREEs cells whose post-drain heads are 6-10 apart (3 of 6
+   first-pass 4l cells, the 7-val smoke; equal hashes and digests); patch + port note in 136.2.
+9n2. **[DONE s140, section 137] [GO s140 (18c / owner chat msg 201), main `f4010070`] Fresh pre-testnet baselines.**
+   Section 126's 9n shapes S (standard 100k) and D (1M accounts + 1M resting orders), 3 val equal stakes, oracle feed,
+   600 s, n = 2 each, plus the 9s 2/2/1 shape T (seed, `BENCH_RPCS=0,1`, 300 s, as 130 / 133), n = 2; standard load.
+   One table: matched/s, blocks/s + native blocks/s, fills per block, commit p50 / p99, RSS, CPU per 1k fills.
+   **Done s140 (unit bench-ozarchy-s140-chain-c after 9v2 7l, run dirs ozarchy-s140-9n2-{sd,t,sd-rerun}-run; node
+   `69fc5ee6` = 9v B byte-identical, bench `b2b06854`; two generated drivers (duration is spec-wide); 7 scored + 1 w1
+   ACCEPT / AGREE / PASS, 1 FOREIGN rerun (sd r1-S, a desktop burst) from a timed second driver; section 137):** S
+   256,889 matched/s, 23.50 native blk/s, 10.7k fills / block, p50 / p99 11.7 / 458 ms, RSS max 5.2 GB (126: 259,102
+   at 22.6); D 247,013, 22.79 native, p99 462, RSS max 6.5 GB (126: 247,335 at 21.9); T 276,669, 15.85 blk/s, 9.75
+   native, 28.1k fills / block, p99 749 (133 B: 276,486, 15.25, 9.33). ~260k at ~22 native blk/s holds. T's 2.6x
+   larger blocks: 38.5% of T's blocks carry no native work (6.1 empty blk/s, S / D 0) while leaders rotate evenly, and
+   the load reaches only val0 / val1 (`BENCH_RPCS=0,1`): inferred, val2's leader views find an empty mempool.
+9t. **[DONE s140, section 138] [GO s140 (18c chat msg 209), main `f4010070`] T-shape empty-block check.** Tests
+   section 137's inference that T's empty blocks are val2-led views with an empty mempool (`BENCH_RPCS=0,1`). 137's T
+   shape (stakes 2 / 2 / 1, seed, U all up, standard load, 300 s, stage `ozarchy-s140-9n2-stage`, frozen harness
+   `wt/bq-f4010070`), arm R2 = `BENCH_RPCS=0,1` vs R3 = `0,1,2`, nothing else differs; w1 + ABBA n = 2. Report empty /
+   native blk/s, fills per native block, blocks/s, matched/s, p50 / p99, and per-leader native vs empty builds.
+   **Done s140 (unit bench-ozarchy-s140-9t, run dir ozarchy-s140-9t-run; node `69fc5ee6`, bench `b2b06854`; one
+   generated driver; 4 scored + 1 w1 ACCEPT / AGREE / PASS, 0 reruns (only the unscored w1 broke FOREIGN); section
+   138):** inference REFUTED. ~50% of committed blocks carry no native action in both arms, evenly over val0 / val1 /
+   val2 (val2 52.5-52.7% R2, 50.9-51.6% R3); engine-empty share 37.7% -> 38.4%. `BENCH_RPCS` does set T's cadence:
+   R3 - R2 paired matched/s -18,672 ± 1,429 (-6.8%), native blk/s +3.09 ± 0.08, blocks/s 15.7 -> 20.9, fills per
+   native block -8,264 ± 358 (28.1k -> 19.9k), commit p99 766 -> 483 ms. R3 lands near 137's S. 137's "S / D 0 empty"
+   is the oracle feed running the engine every block; by content S is ~49% empty too.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
