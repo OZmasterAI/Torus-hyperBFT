@@ -22787,6 +22787,124 @@ rpc 1.684 -> 1.685, tokio 1.985 -> 2.000, exec 8.396 -> 8.416, rocksdb 1.162 -> 
 * Analysis: `ozarchy-s140-9v-tools/analyst/abba9v.py` -> `abba9v.txt`, `foreign9v.txt` (section 134's
   `foreign9p3.py`).
 
+## 137. Step 9n2, fresh pre-testnet baselines on main `f4010070` (all s138-s140 fixes, epoch-plan hand-off default on): section 126's 9n shapes S (standard 100k genesis) and D (1M accounts + 1M pre-loaded resting orders), 3 val equal stakes, `ORACLE_FEED=1`, 600 s, n = 2 each, plus the 9s 2 / 2 / 1 shape T of sections 130 / 133 (`ORACLE_FEED=seed`, `BENCH_RPCS=0,1`, 300 s), n = 2; standard load (rate 76,000, cap 4), hash + attestation + L6.1 + L2.1 + fail-stop on, Classic, 15 s checkpoints (unit bench-ozarchy-s140-chain-c after section 136's 7l; run dirs ozarchy-s140-9n2-{sd,t,sd-rerun}-run, archy, 2026-10-28)
+
+**9n2: section 126's capacity numbers still hold on current main. Equal-stake standard S: 256,889 matched/s at 23.5
+native blocks/s (126: 259,102 at 22.6). Deep D: 247,013 at 22.8 (126: 247,335 at 21.9). The 2 / 2 / 1 shape T:
+276,669 matched/s at 15.85 blocks/s, 9.75 native (133 B: 276,486, 15.25, 9.33). T's blocks are 2.6x larger because
+about 39% of its blocks carry no native work, not because consensus is slower per block (137.4).**
+
+| shape | n | matched/s | blocks/s | native blk/s | fills / native blk | commit p50 / p99 ms | RSS load mean MB (val0 / val1 / val2) | RSS load max MB | CPU ms / 1k fills | engine ms / 1k fills |
+|---|---|---|---|---|---|---|---|---|---|---|
+| S | 2 | 256,889 (257,153 / 256,625) | 23.50 | 23.50 | 10,719 | 11.7 / 458 | 2,955 / 2,973 / 3,818 | 4,211 / 4,265 / 5,207 | 25.20 | 2.95 |
+| D | 2 | 247,013 (248,538 / 245,489) | 22.80 | 22.79 | 10,599 | 12.3 / 462 | 4,412 / 4,415 / 5,176 | 5,541 / 5,886 / 6,521 | 26.68 | 3.13 |
+| T | 2 | 276,669 (275,645 / 277,692) | 15.85 | 9.75 | 28,130 | 13.3 / 749 | 3,471 / 3,367 / 4,598 | 3,957 / 3,835 / 6,294 | 24.54 | 2.59 |
+| 126 S | 2 | 259,102 | 22.6 | 22.64 | 11,192 | 11.9 / 464 | 3,018 / 2,952 / 3,790 | 4,205 / 4,306 / 4,856 | - | 2.95 |
+| 126 D | 2 | 247,335 | 21.9 | 21.92 | 11,010 | 12.5 / 463 | 4,412 / 4,465 / 5,203 | 5,317 / 5,471 / 6,722 | - | 3.15 |
+| 133 B | 4 | 276,486 | 15.25 | 9.33 | - | - | - | - | - | - |
+
+* Sources: matched/s, blocks/s, native blocks/s and fills per native block from the headline (val0 view);
+  commit interval p50 / p99 = load-window delta of `torus_commit_interval_seconds`, mean of 3 nodes; CPU = process
+  user + sys per 1k fills, mean of 3 nodes; engine = val0's engine phase per 1k fills; RSS = `mem-samples.txt` VmRSS
+  in the load window, per node (mean of the 2 cells; max = the larger cell max). 126's p50 / p99 and RSS are the
+  means of its two cells.
+* Against 126 (cross-campaign, levels only): S matched/s -0.9%, native blocks/s +3.8%, fills per native block -4.2%;
+  D matched/s -0.1%, native blocks/s +4.0%. RSS level. So the s138-s140 changes on main left matched/s where it was. Blocks come ~4% more
+  often and are ~4% smaller.
+* Against 133's B arm (`f0bd74ba`, same T shape and load; 133's harness was the frozen `9083b278` one): matched/s
+  +0.1%, blocks/s +3.9%, native +4.5%.
+
+Question (18c / owner chat msg 201): one table of current numbers before testnet, on main `f4010070`. Does ~260k
+matched/s at ~22 native blocks/s (equal-stake standard, section 126) still hold? And why does the 2 / 2 / 1 shape make
+~2.5x larger blocks at ~15 blocks/s? Name the setting that differs if the data shows it; no extra cells for that.
+
+### 137.1 Setup
+
+* Binary: fresh release build of main `f4010070` (`ozarchy-s140-9n2-tools/build/build-9n2.sh` = section 135's
+  `build-9v.sh` with one arm: worktree `wt/bq-f4010070`, target `~/.cargo-target-s140-9n2-M`, `--locked`,
+  `CARGO_INCREMENTAL=0`, under the shared build lock), staged in `ozarchy-s140-9n2-stage/M/release`: node
+  `69fc5ee6`, bench `b2b06854`. **That node is byte-identical to section 135 / 136's B (`b42e5e98`):**
+  `b42e5e98..f4010070` changes only docs.
+* Harness: `wt/bq-f4010070` itself (its `tools/matched-bench` = `wt/bq-0261068b`'s); the untracked
+  `testnet/genesis-weighted-full.json` was copied in, else preflight refuses (`FORCE=1` rebuilds it in each run's
+  first cell anyway).
+* Specs: `make-specs-9n2.py`. S / D = section 126's `9n-{std,deep}.json` (equal stakes, oracle feed, default
+  `BENCH_RPCS` = all 3 nodes, 600 s; D adds `BULK_COUNT=1000000` `PRELOAD=1000000`); T = section 133's
+  `base-bisect-main.json` (stakes 2 / 2 / 1, seed, `BENCH_RPCS=0,1`, 300 s). Both: rate 76,000, 5,000 senders, batch
+  400, cap 4, commit tail, same node env. Checks: `configchk3` + `handoffchk3` + `burstwait` (section 136's checks
+  file); arm expectations: D `preload.json` resting 1,000,000 on all 3 nodes and `BULK_COUNT=1000000` in run.log; S
+  no 1M bulk; T the 2,2,1 stakes line.
+* **Two generated drivers, not one:** make-driver.py takes the cell duration and the rate per spec, not per arm (they
+  are run-cell.sh's positional arguments), so the 600 s S / D cells and the 300 s T cells cannot share a driver.
+  `drivers/ozarchy-s140-9n2-sd-campaign.sh` (w1 S 300 s unscored + r1 S D, r2 D S) then
+  `drivers/ozarchy-s140-9n2-t-campaign.sh` (r1 T, r2 T; no warm-up, it ran straight after sd), chained in one bench
+  unit after section 136's 7l (`ozarchy-s140-9v2-tools/campaign-chain-7l-9n2.sh`), nothing in between. Smokes first
+  (D 90 s, T 60 s, `smoke-chain-b.sh`): ACCEPT / AGREE / PASS, every check OK.
+* Burst pacing: section 136's `burstwait.py` (LOAD_S 606 for the 600 s cells).
+
+### 137.2 Validity
+
+* 7 scored + 1 w1 cells used: rc 0, ACCEPT / AGREE / PASS, state attestation equal, node md5 `69fc5ee6` on all 3
+  nodes. D: 1,000,000 orders resting on all 3 nodes in both cells. 0 panic / fail-stop / HARD FINDING lines, 0 CHECK
+  FAIL, 0 CELL-FLAG. Consensus timeouts: 0 in S / D, 1 in T r1.
+* FOREIGN: `sd r1-S` broke the rule (a 2.08-core 2 s interval: the 04:37:26 desktop burst fell into its window,
+  because the run's first burstwait call used the default 130 s start delay and the cell started ~40 s after it).
+  It was rerun from a second, timed driver (`drivers/ozarchy-s140-9n2-sd-rerun-campaign.sh`, launched at 06:23:30 so
+  its load window 06:24:23-06:34:26 sat between bursts; clean, max interval 0.38 core) and the rerun is used. The
+  broken cell's numbers hardly differ (257,185 matched/s, 22.67 native blocks/s). The other 6 scored cells: max
+  interval 0.30-0.48 core.
+
+### 137.3 Per cell (run order)
+
+| cell | matched/s | blocks/s | native blk/s | empty blk/s | fills / native blk | p50 / p99 ms | CPU ms / 1k fills | exec block_ms |
+|---|---|---|---|---|---|---|---|---|
+| sd w1 S (300 s, unscored) | 261,660 | 21.5 | 21.53 | - | 11,647 | 11.6 / 481 | 24.03 | - |
+| sd r1 S (FOREIGN, replaced) | 257,185 | 22.7 | 22.67 | - | 11,104 | 12.0 / 466 | 25.19 | - |
+| sd r1 D | 248,538 | 22.6 | 22.56 | 0.0 | 10,745 | 11.9 / 469 | 26.38 | 41.1 |
+| sd r2 D | 245,489 | 23.0 | 23.03 | 0.0 | 10,453 | 12.7 / 454 | 26.98 | 41.6 |
+| sd r2 S | 256,625 | 23.6 | 23.64 | 0.0 | 10,646 | 11.6 / 459 | 25.21 | 38.3 |
+| t r1 T | 275,645 | 15.7 | 9.60 | 6.14 | 28,444 | 12.9 / 747 | 24.59 | 89.6 |
+| t r2 T | 277,692 | 16.0 | 9.90 | 6.05 | 27,815 | 13.6 / 751 | 24.49 | 87.7 |
+| sd-rerun r1 S | 257,153 | 23.4 | 23.37 | 0.0 | 10,793 | 11.9 / 458 | 25.20 | 38.5 |
+
+### 137.4 Why T makes ~2.6x larger blocks at ~16 blocks/s
+
+* In T, 6.1 of 15.85 blocks/s (38.5%) are empty of native work; in S and D, 0. Every validator builds the same share
+  of blocks in both shapes (`block_build_count` 1,607 / 1,607 / 1,608 in T r2, 4,751 / 4,751 / 4,752 in S r2: leaders
+  rotate evenly; stake does not weight leadership).
+* T sends the load to val0 and val1 only (`BENCH_RPCS=0,1`, bench.log `RPC endpoints: 2`; S / D: 3). The empty
+  third of the blocks matches val2's leader views finding no native transactions in its own mempool. **Inferred:**
+  the bench does not record per-proposer block contents.
+* So the same offered load lands in 2 of every 3 blocks. Fills per native block go 10.7k -> 28.1k, exec time per
+  native block 38 -> 88 ms, and the view is longer, hence 15.85 instead of 23.5 blocks/s. Commit p99 749 vs 458 ms
+  follows.
+* The other two differences, stakes 2 / 2 / 1 (quorum without val2) and seed vs feed oracle, are not separated by
+  these cells. Neither explains an empty third of the blocks.
+* T's matched/s is 7.7% above S's on the same binary. Larger blocks spread the per-block overhead (CPU per 1k fills
+  24.5 vs 25.2, engine 2.59 vs 2.95 ms). It is a shape effect, not a capacity difference.
+
+### 137.5 Verdict and limits
+
+* **~260k at ~22 native blocks/s still holds** on `f4010070`: S 256.9k at 23.5 (-0.9% / +3.8% vs 126); deep D 247.0k
+  at 22.8 (level). RSS level (D peak 6.5 GB per node). The 2 / 2 / 1 baseline matches section 133's B.
+* n = 2 per shape, 2 cells each, so no CIs (df 1). These are levels for the table, not steps. The S / D w1 of section
+  126 was a counted 600 s cell; here w1 was 300 s and unscored.
+* T's block size is explained by the load reaching 2 of 3 leaders. To confirm it: a T cell with `BENCH_RPCS=0,1,2`
+  (and/or equal stakes), not run (owner: no extra cells).
+
+### 137.6 Data
+
+* Cells (`~/bench-results-matched/`): `ozarchy-s140-9n2-sd-{w1,r1-S,r1-D,r2-D,r2-S}`,
+  `ozarchy-s140-9n2-sd-rerun-r1-S` (used for r1 S), `ozarchy-s140-9n2-t-{r1-T,r2-T}`; smokes
+  `ozarchy-s140-9n2-{sd,t}-smoke-s0`.
+* Run dirs `ozarchy-s140-9n2-{sd,t,sd-rerun}-run/` (`campaign.log`, `campaign.done`, `cells.tsv`, `foreign.txt`,
+  `burstwait-state.tsv`, `smoke/`); chain log `ozarchy-s140-chain-c-run/chain.log` (`chain.done`: 7l=0 sd=0 t=0).
+* Stage `ozarchy-s140-9n2-stage/` (`build-9n2.log`, `build/md5s.txt`, `build/build.done`).
+* Tools `ozarchy-s140-9n2-tools/`: `make-specs-9n2.py`, `specs/`, `drivers/` (+ `.gen` / `.dry` / `.show` logs),
+  `build/build-9n2.sh`, `prof/` (`run-with-sampler.sh`, `foreign-sampler.py`), `campaign-chain-9n2.sh` (written,
+  superseded by the combined chain); analysis `analyst/cells9n2.py` -> `cells9n2.txt`, `n_mem.py` (section 126's) ->
+  `mem9n2.txt`; FOREIGN in `ozarchy-s140-9v2-tools/analyst/foreign9v2.txt`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

@@ -1276,6 +1276,18 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    blocks/s 16.13 -> 16.00 (-0.13 ± 0.34), commit p99 740 -> 731 ms (-9 ± 53), matched/s +392 ± 3,498, CPU per 1k
    fills +0.08 ± 0.30: within noise. Commit p50 +0.6 ± 0.5 ms (Welch only). Sync-server thread flat. PASS. Not
    measured: the growth with validator count (cost is per incoming vote).
+9n2. **[DONE s140, section 137] [GO s140 (18c / owner chat msg 201), main `f4010070`] Fresh pre-testnet baselines.**
+   Section 126's 9n shapes S (standard 100k) and D (1M accounts + 1M resting orders), 3 val equal stakes, oracle feed,
+   600 s, n = 2 each, plus the 9s 2/2/1 shape T (seed, `BENCH_RPCS=0,1`, 300 s, as 130 / 133), n = 2; standard load.
+   One table: matched/s, blocks/s + native blocks/s, fills per block, commit p50 / p99, RSS, CPU per 1k fills.
+   **Done s140 (unit bench-ozarchy-s140-chain-c after 9v2 7l, run dirs ozarchy-s140-9n2-{sd,t,sd-rerun}-run; node
+   `69fc5ee6` = 9v B byte-identical, bench `b2b06854`; two generated drivers (duration is spec-wide); 7 scored + 1 w1
+   ACCEPT / AGREE / PASS, 1 FOREIGN rerun (sd r1-S, a desktop burst) from a timed second driver; section 137):** S
+   256,889 matched/s, 23.50 native blk/s, 10.7k fills / block, p50 / p99 11.7 / 458 ms, RSS max 5.2 GB (126: 259,102
+   at 22.6); D 247,013, 22.79 native, p99 462, RSS max 6.5 GB (126: 247,335 at 21.9); T 276,669, 15.85 blk/s, 9.75
+   native, 28.1k fills / block, p99 749 (133 B: 276,486, 15.25, 9.33). ~260k at ~22 native blk/s holds. T's 2.6x
+   larger blocks: 38.5% of T's blocks carry no native work (6.1 empty blk/s, S / D 0) while leaders rotate evenly, and
+   the load reaches only val0 / val1 (`BENCH_RPCS=0,1`): inferred, val2's leader views find an empty mempool.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
