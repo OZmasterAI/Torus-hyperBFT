@@ -1095,34 +1095,39 @@ impl StateDb {
     /// ([`Self::compact_range_in_background`]) and the count starts over. One
     /// market per range, so a run rewrites only the files holding the churned
     /// markets, never the whole CF.
-    pub fn note_scanned_deletes(
+    ///
+    /// `groups` is everything one flush deleted, `(cf, prefix, n, first,
+    /// last)` per market: counted under one lock hold, so the markets of one
+    /// flush that reach the threshold join one batch (one run). Noted one at a
+    /// time, the worker could take the first market's range before the next
+    /// was queued (s140: `one_range_per_market_never_a_span_over_markets` saw
+    /// two runs on a loaded host).
+    pub fn note_scanned_deletes<'a>(
         &self,
-        cf: &'static str,
-        prefix: &[u8],
-        n: u64,
-        first: &[u8],
-        last: &[u8],
+        groups: impl IntoIterator<Item = (&'static str, &'a [u8], u64, &'a [u8], &'a [u8])>,
     ) {
         let mut state = self.range_compaction.0.lock_state();
-        let key = (cf, prefix.to_vec());
-        let entry = state
-            .uncompacted
-            .entry(key.clone())
-            .or_insert_with(|| (0, first.to_vec(), last.to_vec()));
-        entry.0 += n;
-        if first < entry.1.as_slice() {
-            entry.1 = first.to_vec();
+        for (cf, prefix, n, first, last) in groups {
+            let key = (cf, prefix.to_vec());
+            let entry = state
+                .uncompacted
+                .entry(key.clone())
+                .or_insert_with(|| (0, first.to_vec(), last.to_vec()));
+            entry.0 += n;
+            if first < entry.1.as_slice() {
+                entry.1 = first.to_vec();
+            }
+            if last > entry.2.as_slice() {
+                entry.2 = last.to_vec();
+            }
+            if entry.0 < crate::cf::SCANNED_DELETES_COMPACTION_THRESHOLD {
+                continue;
+            }
+            let (_, lo, mut hi) = state.uncompacted.remove(&key).expect("entry just updated");
+            // The smallest key after `hi`: the range covers `hi` itself.
+            hi.push(0);
+            self.request_locked(&mut state, cf, key.1, lo, Some(hi));
         }
-        if last > entry.2.as_slice() {
-            entry.2 = last.to_vec();
-        }
-        if entry.0 < crate::cf::SCANNED_DELETES_COMPACTION_THRESHOLD {
-            return;
-        }
-        let (_, lo, mut hi) = state.uncompacted.remove(&key).expect("entry just updated");
-        // The smallest key after `hi`: the range covers `hi` itself.
-        hi.push(0);
-        self.request_locked(&mut state, cf, key.1, lo, Some(hi));
     }
 
     /// Queue `[start, end)` of `cf` under `group`, start the worker if needed

@@ -162,6 +162,10 @@ pub struct DaGcFence {
     chunks: AtomicU64,
     #[cfg(test)]
     max_chunks_waited: AtomicU64,
+    /// [`RELEASE_YIELD_MAX`] in ms, raisable by a test that counts chunks:
+    /// on a loaded host a woken pin can stay off-CPU past 10 ms (tests).
+    #[cfg(test)]
+    release_yield_max_ms: AtomicU64,
 }
 
 impl Default for DaGcFence {
@@ -234,6 +238,8 @@ impl DaGcFence {
             chunks: AtomicU64::new(0),
             #[cfg(test)]
             max_chunks_waited: AtomicU64::new(0),
+            #[cfg(test)]
+            release_yield_max_ms: AtomicU64::new(RELEASE_YIELD_MAX.as_millis() as u64),
         }
     }
 
@@ -490,11 +496,19 @@ impl DaGcFence {
             }
             let waited = Instant::now();
             while self.pin_waiters.load(Ordering::SeqCst) > 0
-                && waited.elapsed() < RELEASE_YIELD_MAX
+                && waited.elapsed() < self.release_yield_max()
             {
                 std::thread::yield_now();
             }
         }
+    }
+
+    /// How long a release waits between two chunks for the queued pins.
+    fn release_yield_max(&self) -> Duration {
+        #[cfg(test)]
+        return Duration::from_millis(self.release_yield_max_ms.load(Ordering::SeqCst));
+        #[cfg(not(test))]
+        RELEASE_YIELD_MAX
     }
 
     /// Pins a release drops per lock hold (tests).
@@ -824,6 +838,23 @@ mod tests {
     /// (the best of three attempts, as other processes can preempt the
     /// releasing thread mid-chunk; the old fence waited for the whole
     /// release every time).
+    ///
+    /// The chunk count holds whatever the load only if the release waits for
+    /// a queued pin until it took the lock: the node's 10 ms
+    /// [`RELEASE_YIELD_MAX`] is a scheduling bound (s140: "a queued pin
+    /// waited for 4 chunks" on 18c at load ~100, where a woken pin can stay
+    /// off-CPU past 10 ms), so the count is taken with it raised to 1 s. The
+    /// old fence (no hand-off between chunks) still fails it.
+    ///
+    /// In time, the 99th-percentile pin of an attempt is held to the bound,
+    /// not the slowest: tens of thousands of pins run during a release, and
+    /// on a loaded host one of them is always preempted mid-call (s140, 18c
+    /// at load ~45: the slowest pin 100 ms - 1 s in every attempt). The pins
+    /// start once the release dropped its first chunk: a pin into the full
+    /// fence evicts a passed entry, one less for the release to drop (s140:
+    /// "252 lock holds" when the releasing thread started late). A release
+    /// in one lock hold (the old fence) fails the lock-hold count; one that
+    /// does not let a queued pin in between its chunks fails the chunk count.
     #[test]
     fn a_pin_waits_at_most_one_release_chunk() {
         use std::sync::atomic::AtomicBool;
@@ -835,6 +866,7 @@ mod tests {
         let mut attempts = Vec::new();
         for _ in 0..3 {
             let fence = DaGcFence::default();
+            fence.release_yield_max_ms.store(1_000, Ordering::SeqCst);
             fence.set_enabled(true);
             fence.note_committed(100);
             for chunk in all.chunks(20_000) {
@@ -843,7 +875,7 @@ mod tests {
             assert_eq!(fence.pinned(), DA_GC_FENCE_MAX_PINS);
             let done = AtomicBool::new(false);
             let (started_tx, started_rx) = std::sync::mpsc::channel();
-            let (worst, release, pins) = std::thread::scope(|s| {
+            let (mut waits, release) = std::thread::scope(|s| {
                 let release = s.spawn(|| {
                     started_tx.send(()).unwrap();
                     let t = Instant::now();
@@ -852,16 +884,22 @@ mod tests {
                     t.elapsed()
                 });
                 started_rx.recv().unwrap();
-                std::thread::sleep(Duration::from_millis(1));
-                let (mut worst, mut pins) = (Duration::ZERO, 0u64);
-                while !done.load(Ordering::SeqCst) || pins == 0 {
-                    let t = Instant::now();
-                    assert!(fence.pin(102, &[n(u64::MAX - pins)]).is_empty());
-                    worst = worst.max(t.elapsed());
-                    pins += 1;
+                while fence.chunks.load(Ordering::SeqCst) == 0 {
+                    std::thread::yield_now();
                 }
-                (worst, release.join().unwrap(), pins)
+                let mut waits = Vec::new();
+                while !done.load(Ordering::SeqCst) || waits.is_empty() {
+                    let t = Instant::now();
+                    assert!(fence
+                        .pin(102, &[n(u64::MAX - waits.len() as u64)])
+                        .is_empty());
+                    waits.push(t.elapsed());
+                }
+                (waits, release.join().unwrap())
             });
+            let pins = waits.len() as u64;
+            waits.sort_unstable();
+            let (p99, worst) = (waits[waits.len() * 99 / 100], waits[waits.len() - 1]);
             let chunks = fence.chunks.load(Ordering::SeqCst);
             assert!(
                 chunks >= (DA_GC_FENCE_MAX_PINS / DA_GC_FENCE_RELEASE_CHUNK) as u64,
@@ -871,13 +909,15 @@ mod tests {
             assert!(waited <= 2, "a queued pin waited for {waited} chunks");
             assert_eq!(fence.pinned() as u64, pins, "only the pins at 102 remain");
             attempts.push(format!(
-                "worst {worst:?} (release {release:?}, {pins} pins)"
+                "p99 {p99:?}, worst {worst:?} (release {release:?}, {pins} pins)"
             ));
-            if worst < bound {
+            if p99 < bound {
                 return;
             }
         }
-        panic!("a one-hash pin waited over {bound:?} in every attempt: {attempts:?}");
+        panic!(
+            "the 99th-percentile one-hash pin waited over {bound:?} in every attempt: {attempts:?}"
+        );
     }
 
     /// Releasing in chunks keeps pin/delete exclusion: between two chunks

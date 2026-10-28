@@ -104,3 +104,31 @@ where
         thread::sleep(poll_interval);
     }
 }
+
+/// [`wait_until`] for a cluster on a possibly loaded host: poll `condition` until it holds, and
+/// panic only once `progress` (e.g. the sum of committed heights) stayed the same for `stall`, or
+/// `ceiling` elapsed in total. A cluster that stops committing still fails within `stall`; a slow
+/// but committing one (several builders on the host) is not failed by a fixed deadline.
+pub(crate) fn wait_until_progressing<C, P, D>(
+    ceiling: Duration,
+    stall: Duration,
+    poll_interval: Duration,
+    context: &str,
+    mut condition: C,
+    progress: P,
+    describe: D,
+) where
+    C: FnMut() -> bool,
+    P: FnMut() -> u64,
+    D: FnMut() -> String,
+{
+    wait_for_scenario(
+        ceiling,
+        stall,
+        poll_interval,
+        context,
+        || if condition() { Scenario::Reached } else { Scenario::Pending },
+        progress,
+        describe,
+    );
+}
