@@ -23063,6 +23063,10 @@ matched/s at ~22 native blocks/s (equal-stake standard, section 126) still hold?
 * T sends the load to val0 and val1 only (`BENCH_RPCS=0,1`, bench.log `RPC endpoints: 2`; S / D: 3). The empty
   third of the blocks matches val2's leader views finding no native transactions in its own mempool. **Inferred:**
   the bench does not record per-proposer block contents.
+  **Corrected by section 138 (9t):** the inference does not hold. Counted from node logs, ~50% of committed blocks
+  carry no native action for every leader (val2 included) with `BENCH_RPCS=0,1` and with `0,1,2`, and in S too. The
+  38.5% above counts blocks where the execution engine did not run, which the live oracle feed (S, D) triggers on
+  every block; it is not a content count. `BENCH_RPCS=0,1,2` does change T's block rate and size (138).
 * So the same offered load lands in 2 of every 3 blocks. Fills per native block go 10.7k -> 28.1k, exec time per
   native block 38 -> 88 ms, and the view is longer, hence 15.85 instead of 23.5 blocks/s. Commit p99 749 vs 458 ms
   follows.
@@ -23092,6 +23096,123 @@ matched/s at ~22 native blocks/s (equal-stake standard, section 126) still hold?
   `build/build-9n2.sh`, `prof/` (`run-with-sampler.sh`, `foreign-sampler.py`), `campaign-chain-9n2.sh` (written,
   superseded by the combined chain); analysis `analyst/cells9n2.py` -> `cells9n2.txt`, `n_mem.py` (section 126's) ->
   `mem9n2.txt`; FOREIGN in `ozarchy-s140-9v2-tools/analyst/foreign9v2.txt`.
+
+## 138. Step 9t, T-shape empty-block check: section 137's T shape (main `f4010070`, stakes 2 / 2 / 1, `ORACLE_FEED=seed`, U all up, rate 76,000, cap 4, 300 s), arm R2 = `BENCH_RPCS=0,1` (the T default) vs arm R3 = `BENCH_RPCS=0,1,2`, same load, w1 (R2, unscored) + ABBA n = 2 (unit bench-ozarchy-s140-9t, run dir ozarchy-s140-9t-run, archy, 2026-10-28)
+
+**9t: section 137.4's inference does not hold. Sending load to val2 as well does not remove empty blocks. About half
+of all committed blocks carry no native action in both arms, and the share is the same for every leader. val2's own
+empty share is 52.5% / 52.7% with R2 and 50.9% / 51.6% with R3. BENCH_RPCS does change T's cadence: R3 makes 33% more
+blocks/s, 29% smaller blocks, commit p99 -37% and matched/s -6.8%, which lands close to section 137's S. The engine-empty
+share stays at 38% in both arms (138.4).**
+
+| arm | n | matched/s | blocks/s | native blk/s | empty blk/s | fills / native blk | commit p50 / p99 ms | CPU ms / 1k fills |
+|---|---|---|---|---|---|---|---|---|
+| R2 (`0,1`) | 2 | 275,626 ± 7,857 | 15.70 ± 0.00 | 9.77 ± 0.23 | 5.93 ± 0.36 | 28,149 ± 374 | 13.6 ± 1.9 / 766 ± 25 | 24.75 |
+| R3 (`0,1,2`) | 2 | 256,954 ± 6,428 | 20.90 ± 3.81 | 12.86 ± 0.31 | 8.03 ± 3.72 | 19,885 ± 15 | 11.9 ± 2.3 / 483 ± 15 | 25.00 |
+| R3 - R2 (paired, r1 / r2) | 2 | **-18,672 ± 1,429 (-6.8%)** | +5.20 ± 3.81 | **+3.09 ± 0.08** | +2.10 ± 3.36 | **-8,264 ± 358** | -1.7 ± 4.2 / **-283 ± 10** | +0.26 ± 2.33 |
+
+* ± = 95% t interval, df 1 (n = 2): wide. Paired = per-replicate R3 - R2 (ABBA: r1 and r2 each hold one cell of each
+  arm). Sources: section 137's definitions (headline val0 view; native blk/s = `torus_exec_engine_seconds_count`
+  delta, so empty blk/s = blocks the engine skipped; commit p50 / p99 = `torus_commit_interval_seconds`, mean of 3
+  nodes).
+* Against section 137 (same binary, same harness): R2 = 137's T (276,669, 15.85 / 9.75, p99 749). R3 sits next to
+  137's S (256,889 at 23.5 blk/s, 10.7k fills / block, p99 458), but R3 keeps stakes 2 / 2 / 1 and the seed oracle.
+
+Question (18c chat msg 209): section 137 found 38.5% of T's blocks carry no native work while the leaders rotate
+evenly, and inferred that val2-led views find an empty mempool because `BENCH_RPCS=0,1` sends the load only to val0 /
+val1. Does load on val2 remove the empty blocks?
+
+### 138.1 Setup
+
+* Binary: section 137's stage `ozarchy-s140-9n2-stage/M` (main `f4010070`): node `69fc5ee6`, bench `b2b06854`, both
+  md5-checked against `build/md5s.txt` before the launch and on all 3 nodes in every cell. Harness: the same frozen
+  `wt/bq-f4010070` tools 137's T cells used.
+* Spec `ozarchy-s140-9t-tools/make-specs-9t.py`: section 137's `9n2-t.json` with `BENCH_RPCS` moved from the spec-wide
+  harness env into each arm (R2 `0,1`, R3 `0,1,2`). Arm expectations: the 2,2,1 stakes line, and bench.log `RPC
+  endpoints: 2` (R2) / `3` (R3); both endpoint regexes were checked to fail on a 137 cell of the other kind. Checks `configchk3` +
+  `handoffchk3` + `burstwait` (section 136's file). Warm-up gate on.
+* One generated driver (`drivers/ozarchy-s140-9t-campaign.sh`) beside the foreign-CPU sampler
+  (`prof/run-with-sampler.sh`). Order w1 R2, r1 R2 R3, r2 R3 R2. Smoke R3 60 s first: ACCEPT / AGREE / PASS, every
+  check OK. The desktop burst phase was re-sampled for 32 min before the launch
+  (`ozarchy-s140-9v2-tools/prof/phase/foreign-phase-5-9t.txt`). Preflight: no rust-analyzer, localsearch-3 masked,
+  Codex stop review off, `perf_event_paranoid` 2. The bench agent started nothing during the cells (FOREIGN below).
+
+### 138.2 Validity
+
+* 4 scored + 1 w1 cells: rc 0, ACCEPT / AGREE / PASS, node md5 `69fc5ee6` on all 3 nodes. 0 CHECK FAIL, 0 CELL-FLAG.
+  Consensus timeouts: 1 in w1, r1 R2, r2 R3 and r2 R2, 0 in r1 R3.
+* FOREIGN: only the unscored w1 broke the rule (the 07:22:25 desktop burst, max 2 s interval 5.55 cores). It passed
+  the warm-up gate and is not used. The 4 scored cells: foreign avg 0.043-0.045 core, max interval 0.22-0.33 core.
+  No reruns.
+* Run order shows no drift: R2 276,245 -> 275,008 and R3 257,460 -> 256,448 (-0.4% each), w1 275,749.
+
+### 138.3 Per cell (run order)
+
+| cell | matched/s | blocks/s | native blk/s | empty blk/s | fills / native blk | p50 / p99 ms | CPU ms / 1k fills |
+|---|---|---|---|---|---|---|---|
+| w1 R2 (unscored, FOREIGN) | 275,749 | 15.7 | 9.37 | 6.33 | 29,112 | 12.9 / 737 | 24.44 |
+| r1 R2 | 276,245 | 15.7 | 9.79 | 5.95 | 28,178 | 13.8 / 764 | 24.65 |
+| r1 R3 | 257,460 | 21.2 | 12.89 | 8.32 | 19,886 | 11.7 / 482 | 25.09 |
+| r2 R3 | 256,448 | 20.6 | 12.84 | 7.73 | 19,883 | 12.1 / 484 | 24.91 |
+| r2 R2 | 275,008 | 15.7 | 9.75 | 5.90 | 28,119 | 13.5 / 768 | 24.84 |
+
+### 138.4 Per leader: who builds the empty blocks
+
+Read from the node logs in each load window (`analyst/leaders9t.py`). A build is a `produce_block called (CTE)`
+line. A native build is a `selected actions for block` line with `native_actions` > 0 (logged only when the build
+took evm or native work). A committed block is val0's `on_committed_block ... native=N` line, assigned to the node
+whose last build on parent `h - 1` came before that commit (unassigned 0, never two builders). The build counts
+match each node's `torus_block_build_seconds_count` delta to ±1.
+
+| cell | val0 committed / empty share | val1 | val2 | all: empty share (content) | engine-empty share (headline) |
+|---|---|---|---|---|---|
+| 137 t r1 (R2) | 1,611 / 50.7% | 1,611 / 50.3% | 1,611 / 53.8% | 51.6% | 39.1% |
+| 137 t r2 (R2) | 1,607 / 50.5% | 1,607 / 48.3% | 1,607 / 51.4% | 50.1% | 37.8% |
+| r1 R2 | 1,590 / 50.0% | 1,590 / 48.8% | 1,589 / 52.5% | 50.4% | 37.9% |
+| r2 R2 | 1,588 / 48.5% | 1,588 / 49.2% | 1,587 / 52.7% | 50.1% | 37.6% |
+| r1 R3 | 2,130 / 51.5% | 2,130 / 50.2% | 2,129 / 50.9% | 50.9% | 39.2% |
+| r2 R3 | 2,082 / 51.4% | 2,082 / 48.9% | 2,081 / 51.6% | 50.6% | 37.5% |
+| 137 sd r2 S (all RPCs, feed) | 4,754 / 50.1% | 4,754 / 46.0% | 4,754 / 50.0% | 48.7% | 0% |
+
+* **The inference is refuted.** In R2, val2's views are empty at about the rate of val0's and val1's (+2-4 points),
+  not all of them. In R3 the gap closes, but the total empty share does not move (50.4 / 50.1% -> 50.9 / 50.6%). val2
+  takes the load from its mempool through gossip: 137's T r2 shows val2 `peak_mempool_native` 10.8k, the same as val0 /
+  val1, although it published 52 own actions. Per native build, val2 packs as many actions as the others (R2 199-200
+  vs 182-189).
+* Leaders rotate evenly in every cell (33.3% each). Stake 2 / 2 / 1 does not weight leadership.
+* Empty blocks come in runs, not one per round: P(native | previous native) 0.79, P(native | previous empty) 0.20 in
+  both arms (val0 view, r1). Mean run ~5 blocks: the load arrives in waves (cap 4 in flight, commit tail), and the
+  blocks between waves are empty.
+* **Two "empty" definitions.** Content-empty (no native action in the block) is ~50% in every shape: T R2, T R3 and
+  137's S. Engine-empty (headline `empty_blk_s`: blocks where the engine did not run) is ~38% in T and 0 in S / D. With
+  `ORACLE_FEED=1` the engine runs every block. With seed it also runs on ~580 blocks that carry no actions
+  (2,991 engine blocks vs 2,408 blocks with actions of 4,821 in 137 t r2). So section 137's "S / D 0 empty" is the oracle feed
+  keeping the engine busy, not fuller blocks.
+* Why T's blocks are 2.6x larger is therefore not answered by leader emptiness. Measured: with 3 ingress RPCs the
+  chain commits 33% more blocks/s at 29% fewer fills each, hotstuff CPU per block drops (`hs_blk` 15.6 -> 12.0) and
+  matched/s drops 6.8%. The empty share stays ~50% / ~38% in both arms. Not measured: the mechanism (bench-side
+  pacing per RPC, view timing). The bench does not log it.
+
+### 138.5 Verdict and limits
+
+* **Inference (137.4) refuted:** load on val2 does not cut empty blocks (empty blk/s +2.1 ± 3.4, CI spans 0;
+  engine-empty share 37.7% -> 38.4%), and val2-led views are not the empty ones in either arm.
+* `BENCH_RPCS` alone moves T's cadence and block size most of the way to S. `0,1` gives T its larger blocks, its
+  higher matched/s (+7.3% over R3) and its long p99. So T and S differ mainly in ingress, not in stakes or oracle
+  (stakes / oracle not separated; R3 is still 2.6 blk/s below 137's S).
+* n = 2 per arm, df 1: only the paired matched/s, native blk/s, fills / block and p99 differences are resolved.
+* Per-leader counts are builds and commits from INFO logs. A block's actions are counted at selection and at commit,
+  not by executed fills.
+
+### 138.6 Data
+
+* Cells (`~/bench-results-matched/`): `ozarchy-s140-9t-{w1,r1-R2,r1-R3,r2-R3,r2-R2}`, smoke `ozarchy-s140-9t-smoke-s0`.
+* Run dir `ozarchy-s140-9t-run/` (`campaign.log`, `campaign.done` exit=0, `wrapper.done`, `cells.tsv`, `foreign.txt`,
+  `burstwait-state.tsv`, `smoke/`).
+* Tools `ozarchy-s140-9t-tools/`: `make-specs-9t.py`, `specs/9t.json`, `drivers/` (+ `.gen` / `.dry` / `.show` logs),
+  `prof/` (copies of 137's `run-with-sampler.sh`, `foreign-sampler.py`); analysis `analyst/cells9t.py` ->
+  `cells9t.txt` (wraps section 136's `abba9v2.py` `cell()`), `analyst/leaders9t.py` -> `leaders9t.txt`, FOREIGN
+  (`ozarchy-s140-9v2-tools/analyst/foreign9v2.py`) -> `analyst/foreign9t.txt`.
 
 ## Open
 

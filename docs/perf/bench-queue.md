@@ -1304,6 +1304,18 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    native, 28.1k fills / block, p99 749 (133 B: 276,486, 15.25, 9.33). ~260k at ~22 native blk/s holds. T's 2.6x
    larger blocks: 38.5% of T's blocks carry no native work (6.1 empty blk/s, S / D 0) while leaders rotate evenly, and
    the load reaches only val0 / val1 (`BENCH_RPCS=0,1`): inferred, val2's leader views find an empty mempool.
+9t. **[DONE s140, section 138] [GO s140 (18c chat msg 209), main `f4010070`] T-shape empty-block check.** Tests
+   section 137's inference that T's empty blocks are val2-led views with an empty mempool (`BENCH_RPCS=0,1`). 137's T
+   shape (stakes 2 / 2 / 1, seed, U all up, standard load, 300 s, stage `ozarchy-s140-9n2-stage`, frozen harness
+   `wt/bq-f4010070`), arm R2 = `BENCH_RPCS=0,1` vs R3 = `0,1,2`, nothing else differs; w1 + ABBA n = 2. Report empty /
+   native blk/s, fills per native block, blocks/s, matched/s, p50 / p99, and per-leader native vs empty builds.
+   **Done s140 (unit bench-ozarchy-s140-9t, run dir ozarchy-s140-9t-run; node `69fc5ee6`, bench `b2b06854`; one
+   generated driver; 4 scored + 1 w1 ACCEPT / AGREE / PASS, 0 reruns (only the unscored w1 broke FOREIGN); section
+   138):** inference REFUTED. ~50% of committed blocks carry no native action in both arms, evenly over val0 / val1 /
+   val2 (val2 52.5-52.7% R2, 50.9-51.6% R3); engine-empty share 37.7% -> 38.4%. `BENCH_RPCS` does set T's cadence:
+   R3 - R2 paired matched/s -18,672 ± 1,429 (-6.8%), native blk/s +3.09 ± 0.08, blocks/s 15.7 -> 20.9, fills per
+   native block -8,264 ± 358 (28.1k -> 19.9k), commit p99 766 -> 483 ms. R3 lands near 137's S. 137's "S / D 0 empty"
+   is the oracle feed running the engine every block; by content S is ~49% empty too.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
