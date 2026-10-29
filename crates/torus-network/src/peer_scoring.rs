@@ -250,21 +250,37 @@ impl ConsensusRateLimiter {
     pub fn check_and_increment_at(
         &mut self,
         peer: &PeerId,
-        _class: AuthorClass,
+        class: AuthorClass,
         now: Instant,
     ) -> bool {
-        let params = self.other;
+        let (other, validator) = (self.other, self.validator);
+        let params_of = |c: AuthorClass| match c {
+            AuthorClass::Other => other,
+            AuthorClass::Validator => validator,
+        };
         let bucket = self.buckets.entry(*peer).or_insert(TokenBucket {
-            tokens: params.max_tokens,
+            tokens: params_of(class).max_tokens,
             last_refill: now,
-            class: AuthorClass::Other,
+            class,
         });
-        // Refill tokens based on elapsed time
+        // Refill at the rate of the class the bucket ran at since last_refill.
+        let held = params_of(bucket.class);
         let elapsed = now
             .saturating_duration_since(bucket.last_refill)
             .as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed * params.refill_rate).min(params.max_tokens);
+        bucket.tokens = (bucket.tokens + elapsed * held.refill_rate).min(held.max_tokens);
         bucket.last_refill = now;
+        // Validator-set change: a promoted author (joined the set) gets the
+        // full validator bucket at once; a demoted one (left the set) keeps at
+        // most the small burst and refills at the small rate from here on.
+        if bucket.class != class {
+            let to = params_of(class);
+            bucket.tokens = match class {
+                AuthorClass::Validator => to.max_tokens,
+                AuthorClass::Other => bucket.tokens.min(to.max_tokens),
+            };
+            bucket.class = class;
+        }
         // Try to consume one token
         if bucket.tokens >= 1.0 {
             bucket.tokens -= 1.0;

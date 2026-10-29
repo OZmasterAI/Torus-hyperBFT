@@ -1562,8 +1562,11 @@ pub async fn run_swarm_with_config(
 /// limiter anyway (it is no longer in `peer_map`), so a larger bucket would
 /// buy it nothing.
 fn consensus_author_class(shared: &SharedState, author: &PeerId) -> AuthorClass {
-    let _ = (shared, author);
-    AuthorClass::Other
+    if is_validator_peer(shared, author) {
+        AuthorClass::Validator
+    } else {
+        AuthorClass::Other
+    }
 }
 
 /// Per-author consensus gossip rate-limit gate. Same decision as
