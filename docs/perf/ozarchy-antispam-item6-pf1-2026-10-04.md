@@ -23373,6 +23373,122 @@ re-send shorten the stalls, and is the drop -> missing header -> re-send chain r
   re-sends, limiter counter, empty by content), `analyst/cells9h.py` -> `cells9h-{t,s}.txt` (arm table, paired B - A),
   `analyst/proof9h.py` (139.2), FOREIGN (`ozarchy-s140-9s2-tools/analyst/foreign9s.py`) -> `analyst/foreign9h.txt`.
 
+## 140. Step 9v3, vote-path cost fix re-bench: A0 = main `7251fc7c` (before the VSU fix) vs A = main `2a60118c` (per-vote validator-set reads) vs B = 18c `perf/vote-vset-cache` `0223526b` (off `2a60118c`: HotStuff re-reads the validator-set state per vote only when a block-tree generation number changed), section 136's 7l shape (7 val 1 / ... / 1 all up, `DL_K=3`, `ORACLE_FEED=seed`, `BENCH_RPCS=0,1,2`, RATE 180, cap 4, 300 s) and 4l shape (4 val, RATE 475), hash + attestation + L6.1 + L2.1 + fail-stop on, Classic, 15 s checkpoints, w1 (A, unscored) + rotated A0 A B / B A A0 / A0 A B (n = 3 per arm and shape), load windows timed between the desktop burst and the 10-minute claude spikes (units bench-ozarchy-s140-9v3-chain + bench-ozarchy-s140-9v3-rerun-chain; run dirs ozarchy-s140-9v3-{7l,4l,7l-rerun}-run, archy, 2026-10-28 / 29)
+
+Question (18c chat msg 223): section 136 measured the VSU fix (`7251fc7c` -> `b42e5e98`) at +7.1% hotstuff-algo ms per
+block at 7 val (FAIL) and +3.8% at 4 val. 18c's fix caches the validator-set state read per vote (6 steady votes: 6
+reads -> 1). Pass: B within 5% of A0 and below A on hotstuff-algo ms per block / per view; blocks/s and commit p99 not
+worse than A.
+
+### 140.1 Setup
+
+* Binaries (each arm its own node + bench binary; md5 checked by every driver's preflight and on every node of every
+  cell):
+  * A0: `ozarchy-s140-9v-stage/A` (main `7251fc7c`; node `50c1cfeb`, bench `121459c5`).
+  * A: `ozarchy-s140-9h-stage/M` (main `2a60118c`; node `d86bfb18`, bench `5decc61e`).
+  * B: `ozarchy-s140-9v3-stage/B` (`0223526b`; node `022b7d73`, bench `bd84bd3b`), built by `build/build-9v3.sh` (=
+    `build-9h.sh` for one sha) in a fresh detached `wt/bq-0223526b`, own target dir, `CARGO_INCREMENTAL=0`,
+    `--locked`, under the shared build lock (274 s). `origin/perf/vote-vset-cache` has since moved to `e6bef9fa`
+    (docs + a unit test on top of `0223526b`, no runtime change); `0223526b` is what was benched.
+* Harness + tools frozen at main `5dc5e840` (`wt/bq-5dc5e840`: N 3..7 harness, post-drain height-spread limit 15 for
+  every N, the N = 4 preflight fix), with the untracked `testnet/genesis-weighted-full.json` copied in from
+  `wt/bq-9807e955` (same md5 as 9v2's).
+* Specs: `make-specs-9v3.py` (from section 136's `9v2-7l.json` / `9v2-4l.json`; harness, binaries, arms, order and
+  checks changed). Checks file `checks/9v3-checks.sh`: 9v2's `configchk<N>` + `handoffchk<N>` + `burstwait` =
+  `prof/timedwait.py`. One generated driver per shape (`drivers/ozarchy-s140-9v3-{7l,4l}-campaign.sh`), both in one
+  unit (`campaign-chain-9v3.sh`: 7l, then 4l), each beside the foreign sampler and the per-thread task snapshots
+  (`prof/run-campaign-9v3.sh` = 9v2's).
+* Pacing: `prof/timedwait.py` = section 139's, with LOAD_S per shape from 9v2's load windows (7l 330 s, 4l 313 s ->
+  334 / 316; 9v2 had used 306 s) and D per shape (7l 134 s, 4l 117 s); the first cell of each driver timed with
+  `--first 128` (the smokes' chain start -> t_bench0: 128 / 129 s). Burst phase hh:01:06 / :16 / :31 / :46 (18 of 20
+  clusters; pre-launch sample + the 9h runs); the Claude desktop app spike at mm:x5:58 seen again in the smokes.
+  Only ~4 load windows per hour fit a 334 s window between them (t0 near mm:08:22, 18:22, 38:22, 48:22).
+* Smokes (B, 60 s, unit bench-ozarchy-s140-9v3-smoke): 7l 36,196 matched/s, 4l 96,235, both ACCEPT / AGREE / PASS,
+  every CHECK OK.
+
+### 140.2 Validity
+
+* All 20 main cells (2 w1 + 18 scored) and the 8 reruns: rc 0, ACCEPT / AGREE / PASS, node md5 = the arm's staged md5
+  on every node, every CHECK OK (config / hand-off lines on val0..val<N-1>, expectations, env, sysctl), 0 CELL-FLAG,
+  0 panic / fail-stop lines. Smokes as 140.1.
+* FOREIGN (rule of 9s: foreign avg > 0.1 core or any 2 s > 0.5 core in the load window; `analyst/foreign9v3.txt`):
+  every 4l cell and 7l w1 / r1-A0 ok (foreign avg 0.031-0.040, max 0.11-0.50 core). The other 8 scored 7l cells broke
+  it: a Chromium session (with pipewire-pulse) ran 0.37-0.56 core on average from 21:35 to 23:25, 0.95-2.27 core at
+  peak. Neither the desktop burst nor the claude spikes hit any cell (timedwait put every window between them). The 8
+  were rerun from a second timed driver (`ozarchy-s140-9v3-7l-rerun-campaign.sh`, unit
+  bench-ozarchy-s140-9v3-rerun-chain, 02:16-04:16, same rotation, no w1), all ok (foreign avg 0.038-0.041, max 0.18).
+  The 7l tables use r1-A0 (main) + the 8 reruns. The Chromium-hit set gives the same answer (B - A0 +0.3%, A - A0
+  +5.7%, B - A -5.2% hotstuff ms / block; `analyst/abba9v3-7l-orig.txt`).
+* Busy threads (busy host CPUs in the load window): 7l 18.6-19.5 per cell, 4l 14.0-14.3, all within the <= ~20 limit.
+* Drift: no run-order trend in hotstuff ms / block within any arm (7l A0 5.94 / 5.98 / 5.87, A 6.31 / 6.29 / 6.34,
+  B 5.87 / 5.93 / 5.95 by round).
+
+### 140.3 Arm means (n = 3 per arm; mean of N nodes; `analyst/abba9v3-{7l,4l}.txt`)
+
+| metric | 7l A0 | 7l A | 7l B | 4l A0 | 4l A | 4l B |
+|---|---|---|---|---|---|---|
+| hotstuff-algo ms / committed block | 5.930 | 6.311 | 5.914 | 5.850 | 6.076 | 5.854 |
+| hotstuff-algo ms / view | 5.928 | 6.309 | 5.912 | 5.849 | 6.075 | 5.854 |
+| hotstuff-algo ms / block, /proc snapshots | 5.887 | 6.275 | 5.875 | 5.810 | 6.040 | 5.821 |
+| hotstuff-algo cores per node | 0.208 | 0.219 | 0.208 | 0.172 | 0.178 | 0.172 |
+| blocks/s | 35.10 | 34.70 | 35.17 | 29.33 | 29.27 | 29.30 |
+| matched/s | 36,506 | 36,464 | 36,508 | 95,208 | 95,208 | 95,214 |
+| commit p50 ms | 15.4 | 16.3 | 15.3 | 12.9 | 13.1 | 12.9 |
+| commit p99 ms | 450 | 446 | 450 | 472 | 474 | 472 |
+| busy threads (host) | 19.18 | 19.31 | 19.04 | 14.10 | 14.20 | 14.13 |
+| process CPU ms / 1k fills | 68.3 | 68.8 | 67.8 | 33.4 | 33.7 | 33.5 |
+| consensus timeouts / cell | 2.3 | 3.7 | 2.3 | | | |
+
+### 140.4 Paired comparisons (per-round diffs, t(2) 95% CI; Welch in the analyst files)
+
+| | 7l B - A0 | 7l B - A | 7l A - A0 | 4l B - A0 | 4l B - A | 4l A - A0 |
+|---|---|---|---|---|---|---|
+| hotstuff ms / block | -0.016 ± 0.197 (-0.3%, CI -3.6..+3.0%) | -0.397 ± 0.097 (-6.3%, CI -7.8..-4.8%) | +0.381 ± 0.202 (+6.4%, CI +3.0..+9.8%) | +0.004 ± 0.121 (+0.1%, CI -2.0..+2.1%) | -0.222 ± 0.086 (-3.7%, CI -5.1..-2.2%) | +0.226 ± 0.041 (+3.9%, CI +3.2..+4.6%) |
+| hotstuff ms / view | -0.016 ± 0.196 (-0.3%) | -0.397 ± 0.097 (-6.3%) | +0.380 ± 0.197 (+6.4%) | +0.004 ± 0.122 (+0.1%) | -0.221 ± 0.090 (-3.6%) | +0.225 ± 0.041 (+3.8%) |
+| blocks/s | +0.07 ± 0.76 | +0.47 ± 0.72 | -0.40 ± 1.38 | -0.03 ± 0.38 | +0.03 ± 1.00 | -0.07 ± 0.76 |
+| matched/s | +1 ± 18 | +43 ± 168 | -42 ± 186 | +6 ± 20 | +6 ± 55 | -0 ± 49 |
+| commit p50 ms | -0.1 ± 1.1 | -1.0 ± 1.0 | +0.9 ± 0.5 | +0.0 ± 0.3 | -0.2 ± 0.4 | +0.3 ± 0.3 |
+| commit p99 ms | +0 ± 6 | +4 ± 1 (+0.9%) | -4 ± 6 | +0 ± 2 | -1 ± 2 | +1 ± 1 |
+
+Welch CIs (n = 3 vs 3) agree in sign and resolution: 7l B - A0 hotstuff -0.016 ± 0.128, B - A -0.397 ± 0.089;
+4l B - A0 +0.004 ± 0.141, B - A -0.222 ± 0.153.
+
+### 140.5 Verdict
+
+**PASS on the hotstuff cost, at both N.** B (`0223526b`) brings hotstuff-algo ms per block and per view back to A0
+(before the VSU fix): 7 val -0.3% (paired CI -3.6..+3.0%, inside the 5% bound), 4 val +0.1% (-2.0..+2.1%). B is
+below A at both N: -6.3% at 7 val, -3.7% at 4 val, both resolved. The cost B removes is exactly the VSU fix's cost
+(A - A0 +6.4% / +3.9% here, +7.1% / +3.8% in section 136), so the per-vote validator-set read was the whole of it.
+blocks/s is not worse than A (7l +0.47 ± 0.72, 4l +0.03 ± 1.00), matched/s is flat, commit p50 drops back to A0's
+(7l -1.0 ms vs A). One strict-reading miss: 7l commit p99 is 450 ms for B vs 446 for A, +4 ± 1 ms (+0.9%), resolved.
+It equals A0's 450, and section 136 had A (VSU fix) 4 ms below A0 too, so B returns p99 to the pre-fix level
+rather than making it worse than that. At 4 val B's p99 is 1 ms lower than A's. Read: pass on the primary metric; the 7l
+p99 +4 ms is for the owner to accept or not.
+
+### 140.6 Limits
+
+* n = 3 per arm, one host; paired CIs use t(2). The 7l B - A0 interval is ±3.3%, so it cannot tell a 1-2% residual
+  from zero. It only shows B is within 5% of A0.
+* 7l: 8 of 9 scored cells are reruns 2-5 h after the main block (r1-A0 is from the main block). The Chromium-hit main
+  block gives the same verdict.
+* Benched `0223526b`; the branch tip is now `e6bef9fa` (docs + a unit test, no runtime change), not re-benched.
+* Commit p99 is interpolated inside the 256-512 ms histogram bucket, so a 4 ms shift near 450 ms is a small change in
+  the share of intervals above 256 ms, not a measured 4 ms latency.
+
+### 140.7 Data
+
+* Cells (`~/bench-results-matched/`): `ozarchy-s140-9v3-{7l,4l}-{w1,r1-A0,r1-A,r1-B,r2-B,r2-A,r2-A0,r3-A0,r3-A,r3-B}`
+  (7l: all but w1 and r1-A0 replaced, FOREIGN), reruns `ozarchy-s140-9v3-7l-rerun-{r1-A,r1-B,r2-B,r2-A,r2-A0,r3-A0,r3-A,r3-B}`,
+  smokes `ozarchy-s140-9v3-{7l,4l}-smoke-s0`.
+* Run dirs `ozarchy-s140-9v3-{7l,4l,7l-rerun}-run/` (`campaign.log`, `campaign.done` exit=0, `cells.tsv`,
+  `foreign.txt`, `burstwait-state.tsv`), chain logs `ozarchy-s140-9v3-chain-run/` and
+  `ozarchy-s140-9v3-rerun-chain-run/`, stage `ozarchy-s140-9v3-stage/{B,build}`.
+* Tools `ozarchy-s140-9v3-tools/`: `make-specs-9v3.py`, `specs/`, `drivers/` (+ `.gen` / `.dry` / `.show` logs),
+  `campaign-chain-9v3.sh`, `campaign-chain-9v3-rerun.sh`, `smoke-chain-9v3.sh`, `checks/9v3-checks.sh`, `prof/`
+  (`timedwait.py`, `foreign-sampler.py`, `run-campaign-9v3.sh`, `phase/`), `build/build-9v3.sh` + `build.log`; analysis
+  `analyst/abba9v3.py` (3 arms; `abba9v3-7l.txt` with the reruns substituted, `abba9v3-7l-orig.txt` the main block,
+  `abba9v3-4l.txt`), FOREIGN (`ozarchy-s140-9v2-tools/analyst/foreign9v2.py`) -> `analyst/foreign9v3.txt`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
