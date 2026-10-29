@@ -1334,6 +1334,20 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    2.6-4.8x re-sends, 1.4-2.5x limiter drops (re-sends spend the same bucket), and 2-4x stall views. matched/s does
    not change (T -1.5% ± 1.8, S -0.3%). Fix belongs in the limiter (validator exemption / bucket sized to the view
    rate), not the re-send interval.
+9v3. **[DONE s140, section 140: PASS (hotstuff cost); 7l p99 +4 ms vs A for the owner] [GO s140 (18c chat msg 223), A0 =
+   main `7251fc7c`, A = main `2a60118c`, B = `perf/vote-vset-cache` `0223526b`] Vote-path cost fix re-bench.** 18c's
+   fix: HotStuff re-reads the validator-set state per vote only when a block-tree generation number changed (6 steady
+   votes: 6 reads -> 1). Three arms, each its own binary, rotated A0 A B / B A A0 / A0 A B, n = 3 + w1, on 136's 7l
+   shape (7 val 1/.../1, `DL_K=3`, seed, `BENCH_RPCS=0,1,2`, RATE 180, 300 s) and 4l (4 val, RATE 475). Pass: B
+   within 5% of A0 and below A on hotstuff-algo ms per block / per view; blocks/s and p99 not worse than A.
+   **Done s140 (units bench-ozarchy-s140-9v3-chain + bench-ozarchy-s140-9v3-rerun-chain, run dirs
+   ozarchy-s140-9v3-{7l,4l,7l-rerun}-run; B node `022b7d73`; tools frozen at main `5dc5e840`; 18 scored + 2 w1 + 8
+   reruns ACCEPT / AGREE / PASS, 0 CHECK FAIL; 8 of 9 scored 7l cells FOREIGN (Chromium 0.4-0.6 core, 21:35-23:25) and
+   rerun from a timed second driver; 4l clean; 14-19.5 busy threads; section 140):** hotstuff-algo ms per block
+   A0 / A / B: 7l 5.930 / 6.311 / 5.914 (B - A0 -0.3%, paired CI -3.6..+3.0%; B - A -6.3%, -7.8..-4.8%), 4l
+   5.850 / 6.076 / 5.854 (B - A0 +0.1%, -2.0..+2.1%; B - A -3.7%, -5.1..-2.2%); per view the same. B removes the
+   VSU fix's whole vote-path cost. blocks/s not worse than A (7l +0.47 ± 0.72, 4l +0.03 ± 1.00), matched/s flat,
+   commit p50 back to A0's. 7l commit p99 B 450 vs A 446 ms (+4 ± 1, = A0's 450); 4l p99 -1 ± 2.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
