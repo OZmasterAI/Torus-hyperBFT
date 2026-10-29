@@ -280,7 +280,6 @@ impl ConsensusRateLimiter {
         bytes: usize,
         now: Instant,
     ) -> bool {
-        let _ = bytes;
         let (other, validator) = (self.other, self.validator);
         let params_of = |c: AuthorClass| match c {
             AuthorClass::Other => other,
@@ -298,6 +297,9 @@ impl ConsensusRateLimiter {
             .saturating_duration_since(bucket.last_refill)
             .as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * held.refill_rate).min(held.max_tokens);
+        if let Some((burst, rate)) = held.bytes {
+            bucket.byte_tokens = (bucket.byte_tokens + elapsed * rate).min(burst);
+        }
         bucket.last_refill = now;
         // Validator-set change: a promoted author (joined the set) gets the
         // full validator bucket at once; a demoted one (left the set) keeps at
@@ -308,11 +310,19 @@ impl ConsensusRateLimiter {
                 AuthorClass::Validator => to.max_tokens,
                 AuthorClass::Other => bucket.tokens.min(to.max_tokens),
             };
+            bucket.byte_tokens = to.bytes.map_or(0.0, |(burst, _)| burst);
             bucket.class = class;
         }
-        // Try to consume one token
-        if bucket.tokens >= 1.0 {
+        // Consume one token (and the message's bytes, if the class has a byte
+        // budget); a refused message spends neither.
+        let bytes_ok = params_of(class)
+            .bytes
+            .is_none_or(|_| bucket.byte_tokens >= bytes as f64);
+        if bucket.tokens >= 1.0 && bytes_ok {
             bucket.tokens -= 1.0;
+            if params_of(class).bytes.is_some() {
+                bucket.byte_tokens -= bytes as f64;
+            }
             true
         } else {
             false
@@ -685,8 +695,12 @@ mod tests {
         let val = test_peer(22);
         let mut admitted = 0;
         for i in 0..2_000u64 {
-            if l.check_and_increment_at(&val, AuthorClass::Validator, 0, t0 + Duration::from_millis(i))
-            {
+            if l.check_and_increment_at(
+                &val,
+                AuthorClass::Validator,
+                0,
+                t0 + Duration::from_millis(i),
+            ) {
                 admitted += 1;
             }
         }
@@ -803,9 +817,7 @@ mod tests {
         let t0 = Instant::now();
         let other = test_peer(27);
         let admitted = (0..100)
-            .filter(|_| {
-                l.check_and_increment_at(&other, AuthorClass::Other, MIB as usize, t0)
-            })
+            .filter(|_| l.check_and_increment_at(&other, AuthorClass::Other, MIB as usize, t0))
             .count();
         assert_eq!(admitted, 50);
     }
@@ -818,9 +830,7 @@ mod tests {
         let p = test_peer(28);
         assert!(l.check_and_increment_at(&p, AuthorClass::Other, 10, t0));
         let admitted = (0..10)
-            .filter(|_| {
-                l.check_and_increment_at(&p, AuthorClass::Validator, MIB as usize, t0)
-            })
+            .filter(|_| l.check_and_increment_at(&p, AuthorClass::Validator, MIB as usize, t0))
             .count();
         assert_eq!(admitted, 4);
     }

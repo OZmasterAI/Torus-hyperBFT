@@ -475,6 +475,10 @@ fn serve_native_da_shard(
     }
 }
 
+/// Lock order for the validator-set state: `validators` -> `peer_map` ->
+/// `recently_deposed`. Take a later lock while holding an earlier one, never
+/// the reverse (s140 review: `is_validator_peer` held `peer_map` across a
+/// `validators` read and could deadlock against `update_validator_set`).
 pub struct SharedState {
     pub inbound: Mutex<VecDeque<(VerifyingKey, hotstuff_rs::networking::messages::Message)>>,
     pub peer_map: RwLock<PeerMap>,
@@ -772,9 +776,16 @@ fn batch_would_exceed(batch_bytes: usize, action_len: usize, max_msg_size: usize
 /// fault — s339: a 1h ban of one validator for relaying oversized batches stalled
 /// commits cluster-wide until expiry. Abuse from a validator stays bounded by the
 /// per-author rate limiters, which apply regardless of ban state.
+///
+/// Lock order (s140 review): never hold `peer_map` while taking
+/// `validators`. The set-change path (`bridge.rs` `init/update_validator_set`)
+/// and the other swarm sites lock `validators` -> `peer_map`; this check used
+/// to hold `peer_map` (read) across the `validators` read, which can deadlock
+/// against a concurrent set update, and since s140 it runs on every consensus
+/// gossip message. The key is copied out and the guard dropped first.
 fn is_validator_peer(shared: &SharedState, peer: &PeerId) -> bool {
-    let peer_map = shared.peer_map.read().unwrap();
-    match peer_map.get_vk(peer) {
+    let vk = shared.peer_map.read().unwrap().get_vk(peer).copied();
+    match vk {
         Some(vk) => shared.validators.read().unwrap().contains(&vk.to_bytes()),
         None => false,
     }
@@ -3827,7 +3838,13 @@ mod tests {
         ));
         assert_eq!(metrics.consensus_rate_limited_dropped.get(), 3);
         // No metrics registry (tests/tools): same decision, no panic.
-        assert!(!consensus_rate_limit_admit(&mut limiter, None, &author, O, 0));
+        assert!(!consensus_rate_limit_admit(
+            &mut limiter,
+            None,
+            &author,
+            O,
+            0
+        ));
         assert_eq!(metrics.consensus_rate_limited_dropped.get(), 3);
     }
 
