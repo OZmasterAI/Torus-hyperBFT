@@ -30,9 +30,6 @@ use torus_network::{LibP2PNetwork, NetworkConfig};
 
 /// Views of the probe messages that wait for the mesh (below the burst's).
 const PROBE_BASE: u64 = 1_000_000;
-/// Messages in the measured burst and the gap between them.
-const BURST: u64 = 400;
-const BURST_GAP: Duration = Duration::from_millis(5);
 
 fn seed_key(seed: u8) -> SigningKey {
     let mut b = [0u8; 32];
@@ -85,6 +82,20 @@ fn view_of(msg: &Message) -> Option<u64> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn validator_burst_at_bench_view_rate_is_not_dropped() {
+    // 400 messages 5 ms apart: 200 per s for 2 s.
+    run_burst(400, Duration::from_micros(5_000)).await;
+}
+
+/// s140 review: past the 400 burst, on the refill rate. 1,200 messages
+/// 2.5 ms apart (<= 400 per s for >= 3 s; sleeps only stretch the gap) need
+/// the validator refill, not just the burst. Before the fix: ~200 received.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn validator_stream_beyond_burst_rides_the_refill() {
+    run_burst(1_200, Duration::from_micros(2_500)).await;
+}
+
+/// Two nodes, A publishes `burst` unique messages `gap` apart, B must get all.
+async fn run_burst(burst: u64, gap: Duration) {
     let (sk_a, sk_b) = (seed_key(1), seed_key(2));
     let (vk_a, vk_b) = (sk_a.verifying_key(), sk_b.verifying_key());
     let (pid_a, pid_b) = (
@@ -141,23 +152,22 @@ async fn validator_burst_at_bench_view_rate_is_not_dropped() {
     while net_b.recv().is_some() {}
     let drops_before = metrics_b.consensus_rate_limited_dropped.get();
 
-    // The burst: 400 unique messages, 5 ms apart (200 per s for 2 s).
     let mut got = std::collections::HashSet::new();
-    for view in 1..=BURST {
+    for view in 1..=burst {
         net_a.broadcast(vote(view));
-        tokio::time::sleep(BURST_GAP).await;
+        tokio::time::sleep(gap).await;
         while net_a.recv().is_some() {}
         while let Some((vk, msg)) = net_b.recv() {
-            if let Some(v) = view_of(&msg).filter(|v| vk == vk_a && *v <= BURST) {
+            if let Some(v) = view_of(&msg).filter(|v| vk == vk_a && *v <= burst) {
                 got.insert(v);
             }
         }
     }
     let deadline = Instant::now() + Duration::from_secs(10);
-    while (got.len() as u64) < BURST && Instant::now() < deadline {
+    while (got.len() as u64) < burst && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
         while let Some((vk, msg)) = net_b.recv() {
-            if let Some(v) = view_of(&msg).filter(|v| vk == vk_a && *v <= BURST) {
+            if let Some(v) = view_of(&msg).filter(|v| vk == vk_a && *v <= burst) {
                 got.insert(v);
             }
         }
@@ -171,8 +181,8 @@ async fn validator_burst_at_bench_view_rate_is_not_dropped() {
     );
     assert_eq!(
         got.len() as u64,
-        BURST,
-        "B received {} of A's {BURST} burst messages; limiter drops during the burst: {dropped}",
+        burst,
+        "B received {} of A's {burst} messages; limiter drops during the burst: {dropped}",
         got.len()
     );
     assert_eq!(dropped, 0, "limiter dropped {dropped} of A's messages");

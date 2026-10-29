@@ -1273,12 +1273,19 @@ pub async fn run_swarm_with_config(
         config.consensus_rate_limit_per_peer,
         config.consensus_validator_rate_limit,
         config.consensus_validator_burst,
+    )
+    .with_validator_byte_budget(
+        config.consensus_validator_byte_rate,
+        config
+            .consensus_validator_byte_rate
+            .max(config.max_consensus_message_size as u64),
     );
     info!(
         other_rate = config.consensus_rate_limit_per_peer,
         validator_rate = config.consensus_validator_rate_limit,
         validator_burst = config.consensus_validator_burst,
-        "consensus gossip limiter (TORUS_CONSENSUS_VALIDATOR_RATE / _BURST)"
+        validator_byte_rate = config.consensus_validator_byte_rate,
+        "consensus gossip limiter (TORUS_CONSENSUS_VALIDATOR_RATE / _BURST / _BYTE_RATE)"
     );
     let mut peer_scoring = PeerScoring::new(config.ban_list_path.clone());
 
@@ -1561,7 +1568,7 @@ pub async fn run_swarm_with_config(
 /// consensus messages are dropped by `verify_sender_key` right after the
 /// limiter anyway (it is no longer in `peer_map`), so a larger bucket would
 /// buy it nothing.
-fn consensus_author_class(shared: &SharedState, author: &PeerId) -> AuthorClass {
+pub(crate) fn consensus_author_class(shared: &SharedState, author: &PeerId) -> AuthorClass {
     if is_validator_peer(shared, author) {
         AuthorClass::Validator
     } else {
@@ -1579,8 +1586,9 @@ fn consensus_rate_limit_admit(
     metrics: Option<&torus_telemetry::Metrics>,
     author: &PeerId,
     class: AuthorClass,
+    bytes: usize,
 ) -> bool {
-    if limiter.check_and_increment_as(author, class) {
+    if limiter.check_and_increment_as(author, class, bytes) {
         return true;
     }
     if let Some(m) = metrics {
@@ -1676,6 +1684,7 @@ fn handle_event(
                     shared.metrics.as_deref(),
                     &author,
                     consensus_author_class(shared, &author),
+                    message.data.len(),
                 ) {
                     return;
                 }
@@ -3792,7 +3801,7 @@ mod tests {
         // Burst of 5 admitted, nothing counted.
         for i in 0..5 {
             assert!(
-                consensus_rate_limit_admit(&mut limiter, Some(&metrics), &author, O),
+                consensus_rate_limit_admit(&mut limiter, Some(&metrics), &author, O, 0),
                 "message {i} within burst was dropped"
             );
         }
@@ -3803,7 +3812,8 @@ mod tests {
                 &mut limiter,
                 Some(&metrics),
                 &author,
-                O
+                O,
+                0
             ));
         }
         assert_eq!(metrics.consensus_rate_limited_dropped.get(), 3);
@@ -3812,11 +3822,12 @@ mod tests {
             &mut limiter,
             Some(&metrics),
             &other,
-            O
+            O,
+            0
         ));
         assert_eq!(metrics.consensus_rate_limited_dropped.get(), 3);
         // No metrics registry (tests/tools): same decision, no panic.
-        assert!(!consensus_rate_limit_admit(&mut limiter, None, &author, O));
+        assert!(!consensus_rate_limit_admit(&mut limiter, None, &author, O, 0));
         assert_eq!(metrics.consensus_rate_limited_dropped.get(), 3);
     }
 
@@ -3891,6 +3902,7 @@ mod tests {
                     Some(&metrics),
                     &author,
                     consensus_author_class(&shared, &author),
+                    200,
                 )
             })
             .count();
@@ -3903,6 +3915,7 @@ mod tests {
                     Some(&metrics),
                     &stranger,
                     consensus_author_class(&shared, &stranger),
+                    200,
                 )
             })
             .count();

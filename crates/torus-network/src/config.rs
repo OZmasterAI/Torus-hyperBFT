@@ -49,6 +49,11 @@ pub struct NetworkConfig {
     /// (`TORUS_CONSENSUS_VALIDATOR_BURST`, default
     /// [`DEFAULT_CONSENSUS_VALIDATOR_BURST`]).
     pub consensus_validator_burst: u32,
+    /// s140 review: consensus gossip BYTE budget of a validator-set author,
+    /// bytes per second; burst = max(this, `max_consensus_message_size`) so a
+    /// max-size message always fits (`TORUS_CONSENSUS_VALIDATOR_BYTE_RATE`,
+    /// default [`DEFAULT_CONSENSUS_VALIDATOR_BYTE_RATE`]).
+    pub consensus_validator_byte_rate: u64,
     /// Path to the peer ban list JSON file (Phase 3: 3.1.7).
     pub ban_list_path: Option<PathBuf>,
     /// B2 consensus isolation: fan consensus broadcasts over `/torus/direct`
@@ -199,6 +204,31 @@ pub const DEFAULT_CONSENSUS_VALIDATOR_RATE: u32 = 400;
 /// default rate (the observed 250-ms peak is 31 views = 62 messages).
 pub const DEFAULT_CONSENSUS_VALIDATOR_BURST: u32 = 400;
 
+/// s140 review default byte budget (bytes/s, also the burst) of the validator
+/// bucket: 4 MiB. Consensus gossip carries proposal HEADERS, AdvanceView /
+/// timeout votes and block-sync adverts, never block bodies (those go direct);
+/// their size is linear in the validator count N (certificates: ~65 B per
+/// signature slot plus per-voter TC metadata), ~N x 450 B for the largest
+/// (a header with QC + TC + NEC): ~1.5 KB at N = 3, ~45 KB at N = 100. At the
+/// ~100 msgs/s per-author 1-s peak an honest 3-validator author sends at most
+/// ~0.2 MB/s, so 4 MiB/s is ~20x headroom, while a flooding validator is held
+/// to 4 MiB/s instead of 400 x 1 MiB.
+pub const DEFAULT_CONSENSUS_VALIDATOR_BYTE_RATE: u64 = 4 << 20;
+
+/// s140 review: effective `TORUS_CONSENSUS_VALIDATOR_BYTE_RATE` (see
+/// [`NetworkConfig::consensus_validator_byte_rate`]). Read once at first use.
+pub fn consensus_validator_byte_rate() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        parse_positive_u64(
+            std::env::var("TORUS_CONSENSUS_VALIDATOR_BYTE_RATE")
+                .ok()
+                .as_deref(),
+            DEFAULT_CONSENSUS_VALIDATOR_BYTE_RATE,
+        )
+    })
+}
+
 /// s140: effective `TORUS_CONSENSUS_VALIDATOR_RATE` (see
 /// [`NetworkConfig::consensus_validator_rate_limit`]). Read once at first use.
 /// `=50` together with `TORUS_CONSENSUS_VALIDATOR_BURST=50` restores the
@@ -233,6 +263,13 @@ pub fn consensus_validator_burst() -> u32 {
 /// zero bucket would drop every validator message) falls back to `default`.
 fn parse_positive_u32(raw: Option<&str>, default: u32) -> u32 {
     raw.and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+/// [`parse_positive_u32`] for 64-bit byte counts.
+fn parse_positive_u64(raw: Option<&str>, default: u64) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(default)
 }
@@ -348,6 +385,7 @@ impl Default for NetworkConfig {
             consensus_rate_limit_per_peer: 50,
             consensus_validator_rate_limit: consensus_validator_rate_limit(),
             consensus_validator_burst: consensus_validator_burst(),
+            consensus_validator_byte_rate: consensus_validator_byte_rate(),
             ban_list_path: None,
             consensus_direct_fan: consensus_direct_fan(),
             consensus_gossip_mirror: consensus_gossip_mirror(),
@@ -398,6 +436,11 @@ mod tests {
         assert_eq!(parse_positive_u32(Some("-5"), d), d);
         assert_eq!(parse_positive_u32(Some(" 50 "), d), 50);
         assert_eq!(parse_positive_u32(Some("800"), d), 800);
+        let b = DEFAULT_CONSENSUS_VALIDATOR_BYTE_RATE;
+        assert_eq!(parse_positive_u64(None, b), b);
+        assert_eq!(parse_positive_u64(Some("0"), b), b);
+        assert_eq!(parse_positive_u64(Some("4MiB"), b), b);
+        assert_eq!(parse_positive_u64(Some("8388608"), b), 8 << 20);
     }
 
     /// s140: the validator bucket defaults sit above the legacy 50/s bucket
@@ -408,6 +451,7 @@ mod tests {
         assert_eq!(c.consensus_rate_limit_per_peer, 50);
         assert_eq!(DEFAULT_CONSENSUS_VALIDATOR_RATE, 400);
         assert_eq!(DEFAULT_CONSENSUS_VALIDATOR_BURST, 400);
+        assert_eq!(DEFAULT_CONSENSUS_VALIDATOR_BYTE_RATE, 4 << 20);
     }
 
     /// B3 (send-queue hygiene): the `TORUS_GOSSIP_QUEUE_LEN` parse seam.

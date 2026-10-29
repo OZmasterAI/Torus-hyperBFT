@@ -1329,4 +1329,74 @@ mod tests {
             LEGACY_FLEET_DIRECT_MSG_FLOOR
         );
     }
+
+    /// s140 review (RED): the per-message consensus author classification
+    /// (`swarm::consensus_author_class`, on every consensus gossip message
+    /// since s140) must not deadlock against a concurrent
+    /// `update_validator_set` (the real API). The update path locks
+    /// `validators` -> `peer_map` (writes); `is_validator_peer` held
+    /// `peer_map` (read) while taking `validators` (read): the inverted
+    /// order. Both run on their own threads here (consensus thread vs swarm
+    /// task in the node); a deadlock fails at the deadline.
+    #[test]
+    fn author_class_does_not_deadlock_against_update_validator_set() {
+        use hotstuff_rs::types::data_types::Power;
+        use std::sync::mpsc;
+        let config = NetworkConfig {
+            listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+            ..Default::default()
+        };
+        let mut b = [0u8; 32];
+        b[0] = 41;
+        // Own runtime: a deadlocked swarm task would hang the runtime's drop,
+        // so on failure it is leaked and the test fails instead of hanging.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (net, _tx, _na) = rt
+            .block_on(LibP2PNetwork::new(config, SigningKey::from_bytes(&b)))
+            .unwrap();
+        b[0] = 42;
+        let vk = SigningKey::from_bytes(&b).verifying_key();
+        let author = peer_id_from_verifying_key(&vk);
+        const ROUNDS: usize = 100_000;
+        let (done_tx, done_rx) = mpsc::channel();
+        let updater = {
+            let (mut net, done_tx) = (net.clone(), done_tx.clone());
+            std::thread::spawn(move || {
+                for i in 0..ROUNDS {
+                    let mut updates = ValidatorSetUpdates::new();
+                    if i % 2 == 0 {
+                        updates.insert(vk, Power::new(1));
+                    } else {
+                        updates.delete(vk);
+                    }
+                    net.update_validator_set(updates);
+                }
+                let _ = done_tx.send(());
+            })
+        };
+        let flood = {
+            let shared = net.shared.clone();
+            std::thread::spawn(move || {
+                for _ in 0..ROUNDS {
+                    std::hint::black_box(crate::swarm::consensus_author_class(&shared, &author));
+                }
+                let _ = done_tx.send(());
+            })
+        };
+        for _ in 0..2 {
+            if done_rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .is_err()
+            {
+                std::mem::forget(rt);
+                panic!("deadlock: consensus_author_class vs update_validator_set");
+            }
+        }
+        updater.join().unwrap();
+        flood.join().unwrap();
+    }
 }

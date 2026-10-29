@@ -166,13 +166,18 @@ struct TokenBucket {
     last_refill: Instant,
     /// The class whose rate/burst this bucket currently runs at.
     class: AuthorClass,
+    /// s140 review: byte tokens of the validator class's byte budget (unused
+    /// while the class has none).
+    byte_tokens: f64,
 }
 
 /// Which consensus gossip bucket an author is charged against (s140).
 ///
-/// `Validator` = a current (or recently deposed, within the deposed-grace
-/// window) member of the consensus validator set, as the network layer knows
-/// it from `Network::{init,update}_validator_set`. Everyone else is `Other`.
+/// `Validator` = a CURRENT member of the consensus validator set, as the
+/// network layer knows it from `Network::{init,update}_validator_set`.
+/// Everyone else is `Other`, including a validator removed from the set (even
+/// within the deposed-grace window: its consensus gossip is dropped by
+/// `verify_sender_key` after the limiter anyway).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthorClass {
     /// Not a known validator: the small, legacy bucket.
@@ -186,6 +191,9 @@ pub enum AuthorClass {
 struct BucketParams {
     max_tokens: f64,
     refill_rate: f64, // tokens per second
+    /// Optional byte budget: (burst bytes, refill bytes per second). A message
+    /// is admitted only if both its count token and its bytes are available.
+    bytes: Option<(f64, f64)>,
 }
 
 /// Consensus message rate limiter per peer using token bucket algorithm
@@ -226,24 +234,42 @@ impl ConsensusRateLimiter {
             other: BucketParams {
                 max_tokens: limit_per_sec as f64,
                 refill_rate: limit_per_sec as f64,
+                bytes: None,
             },
             validator: BucketParams {
                 max_tokens: validator_burst as f64,
                 refill_rate: validator_rate as f64,
+                bytes: None,
             },
         }
+    }
+
+    /// s140 review: also cap a validator author's consensus gossip BYTES:
+    /// `byte_rate` per second, burst `byte_burst` (the message-count cap alone
+    /// lets 400 messages/s of up to `max_consensus_message_size` = 1 MiB
+    /// through). Non-validator authors keep the message-count cap only.
+    pub fn with_validator_byte_budget(mut self, byte_rate: u64, byte_burst: u64) -> Self {
+        self.validator.bytes = Some((byte_burst as f64, byte_rate as f64));
+        self
     }
 
     /// Check if a consensus message from this peer should be accepted,
     /// charging the [`AuthorClass::Other`] bucket. Returns false if rate
     /// exceeded.
     pub fn check_and_increment(&mut self, peer: &PeerId) -> bool {
-        self.check_and_increment_as(peer, AuthorClass::Other)
+        self.check_and_increment_as(peer, AuthorClass::Other, 0)
     }
 
-    /// [`Self::check_and_increment`] for an author of class `class`.
-    pub fn check_and_increment_as(&mut self, peer: &PeerId, class: AuthorClass) -> bool {
-        self.check_and_increment_at(peer, class, Instant::now())
+    /// [`Self::check_and_increment`] for an author of class `class` and a
+    /// message of `bytes` bytes (charged against the class's byte budget, if
+    /// it has one).
+    pub fn check_and_increment_as(
+        &mut self,
+        peer: &PeerId,
+        class: AuthorClass,
+        bytes: usize,
+    ) -> bool {
+        self.check_and_increment_at(peer, class, bytes, Instant::now())
     }
 
     /// [`Self::check_and_increment_as`] at an explicit instant (test seam).
@@ -251,8 +277,10 @@ impl ConsensusRateLimiter {
         &mut self,
         peer: &PeerId,
         class: AuthorClass,
+        bytes: usize,
         now: Instant,
     ) -> bool {
+        let _ = bytes;
         let (other, validator) = (self.other, self.validator);
         let params_of = |c: AuthorClass| match c {
             AuthorClass::Other => other,
@@ -262,6 +290,7 @@ impl ConsensusRateLimiter {
             tokens: params_of(class).max_tokens,
             last_refill: now,
             class,
+            byte_tokens: params_of(class).bytes.map_or(0.0, |(burst, _)| burst),
         });
         // Refill at the rate of the class the bucket ran at since last_refill.
         let held = params_of(bucket.class);
@@ -626,7 +655,7 @@ mod tests {
         at: Instant,
     ) -> usize {
         (0..n)
-            .filter(|_| l.check_and_increment_at(peer, class, at))
+            .filter(|_| l.check_and_increment_at(peer, class, 0, at))
             .count()
     }
 
@@ -656,7 +685,7 @@ mod tests {
         let val = test_peer(22);
         let mut admitted = 0;
         for i in 0..2_000u64 {
-            if l.check_and_increment_at(&val, AuthorClass::Validator, t0 + Duration::from_millis(i))
+            if l.check_and_increment_at(&val, AuthorClass::Validator, 0, t0 + Duration::from_millis(i))
             {
                 admitted += 1;
             }
@@ -707,7 +736,12 @@ mod tests {
                 let step_us = over_ms * 1_000 / views;
                 for _ in 0..views {
                     for _ in 0..2 {
-                        if !l.check_and_increment_at(&p, class, t0 + Duration::from_micros(at_us)) {
+                        if !l.check_and_increment_at(
+                            &p,
+                            class,
+                            HONEST_MSG_BYTES,
+                            t0 + Duration::from_micros(at_us),
+                        ) {
                             drops += 1;
                         }
                     }
@@ -717,7 +751,78 @@ mod tests {
             drops
         };
         assert_eq!(run(&mut two_class(), AuthorClass::Validator), 0);
+        assert_eq!(run(&mut two_class_bytes(), AuthorClass::Validator), 0);
         assert!(run(&mut two_class(), AuthorClass::Other) > 500);
+    }
+
+    /// Upper estimate of an honest 3-validator consensus gossip message
+    /// (proposal header with QC + TC + NEC, ~N x 450 B + fixed fields).
+    const HONEST_MSG_BYTES: usize = 2_048;
+    const MIB: u64 = 1 << 20;
+
+    /// `two_class` plus the shipped validator byte budget (4 MiB/s, burst 4 MiB).
+    fn two_class_bytes() -> ConsensusRateLimiter {
+        two_class().with_validator_byte_budget(4 * MIB, 4 * MIB)
+    }
+
+    /// s140 review (RED): a validator flooding max-size (1 MiB) messages is
+    /// held to the byte budget — 4 of them from a full 4 MiB burst, not 400 —
+    /// then ~1 per 250 ms of refill; small honest messages of the same author
+    /// are refused only while its bytes are exhausted.
+    #[test]
+    fn validator_byte_budget_caps_large_messages() {
+        let mut l = two_class_bytes();
+        let t0 = Instant::now();
+        let val = test_peer(26);
+        let big = MIB as usize;
+        let admitted = (0..100)
+            .filter(|_| l.check_and_increment_at(&val, AuthorClass::Validator, big, t0))
+            .count();
+        assert_eq!(admitted, 4, "1 MiB messages admitted from a 4 MiB burst");
+        assert!(!l.check_and_increment_at(&val, AuthorClass::Validator, 100, t0));
+        // 250 ms refills 1 MiB: one more max-size message.
+        let t1 = t0 + Duration::from_millis(250);
+        let admitted = (0..10)
+            .filter(|_| l.check_and_increment_at(&val, AuthorClass::Validator, big, t1))
+            .count();
+        assert_eq!(admitted, 1);
+        // Count tokens were not spent by the refused messages: after a full
+        // byte refill the author still has (almost) its whole count burst.
+        let t2 = t1 + Duration::from_secs(1);
+        let admitted = (0..500)
+            .filter(|_| l.check_and_increment_at(&val, AuthorClass::Validator, 100, t2))
+            .count();
+        assert_eq!(admitted, 400);
+    }
+
+    /// s140 review (RED): the byte budget applies to validator authors only;
+    /// a non-validator keeps the message-count cap alone (unchanged).
+    #[test]
+    fn byte_budget_is_validator_only() {
+        let mut l = two_class_bytes();
+        let t0 = Instant::now();
+        let other = test_peer(27);
+        let admitted = (0..100)
+            .filter(|_| {
+                l.check_and_increment_at(&other, AuthorClass::Other, MIB as usize, t0)
+            })
+            .count();
+        assert_eq!(admitted, 50);
+    }
+
+    /// s140 review (RED): promotion refills the byte budget too.
+    #[test]
+    fn promotion_refills_byte_budget() {
+        let mut l = two_class_bytes();
+        let t0 = Instant::now();
+        let p = test_peer(28);
+        assert!(l.check_and_increment_at(&p, AuthorClass::Other, 10, t0));
+        let admitted = (0..10)
+            .filter(|_| {
+                l.check_and_increment_at(&p, AuthorClass::Validator, MIB as usize, t0)
+            })
+            .count();
+        assert_eq!(admitted, 4);
     }
 
     /// `new` keeps the single-class limiter: both classes run at its rate.
