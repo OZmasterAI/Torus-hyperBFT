@@ -164,41 +164,106 @@ struct PeerScore {
 struct TokenBucket {
     tokens: f64,
     last_refill: Instant,
+    /// The class whose rate/burst this bucket currently runs at.
+    class: AuthorClass,
+}
+
+/// Which consensus gossip bucket an author is charged against (s140).
+///
+/// `Validator` = a current (or recently deposed, within the deposed-grace
+/// window) member of the consensus validator set, as the network layer knows
+/// it from `Network::{init,update}_validator_set`. Everyone else is `Other`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthorClass {
+    /// Not a known validator: the small, legacy bucket.
+    Other,
+    /// A validator-set author: the larger bucket sized to the view rate.
+    Validator,
+}
+
+/// Rate and burst of one bucket class.
+#[derive(Clone, Copy, Debug)]
+struct BucketParams {
+    max_tokens: f64,
+    refill_rate: f64, // tokens per second
 }
 
 /// Consensus message rate limiter per peer using token bucket algorithm
 /// (Batch EK: CONS-FIND-19). Prevents 2x burst that tumbling windows allow.
+///
+/// s140: two bucket classes. Validator-set authors get a separate, larger
+/// bucket (a 3-validator net emits ~2 consensus gossip messages per author per
+/// view, i.e. ~100/s per author at the bench's 1-s peak view rate, so the
+/// legacy 50/s burst 50 dropped the leader's proposal header and stalled the
+/// view until the 250 ms header re-send; perf doc section 139). Validators
+/// keep a cap (no exemption), so a misbehaving validator still cannot flood.
 pub struct ConsensusRateLimiter {
     buckets: HashMap<PeerId, TokenBucket>,
-    max_tokens: f64,
-    refill_rate: f64, // tokens per second
+    other: BucketParams,
+    validator: BucketParams,
 }
 
 /// Stale bucket entries older than this are cleaned up.
 const RATE_LIMITER_CLEANUP_AGE: Duration = Duration::from_secs(300);
 
 impl ConsensusRateLimiter {
+    /// One bucket class for everyone: `limit_per_sec` rate, burst
+    /// `limit_per_sec` (the pre-s140 limiter, exactly).
     pub fn new(limit_per_sec: u32) -> Self {
+        Self::with_validator_bucket(limit_per_sec, limit_per_sec, limit_per_sec)
+    }
+
+    /// `limit_per_sec` (rate = burst) for [`AuthorClass::Other`] authors, and
+    /// `validator_rate` per second with burst `validator_burst` for
+    /// [`AuthorClass::Validator`] authors.
+    pub fn with_validator_bucket(
+        limit_per_sec: u32,
+        validator_rate: u32,
+        validator_burst: u32,
+    ) -> Self {
         Self {
             buckets: HashMap::new(),
-            max_tokens: limit_per_sec as f64,
-            refill_rate: limit_per_sec as f64,
+            other: BucketParams {
+                max_tokens: limit_per_sec as f64,
+                refill_rate: limit_per_sec as f64,
+            },
+            validator: BucketParams {
+                max_tokens: validator_burst as f64,
+                refill_rate: validator_rate as f64,
+            },
         }
     }
 
-    /// Check if a consensus message from this peer should be accepted.
-    /// Returns false if rate exceeded.
+    /// Check if a consensus message from this peer should be accepted,
+    /// charging the [`AuthorClass::Other`] bucket. Returns false if rate
+    /// exceeded.
     pub fn check_and_increment(&mut self, peer: &PeerId) -> bool {
-        let now = Instant::now();
-        let max = self.max_tokens;
-        let rate = self.refill_rate;
+        self.check_and_increment_as(peer, AuthorClass::Other)
+    }
+
+    /// [`Self::check_and_increment`] for an author of class `class`.
+    pub fn check_and_increment_as(&mut self, peer: &PeerId, class: AuthorClass) -> bool {
+        self.check_and_increment_at(peer, class, Instant::now())
+    }
+
+    /// [`Self::check_and_increment_as`] at an explicit instant (test seam).
+    pub fn check_and_increment_at(
+        &mut self,
+        peer: &PeerId,
+        _class: AuthorClass,
+        now: Instant,
+    ) -> bool {
+        let params = self.other;
         let bucket = self.buckets.entry(*peer).or_insert(TokenBucket {
-            tokens: max,
+            tokens: params.max_tokens,
             last_refill: now,
+            class: AuthorClass::Other,
         });
         // Refill tokens based on elapsed time
-        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed * rate).min(max);
+        let elapsed = now
+            .saturating_duration_since(bucket.last_refill)
+            .as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * params.refill_rate).min(params.max_tokens);
         bucket.last_refill = now;
         // Try to consume one token
         if bucket.tokens >= 1.0 {
@@ -528,6 +593,126 @@ mod tests {
         }
         assert!(limiter.check_and_increment(&peer)); // ~1 token
         assert!(!limiter.check_and_increment(&peer)); // depleted again
+    }
+
+    /// s140 two-class limiter, the shape the node runs: Other 50/s burst 50,
+    /// Validator 400/s burst 400.
+    fn two_class() -> ConsensusRateLimiter {
+        ConsensusRateLimiter::with_validator_bucket(50, 400, 400)
+    }
+
+    /// Admitted count of `n` messages from `peer` as `class`, all at `at`.
+    fn admit_n(
+        l: &mut ConsensusRateLimiter,
+        peer: &PeerId,
+        class: AuthorClass,
+        n: usize,
+        at: Instant,
+    ) -> usize {
+        (0..n)
+            .filter(|_| l.check_and_increment_at(peer, class, at))
+            .count()
+    }
+
+    /// s140 (RED): a validator author is charged the large bucket — its whole
+    /// 400 burst is admitted — while a non-validator at the same instant keeps
+    /// the legacy 50.
+    #[test]
+    fn validator_author_gets_large_bucket_other_gets_small() {
+        let mut l = two_class();
+        let t0 = Instant::now();
+        let (val, other) = (test_peer(20), test_peer(21));
+        assert_eq!(admit_n(&mut l, &val, AuthorClass::Validator, 500, t0), 400);
+        assert_eq!(admit_n(&mut l, &other, AuthorClass::Other, 500, t0), 50);
+        // Refill runs at the class rate: 100 ms = 40 validator tokens, 5 other.
+        let t1 = t0 + Duration::from_millis(100);
+        assert_eq!(admit_n(&mut l, &val, AuthorClass::Validator, 100, t1), 40);
+        assert_eq!(admit_n(&mut l, &other, AuthorClass::Other, 100, t1), 5);
+    }
+
+    /// s140 (RED): a validator above the large cap is still dropped (a cap,
+    /// not an exemption) — sustained 1,000/s for 2 s admits only burst +
+    /// 2 s of refill.
+    #[test]
+    fn validator_above_large_cap_is_dropped() {
+        let mut l = two_class();
+        let t0 = Instant::now();
+        let val = test_peer(22);
+        let mut admitted = 0;
+        for i in 0..2_000u64 {
+            if l.check_and_increment_at(&val, AuthorClass::Validator, t0 + Duration::from_millis(i))
+            {
+                admitted += 1;
+            }
+        }
+        // 400 burst + ~1.999 s x 400/s refill, never the offered 2,000.
+        assert!(
+            (1_150..=1_200).contains(&admitted),
+            "admitted {admitted} of 2,000"
+        );
+    }
+
+    /// s140 (RED): a set change moves an author between buckets. Promotion
+    /// (joined the set) gets the full large bucket at once; demotion (left the
+    /// set) clamps the tokens to the small burst and refills at the small rate.
+    #[test]
+    fn set_change_moves_author_between_buckets() {
+        let mut l = two_class();
+        let t0 = Instant::now();
+        let p = test_peer(23);
+        // Not yet a validator: small bucket, exhausted.
+        assert_eq!(admit_n(&mut l, &p, AuthorClass::Other, 60, t0), 50);
+        // Joins the set: the large bucket, full.
+        assert_eq!(admit_n(&mut l, &p, AuthorClass::Validator, 500, t0), 400);
+        // Refill 200 validator tokens, then leaves the set: clamped to 50.
+        let t1 = t0 + Duration::from_millis(500);
+        assert_eq!(admit_n(&mut l, &p, AuthorClass::Other, 500, t1), 50);
+        // Back on the small rate: 100 ms = 5 tokens.
+        let t2 = t1 + Duration::from_millis(100);
+        assert_eq!(admit_n(&mut l, &p, AuthorClass::Other, 100, t2), 5);
+    }
+
+    /// s140 (RED): bench-like honest validator stream — 2 consensus gossip
+    /// messages per author per view (measured, perf doc section 139's proof
+    /// smoke) at the observed view-rate peaks (31 views in 250 ms, 51 in 1 s,
+    /// 28.5/s over 10 s), plus the limiter-free idle rate (13 ms views,
+    /// 77 views/s) for 10 s — is never dropped by the validator bucket, and IS
+    /// dropped by the legacy 50/s bucket (the section 139 stall cause).
+    #[test]
+    fn bench_like_validator_stream_not_dropped() {
+        // (views, over_ms) phases, back to back.
+        let phases: [(u64, u64); 4] = [(31, 250), (51, 1_000), (285, 10_000), (770, 10_000)];
+        let run = |l: &mut ConsensusRateLimiter, class: AuthorClass| {
+            let p = test_peer(24);
+            let t0 = Instant::now();
+            let mut at_us = 0u64;
+            let mut drops = 0;
+            for (views, over_ms) in phases {
+                let step_us = over_ms * 1_000 / views;
+                for _ in 0..views {
+                    for _ in 0..2 {
+                        if !l.check_and_increment_at(&p, class, t0 + Duration::from_micros(at_us)) {
+                            drops += 1;
+                        }
+                    }
+                    at_us += step_us;
+                }
+            }
+            drops
+        };
+        assert_eq!(run(&mut two_class(), AuthorClass::Validator), 0);
+        assert!(run(&mut two_class(), AuthorClass::Other) > 500);
+    }
+
+    /// `new` keeps the single-class limiter: both classes run at its rate.
+    #[test]
+    fn single_class_new_ignores_class() {
+        let mut l = ConsensusRateLimiter::new(50);
+        let t0 = Instant::now();
+        assert_eq!(
+            admit_n(&mut l, &test_peer(25), AuthorClass::Validator, 100, t0),
+            50
+        );
     }
 
     #[test]

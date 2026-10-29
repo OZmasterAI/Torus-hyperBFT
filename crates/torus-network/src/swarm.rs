@@ -24,8 +24,8 @@ use crate::codec::{
 use crate::config::NetworkConfig;
 use crate::peer::PeerMap;
 use crate::peer_scoring::{
-    ConsensusRateLimiter, PeerScoring, PENALTY_INVALID_CONSENSUS_MSG, PENALTY_INVALID_TX,
-    REWARD_BLOCK_RELAY,
+    AuthorClass, ConsensusRateLimiter, PeerScoring, PENALTY_INVALID_CONSENSUS_MSG,
+    PENALTY_INVALID_TX, REWARD_BLOCK_RELAY,
 };
 use crate::pending_send::PendingSendQueue;
 use crate::swarm_poll_trace::ReceiveTrace;
@@ -1269,8 +1269,17 @@ pub async fn run_swarm_with_config(
 
     let mut tx_gossip_state =
         TxGossipState::new(config.tx_dedup_window_secs, config.tx_rate_limit_per_peer);
-    let mut consensus_rate_limiter =
-        ConsensusRateLimiter::new(config.consensus_rate_limit_per_peer);
+    let mut consensus_rate_limiter = ConsensusRateLimiter::with_validator_bucket(
+        config.consensus_rate_limit_per_peer,
+        config.consensus_validator_rate_limit,
+        config.consensus_validator_burst,
+    );
+    info!(
+        other_rate = config.consensus_rate_limit_per_peer,
+        validator_rate = config.consensus_validator_rate_limit,
+        validator_burst = config.consensus_validator_burst,
+        "consensus gossip limiter (TORUS_CONSENSUS_VALIDATOR_RATE / _BURST)"
+    );
     let mut peer_scoring = PeerScoring::new(config.ban_list_path.clone());
 
     // Block any previously banned peers
@@ -1545,22 +1554,39 @@ pub async fn run_swarm_with_config(
     }
 }
 
+/// s140: which consensus gossip bucket `author` is charged against: the
+/// validator bucket for a CURRENT validator-set member (the set the consensus
+/// engine pushes through `Network::{init,update}_validator_set`), the small
+/// bucket for anyone else. A recently-deposed validator is `Other`: its
+/// consensus messages are dropped by `verify_sender_key` right after the
+/// limiter anyway (it is no longer in `peer_map`), so a larger bucket would
+/// buy it nothing.
+fn consensus_author_class(shared: &SharedState, author: &PeerId) -> AuthorClass {
+    let _ = (shared, author);
+    AuthorClass::Other
+}
+
 /// Per-author consensus gossip rate-limit gate. Same decision as
-/// `ConsensusRateLimiter::check_and_increment`; a drop is debug-logged and
+/// `ConsensusRateLimiter::check_and_increment_as`; a drop is debug-logged and
 /// counted on `torus_consensus_rate_limited_dropped` (s58: the drop was
-/// debug-log only, so lost leader headers could not be confirmed).
+/// debug-log only, so lost leader headers could not be confirmed), and a
+/// validator-author drop also on `torus_consensus_rate_limited_validator_dropped`.
 fn consensus_rate_limit_admit(
     limiter: &mut ConsensusRateLimiter,
     metrics: Option<&torus_telemetry::Metrics>,
     author: &PeerId,
+    class: AuthorClass,
 ) -> bool {
-    if limiter.check_and_increment(author) {
+    if limiter.check_and_increment_as(author, class) {
         return true;
     }
     if let Some(m) = metrics {
         m.consensus_rate_limited_dropped.inc();
+        if class == AuthorClass::Validator {
+            m.consensus_rate_limited_validator_dropped.inc();
+        }
     }
-    debug!(%author, "consensus rate limit exceeded, dropping message");
+    debug!(%author, ?class, "consensus rate limit exceeded, dropping message");
     false
 }
 
@@ -1646,6 +1672,7 @@ fn handle_event(
                     consensus_rate_limiter,
                     shared.metrics.as_deref(),
                     &author,
+                    consensus_author_class(shared, &author),
                 ) {
                     return;
                 }
@@ -3754,6 +3781,7 @@ mod tests {
     /// only) and keep the same admit/drop decision as the bare limiter.
     #[test]
     fn consensus_rate_limit_drops_are_counted() {
+        const O: AuthorClass = AuthorClass::Other;
         let metrics = torus_telemetry::Metrics::new();
         let mut limiter = ConsensusRateLimiter::new(5);
         let author = PeerId::random();
@@ -3761,7 +3789,7 @@ mod tests {
         // Burst of 5 admitted, nothing counted.
         for i in 0..5 {
             assert!(
-                consensus_rate_limit_admit(&mut limiter, Some(&metrics), &author),
+                consensus_rate_limit_admit(&mut limiter, Some(&metrics), &author, O),
                 "message {i} within burst was dropped"
             );
         }
@@ -3771,7 +3799,8 @@ mod tests {
             assert!(!consensus_rate_limit_admit(
                 &mut limiter,
                 Some(&metrics),
-                &author
+                &author,
+                O
             ));
         }
         assert_eq!(metrics.consensus_rate_limited_dropped.get(), 3);
@@ -3779,12 +3808,107 @@ mod tests {
         assert!(consensus_rate_limit_admit(
             &mut limiter,
             Some(&metrics),
-            &other
+            &other,
+            O
         ));
         assert_eq!(metrics.consensus_rate_limited_dropped.get(), 3);
         // No metrics registry (tests/tools): same decision, no panic.
-        assert!(!consensus_rate_limit_admit(&mut limiter, None, &author));
+        assert!(!consensus_rate_limit_admit(&mut limiter, None, &author, O));
         assert_eq!(metrics.consensus_rate_limited_dropped.get(), 3);
+    }
+
+    /// s140 (RED): the swarm charges a CURRENT validator-set author (by its
+    /// PeerId through `peer_map` + `validators`, the set the consensus engine
+    /// pushes) the validator bucket, and everyone else the small one; a
+    /// removed validator drops back to the small bucket, a newly added one
+    /// gets the large one.
+    #[test]
+    fn consensus_author_class_follows_validator_set() {
+        let shared = test_shared();
+        let (vk_val, vk_new) = (test_vk(30), test_vk(31));
+        let (p_val, p_new) = (
+            crate::bridge::peer_id_from_verifying_key(&vk_val),
+            crate::bridge::peer_id_from_verifying_key(&vk_new),
+        );
+        let stranger = PeerId::random();
+        shared.peer_map.write().unwrap().insert(vk_val, p_val);
+        shared.validators.write().unwrap().insert(vk_val.to_bytes());
+        assert_eq!(
+            consensus_author_class(&shared, &p_val),
+            AuthorClass::Validator
+        );
+        assert_eq!(consensus_author_class(&shared, &p_new), AuthorClass::Other);
+        assert_eq!(
+            consensus_author_class(&shared, &stranger),
+            AuthorClass::Other
+        );
+        // Set change: vk_val removed, vk_new added (what update_validator_set does).
+        shared
+            .validators
+            .write()
+            .unwrap()
+            .remove(&vk_val.to_bytes());
+        shared.peer_map.write().unwrap().remove_by_vk(&vk_val);
+        shared
+            .recently_deposed
+            .write()
+            .unwrap()
+            .insert(vk_val.to_bytes(), Instant::now());
+        shared.peer_map.write().unwrap().insert(vk_new, p_new);
+        shared.validators.write().unwrap().insert(vk_new.to_bytes());
+        assert_eq!(consensus_author_class(&shared, &p_val), AuthorClass::Other);
+        assert_eq!(
+            consensus_author_class(&shared, &p_new),
+            AuthorClass::Validator
+        );
+    }
+
+    /// s140 (RED): end to end through the gate with the shipped defaults — a
+    /// validator author's 300-message burst (6 x the legacy bucket) is
+    /// admitted without a drop, a stranger's is cut at 50, and only the
+    /// validator-class counter stays at 0.
+    #[test]
+    fn validator_author_burst_admitted_by_gate() {
+        let shared = test_shared();
+        let metrics = torus_telemetry::Metrics::new();
+        let vk = test_vk(32);
+        let author = crate::bridge::peer_id_from_verifying_key(&vk);
+        shared.peer_map.write().unwrap().insert(vk, author);
+        shared.validators.write().unwrap().insert(vk.to_bytes());
+        let cfg = crate::config::NetworkConfig::default();
+        let mut limiter = ConsensusRateLimiter::with_validator_bucket(
+            cfg.consensus_rate_limit_per_peer,
+            crate::config::DEFAULT_CONSENSUS_VALIDATOR_RATE,
+            crate::config::DEFAULT_CONSENSUS_VALIDATOR_BURST,
+        );
+        let admitted = (0..300)
+            .filter(|_| {
+                consensus_rate_limit_admit(
+                    &mut limiter,
+                    Some(&metrics),
+                    &author,
+                    consensus_author_class(&shared, &author),
+                )
+            })
+            .count();
+        assert_eq!(admitted, 300, "validator burst was rate-limited");
+        let stranger = PeerId::random();
+        let admitted = (0..300)
+            .filter(|_| {
+                consensus_rate_limit_admit(
+                    &mut limiter,
+                    Some(&metrics),
+                    &stranger,
+                    consensus_author_class(&shared, &stranger),
+                )
+            })
+            .count();
+        assert!(
+            (50..=51).contains(&admitted),
+            "stranger admitted {admitted}"
+        );
+        assert_eq!(metrics.consensus_rate_limited_validator_dropped.get(), 0);
+        assert!(metrics.consensus_rate_limited_dropped.get() >= 249);
     }
 
     #[test]
