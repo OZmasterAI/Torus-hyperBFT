@@ -140,6 +140,8 @@ pub const BLOCK_AT_HEIGHT: [u8; 1] = [1];
 pub const BLOCK_TO_CHILDREN: [u8; 1] = [2];
 pub const COMMITTED_APP_STATE: [u8; 1] = [3];
 pub const PENDING_APP_STATE_UPDATES: [u8; 1] = [4];
+/// Part of the validator-set state: write only through a setter that marks the batch, see
+/// [`VALIDATOR_SET_STATE_KEYS`].
 pub const COMMITTED_VALIDATOR_SET: [u8; 1] = [5];
 pub const VALIDATOR_SET_UPDATES_STATUS: [u8; 1] = [6];
 pub const LOCKED_PC: [u8; 1] = [7];
@@ -148,8 +150,14 @@ pub const HIGHEST_PC: [u8; 1] = [9];
 pub const HIGHEST_COMMITTED_BLOCK: [u8; 1] = [10];
 pub const NEWEST_BLOCK: [u8; 1] = [11];
 pub const HIGHEST_TC: [u8; 1] = [12];
+/// Part of the validator-set state: write only through a setter that marks the batch, see
+/// [`VALIDATOR_SET_STATE_KEYS`].
 pub const PREVIOUS_VALIDATOR_SET: [u8; 1] = [13];
+/// Part of the validator-set state: write only through a setter that marks the batch, see
+/// [`VALIDATOR_SET_STATE_KEYS`].
 pub const VALIDATOR_SET_UPDATE_BLOCK_HEIGHT: [u8; 1] = [14];
+/// Part of the validator-set state: write only through a setter that marks the batch, see
+/// [`VALIDATOR_SET_STATE_KEYS`].
 pub const VALIDATOR_SET_UPDATE_DECIDED: [u8; 1] = [15];
 pub const HIGHEST_VIEW_PHASE_VOTED: [u8; 1] = [16];
 pub const LOCAL_TIP: [u8; 1] = [17];
@@ -175,7 +183,32 @@ pub const APP_FED_BLOCK_HEIGHT: [u8; 1] = [23];
 /// recently committed validator-set update took over as the source of fresh proposals (the view of
 /// the Commit or Decide PC on the updating block that committed it). Tips of views up to it were
 /// proposed under the previous set, later ones under the committed set.
+/// Part of the validator-set state: write only through a setter that marks the batch, see
+/// [`VALIDATOR_SET_STATE_KEYS`].
 pub const VALIDATOR_SET_UPDATE_VIEW: [u8; 1] = [24];
+
+/// The variables that make up [`ValidatorSetState`](crate::types::validator_set::ValidatorSetState)
+/// (`COMMITTED_VALIDATOR_SET`, `PREVIOUS_VALIDATOR_SET`, `VALIDATOR_SET_UPDATE_BLOCK_HEIGHT`,
+/// `VALIDATOR_SET_UPDATE_DECIDED`, `VALIDATOR_SET_UPDATE_VIEW`).
+///
+/// perf/vote-vset-cache: any write (or delete) of one of these keys MUST go through a
+/// `BlockTreeWriteBatch` setter that marks the batch as setting the validator-set state (it sets
+/// the batch's flag, `self.1 = true`), and a new variable of the state MUST be added here. The
+/// block tree changes its
+/// validator-set state generation (`BlockTreeSingleton::validator_set_state_generation`)
+/// only on such a batch, and HotStuff re-syncs its phase-vote collectors only when the
+/// generation changed: an unmarked write leaves the collectors over the old set, and an old-set
+/// quorum then completes a PC the new set has not certified (the s140 review P1 bug; see
+/// `hotstuff/vote_vset_cache_test.rs` and `hotstuff/vsu_decide_collector_test.rs`). The unit test
+/// `validator_set_state_setters_mark_the_batch` in `block_tree/accessors/internal.rs` checks the
+/// setters against this list.
+pub const VALIDATOR_SET_STATE_KEYS: [[u8; 1]; 5] = [
+    COMMITTED_VALIDATOR_SET,
+    PREVIOUS_VALIDATOR_SET,
+    VALIDATOR_SET_UPDATE_BLOCK_HEIGHT,
+    VALIDATOR_SET_UPDATE_DECIDED,
+    VALIDATOR_SET_UPDATE_VIEW,
+];
 /// The format of the consensus data in this store, a borsh `u32`
 /// ([`CONSENSUS_DB_FORMAT_VERSION`]), written once by
 /// [`BlockTreeSingleton::initialize`](super::accessors::internal::BlockTreeSingleton::initialize)

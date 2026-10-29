@@ -92,6 +92,24 @@ fn note_gap_commit_deferral(block: &CryptoHash) -> Option<u64> {
     })
 }
 
+/// Test seam: counts [`BlockTreeSingleton::validator_set_state`] reads on this thread (each is
+/// ~5 KV gets and 2 validator-set deserializations), so a test can bound the reads a code path
+/// makes (perf/vote-vset-cache: a steady view's votes must not read the state per vote).
+#[cfg(test)]
+pub(crate) mod validator_set_state_reads {
+    use std::cell::Cell;
+    thread_local! {
+        static READS: Cell<u64> = const { Cell::new(0) };
+    }
+    pub(crate) fn note() {
+        READS.with(|r| r.set(r.get() + 1));
+    }
+    /// Reads of the validator-set state made on this thread so far.
+    pub(crate) fn count() -> u64 {
+        READS.with(Cell::get)
+    }
+}
+
 /// Result of a [`BlockTreeSingleton::update`] call, containing both the
 /// validator set updates (if any) and the list of newly committed block hashes
 /// (oldest to newest). The caller uses `committed_block_hashes` to invoke
@@ -124,11 +142,25 @@ pub struct UpdateResult {
 /// `self.2` is the same write-through pattern for the `SPECULATIVE_COMMITS` list
 /// (MonadBFT B2), which was previously a raw KV read-modify-write of the whole
 /// `Vec<CryptoHash>` blob twice per view (S395 floor shave).
+/// `self.3` is the [generation](Self::validator_set_state_generation) of the validator-set state:
+/// a fresh, process-wide unique value is taken on construction and after every write that sets a
+/// validator-set state variable (perf/vote-vset-cache).
 pub struct BlockTreeSingleton<K: KVStore>(
     K,
     core::cell::RefCell<Option<crate::hotstuff::types::LeaderReputation>>,
     core::cell::RefCell<Option<Vec<CryptoHash>>>,
+    core::cell::Cell<u64>,
 );
+
+/// Source of [`BlockTreeSingleton::validator_set_state_generation`] values. Process-wide, so two
+/// block-tree instances never share a generation (a cache synced against one instance is never
+/// taken as current for another, e.g. a store re-opened with a different state).
+static NEXT_VALIDATOR_SET_STATE_GENERATION: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1);
+
+fn next_validator_set_state_generation() -> u64 {
+    NEXT_VALIDATOR_SET_STATE_GENERATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
 
 /// Lifecycle methods.
 ///
@@ -145,6 +177,7 @@ impl<K: KVStore> BlockTreeSingleton<K> {
             kv_store,
             core::cell::RefCell::new(None),
             core::cell::RefCell::new(None),
+            core::cell::Cell::new(next_validator_set_state_generation()),
         )
     }
 
@@ -207,7 +240,22 @@ impl<K: KVStore> BlockTreeSingleton<K> {
 
     /// Atomically write the changes in `write_batch` into the `BlockTreeSingleton`.
     pub fn write(&mut self, write_batch: BlockTreeWriteBatch<K::WriteBatch>) {
-        self.0.write(write_batch.0)
+        let sets_validator_set_state = write_batch.1;
+        self.0.write(write_batch.0);
+        if sets_validator_set_state {
+            self.3.set(next_validator_set_state_generation());
+        }
+    }
+
+    /// The generation of the [validator-set state](Self::validator_set_state): it changes on every
+    /// [`write`](Self::write) of a batch that sets a validator-set state variable (committed or
+    /// previous validator set, update height, update view, update decided), whichever path wrote
+    /// it (HotStuff, the pacemaker, block sync), and nowhere else. Equal generations from this
+    /// instance mean an equal state, so a reader may keep what it derived from the state until the
+    /// generation differs (HotStuff's phase-vote collectors, perf/vote-vset-cache). Values are
+    /// unique across instances and not persisted: a new instance (a restart) starts at a fresh one.
+    pub fn validator_set_state_generation(&self) -> u64 {
+        self.3.get()
     }
 
     /// Create an `AppBlockTreeView` which sees the app state as it will be right after `parent` becomes
@@ -1114,6 +1162,8 @@ impl<K: KVStore> BlockTreeSingleton<K> {
     }
 
     pub fn validator_set_state(&self) -> Result<ValidatorSetState, BlockTreeError> {
+        #[cfg(test)]
+        validator_set_state_reads::note();
         Ok(self.0.validator_set_state()?)
     }
 
@@ -1232,11 +1282,17 @@ impl From<KVSetError> for BlockTreeError {
     }
 }
 
-pub struct BlockTreeWriteBatch<W: WriteBatch>(pub(super) W);
+/// `self.1`: the batch sets a validator-set state variable (see
+/// [`BlockTreeSingleton::validator_set_state_generation`]). Every setter that writes one of
+/// [`VALIDATOR_SET_STATE_KEYS`](variables::VALIDATOR_SET_STATE_KEYS) MUST set it (`self.1 = true`):
+/// HotStuff's phase-vote collectors re-sync only when the generation changed, so an unmarked
+/// validator-set write lets an old-set quorum complete a PC (s140 review P1; see that constant,
+/// `hotstuff/vote_vset_cache_test.rs`, and `validator_set_state_setters_mark_the_batch` below).
+pub struct BlockTreeWriteBatch<W: WriteBatch>(pub(super) W, bool);
 
 impl<W: WriteBatch> BlockTreeWriteBatch<W> {
     pub(crate) fn new() -> BlockTreeWriteBatch<W> {
-        BlockTreeWriteBatch(W::new())
+        BlockTreeWriteBatch(W::new(), false)
     }
 
     pub fn new_unsafe() -> BlockTreeWriteBatch<W> {
@@ -1471,6 +1527,7 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
         &mut self,
         validator_set: &ValidatorSet,
     ) -> Result<(), BlockTreeError> {
+        self.1 = true;
         let validator_set_bytes: ValidatorSetBytes = validator_set.into();
         let _: () = self.0.set(
             &variables::COMMITTED_VALIDATOR_SET,
@@ -1623,6 +1680,7 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
         &mut self,
         validator_set: &ValidatorSet,
     ) -> Result<(), BlockTreeError> {
+        self.1 = true;
         let validator_set_bytes: ValidatorSetBytes = validator_set.into();
         let _: () = self.0.set(
             &variables::PREVIOUS_VALIDATOR_SET,
@@ -1641,6 +1699,7 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
         &mut self,
         height: BlockHeight,
     ) -> Result<(), BlockTreeError> {
+        self.1 = true;
         let _: () = self.0.set(
             &variables::VALIDATOR_SET_UPDATE_BLOCK_HEIGHT,
             &height
@@ -1687,6 +1746,7 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
 
     /* ↓↓↓ Validator Set Update View ↓↓↓ */
     pub fn set_validator_set_update_view(&mut self, view: ViewNumber) -> Result<(), BlockTreeError> {
+        self.1 = true;
         let _: () = self.0.set(
             &variables::VALIDATOR_SET_UPDATE_VIEW,
             &view.try_to_vec().map_err(|err| KVSetError::SerializeValueError {
@@ -1703,6 +1763,7 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
         &mut self,
         update_complete: bool,
     ) -> Result<(), BlockTreeError> {
+        self.1 = true;
         let _: () = self.0.set(
             &variables::VALIDATOR_SET_UPDATE_DECIDED,
             &update_complete
@@ -3138,5 +3199,67 @@ mod leader_exclusion_storage_tests {
         let vss2 = reloaded.validator_set_state().unwrap();
         assert!(vss2.committed_validator_set() == vss.committed_validator_set());
         assert!(vss2.previous_validator_set() == vss.previous_validator_set());
+    }
+}
+
+#[cfg(test)]
+mod validator_set_state_generation_tests {
+    //! perf/vote-vset-cache (review P3): every write-batch setter of a validator-set state
+    //! variable marks the batch, and every such variable has a marking setter.
+    use super::*;
+    use crate::block_tree::pluggables::WriteBatch;
+
+    #[derive(Default)]
+    struct KeysWb {
+        keys: Vec<Vec<u8>>,
+    }
+
+    impl WriteBatch for KeysWb {
+        fn new() -> Self {
+            Self::default()
+        }
+        fn set(&mut self, key: &[u8], _value: &[u8]) {
+            self.keys.push(key.to_vec());
+        }
+        fn delete(&mut self, key: &[u8]) {
+            self.keys.push(key.to_vec());
+        }
+    }
+
+    #[test]
+    fn validator_set_state_setters_mark_the_batch() {
+        type Setter = fn(&mut BlockTreeWriteBatch<KeysWb>);
+        let setters: [(&str, Setter); 5] = [
+            ("set_committed_validator_set", |wb| wb.set_committed_validator_set(&ValidatorSet::new()).unwrap()),
+            ("set_previous_validator_set", |wb| wb.set_previous_validator_set(&ValidatorSet::new()).unwrap()),
+            ("set_validator_set_update_block_height", |wb| {
+                wb.set_validator_set_update_block_height(BlockHeight::new(3)).unwrap()
+            }),
+            ("set_validator_set_update_decided", |wb| wb.set_validator_set_update_decided(true).unwrap()),
+            ("set_validator_set_update_view", |wb| wb.set_validator_set_update_view(ViewNumber::new(3)).unwrap()),
+        ];
+        let mut covered = Vec::new();
+        for (name, setter) in setters {
+            let mut wb = BlockTreeWriteBatch::<KeysWb>::new();
+            assert!(!wb.1, "a new batch sets no validator-set state");
+            setter(&mut wb);
+            assert!(wb.1, "{name} writes the validator-set state and must mark the batch");
+            for key in &wb.0.keys {
+                assert!(
+                    variables::VALIDATOR_SET_STATE_KEYS.iter().any(|k| k.as_slice() == key.as_slice()),
+                    "{name} writes {key:?}, not in VALIDATOR_SET_STATE_KEYS"
+                );
+            }
+            covered.extend(wb.0.keys);
+        }
+        for key in variables::VALIDATOR_SET_STATE_KEYS {
+            assert!(
+                covered.iter().any(|k| k.as_slice() == key.as_slice()),
+                "no marking setter writes validator-set state key {key:?}"
+            );
+        }
+        let mut wb = BlockTreeWriteBatch::<KeysWb>::new();
+        wb.set_highest_view_entered(ViewNumber::new(3)).unwrap();
+        assert!(!wb.1, "a write of another variable does not mark the batch");
     }
 }

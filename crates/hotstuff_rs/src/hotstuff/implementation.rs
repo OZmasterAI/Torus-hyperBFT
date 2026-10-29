@@ -94,6 +94,13 @@ pub(crate) struct HotStuff<N: Network> {
     view_info: ViewInfo,
     proposal_status: ProposalStatus,
     phase_vote_collectors: ActiveCollectorPair<PhaseVoteCollector>,
+    /// perf/vote-vset-cache: the block tree's
+    /// [validator-set state generation](BlockTreeSingleton::validator_set_state_generation) that
+    /// `on_receive_phase_vote` last synced `phase_vote_collectors` to. `None` until the first vote
+    /// (the constructor's state may not be the tree's). Every other update or rebuild of the
+    /// collectors is from a state read from the tree just before, so it never leaves them behind
+    /// the generation recorded here.
+    phase_vote_collectors_synced_to: Option<u64>,
     sender_handle: SenderHandle<N>,
     validator_set_update_handle: ValidatorSetUpdateHandle<N>,
     event_publisher: Option<Sender<Event>>,
@@ -251,6 +258,7 @@ impl<N: Network> HotStuff<N> {
             view_info,
             proposal_status,
             phase_vote_collectors,
+            phase_vote_collectors_synced_to: None,
             sender_handle,
             validator_set_update_handle,
             event_publisher,
@@ -1943,11 +1951,17 @@ impl<N: Network> HotStuff<N> {
             // state when a vote is counted. Block sync commits (and decides) an update with
             // `block_tree.update` directly, in the middle of a view, and does not reach these
             // collectors; a pair built at the view's start over the old set then completes an
-            // old-set PC on a block the new set certifies. A no-op while the state is unchanged
-            // (one read of the state, as the pacemaker's tick does on every loop pass).
-            let _ = self
-                .phase_vote_collectors
-                .update_validator_sets(&block_tree.validator_set_state()?);
+            // old-set PC on a block the new set certifies.
+            // perf/vote-vset-cache (bench 9v2): the state is read again only when its generation
+            // changed since the last sync (a state read is ~5 KV gets and 2 set deserializations,
+            // and was made for every vote).
+            let generation = block_tree.validator_set_state_generation();
+            if self.phase_vote_collectors_synced_to != Some(generation) {
+                let _ = self
+                    .phase_vote_collectors
+                    .update_validator_sets(&block_tree.validator_set_state()?);
+                self.phase_vote_collectors_synced_to = Some(generation);
+            }
             if let Some(new_pc) = self.phase_vote_collectors.collect(signer, phase_vote) {
                 Event::CollectPC(CollectPCEvent {
                     timestamp: SystemTime::now(),
