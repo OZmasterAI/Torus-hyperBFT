@@ -1348,6 +1348,28 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    5.850 / 6.076 / 5.854 (B - A0 +0.1%, -2.0..+2.1%; B - A -3.7%, -5.1..-2.2%); per view the same. B removes the
    VSU fix's whole vote-path cost. blocks/s not worse than A (7l +0.47 ± 0.72, 4l +0.03 ± 1.00), matched/s flat,
    commit p50 back to A0's. 7l commit p99 B 450 vs A 446 ms (+4 ± 1, = A0's 450); 4l p99 -1 ± 2.
+9g2. **[DONE s140, section 141: stalls / drops / p99 PASS, matched/s FAIL in S (-1.6%), borderline T (-2.2%); C keeps
+   B's picture at -4..-6% matched/s, for the owner] [GO s140 (18c chat msg 229; C: msg 231), A = main `c40992d7`, B =
+   `perf/validator-gossip-bucket` `a685f784`, C = `b3783eef`] Validator gossip bucket A/B.** 18c's fix for 139.2's
+   limiter drop -> lost header -> 250 ms re-send stall: validator-set authors get their own consensus gossip bucket,
+   400 / s burst 400 (`TORUS_CONSENSUS_VALIDATOR_RATE` / `_BURST`), others keep 50 / 50. Shapes T (2/2/1, seed,
+   `BENCH_RPCS=0,1`, 300 s) and S (equal, 100k, `ORACLE_FEED=1`, 600 s), `TORUS_HEADER_RESEND_MS=250`, w1 + ABBA n = 3,
+   plus one B cell with re-send 75 ms; follow-up C (B + lock-order fix + 4 MiB / s validator byte budget), A C C A n = 2.
+   Pass: stall-view share and limiter drops clearly down, commit p99 not worse, matched/s within noise or better; C:
+   B's stall / drop picture within noise and validator drops ~0.
+   **Done s140 (units bench-ozarchy-s140-9g2-chain, bench-ozarchy-s140-9g2-rerun-c-chain,
+   bench-ozarchy-s140-9g2-s-rerun2-chain; run dirs ozarchy-s140-9g2-{t,s,t-rerun,s-rerun,s-rerun2}-run,
+   ozarchy-s140-9g2c-{t,s}-run; nodes A `a50e55f9`, B `b3165a4f`, C `36217bc0`; tools frozen at main `c40992d7`; 12
+   scored + 2 w1 + 2 B75 + 8 C-campaign cells + 5 reruns, all ACCEPT / AGREE / PASS, 0 CHECK FAIL; 4 scored cells
+   FOREIGN (one-off desktop / claude spikes) rerun, S r1-B twice; section 141):** limiter drops in the load window
+   (3 nodes) T 1,249 -> 8, S 2,708 -> 6 (all residual in the validator bucket); stall views (re-send) T 23.5% -> 4.6%,
+   S 25.8% -> 1.5% of wall time; views > 200 ms -15.2 ± 1.7 / -23.1 ± 5.5 pts; blocks/s T 15.97 -> 28.37 (62.6 -> 35.3
+   ms), S 23.43 -> 29.63 (42.7 -> 33.8 ms); commit p99 T 732 -> 523 (-209 ± 69), S 460 -> 265 (-195 ± 31). matched/s
+   T 275,835 -> 269,868 (-2.2%, paired ± 2.8%, Welch p 0.04), S 256,298 -> 252,250 (-1.6% ± 1.4%, Welch p 0.009);
+   CPU / 1k fills +3.2% / +4.8%. B75: 20-40x re-sends, no gain, lowest matched/s. C - A (n = 2): drops T -1,272, S
+   -2,740 (validator drops 3-12 per window), views > 200 ms T 41.7%, S 8.4% (B 44.1 / 10.3), p99 -250 / -216 ms;
+   matched/s -5.5% (T, n.s.) / -4.4% (S, ± 2.0%), blocks/s T 34.2, S 33.9 (more than B): C - B ~-3% not run
+   side by side.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
