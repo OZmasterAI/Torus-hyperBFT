@@ -1071,6 +1071,11 @@ pub struct Metrics {
     /// validators; a rise means a validator exceeds the validator cap.
     /// Exported as `torus_consensus_rate_limited_validator_dropped_total`.
     pub consensus_rate_limited_validator_dropped: Counter,
+    /// s140 review: the subset of `consensus_rate_limited_validator_dropped`
+    /// refused by the validator BYTE budget
+    /// (`TORUS_CONSENSUS_VALIDATOR_BYTE_RATE`) rather than the message cap.
+    /// Exported as `torus_consensus_rate_limited_validator_byte_dropped_total`.
+    pub consensus_rate_limited_validator_byte_dropped: Counter,
 
     // B1 batched direct-to-leader forward (design §1).
     /// RPC-admitted actions whose leader-forward was shed because the BOUNDED
@@ -3320,6 +3325,13 @@ impl Metrics {
             consensus_rate_limited_validator_dropped.clone(),
         );
 
+        let consensus_rate_limited_validator_byte_dropped = Counter::default();
+        registry.register(
+            "torus_consensus_rate_limited_validator_byte_dropped",
+            "Inbound consensus gossip from validator-set authors dropped by the validator byte budget",
+            consensus_rate_limited_validator_byte_dropped.clone(),
+        );
+
         let rpc_forward_dropped_full = Counter::default();
         registry.register(
             "torus_rpc_forward_dropped_full",
@@ -3664,6 +3676,7 @@ impl Metrics {
             consensus_dedup_dropped,
             consensus_rate_limited_dropped,
             consensus_rate_limited_validator_dropped,
+            consensus_rate_limited_validator_byte_dropped,
             rpc_forward_dropped_full,
             d2l_envelopes_sent,
             d2l_envelopes_retried,
@@ -4798,7 +4811,12 @@ mod tests {
     fn consensus_rate_limited_validator_dropped_registers() {
         let m = Metrics::new();
         m.consensus_rate_limited_validator_dropped.inc();
+        m.consensus_rate_limited_validator_byte_dropped.inc();
         let text = m.encode();
+        assert!(
+            text.contains("torus_consensus_rate_limited_validator_byte_dropped_total 1"),
+            "validator byte-budget drop counter not exported:\n{text}"
+        );
         assert!(
             text.contains("torus_consensus_rate_limited_validator_dropped_total 1"),
             "validator rate-limit drop counter not exported:\n{text}"

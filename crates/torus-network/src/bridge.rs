@@ -1362,6 +1362,18 @@ mod tests {
         let vk = SigningKey::from_bytes(&b).verifying_key();
         let author = peer_id_from_verifying_key(&vk);
         const ROUNDS: usize = 100_000;
+        // The mapping must land through the real API, or the flood below
+        // would only ever see `Other` and pass vacuously.
+        {
+            let mut net = net.clone();
+            let mut updates = ValidatorSetUpdates::new();
+            updates.insert(vk, Power::new(1));
+            net.update_validator_set(updates);
+        }
+        assert_eq!(
+            crate::swarm::consensus_author_class(&net.shared, &author),
+            crate::peer_scoring::AuthorClass::Validator
+        );
         let (done_tx, done_rx) = mpsc::channel();
         let updater = {
             let (mut net, done_tx) = (net.clone(), done_tx.clone());
@@ -1369,9 +1381,9 @@ mod tests {
                 for i in 0..ROUNDS {
                     let mut updates = ValidatorSetUpdates::new();
                     if i % 2 == 0 {
-                        updates.insert(vk, Power::new(1));
-                    } else {
                         updates.delete(vk);
+                    } else {
+                        updates.insert(vk, Power::new(1));
                     }
                     net.update_validator_set(updates);
                 }
@@ -1381,10 +1393,16 @@ mod tests {
         let flood = {
             let shared = net.shared.clone();
             std::thread::spawn(move || {
+                let mut validator_hits = 0usize;
                 for _ in 0..ROUNDS {
-                    std::hint::black_box(crate::swarm::consensus_author_class(&shared, &author));
+                    if crate::swarm::consensus_author_class(&shared, &author)
+                        == crate::peer_scoring::AuthorClass::Validator
+                    {
+                        validator_hits += 1;
+                    }
                 }
                 let _ = done_tx.send(());
+                validator_hits
             })
         };
         for _ in 0..2 {
@@ -1397,6 +1415,10 @@ mod tests {
             }
         }
         updater.join().unwrap();
-        flood.join().unwrap();
+        let validator_hits = flood.join().unwrap();
+        assert!(
+            validator_hits > 0,
+            "the flood never saw the author as a validator: the test exercised only `Other`"
+        );
     }
 }

@@ -212,7 +212,13 @@ pub const DEFAULT_CONSENSUS_VALIDATOR_BURST: u32 = 400;
 /// (a header with QC + TC + NEC): ~1.5 KB at N = 3, ~45 KB at N = 100. At the
 /// ~100 msgs/s per-author 1-s peak an honest 3-validator author sends at most
 /// ~0.2 MB/s, so 4 MiB/s is ~20x headroom, while a flooding validator is held
-/// to 4 MiB/s instead of 400 x 1 MiB.
+/// to 4 MiB/s instead of 400 x 1 MiB. At large N it still holds: at N = 100
+/// the largest honest message (~45 KB) fits ~93 per second per author, and a
+/// 100-validator net runs far fewer views per second than the 3-validator
+/// bench (each view needs a 2f+1 quorum round trip), while typical messages
+/// (a header or AdvanceView with one QC, ~N x 65 B = ~6.5 KB) fit ~640 per
+/// second, above the 400/s message cap; raise the knob for N in the
+/// hundreds with TC-heavy views.
 pub const DEFAULT_CONSENSUS_VALIDATOR_BYTE_RATE: u64 = 4 << 20;
 
 /// s140 review: effective `TORUS_CONSENSUS_VALIDATOR_BYTE_RATE` (see

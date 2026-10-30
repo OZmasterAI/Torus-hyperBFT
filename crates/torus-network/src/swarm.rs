@@ -24,7 +24,7 @@ use crate::codec::{
 use crate::config::NetworkConfig;
 use crate::peer::PeerMap;
 use crate::peer_scoring::{
-    AuthorClass, ConsensusRateLimiter, PeerScoring, PENALTY_INVALID_CONSENSUS_MSG,
+    Admission, AuthorClass, ConsensusRateLimiter, PeerScoring, PENALTY_INVALID_CONSENSUS_MSG,
     PENALTY_INVALID_TX, REWARD_BLOCK_RELAY,
 };
 use crate::pending_send::PendingSendQueue;
@@ -1599,16 +1599,21 @@ fn consensus_rate_limit_admit(
     class: AuthorClass,
     bytes: usize,
 ) -> bool {
-    if limiter.check_and_increment_as(author, class, bytes) {
-        return true;
-    }
+    let cap = match limiter.admit(author, class, bytes) {
+        Admission::Admitted => return true,
+        Admission::CountCap => "count",
+        Admission::ByteCap => "bytes",
+    };
     if let Some(m) = metrics {
         m.consensus_rate_limited_dropped.inc();
         if class == AuthorClass::Validator {
             m.consensus_rate_limited_validator_dropped.inc();
+            if cap == "bytes" {
+                m.consensus_rate_limited_validator_byte_dropped.inc();
+            }
         }
     }
-    debug!(%author, ?class, "consensus rate limit exceeded, dropping message");
+    debug!(%author, ?class, cap, bytes, "consensus rate limit exceeded, dropping message");
     false
 }
 
@@ -3942,6 +3947,36 @@ mod tests {
         );
         assert_eq!(metrics.consensus_rate_limited_validator_dropped.get(), 0);
         assert!(metrics.consensus_rate_limited_dropped.get() >= 249);
+        // s140 review: a byte-budget refusal is counted as such. Fresh
+        // validator author, 1 MiB messages: 4 fit the 4 MiB burst, the 5th
+        // is refused by the byte cap, not the count cap.
+        let mut limiter = limiter.with_validator_byte_budget(4 << 20, 4 << 20);
+        let vk2 = test_vk(34);
+        let big = crate::bridge::peer_id_from_verifying_key(&vk2);
+        shared.peer_map.write().unwrap().insert(vk2, big);
+        shared.validators.write().unwrap().insert(vk2.to_bytes());
+        let class = consensus_author_class(&shared, &big);
+        for _ in 0..4 {
+            assert!(consensus_rate_limit_admit(
+                &mut limiter,
+                Some(&metrics),
+                &big,
+                class,
+                1 << 20
+            ));
+        }
+        assert!(!consensus_rate_limit_admit(
+            &mut limiter,
+            Some(&metrics),
+            &big,
+            class,
+            1 << 20
+        ));
+        assert_eq!(metrics.consensus_rate_limited_validator_dropped.get(), 1);
+        assert_eq!(
+            metrics.consensus_rate_limited_validator_byte_dropped.get(),
+            1
+        );
     }
 
     #[test]

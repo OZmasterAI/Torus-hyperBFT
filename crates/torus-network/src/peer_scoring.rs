@@ -186,6 +186,18 @@ pub enum AuthorClass {
     Validator,
 }
 
+/// Outcome of one consensus gossip limiter check (s140 review: which cap
+/// fired, for the drop log and counters).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admission {
+    /// Admitted: a message token (and its bytes, if budgeted) was spent.
+    Admitted,
+    /// Refused by the message-count cap.
+    CountCap,
+    /// Count token available, refused by the class's byte budget.
+    ByteCap,
+}
+
 /// Rate and burst of one bucket class.
 #[derive(Clone, Copy, Debug)]
 struct BucketParams {
@@ -280,6 +292,22 @@ impl ConsensusRateLimiter {
         bytes: usize,
         now: Instant,
     ) -> bool {
+        self.admit_at(peer, class, bytes, now) == Admission::Admitted
+    }
+
+    /// [`Self::check_and_increment_as`], reporting which cap refused.
+    pub fn admit(&mut self, peer: &PeerId, class: AuthorClass, bytes: usize) -> Admission {
+        self.admit_at(peer, class, bytes, Instant::now())
+    }
+
+    /// [`Self::admit`] at an explicit instant (test seam).
+    pub fn admit_at(
+        &mut self,
+        peer: &PeerId,
+        class: AuthorClass,
+        bytes: usize,
+        now: Instant,
+    ) -> Admission {
         let (other, validator) = (self.other, self.validator);
         let params_of = |c: AuthorClass| match c {
             AuthorClass::Other => other,
@@ -318,14 +346,16 @@ impl ConsensusRateLimiter {
         let bytes_ok = params_of(class)
             .bytes
             .is_none_or(|_| bucket.byte_tokens >= bytes as f64);
-        if bucket.tokens >= 1.0 && bytes_ok {
+        if bucket.tokens < 1.0 {
+            Admission::CountCap
+        } else if !bytes_ok {
+            Admission::ByteCap
+        } else {
             bucket.tokens -= 1.0;
             if params_of(class).bytes.is_some() {
                 bucket.byte_tokens -= bytes as f64;
             }
-            true
-        } else {
-            false
+            Admission::Admitted
         }
     }
 
@@ -807,6 +837,31 @@ mod tests {
             .filter(|_| l.check_and_increment_at(&val, AuthorClass::Validator, 100, t2))
             .count();
         assert_eq!(admitted, 400);
+    }
+
+    /// s140 review: the verdict names the cap that fired.
+    #[test]
+    fn admission_names_the_cap() {
+        let mut l = two_class_bytes();
+        let t0 = Instant::now();
+        let p = test_peer(29);
+        let v = AuthorClass::Validator;
+        let big = MIB as usize;
+        for _ in 0..4 {
+            assert_eq!(l.admit_at(&p, v, big, t0), Admission::Admitted);
+        }
+        assert_eq!(l.admit_at(&p, v, big, t0), Admission::ByteCap);
+        let q = test_peer(30);
+        for _ in 0..50 {
+            assert_eq!(
+                l.admit_at(&q, AuthorClass::Other, 10, t0),
+                Admission::Admitted
+            );
+        }
+        assert_eq!(
+            l.admit_at(&q, AuthorClass::Other, 10, t0),
+            Admission::CountCap
+        );
     }
 
     /// s140 review (RED): the byte budget applies to validator authors only;
