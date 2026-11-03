@@ -23723,6 +23723,193 @@ S +9 ms, single cells), and matched/s is the lowest cell of each shape. Not wort
   (the main-chain cells only), `cells9g2c-{t,s}.txt`; FOREIGN (`ozarchy-s140-9v2-tools/analyst/foreign9v2.py`) ->
   `analyst/foreign9g2-{t,s}.txt`, `foreign9g2-rerun-c.txt`, `foreign9g2-rerun2.txt`.
 
+## 142. Step 9g3, validator gossip bucket A/B/C side by side: A = main `c40992d7` vs B = 18c `perf/validator-gossip-bucket` `a685f784` vs C = `perf/validator-gossip-bucket` `96474444` (B's hot path + `b3783eef`'s lock-order fix + 4 MiB / s validator byte budget + a byte-drop counter), each its own binary, `TORUS_HEADER_RESEND_MS=250` on all three; shapes T (2 / 2 / 1, `ORACLE_FEED=seed`, `BENCH_RPCS=0,1`, 300 s) and S (3 equal stakes, 100k genesis, `ORACLE_FEED=1`, 600 s) exactly as 141, w1 + A B C / C B A / A B C (n = 3 per arm) per shape (units bench-ozarchy-s140-9g3-chain, bench-ozarchy-s140-9g3-rerun-chain, bench-ozarchy-s140-9g3-rerun2-chain; run dirs ozarchy-s140-9g3-{t,s,s-rerun,s-rerun2}-run, archy, 2026-10-30 / 31)
+
+**9g3: C = B. Run side by side, C and B are the same within noise in both shapes: matched/s C - B +1.5% ± 8.2 (T)
+and +0.3% ± 1.2 (S) paired (Welch p 0.60 / 0.42), with the same stall and drop picture and the same commit p99. The
+~3% C - B gap of 141.6 was a cross-campaign artifact. C - A matched/s is -2.0% ± 1.1 in S (B -2.3% ± 2.0), as in 141.
+In T both branch arms cost more than in 141: C - A -5.9% ± 2.9, B - A -7.2% ± 8.1. Drops and stalls are as in 141:
+limiter drops in the window T 1,468 -> 5 (B) / 5 (C), S 3,047 -> 4 / 7 (3 nodes, all in the validator bucket).
+Stall views take T 30.0% -> 3.1% / 3.2% and S 31.6% -> 3.1% / 3.3% of wall time. Commit p99 falls T 515 -> 342 /
+328 ms and S 475 -> 249 / 255 ms. C's byte-drop counter stays 0 on every node of every cell.**
+
+| shape, arm | n | views > 200 ms (wall) | stall views (re-send) wall / mean ms | re-send lines | limiter drops in window (3 nodes) | validator / byte drops | empty (content) | matched/s | blocks/s (ms / block) | native blk/s | commit p50 / p99 ms | order age p50 / p99 ms | timeouts | CPU ms / 1k fills |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| T, A | 3 | 51.9% ± 3.9 | 30.0% ± 3.3 / 274 ± 9 | 339 ± 26 | 1,468 ± 147 (all other bucket) | n/a / n/a | 49.0% ± 2.1 | 264,726 ± 2,030 | 17.87 ± 1.46 (56.0) | 11.55 ± 1.40 | 12.0 ± 1.2 / 515 ± 33 | 1,120 ± 818 / 7,889 ± 2,620 | 4, 5, 6 | 24.43 ± 0.36 |
+| T, B | 3 | 16.2% ± 4.2 | 3.1% ± 2.3 / 341 ± 25 | 27 ± 21 | 5.3 ± 2.9 | 5.3 / n/a | 47.6% ± 6.5 | 245,562 ± 23,300 | 33.97 ± 0.76 (29.4) | 21.58 ± 1.75 | 8.7 ± 1.1 / 342 ± 48 | 251 ± 49 / 8,260 ± 1,460 | 4, 5, 3 | 27.88 ± 2.55 |
+| T, C | 3 | 15.9% ± 10.5 | 3.2% ± 4.2 / 342 ± 25 | 29 ± 39 | 5.3 ± 5.2 | 5.3 / 0 | 45.2% ± 8.1 | 248,993 ± 8,330 | 33.23 ± 3.59 (30.1) | 22.01 ± 5.13 | 9.3 ± 1.7 / 328 ± 147 | 240 ± 99 / 7,266 ± 4,820 | 0, 3, 4 | 27.63 ± 1.51 |
+| T, B - A (paired) | 3 | **-35.7 ± 2.8 pts** | **-26.9 ± 1.1 pts / +67 ± 33** | **-311 ± 18** | **-1,463 ± 144** | | -1.4 ± 7.5 pts | -19,160 ± 21,300 (-7.2% ± 8.1) | **+16.10 ± 1.14** | **+10.03 ± 1.62** | **-3.3 ± 2.3 / -173 ± 46** | **-869 ± 801** / +371 ± 1,990 | -1 ± 4.3 | **+3.45 ± 2.38 (+14.1%)** |
+| T, C - A (paired) | 3 | **-36.1 ± 11.5 pts** | **-26.7 ± 7.2 pts / +68 ± 17** | **-309 ± 65** | **-1,463 ± 149** | | -3.8 ± 7.6 pts | **-15,730 ± 7,530 (-5.9% ± 2.9)** | **+15.37 ± 3.48** | **+10.46 ± 4.80** | **-2.6 ± 0.6 / -187 ± 152** | **-880 ± 855** / -623 ± 5,170 | -2.7 ± 2.9 | **+3.20 ± 1.15 (+13.1%)** |
+| T, C - B (paired) | 3 | -0.4 ± 13.8 pts | +0.2 ± 6.1 pts / +1 ± 48 | +2 ± 55 | 0 ± 6.6 | 0 ± 6.6 / - | -2.4 ± 14.6 pts | +3,431 ± 19,500 (+1.5% ± 8.2) | -0.73 ± 2.91 | +0.43 ± 6.38 | +0.6 ± 2.7 / -14 ± 192 | -11 ± 148 / -994 ± 3,690 | -1.7 ± 6.3 | -0.25 ± 2.36 (-0.8%) |
+| S, A | 3 | 38.1% ± 9.1 | 31.6% ± 2.7 / 293 ± 5 | 657 ± 73 | 3,047 ± 194 (all other bucket) | n/a / n/a | 49.1% ± 2.5 | 260,230 ± 2,920 | 22.23 ± 3.59 (45.0) | 22.24 ± 3.51 | 11.7 ± 1.0 / 475 ± 32 | 329 ± 127 / 4,899 ± 414 | 0, 0, 0 | 24.51 ± 0.57 |
+| S, B | 3 | 8.4% ± 3.7 | 3.1% ± 3.1 / 376 ± 51 | 53 ± 55 | 4.0 ± 7.5 | 4.0 / n/a | 41.1% ± 4.9 | 254,229 ± 2,990 | 31.70 ± 1.74 (31.5) | 31.71 ± 1.73 | 11.2 ± 1.4 / 249 ± 13 | 218 ± 21 / 4,685 ± 527 | 0, 0, 0 | 26.33 ± 0.34 |
+| S, C | 3 | 9.4% ± 1.3 | 3.3% ± 0.7 / 384 ± 53 | 57 ± 11 | 7.3 ± 8.7 | 7.3 / 0 | 42.1% ± 4.6 | 254,938 ± 27 | 31.00 ± 3.66 (32.3) | 31.02 ± 3.57 | 11.2 ± 1.8 / 255 ± 18 | 223 ± 6 / 4,798 ± 238 | 0, 0, 0 | 26.24 ± 0.18 |
+| S, B - A (paired) | 3 | **-29.6 ± 10.5 pts** | **-28.6 ± 4.4 pts / +83 ± 51** | **-604 ± 95** | **-3,043 ± 198** | | **-8.0 ± 6.2 pts** | **-6,001 ± 5,220 (-2.3% ± 2.0)** | **+9.47 ± 5.13** | **+9.47 ± 4.97** | -0.4 ± 1.8 / **-226 ± 35** | -111 ± 125 / -214 ± 721 | 0 | **+1.81 ± 0.73 (+7.4%)** |
+| S, C - A (paired) | 3 | **-28.7 ± 10.4 pts** | **-28.4 ± 3.2 pts / +91 ± 50** | **-600 ± 78** | **-3,039 ± 185** | | **-7.0 ± 2.2 pts** | **-5,292 ± 2,910 (-2.0% ± 1.1)** | **+8.77 ± 6.90** | **+8.78 ± 6.76** | -0.4 ± 2.7 / **-220 ± 50** | -107 ± 128 / -101 ± 622 | 0 | **+1.72 ± 0.64 (+7.0%)** |
+| S, C - B (paired) | 3 | +0.9 ± 3.9 pts | +0.2 ± 3.6 pts / +8 ± 100 | +4 ± 65 | +3.3 ± 14.3 | +3.3 ± 14.3 / - | +1.0 ± 8.2 pts | +709 ± 2,970 (+0.3% ± 1.2) | -0.70 ± 3.48 | -0.69 ± 3.49 | 0.0 ± 2.7 / +6 ± 23 | +5 ± 27 / +113 ± 668 | 0 | -0.09 ± 0.50 (-0.3%) |
+
+* ± = 95% t interval, df 2 (n = 3): arm means, and paired X - Y per round (r1, r2, r3 each hold one cell of each arm,
+  in the orders A B C / C B A / A B C); % = the mean of the per-round ratios. Bold = the paired interval excludes 0.
+  Welch (unpaired, `analyst/cells9g3-{t,s}.txt`) on matched/s: T B - A p 0.07, C - A p 0.011, C - B p 0.60; S
+  B - A p 0.003, C - A p 0.016, C - B p 0.42; CPU / 1k T C - B p 0.74, S p 0.38. Definitions are 141's
+  (`analyst/cells9g3.py` = 141's `cells9g2.py` + the byte-drop counter + all three arm pairs): views > 200 ms = wall
+  share of views lasting > 200 ms, mean of the 3 nodes; stall views = views with a `header re-send` line on any node;
+  limiter drops = per node `torus_consensus_rate_limited_dropped_total` at the last 1 Hz scrape at or before t_bench0
+  and t_bench1, summed over the nodes; validator drops = the same for
+  `torus_consensus_rate_limited_validator_dropped_total`, byte drops for
+  `torus_consensus_rate_limited_validator_byte_dropped_total` (C only; A has neither counter, B has no byte counter:
+  n/a); empty = committed blocks with `native=0` on val0; CPU ms / 1k fills = node user + sys per 1,000 fills.
+
+Question (18c, after 141.6): C (the branch head to land) measured -4.4% (S) / -5.5% (T) matched/s vs A at n = 2, about
+3% below B, but never beside B. Is C as fast as B, with B's stall / drop picture? Pass for landing C: C - B matched/s
+within noise; C - A about -2% like B; B's stall / drop picture (stall share and drops way down, p99 not worse);
+validator and byte drops ~0.
+
+### 142.1 Setup
+
+* Binaries: A and B are 141's staged binaries, copied to `ozarchy-s140-9g3-stage/{A,B}` and md5-checked against 141's
+  `build/md5s.txt` (A node `a50e55f9`, bench `67cedc1e`; B node `b3165a4f`, bench `8666d172`; flood `dd59d50d`).
+  C = `96474444` (= `origin/perf/validator-gossip-bucket`, verified at launch), built fresh by
+  `ozarchy-s140-9g3-tools/build/build-9g3c.sh` (copy of 141's `build-9g2c.sh`: fresh detached `wt/bq-96474444`,
+  fresh `CARGO_TARGET_DIR`, `--locked`, `CARGO_INCREMENTAL=0`, under the shared build lock; 283 s): node `2604e277`,
+  bench `7b816e73`, flood `dd59d50d` (`stage/build-c/md5s.txt`).
+* C vs `b3783eef` (141.6's C): `peer_scoring.rs` `admit` returns which cap refused (`Admission::{Admitted, CountCap,
+  ByteCap}`); `swarm.rs` counts a byte-cap refusal also in the new counter
+  `torus_consensus_rate_limited_validator_byte_dropped_total` (a subset of the validator drops) and adds
+  `cap = count | bytes` and the message size to the drop's debug line; telemetry registers the counter; the rest is
+  tests and a doc note. The admission order (count token first, then the byte budget) and the defaults (400 / 400,
+  others 50 / 50, byte rate `4 << 20`) are `b3783eef`'s.
+* Harness: `wt/bq-c40992d7`, as in 141 (`tools/`, `testnet/` and `scripts/` are identical to `origin/main` `e29448b4`:
+  `c40992d7..e29448b4` touches only `docs/`). Specs `ozarchy-s140-9g3-tools/make-specs-9g3.py` from 141's
+  `9g2-{t,s}.json`: same harness env, node env, expectations and shapes; arms A, B (141's) and C (B's arm on binary
+  C); `TORUS_CONSENSUS_VALIDATOR_RATE` / `_BURST` / `_BYTE_RATE` in `absent_env`. Per shape w1 A (300 s, warm-up
+  gate) + r1 A B C, r2 C B A, r3 A B C. One generated driver per shape, both in one unit (`campaign-chain-9g3.sh`:
+  T then S), beside the foreign sampler. `end_pass=0`: make-driver keeps the report scans in-line whenever the spec
+  has a checks file or a `run.log` expectation (as in 141); cells were 7.5 min (T) / 11.5 min (S) apart plus the
+  pacing waits.
+* Checks (`checks/9g3-checks.sh`): `configchk3` + `handoffchk3` + `limchk` (B and C: limiter line `other_rate=50
+  validator_rate=400 validator_burst=400` and the validator counter on all 3 nodes; A: neither) + `bytechk` (C: the
+  limiter line carries `validator_byte_rate=4194304` and `metrics-after-val<n>.txt` exports the byte counter; B and A:
+  neither) + `burstwait`. Tried before launch on 141 cells: A and B pass; 141's C (`b3783eef`, no byte counter) fails
+  `bytechk` as C, and every arm swap fails.
+* Smokes (60 s, arm C, `smoke-chain-9g3.sh`): T 271,808 and S 283,450 matched/s, ACCEPT / AGREE / PASS, every check
+  OK, byte drops 0. First-cell D from the smokes: T 119 s, S 47 s (used 120 / 48).
+* Pacing (`prof/timedwait.py`, 141's `timedwait-c.py` with three changes). (1) The phase seeds come from a pre-launch
+  sample (`prof/phase/foreign-phase-1-9g3.txt`, 21:40-22:02). (2) The 9g2 claude spikes (mm:x8:00 / mm:x5:58) were
+  gone after the host reboot. In their place is the main session's keep-warm cron: claude, about 0.2-0.55 core for
+  2-4 s at mm:x4:09 (`SPIKES = (249,)`, pre / post margin 10 s). A 606 s S window cannot avoid it. (3) A burst vote
+  needs omarchy-agent-u in the interval: quickshell-only spikes from desktop use (21:43:10, 21:56:56, 21:59:23) had
+  outvoted the real phase once. Desktop burst phase mm:01:23 / 16:23 / 31:23 / 46:23, stable all night (12 of 12
+  clusters).
+
+### 142.2 Validity, FOREIGN reruns
+
+* Main chain 22:02-02:16: 20 cells (2 w1, 18 scored), all rc 0, ACCEPT / AGREE / PASS, panic / fail-stop lines 0,
+  node md5 = the arm's staged md5 on all 3 nodes, 0 CHECK FAIL, 0 CELL-FLAG; `limchk` and `bytechk` OK on every cell.
+* FOREIGN (`analyst/foreign9g3-{t,s}.txt`, 9s rule): all 10 T cells clean (max 2 s 0.06-0.22 core). In S, every
+  600 s window holds one keep-warm spike (0.39-0.58 core at mm:x4:09). Three S cells broke the rule. r1-C (0.53 core)
+  and r3-A (0.57) broke it on that spike. r2-C (0.69) broke it on `updatedb` (plocate timer, 00:54:52-59). Reruns
+  from a second timed driver (`ozarchy-s140-9g3-s-rerun`, 02:17-03:01): r1-C and r3-A clean (0.45 / 0.46). r2-C
+  broke it again on the keep-warm spike (0.535), so it ran a third time (`ozarchy-s140-9g3-s-rerun2-r2-C`,
+  03:02-03:16): clean (0.25). All reruns rc 0, ACCEPT / AGREE / PASS, md5 OK, 0 CHECK FAIL. The scored S set: r1-A,
+  r1-B, rerun-r1-C, rerun2-r2-C, r2-B, r2-A, rerun-r3-A, r3-B, r3-C. The replaced cells agree with their reruns:
+  r1-C 254,404 vs 254,931; r2-C 256,119 / 254,794 vs 254,932; r3-A 259,325 vs 260,758 matched/s.
+* Run order: T A 264,991 / 263,809 / 265,378 (flat); B 247,287 / 235,444 / 253,955 and C 246,310 / 247,916 / 252,752
+  (r3 highest for both, B r2 the low outlier). S flat: A 261,049 / 258,883 / 260,758, B 252,843 / 254,862 / 254,982,
+  C 254,931 / 254,932 / 254,950.
+
+### 142.3 Per cell (matched/s, blocks/s, ms per block) and per-node drops
+
+T (300 s):
+
+| cell | arm | matched/s | blocks/s | ms / block |
+|---|---|---|---|---|
+| w1 | A | 260,741 | 18.3 | 54.6 |
+| r1-A | A | 264,991 | 18.1 | 55.2 |
+| r1-B | B | 247,287 | 34.3 | 29.2 |
+| r1-C | C | 246,310 | 34.9 | 28.7 |
+| r2-C | C | 247,916 | 32.5 | 30.8 |
+| r2-B | B | 235,444 | 33.7 | 29.7 |
+| r2-A | A | 263,809 | 17.2 | 58.1 |
+| r3-A | A | 265,378 | 18.3 | 54.6 |
+| r3-B | B | 253,955 | 33.9 | 29.5 |
+| r3-C | C | 252,752 | 32.3 | 31.0 |
+| mean A / B / C | | 264,726 / 245,562 / 248,993 | 17.87 / 33.97 / 33.23 | 56.0 / 29.4 / 30.1 |
+
+S (600 s; w1 300 s):
+
+| cell | arm | matched/s | blocks/s | ms / block |
+|---|---|---|---|---|
+| w1 | A | 262,789 | 22.8 | 43.9 |
+| r1-A | A | 261,049 | 21.3 | 46.9 |
+| r1-B | B | 252,843 | 31.7 | 31.5 |
+| rerun-r1-C | C | 254,931 | 32.6 | 30.7 |
+| rerun2-r2-C | C | 254,932 | 29.7 | 33.7 |
+| r2-B | B | 254,862 | 31.0 | 32.3 |
+| r2-A | A | 258,883 | 23.9 | 41.8 |
+| rerun-r3-A | A | 260,758 | 21.5 | 46.5 |
+| r3-B | B | 254,982 | 32.4 | 30.9 |
+| r3-C | C | 254,950 | 30.7 | 32.6 |
+| mean A / B / C | | 260,230 / 254,229 / 254,938 | 22.23 / 31.70 / 31.00 | 45.0 / 31.5 / 32.3 |
+
+* `torus_consensus_rate_limited_dropped_total` per node at the start -> end of the load window (val0 / val1 / val2).
+  On B and C the validator counter equals it on every node of every cell, and on C the byte counter is 0 -> 0
+  everywhere. T A r1 464->926 / 461->935 / 462->1037, r2 442->908 / 438->906 / 439->998, r3 419->859 / 413->852 /
+  415->937; T B r1 95->97 / 97->99 / 106->108, r2 94->95 / 92->94 / 106->109, r3 101->102 / 101->102 / 118->120; T C
+  r1 102->102 / 101->102 / 119->121, r2 114->114 / 112->116 / 119->122, r3 107->109 / 106->108 / 119->121. S A r1
+  125->1134 / 122->1158 / 123->1120, r2 115->1183 / 111->1136 / 111->1145, rerun-r3 111->1116 / 108->1116 /
+  107->1065; S B r1 15->16 / 15->17 / 15->19, r2 15->15 / 14->14 / 16->17, r3 18->19 / 18->20 / 20->21; S C rerun-r1
+  15->16 / 14->17 / 16->19, rerun2-r2 12->16 / 14->18 / 13->16, r3 14->15 / 13->15 / 15->16. B and C drop 0-4 per
+  node per cell. The 90-120 (T) / 12-20 (S) already counted at the load start are startup / preload, as in 141.
+
+### 142.4 Reading
+
+* The 141.6 C - B gap is gone. Run side by side in the same hours, C and B agree on every metric: matched/s, blocks/s,
+  stall share, drops, p50 / p99, order age, CPU per 1k fills. Every paired C - B interval includes 0, and every Welch
+  p is >= 0.16 (the lowest is empty-block share). In S, the shape with the tight intervals, C - B is +0.3% ± 1.2 matched/s and +6 ± 23 ms p99. The
+  lock-order change and the byte budget cost nothing measurable. The byte budget never refuses a message at this
+  load (byte drops 0 on every node of every C cell).
+* S repeats 141: the validator bucket costs about 2% matched/s (B -2.3%, C -2.0%; both intervals exclude 0). It runs
+  ~40% more blocks/s, emptier blocks by count (-7 to -8 pts) and +7% CPU per 1k fills. 141.6's C at -4.4% (n = 2,
+  other hours) was low for its campaign, not for the code.
+* T this time: the branch arms cost -6 to -7% vs A, not 141's -2.2%. A ran 4.0% lower than in 141 (264,726 vs
+  275,835), with more stall share (30.0% vs 23.5%) and more timeouts (4-6 per cell vs 0-1). B and C ran 9% lower than
+  141's B (245,562 / 248,993 vs 269,868), at more blocks/s (34.0 / 33.2 vs 28.4) and +13-14% CPU per 1k fills vs A
+  (141: +3%). In both shapes the branch's throughput cost follows the block count: more blocks per s at the same load
+  means more fixed per-block work. T's block count rose more this run than in 141. The run gives no cause for the
+  T shift; the host had been rebooted 9 minutes before the build. C and B shifted together, so C - B is unaffected.
+* Stalls and drops: unchanged from 141 for both branch arms. Drops ~0 (4-7 per window over 3 nodes, all in the
+  validator bucket). Stall views ~3% of wall time (A 30-32%). Views > 200 ms down 29-36 pts. Commit p99 down 173-226
+  ms. Order age p50 down (T ~870 ms, S ~110 ms).
+
+Pass for landing C:
+
+| criterion | T | S | verdict |
+|---|---|---|---|
+| C - B matched/s within noise | +1.5% ± 8.2 (Welch p 0.60) | +0.3% ± 1.2 (p 0.42) | **PASS** |
+| C - A about -2% like B | -5.9% ± 2.9 vs B -7.2% ± 8.1 | -2.0% ± 1.1 vs B -2.3% ± 2.0 | **PASS in S; in T C = B but both ~-6%, not -2%** |
+| B's stall / drop picture, p99 not worse | stall 3.2% (B 3.1, A 30.0); drops 5.3 (B 5.3); p99 328 (B 342, A 515) | stall 3.3% (B 3.1, A 31.6); drops 7.3 (B 4.0); p99 255 (B 249, A 475) | **PASS** |
+| validator + byte drops ~0 | validator 3-7 per window, byte 0 | validator 6-11 per window, byte 0 | **PASS** |
+
+### 142.5 Caveats
+
+* n = 3 per arm. T's branch-arm cells are noisy: B r2 235,444, and the C - B T interval is ± 8%. S is the firm shape.
+* T moved against 141 for every arm (A -4%, B / C -8 to -9%), and the cause is not known. It may be the post-reboot
+  host state or the hour; this campaign has no data to test either. The verdict uses only within-campaign pairs.
+* The keep-warm cron (claude, ~0.4-0.55 core for 2-4 s once per 10 min) lands in every S window. The FOREIGN rule
+  replaced 3 cells (one twice), and the replaced cells match their reruns within 0.6%.
+* Validator bucket / byte budget at defaults only; at this load the byte budget never fires, so its cap is untested.
+
+### 142.6 Files
+
+* Tools `ozarchy-s140-9g3-tools/`: `make-specs-9g3.py`, `specs/` (9g3-{t,s}, 9g3-{t,s}-smkc, 9g3-s-rerun,
+  9g3-s-rerun2), `drivers/` (+ `.gen` / `.dry` / `.show` logs), `smoke-chain-9g3.sh`, `campaign-chain-9g3.sh`,
+  `campaign-chain-9g3-rerun.sh`, `campaign-chain-9g3-rerun2.sh`, `checks/9g3-checks.sh`, `prof/` (`timedwait.py`,
+  `foreign-sampler.py`, `run-with-sampler.sh`, `phase/foreign-phase-1-9g3.txt`), `build/build-9g3c.sh` + `build-c.log`;
+  analysis `analyst/cells9g3.py` -> `cells9g3-{t,s}.txt` (scored sets), `cells9g3-s-replaced.txt` (the FOREIGN-replaced
+  cells); `analyst/foreign9g3.py` (= 140's `foreign9v2.py`) -> `foreign9g3-{t,s,s-rerun,s-rerun2}.txt`.
+  Stage `ozarchy-s140-9g3-stage/{A,B,C}`, `build/md5s.txt` (A, B), `build-c/md5s.txt` (C).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

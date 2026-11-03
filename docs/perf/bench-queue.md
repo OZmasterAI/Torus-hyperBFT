@@ -1370,6 +1370,24 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    -2,740 (validator drops 3-12 per window), views > 200 ms T 41.7%, S 8.4% (B 44.1 / 10.3), p99 -250 / -216 ms;
    matched/s -5.5% (T, n.s.) / -4.4% (S, ± 2.0%), blocks/s T 34.2, S 33.9 (more than B): C - B ~-3% not run
    side by side.
+9g3. **[DONE s140, section 142: C = B (matched/s C - B +1.5% T / +0.3% S, n.s.); stalls / drops / p99 PASS; validator
+   drops ~0, byte drops 0; C - A -2.0% S (like B), -5.9% T (B -7.2%)] [GO s140, owner, A = main `c40992d7`, B =
+   `perf/validator-gossip-bucket` `a685f784`, C = `96474444`] Validator gossip bucket A/B/C side by side.** Settles
+   141.6's cross-campaign C - B gap before landing C (= B + lock-order fix + 4 MiB / s validator byte budget +
+   byte-drop counter `torus_consensus_rate_limited_validator_byte_dropped_total`). Shapes T / S as 9g2,
+   `TORUS_HEADER_RESEND_MS=250`, w1 + A B C / C B A / A B C, n = 3 per arm. Pass: C - B matched/s within noise, C - A
+   about -2% like B, B's stall / drop picture, validator + byte drops ~0.
+   **Done s140 (units bench-ozarchy-s140-9g3-chain, bench-ozarchy-s140-9g3-rerun-chain,
+   bench-ozarchy-s140-9g3-rerun2-chain; run dirs ozarchy-s140-9g3-{t,s,s-rerun,s-rerun2}-run; nodes A `a50e55f9`, B
+   `b3165a4f` (141's binaries), C `2604e277`; harness `wt/bq-c40992d7` (= `e29448b4` outside docs); 18 scored + 2 w1
+   + 4 reruns, all ACCEPT / AGREE / PASS, 0 CHECK FAIL; 3 S cells FOREIGN (keep-warm claude spike x2, updatedb x1)
+   rerun, S r2-C twice; T all clean; section 142):** matched/s A / B / C T 264,726 / 245,562 / 248,993, S 260,230 /
+   254,229 / 254,938; C - B paired T +3,431 ± 19,500 (+1.5% ± 8.2), S +709 ± 2,970 (+0.3% ± 1.2); C - A T -5.9% ±
+   2.9, S -2.0% ± 1.1 (B - A -7.2% ± 8.1 / -2.3% ± 2.0). Window drops (3 nodes) T 1,468 -> 5.3 / 5.3, S 3,047 -> 4.0
+   / 7.3 (all validator bucket; byte 0); stall views T 30.0% -> 3.1 / 3.2%, S 31.6% -> 3.1 / 3.3%; commit p99 T 515
+   -> 342 / 328, S 475 -> 249 / 255 ms; blocks/s T 17.9 -> 34.0 / 33.2, S 22.2 -> 31.7 / 31.0; CPU / 1k fills vs A T
+   +14% / +13%, S +7.4% / +7.0%. T ran lower than in 141 for every arm (A -4%, B / C -8..-9%, more blocks/s and stalls),
+   cause unknown; C and B moved together.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
