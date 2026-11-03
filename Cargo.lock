@@ -1081,6 +1081,7 @@ dependencies = [
  "bincode",
  "clap",
  "ed25519-dalek",
+ "futures",
  "hex",
  "k256",
  "rand 0.8.5",

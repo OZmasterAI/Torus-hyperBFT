@@ -25,6 +25,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 bincode = { workspace = true }
 tokio = { workspace = true }
+# FuturesOrdered: the in-flight tail's ordered read-ahead (--in-flight-tail-depth).
+futures = "0.3"
 clap = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }

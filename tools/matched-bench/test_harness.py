@@ -447,6 +447,7 @@ class SummarizeTest(unittest.TestCase):
                 "tail_errors": 12,
                 "tail_missed": 1,
                 "tail_mode": "head",
+                "tail_depth": 1,
             },
         )
 
@@ -470,6 +471,179 @@ class SummarizeTest(unittest.TestCase):
         self.assertIsNone(s["cell"]["in_flight_tail"], "unset = flag omitted")
         self.assertEqual(s["ingest"]["in_flight"]["tail_mode"], "head")
 
+    # bench --max-in-flight release timing (feat/bench-release-timing, s121):
+    # the lines exactly as release_timing.rs window_and_hist_lines_are_stable
+    # prints them, plus one key and one histogram the bench does not print yet
+    # (a later bench adding fields must come through without a summarize.py
+    # change).
+    BENCH_LOG_RELEASE_TIMING = (
+        "release-timing: t=15.0 wall_ms=1760000015000 final=0 released=4 "
+        "age_p50_ms=416 age_p90_ms=1600 age_p99_ms=1600 age_max_ms=1600 ready_calls=3 "
+        "wait_cap_n=2 wait_cap_s=0.006 wait_cap_p50_ms=1.0 wait_cap_p99_ms=4.9 "
+        "wait_cancel_n=1 wait_cancel_s=0.002 wait_cancel_p50_ms=2.0 wait_cancel_p99_ms=2.0 "
+        "tail_rounds=2 tail_fetched=3 tail_fetch_max=2 tail_round_p50_ms=4.0 "
+        "tail_round_max_ms=12.0 tail_lag_max=3 tail_body_p50_ms=3.2\n"
+        # feat/bench-tail-depth blocks line: fetch_ms and applied before seen.
+        "release-timing-blocks: t=15.0 fetch_ms=7:3,8:4,9:2 "
+        "applied=7@1001,8@1051,9@1301 seen=7@1000,8@1050,9@1300\n"
+        "release-timing: t=30.0 wall_ms=1760000030000 final=1 released=0 "
+        "age_p50_ms=- age_p90_ms=- age_p99_ms=- age_max_ms=- ready_calls=0 "
+        "wait_cap_n=0 wait_cap_s=0.000 wait_cap_p50_ms=- wait_cap_p99_ms=- "
+        "wait_cancel_n=0 wait_cancel_s=0.000 wait_cancel_p50_ms=- wait_cancel_p99_ms=- "
+        "tail_rounds=0 tail_fetched=0 tail_fetch_max=- tail_round_p50_ms=- "
+        "tail_round_max_ms=- tail_lag_max=-\n"
+        "release-timing-blocks: t=30.0 seen=\n"
+        "release-timing-hist: what=age_ms n=4 sum=3320 p50=416 p90=1600 p99=1600 "
+        "p999=1600 max=1600 buckets=400:1,416:1,896:1,1600:1\n"
+        "release-timing-hist: what=wait_cancel_us n=0 sum=0 p50=- p90=- p99=- p999=- "
+        "max=- buckets=\n"
+        "release-timing-hist: what=tail_body_us n=1 sum=3200 p50=3200 p90=3200 "
+        "p99=3200 p999=3200 max=3200 buckets=3200:1\n"
+    )
+
+    def test_release_timing_lines_are_summarized(self):
+        write_cell(self.d, 1_000, 1_000)
+        write_agreement(self.d, ["same"] * 3)
+        with open(os.path.join(self.d, "bench.log"), "w") as f:
+            f.write(self.BENCH_LOG_CAPPED + self.BENCH_LOG_RELEASE_TIMING)
+        s, _ = run_summarize(self.d, extra=["--max-in-flight", "1"])
+        rt = s["ingest"]["release_timing"]
+        w0, w1 = rt["windows"]
+        self.assertEqual(w0["t"], 15.0)
+        self.assertEqual(w0["wall_ms"], 1760000015000)
+        self.assertEqual(w0["final"], 0)
+        self.assertEqual(w0["released"], 4)
+        self.assertEqual(w0["age_p50_ms"], 416)
+        self.assertEqual(w0["wait_cap_s"], 0.006)
+        self.assertEqual(w0["tail_fetch_max"], 2)
+        self.assertEqual(w0["tail_round_max_ms"], 12.0)
+        self.assertEqual(w0["tail_body_p50_ms"], 3.2, "unknown keys pass through")
+        self.assertEqual(len(w0), 24, "23 printed today + tail_body_p50_ms")
+        self.assertEqual(w1["final"], 1)
+        self.assertIsNone(w1["age_p50_ms"], "'-' = no sample in the window")
+        self.assertIsNone(w1["tail_lag_max"])
+        self.assertEqual(w1["wait_cap_s"], 0.0)
+        # Seen heights stay in bench.log (offline join with the commit log).
+        self.assertEqual(rt["seen_bodies"], 3)
+        self.assertEqual(
+            rt["hist"]["age_ms"],
+            {
+                "n": 4,
+                "sum": 3320,
+                "p50": 416,
+                "p90": 1600,
+                "p99": 1600,
+                "p999": 1600,
+                "max": 1600,
+                "buckets": [[400, 1], [416, 1], [896, 1], [1600, 1]],
+            },
+        )
+        self.assertEqual(
+            rt["hist"]["wait_cancel_us"],
+            {
+                "n": 0,
+                "sum": 0,
+                "p50": None,
+                "p90": None,
+                "p99": None,
+                "p999": None,
+                "max": None,
+                "buckets": [],
+            },
+        )
+        self.assertEqual(
+            rt["hist"]["tail_body_us"]["p50"], 3200, "unknown hists pass through"
+        )
+        # A bench without release timing (or cap off): None, not an empty dict.
+        with open(os.path.join(self.d, "bench.log"), "w") as f:
+            f.write(self.BENCH_LOG_CAPPED)
+        s, _ = run_summarize(self.d, extra=["--max-in-flight", "1"])
+        self.assertIsNone(s["ingest"]["release_timing"])
+
+    def test_deep_tail_cell_records_the_tail_depth(self):
+        """IN_FLIGHT_TAIL_DEPTH -> cell.in_flight_tail_depth (None = unset =
+        the bench default, 1) and, from bench.log's ' | tail_depth=N' suffix
+        (printed only for N > 1), ingest.in_flight.tail_depth."""
+        write_cell(self.d, 1_000, 1_000)
+        write_agreement(self.d, ["same"] * 3)
+        with open(os.path.join(self.d, "bench.log"), "w") as f:
+            f.write(
+                self.BENCH_LOG_CAPPED.replace(
+                    "missed=1\n", "missed=1 | tail=commit | tail_depth=4\n"
+                )
+            )
+        s, _ = run_summarize(
+            self.d,
+            extra=[
+                "--max-in-flight",
+                "1",
+                "--in-flight-tail",
+                "commit",
+                "--in-flight-tail-depth",
+                "4",
+            ],
+        )
+        self.assertEqual(s["cell"]["in_flight_tail_depth"], 4)
+        self.assertEqual(s["ingest"]["in_flight"]["tail_depth"], 4)
+        self.assertEqual(s["ingest"]["in_flight"]["tail_mode"], "commit")
+        # Head mode: the depth suffix alone is not a tail mode.
+        with open(os.path.join(self.d, "bench.log"), "w") as f:
+            f.write(
+                self.BENCH_LOG_CAPPED.replace("missed=1\n", "missed=1 | tail_depth=2\n")
+            )
+        s, _ = run_summarize(
+            self.d, extra=["--max-in-flight", "1", "--in-flight-tail-depth", "2"]
+        )
+        self.assertEqual(s["ingest"]["in_flight"]["tail_mode"], "head")
+        self.assertEqual(s["ingest"]["in_flight"]["tail_depth"], 2)
+        # Unset: no suffix, depth 1.
+        with open(os.path.join(self.d, "bench.log"), "w") as f:
+            f.write(self.BENCH_LOG_CAPPED)
+        s, _ = run_summarize(self.d, extra=["--max-in-flight", "1"])
+        self.assertIsNone(s["cell"]["in_flight_tail_depth"], "unset = flag omitted")
+        self.assertEqual(s["ingest"]["in_flight"]["tail_depth"], 1)
+
+    def test_resummarize_keeps_the_oracle_feed_block(self):
+        """run-cell.sh adds summary.json .oracle_feed AFTER summarize.py; a
+        resummarize rebuilds summary.json, so it must carry the block over
+        (archy p4tail10: it was dropped). A cell without one gets none."""
+        write_cell(self.d, 1_000, 1_000)
+        write_agreement(self.d, ["same"] * 3)
+        with open(os.path.join(self.d, "bench.log"), "w") as f:
+            f.write(self.BENCH_LOG_CAPPED + self.BENCH_LOG_RELEASE_TIMING)
+        run_summarize(self.d, extra=["--max-in-flight", "1"])
+        p = os.path.join(self.d, "summary.json")
+        with open(p) as f:
+            d = json.load(f)
+        feed = {
+            "oracle_feed": 1,
+            "sent": 120,
+            "accepted": 118,
+            "stale_marks_at_bench_end": 0,
+        }
+        d["oracle_feed"] = feed
+        with open(p, "w") as f:
+            json.dump(d, f)
+
+        def resummarize():
+            r = subprocess.run(
+                ["bash", os.path.join(HERE, "resummarize.sh"), self.d],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            with open(p) as f:
+                return json.load(f)
+
+        s = resummarize()
+        self.assertEqual(s["oracle_feed"], feed)
+        self.assertEqual(s["ingest"]["release_timing"]["seen_bodies"], 3, "rebuilt")
+        del s["oracle_feed"]
+        with open(p, "w") as f:
+            json.dump(s, f)
+        self.assertNotIn("oracle_feed", resummarize())
+
     def test_rpc_max_response_mb_comes_from_the_node_env(self):
         write_cell(self.d, 1_000, 1_000)
         write_agreement(self.d, ["same"] * 3)
@@ -489,6 +663,7 @@ class SummarizeTest(unittest.TestCase):
         s, _ = run_summarize(self.d)
         self.assertIsNone(s["cell"]["max_in_flight"])
         self.assertIsNone(s["cell"]["in_flight_tail"])
+        self.assertIsNone(s["cell"]["in_flight_tail_depth"])
         self.assertIsNone(s["cell"]["open_order_budget"])
         self.assertIsNone(s["ingest"]["bench_submit_rate"])
         self.assertIsNone(s["ingest"]["econ_mix"])
@@ -1145,6 +1320,80 @@ class CrashKillGuardTest(unittest.TestCase):
             self.assertIn("FATAL", r.stderr)
         r = run(IN_FLIGHT_TAIL="commit")
         self.assertEqual(r.returncode, 2, "commit tail without MAX_IN_FLIGHT")
+        self.assertIn("FATAL", r.stderr)
+
+    def test_in_flight_tail_depth_reaches_the_bench_only_when_set(self):
+        """IN_FLIGHT_TAIL_DEPTH=N -> bench --in-flight-tail-depth N (body
+        reads the in-flight tail keeps in flight; applied in height order).
+        Unset (default) = flag omitted, so older bench binaries still run.
+        Positive integer <= 64, needs MAX_IN_FLIGHT. Validated, logged,
+        allowlisted in campaign/run_cell.py, recorded as
+        cell.in_flight_tail_depth (also on resummarize). The tail stays on
+        val2 (RPCS[2])."""
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        self.assertIn("IN_FLIGHT_TAIL_DEPTH=${IN_FLIGHT_TAIL_DEPTH:-}", src)
+        self.assertIn("in_flight_tail_depth='${IN_FLIGHT_TAIL_DEPTH:-unset}'", src)
+        self.assertIn('--in-flight-tail-depth "${IN_FLIGHT_TAIL_DEPTH:-}"', src)
+        self.assertLess(
+            src.index("#   IN_FLIGHT_TAIL_DEPTH="), src.index("set -uo pipefail")
+        )
+        with open(os.path.join(HERE, "campaign", "run_cell.py")) as f:
+            self.assertIn('"IN_FLIGHT_TAIL_DEPTH",', f.read())
+        with open(os.path.join(HERE, "resummarize.sh")) as f:
+            self.assertIn(
+                '--in-flight-tail-depth "$(j \'.cell.in_flight_tail_depth // ""\')"',
+                f.read(),
+            )
+        lines = [
+            l
+            for l in src.splitlines()
+            if ("IN_FLIGHT_TAIL" in l or "MAX_IN_FLIGHT" in l)
+            and not l.lstrip().startswith(
+                ("#", "log ", "--", "python3", "if ", "export ")
+            )
+        ]
+        snippet = (
+            "RPCS=(http://127.0.0.1:8645 http://127.0.0.1:8646 http://127.0.0.1:8647)\n"
+            "BENCH_CMD=()\n" + "\n".join(lines) + '\necho "${BENCH_CMD[*]}"'
+        )
+
+        def run(**env):
+            base = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("MAX_IN_FLIGHT", "IN_FLIGHT_TAIL", "IN_FLIGHT_TAIL_DEPTH")
+            }
+            return subprocess.run(
+                ["bash", "-c", snippet],
+                capture_output=True,
+                text=True,
+                env=dict(base, **env),
+            )
+
+        watch = "--max-in-flight 4 --in-flight-watch-rpc http://127.0.0.1:8647"
+        r = run(MAX_IN_FLIGHT="4")
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, watch), r.stderr)
+        self.assertNotIn("--in-flight-tail-depth", r.stdout, "unset = flag absent")
+        for n in ("1", "4", "64"):
+            r = run(MAX_IN_FLIGHT="4", IN_FLIGHT_TAIL_DEPTH=n)
+            self.assertEqual(
+                (r.returncode, r.stdout.strip()),
+                (0, f"{watch} --in-flight-tail-depth {n}"),
+                r.stderr,
+            )
+        r = run(MAX_IN_FLIGHT="4", IN_FLIGHT_TAIL="commit", IN_FLIGHT_TAIL_DEPTH="4")
+        self.assertEqual(
+            r.stdout.strip(),
+            f"{watch} --in-flight-tail commit --in-flight-tail-depth 4",
+            r.stderr,
+        )
+        for bad in ("x", "0", "-1", "1.5", "65", "04"):
+            r = run(MAX_IN_FLIGHT="4", IN_FLIGHT_TAIL_DEPTH=bad)
+            self.assertEqual(r.returncode, 2, (bad, r.stdout, r.stderr))
+            self.assertIn("FATAL", r.stderr)
+        r = run(IN_FLIGHT_TAIL_DEPTH="4")
+        self.assertEqual(r.returncode, 2, "a deep tail without MAX_IN_FLIGHT")
         self.assertIn("FATAL", r.stderr)
 
     def test_max_in_flight_raises_the_node_rpc_response_cap(self):
