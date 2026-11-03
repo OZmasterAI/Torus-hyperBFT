@@ -2350,3 +2350,7 @@ mod cross_chain_timeout_test;
 #[cfg(test)]
 #[path = "leader_exclusion_test.rs"]
 mod leader_exclusion_test;
+
+#[cfg(test)]
+#[path = "tick_vset_cache_test.rs"]
+mod tick_vset_cache_test;
