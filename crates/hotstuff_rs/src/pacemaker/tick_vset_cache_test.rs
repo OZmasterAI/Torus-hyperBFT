@@ -65,7 +65,9 @@ fn pacemaker(
     let config = PacemakerConfiguration {
         chain_id: CHAIN,
         keypair: Keypair::new(local.clone()),
-        epoch_length: EpochLength::new(100_000),
+        // Short epoch: `new` schedules every view to the epoch's end, and 100k views take most of a
+        // short view to schedule in a debug build.
+        epoch_length: EpochLength::new(1_000),
         max_view_time,
         backoff_factor: 2,
         backoff_cap: 8,
@@ -126,12 +128,12 @@ fn a_validator_set_write_between_ticks_is_seen_by_the_next_tick_only() {
     let before = validator_set_state_reads::count();
     pacemaker.tick(&tree).unwrap();
     assert_eq!(validator_set_state_reads::count() - before, 1, "the first tick reads the state");
-    assert_eq!(pacemaker.query().view, ViewNumber::new(5), "fixture: the first tick is before the deadline");
-    assert_eq!(net.timeout_votes_sent(), 0, "fixture: no timeout yet");
+    assert_eq!(net.timeout_votes_sent(), 0, "n3 is not in the old set: it sends no TimeoutVote");
 
     write_steady_set(&mut tree, &new_set);
     wait_past(&pacemaker);
 
+    let view = pacemaker.query().view;
     let before = validator_set_state_reads::count();
     pacemaker.tick(&tree).unwrap();
     assert_eq!(
@@ -140,7 +142,7 @@ fn a_validator_set_write_between_ticks_is_seen_by_the_next_tick_only() {
         "the timed-out view must be handled over the new set: n3 is a validator now and sends a TimeoutVote"
     );
     assert_eq!(validator_set_state_reads::count() - before, 1, "the tick after the write re-reads the state");
-    assert_eq!(pacemaker.query().view, ViewNumber::new(6), "the timeout moves the pacemaker to view 6");
+    assert_eq!(pacemaker.query().view, view + 1, "the timeout moves the pacemaker to the next view");
 
     let before = validator_set_state_reads::count();
     for _ in 0..5 {

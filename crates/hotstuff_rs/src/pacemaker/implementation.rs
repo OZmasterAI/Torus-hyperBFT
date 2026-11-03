@@ -9,7 +9,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::mpsc::Sender,
+    sync::{mpsc::Sender, Arc},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -60,6 +60,13 @@ pub(crate) struct Pacemaker<N: Network> {
     view_info: ViewInfo,
     sender: SenderHandle<N>,
     event_publisher: Option<Sender<Event>>,
+    /// perf/pacemaker-vset-cache: the block tree's validator-set state as [`tick`](Self::tick) last
+    /// read it, with the tree's
+    /// [validator-set state generation](BlockTreeSingleton::validator_set_state_generation) at that
+    /// read. `tick` runs on every pass of the algorithm loop and reads the state again only when the
+    /// generation differs (any write of the state, block sync's included, and any other tree
+    /// instance give a new generation). `None` until the first tick.
+    tick_validator_set_state: Option<(u64, Arc<ValidatorSetState>)>,
 }
 
 impl<N: Network> Pacemaker<N> {
@@ -83,6 +90,7 @@ impl<N: Network> Pacemaker<N> {
             view_info,
             sender,
             event_publisher,
+            tick_validator_set_state: None,
         })
     }
 
@@ -98,7 +106,16 @@ impl<N: Network> Pacemaker<N> {
         block_tree: &BlockTreeSingleton<K>,
     ) -> Result<(), PacemakerError> {
         let cur_view = self.view_info.view;
-        let validator_set_state = block_tree.validator_set_state()?;
+        // A state read is ~5 KV gets and 2 validator-set deserializations: only when it changed.
+        let generation = block_tree.validator_set_state_generation();
+        let validator_set_state = match &self.tick_validator_set_state {
+            Some((read_at, state)) if *read_at == generation => Arc::clone(state),
+            _ => {
+                let state = Arc::new(block_tree.validator_set_state()?);
+                self.tick_validator_set_state = Some((generation, Arc::clone(&state)));
+                state
+            }
+        };
 
         // 1. Check if the current view has timed out.
         if Instant::now() > self.view_info.deadline {
