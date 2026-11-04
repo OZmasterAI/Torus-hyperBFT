@@ -26223,6 +26223,40 @@ mod crash_recovery_tests {
         buf
     }
 
+    /// Item 3 (`TORUS_EMPTY_PROPOSAL_WAIT_MS`): the leader may hold an empty proposal only when
+    /// nothing could be selected for its block. The native pool is non-destructive, so actions
+    /// already carried by this proposer's in-flight blocks stay pooled until they commit: they do
+    /// not count. Any pending EVM transaction counts.
+    #[test]
+    fn nothing_to_propose_skips_in_flight_actions_and_counts_evm() {
+        let (config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(Mempool::new(state_db.clone(), torus_mempool::MempoolConfig::default()));
+        let mut app = TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
+        assert!(app.nothing_to_propose(), "both pools empty");
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let key = k256::ecdsa::SigningKey::from_slice(&[61u8; 32]).unwrap();
+        let action = torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, nonce, &key);
+        let sender = action.recover_sender().unwrap();
+        mempool.add_native_action_presigned(sender, action.clone()).unwrap();
+        assert!(!app.nothing_to_propose(), "a pooled action no block carries yet");
+
+        let hash = torus_types::compute_action_hash_with_scratch(&action, &mut Vec::new());
+        app.in_flight_hashes.note(1, [hash]);
+        assert!(
+            app.nothing_to_propose(),
+            "the only pooled action is in this proposer's in-flight block: nothing new to propose"
+        );
+
+        let evm_key = k256::ecdsa::SigningKey::from_slice(&[62u8; 32]).unwrap();
+        let to = alloy_primitives::TxKind::Call(Address::repeat_byte(0x42));
+        mempool.add_evm_tx(signed_eip1559_gas(&evm_key, 0, to, vec![], U256::ZERO, 100_000)).unwrap();
+        assert!(!app.nothing_to_propose(), "a pending EVM transaction");
+    }
+
     /// Out-of-batch fixture (Task 0 (a)-(c)), epoch_length 4:
     ///   1  EVM contract creation (bundle: accounts + storage)   serial
     ///   2  empty + a buffered equivocation slash                 serial marker
