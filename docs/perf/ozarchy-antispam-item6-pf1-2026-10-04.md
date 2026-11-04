@@ -24021,6 +24021,179 @@ Lag = every 0.1 s in t0 + 10 s .. t0 + 300 s, val2's committed height minus the 
 
 * Tools `ozarchy-s140-9g4-tools/`: `make-specs-9g4.py`, `specs/` (9g4-t, 9g4-smk-{A1, A4, C4, A8, C8}, 9g4-t-rerun, 9g4-t-depth4-notrun), `drivers/`, `smoke-chain-9g4.sh`, `campaign-chain-9g4.sh`, `campaign-chain-9g4-rerun.sh`, `checks/9g4-checks.sh`, `prof/` (`timedwait.py`, `foreign-sampler.py`, `run-with-sampler.sh`, `phase/foreign-phase-1-9g4.txt`), `build/` (`build-9g4.sh`, `stage-9g4.sh`, `build.log`). Analysis `analyst/cells9g4.py` -> `cells9g4-t.txt` (scored set), `cells9g4-t-replaced.txt` (FOREIGN-replaced cells); `analyst/blockrate9g4.py` -> `blockrate9g4-t.txt`; `analyst/commitgap9g4.py` -> `commitgap9g4-t.txt`; `analyst/mix9g4.py` -> `mix9g4-t.txt`; `analyst/lagseries.py`; `analyst/foreign9g4.py` -> `foreign9g4-t.txt`, `foreign9g4-t-rerun.txt`. Stage `ozarchy-s140-9g4-stage/{A,C}`, `build/md5s.txt`. Run dirs `ozarchy-s140-9g4-t-run`, `ozarchy-s140-9g4-t-rerun-run`, smokes `ozarchy-s140-9g4-t-smk{a1,a4,c4,a8,c8}-run`. Units `bench-ozarchy-s140-9g4-chain`, `bench-ozarchy-s140-9g4-rerun-chain`, `bench-ozarchy-s140-9g4-smoke`, `-smoke2`.
 
+## 144. Step 9g5, T shape at tail depth 8 below exec saturation: A8 = main `c40992d7` vs C8 = `perf/validator-gossip-bucket` `96474444` vs D8 = main `4b083920` (pacemaker vset cache), RATE 400
+
+**9g5: at RATE 400 matched/s cannot show a cost, because the offered rate pins it on every arm (C8 - A8 -0.03% ± 0.43; 397 submitted/s on all 9 cells, no cap or budget waits). No consensus-side cost of C is visible: C removes A's limiter stalls and runs 5.5x the block rate with better commit latency. The cost of C at this load is on the execution and CPU side: at equal offered load exec busy 36% -> 91% and CPU per fill +111%, because its 146 blocks/s include ~115 with actions, at 4.9 action slots each, and 28% of those slots are duplicates. No rate met 18c's criteria on C8 (lowest exec busy found: 91%), so RATE 400 is the closest pick, not a clean below-saturation point for C. A8 itself meets them. Unsaturated A8 vs 143's saturated A8: 26.5 vs 3.87 blocks/s and commit p99 480 vs 1,043 ms, but with stall views 73.7% vs 18.9%: A's 50 / s limiter appears to set its block rate. D8 - A8 shows no effect at about ±1% (CPU per fill -0.30% ± 1.02, blocks/s -0.88% ± 1.09).**
+
+Question (18c msg 249, owner OK): section 143 found C8 - A8 +0.06% ± 0.26, but both arms ran at the exec ceiling (99.7% busy, queue ~60 of 64, ~16 s commit -> exec), so a consensus-side cost of C could not show in matched/s. Repeat C vs A at depth 8 below exec saturation. (1) Is a consensus-side cost of C visible, against the owner's ~2% acceptance? (2) Block rate and commit p99 unsaturated vs 143's saturated A8. (3) D8 - A8 (ride-along, lowest priority).
+
+### 144.1 Setup
+
+* Binaries (`ozarchy-s140-9g5-stage/{A,C,D}/release`, `build/md5s.txt`): A `c40992d7` node `a50e55f9` and C `96474444` node `2604e277`, copied from `ozarchy-s140-9g4-stage` and md5-checked; D `4b083920` node `70a74586`, fresh build; flood `dd59d50d` on all. One `bench-throughput` for every cell: main `4b083920`, md5 `4b8c62d7`. Built by `ozarchy-s140-9g5-tools/build/build-9g5.sh` (fresh detached `wt/bq-4b083920`, fresh target dir, `--locked`, `CARGO_INCREMENTAL=0`, shared build lock, 273 s).
+* D's node change checked: `c40992d7..4b083920` outside docs and tools touches `crates/hotstuff_rs/src/pacemaker/implementation.rs` (the tick vset cache) and its new test only, plus one `Cargo.lock` line (`futures` for `bench-throughput`). So D8 - A8 measures that cache alone. D has no validator bucket: `limchk` and `bytechk` passed on all D8 cells.
+* Harness: `wt/bq-4b083920`, `testnet/genesis-weighted-full.json` + params copied from `wt/bq-96c76675` (md5 equal). `96c76675..4b083920` does not touch `tools/`, `testnet/`, `scripts/` or `Cargo.lock`.
+* Shape: 9g4's T via `make-specs-9g5.py` from `9g4-t.json`: stakes 2/2/1, `ORACLE_FEED=seed`, `BENCH_RPCS=0,1` (senders on val0 / val1, tail on val2), 300 s, `TORUS_HEADER_RESEND_MS=250`, validator bucket env in `absent_env`, `IN_FLIGHT_TAIL_DEPTH=8` in every cell, `MAX_IN_FLIGHT=4` unchanged. Only `RATE` changes: 400 actions / s in aggregate (9g4 had 76,000 with the cap and budget limiting).
+* Order: w1 A8 + r1 A8 C8 D8 | r2 D8 C8 A8 | r3 C8 A8 D8, n = 3 per arm.
+* Checks (`checks/9g5-checks.sh`): as 143 (`configchk3`, `handoffchk3`, `limchk`, `bytechk`, `depthchk`, `burstwait`); `end_pass=0`. Reruns add `prof/quietgate.py` before each cell (foreign <= 0.09 core over 120 s).
+* Pacing (`prof/timedwait.py`): keep-warm cron spike mm:x7:03 (`SPIKES = (422,)`, resampled), desktop burst phase mm:06:58 (15 min, last seen 18:37) and a second desktop job from about 14:28 at mm:00:35, 15:35, 30:35, 45:35. That allowed about 4 load windows per hour.
+
+### 144.2 Choosing the rate
+
+18c's criteria: exec busy <= ~80%, queue near empty, commit -> exec well under 1 s, tail lag p99 <= ~10, picked on A8. Rungs are one cell each, unscored, ACCEPT / AGREE / PASS, 0 CHECK FAIL, 300 s except the 120 s C8 at 900 (`analyst/ladder9g5-t.txt`).
+
+| arm, RATE | exec actions/s | submitted (of RATE) | matched/s | exec busy | queue mean (peak) | commit -> exec p50 s | tail lag p99 | blocks/s | actions / nonempty | commit p99 ms | stall views | limiter drops |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| A8 1200 | 1,189 | 99.3% | 238,400 | 99.2% | 44-60 (66) | 2.41-3.50 | 15 | 19.1 | 64 | 229 | 1.5% | 101 |
+| A8 1000 | 994 | 99.3% | 199,600 | 86.3% | 9-10 (66) | 0.23-0.25 | 17 | 25.5 | 41 | 454 | 32.5% | 1,973 |
+| A8 900 | 894 | 99.3% | 179,500 | 75.5% | 5.1 (26) | 0.14 | 16 | 25.7 | 37 | 466 | 42.5% | 2,568 |
+| A8 800 | 796 | 99.4% | 160,100 | 67.1% | 4.3 (44) | 0.11 | 16 | 25.6 | 34 | 471 | 48.3% | 3,098 |
+| A8 600 | 596 | 99.3% | 120,100 | 50.5% | 2.4 (13) | 0.07 | 12 | 26.1 | 27 | 478 | 64.4% | 4,229 |
+| A8 400 (scored mean) | 398 | 99.25% | 80,636 | 36.3% | 1.5 (18) | 0.04 | 11 | 26.5 | 19 | 480 | 73.7% | 5,288 |
+| C8 900 (120 s) | 885 | 98.4% | 180,900 | 98.7% | 39-47 (66) | 0.64-0.85 | 30 | 54.6 | 20 | 115 | 0.2% | 7 |
+| C8 700 | 696 | 99.3% | 140,100 | 98.2% | 39-55 (66) | 0.42-0.74 | 32 | 81.1 | 11 | 66 | 0.1% | 4 |
+| C8 600 | 600 | 99.3% | 120,700 | 96.9% | 28-52 (66) | 0.19-0.58 | 33 | 99.8 | 8 | 58 | 0% | 2 |
+| C8 400 | 401 | 99.2% | 80,610 | 91.0% | 17-19 (66) | 0.07 | 41 | 145.1 | 5 | 31 | 0.2% | 14 |
+| D8 900 (120 s) | 884 | 98.4% | 180,500 | 75.9% | 6-7 (37) | 0.17-0.19 | 17 | 25.7 | 38 | 463 | 42.2% | 1,079 |
+
+* **Which limit is active:** `RATE`, on every rung shown. The bench reaches 98.4-99.4% of it, and `wait_cap` and `wait_cancel` (the in-flight cap and the budget hold) have n = 0 in every cell, against ~155,000 budget holds per cell in 9g4. Fills per action (~201) and cancel-all share (~34%) barely move across rungs.
+* **Picking on A8 alone would have failed the question.** A8 and D8 are clearly below saturation at 900, but C8 at 900 is not. As the rate falls, C's block rate rises (54.6 -> 145 blocks/s) and its smaller blocks keep exec busy, so its busy share falls only to 91% at 400. 18c was told before the launch (msgs 251, 252, 255, 256).
+* **RATE 400 is the closest, not a pass.** Time with the exec queue >= 60 of 64 on C8, by node: 700 53 / 48 / 15%, 600 2 / 63 / 6%, 400 0 / 5 / 6%. So 400 is the only rung where backpressure from exec does not hold C's block rate most of the time. C8 still misses busy (91% vs ~80%), queue (mean ~16) and lag (p99 41). A8 meets all four at 400 (p99 11).
+* **Lag in heights is not comparable across block rates.** 41 heights at 146 blocks/s is ~0.28 s, A8's 11 at 26.5 blocks/s is ~0.42 s, and 143's A8 9.7 at 3.87 blocks/s was ~2.5 s. C8's tail is closer to the tip in wall clock than A8's.
+
+### 144.3 Validity, FOREIGN reruns
+
+* Three drivers, all 21 cells rc 0, ACCEPT / AGREE / PASS, node md5 = the arm's staged md5 on all 3 nodes, 0 CHECK FAIL, 0 CELL-FLAG.
+* Main run 15:38-18:07 (`ozarchy-s140-9g5-t`, w1 + 9): desktop Chromium started at 16:09:08 and used 0.2-0.4 core. FOREIGN (`analyst/foreign9g5-t.txt`, 9s rule) broke on 8 of the 9 scored cells (avg 0.31-0.60 core, 2 s peak up to 2.04); only r1-A8 was clean. w1 had one desktop burst (peak 1.65, avg 0.07), unscored.
+* Rerun 18:29-21:39 (`ozarchy-s140-9g5-t-rerun`, all 9 scored cells so each round comes from one driver), started when the gate saw the desktop quiet (~18:27, Chromium closed). 7 cells clean. rerun-r1-C8 and rerun-r2-C8 each caught the mm:45:35 desktop burst (2 s peak 1.9 cores, avg 0.05): that job turned out to run every 15 min, and the pacing had it as 30.
+* Second rerun 21:40-22:59 (`ozarchy-s140-9g5-t-rerun2`, r1 C8, r2 C8): clean (avg 0.03, max 2 s 0.08).
+* Scored set, all FOREIGN clean: rerun-r1-{A8, D8}, rerun2-r1-C8, rerun-r2-{D8, A8}, rerun2-r2-C8, rerun-r3-{C8, A8, D8}.
+* What the foreign load did. Chromium at ~0.5 core lowered C8's block rate 3.7% (140.9 / 141.1 / 140.5 vs 146.0 / 146.7 / 146.3) and raised its chain time to ~6.6 ms from 6.31, while A8 and D8 block rates did not move and their CPU per 1k fills rose ~1.6-2.2% (A8 28.71 / 29.07 / 29.23, D8 28.96 / 28.94 / 29.07). matched/s did not move, pinned by the rate. The 2 s burst alone changed nothing visible: replaced vs rerun2 C8 146.4 / 146.7 vs 146.0 / 146.7 blocks/s.
+* Run order: flat. A8 26.5 / 26.4 / 26.5, C8 146.0 / 146.7 / 146.3, D8 26.4 / 26.1 / 26.2 blocks/s.
+
+### 144.4 Per cell
+
+| cell | arm | matched/s | exec actions/s | fills/action | blk/s | actions/nonempty | empty blocks | commit p50 / p99 ms | stall views | re-sends | drops (validator) | exec busy | queue val0 | commit -> exec ms | tail lag p50 / p99 | val2 / mean(val0, val1) cores | CPU ms / 1k fills |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| rerun-r1-A8 | A8 | 80,574 | 397.6 | 202.7 | 26.5 | 18.9 | 16.6% | 9.4 / 480 | 73.4% | 967 | 5229 (0) | 36.4% | 1.5 | 41 | 3 / 11 | 2.30 / 2.30 | 28.58 |
+| rerun2-r1-C8 | C8 | 80,615 | 401.2 | 200.9 | 146.0 | 5.0 | 23.0% | 6.2 / 31 | 0.1% | 1 | 3 (3) | 90.6% | 16.0 | 62 | 16 / 41 | 4.85 / 4.81 | 59.87 |
+| rerun-r1-D8 | D8 | 80,571 | 397.6 | 202.6 | 26.4 | 18.6 | 15.2% | 9.3 / 479 | 74.2% | 980 | 5109 (0) | 36.4% | 1.5 | 42 | 3 / 11 | 2.28 / 2.29 | 28.36 |
+| rerun-r2-D8 | D8 | 80,545 | 397.6 | 202.6 | 26.1 | 18.9 | 15.5% | 9.2 / 480 | 73.4% | 950 | 5039 (0) | 36.2% | 1.8 | 41 | 3 / 11 | 2.29 / 2.28 | 28.38 |
+| rerun2-r2-C8 | C8 | 80,606 | 401.2 | 200.9 | 146.7 | 4.9 | 21.9% | 6.2 / 31 | 0.1% | 1 | 4 (4) | 91.0% | 16.5 | 67 | 16 / 41 | 4.88 / 4.83 | 60.16 |
+| rerun-r2-A8 | A8 | 80,534 | 397.6 | 202.5 | 26.4 | 18.6 | 15.3% | 9.5 / 480 | 73.6% | 988 | 5330 (0) | 36.2% | 1.5 | 40 | 3 / 11 | 2.29 / 2.29 | 28.45 |
+| rerun-r3-C8 | C8 | 80,620 | 401.2 | 200.9 | 146.3 | 4.8 | 20.5% | 6.2 / 31 | 0.1% | 1 | 8 (8) | 90.8% | 15.5 | 63 | 15 / 41 | 4.88 / 4.82 | 60.06 |
+| rerun-r3-A8 | A8 | 80,801 | 398.9 | 202.6 | 26.5 | 18.8 | 15.9% | 9.4 / 479 | 74.1% | 979 | 5304 (0) | 36.1% | 1.6 | 40 | 3 / 11 | 2.29 / 2.30 | 28.39 |
+| rerun-r3-D8 | D8 | 80,799 | 398.9 | 202.6 | 26.2 | 18.9 | 15.1% | 9.3 / 480 | 73.3% | 964 | 5153 (0) | 36.3% | 1.6 | 41 | 3 / 11 | 2.29 / 2.30 | 28.41 |
+
+Lag and other definitions as in 143. Empty = content-empty, val0 `native=0`. Exec busy = mean(val0, val1); val2 is within 0.1 point on every arm. Practically no full-size (400-action) bodies occur at this rate, so 143's full-body fetch columns are empty here.
+
+### 144.5 Arms and pairs
+
+| | A8 | C8 | D8 | C8 - A8 (paired) | D8 - A8 (paired) |
+|---|---|---|---|---|---|
+| matched/s | 80,636 | 80,614 | 80,638 | -23 ± 344 (-0.03% ± 0.43) | +2 ± 20 (0.00% ± 0.02) |
+| exec actions/s (val0, bench window) | 398.0 | 401.2 | 398.0 | **+3.2 ± 1.9 (+0.80% ± 0.47)** | 0 |
+| fills per executed action | 202.6 | 200.9 | 202.6 | **-1.7 ± 0.1 (-0.82% ± 0.07)** | 0.0 ± 0.1 |
+| orders placed per executed action | 264.4 | 262.0 | 264.4 | -2.4 ± 0.0 | -0.0 ± 0.1 |
+| cancel-all share (accepted, whole run) | 33.8 | 33.8 | 33.8 | 0 | 0 |
+| submitted/s (bench) | 397 | 397 | 397 | 0 | 0 |
+| blocks/s | 26.47 | 146.33 | 26.23 | **+119.87 ± 1.00 (+453% ± 6)** | -0.23 ± 0.29 (-0.88% ± 1.09) |
+| native blocks/s (headline: exec engine ran, includes content-empty) | 26.07 | 141.13 | 25.82 | 115.06 ± 0.83 | -0.25 ± 0.55 |
+| blocks with actions/s (blocks/s x (1 - content-empty share)) | ~22 | ~115 | ~22 | | |
+| content-empty share of blocks (val0 native=0), % | 15.9 | 21.8 | 15.3 | 5.9 ± 2.7 | -0.7 ± 2.0 |
+| action slots committed/s (val2 log) | 420.5 | 567.6 | 420.6 | 147.1 ± 10.3 | 0.1 ± 0.2 |
+| action slots per nonempty block | 18.8 | 4.9 | 18.8 | -13.9 ± 0.4 | 0.0 ± 0.8 |
+| slots that were duplicates, % (slots - processed) | 4.6 | 28.4 | 4.6 | **+23.8 ± 1.3** | 0.0 ± 0.2 |
+| commit interval p50, ms | 9.41 | 6.18 | 9.24 | -3.23 ± 0.13 | -0.16 ± 0.19 |
+| commit interval p99, ms | 479.7 | 30.8 | 479.5 | **-448.8 ± 0.8** | -0.2 ± 1.9 |
+| order age p99, ms | 570 | 141 | 889 | -429 ± 58 | 319 ± 791 |
+| stall views, wall % | 73.71 | 0.08 | 73.64 | **-73.63 ± 0.81** | -0.07 ± 1.91 |
+| stall view mean, ms | 238 | 254 | 242 | 16 ± 6 | 4 ± 15 |
+| re-send lines | 978 | 1 | 965 | -977 ± 26 | -13 ± 63 |
+| limiter drops in window, all | 5,288 | 5 | 5,100 | **-5,283 ± 127** | -187 ± 226 |
+| limiter drops in window, validator bucket | 0 | 5 | 0 | 5 ± 7 | 0 |
+| limiter drops in window, byte | 0 | 0 | 0 | 0 | 0 |
+| mempool native size (mean val0, val1) | 60.0 | 13.8 | 68.3 | -46.2 ± 1.1 | 8.3 ± 13.1 |
+| exec busy val0, val1 mean, % | 36.3 | 90.8 | 36.3 | **+54.6 ± 0.7** | 0.0 ± 0.4 |
+| exec busy val2, % | 36.2 | 90.8 | 36.3 | 54.6 ± 1.0 | 0.1 ± 0.7 |
+| exec queue depth mean val0 (cap 64) | 1.5 | 16.0 | 1.6 | 14.5 ± 1.3 | 0.1 ± 0.4 |
+| exec queue depth peak val0 | 18 | 64 | 27 | 46 ± 27 | 9 ± 39 |
+| commit -> exec start p50, ms (val0, val1 mean) | 40 | 64 | 41 | 24 ± 8 | 1 ± 1 |
+| commit -> exec start p99, ms (val0) | 183 | 508 | 409 | 325 ± 89 | 226 ± 537 |
+| exec chain ms per block (headline) | 13.86 | 6.31 | 14.03 | -7.55 ± 0.10 | 0.17 ± 0.30 |
+| exec wall ms per action slot (val0, val1) | 0.835 | 1.474 | 0.837 | 0.640 ± 0.059 | 0.002 ± 0.016 |
+| tail lag p50, heights | 3.0 | 15.7 | 3.0 | 12.7 ± 1.4 | 0 |
+| tail lag p99, heights | 11.0 | 41.0 | 11.0 | 30.0 ± 0.0 | 0 |
+| CPU cores val2 | 2.29 | 4.87 | 2.29 | 2.58 ± 0.05 | -0.00 ± 0.03 |
+| CPU cores mean(val0, val1) | 2.30 | 4.82 | 2.29 | **+2.53 ± 0.04** | -0.01 ± 0.02 |
+| val2 - mean(val0, val1), cores | -0.005 | 0.048 | -0.000 | 0.053 ± 0.016 | 0.004 ± 0.017 |
+| sys CPU cores mean(val0, val1) | 0.26 | 0.88 | 0.26 | 0.62 ± 0.02 | -0.00 ± 0.01 |
+| val2 - mean(val0, val1), ms per 400 actions | -4.8 | 50.0 | -0.3 | 54.8 ± 16.1 | 4.5 ± 17.4 |
+| CPU ms per 1k fills | 28.47 | 60.03 | 28.38 | **+31.56 ± 0.58 (+110.9% ± 2.9)** | -0.09 ± 0.30 (-0.30% ± 1.02) |
+| val2 commit gap p99, ms | 255.6 | 12.0 | 255.5 | -243.6 ± 0.4 | -0.2 ± 0.4 |
+| val2 vote delay, ms | 4.76 | 2.85 | 4.82 | -1.91 ± 0.20 | 0.06 ± 0.16 |
+| view duration, ms (val2) | 37.81 | 6.69 | 38.08 | -31.12 ± 0.12 | 0.28 ± 0.58 |
+| val2 RPC handler mean, ms | 4.43 | 1.83 | 4.46 | -2.59 ± 0.04 | 0.04 ± 0.14 |
+
+± = 95% t interval, df 2, n = 3, per round. Bold = headline pairs whose interval excludes 0. Welch (`analyst/cells9g5-t.txt`) on matched/s: C8 - A8 -23 ± 357, p 0.81; D8 - A8 +2 ± 322, p 0.99. Cancel-all share and submitted/s print identical because the bench rounds them; the mix comparison is otherwise in the first rows. Other tables: `analyst/blockrate9g5-t.txt`, `mix9g5-t.txt`, `commitgap9g5-t.txt`.
+
+Exec time by block size (val0, `analyst/dupes9g5-t.txt`, means of the 3 cells):
+
+| native actions in block | A8 blocks/s | A8 ms / block | C8 blocks/s | C8 ms / block |
+|---|---|---|---|---|
+| 0 | 4.1 | 2.9 | 30.7 | 2.3 |
+| 1-2 | 3.0 | 5.2 | 29.1 | 4.9 |
+| 3-9 | 12.2 | 9.0 | 75.0 | 7.8 |
+| 10-49 | 4.4 | 16.6 | 11.1 | 10.0 |
+| 50+ | 2.8 | 54.4 | 0.0 | 47.4 |
+
+Against 143's saturated A8 and C8:
+
+| | 143 A8 (saturated) | 144 A8 (RATE 400) | 143 C8 (saturated) | 144 C8 (RATE 400) |
+|---|---|---|---|---|
+| matched/s | 304,781 | 80,636 | 304,979 | 80,614 |
+| exec actions/s | 1,493 | 398 | 1,517 | 401 |
+| fills per executed action | 204.1 | 202.6 | 201.1 | 200.9 |
+| cancel-all share | 34.2% | 33.8% | 35.0% | 33.8% |
+| blocks/s | 3.87 | 26.47 | 4.33 | 146.33 |
+| actions per nonempty block | 397 | 18.8 | 396 | 4.9 |
+| commit p50 / p99 ms | 182 / 1,043 | 9.4 / 480 | 145 / 1,051 | 6.2 / 31 |
+| stall views | 18.9% | 73.7% | 15.2% | 0.08% |
+| limiter drops in window | 24 | 5,288 | 8.7 | 5 |
+| exec busy | 99.7% | 36.3% | 99.7% | 90.8% |
+| exec queue (cap 64) | 60.6 | 1.5 | 59.0 | 16.0 |
+| commit -> exec p50 | 16.5 s | 40 ms | 15.4 s | 64 ms |
+| tail lag p50 / p99 | 2.3 / 9.7 | 3 / 11 | 3.0 / 18.3 | 15.7 / 41 |
+| CPU ms / 1k fills | 24.38 | 28.47 | 24.30 | 60.03 |
+| val2 - mean(val0, val1), cores | -0.81 | -0.005 | -0.79 | +0.048 |
+
+### 144.6 Reading
+
+* **(1) matched/s cannot show a cost at this rate; no consensus-side cost of C is visible anywhere else.**
+  - matched/s = executed actions / s x fills per action. C8 - A8 is -0.03% ± 0.43 (Welch ± 0.44), which is +0.80% ± 0.47 actions x -0.82% ± 0.07 fills per action. The bench submits 397 actions / s on all 9 cells with no cap or budget waits, so it reaches the offered rate on every arm and the number is pinned by offered load. That interval formally excludes -2%, but it is no evidence for the owner's ~2% acceptance: it would read the same with a much slower node, as long as the node keeps up. The small action / fill split (C8 processes ~1,200 more actions per cell for about the same fills) is not extra offered work: the bench submitted 124,996 actions on both cells checked (rerun-r1-A8, rerun2-r1-C8). It was not traced.
+  - Where a consensus-side cost could show, C8 is better than A8: blocks/s +119.9 ± 1.0, commit p50 -3.2 ± 0.1 ms, commit p99 -449 ± 1 ms, stall views -73.6 ± 0.8 pts, re-send lines 978 -> 1, limiter drops 5,288 -> 5 (all validator bucket, byte 0), mempool 60 -> 14, order age p99 570 -> 141 ms. n = 3 resolves all of these by a wide margin.
+  - **Where C costs: exec and CPU.** Exec busy +54.6 ± 0.7 pts, queue 1.5 -> 16 (peak at the cap), CPU +2.53 ± 0.04 cores per node (of which sys +0.62), CPU per 1k fills +110.9% ± 2.9. On the ladder C8 is above 90% busy at every rate tried, where A8 is at 36-86% up to 1000. That busy share does not by itself mean less capacity, because C's block rate is elastic: it falls as load rises (146 blocks/s at 400, 55 at 900, 4.3 at the ceiling) with blocks growing to match, C8 reaches the offered rate on every rung, and 143 shows the same ceiling as A. So the measured cost is CPU at light load (about 2x per fill and per node), not lost throughput. Elasticity between 900 and the ceiling was not measured.
+  - Why: the same offered actions are cut into many more blocks: 146 blocks/s, ~115 of them with actions, at 4.9 slots each, and a block has a floor cost (2.3 ms empty, 4.9 ms with 1-2 actions): the table above adds up to 91% of wall on C8 and 36% on A8. 28.4% of C8's committed slots are duplicates (A8 4.6%): the slots minus `torus_native_actions_processed` match the `skipping duplicate/replayed native action` log count (49,385-51,434 per cell on C8, 5,936-6,264 on A8). So at this block rate more than a quarter of the slots carry an action an earlier block already carried. CPU per fill was not profiled further, so the shares of block overhead, duplicates and the extra sys time are not separated.
+  - On the ~2% itself: no matched/s shortfall at any load tried. Offered load is reached at 600, 700 (rungs, n = 1) and at 400 (n = 3), and 143 shows equal throughput at the ceiling. Between 900 and the ceiling C was not measured. 9g3's -5.9% at depth 1 is still not split, because no C at depth 1 has been run.
+  - val2: -0.005 -> +0.048 cores vs mean(val0, val1), +54.8 ± 16.1 ms per 400 actions (~1.1% of 5,037 ms), a resolved but small excess on C8. Its commit gap p99 is 12 ms vs ~10 ms on the other nodes.
+* **(2) Unsaturated vs 143's saturated A8: block rate 3.87 -> 26.47, commit p99 1,043 -> 480 ms.** The queue is gone (60 -> 1.5, commit -> exec 16 s -> 40 ms), and commit p50 falls from 182 to 9.4 ms. But the p99 does not fall to a normal commit: 480 ms on A8 and D8 is the stall view. Stall views are 73.7% of wall, mean 238 ms, close to the 250 ms re-send, with 5,288 limiter drops. On the ladder A8's block rate stays 25.5-26.5 from 1000 to 400 while stalls rise from 32.5% to 73.7% and drops from 1,973 to 5,288. C8, whose change here is the validator bucket, runs 5.5x the block rate with 0.08% stalls at the same load. So the evidence points to A's 50 / s limiter setting its ~26 blocks/s, not exec or demand. This is inferred: the per-author message count per block was not traced.
+  - **This corrects 143's reading.** 143 called C's stall gain "a depth 1 picture" because at depth 8 A hardly hit its limiter. Depth was not the cause: exec saturation held blocks to ~4 / s, below the limiter. At depth 8 below saturation C's stall gain is the largest measured so far (-73.6 pts).
+  - CPU per fill is higher unsaturated on every arm (A8 24.4 -> 28.5, +17%), consistent with fewer actions sharing each block's fixed cost; not profiled.
+* **(3) D8 - A8: no effect resolved.** matched/s +2 ± 20, blocks/s -0.23 ± 0.29 (-0.88% ± 1.09), chain +0.17 ± 0.30 ms, exec busy 0.0 ± 0.4 pts, CPU per 1k fills -0.09 ± 0.30 (-0.30% ± 1.02), CPU -0.008 ± 0.024 core per node, commit p99 -0.2 ± 1.9 ms. n = 3 bounds the cache's effect at this load to about ±1%, smaller effects are not resolved, and A's limiter caps D's block rate, so a tick-loop saving can only show in CPU. One watch item: r2-D8 and r3-D8 logged consensus timeouts on val0 and val1 (2 + 3, 2 + 2) with order age p99 ~1,060 ms against ~550 ms. A8 logged some as well (r1 val1 2, r2 val1 1; rung 800 val0 2, age p99 1,325 ms), and the three Chromium-hit D8 cells of the main run logged none on val0, so it is not shown to be D's. It is not resolved at n = 3.
+
+### 144.7 Caveats
+
+* **C8 is not below saturation by 18c's criteria at any rate found.** Exec busy 91%, queue mean 16 with peaks at the cap, lag p99 41. Commit -> exec p50 (64 ms) meets the criterion, and on the 400 rung the queue is at >= 60 in 0-6% of the scrapes, but exec may still hold C's block rate down part of the time. Busy fell from 97% to 91% between 600 and 400, so a lower rate would likely bring it down further; none below 400 was tried.
+* RATE 400 is about a quarter of T's exec capacity (~1,490 actions / s), so this is C at light load, the regime where small blocks are worst. The CPU cost at the ceiling is nil (143: 24.30 vs 24.38 ms / 1k fills). Between those two it was seen only on single rungs.
+* Matched/s resolution: `benchwin_span_s` is whole seconds, 314 or 315 s, so a cell's matched/s moves 0.32% with the span alone (r3 A8 and D8 80,800 vs 80,550 elsewhere). C8 - A8's ± 0.43 is mostly that rounding, and D8 - A8's ± 0.02 is tight only because its pairs had equal spans. Exec actions / s use the same span. Submitted was 124,996 on both cells checked, which over 315 s is the 397 / s shown; processed was 125,257 (rerun-r1-A8) and 126,454 (rerun2-r1-C8), so both exceed submitted, C8 by more. Not traced.
+* Scored rounds are hours apart inside a round: r1 and r2 C8 come from the second rerun (22:01, 22:31), the others from 18:31-21:36. The run order is flat, and replaced C8 cells at 18:41 and 19:41 match.
+* T's stakes are 2 / 2 / 1 with the tail on val2, as 143.
+* Ladder rungs are single cells and unscored. Some took desktop bursts (A8 1200 peak 0.60, C8 900 peak 2.2 and avg 0.20, C8 700 peak 2.0, C8 400 peak 2.0). The rate choice does not hinge on these.
+* 9g6 (18c msg 253) is queued at this RATE on main, so it starts where A's limiter already sets ~26 blocks/s with ~74% stall views.
+
+### 144.8 Files
+
+* Tools `ozarchy-s140-9g5-tools/`: `make-specs-9g5.py`, `specs/` (9g5-t, 9g5-t-rerun, 9g5-t-rerun2, 9g5-lad{1200, 1000, 900, 800, 600, 700c8, 600c8, 400c8}, 9g5-smk-{C8, D8} at RATE 900), `drivers/`, `smoke-chain-9g5.sh`, `campaign-chain-9g5.sh`, `campaign-chain-9g5-rerun.sh`, `campaign-chain-9g5-rerun2.sh`, `checks/9g5-checks.sh`, `prof/` (`timedwait.py`, `quietgate.py`, `foreign-sampler.py`, `run-with-sampler.sh`, `phase/foreign-phase-1-9g5.txt`), `build/` (`build-9g5.sh`, `build.log`). Analysis `analyst/`: `scored.txt`, `ladder9g5.py` -> `ladder9g5-t.txt`, `cells9g5.py` -> `cells9g5-t.txt`, `cells9g5-t-replaced.txt`, `blockrate9g5.py` -> `blockrate9g5-t.txt`, `blockrate9g5-t-replaced.txt`, `mix9g5.py` -> `mix9g5-t.txt`, `mix9g5-t-replaced.txt`, `commitgap9g5.py` -> `commitgap9g5-t.txt`, `dupes9g5.py` -> `dupes9g5-t.txt`, `dupwarn9g5.py` -> `dupwarn9g5-t.txt`, `foreign9g5.py` -> `foreign9g5-t{,-rerun,-rerun2}.txt`, `table144.py` -> `table144.txt`, `lagseries.py`. Stage `ozarchy-s140-9g5-stage/{A,C,D}`, `build/md5s.txt`. Run dirs `ozarchy-s140-9g5-{t,t-rerun,t-rerun2}-run`, rungs and smokes `ozarchy-s140-9g5-t-{lad*,smkc8,smkd8}-run`. Units `bench-ozarchy-s140-9g5-chain`, `-rerun-chain`, `-rerun2-chain`, `-lad1` .. `-lad5`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
