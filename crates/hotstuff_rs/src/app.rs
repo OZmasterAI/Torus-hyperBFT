@@ -239,6 +239,16 @@ pub trait App<K: KVStore>: Send {
         false
     }
 
+    /// Item 3 (`TORUS_EMPTY_PROPOSAL_WAIT_MS`): whether a block produced now would carry nothing
+    /// new. With the wait set, a leader whose app answers `true` holds its fresh block (a deferred
+    /// proposal, retried by the algorithm loop) until the app has something or the wait ends, and
+    /// then proposes either way. Nudges and re-proposals never wait.
+    ///
+    /// The default always has something, so the wait never applies.
+    fn nothing_to_propose(&self) -> bool {
+        false
+    }
+
     /// [`Self::check_block_data`] for the vote on a block consensus may make a
     /// leader propose again, whose contents (and so its timestamp) are fixed
     /// by its hash, and whose vote-time FRESHNESS rules an honest replica

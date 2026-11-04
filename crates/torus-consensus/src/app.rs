@@ -11345,6 +11345,25 @@ impl App<RocksKVStore> for TorusApp {
         response.data.vec().is_empty()
     }
 
+    /// Item 3 (`TORUS_EMPTY_PROPOSAL_WAIT_MS`): no pending EVM transaction and no pooled
+    /// native action outside this proposer's in-flight blocks. Conservative: any pending EVM
+    /// transaction counts, even one the EVM cadence leaves out of this height, and without a
+    /// mempool there is nothing to wait for (the wait never applies).
+    fn nothing_to_propose(&self) -> bool {
+        let Some(ref mempool) = self.mempool else {
+            return false;
+        };
+        mempool.evm_pool_size() == 0
+            && mempool
+                .select_native_for_block_with_senders_excluding(
+                    1,
+                    &self.in_flight_native_hashes(),
+                    usize::MAX,
+                    usize::MAX,
+                )
+                .is_empty()
+    }
+
     /// Review M2 (s138): the pre-vote check of a block hotstuff may force a
     /// leader to propose again unchanged. See
     /// [`TorusApp::check_reproposal_proposal_data`].
@@ -11839,6 +11858,24 @@ impl TorusApp {
     /// (`base_fee`, `big_base_fee`), not the committed ones, and leave the txs of
     /// the blocks the proposal extends that the pool still holds (`ancestry`)
     /// pooled ([`Self::evm_in_flight`]).
+    /// The native actions of this proposer's in-flight (proposed-but-uncommitted)
+    /// blocks. Pipeline-aware selection excludes them so the non-destructive pool
+    /// does not re-select them for N+1/N+2 before N commits and calls
+    /// `remove_committed_native` — the root cause of duplicate native inclusion
+    /// (memory 282f9818). `pending_proposals` is exactly that in-flight window.
+    fn in_flight_native_hashes(&self) -> std::collections::HashSet<torus_types::B256> {
+        let mut in_flight: std::collections::HashSet<torus_types::B256> = self
+            .pending_proposals
+            .values()
+            .flat_map(|b| b.native_action_hashes().iter().copied())
+            .collect();
+        // Union the hash ledger: covers compact proposals whose bodies never
+        // reconstructed (MissingData) — absent from `pending_proposals` but
+        // still in flight on the wire (s355 duplicate-inclusion tail).
+        self.in_flight_hashes.extend_into(&mut in_flight);
+        in_flight
+    }
+
     fn select_block_payload(
         &self,
         parent: &TorusBlockHeader,
@@ -11869,20 +11906,7 @@ impl TorusApp {
         let Some(ref mempool) = self.mempool else {
             return (vec![], vec![]);
         };
-        // Pipeline-aware selection: exclude actions already carried by our
-        // in-flight (proposed-but-uncommitted) blocks so the non-destructive pool
-        // does not re-select them for N+1/N+2 before N commits and calls
-        // `remove_committed_native` — the root cause of duplicate native inclusion
-        // (memory 282f9818). `pending_proposals` is exactly that in-flight window.
-        let mut in_flight: std::collections::HashSet<torus_types::B256> = self
-            .pending_proposals
-            .values()
-            .flat_map(|b| b.native_action_hashes().iter().copied())
-            .collect();
-        // Union the hash ledger: covers compact proposals whose bodies never
-        // reconstructed (MissingData) — absent from `pending_proposals` but
-        // still in flight on the wire (s355 duplicate-inclusion tail).
-        self.in_flight_hashes.extend_into(&mut in_flight);
+        let in_flight = self.in_flight_native_hashes();
 
         // Package D rank 1 — exec-backlog watermark pacing. The LOCAL backlog
         // is queued+in-flight exec channel blocks (`exec_queue_len`, the
@@ -26252,6 +26276,12 @@ mod crash_recovery_tests {
         );
 
         let evm_key = k256::ecdsa::SigningKey::from_slice(&[62u8; 32]).unwrap();
+        // The key's address (an EIP-712 signer recovers to the same secp256k1 address), funded
+        // so the pool admits its transaction.
+        let evm_sender = torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, nonce, &evm_key)
+            .recover_sender()
+            .unwrap();
+        fund_evm_balance(&state_db, evm_sender, U256::from(10u64).pow(U256::from(12u64)));
         let to = alloy_primitives::TxKind::Call(Address::repeat_byte(0x42));
         mempool.add_evm_tx(signed_eip1559_gas(&evm_key, 0, to, vec![], U256::ZERO, 100_000)).unwrap();
         assert!(!app.nothing_to_propose(), "a pending EVM transaction");

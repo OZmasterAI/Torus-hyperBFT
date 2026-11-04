@@ -217,6 +217,12 @@ pub(crate) struct HotStuff<N: Network> {
     /// before the feed). Read once from `TORUS_DEFER_PARENT_FEED` (`1`
     /// enables). Default OFF.
     defer_parent_feed: bool,
+    /// Item 3: how long a leader whose app has nothing to propose
+    /// ([`App::nothing_to_propose`]) holds its fresh block. Read once from
+    /// `TORUS_EMPTY_PROPOSAL_WAIT_MS` ([`parse_empty_proposal_wait_ms`]). Default OFF.
+    empty_proposal_wait: Option<Duration>,
+    /// Item 3: the view whose fresh block is being held, and since when.
+    empty_wait_started: Option<(ViewNumber, Instant)>,
     /// s72 fix D: a body insert committed blocks whose feed was skipped; run by
     /// [`run_pending_commit_feed`](Self::run_pending_commit_feed).
     commit_feed_pending: bool,
@@ -291,6 +297,8 @@ impl<N: Network> HotStuff<N> {
             defer_commit_feed: defer_commit_feed_from_env(),
             inline_self_header: None,
             defer_parent_feed: defer_parent_feed_from_env(),
+            empty_proposal_wait: empty_proposal_wait_from_env(),
+            empty_wait_started: None,
             commit_feed_pending: false,
             pushed_bodies: VecDeque::new(),
             peer_last_heard: std::collections::HashMap::new(),
@@ -327,6 +335,12 @@ impl<N: Network> HotStuff<N> {
     #[cfg(test)]
     pub(crate) fn set_defer_parent_feed(&mut self, on: bool) {
         self.defer_parent_feed = on;
+    }
+
+    /// Test-only override of the empty-proposal wait (item 3).
+    #[cfg(test)]
+    pub(crate) fn set_empty_proposal_wait(&mut self, wait: Option<Duration>) {
+        self.empty_proposal_wait = wait;
     }
 
     /// Test-only override of the round-skip flag.
@@ -541,6 +555,31 @@ impl<N: Network> HotStuff<N> {
             }
             None => false,
         }
+    }
+
+    /// Item 3: whether this leader holds its fresh block for now. Only with
+    /// `TORUS_EMPTY_PROPOSAL_WAIT_MS` set and nothing to propose, and only until the wait,
+    /// counted from this view's first attempt, has passed: a quiet chain still proposes (empty)
+    /// within the wait, far below any view timeout. Like the exec-backpressure yield it is
+    /// node-local and safe (a held block looks like a slow leader). The algorithm loop retries a
+    /// deferred proposal every ~10 ms, so the block goes out within ~10 ms of the first action.
+    fn waits_for_payload<K: KVStore>(&mut self, app: &impl App<K>) -> bool {
+        let Some(wait) = self.empty_proposal_wait else {
+            return false;
+        };
+        if !app.nothing_to_propose() {
+            return false;
+        }
+        let view = self.view_info.view;
+        let now = Instant::now();
+        let started = match self.empty_wait_started {
+            Some((held, since)) if held == view => since,
+            _ => {
+                self.empty_wait_started = Some((view, now));
+                now
+            }
+        };
+        now.duration_since(started) < wait
     }
 
     /// T1.3 metric accessor: how many times this replica phase-voted on a proposal header whose
@@ -875,6 +914,12 @@ impl<N: Network> HotStuff<N> {
                 // (yield-not-starve). Default OFF — see
                 // `should_yield_proposal_for_exec_backpressure`.
                 if self.should_yield_proposal_for_exec_backpressure() {
+                    self.proposal_deferred = true;
+                    return Ok(());
+                }
+                // Item 3: nothing to propose yet; hold the fresh block (deferred like the
+                // yield above) until the app has something or the wait ends.
+                if self.waits_for_payload(&*app) {
                     self.proposal_deferred = true;
                     return Ok(());
                 }
@@ -4342,6 +4387,25 @@ pub(crate) fn parse_defer_commit_feed(raw: Option<String>) -> bool {
 fn defer_parent_feed_from_env() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| parse_defer_commit_feed(std::env::var("TORUS_DEFER_PARENT_FEED").ok()))
+}
+
+/// Item 3: the cap on `TORUS_EMPTY_PROPOSAL_WAIT_MS`, far below any view timeout.
+pub(crate) const MAX_EMPTY_PROPOSAL_WAIT_MS: u64 = 100;
+
+/// `TORUS_EMPTY_PROPOSAL_WAIT_MS` (item 3): unset, empty, `0` or unparsable = off; else the wait
+/// in ms, capped at [`MAX_EMPTY_PROPOSAL_WAIT_MS`].
+pub(crate) fn parse_empty_proposal_wait_ms(raw: Option<String>) -> Option<Duration> {
+    raw.as_deref()
+        .map(str::trim)
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(|ms| Duration::from_millis(ms.min(MAX_EMPTY_PROPOSAL_WAIT_MS)))
+}
+
+/// Cached env read of `TORUS_EMPTY_PROPOSAL_WAIT_MS` (item 3).
+fn empty_proposal_wait_from_env() -> Option<Duration> {
+    static WAIT: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *WAIT.get_or_init(|| parse_empty_proposal_wait_ms(std::env::var("TORUS_EMPTY_PROPOSAL_WAIT_MS").ok()))
 }
 
 /// `TORUS_ROUND_SKIP`: on by default (s74 rejoin view sync); only `0` turns it off.
