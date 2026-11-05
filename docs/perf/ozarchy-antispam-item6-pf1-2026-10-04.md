@@ -24021,6 +24021,178 @@ Lag = every 0.1 s in t0 + 10 s .. t0 + 300 s, val2's committed height minus the 
 
 * Tools `ozarchy-s140-9g4-tools/`: `make-specs-9g4.py`, `specs/` (9g4-t, 9g4-smk-{A1, A4, C4, A8, C8}, 9g4-t-rerun, 9g4-t-depth4-notrun), `drivers/`, `smoke-chain-9g4.sh`, `campaign-chain-9g4.sh`, `campaign-chain-9g4-rerun.sh`, `checks/9g4-checks.sh`, `prof/` (`timedwait.py`, `foreign-sampler.py`, `run-with-sampler.sh`, `phase/foreign-phase-1-9g4.txt`), `build/` (`build-9g4.sh`, `stage-9g4.sh`, `build.log`). Analysis `analyst/cells9g4.py` -> `cells9g4-t.txt` (scored set), `cells9g4-t-replaced.txt` (FOREIGN-replaced cells); `analyst/blockrate9g4.py` -> `blockrate9g4-t.txt`; `analyst/commitgap9g4.py` -> `commitgap9g4-t.txt`; `analyst/mix9g4.py` -> `mix9g4-t.txt`; `analyst/lagseries.py`; `analyst/foreign9g4.py` -> `foreign9g4-t.txt`, `foreign9g4-t-rerun.txt`. Stage `ozarchy-s140-9g4-stage/{A,C}`, `build/md5s.txt`. Run dirs `ozarchy-s140-9g4-t-run`, `ozarchy-s140-9g4-t-rerun-run`, smokes `ozarchy-s140-9g4-t-smk{a1,a4,c4,a8,c8}-run`. Units `bench-ozarchy-s140-9g4-chain`, `bench-ozarchy-s140-9g4-rerun-chain`, `bench-ozarchy-s140-9g4-smoke`, `-smoke2`.
 
+## 145. Step 9g6, empty-proposal wait: W0 = `TORUS_EMPTY_PROPOSAL_WAIT_MS` unset vs W10 = 10 vs W20 = 20 on all nodes, main `e3e64e2f`, T shape, RATE 400, tail depth 8
+
+**9g6: under load at RATE 400 the wait works: blocks with actions/s 22.24 -> 24.12 (W10, +8.5% ± 6.5) -> 24.84 (W20, +11.7% ± 7.3), content-empty share 15.8% -> 9.0% -> 6.1%, total blocks/s unchanged (~26.4). Commit p99 is not hurt (-1.7 ± 0.9, -4.0 ± 1.0 ms), but that p99 is the stall view and cannot show a cost of a few ms. matched/s cannot show a cost at all: 124,996 actions submitted on all 9 cells. The costs that do show are commit p50 +1.73 ± 0.17 / +2.11 ± 0.26 ms and CPU per fill +1.61% ± 1.28 / +2.68% ± 0.62. W20 beats W10 in every round (+0.73 ± 0.20 blocks with actions/s). With no load the wait does the opposite of its purpose: idle blocks/s 26.4 -> 27.7 -> 37.9 (W20 +44% ± 6), nearly all empty, limiter drops before the load 1,365 -> 3,049 -> 14,595. n = 3 resolves the signs and W20 over W10, not the size of the load effect, because round 3's W10 and W20 cells sit ~3 points lower for a reason not traced.**
+
+Question (18c msg 253, owner OK): origin/main `e3e64e2f` adds `TORUS_EMPTY_PROPOSAL_WAIT_MS` (node env, off unless > 0, cap 100 ms). A leader whose mempool has nothing new (no EVM tx, no native action outside its own in-flight blocks) holds its fresh block until the first action arrives (loop retries ~10 ms) or the wait ends, then proposes (empty if still nothing). Nudges and re-proposals never wait. Does the wait cut empty blocks without hurting commit p99 or matched/s? W10 vs W20? Headline: blocks with actions per s.
+
+### 145.1 Setup
+
+* One build for every arm (`ozarchy-s140-9g6-stage/M/release`, `build/md5s.txt`): main `e3e64e2f`, node `3c2be6ce`, bench `37d05b4a`, flood `dd59d50d`. Built by `ozarchy-s140-9g6-tools/build/build-9g6.sh` (fresh detached `wt/bq-e3e64e2f`, fresh target dir, `--locked`, `CARGO_INCREMENTAL=0`). The arms differ by node env only.
+* Harness: `wt/bq-e3e64e2f`, `testnet/genesis-weighted-full.json` + params copied from `wt/bq-4b083920` (md5 equal). `4b083920..e3e64e2f` does not touch `tools/`, `testnet/`, `scripts/` or `Cargo.lock`.
+* Shape: 9g5's T via `make-specs-9g6.py` from `9g5-t.json`: stakes 2/2/1, `ORACLE_FEED=seed`, `BENCH_RPCS=0,1` (senders on val0 / val1, tail on val2), 300 s, `TORUS_HEADER_RESEND_MS=250`, validator bucket env in `absent_env`, `IN_FLIGHT_TAIL_DEPTH=8`, `MAX_IN_FLIGHT=4`, `RATE=400` (9g5's final pick).
+* Order: w1 W0 + r1 W0 W10 W20 | r2 W20 W10 W0 | r3 W10 W0 W20, n = 3 per arm. No reply to msg 259's regime question, so RATE 400 as ordered.
+* Checks (`checks/9g6-checks.sh`): as 144 (`configchk3`, `handoffchk3`, `limchk`, `bytechk`, `depthchk` fixed at 8, `burstwait`), `end_pass=0`, plus new `waitenvchk`: `node-env-all.txt` has one row for each of the 3 pids in run.log's `node pids:` line, each with the arm's value (W0: name absent). Run on the three smokes it failed on all 4 wrong-arm test runs and passed on the 3 right ones. The spec also has the arm `expect` and the driver's `envchk` on the same name. **The node has no log line or metric for the wait, so these prove the env reached every node, not how often the wait fired.**
+* Pacing (`prof/timedwait.py`, `prof/quietgate.py` before every cell, foreign <= 0.09 core over 120 s): keep-warm cron mm:x7:03 (seen 23:27:03, 23:37:03), desktop job mm:00:35 / 15:35 / 30:35 / 45:35 (seen 23:30:34). The old mm:06:58 job did not appear in the pre-launch sample or the run. Two fixes in this copy: `LOAD_S` 306 -> 318 (9g5's real window was 314-315 s), and 9g5's script skipped all waiting when it had no 15-minute phase to anchor on, which would have applied here.
+
+### 145.2 Validity
+
+* Driver 23:45-02:15, 10 cells, all rc 0, ACCEPT / AGREE / PASS, node md5 = staged `3c2be6ce` on all 3 nodes, 0 CHECK FAIL, 0 CELL-FLAG, 0 reruns. Re-checked from each cell's summary.json and raw files, not from the campaign's cell index.
+* FOREIGN (`analyst/foreign9g6-t.txt`): all 10 cells clean, avg 0.027-0.029 core, 2 s peak 0.065-0.119 (limits 0.1 / 0.5). `benchwin_span_s` is 315 on all 9 scored cells, so 144's span rounding of 0.32% does not enter here.
+* Control: W0 repeats 144's A8 at this rate: blocks/s 26.40 vs 26.47, content-empty 15.8% vs 15.9%, stall views 73.9% vs 73.7%, drops 5,177 vs 5,288, commit p99 479.4 vs 479.7 ms, CPU per 1k fills 28.40 vs 28.47. W0 is flat over the run: 22.35 / 22.27 / 22.10 blocks with actions/s. Consensus timeouts per arm, all nodes, 3 cells: W0 4, W10 2, W20 7; no pattern resolved (order age p99 row below).
+
+### 145.3 Per cell
+
+| cell | arm | blocks with actions/s | blk/s | content-empty | slots/nonempty | commit p50 / p99 ms | matched/s | exec actions/s | fills/action | submitted | exec busy | stall views | re-sends | drops | view ms | mempool | CPU ms / 1k fills |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| r1-W0 | W0 | 22.35 | 26.50 | 15.7% | 18.7 | 9.29 / 479 | 80,548 | 397.6 | 202.6 | 124996 | 36.3% | 74.2% | 1003 | 5285 | 37.8 | 61 | 28.40 |
+| r1-W10 | W10 | 23.80 | 26.50 | 10.2% | 17.5 | 10.95 / 478 | 80,556 | 397.6 | 202.6 | 124996 | 36.9% | 69.7% | 897 | 5386 | 37.8 | 55 | 28.69 |
+| r1-W20 | W20 | 24.52 | 26.40 | 7.1% | 16.8 | 11.48 / 475 | 80,589 | 397.6 | 202.7 | 124996 | 37.7% | 64.6% | 822 | 5586 | 38.0 | 65 | 29.18 |
+| r2-W20 | W20 | 24.58 | 26.50 | 7.2% | 16.8 | 11.40 / 475 | 80,563 | 397.6 | 202.6 | 124996 | 37.4% | 65.1% | 842 | 5521 | 37.8 | 61 | 29.04 |
+| r2-W10 | W10 | 23.92 | 26.50 | 9.7% | 17.4 | 11.04 / 478 | 80,557 | 397.6 | 202.6 | 124996 | 37.3% | 69.5% | 895 | 5794 | 37.8 | 62 | 28.92 |
+| r2-W0 | W0 | 22.27 | 26.40 | 15.7% | 18.8 | 9.24 / 480 | 80,536 | 397.6 | 202.6 | 124996 | 36.2% | 73.8% | 963 | 5288 | 37.8 | 61 | 28.36 |
+| r3-W10 | W10 | 24.62 | 26.50 | 7.1% | 16.9 | 11.03 / 478 | 80,579 | 397.6 | 202.7 | 124996 | 37.2% | 69.8% | 893 | 5342 | 37.8 | 60 | 28.96 |
+| r3-W0 | W0 | 22.10 | 26.30 | 16.0% | 18.9 | 9.29 / 479 | 80,526 | 397.6 | 202.5 | 124996 | 36.3% | 73.8% | 965 | 4957 | 38.1 | 66 | 28.44 |
+| r3-W20 | W20 | 25.43 | 26.50 | 4.0% | 16.2 | 11.28 / 476 | 80,588 | 397.6 | 202.7 | 124996 | 37.8% | 66.1% | 843 | 5777 | 37.8 | 61 | 29.26 |
+
+Blocks with actions/s = blocks/s x (1 - content-empty share). Empty = content-empty, val0 `native=0`. Exec busy = mean(val0, val1). Submitted = `bench_submitted_actions`. Drops = all nodes, load window.
+
+Cross-check of the headline per cell (`analyst/table145.txt`): that formula, action slots/s / slots per nonempty block (val2 log), and a direct count of val0 blocks with `native > 0` agree within 0.84% on every cell. The second and third agree within 0.01 blocks/s. The formula reads slightly low because the headline blocks/s is rounded to 0.1.
+
+### 145.4 Arms and pairs
+
+| | W0 | W10 | W20 | W10 - W0 (paired) | W20 - W0 (paired) | W20 - W10 (paired) |
+|---|---|---|---|---|---|---|
+| blocks with actions/s = blocks/s x (1 - content-empty) | 22.24 | 24.12 | 24.84 | **1.88 ± 1.41 (+8.45% ± 6.47)** | **2.61 ± 1.58 (+11.73% ± 7.30)** | **0.73 ± 0.20 (+3.02% ± 0.72)** |
+| cross-check: slots/s / slots per nonempty (val2 log) | 22.37 | 24.21 | 24.99 | **1.84 ± 1.50 (+8.25% ± 6.85)** | **2.62 ± 1.52 (+11.72% ± 7.03)** | **0.78 ± 0.19 (+3.21% ± 0.80)** |
+| cross-check: direct count, val0 native > 0 | 22.37 | 24.22 | 24.99 | **1.84 ± 1.50 (+8.24% ± 6.85)** | **2.61 ± 1.53 (+11.69% ± 7.07)** | **0.77 ± 0.20 (+3.18% ± 0.85)** |
+| blocks/s | 26.40 | 26.50 | 26.47 | 0.10 ± 0.25 (+0.38% ± 0.94) | 0.07 ± 0.38 (+0.25% ± 1.44) | -0.03 ± 0.14 (-0.13% ± 0.54) |
+| content-empty share of blocks (val0 native=0), % | 15.8 | 9.0 | 6.1 | **-6.8 ± 4.6** | **-9.6 ± 5.0** | **-2.9 ± 0.9** |
+| native blocks/s (headline: exec engine ran, includes content-empty) | 25.94 | 26.20 | 26.13 | 0.27 ± 0.29 | 0.19 ± 0.38 | -0.08 ± 0.09 |
+| empty blocks/s (headline: exec engine skipped) | 0.49 | 0.29 | 0.31 | **-0.20 ± 0.04** | **-0.18 ± 0.06** | 0.02 ± 0.07 |
+| action slots committed/s (val2 log) | 420.4 | 417.1 | 414.1 | **-3.4 ± 1.7** | **-6.3 ± 1.6** | -3.0 ± 3.1 |
+| action slots per nonempty block | 18.80 | 17.23 | 16.58 | **-1.57 ± 1.03** | **-2.22 ± 1.12** | **-0.65 ± 0.18** |
+| slots that were duplicates, % (slots - processed) | 4.6 | 3.9 | 3.2 | **-0.8 ± 0.5** | **-1.4 ± 0.2** | -0.7 ± 0.7 |
+| commit interval p50, ms | 9.27 | 11.01 | 11.39 | **1.73 ± 0.17** | **2.11 ± 0.26** | **0.38 ± 0.35** |
+| commit interval p99, ms | 479.4 | 477.7 | 475.4 | **-1.7 ± 0.9** | **-4.0 ± 1.0** | **-2.3 ± 0.4** |
+| order age p50, ms | 154.2 | 145.7 | 141.5 | **-8.5 ± 2.6** | **-12.7 ± 2.5** | **-4.2 ± 3.1** |
+| order age p99, ms | 582 | 551 | 604 | -32 ± 102 | 22 ± 144 | 53 ± 153 |
+| matched/s | 80537 | 80564 | 80580 | 27 ± 58 (+0.03% ± 0.07) | 43 ± 44 (+0.05% ± 0.05) | 16 ± 36 (+0.02% ± 0.04) |
+| exec actions/s (val0, bench window) | 397.6 | 397.6 | 397.6 | 0 | 0 | 0 |
+| fills per executed action | 202.6 | 202.6 | 202.7 | 0.1 ± 0.3 (+0.03% ± 0.14) | 0.1 ± 0.2 (+0.05% ± 0.12) | 0.0 ± 0.1 (+0.02% ± 0.07) |
+| orders placed per executed action | 264.4 | 264.4 | 264.4 | 0 | 0 | 0 |
+| cancel-all share (accepted, whole run), % | 33.8 | 33.8 | 33.8 | 0 | 0 | 0 |
+| cancel-all actions accepted (whole run) | 42211 | 42211 | 42211 | 0 | 0 | 0 |
+| bench_submitted_actions (cell total) | 124996 | 124996 | 124996 | 0 | 0 | 0 |
+| val0 actions processed (cell total) | 125258 | 125269 | 125263 | 11 ± 49 | 5 ± 9 | -6 ± 53 |
+| wait_cap n (in-flight cap) | 0 | 0 | 0 | 0 | 0 | 0 |
+| wait_cancel n (budget) | 0 | 0 | 0 | 0 | 0 | 0 |
+| stall views, wall % | 73.93 | 69.68 | 65.30 | **-4.26 ± 0.73** | **-8.63 ± 2.42** | **-4.38 ± 1.70** |
+| stall view mean, ms | 239 | 246 | 248 | 6 ± 12 | 8 ± 18 | 2 ± 6 |
+| re-send lines | 977 | 895 | 836 | **-82 ± 52** | **-141 ± 85** | **-59 ± 34** |
+| limiter drops in window, all | 5177 | 5507 | 5628 | 331 ± 516 (+6.42% ± 9.95) | 451 ± 798 (+8.88% ± 16.56) | 121 ± 896 (+2.38% ± 16.22) |
+| limiter drops in window, validator bucket | 0 | 0 | 0 | 0 | 0 | 0 |
+| limiter drops in window, byte | 0 | 0 | 0 | 0 | 0 | 0 |
+| view duration, ms (val2, load window; equal on all nodes) | 37.88 | 37.78 | 37.86 | -0.10 ± 0.37 | -0.02 ± 0.58 | +0.08 ± 0.27 |
+| mempool native size (mean val0, val1) | 62.6 | 58.8 | 62.3 | -3.8 ± 10.8 | -0.4 ± 12.1 | 3.4 ± 13.5 |
+| exec busy val0, val1 mean, % | 36.3 | 37.1 | 37.7 | **0.9 ± 0.7** | **1.4 ± 0.4** | 0.5 ± 1.0 |
+| exec busy val2, % | 36.4 | 37.2 | 37.5 | **0.8 ± 0.4** | **1.1 ± 0.7** | 0.3 ± 1.1 |
+| exec queue depth mean val0 (cap 64) | 1.6 | 1.4 | 1.3 | -0.2 ± 0.3 | -0.3 ± 0.5 | -0.1 ± 0.5 |
+| commit -> exec start p50, ms (val0, val1 mean) | 41 | 34 | 27 | **-7 ± 1** | **-13 ± 4** | **-6 ± 5** |
+| exec chain ms per block (headline) | 13.90 | 14.09 | 14.34 | **0.19 ± 0.19** | **0.45 ± 0.22** | 0.25 ± 0.32 |
+| exec wall ms per action slot (val0, val1) | 0.835 | 0.875 | 0.900 | **0.040 ± 0.020** | **0.065 ± 0.021** | 0.025 ± 0.032 |
+| tail lag p50, heights | 3.0 | 3.0 | 3.0 | 0 | 0 | 0 |
+| tail lag p99, heights | 11.0 | 11.0 | 11.0 | 0 | 0 | 0 |
+| CPU cores val2 | 2.29 | 2.32 | 2.34 | **0.03 ± 0.03** | **0.05 ± 0.01** | 0.02 ± 0.04 |
+| CPU cores mean(val0, val1) | 2.29 | 2.33 | 2.35 | **0.04 ± 0.03 (+1.73% ± 1.21)** | **0.07 ± 0.02 (+2.92% ± 0.76)** | 0.03 ± 0.04 (+1.16% ± 1.62) |
+| sys CPU cores mean(val0, val1) | 0.26 | 0.27 | 0.28 | **0.01 ± 0.00** | **0.02 ± 0.01** | 0.01 ± 0.01 |
+| CPU ms per 1k fills | 28.40 | 28.86 | 29.16 | **0.46 ± 0.36 (+1.61% ± 1.28)** | **0.76 ± 0.18 (+2.68% ± 0.62)** | 0.30 ± 0.46 (+1.05% ± 1.61) |
+| val2 vote delay, ms (load window) | 5.00 | 4.74 | 4.64 | **-0.27 ± 0.04** | **-0.36 ± 0.04** | **-0.09 ± 0.03** |
+| NO LOAD: idle blocks/s (summary idle_blk_s) | 26.37 | 27.73 | 37.90 | **1.37 ± 0.29 (+5.18% ± 1.08)** | **11.53 ± 1.23 (+43.76% ± 6.07)** | **10.17 ± 1.37 (+36.68% ± 6.20)** |
+| NO LOAD: limiter drops before t_bench0, all nodes | 1365 | 3049 | 14595 | **1684 ± 338** | **13230 ± 262** | **11546 ± 521** |
+| NO LOAD: limiter drops/s before t_bench0, all nodes | 14.1 | 31.2 | 156.9 | **17.1 ± 1.3** | **142.8 ± 2.6** | **125.7 ± 3.9** |
+| NO LOAD: limiter drops after t_bench1, all nodes | 585 | 3205 | 6283 | 2620 ± 8638 | **5698 ± 1000** | 3078 ± 9637 |
+| NO LOAD: re-send lines before t_bench0, all nodes | 350 | 245 | 37 | **-105 ± 34** | **-313 ± 3** | **-208 ± 31** |
+
+± = 95% t interval, df 2, n = 3, per round. Bold = interval excludes 0. Other tables: `analyst/blockrate9g6-t.txt`, `mix9g6-t.txt`, `commitgap9g6-t.txt`, `dupes9g6-t.txt`.
+
+"Empty" has two meanings here. Headline `empty_blk_s` (the exec engine skipped the block) is 0.49 / 0.29 / 0.31 per s, while content-empty blocks are about 4.0 / 2.2 / 1.4 per s. Headline `native_blk_s` (the engine ran) is 25.94 / 26.20 / 26.13, not blocks with actions (22.24 / 24.12 / 24.84).
+
+Exec time by block size (val0, `analyst/dupes9g6-t.txt`, means of the 3 cells):
+
+| native actions in block | W0 blocks/s | W10 blocks/s | W20 blocks/s | W0 ms / block | W10 ms / block | W20 ms / block |
+|---|---|---|---|---|---|---|
+| 0 | 4.02 | 2.23 | 1.39 | 2.8 | 2.9 | 2.7 |
+| 1-2 | 3.23 | 3.18 | 3.28 | 5.2 | 5.5 | 5.6 |
+| 3-9 | 11.91 | 13.63 | 13.71 | 9.0 | 9.3 | 9.6 |
+| 10-49 | 4.39 | 4.72 | 5.46 | 16.5 | 16.1 | 15.8 |
+| 50+ | 2.84 | 2.68 | 2.53 | 54.5 | 54.1 | 54.3 |
+
+### 145.5 Which leader builds the empty blocks
+
+From `analyst/leaders9g6-t.txt` and `leadersum9g6-t.txt` (9t's `leaders9t.py`; each of the 3 nodes builds 33.3% of committed blocks in every cell).
+
+| content-empty share of the blocks this node led, % | W0 | W10 | W20 | W10 - W0 | W20 - W0 | W20 - W10 |
+|---|---|---|---|---|---|---|
+| val0 (senders) | 2.3 | 1.0 | 1.1 | -1.3 ± 0.6 | -1.2 ± 0.7 | +0.1 ± 0.1 |
+| val1 (senders) | 2.0 | 0.9 | 1.1 | -1.2 ± 0.8 | -1.0 ± 1.0 | +0.2 ± 0.4 |
+| val2 (tail, no senders) | 43.0 | 25.1 | 16.3 | **-17.8 ± 13.4** | **-26.7 ± 14.8** | **-8.9 ± 2.3** |
+| val2's share of all content-empty blocks | 90.8 | 93.0 | 88.2 | | | |
+
+By round, val2: W0 42.6 / 42.8 / 43.6, W10 28.6 / 27.1 / 19.5, W20 19.5 / 19.3 / 10.0.
+
+So the empty blocks are nearly all val2's, and the wait's gain is nearly all there. Inferred, not traced: val2 has no senders, so it sees actions only through gossip, and its pool often holds nothing new when it leads. Action slots also shift towards val2: over the window its builds carry 38,167 actions on W0 and 46,040 on W20, and val1's fall from 43,880 to 34,542 (means).
+
+### 145.6 No-load phases (not asked, found in the drop counts)
+
+The phases around the load window carry almost no actions (~90-130 before, ~30-70 after). Before the load runs ~93-102 s from the first commit. `analyst/dropphase9g6-t.txt`, `idle9g6-t.txt`.
+
+| | W0 | W10 | W20 | W10 - W0 | W20 - W0 |
+|---|---|---|---|---|---|
+| idle blocks/s (`idle_blk_s`) | 26.37 | 27.73 | 37.90 | **+1.37 ± 0.29 (+5.2% ± 1.1)** | **+11.53 ± 1.23 (+43.8% ± 6.1)** |
+| limiter drops before the load, all nodes | 1,365 | 3,049 | 14,595 | **+1,684 ± 338** | **+13,230 ± 262** |
+| limiter drops/s before the load | 14.1 | 31.2 | 156.9 | **+17.1 ± 1.3** | **+142.8 ± 2.6** |
+| re-send lines before the load, all nodes | 350 | 245 | 37 | **-105 ± 34** | **-313 ± 3** |
+| limiter drops after the load, all nodes | 585 | 3,205 | 6,283 | 2,620 ± 8,638 | **+5,698 ± 1,000** |
+
+* **On a quiet chain the wait raises the empty block rate.** About 97% of these blocks are empty, so W20 commits ~44% more empty blocks per second than W0. The rate is steady in 10 s bins (38 per s) before and after the load on all W20 cells.
+* The drop counter goes up ~10x on W20 while re-sends fall ~90%. Inferred, not traced: at W0 the idle chain spends most of its wall time in 250 ms stall views, and spacing the proposals by ~20 ms avoids most of those stalls, so the block rate rises even with the hold. Why the drops rise is not traced.
+* W10 is much milder (+5%, drops x2.2), so the effect is not linear in the wait. Only two nonzero values were run.
+* r2-W10's phase after the load is different: 67 s instead of 35-41 s, ~34 blocks/s, 7,296 drops, 69 actions. Not traced. Its load window looks like the other W10 cells, and this one cell is why W10's drops-after row is so wide.
+* These phases are the cell's start and end, not a designed idle test. Their sizes are tight across rounds, but a long idle run was not made.
+
+### 145.7 Reading
+
+* **(1) Does the wait cut empty blocks without hurting commit p99 or matched/s? Under load at this rate: yes for empty blocks, with limits on what the other two can show.**
+  - Headline: blocks with actions/s +1.88 ± 1.41 (W10), +2.61 ± 1.58 (W20). Content-empty -6.8 ± 4.6 and -9.6 ± 5.0 points. Blocks/s does not move (+0.38% ± 0.94, +0.25% ± 1.44). So the wait turns empty blocks into blocks with actions at the same block rate, and slots per nonempty block fall from 18.8 to 17.2 and 16.6. Duplicate slots fall 4.6% -> 3.9% -> 3.2%.
+  - **Commit p99: no harm visible, but low sensitivity.** -1.7 ± 0.9 and -4.0 ± 1.0 ms. This p99 (~480 ms) is the stall view (144), so a cost of a few ms on ordinary commits would not reach it. Its small fall comes with fewer stalls; the link is not traced.
+  - **Commit p50 does rise:** +1.73 ± 0.17 and +2.11 ± 0.26 ms, on 9.27 ms. Order age p50 falls at the same time: -8.5 ± 2.6 and -12.7 ± 2.5 ms on 154 ms. Order age p99 is not resolved (-32 ± 102, +22 ± 144 ms). Tail lag is unchanged (3 / 11 heights). That the p50 rise is the leader's hold, and the order age fall is actions reaching a block sooner, is inferred, since the hold is not measured.
+  - **matched/s cannot show a cost here.** +0.03% ± 0.07 and +0.05% ± 0.05. It is pinned by the offered rate: `bench_submitted_actions` is 124,996 on all 9 cells (397 / s, 99.25% of RATE), `wait_cap` and `wait_cancel` n = 0. Split: exec actions/s 397.6 on every cell, fills per action 202.6 / 202.6 / 202.7, cancel-all 42,211 actions on every cell (33.8%). All this shows is that the node keeps up with 400 actions / s on all arms. It says nothing about capacity near the ~1,490 actions / s ceiling, which was not run.
+  - **Costs that do show:** CPU per 1k fills +1.61% ± 1.28 and +2.68% ± 0.62, cores per node +0.04 ± 0.03 and +0.07 ± 0.02, exec busy +0.9 ± 0.7 and +1.4 ± 0.4 points, chain +0.19 ± 0.19 and +0.45 ± 0.22 ms, exec ms per slot +0.040 ± 0.020 and +0.065 ± 0.021. Consistent with 144's block floor cost (the same actions in more, smaller blocks); not profiled. No backlog: queue ~1.5, commit -> exec p50 falls 41 -> 34 -> 27 ms.
+* **(2) Limiter and stalls.** Stall views fall -4.26 ± 0.73 (W10) and -8.63 ± 2.42 points (W20), re-send lines -82 ± 52 and -141 ± 85. Limiter drops in the load window are not resolved: +6.4% ± 10.0 and +8.9% ± 16.6, validator and byte counters 0 as expected on main. So stalls fall without drops falling, and blocks/s stays at ~26.5. Whether the limiter still sets that rate at W20 is not traced. Stall views are still 65% of wall at W20, so the wait leaves this regime in place rather than ending it.
+* **(3) W10 vs W20: W20 gives more under load.** Blocks with actions +0.73 ± 0.20 (+3.02% ± 0.72; +0.72 / +0.66 / +0.81 by round), content-empty -2.9 ± 0.9 points, val2's empty share -8.9 ± 2.3 points, stalls -4.38 ± 1.70 points, commit p99 -2.3 ± 0.4 ms, commit p50 +0.38 ± 0.35 ms. Extra CPU per fill +1.05% ± 1.61 and exec busy +0.5 ± 1.0 points are not resolved. **With no load W10 is clearly better:** +5% vs +44% idle blocks/s and drops x2.2 vs x10.7. So the choice depends on how much time the chain spends idle, and this bench does not settle that.
+
+### 145.8 Caveats
+
+* **What n = 3 can and cannot resolve.** Replicate noise on the headline, max - min over rounds: W0 0.25, W10 0.82, W20 0.92 blocks with actions/s. The sign holds in all 3 rounds for both arms (W10 - W0 +1.45 / +1.65 / +2.52, W20 - W0 +2.17 / +2.31 / +3.33), but the size is known only to about ± 60-75% of itself. Not resolved: limiter drops in the window (± 10-17%), order age p99 (± 100-150 ms), mempool (± 11-14), W20 - W10 CPU (± 1.6%).
+* **Round 3 anomaly, not traced.** r3-W10 and r3-W20 are ~3 content-empty points below their arm's other cells (W10 10.2 / 9.7 / 7.1%, W20 7.1 / 7.2 / 4.0%), all of it in val2's blocks (`leadersum9g6-t.txt`). It holds across the whole window in 30 s bins (`emptyseries9g6-t.txt`), so it is not a burst. r3-W0 ran between them and did not move (16.0%). Both cells finished after 01:30 (01:37, 02:07), so a change over time that only the wait arms feel cannot be told from a round effect. FOREIGN is equal on all cells. It sets the wide W10 - W0 and W20 - W0 intervals. W20 - W10 stays tight because both moved together.
+* **Regime.** Main has no validator bucket, so 9g6 runs where A's 50 / s limiter appears to hold ~26 blocks/s with ~74% stall views at W0 (144; inferred there, not traced per author). The wait's effect here should not be assumed at another rate or on a bucket node. C8 at this rate runs 146 blocks/s, ~0.1% stalls, 22% content-empty (144), and the wait has not been run there.
+* Rate: RATE 400 is about a quarter of T's exec capacity. Higher rates, with fewer empty blocks at W0, were not run.
+* Waits other than 10 and 20 ms were not run; the cap is 100 ms. The retry loop is ~10 ms, so W10 may hold for little more than one retry (read from the code comment, not measured).
+* T's stakes are 2 / 2 / 1 with senders on val0 / val1 and the tail on val2. Since nearly all empty blocks are val2's, the size of the gain depends on this layout.
+* Smokes (120 s, one cell per arm, unscored) gave content-empty 17.4 / 11.2 / 7.8%, in line with r1 and r2.
+
+### 145.9 Correction: view and vote rows in 143 and 144
+
+`blockrate9g{4,5,6}.py` read `consensus_by_node.<val>.view_*`, which covers the whole run including the no-load phases, while their tables read as load window. Load-window values come from `consensus_by_node.<val>.load` (`ozarchy-s140-9g6-tools/analyst/viewload.py` -> `viewload.txt`). 145 and 144 now use them. In 145 this removed an artifact: the whole-run view duration fell 37.90 -> 36.83 ms on W20 only because of the faster idle phases; under load it is flat. 144's conclusions do not change.
+
+**143's "control inside the run" was wrong.** It read val2's vote delay excess over mean(val0, val1) as +2.2 (A1) / +7.2 (A8) / +1.7 ms (C8) and concluded it follows the node binary, not the tail. In the load window it is +2.56 / +11.93 / +11.87 ms: A8 - A1 **+9.37 ± 4.27**, C8 - A8 -0.06 ± 2.20. So it goes with depth 8 at full bodies on both arms, not with the binary, and that argument against an effect of val2's serving falls away. The rest of 143's reading stands: val2's CPU shows no excess, and exec is what holds ~4 blocks/s, with ~9 ms small beside a ~246 ms view (143's load-window view duration: A1 62.65, A8 246.37, C8 229.78 ms; the whole-run values 60.03, 181.30, 63.63 mixed in the idle phases). Depth alone does not produce it: at depth 8 with small bodies (144) the excess is +0.92 (A8) and +0.25 ms (C8). Whether it comes from body size, concurrent reads of full bodies or saturation is not separated.
+
+### 145.10 Files
+
+* Tools `ozarchy-s140-9g6-tools/`: `make-specs-9g6.py`, `specs/` (9g6-t, 9g6-smk-{W10, W20}), `drivers/`, `smoke-chain-9g6.sh`, `campaign-chain-9g6.sh`, `checks/9g6-checks.sh`, `prof/` (`timedwait.py`, `quietgate.py`, `foreign-sampler.py`, `run-with-sampler.sh`, `phase/foreign-phase-1-9g6.txt`), `build/` (`build-9g6.sh`, `build.log`). Analysis `analyst/`: `scored.txt`, `cells9g6.py` -> `cells9g6-t.txt`, `blockrate9g6.py` -> `blockrate9g6-t.txt`, `mix9g6.py` -> `mix9g6-t.txt`, `commitgap9g6.py` -> `commitgap9g6-t.txt`, `dupes9g6.py` -> `dupes9g6-t.txt`, `dupwarn9g6.py` -> `dupwarn9g6-t.txt`, `foreign9g6.py` -> `foreign9g6-t.txt`, `emptyseries9g6.py` -> `emptyseries9g6-t.txt`, `leadersum9g6.py` -> `leaders9g6-t.txt` (from 9t's `leaders9t.py`), `leadersum9g6-t.txt`, `dropphase9g6.py` -> `dropphase9g6-t.txt`, `idle9g6.py` -> `idle9g6-t.txt`, `table145.py` -> `table145.txt`, `viewload.py` -> `viewload.txt`. Stage `ozarchy-s140-9g6-stage/M`, `build/md5s.txt`. Run dir `ozarchy-s140-9g6-t-run`, smokes `ozarchy-s140-9g6-t-smoke-s0`, `ozarchy-s140-9g6-t-smkw10-smoke-s0`, `ozarchy-s140-9g6-t-smkw20-smoke-s0`. Unit `bench-ozarchy-s140-9g6-chain`, chain log + `campaign.done` in `ozarchy-s140-9g6-chain-run`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
